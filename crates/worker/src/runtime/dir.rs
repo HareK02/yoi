@@ -41,6 +41,7 @@ pub struct SpawnedWorkerRecord {
 /// The directory is removed on drop.
 pub struct RuntimeDir {
     path: PathBuf,
+    write_legacy_snapshots: bool,
 }
 
 impl RuntimeDir {
@@ -52,7 +53,23 @@ impl RuntimeDir {
         let pid = std::process::id().to_string();
         fs::write(path.join("pid"), pid.as_bytes()).await?;
 
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            write_legacy_snapshots: true,
+        })
+    }
+
+    /// Create an ephemeral Runtime-owned artifact directory.
+    ///
+    /// Runtime-managed Workers keep their status in the owning Runtime and do
+    /// not materialize legacy pid/status/manifest projections.
+    pub async fn create_transient(base: &Path, worker_name: &str) -> Result<Self, io::Error> {
+        let path = base.join(worker_name);
+        fs::create_dir_all(&path).await?;
+        Ok(Self {
+            path,
+            write_legacy_snapshots: false,
+        })
     }
 
     /// Create in the default base directory resolved via
@@ -64,12 +81,18 @@ impl RuntimeDir {
 
     /// Write status.json atomically.
     pub async fn write_status(&self, state: &WorkerSharedState) -> Result<(), io::Error> {
+        if !self.write_legacy_snapshots {
+            return Ok(());
+        }
         let content = state.status_json();
         atomic_write(&self.path.join("status.json"), content.as_bytes()).await
     }
 
     /// Write manifest.toml (typically once at startup).
     pub async fn write_manifest(&self, toml: &str) -> Result<(), io::Error> {
+        if !self.write_legacy_snapshots {
+            return Ok(());
+        }
         atomic_write(&self.path.join("manifest.toml"), toml.as_bytes()).await
     }
 
@@ -198,6 +221,23 @@ mod tests {
 
         let content = std::fs::read_to_string(rt.path().join("manifest.toml")).unwrap();
         assert_eq!(content, "[engine]\nname = \"test\"");
+    }
+
+    #[tokio::test]
+    async fn transient_directory_does_not_write_liveness_snapshots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = RuntimeDir::create_transient(tmp.path(), "runtime-worker")
+            .await
+            .unwrap();
+
+        rt.write_status(&test_state()).await.unwrap();
+        rt.write_manifest("[worker]\nname = \"runtime-worker\"")
+            .await
+            .unwrap();
+
+        assert!(!rt.path().join("pid").exists());
+        assert!(!rt.path().join("status.json").exists());
+        assert!(!rt.path().join("manifest.toml").exists());
     }
 
     #[tokio::test]

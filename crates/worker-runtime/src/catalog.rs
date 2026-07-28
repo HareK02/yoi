@@ -1,4 +1,3 @@
-use crate::execution::WorkerExecutionStatus;
 use crate::identity::{WorkerId, WorkerRef};
 use crate::interaction::WorkerInput;
 use crate::profile_archive::{ProfileSourceArchive, ProfileSourceArchiveRef};
@@ -211,14 +210,16 @@ pub struct CreateWorkerRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerStatus {
+    Idle,
     Running,
+    Paused,
     Stopped,
     Cancelled,
 }
 
 impl WorkerStatus {
     pub fn is_active(self) -> bool {
-        matches!(self, Self::Running)
+        matches!(self, Self::Idle | Self::Running | Self::Paused)
     }
 }
 
@@ -228,7 +229,8 @@ pub struct WorkerSummary {
     pub worker_ref: WorkerRef,
     pub worker_id: WorkerId,
     pub status: WorkerStatus,
-    pub execution: WorkerExecutionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<WorkingDirectoryStatus>,
     pub profile: ProfileSelector,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
@@ -244,7 +246,8 @@ pub struct WorkerDetail {
     pub worker_ref: WorkerRef,
     pub worker_id: WorkerId,
     pub status: WorkerStatus,
-    pub execution: WorkerExecutionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<WorkingDirectoryStatus>,
     pub profile: ProfileSelector,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,

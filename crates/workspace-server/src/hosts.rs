@@ -26,9 +26,8 @@ use worker_runtime::config_bundle::{
     ConfigBundleMetadata, ConfigBundleProvenance, ConfigProfileDescriptor,
 };
 use worker_runtime::error::RuntimeError as EmbeddedRuntimeError;
-use worker_runtime::execution::{
-    WorkerExecutionBackendKind, WorkerExecutionRunState, WorkerExecutionStatus,
-};
+#[cfg(test)]
+use worker_runtime::execution::WorkerExecutionRunState;
 use worker_runtime::fs_store::FsRuntimeStoreOptions;
 use worker_runtime::http_server::{
     RuntimeHttpConfigBundleAvailabilityResponse, RuntimeHttpConfigBundleSyncRequest,
@@ -1332,12 +1331,8 @@ impl EmbeddedWorkerRuntime {
         Some(EmbeddedWorkerRef::new(EmbeddedWorkerId::parse(worker_id)?))
     }
 
-    fn can_stop_embedded_worker(
-        &self,
-        status: EmbeddedWorkerStatus,
-        execution: &worker_runtime::execution::WorkerExecutionStatus,
-    ) -> bool {
-        runtime_worker_can_stop(self.execution_enabled, status, execution)
+    fn can_stop_embedded_worker(&self, status: EmbeddedWorkerStatus) -> bool {
+        runtime_worker_can_stop(self.execution_enabled, status)
     }
 
     fn map_worker_summary(&self, summary: worker_runtime::catalog::WorkerSummary) -> WorkerSummary {
@@ -1363,8 +1358,7 @@ impl EmbeddedWorkerRuntime {
                 visibility: "backend_internal".to_string(),
                 identity: "runtime_registry_worker".to_string(),
             },
-            state: embedded_worker_execution_status_label(summary.status, &summary.execution)
-                .to_string(),
+            state: embedded_worker_status_label(summary.status).to_string(),
             last_seen_at: None,
             pinned: false,
             retention_state: "transient".to_string(),
@@ -1373,15 +1367,11 @@ impl EmbeddedWorkerRuntime {
                 display_hint: "backend-internal worker-runtime Worker".to_string(),
             },
             capabilities: WorkerCapabilitySummary {
-                can_stop: self.can_stop_embedded_worker(summary.status, &summary.execution),
+                can_stop: self.can_stop_embedded_worker(summary.status),
                 can_spawn_followup: false,
             },
-            working_directory: summary
-                .execution
-                .working_directory
-                .clone()
-                .map(|status| status.summary),
-            diagnostics: embedded_worker_projection_diagnostics(&summary.execution),
+            working_directory: summary.working_directory.map(|status| status.summary),
+            diagnostics: embedded_worker_projection_diagnostics(),
         }
     }
 
@@ -1408,8 +1398,7 @@ impl EmbeddedWorkerRuntime {
                 visibility: "backend_internal".to_string(),
                 identity: "runtime_registry_worker".to_string(),
             },
-            state: embedded_worker_execution_status_label(detail.status, &detail.execution)
-                .to_string(),
+            state: embedded_worker_status_label(detail.status).to_string(),
             last_seen_at: None,
             pinned: false,
             retention_state: "transient".to_string(),
@@ -1418,15 +1407,11 @@ impl EmbeddedWorkerRuntime {
                 display_hint: "backend-internal worker-runtime Worker".to_string(),
             },
             capabilities: WorkerCapabilitySummary {
-                can_stop: self.can_stop_embedded_worker(detail.status, &detail.execution),
+                can_stop: self.can_stop_embedded_worker(detail.status),
                 can_spawn_followup: false,
             },
-            working_directory: detail
-                .execution
-                .working_directory
-                .clone()
-                .map(|status| status.summary),
-            diagnostics: embedded_worker_projection_diagnostics(&detail.execution),
+            working_directory: detail.working_directory.map(|status| status.summary),
+            diagnostics: embedded_worker_projection_diagnostics(),
         }
     }
 }
@@ -2289,8 +2274,7 @@ impl RemoteWorkerRuntime {
                 visibility: "remote_runtime".to_string(),
                 identity: "runtime_registry_worker".to_string(),
             },
-            state: embedded_worker_execution_status_label(summary.status, &summary.execution)
-                .to_string(),
+            state: embedded_worker_status_label(summary.status).to_string(),
             last_seen_at: None,
             pinned: false,
             retention_state: "transient".to_string(),
@@ -2299,10 +2283,10 @@ impl RemoteWorkerRuntime {
                 display_hint: "Backend-proxied remote worker-runtime Worker".to_string(),
             },
             capabilities: WorkerCapabilitySummary {
-                can_stop: runtime_worker_can_stop(true, summary.status, &summary.execution),
+                can_stop: runtime_worker_can_stop(true, summary.status),
                 can_spawn_followup: false,
             },
-            working_directory: summary.execution.working_directory.clone().map(|status| status.summary),
+            working_directory: summary.working_directory.map(|status| status.summary),
             diagnostics: vec![diagnostic(
                 "remote_runtime_projection",
                 DiagnosticSeverity::Info,
@@ -2334,8 +2318,7 @@ impl RemoteWorkerRuntime {
                 visibility: "remote_runtime".to_string(),
                 identity: "runtime_registry_worker".to_string(),
             },
-            state: embedded_worker_execution_status_label(detail.status, &detail.execution)
-                .to_string(),
+            state: embedded_worker_status_label(detail.status).to_string(),
             last_seen_at: None,
             pinned: false,
             retention_state: "transient".to_string(),
@@ -2344,10 +2327,10 @@ impl RemoteWorkerRuntime {
                 display_hint: "Backend-proxied remote worker-runtime Worker".to_string(),
             },
             capabilities: WorkerCapabilitySummary {
-                can_stop: runtime_worker_can_stop(true, detail.status, &detail.execution),
+                can_stop: runtime_worker_can_stop(true, detail.status),
                 can_spawn_followup: false,
             },
-            working_directory: detail.execution.working_directory.clone().map(|status| status.summary),
+            working_directory: detail.working_directory.map(|status| status.summary),
             diagnostics: vec![diagnostic(
                 "remote_runtime_projection",
                 DiagnosticSeverity::Info,
@@ -2814,94 +2797,26 @@ fn embedded_runtime_status_label(status: RuntimeStatus) -> &'static str {
     }
 }
 
-fn runtime_worker_can_stop(
-    execution_enabled: bool,
-    status: EmbeddedWorkerStatus,
-    execution: &WorkerExecutionStatus,
-) -> bool {
-    execution_enabled
-        && status == EmbeddedWorkerStatus::Running
-        && execution.backend == worker_runtime::execution::WorkerExecutionBackendKind::Alive
-        && matches!(
-            execution.run_state,
-            WorkerExecutionRunState::Idle | WorkerExecutionRunState::Busy
-        )
+fn runtime_worker_can_stop(execution_enabled: bool, status: EmbeddedWorkerStatus) -> bool {
+    execution_enabled && status.is_active()
 }
 
 fn embedded_worker_status_label(status: EmbeddedWorkerStatus) -> &'static str {
     match status {
+        EmbeddedWorkerStatus::Idle => "idle",
         EmbeddedWorkerStatus::Running => "running",
+        EmbeddedWorkerStatus::Paused => "paused",
         EmbeddedWorkerStatus::Stopped => "stopped",
         EmbeddedWorkerStatus::Cancelled => "cancelled",
     }
 }
 
-fn embedded_worker_projection_diagnostics(
-    execution: &WorkerExecutionStatus,
-) -> Vec<RuntimeDiagnostic> {
-    let mut diagnostics = vec![diagnostic(
+fn embedded_worker_projection_diagnostics() -> Vec<RuntimeDiagnostic> {
+    vec![diagnostic(
         "embedded_runtime_projection",
         DiagnosticSeverity::Info,
         "Worker identity is projected only as runtime_id plus worker_id; embedded runtime internals remain backend-private".to_string(),
-    )];
-
-    match execution.backend {
-        WorkerExecutionBackendKind::Stopped => diagnostics.push(diagnostic(
-            "embedded_worker_execution_stopped",
-            DiagnosticSeverity::Info,
-            "Worker execution is stopped; the runtime will restore it before dispatching input or protocol methods".to_string(),
-        )),
-        WorkerExecutionBackendKind::Corrupted => diagnostics.push(diagnostic(
-            "embedded_worker_execution_corrupted",
-            DiagnosticSeverity::Error,
-            "Worker execution state is corrupted and cannot be restored without repair".to_string(),
-        )),
-        WorkerExecutionBackendKind::Alive => {
-            if execution.run_state == WorkerExecutionRunState::Rejected {
-                diagnostics.push(diagnostic(
-                    "embedded_worker_execution_rejected",
-                    DiagnosticSeverity::Warning,
-                    "Worker execution rejected the last transient operation; retry or inspect runtime logs".to_string(),
-                ));
-            }
-        }
-    }
-
-    if let Some(restore_dry_check) = execution.restore_dry_check.as_ref() {
-        diagnostics.push(diagnostic(
-            "embedded_worker_execution_restore_dry_check",
-            DiagnosticSeverity::Error,
-            format!(
-                "Worker restore dry-test {}: {}",
-                restore_dry_check.code, restore_dry_check.message
-            ),
-        ));
-    }
-
-    diagnostics
-}
-
-fn embedded_worker_execution_status_label(
-    status: EmbeddedWorkerStatus,
-    execution: &WorkerExecutionStatus,
-) -> &'static str {
-    match status {
-        EmbeddedWorkerStatus::Stopped => "stopped",
-        EmbeddedWorkerStatus::Cancelled => "cancelled",
-        EmbeddedWorkerStatus::Running => match execution.backend {
-            worker_runtime::execution::WorkerExecutionBackendKind::Stopped => "stopped",
-            worker_runtime::execution::WorkerExecutionBackendKind::Corrupted => "corrupted",
-            worker_runtime::execution::WorkerExecutionBackendKind::Alive => {
-                match execution.run_state {
-                    WorkerExecutionRunState::Idle => "idle",
-                    WorkerExecutionRunState::Busy => "running",
-                    WorkerExecutionRunState::Stopped => "stopped",
-                    WorkerExecutionRunState::Rejected => "rejected",
-                    WorkerExecutionRunState::Errored => "errored",
-                }
-            }
-        },
-    }
+    )]
 }
 
 fn default_profile_source_archive_source(
@@ -4501,7 +4416,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_runtime_projection_blocks_stopped_and_corrupted_execution_stop() {
+    fn remote_runtime_projection_uses_canonical_worker_status_for_stop_capability() {
         let (base_url, server) = serve_mock_http(vec![
             mock_response(
                 "GET",
@@ -4510,30 +4425,10 @@ mod tests {
                 200,
                 json!({
                     "workers": [
-                    worker_json_with_execution(
-                        "remote:primary",
-                        "1",
-                        "stopped",
-                        "stopped",
-                    ),
-                    worker_json_with_execution(
-                        "remote:primary",
-                        "2",
-                        "corrupted",
-                        "errored",
-                    ),
-                    worker_json_with_execution(
-                        "remote:primary",
-                        "3",
-                        "alive",
-                        "rejected",
-                    ),
-                    worker_json_with_execution(
-                        "remote:primary",
-                        "4",
-                        "alive",
-                        "errored",
-                    )
+                    worker_json_with_status("remote:primary", "1", "stopped"),
+                    worker_json_with_status("remote:primary", "2", "cancelled"),
+                    worker_json_with_status("remote:primary", "3", "paused"),
+                    worker_json_with_status("remote:primary", "4", "idle")
                     ]
                 })
                 .to_string(),
@@ -4544,12 +4439,7 @@ mod tests {
                 true,
                 200,
                 json!({
-                    "worker": worker_json_with_execution(
-                    "remote:primary",
-                    "1",
-                    "stopped",
-                    "stopped",
-                )})
+                    "worker": worker_json_with_status("remote:primary", "1", "stopped")})
                 .to_string(),
             ),
         ]);
@@ -4569,17 +4459,14 @@ mod tests {
 
         let workers = registry.list_workers(10);
         assert_eq!(workers.items.len(), 4);
-        for worker in &workers.items {
-            assert!(
-                !worker.capabilities.can_stop,
-                "{} should not be stoppable",
-                worker.worker_id
-            );
-        }
+        assert!(!workers.items[0].capabilities.can_stop);
+        assert!(!workers.items[1].capabilities.can_stop);
+        assert!(workers.items[2].capabilities.can_stop);
+        assert!(workers.items[3].capabilities.can_stop);
         assert_eq!(workers.items[0].state, "stopped");
-        assert_eq!(workers.items[1].state, "corrupted");
-        assert_eq!(workers.items[2].state, "rejected");
-        assert_eq!(workers.items[3].state, "errored");
+        assert_eq!(workers.items[1].state, "cancelled");
+        assert_eq!(workers.items[2].state, "paused");
+        assert_eq!(workers.items[3].state, "idle");
 
         let stopped_detail = registry.worker("remote:primary", "1").unwrap();
         assert!(!stopped_detail.capabilities.can_stop);
@@ -4764,22 +4651,20 @@ mod tests {
     }
 
     fn worker_json(runtime_id: &str, worker_id: &str) -> serde_json::Value {
-        worker_json_with_execution(runtime_id, worker_id, "alive", "idle")
+        worker_json_with_status(runtime_id, worker_id, "idle")
     }
 
-    fn worker_json_with_execution(
+    fn worker_json_with_status(
         runtime_id: &str,
         worker_id: &str,
-        backend: &str,
-        run_state: &str,
+        status: &str,
     ) -> serde_json::Value {
         let worker_id = worker_id.parse::<u64>().unwrap();
         json!({
             "worker_ref": { "runtime_id": runtime_id, "worker_id": worker_id },
             "runtime_id": runtime_id,
             "worker_id": worker_id,
-            "status": "running",
-            "execution": { "backend": backend, "run_state": run_state },
+            "status": status,
             "intent": { "kind": "role", "role": "coder", "purpose": "remote test" },
             "profile": { "kind": "builtin", "value": "coder" },
             "profile_source": {

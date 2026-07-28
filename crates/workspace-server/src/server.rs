@@ -7192,15 +7192,6 @@ mod tests {
                 .cleanup_working_directory(working_directory_id)
         }
 
-        fn dry_restore_worker(
-            &self,
-            _request: worker_runtime::execution::WorkerExecutionRestoreDryRequest,
-        ) -> worker_runtime::execution::WorkerRestoreDryCheck {
-            worker_runtime::execution::WorkerRestoreDryCheck::valid(
-                "deterministic test backend dry restore ok",
-            )
-        }
-
         fn spawn_worker(
             &self,
             request: worker_runtime::execution::WorkerExecutionSpawnRequest,
@@ -9024,8 +9015,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn embedded_runtime_fs_store_restores_catalog_config_bundle_and_corrupts_failed_execution()
-     {
+    async fn embedded_runtime_fs_store_restores_catalog_and_stops_failed_execution() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_server_config(dir.path().join("workspace"));
         let store_root = config.embedded_runtime_store_root.clone();
@@ -9112,14 +9102,8 @@ mod tests {
             .runtime
             .worker("embedded-worker-runtime", &worker_id)
             .expect("restored worker");
-        assert_eq!(restored_worker.state, "corrupted");
+        assert_eq!(restored_worker.state, "stopped");
         assert!(!restored_worker.capabilities.can_stop);
-        assert!(
-            restored_worker
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "embedded_worker_execution_corrupted")
-        );
 
         let bundles = restored
             .runtime

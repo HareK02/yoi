@@ -1,12 +1,9 @@
-use crate::catalog::{CreateWorkerRequest, WorkerStatus};
+use crate::catalog::{CreateWorkerRequest, WorkingDirectoryStatus};
 use crate::config_bundle::ConfigBundle;
 use crate::diagnostics::{DiagnosticSeverity, RuntimeDiagnostic};
 use crate::error::RuntimeError;
-use crate::execution::WorkerExecutionStatus;
 use crate::identity::{WorkerId, WorkerRef};
 use crate::management::{RuntimeBackendKind, RuntimeLimits, RuntimeStatus};
-#[cfg(feature = "ws-server")]
-use crate::observation::WorkerObservationEvent;
 use crate::observation::{EventCursor, RuntimeEvent, RuntimeEventBatch};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -21,8 +18,7 @@ const EVENTS_FILE: &str = "events.jsonl";
 const WORKERS_DIR: &str = "workers";
 const LEGACY_RUNTIMES_DIR: &str = "runtimes";
 const WORKER_FILE: &str = "worker.json";
-#[cfg(feature = "ws-server")]
-const OBSERVATIONS_FILE: &str = "observations.jsonl";
+const LEGACY_OBSERVATIONS_FILE: &str = "observations.jsonl";
 
 static NEXT_TMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -153,11 +149,7 @@ impl FsRuntimeStore {
             &WorkerSnapshot::from_persisted(worker),
             "write worker snapshot",
         )?;
-        #[cfg(feature = "ws-server")]
-        ensure_file_exists(
-            &worker_dir.join(OBSERVATIONS_FILE),
-            "create observations log",
-        )?;
+        remove_legacy_observations(&worker_dir);
         Ok(())
     }
 
@@ -178,19 +170,6 @@ impl FsRuntimeStore {
             self.ensure_worker_ref(worker_ref)?;
         }
         append_json_line(&self.events_path(), event, "append event")
-    }
-
-    #[cfg(feature = "ws-server")]
-    pub(crate) fn append_worker_observation_event(
-        &self,
-        event: &WorkerObservationEvent,
-    ) -> Result<(), RuntimeError> {
-        self.ensure_worker_ref(&event.worker_ref)?;
-        append_json_line(
-            &self.observations_path(&event.worker_ref.worker_id),
-            event,
-            "append worker observation",
-        )
     }
 
     pub(crate) fn load_runtime_state(&self) -> Result<PersistedRuntimeState, RuntimeError> {
@@ -229,9 +208,6 @@ impl FsRuntimeStore {
             })?;
         worker_dirs.sort_by_key(|entry| entry.path());
 
-        #[cfg(feature = "ws-server")]
-        let mut observation_events = Vec::new();
-
         for entry in worker_dirs {
             let path = entry.path();
             if !path.is_dir() {
@@ -263,43 +239,7 @@ impl FsRuntimeStore {
                 );
                 continue;
             }
-            #[cfg(feature = "ws-server")]
-            let worker_observations = match read_json_lines::<WorkerObservationEvent>(
-                &path.join(OBSERVATIONS_FILE),
-                "read worker observations",
-            ) {
-                Ok(events) => events,
-                Err(_error) => {
-                    record_worker_load_diagnostic(
-                        &mut snapshot,
-                        Some(worker_snapshot.worker_ref.clone()),
-                        "ignored worker with unreadable observations while loading runtime store",
-                    );
-                    continue;
-                }
-            };
-            #[cfg(feature = "ws-server")]
-            let mut observations_valid = true;
-            #[cfg(feature = "ws-server")]
-            for event in &worker_observations {
-                if self.ensure_worker_ref(&event.worker_ref).is_err()
-                    || event.worker_ref.worker_id != worker_snapshot.worker_id
-                {
-                    observations_valid = false;
-                    break;
-                }
-            }
-            #[cfg(feature = "ws-server")]
-            if !observations_valid {
-                record_worker_load_diagnostic(
-                    &mut snapshot,
-                    Some(worker_snapshot.worker_ref.clone()),
-                    "ignored worker with invalid observations while loading runtime store",
-                );
-                continue;
-            }
-            #[cfg(feature = "ws-server")]
-            observation_events.extend(worker_observations);
+            remove_legacy_observations(&path);
             let worker = worker_snapshot.into_persisted();
             if workers.insert(worker.worker_id.clone(), worker).is_some() {
                 record_worker_load_diagnostic(
@@ -310,15 +250,7 @@ impl FsRuntimeStore {
             }
         }
 
-        #[cfg(feature = "ws-server")]
-        observation_events.sort_by_key(|event| event.sequence);
-
-        Ok(snapshot.into_persisted(
-            events,
-            workers,
-            #[cfg(feature = "ws-server")]
-            observation_events,
-        ))
+        Ok(snapshot.into_persisted(events, workers))
     }
 
     fn ensure_worker_ref(&self, _worker_ref: &WorkerRef) -> Result<(), RuntimeError> {
@@ -336,10 +268,12 @@ impl FsRuntimeStore {
     fn worker_dir(&self, worker_id: &WorkerId) -> PathBuf {
         self.root.join(WORKERS_DIR).join(worker_id.to_string())
     }
+}
 
-    #[cfg(feature = "ws-server")]
-    fn observations_path(&self, worker_id: &WorkerId) -> PathBuf {
-        self.worker_dir(worker_id).join(OBSERVATIONS_FILE)
+fn remove_legacy_observations(worker_dir: &Path) {
+    let path = worker_dir.join(LEGACY_OBSERVATIONS_FILE);
+    if path.is_file() {
+        let _ = fs::remove_file(path);
     }
 }
 
@@ -360,8 +294,6 @@ pub(crate) struct PersistedRuntimeState {
     pub(crate) workers: BTreeMap<WorkerId, PersistedWorkerRecord>,
     pub(crate) config_bundles: BTreeMap<String, ConfigBundle>,
     pub(crate) events: Vec<RuntimeEvent>,
-    #[cfg(feature = "ws-server")]
-    pub(crate) observation_events: Vec<WorkerObservationEvent>,
     pub(crate) diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -369,9 +301,8 @@ pub(crate) struct PersistedRuntimeState {
 pub(crate) struct PersistedWorkerRecord {
     pub(crate) worker_ref: WorkerRef,
     pub(crate) worker_id: WorkerId,
-    pub(crate) status: WorkerStatus,
     pub(crate) request: CreateWorkerRequest,
-    pub(crate) execution: WorkerExecutionStatus,
+    pub(crate) working_directory: Option<WorkingDirectoryStatus>,
     pub(crate) last_event_id: u64,
 }
 
@@ -447,7 +378,6 @@ impl RuntimeSnapshot {
         self,
         events: Vec<RuntimeEvent>,
         workers: BTreeMap<WorkerId, PersistedWorkerRecord>,
-        #[cfg(feature = "ws-server")] observation_events: Vec<WorkerObservationEvent>,
     ) -> PersistedRuntimeState {
         PersistedRuntimeState {
             display_name: self.display_name,
@@ -459,8 +389,6 @@ impl RuntimeSnapshot {
             workers,
             config_bundles: self.config_bundles,
             events,
-            #[cfg(feature = "ws-server")]
-            observation_events,
             diagnostics: self.diagnostics,
         }
     }
@@ -471,11 +399,20 @@ struct WorkerSnapshot {
     schema_version: u32,
     worker_ref: WorkerRef,
     worker_id: WorkerId,
-    status: WorkerStatus,
     request: CreateWorkerRequest,
-    #[serde(default = "WorkerExecutionStatus::stopped")]
-    execution: WorkerExecutionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    working_directory: Option<WorkingDirectoryStatus>,
+    /// One-way migration input for schema-v1 snapshots. New snapshots never
+    /// write the removed execution projection.
+    #[serde(default, rename = "execution", skip_serializing)]
+    legacy_execution: Option<LegacyWorkerExecutionProjection>,
     last_event_id: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct LegacyWorkerExecutionProjection {
+    #[serde(default)]
+    working_directory: Option<WorkingDirectoryStatus>,
 }
 
 impl WorkerSnapshot {
@@ -484,9 +421,9 @@ impl WorkerSnapshot {
             schema_version: SCHEMA_VERSION,
             worker_ref: worker.worker_ref.clone(),
             worker_id: worker.worker_id.clone(),
-            status: worker.status,
             request: worker.request.clone(),
-            execution: worker.execution.clone(),
+            working_directory: worker.working_directory.clone(),
+            legacy_execution: None,
             last_event_id: worker.last_event_id,
         }
     }
@@ -519,9 +456,11 @@ impl WorkerSnapshot {
         PersistedWorkerRecord {
             worker_ref: self.worker_ref,
             worker_id: self.worker_id,
-            status: self.status,
             request: self.request,
-            execution: self.execution,
+            working_directory: self.working_directory.or_else(|| {
+                self.legacy_execution
+                    .and_then(|execution| execution.working_directory)
+            }),
             last_event_id: self.last_event_id,
         }
     }
@@ -752,29 +691,6 @@ where
     file.write_all(b"\n")
         .and_then(|()| file.flush())
         .and_then(|()| file.sync_all())
-        .map_err(|source| RuntimeError::StoreIo {
-            operation,
-            path: path.to_path_buf(),
-            source,
-        })
-}
-
-fn ensure_file_exists(path: &Path, operation: &'static str) -> Result<(), RuntimeError> {
-    let parent = path.parent().ok_or_else(|| RuntimeError::StoreCorrupt {
-        operation,
-        path: path.to_path_buf(),
-        message: "path has no parent directory".to_string(),
-    })?;
-    fs::create_dir_all(parent).map_err(|source| RuntimeError::StoreIo {
-        operation,
-        path: parent.to_path_buf(),
-        source,
-    })?;
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .and_then(|file| file.sync_all())
         .map_err(|source| RuntimeError::StoreIo {
             operation,
             path: path.to_path_buf(),

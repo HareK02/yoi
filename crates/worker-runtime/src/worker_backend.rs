@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -20,9 +20,8 @@ use crate::catalog::{
 };
 use crate::execution::{
     WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation,
-    WorkerExecutionRestoreDryRequest, WorkerExecutionRestoreRequest, WorkerExecutionResult,
-    WorkerExecutionRunState, WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
-    WorkerRestoreDryCheck,
+    WorkerExecutionRestoreRequest, WorkerExecutionResult, WorkerExecutionRunState,
+    WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
 };
 use crate::interaction::{WorkerInput, WorkerInputKind};
 use crate::resource::{BackendResourceClient, ProfileSourceArchiveCache};
@@ -33,7 +32,7 @@ use async_trait::async_trait;
 use manifest::paths;
 use protocol::{Method, Segment, WorkerStatus};
 use session_store::FsStore;
-use session_store::{CombinedStore, FsWorkerStore, Store, WorkerMetadataStore};
+use session_store::{CombinedStore, FsWorkerStore};
 use tokio::runtime::Runtime;
 #[cfg(feature = "ws-server")]
 use tokio::sync::broadcast;
@@ -47,6 +46,42 @@ use worker::{
 
 const DEFAULT_BACKEND_ID: &str = "worker-crate";
 const RUNTIME_TASK_TIMEOUT: Duration = Duration::from_secs(10);
+static NEXT_RUNTIME_ARTIFACT_ROOT: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone)]
+enum RuntimeArtifactRoot {
+    Owned(Arc<OwnedRuntimeArtifactRoot>),
+    External(PathBuf),
+}
+
+impl RuntimeArtifactRoot {
+    fn owned() -> Self {
+        let sequence = NEXT_RUNTIME_ARTIFACT_ROOT.fetch_add(1, Ordering::Relaxed);
+        Self::Owned(Arc::new(OwnedRuntimeArtifactRoot {
+            path: std::env::temp_dir().join(format!(
+                "yoi-worker-runtime-artifacts-{}-{sequence}",
+                std::process::id()
+            )),
+        }))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        match self {
+            Self::Owned(root) => &root.path,
+            Self::External(path) => path,
+        }
+    }
+}
+
+struct OwnedRuntimeArtifactRoot {
+    path: PathBuf,
+}
+
+impl Drop for OwnedRuntimeArtifactRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
 
 /// Factory seam used by [`WorkerRuntimeExecutionBackend`] to construct a real
 /// controller-backed Worker for a Runtime catalog entry.
@@ -61,16 +96,6 @@ pub trait RuntimeWorkerFactory: Send + Sync + 'static {
         &self,
         request: WorkerExecutionRestoreRequest,
     ) -> Result<WorkerHandle, String>;
-
-    async fn dry_restore_controller(
-        &self,
-        _request: WorkerExecutionRestoreDryRequest,
-    ) -> WorkerRestoreDryCheck {
-        WorkerRestoreDryCheck::unavailable(
-            "restore_dry_check_unsupported",
-            "runtime worker factory does not support side-effect-free restore validation",
-        )
-    }
 }
 
 /// Production factory that resolves a normal Worker profile and spawns it under
@@ -81,7 +106,7 @@ pub struct ProfileRuntimeWorkerFactory {
     store_dir: Option<PathBuf>,
     worker_metadata_dir: Option<PathBuf>,
     profile: Option<String>,
-    runtime_base_dir: Option<PathBuf>,
+    runtime_base_dir: RuntimeArtifactRoot,
     resource_client: Option<Arc<dyn BackendResourceClient>>,
     profile_archive_cache: Arc<ProfileSourceArchiveCache>,
 }
@@ -94,7 +119,7 @@ impl ProfileRuntimeWorkerFactory {
             store_dir: None,
             worker_metadata_dir: None,
             profile: None,
-            runtime_base_dir: None,
+            runtime_base_dir: RuntimeArtifactRoot::owned(),
             resource_client: None,
             profile_archive_cache: Arc::new(ProfileSourceArchiveCache::default()),
         }
@@ -118,7 +143,7 @@ impl ProfileRuntimeWorkerFactory {
     }
 
     pub fn with_runtime_base_dir(mut self, runtime_base_dir: impl Into<PathBuf>) -> Self {
-        self.runtime_base_dir = Some(runtime_base_dir.into());
+        self.runtime_base_dir = RuntimeArtifactRoot::External(runtime_base_dir.into());
         self
     }
 
@@ -146,10 +171,7 @@ impl ProfileRuntimeWorkerFactory {
     }
 
     fn runtime_base_dir(&self) -> Result<PathBuf, String> {
-        self.runtime_base_dir
-            .clone()
-            .or_else(|| worker::runtime::dir::default_base().ok())
-            .ok_or_else(|| "could not resolve worker runtime directory".to_string())
+        Ok(self.runtime_base_dir.path().to_path_buf())
     }
 
     fn runtime_worker_name_for_ref(worker_ref: &crate::identity::WorkerRef) -> String {
@@ -339,52 +361,6 @@ async fn fetch_profile_source_archive_http(
     )
 }
 
-impl ProfileRuntimeWorkerFactory {
-    async fn try_dry_restore_controller(
-        &self,
-        request: WorkerExecutionRestoreDryRequest,
-    ) -> Result<(), String> {
-        let WorkerExecutionRestoreDryRequest { worker_ref, .. } = request;
-        let store_dir = self.store_dir()?;
-        let session_store = FsStore::new(&store_dir).map_err(|err| {
-            format!(
-                "failed to initialize session store at {}: {err}",
-                store_dir.display()
-            )
-        })?;
-        let worker_metadata_dir = self.worker_metadata_dir(&store_dir);
-        let worker_metadata_store = FsWorkerStore::new(&worker_metadata_dir).map_err(|err| {
-            format!(
-                "failed to initialize worker metadata store at {}: {err}",
-                worker_metadata_dir.display()
-            )
-        })?;
-        let worker_name = Self::runtime_worker_name_for_ref(&worker_ref);
-        let active_segment = worker_metadata_store
-            .read_by_name(&worker_name)
-            .map_err(|err| format!("failed to read Worker metadata for {worker_name}: {err}"))?
-            .ok_or_else(|| format!("missing Worker metadata for {worker_name}"))?
-            .active
-            .ok_or_else(|| format!("Worker metadata for {worker_name} has no active segment"))?;
-        let active_segment_id = active_segment
-            .segment_id
-            .ok_or_else(|| format!("Worker metadata for {worker_name} has no active segment id"))?;
-        let raw_entries = session_store
-            .read_all(active_segment.session_id, active_segment_id)
-            .map_err(|err| {
-                format!(
-                    "failed to read active segment {} for session {}: {err}",
-                    active_segment_id, active_segment.session_id
-                )
-            })?;
-        let state = session_store::collect_state(&raw_entries);
-        if state.entries_count == 0 {
-            return Err(format!("active segment {active_segment_id} is empty"));
-        }
-        Ok(())
-    }
-}
-
 #[async_trait]
 impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
     async fn spawn_controller(
@@ -462,20 +438,10 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         .map_err(|err| format!("failed to create Worker from profile: {err}"))?;
 
         let runtime_base = self.runtime_base_dir()?;
-        let (handle, _shutdown_rx) = WorkerController::spawn(worker, &runtime_base)
+        let (handle, _shutdown_rx) = WorkerController::spawn_runtime_managed(worker, &runtime_base)
             .await
             .map_err(|err| format!("failed to spawn Worker controller: {err}"))?;
         Ok(handle)
-    }
-
-    async fn dry_restore_controller(
-        &self,
-        request: WorkerExecutionRestoreDryRequest,
-    ) -> WorkerRestoreDryCheck {
-        match self.try_dry_restore_controller(request).await {
-            Ok(()) => WorkerRestoreDryCheck::valid("restore dry-check succeeded"),
-            Err(message) => WorkerRestoreDryCheck::invalid("restore_dry_check_failed", message),
-        }
     }
 
     async fn restore_controller(
@@ -557,7 +523,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         };
 
         let runtime_base = self.runtime_base_dir()?;
-        let (handle, _shutdown_rx) = WorkerController::spawn(worker, &runtime_base)
+        let (handle, _shutdown_rx) = WorkerController::spawn_runtime_managed(worker, &runtime_base)
             .await
             .map_err(|err| format!("failed to spawn restored Worker controller: {err}"))?;
         Ok(handle)
@@ -968,80 +934,11 @@ where
         )
     }
 
-    fn dry_restore_worker(
-        &self,
-        mut request: WorkerExecutionRestoreDryRequest,
-    ) -> WorkerRestoreDryCheck {
-        let working_directory = match request.previous_execution.working_directory.clone() {
-            Some(status) => {
-                let Some(materializer) = self.working_directory_materializer.as_ref() else {
-                    return WorkerRestoreDryCheck::invalid(
-                        "restore_dry_check_failed",
-                        "persisted worker has a working directory binding, but no materializer is configured for this runtime backend",
-                    );
-                };
-                let relative_cwd = request
-                    .request
-                    .working_directory
-                    .as_ref()
-                    .and_then(|working_directory| working_directory.relative_cwd.as_deref());
-                match materializer
-                    .bind_working_directory(&status.summary.working_directory_id, relative_cwd)
-                {
-                    Ok(binding) => Some(binding),
-                    Err(error) => {
-                        return WorkerRestoreDryCheck::invalid(
-                            "restore_dry_check_failed",
-                            error.to_string(),
-                        );
-                    }
-                }
-            }
-            None if request.request.working_directory_request.is_some() => {
-                return WorkerRestoreDryCheck::invalid(
-                    "restore_dry_check_failed",
-                    "persisted worker requested a working directory, but no persisted working directory binding is available to restore",
-                );
-            }
-            None if request.request.working_directory.is_some() => {
-                let Some(materializer) = self.working_directory_materializer.as_ref() else {
-                    return WorkerRestoreDryCheck::invalid(
-                        "restore_dry_check_failed",
-                        "persisted worker has a working directory claim, but no materializer is configured for this runtime backend",
-                    );
-                };
-                let working_directory =
-                    request.request.working_directory.as_ref().expect("checked");
-                match materializer.bind_working_directory(
-                    &working_directory.working_directory_id,
-                    working_directory.relative_cwd.as_deref(),
-                ) {
-                    Ok(binding) => Some(binding),
-                    Err(error) => {
-                        return WorkerRestoreDryCheck::invalid(
-                            "restore_dry_check_failed",
-                            error.to_string(),
-                        );
-                    }
-                }
-            }
-            None => None,
-        };
-        request.working_directory = working_directory;
-        let factory = self.factory.clone();
-        self.run_on_adapter_runtime(
-            async move { Ok(factory.dry_restore_controller(request).await) },
-        )
-        .unwrap_or_else(|message| {
-            WorkerRestoreDryCheck::unavailable("restore_dry_check_unavailable", message)
-        })
-    }
-
     fn restore_worker(
         &self,
         mut request: WorkerExecutionRestoreRequest,
     ) -> WorkerExecutionSpawnResult {
-        let working_directory = match request.previous_execution.working_directory.clone() {
+        let working_directory = match request.previous_working_directory.clone() {
             Some(status) => {
                 let Some(materializer) = self.working_directory_materializer.as_ref() else {
                     return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::rejected(
@@ -1341,6 +1238,7 @@ mod tests {
     use llm_engine::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
     use llm_engine::llm_client::{ClientError, LlmClient, Request};
     use manifest::{Scope, WorkerManifest};
+    use session_store::WorkerMetadataStore;
 
     #[derive(Clone)]
     struct MockClient {
@@ -1462,9 +1360,10 @@ mod tests {
             )
             .await
             .map_err(|err| err.to_string())?;
-            let (handle, _shutdown_rx) = WorkerController::spawn(worker, &self.runtime_base)
-                .await
-                .map_err(|err| err.to_string())?;
+            let (handle, _shutdown_rx) =
+                WorkerController::spawn_runtime_managed(worker, &self.runtime_base)
+                    .await
+                    .map_err(|err| err.to_string())?;
             Ok(handle)
         }
         async fn restore_controller(
@@ -1690,60 +1589,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dry_restore_validates_saved_worker_state_without_profile_source_resolution() {
-        let root = tempfile::tempdir().unwrap();
-        let store_dir = root.path().join("sessions");
-        let worker_metadata_dir = root.path().join("workers");
-        let worker_ref = WorkerRef::new(crate::identity::WorkerId::new(1));
-        let worker_name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&worker_ref);
-        let session_id = session_store::new_session_id();
-        let segment_id = session_store::new_segment_id();
-        FsStore::new(&store_dir)
-            .unwrap()
-            .create_segment(
-                session_id,
-                segment_id,
-                &[session_store::LogEntry::Invoke {
-                    ts: 1,
-                    trigger: protocol::InvokeKind::UserSend,
-                }],
-            )
-            .unwrap();
-        FsWorkerStore::new(&worker_metadata_dir)
-            .unwrap()
-            .set_active(
-                &worker_name,
-                Some(session_store::WorkerActiveSegmentRef::active_segment(
-                    session_id, segment_id,
-                )),
-                None,
-            )
-            .unwrap();
-
-        let request = create_request("restore");
-        let result = ProfileRuntimeWorkerFactory::new(root.path())
-            .with_store_dir(&store_dir)
-            .with_worker_metadata_dir(&worker_metadata_dir)
-            .dry_restore_controller(WorkerExecutionRestoreDryRequest {
-                worker_ref,
-                request,
-                previous_execution: crate::execution::WorkerExecutionStatus::alive(
-                    WorkerExecutionRunState::Idle,
-                ),
-                working_directory: None,
-                config_bundle: None,
-            })
-            .await;
-
-        assert_eq!(
-            result.status,
-            crate::execution::WorkerRestoreDryCheckStatus::Valid,
-            "{}",
-            result.message
-        );
-    }
-
-    #[tokio::test]
     async fn restore_pending_worker_uses_saved_manifest_snapshot() {
         let root = tempfile::tempdir().unwrap();
         let store_dir = root.path().join("sessions");
@@ -1793,9 +1638,7 @@ mod tests {
                 worker_ref: worker_ref.clone(),
                 request,
                 context: test_execution_context(worker_ref),
-                previous_execution: crate::execution::WorkerExecutionStatus::alive(
-                    WorkerExecutionRunState::Idle,
-                ),
+                previous_working_directory: None,
                 working_directory: None,
                 config_bundle: None,
             })
@@ -1948,7 +1791,7 @@ mod tests {
             );
         }
 
-        assert!(detail.execution.working_directory.is_some());
+        assert!(detail.working_directory.is_some());
         let cwds = observed_cwds.lock().unwrap();
         assert_eq!(cwds.len(), 1);
         let cwd = &cwds[0];
@@ -1991,7 +1834,6 @@ mod tests {
         request.working_directory_request = Some(working_directory_request(repo.path()));
         let detail = runtime.create_worker(request).unwrap();
         let workdir_id = detail
-            .execution
             .working_directory
             .as_ref()
             .unwrap()

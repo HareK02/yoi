@@ -179,6 +179,7 @@ pub fn runtime_http_router_with_auth(
             get(get_worker).delete(delete_worker),
         )
         .route("/v1/workers/{worker_id}/input", post(send_worker_input))
+        .route("/v1/workers/{worker_id}/restore", post(restore_worker))
         .route(
             "/v1/workers/{worker_id}/completions",
             post(worker_completions),
@@ -467,6 +468,18 @@ async fn create_worker(
     Ok(Json(RuntimeHttpWorkerResponse { worker }))
 }
 
+async fn restore_worker(
+    State(state): State<RuntimeHttpState>,
+    Path(worker_id): Path<String>,
+) -> RestResult<RuntimeHttpWorkerResponse> {
+    let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
+    let worker = state
+        .runtime
+        .restore_worker(&worker_ref)
+        .map_err(RuntimeHttpRestError::runtime)?;
+    Ok(Json(RuntimeHttpWorkerResponse { worker }))
+}
+
 #[cfg(feature = "ws-server")]
 async fn worker_protocol_ws(
     State(state): State<RuntimeHttpState>,
@@ -512,6 +525,22 @@ async fn worker_protocol_ws_session(
             }
         },
     };
+    // Observation cursors are process-local. After a Runtime restart (or
+    // bounded backlog expiry), the current Worker snapshot is authoritative
+    // and replay resumes from the current in-memory tail.
+    if runtime
+        .read_worker_observation_events(&worker_ref, cursor)
+        .is_err()
+    {
+        cursor = match runtime.worker_observation_cursor_now(&worker_ref) {
+            Ok(cursor) => cursor,
+            Err(error) => {
+                let event = protocol_error_event(error.to_string());
+                let _ = send_protocol_event(&mut socket, &event).await;
+                return;
+            }
+        };
+    }
 
     let mut receiver = match runtime.subscribe_worker_observation() {
         Ok(receiver) => receiver,
@@ -806,7 +835,7 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     if path.starts_with("/v1/config-bundles") || path.starts_with("/v1/working-directories") {
         return Some("workers:create");
     }
-    if path.ends_with("/input") {
+    if path.ends_with("/input") || path.ends_with("/restore") {
         return Some("workers:input");
     }
     if path.ends_with("/stop") || path.ends_with("/cancel") {
@@ -948,14 +977,14 @@ pub enum RuntimeHttpServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{ConfigBundleRef, ProfileSelector};
+    use crate::catalog::{ConfigBundleRef, ProfileSelector, WorkerStatus};
     use crate::config_bundle::{
         ConfigBundle, ConfigBundleMetadata, ConfigBundleProvenance, ConfigProfileDescriptor,
     };
     use crate::execution::{
         WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation,
-        WorkerExecutionResult, WorkerExecutionRunState, WorkerExecutionSpawnRequest,
-        WorkerExecutionSpawnResult,
+        WorkerExecutionRestoreRequest, WorkerExecutionResult, WorkerExecutionRunState,
+        WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
     };
     use crate::management::RuntimeOptions;
     use axum::body::to_bytes;
@@ -1035,6 +1064,17 @@ mod tests {
                     .working_directory
                     .as_ref()
                     .map(|binding| binding.status()),
+            }
+        }
+
+        fn restore_worker(
+            &self,
+            request: WorkerExecutionRestoreRequest,
+        ) -> WorkerExecutionSpawnResult {
+            WorkerExecutionSpawnResult::Connected {
+                handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
+                run_state: WorkerExecutionRunState::Idle,
+                working_directory: request.previous_working_directory,
             }
         }
 
@@ -1155,6 +1195,24 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let stop: RuntimeHttpWorkerLifecycleResponse = read_json(response).await;
         assert_eq!(stop.ack.worker_ref, created.worker.worker_ref);
+
+        let response = empty_request(
+            app.clone(),
+            Method::POST,
+            &format!("/v1/workers/{}/restore", created.worker.worker_id),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let restored: RuntimeHttpWorkerResponse = read_json(response).await;
+        assert_eq!(restored.worker.status, WorkerStatus::Idle);
+
+        let response = empty_request(
+            app.clone(),
+            Method::POST,
+            &format!("/v1/workers/{}/stop", created.worker.worker_id),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
 
         let response = empty_request(
             app.clone(),

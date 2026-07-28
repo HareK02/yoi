@@ -11,13 +11,12 @@ use crate::config_bundle::{
 use crate::diagnostics::DiagnosticSeverity;
 use crate::diagnostics::RuntimeDiagnostic;
 use crate::error::RuntimeError;
+use crate::execution::WorkerExecutionRestoreRequest;
 use crate::execution::{
-    WorkerExecutionBackend, WorkerExecutionBackendKind, WorkerExecutionBackendRef,
-    WorkerExecutionBindingIdentity, WorkerExecutionHandle, WorkerExecutionOperation,
-    WorkerExecutionResult, WorkerExecutionRunState, WorkerExecutionSpawnRequest,
-    WorkerExecutionSpawnResult, WorkerExecutionStatus, WorkerRestoreDryCheckStatus,
+    WorkerExecutionBackend, WorkerExecutionBackendRef, WorkerExecutionHandle,
+    WorkerExecutionOperation, WorkerExecutionResult, WorkerExecutionRunState,
+    WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
 };
-use crate::execution::{WorkerExecutionRestoreDryRequest, WorkerExecutionRestoreRequest};
 #[cfg(feature = "fs-store")]
 use crate::fs_store::{
     FsRuntimeStore, FsRuntimeStoreOptions, PersistedRuntimeState, PersistedWorkerRecord,
@@ -131,7 +130,9 @@ impl Runtime {
         let mut cancelled_worker_count = 0;
         for worker in state.workers.values() {
             match worker.status {
-                WorkerStatus::Running => active_worker_count += 1,
+                WorkerStatus::Idle | WorkerStatus::Running | WorkerStatus::Paused => {
+                    active_worker_count += 1;
+                }
                 WorkerStatus::Stopped => stopped_worker_count += 1,
                 WorkerStatus::Cancelled => cancelled_worker_count += 1,
             }
@@ -354,9 +355,9 @@ impl Runtime {
             let record = WorkerRecord {
                 worker_ref: worker_ref.clone(),
                 worker_id: worker_id.clone(),
-                status: WorkerStatus::Running,
+                status: WorkerStatus::Stopped,
                 request: request.clone(),
-                execution: WorkerExecutionStatus::stopped(),
+                working_directory: None,
                 execution_handle: None,
                 last_event_id: event_id,
             };
@@ -433,16 +434,7 @@ impl Runtime {
     /// List Workers known to this Runtime.
     pub fn list_workers(&self) -> Result<Vec<WorkerSummary>, RuntimeError> {
         let state = self.lock()?;
-        let mut summaries = Vec::with_capacity(state.workers.len());
-        for worker in state.workers.values() {
-            let restore_dry_check = corrupted_worker_restore_dry_check(
-                state.execution_backend.as_ref(),
-                worker,
-                &state.config_bundles,
-            );
-            summaries.push(worker.summary_with_restore_dry_check(restore_dry_check));
-        }
-        Ok(summaries)
+        Ok(state.workers.values().map(WorkerRecord::summary).collect())
     }
 
     /// Fetch Worker detail.  The supplied [`WorkerRef`] must match this Runtime.
@@ -452,16 +444,105 @@ impl Runtime {
         Ok(worker.detail())
     }
 
+    /// Attach a live execution to a persisted Worker definition.
+    ///
+    /// Current liveness is never read from disk. If a handle is already
+    /// present this is idempotent; otherwise the configured backend is tried.
+    pub fn restore_worker(&self, worker_ref: &WorkerRef) -> Result<WorkerDetail, RuntimeError> {
+        let (backend, request) = {
+            let state = self.lock()?;
+            state.ensure_running()?;
+            let worker = state.worker(worker_ref)?;
+            if worker.execution_handle.is_some() {
+                return Ok(worker.detail());
+            }
+            if worker.status == WorkerStatus::Cancelled {
+                return Err(RuntimeError::InvalidRequest(format!(
+                    "worker {} is cancelled",
+                    worker_ref.worker_id
+                )));
+            }
+            let backend = state.execution_backend.clone().ok_or_else(|| {
+                RuntimeError::WorkerExecutionUnavailable {
+                    worker_id: worker_ref.worker_id.clone(),
+                    message: "runtime has no execution backend".to_string(),
+                }
+            })?;
+            let config_bundle = worker
+                .request
+                .config_bundle
+                .as_ref()
+                .and_then(|bundle_ref| state.config_bundles.get(&bundle_ref.id))
+                .cloned();
+            let request = WorkerExecutionRestoreRequest {
+                worker_ref: worker_ref.clone(),
+                request: worker.request.clone(),
+                context: self.execution_context(worker_ref.clone()),
+                previous_working_directory: worker.working_directory.clone(),
+                working_directory: None,
+                config_bundle,
+            };
+            (backend, request)
+        };
+
+        match backend.restore_worker(request) {
+            WorkerExecutionSpawnResult::Connected {
+                handle,
+                run_state,
+                working_directory,
+            } => {
+                self.commit_restored_worker_execution(
+                    worker_ref,
+                    handle,
+                    run_state,
+                    working_directory,
+                )?;
+                self.worker_detail(worker_ref)
+            }
+            WorkerExecutionSpawnResult::Rejected(result)
+            | WorkerExecutionSpawnResult::Errored(result) => {
+                #[cfg(feature = "fs-store")]
+                {
+                    self.lock()?
+                        .record_restore_failure(worker_ref, result.clone())?;
+                }
+                Err(RuntimeError::WorkerExecutionRejected {
+                    worker_id: worker_ref.worker_id.clone(),
+                    operation: result.operation,
+                    outcome: result.outcome,
+                    message: result.message_or_default(),
+                    result,
+                })
+            }
+        }
+    }
+
+    fn ensure_worker_execution(&self, worker_ref: &WorkerRef) -> Result<(), RuntimeError> {
+        let has_handle = {
+            let state = self.lock()?;
+            state
+                .worker(worker_ref)?
+                .execution_handle
+                .as_ref()
+                .is_some()
+        };
+        if has_handle {
+            return Ok(());
+        }
+        self.restore_worker(worker_ref).map(|_| ())
+    }
+
     /// Accept input into a Worker.
     pub fn send_input(
         &self,
         worker_ref: &WorkerRef,
         input: WorkerInput,
     ) -> Result<WorkerInteractionAck, RuntimeError> {
+        validate_worker_input(&input)?;
+        self.ensure_worker_execution(worker_ref)?;
         let (backend, handle) = {
-            let mut state = self.lock()?;
+            let state = self.lock()?;
             state.ensure_running()?;
-            validate_worker_input(&input)?;
             state.ensure_worker_ref(worker_ref)?;
             let worker = state.worker(worker_ref)?;
             if !worker.status.is_active() {
@@ -475,17 +556,9 @@ impl Runtime {
             match (backend, handle) {
                 (Some(backend), Some(handle)) => (backend, handle),
                 _ => {
-                    let worker = state.worker_mut(worker_ref)?;
-                    worker.execution =
-                        if worker.execution.backend == WorkerExecutionBackendKind::Corrupted {
-                            worker.execution.clone()
-                        } else {
-                            WorkerExecutionStatus::stopped_from(worker.execution.clone())
-                        };
-                    state.persist_worker(&worker_ref.worker_id)?;
                     return Err(RuntimeError::WorkerExecutionUnavailable {
                         worker_id: worker_ref.worker_id.clone(),
-                        message: "worker has no execution backend".to_string(),
+                        message: "worker has no live execution handle".to_string(),
                     });
                 }
             }
@@ -512,27 +585,16 @@ impl Runtime {
         );
         let worker = state.worker_mut(worker_ref)?;
         worker.last_event_id = event_id;
-        worker.execution = WorkerExecutionStatus {
-            backend: WorkerExecutionBackendKind::Alive,
-            run_state: dispatch_result.run_state,
-            binding: worker.execution.binding.clone(),
-            working_directory: worker.execution.working_directory.clone(),
-            restore_dry_check: None,
-        };
-
+        worker.status = worker_status_from_run_state(dispatch_result.run_state);
         let status = worker.status;
         #[cfg(feature = "ws-server")]
-        let observation = {
+        {
             let payload = input_protocol_event(&input);
-            Some(state.push_worker_observation_event(worker_ref.clone(), payload))
-        };
+            state.push_worker_observation_event(worker_ref.clone(), payload);
+        }
         state.persist_runtime_snapshot()?;
         state.persist_worker(&worker_ref.worker_id)?;
         state.persist_event_by_id(event_id)?;
-        #[cfg(feature = "ws-server")]
-        if let Some(observation) = observation.as_ref() {
-            state.persist_worker_observation_event(observation)?;
-        }
 
         Ok(WorkerInteractionAck {
             worker_ref: worker_ref.clone(),
@@ -578,9 +640,14 @@ impl Runtime {
             let entries = self.worker_completions(worker_ref, kind, &prefix)?;
             return Ok(vec![Event::Completions { kind, entries }]);
         }
+        if matches!(&method, Method::Shutdown) {
+            self.stop_worker(worker_ref, Some("worker protocol shutdown".to_string()))?;
+            return Ok(Vec::new());
+        }
+        self.ensure_worker_execution(worker_ref)?;
 
         let (backend, handle) = {
-            let mut state = self.lock()?;
+            let state = self.lock()?;
             state.ensure_running()?;
             state.ensure_worker_ref(worker_ref)?;
             let worker = state.worker(worker_ref)?;
@@ -595,17 +662,9 @@ impl Runtime {
             match (backend, handle) {
                 (Some(backend), Some(handle)) => (backend, handle),
                 _ => {
-                    let worker = state.worker_mut(worker_ref)?;
-                    worker.execution =
-                        if worker.execution.backend == WorkerExecutionBackendKind::Corrupted {
-                            worker.execution.clone()
-                        } else {
-                            WorkerExecutionStatus::stopped_from(worker.execution.clone())
-                        };
-                    state.persist_worker(&worker_ref.worker_id)?;
                     return Err(RuntimeError::WorkerExecutionUnavailable {
                         worker_id: worker_ref.worker_id.clone(),
-                        message: "worker has no execution backend".to_string(),
+                        message: "worker has no live execution handle".to_string(),
                     });
                 }
             }
@@ -633,18 +692,14 @@ impl Runtime {
         handle: WorkerExecutionHandle,
         run_state: WorkerExecutionRunState,
         working_directory: Option<CatalogWorkingDirectoryStatus>,
-        result: WorkerExecutionResult,
+        _result: WorkerExecutionResult,
     ) -> Result<WorkerDetail, RuntimeError> {
         let mut state = self.lock()?;
         let detail = {
-            let binding = WorkerExecutionBindingIdentity::from_handle(&handle);
             let worker = state.worker_mut(worker_ref)?;
             worker.execution_handle = Some(handle);
-            let mut execution = WorkerExecutionStatus::alive(run_state).with_binding(binding);
-            if let Some(status) = working_directory {
-                execution = execution.with_working_directory(status);
-            }
-            worker.execution = execution.with_result(result);
+            worker.status = worker_status_from_run_state(run_state);
+            worker.working_directory = working_directory;
             worker.detail()
         };
         state.persist_runtime_snapshot()?;
@@ -670,14 +725,9 @@ impl Runtime {
     ) -> Result<(), RuntimeError> {
         let mut state = self.lock()?;
         let worker = state.worker_mut(worker_ref)?;
-        worker.execution = WorkerExecutionStatus {
-            backend: WorkerExecutionBackendKind::Alive,
-            run_state: result.run_state,
-            binding: worker.execution.binding.clone(),
-            working_directory: worker.execution.working_directory.clone(),
-            restore_dry_check: None,
-        };
-        state.persist_worker(&worker_ref.worker_id)?;
+        if result.is_accepted() {
+            worker.status = worker_status_from_run_state(result.run_state);
+        }
         Ok(())
     }
 
@@ -713,10 +763,8 @@ impl Runtime {
             | WorkerExecutionOperation::ProtocolMethod => return Ok(()),
         };
         if result.is_accepted() {
-            self.record_execution_result(worker_ref, result)?;
             return Ok(());
         }
-        self.record_execution_result(worker_ref, result.clone())?;
         Err(RuntimeError::WorkerExecutionRejected {
             worker_id: worker_ref.worker_id.clone(),
             operation: result.operation,
@@ -939,13 +987,8 @@ impl Runtime {
     ) -> Result<WorkerObservationEvent, RuntimeError> {
         let mut state = self.lock()?;
         state.ensure_worker_ref(worker_ref)?;
-        let execution_state_changed =
-            state.project_protocol_event_to_execution(worker_ref, &payload);
+        state.project_protocol_event_to_status(worker_ref, &payload);
         let event = state.push_worker_observation_event(worker_ref.clone(), payload);
-        if execution_state_changed {
-            state.persist_worker(&worker_ref.worker_id)?;
-        }
-        state.persist_worker_observation_event(&event)?;
         Ok(event)
     }
 
@@ -962,9 +1005,7 @@ impl Runtime {
     ) -> Result<(), RuntimeError> {
         let mut state = self.lock()?;
         state.ensure_worker_ref(worker_ref)?;
-        let event =
-            state.push_worker_observation_event(worker_ref.clone(), input_protocol_event(&input));
-        state.persist_worker_observation_event(&event)?;
+        state.push_worker_observation_event(worker_ref.clone(), input_protocol_event(&input));
         Ok(())
     }
 
@@ -1002,6 +1043,7 @@ impl Runtime {
         let event_id = state.push_event(Some(worker_ref.clone()), event_kind, reason);
         let worker = state.worker_mut(worker_ref)?;
         worker.status = status;
+        worker.execution_handle = None;
         worker.last_event_id = event_id;
         let status = worker.status;
         state.persist_runtime_snapshot()?;
@@ -1044,88 +1086,34 @@ impl Runtime {
         struct RestoreCandidate {
             worker_ref: WorkerRef,
             request: CreateWorkerRequest,
-            previous_execution: WorkerExecutionStatus,
+            previous_working_directory: Option<CatalogWorkingDirectoryStatus>,
             config_bundle: Option<ConfigBundle>,
         }
 
         let candidates = {
-            let mut state = self.lock()?;
-            let Some(backend) = state.execution_backend.clone() else {
-                let worker_ids: Vec<_> = state.workers.keys().cloned().collect();
-                for worker_id in worker_ids {
-                    let Some(worker) = state.workers.get(&worker_id) else {
-                        continue;
-                    };
-                    if worker.execution.backend != WorkerExecutionBackendKind::Alive {
-                        continue;
-                    }
-                    let worker_ref = worker.worker_ref.clone();
-                    let worker = state.worker_mut(&worker_ref)?;
-                    worker.execution =
-                        if worker.execution.backend == WorkerExecutionBackendKind::Corrupted {
-                            worker.execution.clone()
-                        } else {
-                            WorkerExecutionStatus::stopped_from(worker.execution.clone())
-                        };
-                    state.persist_worker(&worker_ref.worker_id)?;
-                }
+            let state = self.lock()?;
+            if state.execution_backend.is_none() {
                 return Ok(());
-            };
-            let backend_id = backend.backend_id().to_string();
-            let mut candidates = Vec::new();
-            let worker_ids: Vec<_> = state.workers.keys().cloned().collect();
-            for worker_id in worker_ids {
-                let Some(worker) = state.workers.get(&worker_id) else {
-                    continue;
-                };
-                if !worker.status.is_active()
-                    || worker.execution_handle.is_some()
-                    || !matches!(
-                        worker.execution.backend,
-                        WorkerExecutionBackendKind::Alive | WorkerExecutionBackendKind::Stopped
-                    )
-                    || worker
-                        .execution
-                        .binding
-                        .as_ref()
-                        .is_none_or(|binding| binding.backend_id != backend_id)
-                {
-                    continue;
-                }
-                if let Some(working_directory) = worker.execution.working_directory.as_ref() {
-                    if let Some(owner) = state.active_primary_worker_id_for_workdir_excluding(
-                        &working_directory.summary.working_directory_id,
-                        &worker.worker_id,
-                    ) {
-                        let worker_ref = worker.worker_ref.clone();
-                        let message = format!(
-                            "worker {} cannot restore working directory {} because active worker {} is already the primary assignment",
-                            worker.worker_id, working_directory.summary.working_directory_id, owner
-                        );
-                        state.record_restore_failure(
-                            &worker_ref,
-                            WorkerExecutionResult::rejected(
-                                WorkerExecutionOperation::Restore,
-                                message,
-                            ),
-                        )?;
-                        continue;
-                    }
-                }
-                let config_bundle = worker
-                    .request
-                    .config_bundle
-                    .as_ref()
-                    .and_then(|bundle_ref| state.config_bundles.get(&bundle_ref.id))
-                    .cloned();
-                candidates.push(RestoreCandidate {
-                    worker_ref: worker.worker_ref.clone(),
-                    request: worker.request.clone(),
-                    previous_execution: worker.execution.clone(),
-                    config_bundle,
-                });
             }
-            candidates
+            state
+                .workers
+                .values()
+                .filter(|worker| worker.execution_handle.is_none())
+                .map(|worker| {
+                    let config_bundle = worker
+                        .request
+                        .config_bundle
+                        .as_ref()
+                        .and_then(|bundle_ref| state.config_bundles.get(&bundle_ref.id))
+                        .cloned();
+                    RestoreCandidate {
+                        worker_ref: worker.worker_ref.clone(),
+                        request: worker.request.clone(),
+                        previous_working_directory: worker.working_directory.clone(),
+                        config_bundle,
+                    }
+                })
+                .collect::<Vec<_>>()
         };
 
         for candidate in candidates {
@@ -1136,43 +1124,13 @@ impl Runtime {
             let Some(backend) = backend else {
                 return Ok(());
             };
-            let dry_check = backend.dry_restore_worker(WorkerExecutionRestoreDryRequest {
-                worker_ref: candidate.worker_ref.clone(),
-                request: candidate.request.clone(),
-                previous_execution: candidate.previous_execution.clone(),
-                working_directory: None,
-                config_bundle: candidate.config_bundle.clone(),
-            });
-            match dry_check.status {
-                WorkerRestoreDryCheckStatus::Valid => {}
-                WorkerRestoreDryCheckStatus::Invalid => {
-                    let mut state = self.lock()?;
-                    state.record_restore_failure(
-                        &candidate.worker_ref,
-                        WorkerExecutionResult::errored(
-                            WorkerExecutionOperation::Restore,
-                            dry_check.message,
-                        ),
-                    )?;
-                    continue;
-                }
-                WorkerRestoreDryCheckStatus::Unavailable => {
-                    let mut state = self.lock()?;
-                    state.record_restore_unavailable(
-                        &candidate.worker_ref,
-                        candidate.previous_execution.clone(),
-                        dry_check.message,
-                    )?;
-                    continue;
-                }
-            }
             let request = WorkerExecutionRestoreRequest {
                 worker_ref: candidate.worker_ref.clone(),
                 request: candidate.request,
                 context: self.execution_context(candidate.worker_ref.clone()),
-                previous_execution: candidate.previous_execution,
+                previous_working_directory: candidate.previous_working_directory,
                 working_directory: None,
-                config_bundle: None,
+                config_bundle: candidate.config_bundle,
             };
             match backend.restore_worker(request) {
                 WorkerExecutionSpawnResult::Connected {
@@ -1195,7 +1153,6 @@ impl Runtime {
         Ok(())
     }
 
-    #[cfg(feature = "fs-store")]
     fn commit_restored_worker_execution(
         &self,
         worker_ref: &WorkerRef,
@@ -1212,13 +1169,9 @@ impl Runtime {
         );
         {
             let worker = state.worker_mut(worker_ref)?;
-            worker.execution_handle = Some(handle.clone());
-            let mut execution = WorkerExecutionStatus::alive(run_state)
-                .with_binding(WorkerExecutionBindingIdentity::from_handle(&handle));
-            if let Some(status) = working_directory {
-                execution = execution.with_working_directory(status);
-            }
-            worker.execution = execution;
+            worker.execution_handle = Some(handle);
+            worker.status = worker_status_from_run_state(run_state);
+            worker.working_directory = working_directory;
             worker.last_event_id = event_id;
         }
         state.persist_runtime_snapshot()?;
@@ -1327,51 +1280,22 @@ impl RuntimeState {
         store: FsRuntimeStore,
     ) -> Result<Self, RuntimeError> {
         let mut workers = BTreeMap::new();
-        let mut diagnostics = persisted.diagnostics;
-        let mut next_diagnostic_id = persisted.next_diagnostic_id;
+        let diagnostics = persisted.diagnostics;
+        let next_diagnostic_id = persisted.next_diagnostic_id;
         for (worker_id, worker) in persisted.workers {
-            let execution = if worker.execution.backend == WorkerExecutionBackendKind::Alive
-                && worker.execution.binding.is_none()
-            {
-                diagnostics.push(RuntimeDiagnostic {
-                    id: next_diagnostic_id,
-                    severity: DiagnosticSeverity::Error,
-                    code: "worker_execution_binding_missing".to_string(),
-                    message: format!(
-                        "worker {} was persisted as alive but has no execution binding identity",
-                        worker.worker_id
-                    ),
-                    worker_ref: Some(worker.worker_ref.clone()),
-                });
-                next_diagnostic_id += 1;
-                WorkerExecutionStatus::corrupted(worker.execution)
-            } else {
-                worker.execution
-            };
             workers.insert(
                 worker_id,
                 WorkerRecord {
                     worker_ref: worker.worker_ref,
                     worker_id: worker.worker_id,
-                    status: worker.status,
+                    status: WorkerStatus::Stopped,
                     request: worker.request,
-                    execution,
+                    working_directory: worker.working_directory,
                     execution_handle: None,
                     last_event_id: worker.last_event_id,
                 },
             );
         }
-
-        #[cfg(feature = "ws-server")]
-        let next_observation_sequence = persisted
-            .observation_events
-            .iter()
-            .map(|event| event.sequence)
-            .max()
-            .map(|sequence| sequence.saturating_add(1))
-            .unwrap_or(1);
-        #[cfg(feature = "ws-server")]
-        let observation_events = persisted.observation_events.into_iter().collect();
 
         Ok(Self {
             display_name: persisted.display_name,
@@ -1388,9 +1312,9 @@ impl RuntimeState {
             events: persisted.events,
             diagnostics,
             #[cfg(feature = "ws-server")]
-            next_observation_sequence,
+            next_observation_sequence: 1,
             #[cfg(feature = "ws-server")]
-            observation_events,
+            observation_events: VecDeque::new(),
             #[cfg(feature = "ws-server")]
             observation_tx: broadcast::channel(256).0,
         })
@@ -1412,8 +1336,6 @@ impl RuntimeState {
                 .collect(),
             config_bundles: self.config_bundles.clone(),
             events: self.events.clone(),
-            #[cfg(feature = "ws-server")]
-            observation_events: Vec::new(),
             diagnostics: self.diagnostics.clone(),
         }
     }
@@ -1470,25 +1392,6 @@ impl RuntimeState {
                 })?;
             store.append_event(event)?;
         }
-        Ok(())
-    }
-
-    #[cfg(all(feature = "fs-store", feature = "ws-server"))]
-    fn persist_worker_observation_event(
-        &self,
-        event: &WorkerObservationEvent,
-    ) -> Result<(), RuntimeError> {
-        if let Some(store) = self.fs_store() {
-            store.append_worker_observation_event(event)?;
-        }
-        Ok(())
-    }
-
-    #[cfg(all(not(feature = "fs-store"), feature = "ws-server"))]
-    fn persist_worker_observation_event(
-        &self,
-        _event: &WorkerObservationEvent,
-    ) -> Result<(), RuntimeError> {
         Ok(())
     }
 
@@ -1595,31 +1498,6 @@ impl RuntimeState {
     fn primary_worker_id_for_workdir(&self, working_directory_id: &str) -> Option<WorkerId> {
         self.workers.values().find_map(|worker| {
             if worker
-                .execution
-                .working_directory
-                .as_ref()
-                .is_some_and(|binding| binding.summary.working_directory_id == working_directory_id)
-                || requested_primary_workdir_id(&worker.request) == Some(working_directory_id)
-            {
-                Some(worker.worker_id)
-            } else {
-                None
-            }
-        })
-    }
-
-    #[cfg(feature = "fs-store")]
-    fn active_primary_worker_id_for_workdir_excluding(
-        &self,
-        working_directory_id: &str,
-        excluded_worker_id: &WorkerId,
-    ) -> Option<WorkerId> {
-        self.workers.values().find_map(|worker| {
-            if worker.worker_id == *excluded_worker_id || !worker.status.is_active() {
-                return None;
-            }
-            if worker
-                .execution
                 .working_directory
                 .as_ref()
                 .is_some_and(|binding| binding.summary.working_directory_id == working_directory_id)
@@ -1656,36 +1534,8 @@ impl RuntimeState {
         });
         let worker = self.worker_mut(worker_ref)?;
         worker.execution_handle = None;
-        worker.execution = WorkerExecutionStatus::corrupted(worker.execution.clone());
+        worker.status = WorkerStatus::Stopped;
         self.persist_runtime_snapshot()?;
-        self.persist_worker(&worker_ref.worker_id)?;
-        Ok(())
-    }
-
-    #[cfg(feature = "fs-store")]
-    fn record_restore_unavailable(
-        &mut self,
-        worker_ref: &WorkerRef,
-        previous_execution: WorkerExecutionStatus,
-        message: String,
-    ) -> Result<(), RuntimeError> {
-        let diagnostic_id = self.next_diagnostic_id;
-        self.next_diagnostic_id += 1;
-        self.diagnostics.push(RuntimeDiagnostic {
-            id: diagnostic_id,
-            severity: DiagnosticSeverity::Warning,
-            code: "worker_execution_restore_unavailable".to_string(),
-            message: format!(
-                "worker {} execution restore deferred: {message}",
-                worker_ref.worker_id
-            ),
-            worker_ref: Some(worker_ref.clone()),
-        });
-        let worker = self.worker_mut(worker_ref)?;
-        worker.execution_handle = None;
-        worker.execution = WorkerExecutionStatus::stopped_from(previous_execution);
-        self.persist_runtime_snapshot()?;
-        self.persist_worker(&worker_ref.worker_id)?;
         Ok(())
     }
 
@@ -1759,48 +1609,41 @@ impl RuntimeState {
     }
 
     #[cfg(feature = "ws-server")]
-    fn project_protocol_event_to_execution(
+    fn project_protocol_event_to_status(
         &mut self,
         worker_ref: &WorkerRef,
         event: &protocol::Event,
-    ) -> bool {
+    ) {
         let Some(worker) = self.workers.get_mut(&worker_ref.worker_id) else {
-            return false;
+            return;
         };
-        let status = &mut worker.execution;
-        let next_run_state = match event {
+        let next_status = match event {
             protocol::Event::Status {
                 status: protocol::WorkerStatus::Running,
-            } => Some(WorkerExecutionRunState::Busy),
+            } => Some(WorkerStatus::Running),
             protocol::Event::Status {
                 status: protocol::WorkerStatus::Idle,
-            } => Some(WorkerExecutionRunState::Idle),
+            } => Some(WorkerStatus::Idle),
             protocol::Event::Status {
                 status: protocol::WorkerStatus::Paused,
-            } => Some(WorkerExecutionRunState::Busy),
+            } => Some(WorkerStatus::Paused),
             protocol::Event::Snapshot { status, .. } => match status {
-                protocol::WorkerStatus::Running => Some(WorkerExecutionRunState::Busy),
-                protocol::WorkerStatus::Idle => Some(WorkerExecutionRunState::Idle),
-                protocol::WorkerStatus::Paused => Some(WorkerExecutionRunState::Busy),
+                protocol::WorkerStatus::Running => Some(WorkerStatus::Running),
+                protocol::WorkerStatus::Idle => Some(WorkerStatus::Idle),
+                protocol::WorkerStatus::Paused => Some(WorkerStatus::Paused),
             },
             protocol::Event::RunEnd { result } => match result {
                 protocol::RunResult::Finished | protocol::RunResult::RolledBack => {
-                    Some(WorkerExecutionRunState::Idle)
+                    Some(WorkerStatus::Idle)
                 }
-                protocol::RunResult::Paused => Some(WorkerExecutionRunState::Busy),
-                protocol::RunResult::LimitReached => Some(WorkerExecutionRunState::Errored),
+                protocol::RunResult::Paused => Some(WorkerStatus::Paused),
+                protocol::RunResult::LimitReached => Some(WorkerStatus::Idle),
             },
-            protocol::Event::Error { .. } => Some(WorkerExecutionRunState::Errored),
             _ => None,
         };
-        let Some(next_run_state) = next_run_state else {
-            return false;
-        };
-        if status.run_state == next_run_state {
-            return false;
+        if let Some(next_status) = next_status {
+            worker.status = next_status;
         }
-        status.run_state = next_run_state;
-        true
     }
 }
 
@@ -1810,55 +1653,18 @@ struct WorkerRecord {
     worker_id: WorkerId,
     status: WorkerStatus,
     request: CreateWorkerRequest,
-    execution: WorkerExecutionStatus,
+    working_directory: Option<CatalogWorkingDirectoryStatus>,
     execution_handle: Option<WorkerExecutionHandle>,
     last_event_id: u64,
 }
 
-fn corrupted_worker_restore_dry_check(
-    execution_backend: Option<&WorkerExecutionBackendRef>,
-    worker: &WorkerRecord,
-    config_bundles: &BTreeMap<String, ConfigBundle>,
-) -> Option<crate::execution::WorkerRestoreDryCheck> {
-    if worker.execution.backend != WorkerExecutionBackendKind::Corrupted {
-        return None;
-    }
-    let Some(execution_backend) = execution_backend else {
-        return Some(crate::execution::WorkerRestoreDryCheck::unavailable(
-            "restore_dry_check_backend_unavailable",
-            "execution backend is unavailable; restore dry-test was not run",
-        ));
-    };
-    let config_bundle = worker
-        .request
-        .config_bundle
-        .as_ref()
-        .and_then(|bundle_ref| config_bundles.get(&bundle_ref.id))
-        .cloned();
-    Some(
-        execution_backend.dry_restore_worker(WorkerExecutionRestoreDryRequest {
-            worker_ref: worker.worker_ref.clone(),
-            request: worker.request.clone(),
-            previous_execution: worker.execution.clone(),
-            working_directory: None,
-            config_bundle,
-        }),
-    )
-}
-
 impl WorkerRecord {
-    fn summary_with_restore_dry_check(
-        &self,
-        restore_dry_check: Option<crate::execution::WorkerRestoreDryCheck>,
-    ) -> WorkerSummary {
+    fn summary(&self) -> WorkerSummary {
         WorkerSummary {
             worker_ref: self.worker_ref.clone(),
             worker_id: self.worker_id,
             status: self.status,
-            execution: self
-                .execution
-                .clone()
-                .with_restore_dry_check(restore_dry_check),
+            working_directory: self.working_directory.clone(),
             profile: self.request.profile.clone(),
             display_name: self.request.display_name.clone(),
             profile_source: self.request.profile_source.reference(),
@@ -1872,7 +1678,7 @@ impl WorkerRecord {
             worker_ref: self.worker_ref.clone(),
             worker_id: self.worker_id,
             status: self.status,
-            execution: self.execution.clone(),
+            working_directory: self.working_directory.clone(),
             profile: self.request.profile.clone(),
             display_name: self.request.display_name.clone(),
             profile_source: self.request.profile_source.reference(),
@@ -1886,11 +1692,20 @@ impl WorkerRecord {
         PersistedWorkerRecord {
             worker_ref: self.worker_ref.clone(),
             worker_id: self.worker_id.clone(),
-            status: self.status,
             request: self.request.clone(),
-            execution: self.execution.clone(),
+            working_directory: self.working_directory.clone(),
             last_event_id: self.last_event_id,
         }
+    }
+}
+
+fn worker_status_from_run_state(run_state: WorkerExecutionRunState) -> WorkerStatus {
+    match run_state {
+        WorkerExecutionRunState::Idle => WorkerStatus::Idle,
+        WorkerExecutionRunState::Busy => WorkerStatus::Running,
+        WorkerExecutionRunState::Stopped
+        | WorkerExecutionRunState::Rejected
+        | WorkerExecutionRunState::Errored => WorkerStatus::Stopped,
     }
 }
 
@@ -1998,7 +1813,7 @@ mod tests {
     };
     use crate::execution::{
         WorkerExecutionBackend, WorkerExecutionContext, WorkerExecutionHandle,
-        WorkerExecutionRestoreDryRequest, WorkerExecutionRestoreRequest, WorkerExecutionRunState,
+        WorkerExecutionRestoreRequest, WorkerExecutionRunState,
     };
     use std::collections::BTreeMap;
     #[cfg(feature = "fs-store")]
@@ -2072,8 +1887,6 @@ mod tests {
         dispatch_result: Mutex<Option<WorkerExecutionResult>>,
         restore_result: Mutex<Option<WorkerExecutionSpawnResult>>,
         restore_count: Mutex<u64>,
-        dry_restore_result: Mutex<Option<crate::execution::WorkerRestoreDryCheck>>,
-        dry_restore_count: Mutex<u64>,
         contexts: Mutex<BTreeMap<WorkerId, WorkerExecutionContext>>,
         #[cfg(feature = "ws-server")]
         snapshots: Mutex<BTreeMap<WorkerId, protocol::Event>>,
@@ -2082,18 +1895,6 @@ mod tests {
     impl TestExecutionBackend {
         fn set_dispatch_result(&self, result: WorkerExecutionResult) {
             *self.dispatch_result.lock().unwrap() = Some(result);
-        }
-
-        fn set_dry_restore_result(&self, result: crate::execution::WorkerRestoreDryCheck) {
-            *self.dry_restore_result.lock().unwrap() = Some(result);
-        }
-
-        fn dry_restore_count(&self) -> u64 {
-            *self.dry_restore_count.lock().unwrap()
-        }
-
-        fn restore_count(&self) -> u64 {
-            *self.restore_count.lock().unwrap()
         }
 
         #[cfg(feature = "ws-server")]
@@ -2134,20 +1935,6 @@ mod tests {
                     .as_ref()
                     .map(|binding| binding.status()),
             }
-        }
-
-        fn dry_restore_worker(
-            &self,
-            _request: WorkerExecutionRestoreDryRequest,
-        ) -> crate::execution::WorkerRestoreDryCheck {
-            *self.dry_restore_count.lock().unwrap() += 1;
-            self.dry_restore_result
-                .lock()
-                .unwrap()
-                .clone()
-                .unwrap_or_else(|| {
-                    crate::execution::WorkerRestoreDryCheck::valid("test dry restore ok")
-                })
         }
 
         fn restore_worker(
@@ -2249,7 +2036,7 @@ mod tests {
         let runtime = runtime_with_backend();
         let detail = runtime.create_worker(task_request("implement v0")).unwrap();
 
-        assert_eq!(detail.status, WorkerStatus::Running);
+        assert_eq!(detail.status, WorkerStatus::Idle);
         assert_eq!(detail.config_bundle.as_ref().unwrap().id, "bundle-1");
 
         let list = runtime.list_workers().unwrap();
@@ -2260,35 +2047,6 @@ mod tests {
         let fetched = runtime.worker_detail(&detail.worker_ref).unwrap();
         assert_eq!(fetched.worker_id, detail.worker_id);
         assert_eq!(fetched.profile, detail.profile);
-    }
-
-    #[test]
-    fn list_corrupted_worker_runs_restore_dry_check_and_reports_error() {
-        let (runtime, backend) = runtime_and_backend();
-        let detail = runtime
-            .create_worker(task_request("restore dry-check"))
-            .unwrap();
-        backend.set_dry_restore_result(crate::execution::WorkerRestoreDryCheck::invalid(
-            "restore_dry_check_failed",
-            "missing Worker metadata for worker-1",
-        ));
-        {
-            let mut state = runtime.lock().unwrap();
-            let worker = state.worker_mut(&detail.worker_ref).unwrap();
-            worker.execution = WorkerExecutionStatus::corrupted(worker.execution.clone());
-        }
-
-        let list = runtime.list_workers().unwrap();
-
-        assert_eq!(backend.dry_restore_count(), 1);
-        let dry_check = list[0].execution.restore_dry_check.as_ref().unwrap();
-        assert_eq!(
-            dry_check.status,
-            crate::execution::WorkerRestoreDryCheckStatus::Invalid
-        );
-        assert_eq!(dry_check.code, "restore_dry_check_failed");
-        assert!(dry_check.message.contains("missing Worker metadata"));
-        assert_eq!(backend.restore_count(), 0);
     }
 
     #[test]
@@ -2415,7 +2173,7 @@ mod tests {
             }
         ));
         let refreshed = runtime.worker_detail(&detail.worker_ref).unwrap();
-        assert_eq!(refreshed.execution.run_state, WorkerExecutionRunState::Busy);
+        assert_eq!(refreshed.status, WorkerStatus::Idle);
         #[cfg(feature = "ws-server")]
         assert!(
             runtime
@@ -2541,7 +2299,53 @@ mod tests {
         ));
         assert_eq!(
             runtime.worker_detail(&detail.worker_ref).unwrap().status,
-            WorkerStatus::Running
+            WorkerStatus::Idle
+        );
+    }
+
+    #[test]
+    fn protocol_shutdown_transitions_worker_to_stopped() {
+        let runtime = runtime_with_backend();
+        let detail = runtime
+            .create_worker(task_request("shutdown from client"))
+            .unwrap();
+
+        runtime
+            .send_protocol_method(&detail.worker_ref, Method::Shutdown)
+            .unwrap();
+
+        assert_eq!(
+            runtime.worker_detail(&detail.worker_ref).unwrap().status,
+            WorkerStatus::Stopped
+        );
+        let events = runtime
+            .read_events(&runtime.event_cursor_from_start().unwrap(), 16)
+            .unwrap()
+            .events;
+        assert!(events.iter().any(|event| {
+            event.kind == RuntimeEventKind::WorkerStopped
+                && event.worker_ref.as_ref() == Some(&detail.worker_ref)
+        }));
+    }
+
+    #[test]
+    fn input_restores_stopped_worker_without_persisted_connection_state() {
+        let (runtime, backend) = runtime_and_backend();
+        let detail = runtime
+            .create_worker(task_request("restore on input"))
+            .unwrap();
+        runtime
+            .send_protocol_method(&detail.worker_ref, Method::Shutdown)
+            .unwrap();
+
+        runtime
+            .send_input(&detail.worker_ref, WorkerInput::user("wake up"))
+            .unwrap();
+
+        assert_eq!(*backend.restore_count.lock().unwrap(), 1);
+        assert_eq!(
+            runtime.worker_detail(&detail.worker_ref).unwrap().status,
+            WorkerStatus::Idle
         );
     }
 
@@ -2765,7 +2569,7 @@ mod tests {
 
     #[cfg(feature = "fs-store")]
     #[test]
-    fn fs_store_restores_workers_events_and_protocol_observations() {
+    fn fs_store_restores_workers_and_events_but_not_protocol_observations() {
         let root = fs_store_root("restore");
         let runtime = Runtime::with_fs_store_and_execution_backend(
             crate::fs_store::FsRuntimeStoreOptions {
@@ -2794,6 +2598,17 @@ mod tests {
         runtime
             .stop_worker(&worker.worker_ref, Some("finished".to_string()))
             .unwrap();
+        let worker_store_dir = root.join("workers").join(worker.worker_id.to_string());
+        let worker_snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(worker_store_dir.join("worker.json")).unwrap())
+                .unwrap();
+        assert!(worker_snapshot.get("status").is_none());
+        assert!(worker_snapshot.get("execution").is_none());
+        std::fs::write(
+            worker_store_dir.join("observations.jsonl"),
+            b"{\"legacy\":true}\n",
+        )
+        .unwrap();
         let store = runtime_store(&runtime);
         drop(runtime);
 
@@ -2805,32 +2620,13 @@ mod tests {
         .unwrap();
         let restored_worker = restored.worker_detail(&worker.worker_ref).unwrap();
         assert_eq!(restored_worker.status, WorkerStatus::Stopped);
-        assert_eq!(
-            restored_worker.execution.backend,
-            WorkerExecutionBackendKind::Stopped
-        );
-        assert_eq!(
-            restored_worker
-                .execution
-                .binding
-                .as_ref()
-                .map(|binding| binding.backend_id.as_str()),
-            Some("test-execution-backend")
-        );
+        assert!(!worker_store_dir.join("observations.jsonl").exists());
         #[cfg(feature = "ws-server")]
         {
             let observations = restored
                 .read_worker_observation_events(&worker.worker_ref, WorkerObservationCursor::zero())
                 .unwrap();
-            assert_eq!(observations.len(), 2);
-            assert!(matches!(
-                observations[0].payload,
-                protocol::Event::UserMessage { .. }
-            ));
-            assert!(matches!(
-                observations[1].payload,
-                protocol::Event::SystemItem { .. }
-            ));
+            assert!(observations.is_empty());
         }
 
         let cursor = restored.event_cursor_from_start().unwrap();
@@ -2852,12 +2648,12 @@ mod tests {
                     },
                 )
                 .unwrap();
-            assert_eq!(observation.sequence, 3);
+            assert_eq!(observation.sequence, 1);
             let observations = restored
                 .read_worker_observation_events(&worker.worker_ref, WorkerObservationCursor::zero())
                 .unwrap();
-            assert_eq!(observations.len(), 3);
-            assert_eq!(observations[2].cursor, observation.cursor);
+            assert_eq!(observations.len(), 1);
+            assert_eq!(observations[0].cursor, observation.cursor);
         }
 
         let _ = std::fs::remove_dir_all(root);
@@ -2889,10 +2685,7 @@ mod tests {
         })
         .unwrap();
         let stopped_worker = backendless.worker_detail(&worker.worker_ref).unwrap();
-        assert_eq!(
-            stopped_worker.execution.backend,
-            WorkerExecutionBackendKind::Stopped
-        );
+        assert_eq!(stopped_worker.status, WorkerStatus::Stopped);
         drop(backendless);
 
         let restoring_backend = Arc::new(TestExecutionBackend::default());
@@ -2908,12 +2701,7 @@ mod tests {
 
         assert_eq!(*restoring_backend.restore_count.lock().unwrap(), 1);
         let restored_worker = restored.worker_detail(&worker.worker_ref).unwrap();
-        assert_eq!(restored_worker.status, WorkerStatus::Running);
-        assert_eq!(
-            restored_worker.execution.backend,
-            WorkerExecutionBackendKind::Alive
-        );
-        assert!(restored_worker.execution.binding.is_some());
+        assert_eq!(restored_worker.status, WorkerStatus::Idle);
         restored
             .send_input(&worker.worker_ref, WorkerInput::user("after restart"))
             .unwrap();
@@ -2935,64 +2723,7 @@ mod tests {
 
     #[cfg(feature = "fs-store")]
     #[test]
-    fn fs_store_marks_worker_corrupted_when_restore_dry_check_fails() {
-        let root = fs_store_root("execution-dry-restore-failed");
-        let runtime = Runtime::with_fs_store_and_execution_backend(
-            crate::fs_store::FsRuntimeStoreOptions {
-                root: root.clone(),
-                display_name: None,
-                limits: RuntimeLimits::default(),
-            },
-            Arc::new(TestExecutionBackend::default()),
-        )
-        .unwrap();
-        runtime.store_config_bundle(test_bundle()).unwrap();
-        let worker = runtime
-            .create_worker(task_request("dry restore failure"))
-            .unwrap();
-        drop(runtime);
-
-        let restoring_backend = Arc::new(TestExecutionBackend::default());
-        restoring_backend.set_dry_restore_result(crate::execution::WorkerRestoreDryCheck::invalid(
-            "restore_dry_check_failed",
-            "missing Worker metadata for dry restore failure",
-        ));
-        let restored = Runtime::with_fs_store_and_execution_backend(
-            crate::fs_store::FsRuntimeStoreOptions {
-                root: root.clone(),
-                display_name: None,
-                limits: RuntimeLimits::default(),
-            },
-            restoring_backend.clone(),
-        )
-        .unwrap();
-
-        assert_eq!(restoring_backend.dry_restore_count(), 1);
-        assert_eq!(restoring_backend.restore_count(), 0);
-        let restored_worker = restored.worker_detail(&worker.worker_ref).unwrap();
-        assert_eq!(restored_worker.status, WorkerStatus::Running);
-        assert_eq!(
-            restored_worker.execution.backend,
-            WorkerExecutionBackendKind::Corrupted
-        );
-        assert!(
-            restored
-                .diagnostics()
-                .unwrap()
-                .iter()
-                .any(
-                    |diagnostic| diagnostic.code == "worker_execution_restore_failed"
-                        && diagnostic.message.contains("missing Worker metadata")
-                        && diagnostic.worker_ref.as_ref() == Some(&worker.worker_ref)
-                )
-        );
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[cfg(feature = "fs-store")]
-    #[test]
-    fn fs_store_marks_worker_corrupted_when_execution_restore_fails() {
+    fn fs_store_stops_worker_and_reports_when_execution_restore_fails() {
         let root = fs_store_root("execution-restore-failed");
         let runtime = Runtime::with_fs_store_and_execution_backend(
             crate::fs_store::FsRuntimeStoreOptions {
@@ -3026,11 +2757,7 @@ mod tests {
 
         assert_eq!(*restoring_backend.restore_count.lock().unwrap(), 1);
         let restored_worker = restored.worker_detail(&worker.worker_ref).unwrap();
-        assert_eq!(restored_worker.status, WorkerStatus::Running);
-        assert_eq!(
-            restored_worker.execution.backend,
-            WorkerExecutionBackendKind::Corrupted
-        );
+        assert_eq!(restored_worker.status, WorkerStatus::Stopped);
         assert!(
             restored
                 .diagnostics()
@@ -3047,10 +2774,7 @@ mod tests {
                 WorkerInput::user("after failed restore"),
             )
             .unwrap_err();
-        assert!(matches!(
-            err,
-            RuntimeError::WorkerExecutionUnavailable { .. }
-        ));
+        assert!(matches!(err, RuntimeError::WorkerExecutionRejected { .. }));
 
         let _ = std::fs::remove_dir_all(root);
     }

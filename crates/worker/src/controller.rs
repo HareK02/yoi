@@ -193,8 +193,36 @@ pub struct WorkerController;
 
 impl WorkerController {
     pub async fn spawn<C, St>(
+        worker: Worker<C, St>,
+        runtime_base: &Path,
+    ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
+    where
+        C: LlmClient + Clone + 'static,
+        St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+    {
+        Self::spawn_inner(worker, runtime_base, false).await
+    }
+
+    /// Spawn a Worker owned by `worker-runtime`.
+    ///
+    /// The controller still uses an ephemeral directory for Unix sockets and
+    /// tool spill artifacts, but does not write legacy pid/status/manifest
+    /// liveness projections.
+    pub async fn spawn_runtime_managed<C, St>(
+        worker: Worker<C, St>,
+        runtime_base: &Path,
+    ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
+    where
+        C: LlmClient + Clone + 'static,
+        St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+    {
+        Self::spawn_inner(worker, runtime_base, true).await
+    }
+
+    async fn spawn_inner<C, St>(
         mut worker: Worker<C, St>,
         runtime_base: &Path,
+        runtime_managed: bool,
     ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
     where
         C: LlmClient + Clone + 'static,
@@ -214,8 +242,11 @@ impl WorkerController {
         // the spawn-tool factories need its socket path, and before the
         // initial status/history writes consume the greeting we build
         // after registration is complete.
-        let runtime_dir =
-            Arc::new(RuntimeDir::create(runtime_base, &worker.manifest().worker.name).await?);
+        let runtime_dir = Arc::new(if runtime_managed {
+            RuntimeDir::create_transient(runtime_base, &worker.manifest().worker.name).await?
+        } else {
+            RuntimeDir::create(runtime_base, &worker.manifest().worker.name).await?
+        });
 
         let spawner_name = worker.manifest().worker.name.clone();
         let self_parent_socket = worker.callback_socket().cloned();

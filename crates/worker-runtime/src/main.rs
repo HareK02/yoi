@@ -82,8 +82,7 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
     let fs_paths = config.resolved_fs_paths();
     let mut factory = ProfileRuntimeWorkerFactory::new(fs_paths.worker_dir.join("worker-root"))
         .with_store_dir(fs_paths.worker_dir.join("sessions"))
-        .with_worker_metadata_dir(fs_paths.worker_dir.join("metadata"))
-        .with_runtime_base_dir(fs_paths.worker_dir.join("runtime"));
+        .with_worker_metadata_dir(fs_paths.worker_dir.join("metadata"));
     if let Some(endpoint) = config.backend_resource_endpoint.clone() {
         factory = factory.with_resource_client(Arc::new(
             worker_runtime::resource::HttpBackendResourceClient::new(
