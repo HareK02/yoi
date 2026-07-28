@@ -168,6 +168,23 @@ pub struct BackendWorkerSummary {
     pub diagnostics: Vec<BackendDiagnostic>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct BackendWorkerRestoreResult {
+    pub state: String,
+    #[serde(default)]
+    pub worker: Option<BackendWorkerSummary>,
+    #[serde(default)]
+    pub diagnostics: Vec<BackendDiagnostic>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct BackendWorkerRestoreResponse {
+    pub workspace_id: String,
+    pub runtime_id: String,
+    pub worker_id: String,
+    pub result: BackendWorkerRestoreResult,
+}
+
 #[derive(Debug)]
 pub struct BackendRuntimeClient {
     target: BackendRuntimeTarget,
@@ -264,6 +281,44 @@ pub async fn list_backend_workers(
         source: "backend_runtime_worker_summary".to_string(),
         diagnostics,
     })
+}
+
+pub async fn list_backend_stopped_workers(
+    target: &BackendRuntimeListTarget,
+) -> Result<BackendRuntimeListResponse<BackendWorkerSummary>, BackendRuntimeClientError> {
+    validate_list_target(target)?;
+    let Some(runtime_id) = target.runtime_id.as_deref() else {
+        return Err(BackendRuntimeClientError::InvalidTarget(
+            "stopped worker listing requires a runtime id".to_string(),
+        ));
+    };
+    let http = reqwest::Client::new();
+    let path = backend_runtime_workers_path(target.workspace_id.as_deref(), runtime_id);
+    let url = join_base_and_path(&target.base_url, &format!("{path}?status=stopped"));
+    Ok(http
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<BackendRuntimeListResponse<BackendWorkerSummary>>()
+        .await?)
+}
+
+pub async fn restore_backend_worker(
+    target: &BackendRuntimeTarget,
+) -> Result<BackendWorkerRestoreResponse, BackendRuntimeClientError> {
+    validate_target(target)?;
+    let http = reqwest::Client::new();
+    let path = backend_runtime_worker_restore_path(None, &target.runtime_id, &target.worker_id);
+    let url = join_base_and_path(&target.base_url, &path);
+    Ok(http
+        .post(url)
+        .json(&serde_json::json!({}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<BackendWorkerRestoreResponse>()
+        .await?)
 }
 
 impl BackendRuntimeClient {
@@ -479,6 +534,26 @@ fn backend_runtime_workers_path(workspace_id: Option<&str>, runtime_id: &str) ->
     }
 }
 
+fn backend_runtime_worker_restore_path(
+    workspace_id: Option<&str>,
+    runtime_id: &str,
+    worker_id: &str,
+) -> String {
+    match workspace_id {
+        Some(workspace_id) => format!(
+            "/api/w/{}/runtimes/{}/workers/{}/restore",
+            path_segment_encode(workspace_id),
+            path_segment_encode(runtime_id),
+            path_segment_encode(worker_id)
+        ),
+        None => format!(
+            "/api/runtimes/{}/workers/{}/restore",
+            path_segment_encode(runtime_id),
+            path_segment_encode(worker_id)
+        ),
+    }
+}
+
 fn protocol_ws_url(target: &BackendRuntimeTarget) -> String {
     let path = format!(
         "/api/runtimes/{}/workers/{}/protocol/ws",
@@ -540,6 +615,23 @@ mod tests {
         assert_eq!(
             protocol_ws_url(&target),
             "ws://127.0.0.1:8787/api/runtimes/runtime%2Fone/workers/worker%20one/protocol/ws"
+        );
+    }
+
+    #[test]
+    fn workers_path_can_be_workspace_scoped_for_status_queries() {
+        let path = backend_runtime_workers_path(Some("team main"), "runtime/one");
+        assert_eq!(
+            format!("{path}?status=stopped"),
+            "/api/w/team%20main/runtimes/runtime%2Fone/workers?status=stopped"
+        );
+    }
+
+    #[test]
+    fn restore_worker_path_uses_backend_runtime_worker_identity() {
+        assert_eq!(
+            backend_runtime_worker_restore_path(None, "runtime/one", "worker one"),
+            "/api/runtimes/runtime%2Fone/workers/worker%20one/restore"
         );
     }
 }

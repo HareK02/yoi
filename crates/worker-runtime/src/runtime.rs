@@ -7,9 +7,7 @@ use crate::config_bundle::{
     ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary, validate_config_bundle,
     validate_config_bundle_ref,
 };
-#[cfg(feature = "fs-store")]
-use crate::diagnostics::DiagnosticSeverity;
-use crate::diagnostics::RuntimeDiagnostic;
+use crate::diagnostics::{DiagnosticSeverity, RuntimeDiagnostic};
 use crate::error::RuntimeError;
 use crate::execution::WorkerExecutionRestoreRequest;
 use crate::execution::{
@@ -435,6 +433,17 @@ impl Runtime {
     pub fn list_workers(&self) -> Result<Vec<WorkerSummary>, RuntimeError> {
         let state = self.lock()?;
         Ok(state.workers.values().map(WorkerRecord::summary).collect())
+    }
+
+    /// List stopped Workers known to this Runtime.
+    pub fn list_stopped_workers(&self) -> Result<Vec<WorkerSummary>, RuntimeError> {
+        let state = self.lock()?;
+        Ok(state
+            .workers
+            .values()
+            .filter(|worker| worker.status == WorkerStatus::Stopped)
+            .map(WorkerRecord::summary)
+            .collect())
     }
 
     /// Fetch Worker detail.  The supplied [`WorkerRef`] must match this Runtime.
@@ -2047,6 +2056,24 @@ mod tests {
         let fetched = runtime.worker_detail(&detail.worker_ref).unwrap();
         assert_eq!(fetched.worker_id, detail.worker_id);
         assert_eq!(fetched.profile, detail.profile);
+    }
+
+    #[test]
+    fn stopped_worker_list_excludes_alive_and_cancelled_workers() {
+        let runtime = runtime_with_backend();
+        let alive = runtime.create_worker(task_request("alive")).unwrap();
+        let stopped = runtime.create_worker(task_request("stopped")).unwrap();
+        let cancelled = runtime.create_worker(task_request("cancelled")).unwrap();
+
+        runtime.stop_worker(&stopped.worker_ref, None).unwrap();
+        runtime.cancel_worker(&cancelled.worker_ref, None).unwrap();
+
+        let candidates = runtime.list_stopped_workers().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].worker_ref, stopped.worker_ref);
+        assert_eq!(candidates[0].status, WorkerStatus::Stopped);
+        assert_ne!(candidates[0].worker_ref, alive.worker_ref);
+        assert_ne!(candidates[0].worker_ref, cancelled.worker_ref);
     }
 
     #[test]

@@ -234,6 +234,17 @@ struct RuntimeHttpConfigBundleAvailabilityQuery {
     digest: String,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+struct RuntimeHttpWorkersQuery {
+    status: Option<RuntimeHttpWorkerStatusFilter>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RuntimeHttpWorkerStatusFilter {
+    Stopped,
+}
+
 /// `GET /v1/workers` response.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeHttpWorkersResponse {
@@ -372,11 +383,14 @@ async fn check_config_bundle(
 
 async fn list_workers(
     State(state): State<RuntimeHttpState>,
+    query: Result<Query<RuntimeHttpWorkersQuery>, QueryRejection>,
 ) -> RestResult<RuntimeHttpWorkersResponse> {
-    let workers = state
-        .runtime
-        .list_workers()
-        .map_err(RuntimeHttpRestError::runtime)?;
+    let Query(query) = query.map_err(RuntimeHttpRestError::query_rejection)?;
+    let workers = match query.status {
+        Some(RuntimeHttpWorkerStatusFilter::Stopped) => state.runtime.list_stopped_workers(),
+        None => state.runtime.list_workers(),
+    }
+    .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkersResponse { workers }))
 }
 

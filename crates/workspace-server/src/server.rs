@@ -56,9 +56,9 @@ use crate::hosts::{
     RuntimeRegistryError, RuntimeRegistryUnregisterResult, RuntimeSummary, WorkerCapabilitySummary,
     WorkerCompletionsRequest, WorkerCompletionsResult, WorkerImplementationSummary,
     WorkerInputKind, WorkerInputRequest, WorkerInputResult, WorkerLifecycleRequest,
-    WorkerLifecycleResult, WorkerOperationState, WorkerSpawnAcceptanceRequirement,
-    WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult, WorkerSpawnWorkingDirectoryRequest,
-    WorkerSummary, WorkerWorkspaceSummary,
+    WorkerLifecycleResult, WorkerOperationState, WorkerRestoreResult,
+    WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult,
+    WorkerSpawnWorkingDirectoryRequest, WorkerSummary, WorkerWorkspaceSummary,
 };
 use crate::identity::WorkspaceIdentity;
 use crate::memory_backend::execute_memory_backend_operation_with_authority;
@@ -669,8 +669,16 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             get(get_runtime_worker),
         )
         .route(
+            "/api/runtimes/{runtime_id}/workers/{worker_id}/restore",
+            post(restore_runtime_worker),
+        )
+        .route(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}",
             get(scoped_get_runtime_worker),
+        )
+        .route(
+            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/restore",
+            post(scoped_restore_runtime_worker),
         )
         .route(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/pin",
@@ -784,6 +792,25 @@ pub struct RuntimeListResponse<T> {
     pub items: Vec<T>,
     pub source: String,
     pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RuntimeWorkersQuery {
+    status: Option<RuntimeWorkersStatusFilter>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RuntimeWorkersStatusFilter {
+    Stopped,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WorkerRestoreResponse {
+    pub workspace_id: String,
+    pub runtime_id: String,
+    pub worker_id: String,
+    pub result: WorkerRestoreResult,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2733,9 +2760,10 @@ async fn scoped_post_companion_cancel(
 async fn scoped_list_runtime_workers(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimePath>,
+    Query(query): Query<RuntimeWorkersQuery>,
 ) -> ApiResult<Json<RuntimeListResponse<WorkerSummary>>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    list_runtime_workers(State(api), AxumPath(path.runtime_id)).await
+    list_runtime_workers(State(api), AxumPath(path.runtime_id), Query(query)).await
 }
 
 async fn scoped_create_runtime_worker(
@@ -2776,6 +2804,14 @@ async fn scoped_get_runtime_worker(
 ) -> ApiResult<Json<WorkerSummary>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     get_runtime_worker(State(api), AxumPath((path.runtime_id, path.worker_id))).await
+}
+
+async fn scoped_restore_runtime_worker(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
+) -> ApiResult<Json<WorkerRestoreResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    restore_runtime_worker(State(api), AxumPath((path.runtime_id, path.worker_id))).await
 }
 
 async fn scoped_pin_runtime_worker(
@@ -4322,6 +4358,39 @@ async fn get_runtime_worker(
     )))
 }
 
+async fn restore_runtime_worker(
+    State(api): State<WorkspaceApi>,
+    AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
+) -> ApiResult<Json<WorkerRestoreResponse>> {
+    let mut result = api
+        .runtime
+        .restore_worker(&runtime_id, &worker_id)
+        .map_err(|err| err.into_error())?;
+    if let Some(worker) = result.worker.as_ref() {
+        let record = sync_worker_observation(&api, worker)?;
+        let links = api.store.list_worker_workdir_links(
+            &api.config.workspace_id,
+            record.runtime_id.as_str(),
+            record.runtime_worker_id,
+        )?;
+        let workdirs = api
+            .store
+            .list_workdir_registry(&api.config.workspace_id, 500)?;
+        result.worker = Some(merge_worker_registry_projection(
+            Some(worker),
+            &record,
+            links,
+            &workdirs,
+        ));
+    }
+    Ok(Json(WorkerRestoreResponse {
+        workspace_id: api.workspace_id().to_string(),
+        runtime_id,
+        worker_id,
+        result,
+    }))
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RuntimeConfigBundleSyncRequest {
     pub bundle: ConfigBundle,
@@ -4378,17 +4447,28 @@ fn reject_no_workdir_for_non_embedded_runtime(
 async fn list_runtime_workers(
     State(api): State<WorkspaceApi>,
     AxumPath(runtime_id): AxumPath<String>,
+    Query(query): Query<RuntimeWorkersQuery>,
 ) -> ApiResult<Json<RuntimeListResponse<WorkerSummary>>> {
     let limit = api.config.max_records.min(200);
-    let worker_list = api
-        .runtime
-        .list_workers_for_runtime(&runtime_id, limit)
-        .map_err(|err| err.into_error())?;
+    let (worker_list, source) = match query.status {
+        Some(RuntimeWorkersStatusFilter::Stopped) => (
+            api.runtime
+                .list_stopped_workers_for_runtime(&runtime_id, limit)
+                .map_err(|err| err.into_error())?,
+            "runtime_registry_stopped",
+        ),
+        None => (
+            api.runtime
+                .list_workers_for_runtime(&runtime_id, limit)
+                .map_err(|err| err.into_error())?,
+            "runtime_registry",
+        ),
+    };
     Ok(Json(RuntimeListResponse {
         workspace_id: api.workspace_id().to_string(),
         limit,
         items: worker_list.items,
-        source: "runtime_registry".to_string(),
+        source: source.to_string(),
         diagnostics: worker_list.diagnostics,
     }))
 }
@@ -9322,6 +9402,22 @@ mod tests {
         assert_eq!(worker["worker_id"], worker_id);
         assert_eq!(worker["runtime_id"], "embedded-worker-runtime");
 
+        let stopped_workers = get_json(
+            app.clone(),
+            "/api/runtimes/embedded-worker-runtime/workers?status=stopped",
+        )
+        .await;
+        assert!(stopped_workers["items"].as_array().unwrap().is_empty());
+
+        let restored = post_json(
+            app.clone(),
+            &format!("/api/runtimes/embedded-worker-runtime/workers/{worker_id}/restore"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(restored["result"]["state"], "accepted");
+        assert_eq!(restored["result"]["worker"]["worker_id"], worker_id);
+
         let accepted = post_json(
             app.clone(),
             &format!("/api/runtimes/embedded-worker-runtime/workers/{worker_id}/input"),
@@ -9373,7 +9469,10 @@ mod tests {
             .unwrap();
         assert_eq!(wrong_runtime.status(), StatusCode::NOT_FOUND);
 
-        let projected = format!("{}{}{}{}", embedded_summary, spawned, worker, accepted);
+        let projected = format!(
+            "{}{}{}{}{}{}",
+            embedded_summary, spawned, worker, stopped_workers, restored, accepted
+        );
         for forbidden in [
             dir.path().to_string_lossy().as_ref(),
             "metadata.json",

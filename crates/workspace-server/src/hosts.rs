@@ -254,6 +254,14 @@ pub struct WorkerSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerRestoreResult {
+    pub state: WorkerOperationState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker: Option<WorkerSummary>,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeList<T> {
     pub items: Vec<T>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
@@ -576,7 +584,23 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
 
     fn list_workers(&self, limit: usize) -> RuntimeList<WorkerSummary>;
 
+    fn list_stopped_workers(&self, _limit: usize) -> RuntimeList<WorkerSummary> {
+        RuntimeList::new(Vec::new(), Vec::new())
+    }
+
     fn worker(&self, worker_id: &str) -> WorkerLookupResult;
+
+    fn restore_worker(&self, worker_id: &str) -> WorkerRestoreResult {
+        WorkerRestoreResult {
+            state: WorkerOperationState::Unsupported,
+            worker: None,
+            diagnostics: vec![diagnostic(
+                "worker_restore_unsupported",
+                DiagnosticSeverity::Info,
+                format!("runtime does not implement worker restore for `{worker_id}`"),
+            )],
+        }
+    }
 
     fn create_working_directory(
         &self,
@@ -955,6 +979,26 @@ impl RuntimeRegistry {
         Ok(RuntimeList::new(items, diagnostics))
     }
 
+    pub fn list_stopped_workers_for_runtime(
+        &self,
+        runtime_id: &str,
+        limit: usize,
+    ) -> Result<RuntimeList<WorkerSummary>, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        let worker_list = runtime.list_stopped_workers(limit);
+        let mut items: Vec<_> = worker_list
+            .items
+            .into_iter()
+            .filter(|worker| !is_retired_companion_worker(worker))
+            .take(limit)
+            .collect();
+        items.truncate(limit);
+        let mut diagnostics = worker_list.diagnostics;
+        diagnostics.truncate(MAX_DIAGNOSTICS);
+        Ok(RuntimeList::new(items, diagnostics))
+    }
+
     pub fn list_workers_for_host(
         &self,
         host_id: &str,
@@ -1013,6 +1057,17 @@ impl RuntimeRegistry {
             });
         }
         Ok(worker)
+    }
+
+    pub fn restore_worker(
+        &self,
+        runtime_id: &str,
+        worker_id: &str,
+    ) -> Result<WorkerRestoreResult, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        validate_backend_identifier("worker_id", worker_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        Ok(runtime.restore_worker(worker_id))
     }
 
     pub fn spawn_worker(
@@ -1501,6 +1556,23 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         }
     }
 
+    fn list_stopped_workers(&self, limit: usize) -> RuntimeList<WorkerSummary> {
+        if limit == 0 {
+            return RuntimeList::new(Vec::new(), Vec::new());
+        }
+        match self.runtime.list_stopped_workers() {
+            Ok(workers) => RuntimeList::new(
+                workers
+                    .into_iter()
+                    .take(limit)
+                    .map(|worker| self.map_worker_summary(worker))
+                    .collect(),
+                Vec::new(),
+            ),
+            Err(err) => RuntimeList::new(Vec::new(), vec![embedded_runtime_diagnostic(&err)]),
+        }
+    }
+
     fn worker(&self, worker_id: &str) -> WorkerLookupResult {
         let Some(worker_ref) = self.worker_ref(worker_id) else {
             return WorkerLookupResult {
@@ -1522,6 +1594,32 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 diagnostics: Vec::new(),
             },
             Err(err) => WorkerLookupResult {
+                worker: None,
+                diagnostics: vec![embedded_runtime_diagnostic(&err)],
+            },
+        }
+    }
+
+    fn restore_worker(&self, worker_id: &str) -> WorkerRestoreResult {
+        let Some(worker_ref) = self.worker_ref(worker_id) else {
+            return WorkerRestoreResult {
+                state: WorkerOperationState::Rejected,
+                worker: None,
+                diagnostics: vec![diagnostic(
+                    "embedded_worker_id_invalid",
+                    DiagnosticSeverity::Warning,
+                    "Worker id was empty and cannot be restored".to_string(),
+                )],
+            };
+        };
+        match self.runtime.restore_worker(&worker_ref) {
+            Ok(detail) => WorkerRestoreResult {
+                state: WorkerOperationState::Accepted,
+                worker: Some(self.map_worker_detail(detail)),
+                diagnostics: Vec::new(),
+            },
+            Err(err) => WorkerRestoreResult {
+                state: WorkerOperationState::Rejected,
                 worker: None,
                 diagnostics: vec![embedded_runtime_diagnostic(&err)],
             },
@@ -2446,6 +2544,24 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         }
     }
 
+    fn list_stopped_workers(&self, limit: usize) -> RuntimeList<WorkerSummary> {
+        if limit == 0 {
+            return RuntimeList::new(Vec::new(), Vec::new());
+        }
+        match self.get_json::<RuntimeHttpWorkersResponse>("/v1/workers?status=stopped") {
+            Ok(response) => RuntimeList::new(
+                response
+                    .workers
+                    .into_iter()
+                    .take(limit)
+                    .map(|worker| self.map_worker_summary(worker))
+                    .collect(),
+                Vec::new(),
+            ),
+            Err(diagnostic) => RuntimeList::new(Vec::new(), vec![diagnostic]),
+        }
+    }
+
     fn worker(&self, worker_id: &str) -> WorkerLookupResult {
         match self.get_json::<RuntimeHttpWorkerResponse>(&format!("/v1/workers/{worker_id}")) {
             Ok(response) => WorkerLookupResult {
@@ -2457,6 +2573,24 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => WorkerLookupResult {
+                worker: None,
+                diagnostics: vec![diagnostic],
+            },
+        }
+    }
+
+    fn restore_worker(&self, worker_id: &str) -> WorkerRestoreResult {
+        match self.post_json::<_, RuntimeHttpWorkerResponse>(
+            &format!("/v1/workers/{worker_id}/restore"),
+            &serde_json::json!({}),
+        ) {
+            Ok(response) => WorkerRestoreResult {
+                state: WorkerOperationState::Accepted,
+                worker: Some(self.map_worker_detail(response.worker)),
+                diagnostics: Vec::new(),
+            },
+            Err(diagnostic) => WorkerRestoreResult {
+                state: WorkerOperationState::Rejected,
                 worker: None,
                 diagnostics: vec![diagnostic],
             },

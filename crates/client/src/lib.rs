@@ -23,8 +23,10 @@ pub use backend_auth::{
 pub use backend_runtime::{
     BackendRuntimeClient, BackendRuntimeClientError, BackendRuntimeListResponse,
     BackendRuntimeListTarget, BackendRuntimeSummary, BackendRuntimeTarget,
-    BackendWorkerCapabilitySummary, BackendWorkerImplementationSummary, BackendWorkerSummary,
-    BackendWorkerWorkspaceSummary, BackendWorkingDirectorySummary, list_backend_workers,
+    BackendWorkerCapabilitySummary, BackendWorkerImplementationSummary,
+    BackendWorkerRestoreResponse, BackendWorkerRestoreResult, BackendWorkerSummary,
+    BackendWorkerWorkspaceSummary, BackendWorkingDirectorySummary, list_backend_stopped_workers,
+    list_backend_workers, restore_backend_worker,
 };
 pub use runtime_command::WorkerRuntimeCommand;
 pub use target::{
