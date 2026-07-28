@@ -6,7 +6,6 @@ Stay precise, edit code directly when asked, and avoid speculative refactoring.
 
 {% include "common/tool-usage" %}
 
-{% include "common/tickets" %}
 
 {% include "common/language" %}
 

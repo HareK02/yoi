@@ -669,6 +669,7 @@ impl FeatureModule for PluginToolFeature {
                 }),
                 tools: Vec::new(),
                 hooks: Vec::new(),
+                instructions: Vec::new(),
                 background_tasks: Vec::new(),
                 provides_services: Vec::new(),
                 requires_services: Vec::new(),

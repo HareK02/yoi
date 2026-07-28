@@ -25,6 +25,7 @@ use minijinja::value::Value;
 use minijinja::{Environment, ErrorKind, UndefinedBehavior};
 use thiserror::Error;
 
+use crate::feature::{FeatureInstructionDeclaration, dedupe_instruction_contributions};
 use crate::prompt::catalog::{CatalogError, PromptCatalog};
 use crate::prompt::loader::{LoaderError, PromptLoader, PromptRef};
 
@@ -120,11 +121,12 @@ impl SystemPromptTemplate {
             .map_err(|e| SystemPromptError::Render(e.to_string()))?;
         append_trailing_section(
             &body,
+            &self.env,
+            ctx,
             ctx.prompts,
             ctx.scope,
             ctx.agents_md.as_deref(),
             ctx.resident_summary,
-            ToolCapabilities::from_tool_names(&ctx.tool_names),
         )
     }
 }
@@ -149,6 +151,7 @@ pub struct SystemPromptContext<'a> {
     pub language: &'a str,
     pub scope: &'a Scope,
     pub tool_names: Vec<String>,
+    pub feature_instructions: &'a [FeatureInstructionDeclaration],
     /// Project-level instructions read from the nearest `AGENTS.md`.
     /// Not visible from the template; consumed by the trailing-section
     /// formatter in [`SystemPromptTemplate::render`].
@@ -209,7 +212,6 @@ struct ToolCapabilities {
     worker_stop: bool,
     worker_list: bool,
     worker_restore: bool,
-    ticket_any: bool,
 }
 
 impl ToolCapabilities {
@@ -226,7 +228,6 @@ impl ToolCapabilities {
                 "StopWorker" => capabilities.worker_stop = true,
                 "ListWorkers" => capabilities.worker_list = true,
                 "RestoreWorker" => capabilities.worker_restore = true,
-                name if name.starts_with("Ticket") => capabilities.ticket_any = true,
                 _ => {}
             }
         }
@@ -269,7 +270,6 @@ impl ToolCapabilities {
         );
         map.insert("memory_mutation", Value::from(self.memory_mutation()));
         map.insert("worker_management", Value::from(self.worker_management()));
-        map.insert("ticket_any", Value::from(self.ticket_any));
         Value::from(map)
     }
 }
@@ -282,11 +282,12 @@ impl ToolCapabilities {
 /// per-pack without touching this function.
 fn append_trailing_section(
     body: &str,
+    env: &Environment<'static>,
+    ctx: &SystemPromptContext<'_>,
     prompts: &PromptCatalog,
     scope: &Scope,
     agents_md: Option<&str>,
     resident_summary: Option<&str>,
-    tool_capabilities: ToolCapabilities,
 ) -> Result<String, SystemPromptError> {
     let mut out = String::with_capacity(body.len() + 256);
     out.push_str(body);
@@ -313,11 +314,19 @@ fn append_trailing_section(
             out.push('\n');
         }
     }
-    if tool_capabilities.worker_management() {
+    for instruction in dedupe_instruction_contributions(ctx.feature_instructions.iter().cloned()) {
         out.push('\n');
-        let section = prompts.worker_orchestration_guidance_section()?;
-        out.push_str(section.trim_end_matches(&['\n', ' '][..]));
-        out.push('\n');
+        let template = env
+            .get_template(&instruction.prompt_ref)
+            .map_err(|e| SystemPromptError::Render(e.to_string()))?;
+        let section = template
+            .render(ctx.to_minijinja_value())
+            .map_err(|e| SystemPromptError::Render(e.to_string()))?;
+        let section = section.trim_end_matches(&['\n', ' '][..]);
+        if !section.trim().is_empty() {
+            out.push_str(section);
+            out.push('\n');
+        }
     }
     // Canonicalise the tail so the emitted prompt has a single form
     // regardless of how individual templates chose to end.
@@ -369,6 +378,7 @@ mod tests {
             language: manifest::defaults::WORKER_LANGUAGE,
             scope,
             tool_names: tools,
+            feature_instructions: &[],
             agents_md,
             resident_summary: None,
             prompts: test_prompts(),
@@ -386,21 +396,9 @@ mod tests {
             language: manifest::defaults::WORKER_LANGUAGE,
             scope,
             tool_names: Vec::new(),
+            feature_instructions: &[],
             agents_md: None,
             resident_summary: summary,
-            prompts: test_prompts(),
-        }
-    }
-
-    fn ctx_with_resident<'a>(cwd: &'a Path, scope: &'a Scope) -> SystemPromptContext<'a> {
-        SystemPromptContext {
-            now: fixed_now(),
-            cwd: cwd.display().to_string().into(),
-            language: manifest::defaults::WORKER_LANGUAGE,
-            scope,
-            tool_names: Vec::new(),
-            agents_md: None,
-            resident_summary: None,
             prompts: test_prompts(),
         }
     }
@@ -412,25 +410,24 @@ mod tests {
             .collect()
     }
 
-    fn worker_management_tool_names() -> Vec<String> {
-        [
-            "SpawnWorker",
-            "SendToWorker",
-            "ReadWorkerOutput",
-            "StopWorker",
-            "ListWorkers",
-            "RestoreWorker",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect()
+    fn ticket_instruction() -> FeatureInstructionDeclaration {
+        FeatureInstructionDeclaration::new(
+            crate::feature::FeatureInstructionId::builtin("ticket.workflow"),
+            "$yoi/common/tickets",
+            crate::feature::FeatureInstructionOrder::WorkflowPolicy,
+            "Ticket workflow guidance",
+        )
+        .unwrap()
     }
 
-    fn ticket_tool_names() -> Vec<String> {
-        ["TicketList", "TicketShow", "TicketComment"]
-            .into_iter()
-            .map(String::from)
-            .collect()
+    fn worker_orchestration_instruction() -> FeatureInstructionDeclaration {
+        FeatureInstructionDeclaration::new(
+            crate::feature::FeatureInstructionId::builtin("worker.orchestration"),
+            "$yoi/common/worker-orchestration",
+            crate::feature::FeatureInstructionOrder::OrchestrationPolicy,
+            "Worker orchestration guidance",
+        )
+        .unwrap()
     }
 
     /// Lazily-initialised builtin catalog shared across system-prompt
@@ -499,19 +496,35 @@ mod tests {
     }
 
     #[test]
-    fn ticket_guidance_is_included_for_typed_ticket_tools() {
+    fn ticket_guidance_is_included_for_ticket_feature_instruction() {
         let loader = PromptLoader::builtins_only();
         let tmpl = SystemPromptTemplate::parse("$yoi/default", loader).unwrap();
         let dir = TempDir::new().unwrap();
         let scope = build_scope(dir.path());
-        let rendered = tmpl
-            .render(&ctx(dir.path(), &scope, ticket_tool_names(), None))
-            .unwrap();
+        let instructions = [ticket_instruction()];
+        let mut ctx = ctx(dir.path(), &scope, vec!["Read".into()], None);
+        ctx.feature_instructions = &instructions;
+        let rendered = tmpl.render(&ctx).unwrap();
 
         assert!(rendered.contains("## Ticket workflow"));
         assert!(rendered.contains("available typed Ticket tools as the authority"));
         assert!(rendered.contains("Do not invoke a Ticket CLI"));
         assert!(rendered.contains("Distinguish implementation completion"));
+    }
+
+    #[test]
+    fn feature_instruction_is_appended_even_when_template_does_not_include_it() {
+        let (_tmp, loader) = user_loader_with("minimal.md", "BASE ONLY");
+        let tmpl = SystemPromptTemplate::parse("$user/minimal", loader).unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let instructions = [ticket_instruction()];
+        let mut ctx = ctx(dir.path(), &scope, vec![], None);
+        ctx.feature_instructions = &instructions;
+        let rendered = tmpl.render(&ctx).unwrap();
+
+        assert!(rendered.starts_with("BASE ONLY"));
+        assert!(rendered.contains("## Ticket workflow"));
     }
 
     #[test]
@@ -534,17 +547,18 @@ mod tests {
     }
 
     #[test]
-    fn ticket_role_instructions_include_common_ticket_guidance() {
+    fn ticket_role_instructions_include_feature_ticket_guidance() {
         let loader = PromptLoader::builtins_only();
         let dir = TempDir::new().unwrap();
         let scope = build_scope(dir.path());
+        let instructions = [ticket_instruction()];
 
         for role in ["intake", "orchestrator", "coder", "reviewer"] {
             let tmpl =
                 SystemPromptTemplate::parse(&format!("$yoi/role/{role}"), loader.clone()).unwrap();
-            let rendered = tmpl
-                .render(&ctx(dir.path(), &scope, ticket_tool_names(), None))
-                .unwrap();
+            let mut ctx = ctx(dir.path(), &scope, vec!["Read".into()], None);
+            ctx.feature_instructions = &instructions;
+            let rendered = tmpl.render(&ctx).unwrap();
 
             assert!(rendered.contains("## Ticket workflow"), "role: {role}");
             assert!(
@@ -578,19 +592,15 @@ mod tests {
     }
 
     #[test]
-    fn worker_orchestration_guidance_is_included_for_worker_management_tools() {
+    fn worker_orchestration_guidance_is_included_for_feature_instruction() {
         let loader = PromptLoader::builtins_only();
         let tmpl = SystemPromptTemplate::parse("$yoi/default", loader).unwrap();
         let dir = TempDir::new().unwrap();
         let scope = build_scope(dir.path());
-        let rendered = tmpl
-            .render(&ctx(
-                dir.path(),
-                &scope,
-                worker_management_tool_names(),
-                None,
-            ))
-            .unwrap();
+        let instructions = [worker_orchestration_instruction()];
+        let mut ctx = ctx(dir.path(), &scope, vec!["Read".into()], None);
+        ctx.feature_instructions = &instructions;
+        let rendered = tmpl.render(&ctx).unwrap();
 
         assert!(rendered.contains("## Worker orchestration"));
         assert!(rendered.contains("spawned Worker notifications are background signals"));

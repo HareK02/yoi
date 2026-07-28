@@ -663,9 +663,13 @@ where
         }
     }
 
+    if feature_config.workers.enabled {
+        worker.register_worker_orchestration_instruction();
+    }
+
     {
         let workspace_client = worker.workspace_client().clone();
-        let worker = worker.engine_mut();
+        let engine = worker.engine_mut();
 
         // Objective tools expose read-only project Objective context through the
         // Backend Workspace API. Workers must not guess local `.yoi/objectives`
@@ -680,7 +684,7 @@ where
                     workspace_id.clone(),
                     base_url.clone(),
                 ) {
-                    worker.register_tool(definition);
+                    engine.register_tool(definition);
                 }
             } else {
                 return Err(std::io::Error::new(
@@ -718,7 +722,7 @@ where
                     )
                 };
                 for definition in definitions {
-                    worker.register_tool(definition);
+                    engine.register_tool(definition);
                 }
             } else {
                 return Err(std::io::Error::new(
@@ -755,7 +759,7 @@ where
                     "worker spawn tools require local Worker filesystem authority",
                 )
             })?;
-            worker.register_tool(spawn_worker_tool(
+            engine.register_tool(spawn_worker_tool(
                 spawner_name.clone(),
                 spawner_socket,
                 runtime_base.clone(),
@@ -767,9 +771,9 @@ where
                 scope_handle,
                 prompts,
             ));
-            worker.register_tool(send_to_worker_tool(spawned_registry.clone()));
-            worker.register_tool(read_worker_output_tool(spawned_registry.clone()));
-            worker.register_tool(stop_worker_tool(spawned_registry.clone()));
+            engine.register_tool(send_to_worker_tool(spawned_registry.clone()));
+            engine.register_tool(read_worker_output_tool(spawned_registry.clone()));
+            engine.register_tool(stop_worker_tool(spawned_registry.clone()));
             let discovery = WorkerDiscovery::new(
                 worker_metadata_store,
                 spawner_name,
@@ -777,9 +781,9 @@ where
                 Some(spawner_cwd),
                 spawned_registry,
             );
-            worker.register_tool(list_workers_tool(discovery.clone()));
-            worker.register_tool(restore_worker_tool(discovery.clone()));
-            worker.register_tool(send_to_peer_worker_tool(discovery));
+            engine.register_tool(list_workers_tool(discovery.clone()));
+            engine.register_tool(restore_worker_tool(discovery.clone()));
+            engine.register_tool(send_to_peer_worker_tool(discovery));
         }
     }
     let _feature_install_report = worker.install_features(feature_registry);

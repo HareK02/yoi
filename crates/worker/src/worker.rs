@@ -34,7 +34,10 @@ use crate::feature::builtin::memory::WorkspaceMemoryBackendError;
 use crate::feature::builtin::{
     SessionExploreFeature, SessionExploreState, TaskFeature, render_extract_input,
 };
-use crate::feature::{FeatureRegistryBuilder, FeatureRegistryInstallReport};
+use crate::feature::{
+    FeatureInstructionDeclaration, FeatureInstructionId, FeatureInstructionOrder,
+    FeatureRegistryBuilder, FeatureRegistryInstallReport, dedupe_instruction_contributions,
+};
 use crate::hook::{
     Hook, HookRegistryBuilder, OnAbort, OnPromptSubmit, OnTurnEnd, PostToolCall, PreLlmRequest,
     PreToolCall,
@@ -44,6 +47,18 @@ use crate::internal_worker::{InternalWorkerSpec, run_internal_worker};
 
 const COMPACTION_EXTENSION_DOMAIN: &str = "yoi.compaction";
 const COMPACTION_BLOCK_ID: &str = "compact";
+const WORKER_ORCHESTRATION_INSTRUCTION_ID: &str = "worker.orchestration";
+const WORKER_ORCHESTRATION_PROMPT_REF: &str = "$yoi/common/worker-orchestration";
+
+fn worker_orchestration_instruction() -> FeatureInstructionDeclaration {
+    FeatureInstructionDeclaration::new(
+        FeatureInstructionId::builtin(WORKER_ORCHESTRATION_INSTRUCTION_ID),
+        WORKER_ORCHESTRATION_PROMPT_REF,
+        FeatureInstructionOrder::OrchestrationPolicy,
+        "Worker orchestration guidance",
+    )
+    .expect("static Worker orchestration instruction declaration is valid")
+}
 use crate::ipc::alerter::Alerter;
 use crate::ipc::interceptor::WorkerInterceptor;
 use crate::ipc::notify_buffer::NotifyBuffer;
@@ -459,6 +474,10 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// `Some` until `ensure_system_prompt_materialized` renders it once,
     /// then `None` forever — including after compaction.
     system_prompt_template: Option<SystemPromptTemplate>,
+    /// Mandatory prompt sections contributed by enabled Worker features.
+    /// These are appended by Rust-owned prompt assembly so authored top-level
+    /// templates cannot accidentally omit feature workflow guidance.
+    feature_instructions: Vec<FeatureInstructionDeclaration>,
     /// User-facing notification sink attached by the Controller at
     /// spawn time. `None` in tests / direct `Worker::new` usage.
     alerter: Option<Alerter>,
@@ -604,6 +623,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
             tracker: None,
             task_feature: self.task_feature.clone(),
             system_prompt_template: None,
+            feature_instructions: self.feature_instructions.clone(),
             alerter: self.alerter.clone(),
             event_tx: self.event_tx.clone(),
             in_flight: self.in_flight.clone(),
@@ -797,6 +817,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             tracker: None,
             task_feature: TaskFeature::new(),
             system_prompt_template: None,
+            feature_instructions: Vec::new(),
             alerter: None,
             event_tx: None,
             in_flight: None,
@@ -828,6 +849,16 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// other callers that build a Worker without going through a manifest.
     pub fn set_system_prompt_template(&mut self, template: SystemPromptTemplate) {
         self.system_prompt_template = Some(template);
+    }
+
+    pub fn register_feature_instruction(&mut self, instruction: FeatureInstructionDeclaration) {
+        let mut instructions = self.feature_instructions.clone();
+        instructions.push(instruction);
+        self.feature_instructions = dedupe_instruction_contributions(instructions);
+    }
+
+    pub fn register_worker_orchestration_instruction(&mut self) {
+        self.register_feature_instruction(worker_orchestration_instruction());
     }
 
     /// Toggle all resident sections in the system prompt.
@@ -1022,7 +1053,11 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         registry: FeatureRegistryBuilder,
     ) -> FeatureRegistryInstallReport {
         let worker = self.engine.as_mut().expect("worker taken during run");
-        registry.install_into_engine(worker, &mut self.hook_builder)
+        let report = registry.install_into_engine(worker, &mut self.hook_builder);
+        for instruction in report.installed_instruction_contributions() {
+            self.register_feature_instruction(instruction);
+        }
+        report
     }
 
     /// Reference to the store.
@@ -1528,6 +1563,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             language: worker_language,
             scope: &scope_snapshot,
             tool_names,
+            feature_instructions: &self.feature_instructions,
             agents_md: agents_md_read.and_then(|read| read.body),
             resident_summary: resident_summary.as_deref(),
             prompts: &self.prompts,
@@ -3608,6 +3644,7 @@ where
             tracker: None,
             task_feature: TaskFeature::new(),
             system_prompt_template: common.system_prompt_template,
+            feature_instructions: common.feature_instructions,
             alerter: None,
             event_tx: None,
             in_flight: None,
@@ -3713,6 +3750,7 @@ where
             tracker: None,
             task_feature: TaskFeature::new(),
             system_prompt_template: common.system_prompt_template,
+            feature_instructions: common.feature_instructions,
             alerter: None,
             event_tx: None,
             in_flight: None,
@@ -4003,6 +4041,7 @@ where
             // Restore replays the saved system_prompt verbatim — no
             // template re-render on resume.
             system_prompt_template: None,
+            feature_instructions: common.feature_instructions,
             alerter: None,
             event_tx: None,
             in_flight: None,
@@ -4666,6 +4705,7 @@ struct WorkerCommon {
     client: Box<dyn LlmClient>,
     prompts: Arc<PromptCatalog>,
     system_prompt_template: Option<SystemPromptTemplate>,
+    feature_instructions: Vec<FeatureInstructionDeclaration>,
 }
 
 async fn restored_child_reachable(child: &WorkerSpawnedChild) -> bool {
@@ -4823,6 +4863,7 @@ fn prepare_worker_common_from_scope(
         client,
         prompts,
         system_prompt_template,
+        feature_instructions: Vec::new(),
     })
 }
 

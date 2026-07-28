@@ -19,13 +19,26 @@ use ticket::{
 
 use crate::feature::{
     FeatureDescriptor, FeatureDiagnostic, FeatureInstallContext, FeatureInstallError,
-    FeatureModule, ToolContribution, ToolDeclaration,
+    FeatureInstructionContribution, FeatureInstructionDeclaration, FeatureInstructionId,
+    FeatureInstructionOrder, FeatureModule, ToolContribution, ToolDeclaration,
 };
 
 const FEATURE_ID: &str = "ticket";
 const FEATURE_NAME: &str = "Ticket tools";
 const FEATURE_DESCRIPTION: &str = "Typed local Ticket work-item operations over a bounded backend root. \
 The tools operate through the ticket crate backend and do not grant generic filesystem write scope.";
+const TICKET_WORKFLOW_INSTRUCTION_ID: &str = "ticket.workflow";
+const TICKET_WORKFLOW_PROMPT_REF: &str = "$yoi/common/tickets";
+
+fn ticket_workflow_instruction() -> FeatureInstructionDeclaration {
+    FeatureInstructionDeclaration::new(
+        FeatureInstructionId::builtin(TICKET_WORKFLOW_INSTRUCTION_ID),
+        TICKET_WORKFLOW_PROMPT_REF,
+        FeatureInstructionOrder::WorkflowPolicy,
+        "Typed Ticket workflow guidance",
+    )
+    .expect("static Ticket workflow instruction declaration is valid")
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TicketFeatureAccess {
@@ -326,7 +339,8 @@ impl TicketFeature {
 impl FeatureModule for TicketFeature {
     fn descriptor(&self) -> FeatureDescriptor {
         let mut descriptor = FeatureDescriptor::builtin(FEATURE_ID, FEATURE_NAME)
-            .with_description(FEATURE_DESCRIPTION);
+            .with_description(FEATURE_DESCRIPTION)
+            .with_instruction(ticket_workflow_instruction());
         let enabled_tool_names = self.enabled_tool_names();
         for name in enabled_tool_names {
             descriptor = descriptor.with_tool(ToolDeclaration::new(
@@ -349,6 +363,11 @@ impl FeatureModule for TicketFeature {
         let Some(backend) = self.tool_backend(context) else {
             return Ok(());
         };
+        context
+            .instructions()
+            .register(FeatureInstructionContribution::new(
+                ticket_workflow_instruction(),
+            ))?;
         let allowed_tool_names = self.enabled_tool_names();
         let mut tools = context.tools();
         for definition in ticket_tools(backend) {

@@ -11,7 +11,7 @@
 //! [`crate::hook::HookRegistryBuilder`], and provider output is represented as
 //! ordinary feature reports/diagnostics instead of a separate authority layer.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -311,6 +311,83 @@ impl HookDeclaration {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct FeatureInstructionId(String);
+
+impl FeatureInstructionId {
+    pub fn new(value: impl Into<String>) -> Result<Self, FeatureInstallError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(FeatureInstallError::InvalidDescriptor(
+                "feature instruction id must not be empty".into(),
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn builtin(slug: impl AsRef<str>) -> Self {
+        Self(format!("builtin:{}", slug.as_ref()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for FeatureInstructionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeatureInstructionOrder {
+    OrchestrationPolicy,
+    WorkflowPolicy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeatureInstructionDeclaration {
+    pub id: FeatureInstructionId,
+    pub prompt_ref: String,
+    pub order: FeatureInstructionOrder,
+    pub description: String,
+}
+
+impl FeatureInstructionDeclaration {
+    pub fn new(
+        id: FeatureInstructionId,
+        prompt_ref: impl Into<String>,
+        order: FeatureInstructionOrder,
+        description: impl Into<String>,
+    ) -> Result<Self, FeatureInstallError> {
+        let prompt_ref = prompt_ref.into();
+        if prompt_ref.trim().is_empty() {
+            return Err(FeatureInstallError::InvalidDescriptor(
+                "feature instruction prompt_ref must not be empty".into(),
+            ));
+        }
+        Ok(Self {
+            id,
+            prompt_ref,
+            order,
+            description: description.into(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeatureInstructionContribution {
+    pub declaration: FeatureInstructionDeclaration,
+}
+
+impl FeatureInstructionContribution {
+    pub fn new(declaration: FeatureInstructionDeclaration) -> Self {
+        Self { declaration }
+    }
+}
+
 /// Background task lifecycle phase represented by this registry slice.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -485,6 +562,7 @@ pub struct FeatureDescriptor {
     pub description: String,
     pub tools: Vec<ToolDeclaration>,
     pub hooks: Vec<HookDeclaration>,
+    pub instructions: Vec<FeatureInstructionDeclaration>,
     pub background_tasks: Vec<BackgroundTaskDeclaration>,
     pub provides_services: Vec<ServiceDeclaration>,
     pub requires_services: Vec<ServiceRequirement>,
@@ -501,6 +579,7 @@ impl FeatureDescriptor {
             description: String::new(),
             tools: Vec::new(),
             hooks: Vec::new(),
+            instructions: Vec::new(),
             background_tasks: Vec::new(),
             provides_services: Vec::new(),
             requires_services: Vec::new(),
@@ -520,6 +599,11 @@ impl FeatureDescriptor {
 
     pub fn with_hook(mut self, hook: HookDeclaration) -> Self {
         self.hooks.push(hook);
+        self
+    }
+
+    pub fn with_instruction(mut self, instruction: FeatureInstructionDeclaration) -> Self {
+        self.instructions.push(instruction);
         self
     }
 
@@ -595,6 +679,7 @@ impl FeatureDiagnostic {
 pub enum FeatureContributionKind {
     Tool,
     Hook,
+    Instruction,
     BackgroundTask,
     Service,
     ProtocolProvider,
@@ -619,6 +704,7 @@ pub struct FeatureInstallReport {
     pub installed: bool,
     pub installed_tools: Vec<String>,
     pub installed_hooks: Vec<HookDeclaration>,
+    pub installed_instructions: Vec<FeatureInstructionDeclaration>,
     pub declared_background_tasks: Vec<BackgroundTaskDeclaration>,
     pub provided_services: Vec<ServiceDeclaration>,
     pub resolved_service_requirements: Vec<ServiceRequirement>,
@@ -635,6 +721,7 @@ impl FeatureInstallReport {
             installed: false,
             installed_tools: Vec::new(),
             installed_hooks: Vec::new(),
+            installed_instructions: Vec::new(),
             declared_background_tasks: Vec::new(),
             provided_services: Vec::new(),
             resolved_service_requirements: Vec::new(),
@@ -662,6 +749,7 @@ impl FeatureInstallReport {
 struct FeatureContributionDeclarations {
     tools: HashSet<String>,
     hooks: HashSet<(String, FeatureHookPoint)>,
+    instructions: HashSet<FeatureInstructionId>,
     background_tasks: HashSet<String>,
     provided_services: HashSet<(ServiceId, String)>,
     protocol_providers: HashSet<ProviderId>,
@@ -679,6 +767,11 @@ impl FeatureContributionDeclarations {
                 .hooks
                 .iter()
                 .map(|hook| (hook.name.clone(), hook.point.clone()))
+                .collect(),
+            instructions: descriptor
+                .instructions
+                .iter()
+                .map(|instruction| instruction.id.clone())
                 .collect(),
             background_tasks: descriptor
                 .background_tasks
@@ -705,6 +798,10 @@ impl FeatureContributionDeclarations {
     fn contains_hook(&self, declaration: &HookDeclaration) -> bool {
         self.hooks
             .contains(&(declaration.name.clone(), declaration.point.clone()))
+    }
+
+    fn contains_instruction(&self, declaration: &FeatureInstructionDeclaration) -> bool {
+        self.instructions.contains(&declaration.id)
     }
 
     fn contains_background_task(&self, declaration: &BackgroundTaskDeclaration) -> bool {
@@ -947,6 +1044,39 @@ impl HookContributionRegistrar<'_> {
     }
 }
 
+/// Prompt instruction registrar for mandatory feature guidance contributions.
+pub struct FeatureInstructionRegistrar<'a> {
+    feature_id: &'a FeatureId,
+    declarations: &'a FeatureContributionDeclarations,
+    report: &'a mut FeatureInstallReport,
+}
+
+impl FeatureInstructionRegistrar<'_> {
+    pub fn register(
+        &mut self,
+        contribution: FeatureInstructionContribution,
+    ) -> Result<(), FeatureInstallError> {
+        let declaration = contribution.declaration;
+        if !self.declarations.contains_instruction(&declaration) {
+            return Err(reject_undeclared_contribution(
+                self.feature_id,
+                self.report,
+                FeatureContributionKind::Instruction,
+                declaration.id.to_string(),
+            ));
+        }
+        if !self
+            .report
+            .installed_instructions
+            .iter()
+            .any(|instruction| instruction.id == declaration.id)
+        {
+            self.report.installed_instructions.push(declaration);
+        }
+        Ok(())
+    }
+}
+
 /// Background task registrar for descriptor/report-only contributions.
 pub struct BackgroundTaskRegistrar<'a> {
     feature_id: &'a FeatureId,
@@ -1184,6 +1314,14 @@ impl FeatureInstallContext<'_> {
         }
     }
 
+    pub fn instructions(&mut self) -> FeatureInstructionRegistrar<'_> {
+        FeatureInstructionRegistrar {
+            feature_id: self.feature_id,
+            declarations: self.declarations,
+            report: self.report,
+        }
+    }
+
     pub fn background_tasks(&mut self) -> BackgroundTaskRegistrar<'_> {
         BackgroundTaskRegistrar {
             feature_id: self.feature_id,
@@ -1245,6 +1383,26 @@ impl FeatureRegistryInstallReport {
             .flat_map(|report| report.installed_tools.iter().cloned())
             .collect()
     }
+
+    pub fn installed_instruction_contributions(&self) -> Vec<FeatureInstructionDeclaration> {
+        dedupe_instruction_contributions(
+            self.reports
+                .iter()
+                .flat_map(|report| report.installed_instructions.iter().cloned()),
+        )
+    }
+}
+
+pub fn dedupe_instruction_contributions(
+    instructions: impl IntoIterator<Item = FeatureInstructionDeclaration>,
+) -> Vec<FeatureInstructionDeclaration> {
+    let mut by_id = BTreeMap::new();
+    for instruction in instructions {
+        by_id.entry(instruction.id.clone()).or_insert(instruction);
+    }
+    let mut instructions = by_id.into_values().collect::<Vec<_>>();
+    instructions.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.id.cmp(&b.id)));
+    instructions
 }
 
 /// Builder/installer for enabled feature modules.
@@ -1550,6 +1708,42 @@ mod tests {
         }
     }
 
+    struct InstructionFeature {
+        descriptor: FeatureDescriptor,
+        instruction: FeatureInstructionDeclaration,
+    }
+
+    impl FeatureModule for InstructionFeature {
+        fn descriptor(&self) -> FeatureDescriptor {
+            self.descriptor.clone()
+        }
+
+        fn install(
+            &self,
+            context: &mut FeatureInstallContext<'_>,
+        ) -> Result<(), FeatureInstallError> {
+            context
+                .instructions()
+                .register(FeatureInstructionContribution::new(
+                    self.instruction.clone(),
+                ))
+        }
+    }
+
+    fn instruction(
+        id: &'static str,
+        prompt_ref: &'static str,
+        order: FeatureInstructionOrder,
+    ) -> FeatureInstructionDeclaration {
+        FeatureInstructionDeclaration::new(
+            FeatureInstructionId::builtin(id),
+            prompt_ref,
+            order,
+            "test instruction",
+        )
+        .unwrap()
+    }
+
     #[test]
     fn descriptor_contributions_are_recorded() {
         let descriptor = FeatureDescriptor::builtin("dummy", "Dummy")
@@ -1574,6 +1768,58 @@ mod tests {
         assert!(feature_report.installed);
         assert_eq!(feature_report.installed_tools, vec!["Dummy"]);
         assert_eq!(feature_report.declared_background_tasks[0].name, "daily");
+    }
+
+    #[test]
+    fn instruction_contributions_are_deduped_and_sorted() {
+        let workflow = instruction(
+            "workflow",
+            "$yoi/common/tickets",
+            FeatureInstructionOrder::WorkflowPolicy,
+        );
+        let orchestration = instruction(
+            "orchestration",
+            "$yoi/common/worker-orchestration",
+            FeatureInstructionOrder::OrchestrationPolicy,
+        );
+        let contributions = dedupe_instruction_contributions([
+            workflow.clone(),
+            orchestration.clone(),
+            workflow.clone(),
+        ]);
+
+        assert_eq!(contributions, vec![orchestration, workflow]);
+    }
+
+    #[test]
+    fn undeclared_instruction_contribution_is_rejected() {
+        let declared = instruction(
+            "declared",
+            "$yoi/common/tickets",
+            FeatureInstructionOrder::WorkflowPolicy,
+        );
+        let undeclared = instruction(
+            "undeclared",
+            "$yoi/common/tickets",
+            FeatureInstructionOrder::WorkflowPolicy,
+        );
+        let descriptor =
+            FeatureDescriptor::builtin("instruction", "Instruction").with_instruction(declared);
+        let mut hook_builder = HookRegistryBuilder::default();
+        let mut pending_tools = Vec::new();
+        let report = FeatureRegistryBuilder::new()
+            .with_module(InstructionFeature {
+                descriptor,
+                instruction: undeclared,
+            })
+            .install_into_pending(&mut pending_tools, &mut hook_builder);
+
+        assert!(!report.reports[0].installed);
+        assert!(report.reports[0].diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("undeclared Instruction contribution")
+        }));
     }
 
     #[test]
