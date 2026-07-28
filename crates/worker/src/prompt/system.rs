@@ -209,6 +209,7 @@ struct ToolCapabilities {
     worker_stop: bool,
     worker_list: bool,
     worker_restore: bool,
+    ticket_any: bool,
 }
 
 impl ToolCapabilities {
@@ -225,6 +226,7 @@ impl ToolCapabilities {
                 "StopWorker" => capabilities.worker_stop = true,
                 "ListWorkers" => capabilities.worker_list = true,
                 "RestoreWorker" => capabilities.worker_restore = true,
+                name if name.starts_with("Ticket") => capabilities.ticket_any = true,
                 _ => {}
             }
         }
@@ -267,6 +269,7 @@ impl ToolCapabilities {
         );
         map.insert("memory_mutation", Value::from(self.memory_mutation()));
         map.insert("worker_management", Value::from(self.worker_management()));
+        map.insert("ticket_any", Value::from(self.ticket_any));
         Value::from(map)
     }
 }
@@ -423,6 +426,13 @@ mod tests {
         .collect()
     }
 
+    fn ticket_tool_names() -> Vec<String> {
+        ["TicketList", "TicketShow", "TicketComment"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+
     /// Lazily-initialised builtin catalog shared across system-prompt
     /// tests, so every `ctx()` can hand out a `&'static PromptCatalog`
     /// reference without forcing test bodies to create one per call.
@@ -486,6 +496,62 @@ mod tests {
         assert!(!rendered.contains("MemoryDelete"));
         assert!(rendered.contains("## Language"));
         assert!(rendered.contains("## Working boundaries"));
+    }
+
+    #[test]
+    fn ticket_guidance_is_included_for_typed_ticket_tools() {
+        let loader = PromptLoader::builtins_only();
+        let tmpl = SystemPromptTemplate::parse("$yoi/default", loader).unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let rendered = tmpl
+            .render(&ctx(dir.path(), &scope, ticket_tool_names(), None))
+            .unwrap();
+
+        assert!(rendered.contains("## Ticket workflow"));
+        assert!(rendered.contains("available typed Ticket tools as the authority"));
+        assert!(rendered.contains("Do not invoke a Ticket CLI"));
+        assert!(rendered.contains("Distinguish implementation completion"));
+    }
+
+    #[test]
+    fn ticket_guidance_is_omitted_without_ticket_tools() {
+        let loader = PromptLoader::builtins_only();
+        let tmpl = SystemPromptTemplate::parse("$yoi/default", loader).unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let rendered = tmpl
+            .render(&ctx(
+                dir.path(),
+                &scope,
+                vec!["Read".into(), "Edit".into()],
+                None,
+            ))
+            .unwrap();
+
+        assert!(!rendered.contains("## Ticket workflow"));
+        assert!(!rendered.contains("Do not invoke a Ticket CLI"));
+    }
+
+    #[test]
+    fn ticket_role_instructions_include_common_ticket_guidance() {
+        let loader = PromptLoader::builtins_only();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+
+        for role in ["intake", "orchestrator", "coder", "reviewer"] {
+            let tmpl =
+                SystemPromptTemplate::parse(&format!("$yoi/role/{role}"), loader.clone()).unwrap();
+            let rendered = tmpl
+                .render(&ctx(dir.path(), &scope, ticket_tool_names(), None))
+                .unwrap();
+
+            assert!(rendered.contains("## Ticket workflow"), "role: {role}");
+            assert!(
+                rendered.contains("Do not invoke a Ticket CLI"),
+                "role: {role}"
+            );
+        }
     }
 
     #[test]
