@@ -167,12 +167,9 @@ impl Tool for TaskUpdateTool {
 }
 
 fn task_output(summary: String, task: &TaskEntry) -> ToolOutput {
-    let content = serde_json::json!({
-        "task": task,
-    });
     ToolOutput {
         summary,
-        content: Some(serde_json::to_string_pretty(&content).unwrap_or_default()),
+        content: Some(serde_json::to_string_pretty(task).unwrap_or_default()),
     }
 }
 
@@ -281,6 +278,10 @@ mod tests {
             .await
             .unwrap();
         assert!(out.summary.contains("Created task 1"));
+        let created_content = out.content.unwrap();
+        let created_json: serde_json::Value = serde_json::from_str(&created_content).unwrap();
+        assert_eq!(created_json["taskid"], 1);
+        assert!(created_json.get("task").is_none());
         assert_eq!(store.get(1).unwrap().status, TaskStatus::Pending);
 
         let out = update
@@ -397,9 +398,10 @@ mod tests {
             .await
             .unwrap();
         let content = out.content.unwrap();
-        assert!(content.contains("\"task\""));
-        assert!(content.contains("\"taskid\": 2"));
-        assert!(!content.contains("\"snapshot\""));
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(json["taskid"], 2);
+        assert!(json.get("task").is_none());
+        assert!(json.get("snapshot").is_none());
         assert!(!content.contains("\"taskid\": 1"));
         assert!(!content.contains("completed task"));
     }
