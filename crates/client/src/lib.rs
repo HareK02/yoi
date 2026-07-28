@@ -12,6 +12,7 @@ pub mod backend_auth;
 pub mod backend_runtime;
 pub mod runtime_command;
 pub mod spawn;
+pub mod target;
 pub mod ticket_role;
 mod worker_client;
 
@@ -26,6 +27,11 @@ pub use backend_runtime::{
     BackendWorkerWorkspaceSummary, BackendWorkingDirectorySummary, list_backend_workers,
 };
 pub use runtime_command::WorkerRuntimeCommand;
+pub use target::{
+    BackendTarget, Dashboard, LocalTarget, Target, TargetError, TargetKind, WorkerByName,
+    WorkerConnection, WorkerConnectionSelector, WorkerList, WorkerListRequest, WorkerResume,
+    WorkerSpawn,
+};
 
 pub use spawn::{
     SpawnConfig, SpawnError, SpawnReady, WorkerProcessLaunchConfig, WorkerProcessLaunchOptions,

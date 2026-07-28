@@ -34,12 +34,12 @@ use crossterm::execute;
 use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
 use session_store::SegmentId;
 
-use client::{BackendRuntimeListTarget, BackendRuntimeTarget, WorkerRuntimeCommand};
+use client::{Target, WorkerConnectionSelector, WorkerListRequest};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LaunchOptions {
+    pub target: Box<dyn Target>,
     pub mode: LaunchMode,
-    pub runtime_command: WorkerRuntimeCommand,
     pub workspace_root: PathBuf,
 }
 
@@ -56,12 +56,15 @@ pub enum LaunchMode {
         worker_name: String,
         socket_override: Option<PathBuf>,
     },
-    /// `yoi workers` / `yoi --backend <url>`: list Backend-authoritative runtime workers,
-    /// then attach to the selected Worker through the Backend Runtime API.
-    BackendRuntimePicker { target: BackendRuntimeListTarget },
-    /// `yoi --backend <url> --runtime-id <id> --worker-id <id>`: connect through the
-    /// Workspace Backend Runtime API and observe the Backend-proxied event stream.
-    BackendRuntime { target: BackendRuntimeTarget },
+    /// `yoi workers` / `yoi --backend <url>`: list workers through the selected
+    /// connection target, then attach to the selected Worker.
+    Workers { runtime_id: Option<String> },
+    /// `yoi --backend <url> --runtime-id <id> --worker-id <id>`: open one Worker
+    /// through the selected connection target.
+    OpenWorker {
+        runtime_id: String,
+        worker_id: String,
+    },
     /// `yoi resume`: open the Worker picker, then attach to the selected live Worker
     /// or restore the selected stopped Worker by name. Without `--all`, the picker
     /// is scoped to the current runtime workspace.
@@ -78,8 +81,8 @@ pub enum LaunchMode {
 
 pub async fn launch(options: LaunchOptions) -> ExitCode {
     let LaunchOptions {
+        target,
         mode,
-        runtime_command,
         workspace_root,
     } = options;
 
@@ -105,20 +108,55 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
         LaunchMode::Spawn {
             worker_name,
             profile,
-        } => console::run_spawn(None, worker_name, profile, runtime_command).await,
+        } => match target.spawn_worker() {
+            Ok(spawn) => {
+                console::run_spawn(None, worker_name, profile, spawn.runtime_command).await
+            }
+            Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
+        },
         LaunchMode::WorkerName {
             worker_name,
             socket_override,
-        } => console::run_worker_name(worker_name, socket_override, runtime_command).await,
-        LaunchMode::BackendRuntimePicker { target } => backend_worker_picker::run(target).await,
-        LaunchMode::BackendRuntime { target } => console::run_backend_runtime(target).await,
-        LaunchMode::Resume { all } => {
-            console::run_resume(runtime_command, workspace_root.clone(), all).await
+        } => match target.worker_by_name() {
+            Ok(worker_by_name) => {
+                console::run_worker_name(
+                    worker_name,
+                    socket_override,
+                    worker_by_name.runtime_command,
+                )
+                .await
+            }
+            Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
+        },
+        LaunchMode::Workers { runtime_id } => {
+            match target.list_workers(WorkerListRequest::new(runtime_id)) {
+                Ok(worker_list) => backend_worker_picker::run(worker_list.target).await,
+                Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
+            }
         }
-        LaunchMode::ResumeWithSession { id, worker_name } => {
-            console::run_spawn(Some(id), worker_name, None, runtime_command).await
-        }
-        LaunchMode::Panel => dashboard::launch(runtime_command).await,
+        LaunchMode::OpenWorker {
+            runtime_id,
+            worker_id,
+        } => match target.connect_worker(WorkerConnectionSelector::new(runtime_id, worker_id)) {
+            Ok(connection) => console::run_backend_runtime(connection.target).await,
+            Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
+        },
+        LaunchMode::Resume { all } => match target.resume_worker() {
+            Ok(resume) => {
+                console::run_resume(resume.runtime_command, workspace_root.clone(), all).await
+            }
+            Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
+        },
+        LaunchMode::ResumeWithSession { id, worker_name } => match target.spawn_worker() {
+            Ok(spawn) => {
+                console::run_spawn(Some(id), worker_name, None, spawn.runtime_command).await
+            }
+            Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
+        },
+        LaunchMode::Panel => match target.dashboard() {
+            Ok(dashboard) => dashboard::launch(dashboard.runtime_command).await,
+            Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
+        },
     };
 
     // Always restore the terminal first so any pending eprintln below

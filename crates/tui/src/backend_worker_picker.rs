@@ -317,6 +317,9 @@ mod tests {
             worker_id: worker_id.to_string(),
             host_id: "host".to_string(),
             label: "label".to_string(),
+            display_name: "label".to_string(),
+            singleton_key: None,
+            tags: Vec::new(),
             role: None,
             profile: profile.map(str::to_string),
             workspace: BackendWorkerWorkspaceSummary {
