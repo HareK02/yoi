@@ -26,6 +26,8 @@ A typed value still needs a **boundary** test when it is converted from untruste
 
 Compile-time behavior may itself be a public API contract. Compile-pass or compile-fail tests are appropriate when downstream code must continue to compile or be rejected, including macro expansion, typestate transitions, public trait bounds, and unavailable methods in a restricted state. Such a test protects the shape of the public API; it does not re-run a compiler guarantee as a runtime assertion.
 
+Yoi currently uses `trybuild` for compile-fail API-shape tests in `llm-engine`. Add new `trybuild` tests only when the compile-time accept/reject behavior is the product contract being protected. Keep fixtures minimal and name them after the API rule, not after the implementation helper that happens to trigger the compiler error.
+
 ## Test names
 
 A test name must describe an observable rule. Prefer names of the form `<condition>_<expected_behavior>` or `<operation>_<expected_result>`. Include the input class or state when omitting it would make the rule ambiguous.
