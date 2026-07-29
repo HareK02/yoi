@@ -8,11 +8,10 @@ mod ticket_cli;
 mod worker_cleanup_cli;
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 use std::time::Duration;
 
 use cli_connection::{
@@ -39,11 +38,6 @@ enum Mode {
     Session(session_cli::SessionCli),
     WorkerCleanup(worker_cleanup_cli::WorkerCleanupCli),
     Ticket(ticket_cli::TicketCli),
-    WorkspaceHelp,
-    WorkspaceServer {
-        subcommand: String,
-        args: Vec<String>,
-    },
     Login {
         backend_url: String,
         no_wait: bool,
@@ -93,11 +87,6 @@ async fn main() -> ExitCode {
             print_memory_lint_help();
             ExitCode::SUCCESS
         }
-        Mode::WorkspaceHelp => {
-            print_workspace_help();
-            ExitCode::SUCCESS
-        }
-        Mode::WorkspaceServer { subcommand, args } => run_workspace_server(&subcommand, args),
         Mode::Login {
             backend_url,
             no_wait,
@@ -332,7 +321,7 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             &target_selection,
             &workspace_root,
         )?;
-        let mode = if target_selection.explicit_backend() {
+        let mode = if target.kind() == client::TargetKind::Backend {
             LaunchMode::Workers {
                 runtime_id: None,
                 include_stopped: false,
@@ -389,16 +378,6 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             let _target = resolve_local_cli_connection(connection_resolver, CliCommand::Plugin)?;
             let plugin_cli = parse_plugin_args(&args[1..])?;
             return Ok(Mode::Plugin(plugin_cli));
-        }
-        "workspace" => {
-            let _target =
-                resolve_local_cli_connection(connection_resolver, CliCommand::WorkspaceServer)?;
-            return parse_workspace_args(&args[1..]);
-        }
-        "server" => {
-            let _target =
-                resolve_local_cli_connection(connection_resolver, CliCommand::WorkspaceServer)?;
-            return parse_workspace_args(&args[1..]);
         }
         "login" => {
             return parse_login_args(&args[1..], connection_resolver);
@@ -937,28 +916,65 @@ struct WorkspaceIdentityFile {
     id: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default)]
 struct ClientConfigFile {
     default_backend: Option<String>,
-    // Parsed as part of the target model; applying configured connection defaults is left to
-    // the later user-facing connection-mode work so current `yoi` default launch stays local.
-    #[allow(dead_code)]
-    #[serde(default)]
     default_connection: ClientDefaultConnection,
-    #[serde(default)]
     backends: BTreeMap<String, ClientBackendConfig>,
-    #[serde(default)]
     workspaces: BTreeMap<String, ClientWorkspaceConfig>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ClientBackendConfig {
-    url: String,
+#[derive(Debug, Default, Deserialize)]
+struct ClientConfigOverlay {
+    default_backend: Option<String>,
+    default_connection: Option<ClientDefaultConnection>,
+    #[serde(default)]
+    backends: BTreeMap<String, ClientBackendConfigOverlay>,
+    #[serde(default)]
+    workspaces: BTreeMap<String, ClientWorkspaceConfigOverlay>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default)]
+struct ClientBackendConfig {
+    url: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ClientBackendConfigOverlay {
+    url: Option<String>,
+}
+
+#[derive(Debug, Default)]
 struct ClientWorkspaceConfig {
-    backend: String,
+    backend: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ClientWorkspaceConfigOverlay {
+    backend: Option<String>,
+}
+
+impl ClientConfigFile {
+    fn apply_overlay(&mut self, overlay: ClientConfigOverlay) {
+        if let Some(default_backend) = overlay.default_backend {
+            self.default_backend = Some(default_backend);
+        }
+        if let Some(default_connection) = overlay.default_connection {
+            self.default_connection = default_connection;
+        }
+        for (name, backend) in overlay.backends {
+            let entry = self.backends.entry(name).or_default();
+            if let Some(url) = backend.url {
+                entry.url = Some(url);
+            }
+        }
+        for (id, workspace) in overlay.workspaces {
+            let entry = self.workspaces.entry(id).or_default();
+            if let Some(backend) = workspace.backend {
+                entry.backend = Some(backend);
+            }
+        }
+    }
 }
 
 fn resolve_workspace_id_from_root(workspace_root: &Path) -> Result<Option<String>, ParseError> {
@@ -1004,7 +1020,7 @@ fn resolve_backend_url(
             config
                 .workspaces
                 .get(id)
-                .map(|workspace| workspace.backend.as_str())
+                .and_then(|workspace| workspace.backend.as_deref())
         })
         .or(config.default_backend.as_deref())
         .ok_or_else(|| ParseError(client_config_missing_message(workspace_id)))?;
@@ -1013,7 +1029,11 @@ fn resolve_backend_url(
             "client config references backend `{backend_name}`, but [backends.{backend_name}] is not defined"
         ))
     })?;
-    let url = backend.url.trim();
+    let Some(url) = backend.url.as_deref().map(str::trim) else {
+        return Err(ParseError(format!(
+            "client config backend `{backend_name}` must contain a url"
+        )));
+    };
     if url.is_empty() {
         return Err(ParseError(format!(
             "client config backend `{backend_name}` must contain a non-empty url"
@@ -1022,30 +1042,67 @@ fn resolve_backend_url(
     Ok(url.to_string())
 }
 
+fn read_client_default_connection() -> Result<ClientDefaultConnection, ParseError> {
+    Ok(read_client_config()?
+        .map(|config| config.default_connection)
+        .unwrap_or_default())
+}
+
 fn read_client_config() -> Result<Option<ClientConfigFile>, ParseError> {
-    let Some(path) = client_config_path() else {
-        return Ok(None);
-    };
+    let mut config = ClientConfigFile::default();
+    let mut found = false;
+
+    if let Some(path) = client_global_config_path() {
+        if let Some(overlay) = read_client_config_overlay(&path)? {
+            config.apply_overlay(overlay);
+            found = true;
+        }
+    }
+
+    let cwd_path = client_cwd_config_path()?;
+    if let Some(overlay) = read_client_config_overlay(&cwd_path)? {
+        config.apply_overlay(overlay);
+        found = true;
+    }
+
+    Ok(found.then_some(config))
+}
+
+fn read_client_config_overlay(path: &Path) -> Result<Option<ClientConfigOverlay>, ParseError> {
     if !path.is_file() {
         return Ok(None);
     }
-    let contents = fs::read_to_string(&path)
+    let contents = fs::read_to_string(path)
         .map_err(|e| ParseError(format!("failed to read {}: {e}", path.display())))?;
-    toml::from_str::<ClientConfigFile>(&contents)
+    toml::from_str::<ClientConfigOverlay>(&contents)
         .map(Some)
         .map_err(|e| ParseError(format!("failed to parse {}: {e}", path.display())))
 }
 
-fn client_config_path() -> Option<PathBuf> {
-    yoi_config_dir().map(|dir| dir.join("client.toml"))
+fn client_global_config_path() -> Option<PathBuf> {
+    manifest::paths::data_dir().map(|dir| dir.join("client").join("config.toml"))
+}
+
+fn client_cwd_config_path() -> Result<PathBuf, ParseError> {
+    Ok(current_dir()?.join(".yoi").join("client.config.toml"))
+}
+
+fn client_config_location_message() -> String {
+    match client_global_config_path() {
+        Some(path) => format!("{} or <cwd>/.yoi/client.config.toml", path.display()),
+        None => "<data_dir>/client/config.toml or <cwd>/.yoi/client.config.toml".to_string(),
+    }
 }
 
 fn client_config_missing_message(workspace_id: Option<&str>) -> String {
+    let locations = client_config_location_message();
     match workspace_id {
         Some(workspace_id) => format!(
-            "Backend URL is required. Pass --backend <URL> or configure $XDG_CONFIG_HOME/yoi/client.toml with [workspaces.{workspace_id}] backend = <name> and [backends.<name>].url"
+            "Backend URL is required. Pass --backend <URL> or configure {locations} with [workspaces.{workspace_id}] backend = <name> and [backends.<name>].url"
         ),
-        None => "Backend URL is required. Pass --backend <URL> or configure default_backend in $XDG_CONFIG_HOME/yoi/client.toml".to_string(),
+        None => format!(
+            "Backend URL is required. Pass --backend <URL> or configure default_backend in {locations}"
+        ),
     }
 }
 
@@ -1187,94 +1244,6 @@ fn yoi_config_dir() -> Option<PathBuf> {
         return Some(PathBuf::from(home).join("yoi"));
     }
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config").join("yoi"))
-}
-
-fn parse_workspace_args(args: &[String]) -> Result<Mode, ParseError> {
-    let Some((subcommand, rest)) = args.split_first() else {
-        return Err(ParseError(
-            "yoi workspace requires `init`, `config`, `identity`, `trust-runtime`, or `serve` (try `yoi workspace --help`)"
-                .to_string(),
-        ));
-    };
-    match subcommand.as_str() {
-        "init" => {
-            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
-                return Ok(Mode::WorkspaceHelp);
-            }
-            Ok(Mode::WorkspaceServer {
-                subcommand: "init".to_string(),
-                args: rest.to_vec(),
-            })
-        }
-        "config" => {
-            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
-                return Ok(Mode::WorkspaceHelp);
-            }
-            Ok(Mode::WorkspaceServer {
-                subcommand: "config".to_string(),
-                args: rest.to_vec(),
-            })
-        }
-        "identity" | "trust-runtime" => {
-            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
-                return Ok(Mode::WorkspaceHelp);
-            }
-            Ok(Mode::WorkspaceServer {
-                subcommand: subcommand.clone(),
-                args: rest.to_vec(),
-            })
-        }
-        "serve" => {
-            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
-                return Ok(Mode::WorkspaceHelp);
-            }
-            Ok(Mode::WorkspaceServer {
-                subcommand: "serve".to_string(),
-                args: rest.to_vec(),
-            })
-        }
-        "--help" | "-h" => Ok(Mode::WorkspaceHelp),
-        other => Err(ParseError(format!(
-            "unknown yoi workspace subcommand `{other}`; expected `init`, `config`, `identity`, `trust-runtime`, or `serve`"
-        ))),
-    }
-}
-
-fn run_workspace_server(subcommand: &str, args: Vec<String>) -> ExitCode {
-    let command = match resolve_workspace_server_command() {
-        Ok(command) => command,
-        Err(error) => {
-            eprintln!("yoi workspace: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let mut child = Command::new(&command);
-    child.arg(subcommand);
-    child.args(args);
-    match child.status() {
-        Ok(status) if status.success() => ExitCode::SUCCESS,
-        Ok(status) => ExitCode::from(status.code().unwrap_or(1).min(255) as u8),
-        Err(error) => {
-            eprintln!(
-                "yoi workspace: failed to launch `{}`: {error}",
-                command.to_string_lossy()
-            );
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn resolve_workspace_server_command() -> Result<OsString, ParseError> {
-    if let Some(value) = std::env::var_os("YOI_WORKSPACE_SERVER_COMMAND") {
-        if !value.is_empty() {
-            return Ok(value);
-        }
-    }
-    let current = std::env::current_exe()
-        .map_err(|error| ParseError(format!("failed to resolve current executable: {error}")))?;
-    let sibling = current.with_file_name("yoi-workspace-server");
-    Ok(sibling.into_os_string())
 }
 
 fn parse_plugin_args(args: &[String]) -> Result<plugin_cli::PluginCliCommand, ParseError> {
@@ -1622,20 +1591,7 @@ fn parse_session_id(value: &str) -> Result<SegmentId, ParseError> {
 
 fn print_help() {
     println!(
-        "yoi\n\nUsage:\n  yoi [TARGET_OPTIONS] [OPTIONS]\n  yoi [TARGET_OPTIONS] resume [--workspace <PATH>] [--all] [--runtime-id <ID>]\n  yoi [TARGET_OPTIONS] workers [-r|--stopped] [--workspace <PATH>] [--runtime-id <ID>]\n  yoi [TARGET_OPTIONS] panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi worker [WORKER_OPTIONS]\n  yoi worker delete <NAME> [--force] [--dry-run]\n  yoi worker prune --older-than <DURATION> [--force] [--dry-run]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi session prune --unreferenced [--older-than <DURATION>] [--force] [--dry-run]\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi workspace init [OPTIONS]
-  yoi workspace config <COMMAND> [OPTIONS]
-  yoi workspace identity <COMMAND> [OPTIONS]
-  yoi workspace trust-runtime <COMMAND> [OPTIONS]
-  yoi workspace serve [OPTIONS]
-  yoi server identity <COMMAND> [OPTIONS]
-  yoi server trust-runtime <COMMAND> [OPTIONS]
-  yoi plugin new <rust-component-tool|rust-component-service> <PATH> [--json]\n  yoi plugin check <PATH_OR_PACKAGE> [--json]\n  yoi plugin pack <PATH> [--output <FILE>] [--json]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp show <SERVER> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp tools|resources|prompts [SERVER] [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nSurfaces:\n  Console   Single-Worker chat/client surface (default, --worker, yoi resume, Backend Runtime target)\n  Dashboard Workspace cockpit/action surface (yoi panel)\n  TUI       Terminal UI implementation umbrella for Console and Dashboard\n\nOptions:\n      --workspace <PATH> Runtime workspace root for default Console/--worker/workers (defaults to cwd)\n      --workspace-id <ID> Workspace identity for Backend scoped routes\n      --backend <URL>    Workspace Backend API URL for Backend Runtime attach/list\n      --runtime-id <ID>  Backend Runtime identity for attach/list\n      --worker <NAME>       Open the Worker Console by name (attach/restore/create)\n      --socket <PATH>    Attach a Worker Console to a specific socket with --worker\n      --session <UUID>   Resume a specific session segment in the Worker Console\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
-    );
-}
-
-fn print_workspace_help() {
-    println!(
-        "yoi workspace\n\nUsage:\n  yoi workspace init [OPTIONS]\n  yoi workspace config <COMMAND> [OPTIONS]\n  yoi workspace identity <COMMAND> [OPTIONS]\n  yoi workspace trust-runtime <COMMAND> [OPTIONS]\n  yoi workspace serve [OPTIONS]\n  yoi server identity <COMMAND> [OPTIONS]\n  yoi server trust-runtime <COMMAND> [OPTIONS]\n\nDescription:\n  Launches the separate yoi-workspace-server executable. The yoi binary does not link the workspace server crate. `serve` reads Workspace records from the Yoi server DB.\n\nSubcommands:\n  init            Initialize .yoi/workspace.toml, .yoi/workspace-backend.local.toml, and a server DB Workspace record\n  config default  Print the latest packaged Backend config template\n  config diff     Compare workspace local config with the packaged template\n  identity        Initialize/show the Server signing identity\n  trust-runtime   Register/list/revoke trusted remote Runtime records\n  serve           Serve the Workspace recorded in the server DB\n\nOptions forwarded to init/config diff:\n      --workspace <PATH>  Workspace root (defaults to cwd)\n\nOptions forwarded to serve:\n      --listen <ADDR>     Listen address override\n  -h, --help              Print help\n\nEnvironment:\n  YOI_WORKSPACE_SERVER_COMMAND  Path to yoi-workspace-server executable override\n"
+        "yoi\n\nUsage:\n  yoi [TARGET_OPTIONS] [OPTIONS]\n  yoi [TARGET_OPTIONS] resume [--workspace <PATH>] [--all] [--runtime-id <ID>]\n  yoi [TARGET_OPTIONS] workers [-r|--stopped] [--workspace <PATH>] [--runtime-id <ID>]\n  yoi [TARGET_OPTIONS] panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi worker [WORKER_OPTIONS]\n  yoi worker delete <NAME> [--force] [--dry-run]\n  yoi worker prune --older-than <DURATION> [--force] [--dry-run]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi session prune --unreferenced [--older-than <DURATION>] [--force] [--dry-run]\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi plugin new <rust-component-tool|rust-component-service> <PATH> [--json]\n  yoi plugin check <PATH_OR_PACKAGE> [--json]\n  yoi plugin pack <PATH> [--output <FILE>] [--json]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp show <SERVER> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp tools|resources|prompts [SERVER] [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nSurfaces:\n  Console   Single-Worker chat/client surface (default, --worker, yoi resume, Backend Runtime target)\n  Dashboard Workspace cockpit/action surface (yoi panel)\n  TUI       Terminal UI implementation umbrella for Console and Dashboard\n\nOptions:\n      --workspace <PATH> Runtime workspace root for default Console/--worker/workers (defaults to cwd)\n      --workspace-id <ID> Workspace identity for Backend scoped routes\n      --backend <URL>    Workspace Backend API URL for Backend Runtime attach/list\n      --runtime-id <ID>  Backend Runtime identity for attach/list\n      --worker <NAME>       Open the Worker Console by name (attach/restore/create)\n      --socket <PATH>    Attach a Worker Console to a specific socket with --worker\n      --session <UUID>   Resume a specific session segment in the Worker Console\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
     );
 }
 
@@ -1668,7 +1624,9 @@ mod tests {
             input: CliConnectionInput<'_>,
         ) -> Result<Box<dyn Target>, ParseError> {
             match input {
-                CliConnectionInput::LocalDefault => Ok(Box::new(LocalTarget::new())),
+                CliConnectionInput::DefaultTarget { .. } | CliConnectionInput::LocalTarget => {
+                    Ok(Box::new(LocalTarget::new()))
+                }
                 CliConnectionInput::BackendTarget { workspace_id, .. } => Ok(Box::new(
                     BackendTarget::new(self.backend_url, workspace_id.map(str::to_string)),
                 )),
@@ -1704,6 +1662,74 @@ mod tests {
     fn client_config_default_connection_defaults_to_local() {
         let config = ClientConfigFile::default();
         assert_eq!(config.default_connection, ClientDefaultConnection::Local);
+    }
+
+    #[test]
+    fn client_config_overlay_merges_property_wise() {
+        let mut config = ClientConfigFile::default();
+        config.apply_overlay(
+            toml::from_str(
+                r#"
+default_backend = "global"
+default_connection = "backend"
+
+[backends.global]
+url = "http://global.example"
+
+[backends.shared]
+url = "http://shared-global.example"
+
+[workspaces.workspace-a]
+backend = "global"
+"#,
+            )
+            .unwrap(),
+        );
+        config.apply_overlay(
+            toml::from_str(
+                r#"
+default_backend = "shared"
+
+[backends.shared]
+url = "http://shared-cwd.example"
+
+[workspaces.workspace-b]
+backend = "shared"
+"#,
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(config.default_connection, ClientDefaultConnection::Backend);
+        assert_eq!(config.default_backend.as_deref(), Some("shared"));
+        assert_eq!(
+            config
+                .backends
+                .get("global")
+                .and_then(|backend| backend.url.as_deref()),
+            Some("http://global.example")
+        );
+        assert_eq!(
+            config
+                .backends
+                .get("shared")
+                .and_then(|backend| backend.url.as_deref()),
+            Some("http://shared-cwd.example")
+        );
+        assert_eq!(
+            config
+                .workspaces
+                .get("workspace-a")
+                .and_then(|workspace| workspace.backend.as_deref()),
+            Some("global")
+        );
+        assert_eq!(
+            config
+                .workspaces
+                .get("workspace-b")
+                .and_then(|workspace| workspace.backend.as_deref()),
+            Some("shared")
+        );
     }
 
     #[test]
@@ -2009,55 +2035,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_workspace_serve_passthrough() {
-        match parse_args_from(["workspace", "serve", "--listen", "127.0.0.1:0"]).unwrap() {
-            Mode::WorkspaceServer { subcommand, args } => {
-                assert_eq!(subcommand, "serve");
-                assert_eq!(args, vec!["--listen", "127.0.0.1:0"]);
-            }
-            other => panic!("unexpected mode: {other:?}"),
-        }
+    fn parse_workspace_command_is_removed_from_yoi_surface() {
+        let err = parse_args_from(["workspace", "serve", "--listen", "127.0.0.1:0"]).unwrap_err();
+        assert_eq!(err.to_string(), "unknown command `workspace`");
     }
 
     #[test]
-    fn parse_workspace_serve_leaves_legacy_flags_to_server() {
-        match parse_args_from(["workspace", "serve", "--workspace", "/tmp/ws"]).unwrap() {
-            Mode::WorkspaceServer { subcommand, args } => {
-                assert_eq!(subcommand, "serve");
-                assert_eq!(args, vec!["--workspace", "/tmp/ws"]);
-            }
-            other => panic!("unexpected mode: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_workspace_init_passthrough() {
-        match parse_args_from(["workspace", "init", "--workspace", "/tmp/ws"]).unwrap() {
-            Mode::WorkspaceServer { subcommand, args } => {
-                assert_eq!(subcommand, "init");
-                assert_eq!(args, vec!["--workspace", "/tmp/ws"]);
-            }
-            other => panic!("unexpected mode: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_workspace_config_passthrough() {
-        match parse_args_from(["workspace", "config", "diff", "--workspace", "/tmp/ws"]).unwrap() {
-            Mode::WorkspaceServer { subcommand, args } => {
-                assert_eq!(subcommand, "config");
-                assert_eq!(args, vec!["diff", "--workspace", "/tmp/ws"]);
-            }
-            other => panic!("unexpected mode: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_workspace_help() {
-        assert!(matches!(
-            parse_args_from(["workspace", "--help"]).unwrap(),
-            Mode::WorkspaceHelp
-        ));
+    fn parse_server_command_is_removed_from_yoi_surface() {
+        let err = parse_args_from(["server", "identity", "show"]).unwrap_err();
+        assert_eq!(err.to_string(), "unknown command `server`");
     }
 
     #[test]

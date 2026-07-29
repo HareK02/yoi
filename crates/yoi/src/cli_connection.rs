@@ -1,7 +1,7 @@
 use client::{BackendTarget, LocalTarget, Target, TargetKind};
 use serde::Deserialize;
 
-use super::{ParseError, resolve_backend_url};
+use super::{ParseError, read_client_default_connection, resolve_backend_url};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CliConnectionRequirement {
@@ -26,7 +26,6 @@ pub(crate) enum CliCommand {
     Mcp,
     MemoryLint,
     Session,
-    WorkspaceServer,
     Login,
 }
 
@@ -47,7 +46,6 @@ impl CliCommand {
             CliCommand::Mcp => "yoi mcp",
             CliCommand::MemoryLint => "yoi memory lint",
             CliCommand::Session => "yoi session",
-            CliCommand::WorkspaceServer => "yoi workspace/server",
             CliCommand::Login => "yoi login",
         }
     }
@@ -68,15 +66,13 @@ impl CliCommand {
             | CliCommand::Plugin
             | CliCommand::Mcp
             | CliCommand::MemoryLint
-            | CliCommand::Session
-            | CliCommand::WorkspaceServer => CliConnectionRequirement::LocalOnly,
+            | CliCommand::Session => CliConnectionRequirement::LocalOnly,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-#[allow(dead_code)]
 pub(crate) enum ClientDefaultConnection {
     Local,
     Backend,
@@ -90,7 +86,10 @@ impl Default for ClientDefaultConnection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CliConnectionInput<'a> {
-    LocalDefault,
+    DefaultTarget {
+        workspace_id: Option<&'a str>,
+    },
+    LocalTarget,
     BackendTarget {
         explicit_backend_url: Option<String>,
         workspace_id: Option<&'a str>,
@@ -115,21 +114,29 @@ impl CliConnectionResolver for ClientConfigCliConnectionResolver {
         input: CliConnectionInput<'_>,
     ) -> Result<Box<dyn Target>, ParseError> {
         match (command.connection_requirement(), input) {
-            (CliConnectionRequirement::LocalOnly, CliConnectionInput::LocalDefault) => {
-                Ok(Box::new(LocalTarget::new()))
-            }
+            (
+                CliConnectionRequirement::LocalOnly,
+                CliConnectionInput::DefaultTarget { .. } | CliConnectionInput::LocalTarget,
+            ) => Ok(Box::new(LocalTarget::new())),
             (CliConnectionRequirement::LocalOnly, CliConnectionInput::BackendTarget { .. }) => {
                 Err(ParseError(format!(
                     "{} uses a local connection target and cannot accept Backend target options",
                     command.display_name()
                 )))
             }
-            (CliConnectionRequirement::BackendOnly, CliConnectionInput::LocalDefault) => {
+            (CliConnectionRequirement::BackendOnly, CliConnectionInput::LocalTarget) => {
                 Err(ParseError(format!(
                     "{} requires a Backend connection target",
                     command.display_name()
                 )))
             }
+            (
+                CliConnectionRequirement::BackendOnly,
+                CliConnectionInput::DefaultTarget { workspace_id },
+            ) => Ok(Box::new(BackendTarget::new(
+                resolve_backend_url(None, workspace_id)?,
+                workspace_id.map(str::to_string),
+            ))),
             (
                 CliConnectionRequirement::BackendOnly | CliConnectionRequirement::ConnectionAware,
                 CliConnectionInput::BackendTarget {
@@ -140,9 +147,19 @@ impl CliConnectionResolver for ClientConfigCliConnectionResolver {
                 resolve_backend_url(explicit_backend_url, workspace_id)?,
                 workspace_id.map(str::to_string),
             ))),
-            (CliConnectionRequirement::ConnectionAware, CliConnectionInput::LocalDefault) => {
+            (CliConnectionRequirement::ConnectionAware, CliConnectionInput::LocalTarget) => {
                 Ok(Box::new(LocalTarget::new()))
             }
+            (
+                CliConnectionRequirement::ConnectionAware,
+                CliConnectionInput::DefaultTarget { workspace_id },
+            ) => match read_client_default_connection()? {
+                ClientDefaultConnection::Local => Ok(Box::new(LocalTarget::new())),
+                ClientDefaultConnection::Backend => Ok(Box::new(BackendTarget::new(
+                    resolve_backend_url(None, workspace_id)?,
+                    workspace_id.map(str::to_string),
+                ))),
+            },
         }
     }
 }
@@ -151,7 +168,7 @@ pub(crate) fn resolve_local_cli_connection<R: CliConnectionResolver + ?Sized>(
     resolver: &R,
     command: CliCommand,
 ) -> Result<Box<dyn Target>, ParseError> {
-    let target = resolver.resolve_connection(command, CliConnectionInput::LocalDefault)?;
+    let target = resolver.resolve_connection(command, CliConnectionInput::LocalTarget)?;
     match target.kind() {
         TargetKind::Local => Ok(target),
         TargetKind::Backend => Err(ParseError(format!(
@@ -196,7 +213,7 @@ pub(crate) fn resolve_connection_aware_cli_connection<R: CliConnectionResolver +
         ));
     }
     if explicit_local {
-        return resolver.resolve_connection(command, CliConnectionInput::LocalDefault);
+        return resolver.resolve_connection(command, CliConnectionInput::LocalTarget);
     }
     if explicit_backend_url.is_some() {
         return resolver.resolve_connection(
@@ -207,7 +224,7 @@ pub(crate) fn resolve_connection_aware_cli_connection<R: CliConnectionResolver +
             },
         );
     }
-    resolver.resolve_connection(command, CliConnectionInput::LocalDefault)
+    resolver.resolve_connection(command, CliConnectionInput::DefaultTarget { workspace_id })
 }
 
 pub(crate) fn backend_target_option_error_for_local_command(
@@ -266,7 +283,6 @@ mod tests {
             CliCommand::Mcp,
             CliCommand::MemoryLint,
             CliCommand::Session,
-            CliCommand::WorkspaceServer,
         ] {
             assert_eq!(
                 command.connection_requirement(),
@@ -297,10 +313,10 @@ mod tests {
     }
 
     #[test]
-    fn cli_connection_resolver_rejects_backend_only_local_default() {
+    fn cli_connection_resolver_rejects_backend_only_local_target() {
         let resolver = ClientConfigCliConnectionResolver;
         let err = resolver
-            .resolve_connection(CliCommand::Login, CliConnectionInput::LocalDefault)
+            .resolve_connection(CliCommand::Login, CliConnectionInput::LocalTarget)
             .unwrap_err();
 
         assert_eq!(

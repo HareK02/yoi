@@ -306,7 +306,7 @@ impl WorkspaceBackendConfigFile {
         match fs::read_to_string(&path) {
             Ok(local) => Ok(ConfigDiff::new(WORKSPACE_BACKEND_CONFIG_TEMPLATE, &local)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Err(Error::Config(format!(
-                "workspace backend local config `{}` does not exist; run `yoi workspace init --workspace {}` first",
+                "workspace backend local config `{}` does not exist; run `yoi-workspace-server init --workspace {}` first",
                 path.display(),
                 workspace_root.display()
             ))),
