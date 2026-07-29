@@ -65,7 +65,7 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("yoi-workspace-server: {error}");
+            eprintln!("yoi-server: {error}");
             ExitCode::FAILURE
         }
     }
@@ -160,7 +160,7 @@ async fn run_init_with_database_path(
     })?;
 
     eprintln!(
-        "yoi-workspace-server: initialized workspace `{}` ({}) in server DB `{}`",
+        "yoi-server: initialized workspace `{}` ({}) in server DB `{}`",
         options.workspace.display(),
         identity.workspace_id,
         database_path.display()
@@ -572,7 +572,7 @@ async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Erro
 
     let listener = TcpListener::bind(resolved.listen).await?;
     eprintln!(
-        "yoi-workspace-server: serving workspace `{}` from server DB `{}` on http://{}",
+        "yoi-server: serving workspace `{}` from server DB `{}` on http://{}",
         workspace.workspace_id,
         database_path.display(),
         listener.local_addr()?
@@ -588,7 +588,7 @@ fn append_trusted_runtime_sources(
     let Some(server_identity) = read_server_identity_file(&server_identity_path())? else {
         if !store.list_trusted_runtimes(false)?.is_empty() {
             return Err(Box::new(CliError(
-                "trusted runtimes are registered but server identity is not initialized; run `yoi-workspace-server identity init`".to_string(),
+                "trusted runtimes are registered but server identity is not initialized; run `yoi-server identity init`".to_string(),
             )));
         }
         return Ok(());
@@ -617,7 +617,8 @@ fn select_serve_workspace(store: &SqliteWorkspaceStore) -> Result<WorkspaceRecor
         .map_err(|error| CliError(format!("failed to list workspaces from server DB: {error}")))?;
     match workspaces.as_slice() {
         [] => Err(CliError(
-            "server DB has no workspace records; run `yoi-workspace-server init --workspace <PATH>`".to_string(),
+            "server DB has no workspace records; run `yoi-server init --workspace <PATH>`"
+                .to_string(),
         )),
         [workspace] => Ok(workspace.clone()),
         _ => Err(CliError(format!(
@@ -825,31 +826,31 @@ fn parse_listen(value: &str) -> Result<SocketAddr, CliError> {
 
 fn print_help() {
     println!(
-        "yoi-workspace-server\n\nUsage:\n  yoi-workspace-server init [OPTIONS]\n  yoi-workspace-server config <COMMAND> [OPTIONS]\n  yoi-workspace-server identity init --server-id <SERVER_ID> [--replace]\n  yoi-workspace-server identity show [--json]\n  yoi-workspace-server trust-runtime add --runtime-id <RUNTIME_ID> --base-url <URL> --public-key <KEY> [--display-name <NAME>] [--replace]\n  yoi-workspace-server trust-runtime list [--json] [--include-revoked]\n  yoi-workspace-server trust-runtime revoke --runtime-id <RUNTIME_ID>\n  yoi-workspace-server skills <COMMAND> [OPTIONS]\n  yoi-workspace-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
+        "yoi-server\n\nUsage:\n  yoi-server init [OPTIONS]\n  yoi-server config <COMMAND> [OPTIONS]\n  yoi-server identity init --server-id <SERVER_ID> [--replace]\n  yoi-server identity show [--json]\n  yoi-server trust-runtime add --runtime-id <RUNTIME_ID> --base-url <URL> --public-key <KEY> [--display-name <NAME>] [--replace]\n  yoi-server trust-runtime list [--json] [--include-revoked]\n  yoi-server trust-runtime revoke --runtime-id <RUNTIME_ID>\n  yoi-server skills <COMMAND> [OPTIONS]\n  yoi-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
     );
 }
 
 fn print_init_help() {
     println!(
-        "yoi-workspace-server init\n\nUsage:\n  yoi-workspace-server init [OPTIONS]\n\nDescription:\n  Initializes a Workspace identity, copies the packaged Backend config template to .yoi/workspace-backend.local.toml, and registers the Workspace in the Yoi server DB.\n\nOptions:\n      --workspace <PATH>  Workspace root to initialize (defaults to cwd)\n  -h, --help              Print help"
+        "yoi-server init\n\nUsage:\n  yoi-server init [OPTIONS]\n\nDescription:\n  Initializes a Workspace identity, copies the packaged Backend config template to .yoi/workspace-backend.local.toml, and registers the Workspace in the Yoi server DB.\n\nOptions:\n      --workspace <PATH>  Workspace root to initialize (defaults to cwd)\n  -h, --help              Print help"
     );
 }
 
 fn print_config_help() {
     println!(
-        "yoi-workspace-server config\n\nUsage:\n  yoi-workspace-server config default\n  yoi-workspace-server config diff [OPTIONS]\n\nDescription:\n  Prints the packaged Workspace Backend config template or compares it with the workspace-local config.\n\nOptions for diff:\n      --workspace <PATH>  Workspace root (defaults to cwd)\n  -h, --help              Print help"
+        "yoi-server config\n\nUsage:\n  yoi-server config default\n  yoi-server config diff [OPTIONS]\n\nDescription:\n  Prints the packaged Workspace Backend config template or compares it with the workspace-local config.\n\nOptions for diff:\n      --workspace <PATH>  Workspace root (defaults to cwd)\n  -h, --help              Print help"
     );
 }
 
 fn print_skills_help() {
     println!(
-        "yoi-workspace-server skills\n\nUsage:\n  yoi-workspace-server skills list [OPTIONS]\n  yoi-workspace-server skills lint [OPTIONS]\n  yoi-workspace-server skills show <NAME> [OPTIONS]\n\nDescription:\n  Uses the Workspace backend Skill catalog/lint/detail authority. Catalog output is lightweight and omits full SKILL.md bodies; detail output includes the body. allowed-tools and scripts are diagnostics only.\n\nOptions:\n      --workspace <PATH>  Workspace root (defaults to cwd)\n  -h, --help              Print help"
+        "yoi-server skills\n\nUsage:\n  yoi-server skills list [OPTIONS]\n  yoi-server skills lint [OPTIONS]\n  yoi-server skills show <NAME> [OPTIONS]\n\nDescription:\n  Uses the Workspace backend Skill catalog/lint/detail authority. Catalog output is lightweight and omits full SKILL.md bodies; detail output includes the body. allowed-tools and scripts are diagnostics only.\n\nOptions:\n      --workspace <PATH>  Workspace root (defaults to cwd)\n  -h, --help              Print help"
     );
 }
 
 fn print_serve_help() {
     println!(
-        "yoi-workspace-server serve\n\nUsage:\n  yoi-workspace-server serve [OPTIONS]\n\nDescription:\n  Serves the Workspace recorded in the Yoi server DB. Workspace records are stored in the XDG/Yoi data directory, and runtime sources are loaded from XDG runtimes.toml.\n\nOptions:\n      --listen <ADDR>     Listen address (default 127.0.0.1:8787)\n  -h, --help              Print help"
+        "yoi-server serve\n\nUsage:\n  yoi-server serve [OPTIONS]\n\nDescription:\n  Serves the Workspace recorded in the Yoi server DB. Workspace records are stored in the XDG/Yoi data directory, and runtime sources are loaded from XDG runtimes.toml.\n\nOptions:\n      --listen <ADDR>     Listen address (default 127.0.0.1:8787)\n  -h, --help              Print help"
     );
 }
 

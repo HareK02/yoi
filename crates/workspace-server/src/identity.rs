@@ -46,7 +46,7 @@ impl WorkspaceIdentity {
             Ok(raw) => Self::parse_str(&raw, &path),
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 Err(Error::WorkspaceIdentity(format!(
-                    "workspace is not initialized at {}; run `yoi-workspace-server init --workspace {}` first",
+                    "workspace is not initialized at {}; run `yoi-server init --workspace {}` first",
                     workspace_root.as_ref().display(),
                     workspace_root.as_ref().display()
                 )))

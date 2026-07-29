@@ -32,10 +32,10 @@ Current image roles:
 
 ```text
 yoi-runtime:latest
-  worker-runtime-rest-server
+  yoi-runtime
 
 yoi-server:latest
-  yoi-workspace-server
+  yoi-server
 
 yoi-webui:latest
   nginx serving built WebUI assets and proxying API requests
@@ -62,7 +62,7 @@ docker/workspace/.yoi/workspace.toml
 docker/workspace/.yoi/workspace-backend.local.toml
 ```
 
-The WebUI container serves static assets and proxies `/api` to the Backend Server. The Backend Server registers the Runtime container as a remote Runtime such as `docker-runtime`. The Runtime container runs `worker-runtime-rest-server` and owns Worker spawning/materialization for that runtime.
+The WebUI container serves static assets and proxies `/api` to the Backend Server. The Backend Server registers the Runtime container as a remote Runtime such as `docker-runtime`. The Runtime container runs `yoi-runtime` and owns Worker spawning/materialization for that runtime.
 
 Container user and writable data directories matter: runtime/server images must be able to write their configured data directories and named volumes. The current local-image Compose setup avoids an image-level `User` override and sets data-directory permissions accordingly.
 

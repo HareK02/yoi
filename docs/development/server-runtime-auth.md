@@ -28,13 +28,13 @@ RUNTIME_BASE_URL=http://127.0.0.1:38800
 From the Workspace Server host:
 
 ```bash
-yoi-workspace-server identity init --server-id server-main
+yoi-server identity init --server-id server-main
 ```
 
 Show the public identity and copy the `public_key` value:
 
 ```bash
-yoi-workspace-server identity show --json
+yoi-server identity show --json
 ```
 
 The Server private identity is stored in the Yoi data directory under the Server data root, currently:
@@ -50,13 +50,13 @@ On Unix this file is written with `0600` permissions. Do not copy the private ke
 From the Runtime host, using the same Runtime storage flags that the Runtime server process will use:
 
 ```bash
-worker-runtime-rest-server identity init --runtime-id runtime-main
+yoi-runtime identity init --runtime-id runtime-main
 ```
 
 Show the public identity and copy the `public_key` value:
 
 ```bash
-worker-runtime-rest-server identity show --json
+yoi-runtime identity show --json
 ```
 
 By default, Runtime auth state is stored at:
@@ -70,21 +70,21 @@ If the Runtime process is launched with `--fs-root` or `--fs-runtime-dir`, pass 
 Example with explicit Runtime storage:
 
 ```bash
-worker-runtime-rest-server identity init \
+yoi-runtime identity init \
   --runtime-id runtime-main \
   --fs-root /var/lib/yoi-runtime
 
-worker-runtime-rest-server identity show \
+yoi-runtime identity show \
   --json \
   --fs-root /var/lib/yoi-runtime
 ```
 
 ## 3. Register the Server public key on Runtime
 
-On the Runtime host, register the Server public key copied from `yoi-workspace-server identity show --json`:
+On the Runtime host, register the Server public key copied from `yoi-server identity show --json`:
 
 ```bash
-worker-runtime-rest-server trust-server add \
+yoi-runtime trust-server add \
   --server-id server-main \
   --public-key '<SERVER_PUBLIC_KEY>'
 ```
@@ -92,7 +92,7 @@ worker-runtime-rest-server trust-server add \
 With explicit Runtime storage, keep using the same storage flags:
 
 ```bash
-worker-runtime-rest-server trust-server add \
+yoi-runtime trust-server add \
   --server-id server-main \
   --public-key '<SERVER_PUBLIC_KEY>' \
   --fs-root /var/lib/yoi-runtime
@@ -101,27 +101,27 @@ worker-runtime-rest-server trust-server add \
 Verify:
 
 ```bash
-worker-runtime-rest-server trust-server list --json
+yoi-runtime trust-server list --json
 ```
 
 ## 4. Register the Runtime public key and endpoint on Server
 
-On the Workspace Server host, register the Runtime public key copied from `worker-runtime-rest-server identity show --json`:
+On the Workspace Server host, register the Runtime public key copied from `yoi-runtime identity show --json`:
 
 ```bash
-yoi-workspace-server trust-runtime add \
+yoi-server trust-runtime add \
   --runtime-id runtime-main \
   --base-url http://127.0.0.1:38800 \
   --public-key '<RUNTIME_PUBLIC_KEY>' \
   --display-name 'Runtime main'
 ```
 
-This writes a trusted Runtime record to the Server DB. During `yoi-workspace-server serve`, active trusted Runtime records are loaded as remote Runtime sources and receive signed capability tokens. You do not need to duplicate the same Runtime in `runtimes.toml` for this trust-backed path.
+This writes a trusted Runtime record to the Server DB. During `yoi-server serve`, active trusted Runtime records are loaded as remote Runtime sources and receive signed capability tokens. You do not need to duplicate the same Runtime in `runtimes.toml` for this trust-backed path.
 
 Verify:
 
 ```bash
-yoi-workspace-server trust-runtime list --json
+yoi-server trust-runtime list --json
 ```
 
 ## 5. Start Runtime and Workspace Server
@@ -129,7 +129,7 @@ yoi-workspace-server trust-runtime list --json
 Start Runtime with the same storage flags used during Runtime identity/trust setup:
 
 ```bash
-worker-runtime-rest-server \
+yoi-runtime \
   --bind 127.0.0.1:38800
 ```
 
@@ -138,26 +138,26 @@ For repository builds, the equivalent cargo command is:
 ```bash
 cargo run -p worker-runtime \
   --features ws-server,fs-store \
-  --bin worker-runtime-rest-server \
+  --bin yoi-runtime \
   -- --bind 127.0.0.1:38800
 ```
 
 Start Workspace Server:
 
 ```bash
-yoi-workspace-server serve --listen 127.0.0.1:8787
+yoi-server serve --listen 127.0.0.1:8787
 ```
 
 For repository builds:
 
 ```bash
-cargo run -p yoi-workspace-server -- serve --listen 127.0.0.1:8787
+cargo run -p yoi-workspace-server --bin yoi-server -- serve --listen 127.0.0.1:8787
 ```
 
 If the Server DB has no workspace record yet, initialize it first:
 
 ```bash
-yoi-workspace-server init --workspace <WORKSPACE_ROOT>
+yoi-server init --workspace <WORKSPACE_ROOT>
 ```
 
 ## Smoke checks
@@ -165,8 +165,8 @@ yoi-workspace-server init --workspace <WORKSPACE_ROOT>
 Check both trust stores:
 
 ```bash
-yoi-workspace-server trust-runtime list --json
-worker-runtime-rest-server trust-server list --json
+yoi-server trust-runtime list --json
+yoi-runtime trust-server list --json
 ```
 
 Check that Workspace Server can see Runtime workers through the authenticated path. From the CLI:
@@ -186,13 +186,13 @@ Identity and trust records are intentionally not overwritten by default.
 Rotate Server identity:
 
 ```bash
-yoi-workspace-server identity init --server-id server-main --replace
+yoi-server identity init --server-id server-main --replace
 ```
 
 After Server identity rotation, every Runtime that trusts that Server must be updated with the new Server public key:
 
 ```bash
-worker-runtime-rest-server trust-server add \
+yoi-runtime trust-server add \
   --server-id server-main \
   --public-key '<NEW_SERVER_PUBLIC_KEY>' \
   --replace
@@ -201,13 +201,13 @@ worker-runtime-rest-server trust-server add \
 Rotate Runtime identity:
 
 ```bash
-worker-runtime-rest-server identity init --runtime-id runtime-main --replace
+yoi-runtime identity init --runtime-id runtime-main --replace
 ```
 
 After Runtime identity rotation, Server must be updated with the new Runtime public key:
 
 ```bash
-yoi-workspace-server trust-runtime add \
+yoi-server trust-runtime add \
   --runtime-id runtime-main \
   --base-url http://127.0.0.1:38800 \
   --public-key '<NEW_RUNTIME_PUBLIC_KEY>' \
@@ -219,13 +219,13 @@ yoi-workspace-server trust-runtime add \
 Revoke a trusted Runtime on Server:
 
 ```bash
-yoi-workspace-server trust-runtime revoke --runtime-id runtime-main
+yoi-server trust-runtime revoke --runtime-id runtime-main
 ```
 
 Remove a trusted Server from Runtime:
 
 ```bash
-worker-runtime-rest-server trust-server revoke --server-id server-main
+yoi-runtime trust-server revoke --server-id server-main
 ```
 
 ## Troubleshooting
@@ -235,7 +235,7 @@ worker-runtime-rest-server trust-server revoke --server-id server-main
 The Server DB contains trusted Runtime records, but the Server signing identity file does not exist. Run:
 
 ```bash
-yoi-workspace-server identity init --server-id server-main
+yoi-server identity init --server-id server-main
 ```
 
 If the identity was created in another environment, ensure the Server process is using the same Yoi data directory.
@@ -245,8 +245,8 @@ If the identity was created in another environment, ensure the Server process is
 Runtime only enables signed capability-token auth when both a Runtime identity and at least one trusted Server are present in its auth file. Check:
 
 ```bash
-worker-runtime-rest-server identity show --json
-worker-runtime-rest-server trust-server list --json
+yoi-runtime identity show --json
+yoi-runtime trust-server list --json
 ```
 
 Also confirm the Runtime process was started with the same `--fs-root` / `--fs-runtime-dir` used for setup.
@@ -256,8 +256,8 @@ Also confirm the Runtime process was started with the same `--fs-root` / `--fs-r
 Confirm the `--runtime-id` registered on Server exactly matches the Runtime identity id:
 
 ```bash
-worker-runtime-rest-server identity show --json
-yoi-workspace-server trust-runtime list --json
+yoi-runtime identity show --json
+yoi-server trust-runtime list --json
 ```
 
 `RUNTIME_ID` is the token audience; mismatches are rejected by Runtime.

@@ -30,7 +30,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("worker-runtime-rest-server: {error}");
+            eprintln!("yoi-runtime: {error}");
             if let ProcessError::Usage(_) = error {
                 eprintln!();
                 eprintln!("{}", usage());
@@ -64,7 +64,7 @@ fn run() -> Result<(), ProcessError> {
         let local_addr = listener.local_addr()?;
         let worker_runtime = build_runtime(&config)?;
         eprintln!(
-            "worker-runtime REST server listening on {local_addr}; intended client is a trusted backend/proxy, not a browser"
+            "yoi-runtime listening on {local_addr}; intended client is a trusted backend/proxy, not a browser"
         );
         worker_runtime::http_server::serve_runtime_http_with_auth(
             worker_runtime,
@@ -796,7 +796,7 @@ fn run_trust_server_command(mut args: VecDeque<String>) -> Result<(), ProcessErr
 }
 
 fn usage() -> &'static str {
-    r#"Usage: worker-runtime-rest-server [OPTIONS]
+    r#"Usage: yoi-runtime [OPTIONS]
 
 Starts a worker-backed Runtime REST command API for a trusted backend/proxy.
 Browsers must not connect to this Runtime process directly.

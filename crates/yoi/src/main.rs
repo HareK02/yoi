@@ -1671,8 +1671,8 @@ Backend-only commands:
   login                        Run Backend device login and save the API token
 
 Standalone binaries:
-  yoi-workspace-server         Workspace Backend server/admin CLI
-  worker-runtime-rest-server   Worker Runtime REST server
+  yoi-server         Workspace Backend server/admin CLI
+  yoi-runtime   Worker Runtime REST server
 
 Options:
   -h, --help                   Print help
@@ -1826,8 +1826,8 @@ backend = "shared"
         assert!(TOP_LEVEL_HELP.contains("--backend <URL>"));
         assert!(TOP_LEVEL_HELP.contains("<data_dir>/client/config.toml"));
         assert!(TOP_LEVEL_HELP.contains("<cwd>/.yoi/client.config.toml"));
-        assert!(TOP_LEVEL_HELP.contains("yoi-workspace-server"));
-        assert!(TOP_LEVEL_HELP.contains("worker-runtime-rest-server"));
+        assert!(TOP_LEVEL_HELP.contains("yoi-server"));
+        assert!(TOP_LEVEL_HELP.contains("yoi-runtime"));
         assert!(!TOP_LEVEL_HELP.contains("yoi workspace"));
         assert!(!TOP_LEVEL_HELP.contains("yoi server"));
         assert!(!TOP_LEVEL_HELP.contains("TARGET_OPTIONS"));

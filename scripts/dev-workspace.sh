@@ -57,8 +57,8 @@ usage() {
 Usage: $(basename "$0") <start|stop|restart|status>
 
 Manage the local Yoi development stack for this checkout:
-  runtime   target/debug/worker-runtime-rest-server --bind $RUNTIME_BIND
-  backend   target/debug/yoi-workspace-server serve --listen $BACKEND_LISTEN
+  runtime   target/debug/yoi-runtime --bind $RUNTIME_BIND
+  backend   target/debug/yoi-server serve --listen $BACKEND_LISTEN
   frontend  deno run -A npm:vite@7.2.7 dev --host $FRONTEND_HOST --port $FRONTEND_PORT  (cwd: web/workspace)
 
 Actions:
@@ -307,7 +307,7 @@ build_runtime_backend() {
     log "building runtime binary"
     (
       cd "$ROOT_DIR"
-      run_cargo build -p worker-runtime --features ws-server,fs-store --bin worker-runtime-rest-server
+      run_cargo build -p worker-runtime --features ws-server,fs-store --bin yoi-runtime
     )
   else
     log "runtime disabled by YOI_DEV_RUNTIME_ENABLED=0; skipping runtime build"
@@ -316,7 +316,7 @@ build_runtime_backend() {
   log "building backend binary"
   (
     cd "$ROOT_DIR"
-    run_cargo build -p yoi-workspace-server --bin yoi-workspace-server
+    run_cargo build -p yoi-workspace-server --bin yoi-server
   )
 }
 
@@ -327,7 +327,7 @@ start_runtime() {
   fi
   local port runtime_bin
   port="$(port_for_addr "$RUNTIME_BIND")"
-  runtime_bin="$ROOT_DIR/target/debug/worker-runtime-rest-server"
+  runtime_bin="$ROOT_DIR/target/debug/yoi-runtime"
   if [[ ! -x "$runtime_bin" ]]; then
     printf 'runtime binary not found or not executable: %s\n' "$runtime_bin" >&2
     return 1
@@ -339,7 +339,7 @@ start_runtime() {
 start_backend() {
   local port backend_bin
   port="$(port_for_addr "$BACKEND_LISTEN")"
-  backend_bin="$ROOT_DIR/target/debug/yoi-workspace-server"
+  backend_bin="$ROOT_DIR/target/debug/yoi-server"
   if [[ ! -x "$backend_bin" ]]; then
     printf 'backend binary not found or not executable: %s\n' "$backend_bin" >&2
     return 1

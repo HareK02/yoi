@@ -231,7 +231,7 @@ in
     tag = imageTag;
     copyToRoot = runtimeRoot;
     config = {
-      Entrypoint = [ "/bin/worker-runtime-rest-server" ];
+      Entrypoint = [ "/bin/yoi-runtime" ];
       Cmd = [
         "--bind"
         "0.0.0.0:38800"
@@ -259,7 +259,7 @@ in
     tag = imageTag;
     copyToRoot = serverRoot;
     config = {
-      Entrypoint = [ "/bin/yoi-workspace-server" ];
+      Entrypoint = [ "/bin/yoi-server" ];
       Cmd = [
         "serve"
         "--listen"

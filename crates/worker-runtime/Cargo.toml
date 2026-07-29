@@ -7,7 +7,7 @@ license.workspace = true
 autobins = false
 
 [[bin]]
-name = "worker-runtime-rest-server"
+name = "yoi-runtime"
 path = "src/main.rs"
 required-features = ["ws-server", "fs-store"]
 

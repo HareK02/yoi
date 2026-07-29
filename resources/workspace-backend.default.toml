@@ -1,14 +1,14 @@
 # Workspace Backend local config template.
 #
-# `yoi-workspace-server init` copies this packaged template to
+# `yoi-server init` copies this packaged template to
 # `.yoi/workspace-backend.local.toml` without overwriting an existing file.
 # The `.local` file is intentionally git-ignored.
 #
 # Print the latest packaged template with:
-#   yoi-workspace-server config default
+#   yoi-server config default
 #
 # Compare the local config with the latest packaged template with:
-#   yoi-workspace-server config diff
+#   yoi-server config diff
 #
 # Omit a key to use the built-in fallback. TOML has no `null`, so optional
 # settings are represented by leaving the key commented out.

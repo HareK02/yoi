@@ -3,7 +3,7 @@
 SvelteKit static SPA for the Yoi workspace control plane.
 
 The frontend is intentionally static. Workspace authority, validation, and API
-behavior live in the Rust `yoi-workspace-server` backend.
+behavior live in the Rust `yoi-server` backend.
 
 ## Development
 
@@ -30,12 +30,12 @@ printed by `deno task dev`.
 If you want to run the backend from the repository root instead:
 
 ```bash
-cargo run -p yoi-workspace-server -- serve --listen 127.0.0.1:8787
+cargo run -p yoi-workspace-server --bin yoi-server -- serve --listen 127.0.0.1:8787
 ```
 
 The backend reads Workspace records from the Yoi server DB at
 `<data_dir>/server/server.db`. Run
-`cargo run -p yoi-workspace-server -- init --workspace .` first when the server
+`cargo run -p yoi-workspace-server --bin yoi-server -- init --workspace .` first when the server
 DB has not been initialized.
 
 ## Static build
