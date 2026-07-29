@@ -37,6 +37,8 @@ pub enum RuntimeAuthError {
     WrongAudience { expected: String, actual: String },
     #[error("capability token is expired")]
     Expired,
+    #[error("capability token is missing workspace scope")]
+    MissingWorkspaceScope,
     #[error("capability token is missing required permission `{0}`")]
     MissingPermission(String),
 }
@@ -186,6 +188,9 @@ pub fn verify_capability_token(
     }
     if claims.exp < now_seconds {
         return Err(RuntimeAuthError::Expired);
+    }
+    if claims.workspace_id.trim().is_empty() {
+        return Err(RuntimeAuthError::MissingWorkspaceScope);
     }
     if let Some(required) = required_permission {
         if !claims

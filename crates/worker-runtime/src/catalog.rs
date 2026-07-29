@@ -230,6 +230,8 @@ pub struct WorkerSummary {
     pub worker_id: WorkerId,
     pub status: WorkerStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<WorkingDirectoryStatus>,
     pub profile: ProfileSelector,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -246,6 +248,8 @@ pub struct WorkerDetail {
     pub worker_ref: WorkerRef,
     pub worker_id: WorkerId,
     pub status: WorkerStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<WorkingDirectoryStatus>,
     pub profile: ProfileSelector,

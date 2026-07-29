@@ -302,6 +302,7 @@ pub(crate) struct PersistedWorkerRecord {
     pub(crate) worker_ref: WorkerRef,
     pub(crate) worker_id: WorkerId,
     pub(crate) request: CreateWorkerRequest,
+    pub(crate) workspace_id: Option<String>,
     pub(crate) working_directory: Option<WorkingDirectoryStatus>,
     pub(crate) last_event_id: u64,
 }
@@ -401,6 +402,8 @@ struct WorkerSnapshot {
     worker_id: WorkerId,
     request: CreateWorkerRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     working_directory: Option<WorkingDirectoryStatus>,
     /// One-way migration input for schema-v1 snapshots. New snapshots never
     /// write the removed execution projection.
@@ -422,6 +425,7 @@ impl WorkerSnapshot {
             worker_ref: worker.worker_ref.clone(),
             worker_id: worker.worker_id.clone(),
             request: worker.request.clone(),
+            workspace_id: worker.workspace_id.clone(),
             working_directory: worker.working_directory.clone(),
             legacy_execution: None,
             last_event_id: worker.last_event_id,
@@ -453,10 +457,17 @@ impl WorkerSnapshot {
     }
 
     fn into_persisted(self) -> PersistedWorkerRecord {
+        let workspace_id = self.workspace_id.or_else(|| {
+            self.request
+                .workspace_api
+                .as_ref()
+                .map(|workspace_api| workspace_api.workspace_id.clone())
+        });
         PersistedWorkerRecord {
             worker_ref: self.worker_ref,
             worker_id: self.worker_id,
             request: self.request,
+            workspace_id,
             working_directory: self.working_directory.or_else(|| {
                 self.legacy_execution
                     .and_then(|execution| execution.working_directory)

@@ -8,7 +8,8 @@
 
 use crate::Runtime;
 use crate::auth::{
-    RuntimeAuthContext, RuntimeHttpAuthConfig, unix_now_seconds, verify_capability_token,
+    RuntimeAuthContext, RuntimeAuthError, RuntimeHttpAuthConfig, unix_now_seconds,
+    verify_capability_token,
 };
 use crate::catalog::{
     ConfigBundleRef, CreateWorkerRequest, WorkerDetail, WorkerLifecycleAck, WorkerSummary,
@@ -25,7 +26,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 #[cfg(feature = "ws-server")]
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::{Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -383,12 +384,20 @@ async fn check_config_bundle(
 
 async fn list_workers(
     State(state): State<RuntimeHttpState>,
+    auth: Option<Extension<RuntimeAuthContext>>,
     query: Result<Query<RuntimeHttpWorkersQuery>, QueryRejection>,
 ) -> RestResult<RuntimeHttpWorkersResponse> {
     let Query(query) = query.map_err(RuntimeHttpRestError::query_rejection)?;
-    let workers = match query.status {
-        Some(RuntimeHttpWorkerStatusFilter::Stopped) => state.runtime.list_stopped_workers(),
-        None => state.runtime.list_workers(),
+    let workspace_id = auth_workspace_id(&state, auth.as_ref())?;
+    let workers = match (query.status, workspace_id) {
+        (Some(RuntimeHttpWorkerStatusFilter::Stopped), Some(workspace_id)) => {
+            state.runtime.list_stopped_workers_scoped(workspace_id)
+        }
+        (Some(RuntimeHttpWorkerStatusFilter::Stopped), None) => {
+            state.runtime.list_stopped_workers()
+        }
+        (None, Some(workspace_id)) => state.runtime.list_workers_scoped(workspace_id),
+        (None, None) => state.runtime.list_workers(),
     }
     .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkersResponse { workers }))
@@ -448,67 +457,87 @@ async fn cleanup_working_directory(
 
 async fn get_worker(
     State(state): State<RuntimeHttpState>,
+    auth: Option<Extension<RuntimeAuthContext>>,
     Path(worker_id): Path<String>,
 ) -> RestResult<RuntimeHttpWorkerResponse> {
     let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
-    let worker = state
-        .runtime
-        .worker_detail(&worker_ref)
-        .map_err(RuntimeHttpRestError::runtime)?;
+    let worker = match auth_workspace_id(&state, auth.as_ref())? {
+        Some(workspace_id) => state
+            .runtime
+            .worker_detail_scoped(workspace_id, &worker_ref),
+        None => state.runtime.worker_detail(&worker_ref),
+    }
+    .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkerResponse { worker }))
 }
 
 async fn delete_worker(
     State(state): State<RuntimeHttpState>,
+    auth: Option<Extension<RuntimeAuthContext>>,
     Path(worker_id): Path<String>,
 ) -> RestResult<RuntimeHttpWorkerDeleteResponse> {
     let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
-    let worker = state
-        .runtime
-        .delete_worker(&worker_ref)
-        .map_err(RuntimeHttpRestError::runtime)?;
+    let worker = match auth_workspace_id(&state, auth.as_ref())? {
+        Some(workspace_id) => state
+            .runtime
+            .delete_worker_scoped(workspace_id, &worker_ref),
+        None => state.runtime.delete_worker(&worker_ref),
+    }
+    .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkerDeleteResponse { worker }))
 }
 
 async fn create_worker(
     State(state): State<RuntimeHttpState>,
+    auth: Option<Extension<RuntimeAuthContext>>,
     body: Result<Json<CreateWorkerRequest>, JsonRejection>,
 ) -> RestResult<RuntimeHttpWorkerResponse> {
     let Json(request) = body.map_err(RuntimeHttpRestError::json_rejection)?;
-    let worker = state
-        .runtime
-        .create_worker(request)
-        .map_err(RuntimeHttpRestError::runtime)?;
+    let worker = match auth_workspace_id(&state, auth.as_ref())? {
+        Some(workspace_id) => state.runtime.create_worker_scoped(workspace_id, request),
+        None => state.runtime.create_worker(request),
+    }
+    .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkerResponse { worker }))
 }
 
 async fn restore_worker(
     State(state): State<RuntimeHttpState>,
+    auth: Option<Extension<RuntimeAuthContext>>,
     Path(worker_id): Path<String>,
 ) -> RestResult<RuntimeHttpWorkerResponse> {
     let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
-    let worker = state
-        .runtime
-        .restore_worker(&worker_ref)
-        .map_err(RuntimeHttpRestError::runtime)?;
+    let worker = match auth_workspace_id(&state, auth.as_ref())? {
+        Some(workspace_id) => state
+            .runtime
+            .restore_worker_scoped(workspace_id, &worker_ref),
+        None => state.runtime.restore_worker(&worker_ref),
+    }
+    .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkerResponse { worker }))
 }
 
 #[cfg(feature = "ws-server")]
 async fn worker_protocol_ws(
     State(state): State<RuntimeHttpState>,
+    auth: Option<Extension<RuntimeAuthContext>>,
     Path(worker_id): Path<String>,
     Query(query): Query<RuntimeWorkerEventsWsQuery>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, RuntimeHttpRestError> {
     let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
-    state
-        .runtime
-        .worker_detail(&worker_ref)
-        .map_err(RuntimeHttpRestError::runtime)?;
+    let workspace_id = auth_workspace_id(&state, auth.as_ref())?.map(ToOwned::to_owned);
+    match workspace_id.as_deref() {
+        Some(workspace_id) => state
+            .runtime
+            .worker_detail_scoped(workspace_id, &worker_ref)
+            .map(|_| ()),
+        None => state.runtime.worker_detail(&worker_ref).map(|_| ()),
+    }
+    .map_err(RuntimeHttpRestError::runtime)?;
     Ok(ws
         .on_upgrade(move |socket| {
-            worker_protocol_ws_session(state.runtime, worker_ref, query, socket)
+            worker_protocol_ws_session(state.runtime, workspace_id, worker_ref, query, socket)
         })
         .into_response())
 }
@@ -516,6 +545,7 @@ async fn worker_protocol_ws(
 #[cfg(feature = "ws-server")]
 async fn worker_protocol_ws_session(
     runtime: Runtime,
+    workspace_id: Option<String>,
     worker_ref: WorkerRef,
     query: RuntimeWorkerEventsWsQuery,
     mut socket: WebSocket,
@@ -599,18 +629,28 @@ async fn worker_protocol_ws_session(
             inbound = socket.next() => {
                 match inbound {
                     Some(Ok(WsMessage::Text(text))) => match decode_method(&text) {
-                        Ok(method) => match runtime.send_protocol_method(&worker_ref, method) {
-                            Ok(events) => {
-                                for event in events {
+                        Ok(method) => {
+                            let result = match workspace_id.as_deref() {
+                                Some(workspace_id) => runtime.send_protocol_method_scoped(
+                                    workspace_id,
+                                    &worker_ref,
+                                    method,
+                                ),
+                                None => runtime.send_protocol_method(&worker_ref, method),
+                            };
+                            match result {
+                                Ok(events) => {
+                                    for event in events {
+                                        if !send_protocol_event(&mut socket, &event).await {
+                                            return;
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    let event = protocol_error_event(error.to_string());
                                     if !send_protocol_event(&mut socket, &event).await {
                                         return;
                                     }
-                                }
-                            }
-                            Err(error) => {
-                                let event = protocol_error_event(error.to_string());
-                                if !send_protocol_event(&mut socket, &event).await {
-                                    return;
                                 }
                             }
                         },
@@ -688,29 +728,42 @@ fn protocol_error_event(message: impl Into<String>) -> protocol::Event {
 
 async fn send_worker_input(
     State(state): State<RuntimeHttpState>,
+    auth: Option<Extension<RuntimeAuthContext>>,
     Path(worker_id): Path<String>,
     body: Result<Json<WorkerInput>, JsonRejection>,
 ) -> RestResult<RuntimeHttpWorkerInputResponse> {
     let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
     let Json(input) = body.map_err(RuntimeHttpRestError::json_rejection)?;
-    let ack = state
-        .runtime
-        .send_input(&worker_ref, input)
-        .map_err(RuntimeHttpRestError::runtime)?;
+    let ack = match auth_workspace_id(&state, auth.as_ref())? {
+        Some(workspace_id) => state
+            .runtime
+            .send_input_scoped(workspace_id, &worker_ref, input),
+        None => state.runtime.send_input(&worker_ref, input),
+    }
+    .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkerInputResponse { ack }))
 }
 
 async fn worker_completions(
     State(state): State<RuntimeHttpState>,
+    auth: Option<Extension<RuntimeAuthContext>>,
     Path(worker_id): Path<String>,
     body: Result<Json<RuntimeHttpWorkerCompletionsRequest>, JsonRejection>,
 ) -> RestResult<RuntimeHttpWorkerCompletionsResponse> {
     let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
     let Json(request) = body.map_err(RuntimeHttpRestError::json_rejection)?;
-    let entries = state
-        .runtime
-        .worker_completions(&worker_ref, request.kind, &request.prefix)
-        .map_err(RuntimeHttpRestError::runtime)?;
+    let entries = match auth_workspace_id(&state, auth.as_ref())? {
+        Some(workspace_id) => state.runtime.worker_completions_scoped(
+            workspace_id,
+            &worker_ref,
+            request.kind,
+            &request.prefix,
+        ),
+        None => state
+            .runtime
+            .worker_completions(&worker_ref, request.kind, &request.prefix),
+    }
+    .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkerCompletionsResponse {
         kind: request.kind,
         prefix: request.prefix,
@@ -720,29 +773,41 @@ async fn worker_completions(
 
 async fn stop_worker(
     State(state): State<RuntimeHttpState>,
+    auth: Option<Extension<RuntimeAuthContext>>,
     Path(worker_id): Path<String>,
     body: Bytes,
 ) -> RestResult<RuntimeHttpWorkerLifecycleResponse> {
     let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
     let request = parse_optional_lifecycle_request(body)?;
-    let ack = state
-        .runtime
-        .stop_worker(&worker_ref, request.reason)
-        .map_err(RuntimeHttpRestError::runtime)?;
+    let ack = match auth_workspace_id(&state, auth.as_ref())? {
+        Some(workspace_id) => {
+            state
+                .runtime
+                .stop_worker_scoped(workspace_id, &worker_ref, request.reason)
+        }
+        None => state.runtime.stop_worker(&worker_ref, request.reason),
+    }
+    .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkerLifecycleResponse { ack }))
 }
 
 async fn cancel_worker(
     State(state): State<RuntimeHttpState>,
+    auth: Option<Extension<RuntimeAuthContext>>,
     Path(worker_id): Path<String>,
     body: Bytes,
 ) -> RestResult<RuntimeHttpWorkerLifecycleResponse> {
     let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
     let request = parse_optional_lifecycle_request(body)?;
-    let ack = state
-        .runtime
-        .cancel_worker(&worker_ref, request.reason)
-        .map_err(RuntimeHttpRestError::runtime)?;
+    let ack = match auth_workspace_id(&state, auth.as_ref())? {
+        Some(workspace_id) => {
+            state
+                .runtime
+                .cancel_worker_scoped(workspace_id, &worker_ref, request.reason)
+        }
+        None => state.runtime.cancel_worker(&worker_ref, request.reason),
+    }
+    .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkerLifecycleResponse { ack }))
 }
 
@@ -806,12 +871,7 @@ async fn require_runtime_auth(
                 return next.run(request).await;
             }
             Err(error) => {
-                return RuntimeHttpRestError::new(
-                    StatusCode::UNAUTHORIZED,
-                    "unauthorized",
-                    format!("invalid Runtime capability token: {error}"),
-                )
-                .into_response();
+                return runtime_auth_error_response(error).into_response();
             }
         }
     }
@@ -834,6 +894,51 @@ async fn require_runtime_auth(
         });
     }
     next.run(request).await
+}
+
+fn runtime_auth_error_response(error: RuntimeAuthError) -> RuntimeHttpRestError {
+    match error {
+        RuntimeAuthError::MissingPermission(permission) => RuntimeHttpRestError::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            format!("Runtime capability token is missing required permission `{permission}`"),
+        ),
+        RuntimeAuthError::MissingWorkspaceScope => RuntimeHttpRestError::new(
+            StatusCode::FORBIDDEN,
+            "workspace_scope_required",
+            "Runtime capability token is missing workspace scope",
+        ),
+        other => RuntimeHttpRestError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            format!("invalid Runtime capability token: {other}"),
+        ),
+    }
+}
+
+fn auth_workspace_id<'a>(
+    state: &RuntimeHttpState,
+    auth: Option<&'a Extension<RuntimeAuthContext>>,
+) -> Result<Option<&'a str>, RuntimeHttpRestError> {
+    let Some(Extension(context)) = auth else {
+        if state.auth.is_some() || state.local_token.is_some() {
+            return Err(RuntimeHttpRestError::new(
+                StatusCode::FORBIDDEN,
+                "workspace_scope_required",
+                "Runtime worker operation requires a workspace-scoped authorization context",
+            ));
+        }
+        return Ok(None);
+    };
+    let workspace_id = context.workspace_id.trim();
+    if workspace_id.is_empty() {
+        return Err(RuntimeHttpRestError::new(
+            StatusCode::FORBIDDEN,
+            "workspace_scope_required",
+            "Runtime worker operation requires a non-empty workspace scope",
+        ));
+    }
+    Ok(Some(workspace_id))
 }
 
 fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static str> {
@@ -991,7 +1096,11 @@ pub enum RuntimeHttpServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{ConfigBundleRef, ProfileSelector, WorkerStatus};
+    use crate::auth::{
+        CapabilityTokenSigner, RuntimeHttpAuthConfig, RuntimeIdentityMaterial, TrustedServerKey,
+        capability_claims,
+    };
+    use crate::catalog::{ConfigBundleRef, ProfileSelector, WorkerStatus, WorkspaceApiRef};
     use crate::config_bundle::{
         ConfigBundle, ConfigBundleMetadata, ConfigBundleProvenance, ConfigProfileDescriptor,
     };
@@ -1027,6 +1136,199 @@ mod tests {
             profile_source_archive_handle: None,
         }
         .with_computed_digest()
+    }
+
+    fn scoped_task_request(objective: &str, workspace_id: &str) -> CreateWorkerRequest {
+        let mut request = task_request(objective);
+        request.workspace_api = Some(WorkspaceApiRef {
+            workspace_id: workspace_id.to_string(),
+            base_url: format!("https://workspace.example/{workspace_id}"),
+        });
+        request
+    }
+
+    fn auth_config_and_signer() -> (RuntimeHttpAuthConfig, CapabilityTokenSigner) {
+        let identity = RuntimeIdentityMaterial::generate("server-a").unwrap();
+        let signer = CapabilityTokenSigner::new(identity.identity_id.clone(), identity.private_key);
+        let auth = RuntimeHttpAuthConfig {
+            runtime_id: "runtime-test".to_string(),
+            trusted_servers: vec![TrustedServerKey {
+                server_id: identity.identity_id,
+                public_key: identity.public_key,
+                display_name: None,
+            }],
+        };
+        (auth, signer)
+    }
+
+    fn token_for_workspace(signer: &CapabilityTokenSigner, workspace_id: &str) -> String {
+        token_for_workspace_with_permissions(
+            signer,
+            workspace_id,
+            [
+                "workers:list",
+                "workers:create",
+                "workers:read",
+                "workers:input",
+                "workers:stop",
+                "workers:protocol",
+                "workers:delete",
+            ],
+        )
+    }
+
+    fn token_for_workspace_with_permissions<const N: usize>(
+        signer: &CapabilityTokenSigner,
+        workspace_id: &str,
+        permissions: [&str; N],
+    ) -> String {
+        let claims = capability_claims(
+            signer.server_id(),
+            "runtime-test",
+            workspace_id,
+            permissions.into_iter().map(str::to_string).collect(),
+            3600,
+        )
+        .unwrap();
+        signer.sign(&claims).unwrap()
+    }
+
+    fn bearer_request(
+        method: Method,
+        uri: impl AsRef<str>,
+        token: &str,
+        body: impl Into<Body>,
+    ) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri.as_ref())
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.into())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn capability_workspace_scope_filters_list_and_hides_detail() {
+        let runtime =
+            Runtime::with_execution_backend(RuntimeOptions::default(), Arc::new(AcceptingBackend))
+                .unwrap();
+        let (auth, signer) = auth_config_and_signer();
+        let token_a = token_for_workspace(&signer, "workspace-a");
+        let token_b = token_for_workspace(&signer, "workspace-b");
+        let app = runtime_http_router_with_auth(runtime, None, Some(auth));
+
+        let create_a = scoped_task_request("a", "workspace-a");
+        let response = app
+            .clone()
+            .oneshot(bearer_request(
+                Method::POST,
+                "/v1/workers",
+                &token_a,
+                serde_json::to_vec(&create_a).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let worker_a: RuntimeHttpWorkerResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(worker_a.worker.workspace_id.as_deref(), Some("workspace-a"));
+
+        let create_b = scoped_task_request("b", "workspace-b");
+        let response = app
+            .clone()
+            .oneshot(bearer_request(
+                Method::POST,
+                "/v1/workers",
+                &token_b,
+                serde_json::to_vec(&create_b).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let worker_b: RuntimeHttpWorkerResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(worker_b.worker.workspace_id.as_deref(), Some("workspace-b"));
+
+        let response = app
+            .clone()
+            .oneshot(bearer_request(
+                Method::GET,
+                "/v1/workers",
+                &token_a,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let workers: RuntimeHttpWorkersResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(workers.workers.len(), 1);
+        assert_eq!(workers.workers[0].worker_ref, worker_a.worker.worker_ref);
+        assert_eq!(
+            workers.workers[0].workspace_id.as_deref(),
+            Some("workspace-a")
+        );
+
+        let response = app
+            .oneshot(bearer_request(
+                Method::GET,
+                format!("/v1/workers/{}", worker_b.worker.worker_id),
+                &token_a,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn capability_token_without_workspace_scope_is_forbidden() {
+        let runtime =
+            Runtime::with_execution_backend(RuntimeOptions::default(), Arc::new(AcceptingBackend))
+                .unwrap();
+        let (auth, signer) = auth_config_and_signer();
+        let token = token_for_workspace_with_permissions(&signer, "", ["workers:list"]);
+        let app = runtime_http_router_with_auth(runtime, None, Some(auth));
+
+        let response = app
+            .oneshot(bearer_request(
+                Method::GET,
+                "/v1/workers",
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn capability_token_without_worker_permission_is_forbidden() {
+        let runtime =
+            Runtime::with_execution_backend(RuntimeOptions::default(), Arc::new(AcceptingBackend))
+                .unwrap();
+        let (auth, signer) = auth_config_and_signer();
+        let token = token_for_workspace_with_permissions(&signer, "workspace-a", ["workers:list"]);
+        let app = runtime_http_router_with_auth(runtime, None, Some(auth));
+        let create = scoped_task_request("a", "workspace-a");
+
+        let response = app
+            .oneshot(bearer_request(
+                Method::POST,
+                "/v1/workers",
+                &token,
+                serde_json::to_vec(&create).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     fn task_request(_objective: &str) -> CreateWorkerRequest {
