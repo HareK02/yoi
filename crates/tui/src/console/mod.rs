@@ -332,13 +332,23 @@ pub(crate) async fn run_resume(
     workspace_root: PathBuf,
     all: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    run_worker_picker(runtime_command, workspace_root, all, true).await
+}
+
+pub(crate) async fn run_worker_picker(
+    runtime_command: WorkerRuntimeCommand,
+    workspace_root: PathBuf,
+    all: bool,
+    include_stopped: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Pick a Worker in its own inline viewport, dropping the viewport before
     // attaching/restoring so each phase gets fresh vertical room.
     let picker_options = if all {
         picker::PickerOptions::all()
     } else {
         picker::PickerOptions::workspace(workspace_root)
-    };
+    }
+    .with_stopped(include_stopped);
     let (worker_name, socket_override) = match picker::run(picker_options).await? {
         PickerOutcome::Picked {
             worker_name,

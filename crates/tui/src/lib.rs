@@ -58,7 +58,11 @@ pub enum LaunchMode {
     },
     /// `yoi workers` / `yoi --backend <url>`: list workers through the selected
     /// connection target, then attach to the selected Worker.
-    Workers { runtime_id: Option<String> },
+    Workers {
+        runtime_id: Option<String>,
+        include_stopped: bool,
+        all: bool,
+    },
     /// `yoi --backend <url> --runtime-id <id> --worker-id <id>`: open one Worker
     /// through the selected connection target.
     OpenWorker {
@@ -76,7 +80,7 @@ pub enum LaunchMode {
         worker_name: Option<String>,
     },
     /// `yoi panel`: open the workspace Dashboard from the current workspace.
-    Panel,
+    Panel { include_stopped: bool },
 }
 
 pub async fn launch(options: LaunchOptions) -> ExitCode {
@@ -128,12 +132,34 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
             }
             Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
         },
-        LaunchMode::Workers { runtime_id } => {
-            match target.list_workers(WorkerListRequest::new(runtime_id)) {
-                Ok(worker_list) => backend_worker_picker::run(worker_list.target).await,
-                Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
+        LaunchMode::Workers {
+            runtime_id,
+            include_stopped,
+            all,
+        } => match target.list_workers(if include_stopped {
+            WorkerListRequest::with_stopped(runtime_id)
+        } else {
+            WorkerListRequest::new(runtime_id)
+        }) {
+            Ok(worker_list) => {
+                if let Some(target) = worker_list.backend_target {
+                    backend_worker_picker::run(target, worker_list.include_stopped).await
+                } else if let Some(runtime_command) = worker_list.local_runtime_command {
+                    console::run_worker_picker(
+                        runtime_command,
+                        workspace_root.clone(),
+                        all,
+                        worker_list.include_stopped,
+                    )
+                    .await
+                } else {
+                    Err(Box::new(io::Error::other(
+                        "worker list target did not include a local or backend source",
+                    )) as Box<dyn std::error::Error>)
+                }
             }
-        }
+            Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
+        },
         LaunchMode::OpenWorker {
             runtime_id,
             worker_id,
@@ -153,7 +179,7 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
             }
             Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
         },
-        LaunchMode::Panel => match target.dashboard() {
+        LaunchMode::Panel { .. } => match target.dashboard() {
             Ok(dashboard) => dashboard::launch(dashboard.runtime_command).await,
             Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
         },

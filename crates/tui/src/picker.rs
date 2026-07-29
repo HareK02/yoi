@@ -80,19 +80,27 @@ pub enum PickerOutcome {
 #[derive(Debug, Clone)]
 pub(crate) struct PickerOptions {
     scope: PickerScope,
+    include_stopped: bool,
 }
 
 impl PickerOptions {
     pub(crate) fn workspace(workspace_root: PathBuf) -> Self {
         Self {
             scope: PickerScope::Workspace(workspace_root),
+            include_stopped: true,
         }
     }
 
     pub(crate) fn all() -> Self {
         Self {
             scope: PickerScope::All,
+            include_stopped: true,
         }
+    }
+
+    pub(crate) fn with_stopped(mut self, include_stopped: bool) -> Self {
+        self.include_stopped = include_stopped;
+        self
     }
 }
 
@@ -134,6 +142,11 @@ fn list_for_options(
     stored_workers: Vec<StoredWorkerInfo>,
     live_workers: Vec<LiveWorkerInfo>,
 ) -> WorkerList {
+    let stored_workers = if options.include_stopped {
+        stored_workers
+    } else {
+        Vec::new()
+    };
     match &options.scope {
         PickerScope::Workspace(workspace_root) => WorkerList::from_workspace_sources(
             WorkerVisibilitySource::ResumePicker,

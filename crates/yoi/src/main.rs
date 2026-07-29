@@ -18,7 +18,8 @@ use std::time::Duration;
 use cli_connection::{
     CliCommand, CliConnectionResolver, ClientConfigCliConnectionResolver, ClientDefaultConnection,
     backend_target_option_error_for_local_command, is_backend_target_option,
-    resolve_backend_cli_connection, resolve_local_cli_connection,
+    resolve_backend_cli_connection, resolve_connection_aware_cli_connection,
+    resolve_local_cli_connection,
 };
 use client::{BackendAuthTarget, Target, start_device_login, wait_for_device_login};
 use memory_lint::{LintCliOptions, LintStatus};
@@ -199,6 +200,107 @@ async fn main() -> ExitCode {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+struct TargetSelection {
+    explicit_local: bool,
+    backend_url: Option<String>,
+    workspace_id: Option<String>,
+}
+
+impl TargetSelection {
+    fn explicit_backend(&self) -> bool {
+        self.backend_url.is_some()
+    }
+}
+
+fn resolve_tui_target<R: CliConnectionResolver + ?Sized>(
+    connection_resolver: &R,
+    command: CliCommand,
+    selection: &TargetSelection,
+    workspace_root: &Path,
+) -> Result<Box<dyn Target>, ParseError> {
+    let workspace_id = if selection.explicit_backend() && selection.workspace_id.is_none() {
+        resolve_workspace_id_from_root(workspace_root)?
+    } else {
+        selection.workspace_id.clone()
+    };
+    resolve_connection_aware_cli_connection(
+        connection_resolver,
+        command,
+        selection.explicit_local,
+        selection.backend_url.clone(),
+        workspace_id.as_deref(),
+    )
+}
+
+fn parse_top_level_target_selection(
+    args: &[String],
+) -> Result<(TargetSelection, &[String]), ParseError> {
+    let mut selection = TargetSelection::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--local" => {
+                if selection.backend_url.is_some() {
+                    return Err(ParseError(
+                        "--local and --backend are mutually exclusive".to_string(),
+                    ));
+                }
+                selection.explicit_local = true;
+                i += 1;
+            }
+            "--backend" => {
+                if selection.explicit_local {
+                    return Err(ParseError(
+                        "--local and --backend are mutually exclusive".to_string(),
+                    ));
+                }
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError("--backend requires a URL".to_string()))?;
+                if value.starts_with('-') || value.is_empty() {
+                    return Err(ParseError("--backend requires a URL".to_string()));
+                }
+                selection.backend_url = Some(value.clone());
+                i += 2;
+            }
+            "--workspace-id" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError("--workspace-id requires a value".to_string()))?;
+                if value.starts_with('-') || value.is_empty() {
+                    return Err(ParseError("--workspace-id requires a value".to_string()));
+                }
+                selection.workspace_id = Some(value.clone());
+                i += 2;
+            }
+            arg if arg.starts_with("--backend=") => {
+                if selection.explicit_local {
+                    return Err(ParseError(
+                        "--local and --backend are mutually exclusive".to_string(),
+                    ));
+                }
+                let value = arg.trim_start_matches("--backend=");
+                if value.is_empty() {
+                    return Err(ParseError("--backend requires a URL".to_string()));
+                }
+                selection.backend_url = Some(value.to_string());
+                i += 1;
+            }
+            arg if arg.starts_with("--workspace-id=") => {
+                let value = arg.trim_start_matches("--workspace-id=");
+                if value.is_empty() {
+                    return Err(ParseError("--workspace-id requires a value".to_string()));
+                }
+                selection.workspace_id = Some(value.to_string());
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    Ok((selection, &args[i..]))
+}
+
 fn parse_args() -> Result<Mode, ParseError> {
     parse_args_from(std::env::args().skip(1))
 }
@@ -221,22 +323,38 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
     args: &[String],
     connection_resolver: &R,
 ) -> Result<Mode, ParseError> {
+    let (target_selection, args) = parse_top_level_target_selection(args)?;
     if args.is_empty() {
-        let target = resolve_local_cli_connection(connection_resolver, CliCommand::DefaultTui)?;
-        return Ok(Mode::Tui {
-            target,
-            mode: LaunchMode::Spawn {
+        let workspace_root = current_dir()?;
+        let target = resolve_tui_target(
+            connection_resolver,
+            CliCommand::DefaultTui,
+            &target_selection,
+            &workspace_root,
+        )?;
+        let mode = if target_selection.explicit_backend() {
+            LaunchMode::Workers {
+                runtime_id: None,
+                include_stopped: false,
+                all: false,
+            }
+        } else {
+            LaunchMode::Spawn {
                 worker_name: None,
                 profile: None,
-            },
-            workspace_root: current_dir()?,
+            }
+        };
+        return Ok(Mode::Tui {
+            target,
+            mode,
+            workspace_root,
         });
     }
 
     match args[0].as_str() {
         "--help" | "-h" => return Ok(Mode::Help),
-        "resume" => return parse_resume_args(&args[1..], connection_resolver),
-        "workers" => return parse_workers_args(&args[1..], connection_resolver),
+        "resume" => return parse_resume_args(&args[1..], &target_selection, connection_resolver),
+        "workers" => return parse_workers_args(&args[1..], &target_selection, connection_resolver),
         "worker" => {
             if let Some(cli) = worker_cleanup_cli::parse_worker_management_args(&args[1..])
                 .map_err(|e| ParseError(e.to_string()))?
@@ -291,11 +409,19 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             return Ok(Mode::Mcp(mcp_cli));
         }
         "panel" => {
-            let target = resolve_local_cli_connection(connection_resolver, CliCommand::Panel)?;
+            let workspace_root = parse_panel_workspace(&args[1..])?;
+            let target = resolve_tui_target(
+                connection_resolver,
+                CliCommand::Panel,
+                &target_selection,
+                &workspace_root,
+            )?;
             return Ok(Mode::Tui {
                 target,
-                mode: LaunchMode::Panel,
-                workspace_root: parse_panel_workspace(&args[1..])?,
+                mode: LaunchMode::Panel {
+                    include_stopped: false,
+                },
+                workspace_root,
             });
         }
         "keys" => {
@@ -349,82 +475,73 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
         _ => {}
     }
 
-    parse_console_options(args, connection_resolver)
+    parse_console_options(args, &target_selection, connection_resolver)
 }
 
 fn parse_console_options<R: CliConnectionResolver + ?Sized>(
     args: &[String],
+    target_selection: &TargetSelection,
     connection_resolver: &R,
 ) -> Result<Mode, ParseError> {
     let mut workspace_root = current_dir()?;
-    let mut session = None;
     let mut worker_name = None;
+    let mut session = None;
+    let mut profile = None;
     let mut socket_override = None;
-    let mut backend_url = None;
-    let mut workspace_id = None;
     let mut runtime_id = None;
     let mut worker_id = None;
-    let mut profile = None;
-
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
         match arg.as_str() {
-            "--session" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| ParseError("--session requires a value".to_string()))?;
-                session = Some(parse_session_id(value)?);
-                i += 2;
-            }
             "--worker" => {
                 let value = args
                     .get(i + 1)
-                    .ok_or_else(|| ParseError("--worker requires a value".to_string()))?;
-                if value.starts_with('-') {
-                    return Err(ParseError("--worker requires a value".to_string()));
+                    .ok_or_else(|| ParseError("--worker requires a name".to_string()))?;
+                if value.starts_with('-') || value.is_empty() {
+                    return Err(ParseError("--worker requires a name".to_string()));
                 }
                 worker_name = Some(value.clone());
-                i += 2;
-            }
-            "--socket" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| ParseError("--socket requires a value".to_string()))?;
-                if value.starts_with('-') {
-                    return Err(ParseError("--socket requires a value".to_string()));
-                }
-                socket_override = Some(PathBuf::from(value));
                 i += 2;
             }
             "--workspace" => {
                 let value = args
                     .get(i + 1)
-                    .ok_or_else(|| ParseError("--workspace requires a value".to_string()))?;
-                if value.starts_with('-') {
-                    return Err(ParseError("--workspace requires a value".to_string()));
+                    .ok_or_else(|| ParseError("--workspace requires a path".to_string()))?;
+                if value.starts_with('-') || value.is_empty() {
+                    return Err(ParseError("--workspace requires a path".to_string()));
                 }
                 workspace_root = PathBuf::from(value);
                 i += 2;
             }
-            "--workspace-id" => {
+            "--session" => {
                 let value = args
                     .get(i + 1)
-                    .ok_or_else(|| ParseError("--workspace-id requires a value".to_string()))?;
+                    .ok_or_else(|| ParseError("--session requires a path".to_string()))?;
                 if value.starts_with('-') || value.is_empty() {
-                    return Err(ParseError("--workspace-id requires a value".to_string()));
+                    return Err(ParseError("--session requires a path".to_string()));
                 }
-                workspace_id = Some(value.clone());
+                session = Some(PathBuf::from(value));
                 i += 2;
             }
-            "--backend" => {
+            "--socket" => {
                 let value = args
                     .get(i + 1)
-                    .ok_or_else(|| ParseError("--backend requires a URL".to_string()))?;
+                    .ok_or_else(|| ParseError("--socket requires a path".to_string()))?;
                 if value.starts_with('-') || value.is_empty() {
-                    return Err(ParseError("--backend requires a URL".to_string()));
+                    return Err(ParseError("--socket requires a path".to_string()));
                 }
-                backend_url = Some(value.clone());
+                socket_override = Some(PathBuf::from(value));
+                i += 2;
+            }
+            "--profile" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError("--profile requires a name".to_string()))?;
+                if value.starts_with('-') || value.is_empty() {
+                    return Err(ParseError("--profile requires a name".to_string()));
+                }
+                profile = Some(value.clone());
                 i += 2;
             }
             "--runtime-id" | "--runtime" => {
@@ -447,62 +564,44 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
                 worker_id = Some(value.clone());
                 i += 2;
             }
-            "--profile" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| ParseError("--profile requires a value".to_string()))?;
-                if value.starts_with('-') {
-                    return Err(ParseError("--profile requires a value".to_string()));
-                }
-                profile = Some(value.clone());
-                i += 2;
-            }
-            arg if arg.starts_with("--session=") => {
-                let value = arg.trim_start_matches("--session=");
-                if value.is_empty() {
-                    return Err(ParseError("--session requires a value".to_string()));
-                }
-                session = Some(parse_session_id(value)?);
-                i += 1;
-            }
             arg if arg.starts_with("--worker=") => {
                 let value = arg.trim_start_matches("--worker=");
                 if value.is_empty() {
-                    return Err(ParseError("--worker requires a value".to_string()));
+                    return Err(ParseError("--worker requires a name".to_string()));
                 }
                 worker_name = Some(value.to_string());
-                i += 1;
-            }
-            arg if arg.starts_with("--socket=") => {
-                let value = arg.trim_start_matches("--socket=");
-                if value.is_empty() {
-                    return Err(ParseError("--socket requires a value".to_string()));
-                }
-                socket_override = Some(PathBuf::from(value));
                 i += 1;
             }
             arg if arg.starts_with("--workspace=") => {
                 let value = arg.trim_start_matches("--workspace=");
                 if value.is_empty() {
-                    return Err(ParseError("--workspace requires a value".to_string()));
+                    return Err(ParseError("--workspace requires a path".to_string()));
                 }
                 workspace_root = PathBuf::from(value);
                 i += 1;
             }
-            arg if arg.starts_with("--workspace-id=") => {
-                let value = arg.trim_start_matches("--workspace-id=");
+            arg if arg.starts_with("--session=") => {
+                let value = arg.trim_start_matches("--session=");
                 if value.is_empty() {
-                    return Err(ParseError("--workspace-id requires a value".to_string()));
+                    return Err(ParseError("--session requires a path".to_string()));
                 }
-                workspace_id = Some(value.to_string());
+                session = Some(PathBuf::from(value));
                 i += 1;
             }
-            arg if arg.starts_with("--backend=") => {
-                let value = arg.trim_start_matches("--backend=");
+            arg if arg.starts_with("--socket=") => {
+                let value = arg.trim_start_matches("--socket=");
                 if value.is_empty() {
-                    return Err(ParseError("--backend requires a URL".to_string()));
+                    return Err(ParseError("--socket requires a path".to_string()));
                 }
-                backend_url = Some(value.to_string());
+                socket_override = Some(PathBuf::from(value));
+                i += 1;
+            }
+            arg if arg.starts_with("--profile=") => {
+                let value = arg.trim_start_matches("--profile=");
+                if value.is_empty() {
+                    return Err(ParseError("--profile requires a name".to_string()));
+                }
+                profile = Some(value.to_string());
                 i += 1;
             }
             arg if arg.starts_with("--runtime-id=") => {
@@ -529,143 +628,125 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
                 worker_id = Some(value.to_string());
                 i += 1;
             }
-            arg if arg.starts_with("--profile=") => {
-                let value = arg.trim_start_matches("--profile=");
-                if value.is_empty() {
-                    return Err(ParseError("--profile requires a value".to_string()));
-                }
-                profile = Some(value.to_string());
-                i += 1;
-            }
             arg if arg.starts_with('-') => {
                 return Err(ParseError(format!("unknown argument: {arg}")));
             }
             value => {
                 return Err(ParseError(format!(
-                    "unknown command `{value}`; use --worker <NAME> to open a Worker by name"
+                    "yoi does not accept positional argument `{value}` before a subcommand"
                 )));
             }
         }
     }
 
-    let backend_target_present = backend_url.is_some()
-        || workspace_id.is_some()
-        || runtime_id.is_some()
-        || worker_id.is_some();
-    if backend_target_present && worker_id.is_some() && runtime_id.is_none() {
+    if worker_id.is_some() && runtime_id.is_none() {
         return Err(ParseError(
-            "--worker-id requires --runtime-id for Backend Runtime API attach".to_string(),
+            "--worker-id requires --runtime-id for Runtime API attach".to_string(),
         ));
     }
-    if backend_target_present
+    if (runtime_id.is_some() || worker_id.is_some())
         && (session.is_some()
             || worker_name.is_some()
             || socket_override.is_some()
             || profile.is_some())
     {
         return Err(ParseError(
-            "Backend Runtime API target cannot be combined with --worker, --socket, --session, or --profile".to_string(),
+            "Runtime API target cannot be combined with --worker, --socket, --session, or --profile".to_string(),
         ));
     }
-
     if profile.is_some() && (session.is_some() || socket_override.is_some()) {
         return Err(ParseError(
             "--profile can only be used for fresh spawn".to_string(),
         ));
     }
+    if session.is_some() && socket_override.is_some() {
+        return Err(ParseError(
+            "--session cannot be combined with --socket".to_string(),
+        ));
+    }
     if socket_override.is_some() && worker_name.is_none() {
         return Err(ParseError("--socket requires --worker".to_string()));
     }
-    if socket_override.is_some() && session.is_some() {
-        return Err(ParseError(
-            "--socket can only be used with --worker attach mode".to_string(),
-        ));
+
+    let target = resolve_tui_target(
+        connection_resolver,
+        CliCommand::DefaultTui,
+        target_selection,
+        &workspace_root,
+    )?;
+
+    if let (Some(runtime_id), Some(worker_id)) = (runtime_id.clone(), worker_id) {
+        return Ok(Mode::Tui {
+            target,
+            mode: LaunchMode::OpenWorker {
+                runtime_id,
+                worker_id,
+            },
+            workspace_root,
+        });
     }
 
-    if backend_target_present {
-        let workspace_id = match workspace_id {
-            Some(workspace_id) => Some(workspace_id),
-            None => resolve_workspace_id_from_root(&workspace_root)?,
-        };
-        let target = resolve_backend_cli_connection(
-            connection_resolver,
-            CliCommand::DefaultTui,
-            backend_url,
-            workspace_id.as_deref(),
-        )?;
-        if let (Some(runtime_id), Some(worker_id)) = (runtime_id.clone(), worker_id) {
-            return Ok(Mode::Tui {
-                target,
-                mode: LaunchMode::OpenWorker {
-                    runtime_id,
-                    worker_id,
-                },
-                workspace_root,
-            });
+    if runtime_id.is_some() {
+        return Ok(Mode::Tui {
+            target,
+            mode: LaunchMode::Workers {
+                runtime_id,
+                include_stopped: false,
+                all: false,
+            },
+            workspace_root,
+        });
+    }
+
+    let mode = if let Some(profile) = profile {
+        LaunchMode::Spawn {
+            worker_name,
+            profile: Some(profile),
         }
-        return Ok(Mode::Tui {
-            target,
-            mode: LaunchMode::Workers { runtime_id },
-            workspace_root,
-        });
-    }
-
-    let target = resolve_local_cli_connection(connection_resolver, CliCommand::DefaultTui)?;
-
-    if let Some(profile) = profile {
-        return Ok(Mode::Tui {
-            target,
-            mode: LaunchMode::Spawn {
-                worker_name,
-                profile: Some(profile),
-            },
-            workspace_root,
-        });
-    }
-    if let Some(id) = session {
-        return Ok(Mode::Tui {
-            target,
-            mode: LaunchMode::ResumeWithSession { id, worker_name },
-            workspace_root,
-        });
-    }
-    if let Some(worker_name) = worker_name {
-        return Ok(Mode::Tui {
-            target,
-            mode: LaunchMode::WorkerName {
-                worker_name,
-                socket_override,
-            },
-            workspace_root,
-        });
-    }
-    Ok(Mode::Tui {
-        target,
-        mode: LaunchMode::Spawn {
+    } else if let Some(session) = session {
+        LaunchMode::ResumeWithSession {
+            id: parse_session_id(&session.to_string_lossy())?,
+            worker_name,
+        }
+    } else if let Some(worker_name) = worker_name {
+        LaunchMode::WorkerName {
+            worker_name,
+            socket_override,
+        }
+    } else {
+        LaunchMode::Spawn {
             worker_name: None,
             profile: None,
-        },
+        }
+    };
+
+    Ok(Mode::Tui {
+        target,
+        mode,
         workspace_root,
     })
 }
 
 fn parse_workers_args<R: CliConnectionResolver + ?Sized>(
     args: &[String],
+    target_selection: &TargetSelection,
     connection_resolver: &R,
 ) -> Result<Mode, ParseError> {
     let mut workspace_root = current_dir()?;
-    let mut workspace_id = None;
-    let mut backend_url = None;
     let mut runtime_id = None;
-
+    let mut include_stopped = false;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
         match arg.as_str() {
             "--help" | "-h" => {
                 return Err(ParseError(
-                    "usage: yoi workers [--workspace PATH] [--workspace-id ID] [--backend URL] [--runtime-id ID]".to_string(),
+                    "usage: yoi [--local|--backend URL] [--workspace-id ID] workers [-r|--stopped] [--workspace PATH] [--runtime-id ID]".to_string(),
                 ));
+            }
+            "-r" | "--restoreable" | "--stopped" => {
+                include_stopped = true;
+                i += 1;
             }
             "--workspace" => {
                 let value = args
@@ -675,26 +756,6 @@ fn parse_workers_args<R: CliConnectionResolver + ?Sized>(
                     return Err(ParseError("--workspace requires a value".to_string()));
                 }
                 workspace_root = PathBuf::from(value);
-                i += 2;
-            }
-            "--workspace-id" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| ParseError("--workspace-id requires a value".to_string()))?;
-                if value.starts_with('-') || value.is_empty() {
-                    return Err(ParseError("--workspace-id requires a value".to_string()));
-                }
-                workspace_id = Some(value.clone());
-                i += 2;
-            }
-            "--backend" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| ParseError("--backend requires a URL".to_string()))?;
-                if value.starts_with('-') || value.is_empty() {
-                    return Err(ParseError("--backend requires a URL".to_string()));
-                }
-                backend_url = Some(value.clone());
                 i += 2;
             }
             "--runtime-id" | "--runtime" => {
@@ -713,22 +774,6 @@ fn parse_workers_args<R: CliConnectionResolver + ?Sized>(
                     return Err(ParseError("--workspace requires a value".to_string()));
                 }
                 workspace_root = PathBuf::from(value);
-                i += 1;
-            }
-            arg if arg.starts_with("--workspace-id=") => {
-                let value = arg.trim_start_matches("--workspace-id=");
-                if value.is_empty() {
-                    return Err(ParseError("--workspace-id requires a value".to_string()));
-                }
-                workspace_id = Some(value.to_string());
-                i += 1;
-            }
-            arg if arg.starts_with("--backend=") => {
-                let value = arg.trim_start_matches("--backend=");
-                if value.is_empty() {
-                    return Err(ParseError("--backend requires a URL".to_string()));
-                }
-                backend_url = Some(value.to_string());
                 i += 1;
             }
             arg if arg.starts_with("--runtime-id=") => {
@@ -757,31 +802,32 @@ fn parse_workers_args<R: CliConnectionResolver + ?Sized>(
             }
         }
     }
-
-    let workspace_id = match workspace_id {
-        Some(workspace_id) => Some(workspace_id),
-        None => resolve_workspace_id_from_root(&workspace_root)?,
-    };
-    let target = resolve_backend_cli_connection(
+    let target = resolve_tui_target(
         connection_resolver,
         CliCommand::Workers,
-        backend_url,
-        workspace_id.as_deref(),
+        target_selection,
+        &workspace_root,
     )?;
     Ok(Mode::Tui {
         target,
-        mode: LaunchMode::Workers { runtime_id },
+        mode: LaunchMode::Workers {
+            runtime_id,
+            include_stopped,
+            all: false,
+        },
         workspace_root,
     })
 }
 
 fn parse_resume_args<R: CliConnectionResolver + ?Sized>(
     args: &[String],
+    target_selection: &TargetSelection,
     connection_resolver: &R,
 ) -> Result<Mode, ParseError> {
     let mut workspace_root = current_dir()?;
     let mut workspace_set = false;
     let mut all = false;
+    let mut runtime_id = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -798,6 +844,16 @@ fn parse_resume_args<R: CliConnectionResolver + ?Sized>(
             "--all" => {
                 all = true;
                 i += 1;
+            }
+            "--runtime-id" | "--runtime" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError("--runtime-id requires a value".to_string()))?;
+                if value.starts_with('-') || value.is_empty() {
+                    return Err(ParseError("--runtime-id requires a value".to_string()));
+                }
+                runtime_id = Some(value.clone());
+                i += 2;
             }
             "--workspace" => {
                 let value = args
@@ -819,13 +875,23 @@ fn parse_resume_args<R: CliConnectionResolver + ?Sized>(
                 workspace_set = true;
                 i += 1;
             }
-            arg if arg.starts_with('-') => {
-                if is_backend_target_option(arg) {
-                    return Err(backend_target_option_error_for_local_command(
-                        CliCommand::Resume,
-                        arg,
-                    ));
+            arg if arg.starts_with("--runtime-id=") => {
+                let value = arg.trim_start_matches("--runtime-id=");
+                if value.is_empty() {
+                    return Err(ParseError("--runtime-id requires a value".to_string()));
                 }
+                runtime_id = Some(value.to_string());
+                i += 1;
+            }
+            arg if arg.starts_with("--runtime=") => {
+                let value = arg.trim_start_matches("--runtime=");
+                if value.is_empty() {
+                    return Err(ParseError("--runtime-id requires a value".to_string()));
+                }
+                runtime_id = Some(value.to_string());
+                i += 1;
+            }
+            arg if arg.starts_with('-') => {
                 return Err(ParseError(format!("unknown yoi resume option `{arg}`")));
             }
             value => {
@@ -842,11 +908,20 @@ fn parse_resume_args<R: CliConnectionResolver + ?Sized>(
         ));
     }
 
-    let target = resolve_local_cli_connection(connection_resolver, CliCommand::Resume)?;
+    let target = resolve_tui_target(
+        connection_resolver,
+        CliCommand::Resume,
+        target_selection,
+        &workspace_root,
+    )?;
 
     Ok(Mode::Tui {
         target,
-        mode: LaunchMode::Resume { all },
+        mode: LaunchMode::Workers {
+            runtime_id,
+            include_stopped: true,
+            all,
+        },
         workspace_root,
     })
 }
@@ -1547,7 +1622,7 @@ fn parse_session_id(value: &str) -> Result<SegmentId, ParseError> {
 
 fn print_help() {
     println!(
-        "yoi\n\nUsage:\n  yoi [OPTIONS]\n  yoi resume [--workspace <PATH>] [--all]\n  yoi workers [--workspace <PATH>] [--workspace-id <ID>] [--backend <URL>] [--runtime-id <ID>]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi worker [WORKER_OPTIONS]\n  yoi worker delete <NAME> [--force] [--dry-run]\n  yoi worker prune --older-than <DURATION> [--force] [--dry-run]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi session prune --unreferenced [--older-than <DURATION>] [--force] [--dry-run]\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi workspace init [OPTIONS]
+        "yoi\n\nUsage:\n  yoi [TARGET_OPTIONS] [OPTIONS]\n  yoi [TARGET_OPTIONS] resume [--workspace <PATH>] [--all] [--runtime-id <ID>]\n  yoi [TARGET_OPTIONS] workers [-r|--stopped] [--workspace <PATH>] [--runtime-id <ID>]\n  yoi [TARGET_OPTIONS] panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi worker [WORKER_OPTIONS]\n  yoi worker delete <NAME> [--force] [--dry-run]\n  yoi worker prune --older-than <DURATION> [--force] [--dry-run]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi session prune --unreferenced [--older-than <DURATION>] [--force] [--dry-run]\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi workspace init [OPTIONS]
   yoi workspace config <COMMAND> [OPTIONS]
   yoi workspace identity <COMMAND> [OPTIONS]
   yoi workspace trust-runtime <COMMAND> [OPTIONS]
@@ -1602,7 +1677,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_uses_injected_cli_connection_resolver_for_backend_command() {
+    fn parser_uses_local_target_for_workers_without_backend_option() {
         let resolver = FixedCliConnectionResolver {
             backend_url: "http://fake-backend.example",
         };
@@ -1612,13 +1687,14 @@ mod tests {
         match mode {
             Mode::Tui {
                 target,
-                mode: LaunchMode::Workers { runtime_id },
+                mode: LaunchMode::Workers { runtime_id, .. },
                 ..
             } => {
                 assert_eq!(runtime_id, None);
-                assert_eq!(target.kind(), TargetKind::Backend);
+                assert_eq!(target.kind(), TargetKind::Local);
                 let workers = target.list_workers(WorkerListRequest::new(None)).unwrap();
-                assert_eq!(workers.target.base_url, "http://fake-backend.example");
+                assert!(workers.local_runtime_command.is_some());
+                assert!(workers.backend_target.is_none());
             }
             other => panic!("expected Workers mode, got {other:?}"),
         }
@@ -1632,12 +1708,6 @@ mod tests {
 
     #[test]
     fn parse_local_only_commands_reject_backend_target_options() {
-        let err = parse_args_from(["resume", "--backend", "http://127.0.0.1:8787"]).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "yoi resume uses a local connection target and cannot accept Backend target option `--backend`"
-        );
-
         let err = parse_args_from(["panel", "--runtime-id", "runtime-a"]).unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -1711,7 +1781,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "--worker-id requires --runtime-id for Backend Runtime API attach"
+            "--worker-id requires --runtime-id for Runtime API attach"
         );
     }
 
@@ -1721,15 +1791,26 @@ mod tests {
         {
             Mode::Tui {
                 target,
-                mode: LaunchMode::Workers { runtime_id },
+                mode: LaunchMode::Workers { runtime_id, .. },
                 ..
             } => {
                 assert_eq!(target.kind(), TargetKind::Backend);
                 let workers = target
                     .list_workers(WorkerListRequest::new(runtime_id.clone()))
                     .unwrap();
-                assert_eq!(workers.target.base_url, "http://127.0.0.1:8787");
-                assert_eq!(workers.target.runtime_id.as_deref(), Some("r"));
+                assert_eq!(
+                    workers.backend_target.as_ref().unwrap().base_url,
+                    "http://127.0.0.1:8787"
+                );
+                assert_eq!(
+                    workers
+                        .backend_target
+                        .as_ref()
+                        .unwrap()
+                        .runtime_id
+                        .as_deref(),
+                    Some("r")
+                );
                 assert_eq!(runtime_id.as_deref(), Some("r"));
             }
             _ => panic!("expected Workers mode"),
@@ -1739,25 +1820,36 @@ mod tests {
     #[test]
     fn parse_workers_subcommand_uses_backend_runtime_picker() {
         match parse_args_from([
-            "workers",
             "--backend",
             "http://127.0.0.1:8787",
             "--workspace-id",
             "workspace-a",
+            "workers",
         ])
         .unwrap()
         {
             Mode::Tui {
                 target,
-                mode: LaunchMode::Workers { runtime_id },
+                mode: LaunchMode::Workers { runtime_id, .. },
                 ..
             } => {
                 assert_eq!(target.kind(), TargetKind::Backend);
                 let workers = target
                     .list_workers(WorkerListRequest::new(runtime_id.clone()))
                     .unwrap();
-                assert_eq!(workers.target.base_url, "http://127.0.0.1:8787");
-                assert_eq!(workers.target.workspace_id.as_deref(), Some("workspace-a"));
+                assert_eq!(
+                    workers.backend_target.as_ref().unwrap().base_url,
+                    "http://127.0.0.1:8787"
+                );
+                assert_eq!(
+                    workers
+                        .backend_target
+                        .as_ref()
+                        .unwrap()
+                        .workspace_id
+                        .as_deref(),
+                    Some("workspace-a")
+                );
                 assert_eq!(runtime_id, None);
             }
             _ => panic!("expected Workers mode"),
@@ -1779,7 +1871,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "Backend Runtime API target cannot be combined with --worker, --socket, --session, or --profile"
+            "Runtime API target cannot be combined with --worker, --socket, --session, or --profile"
         );
     }
 
@@ -1799,10 +1891,18 @@ mod tests {
     fn parse_resume_subcommand_defaults_to_workspace_scope() {
         match parse_args_from(["resume"]).unwrap() {
             Mode::Tui {
-                mode: LaunchMode::Resume { all },
+                mode:
+                    LaunchMode::Workers {
+                        include_stopped,
+                        all,
+                        ..
+                    },
                 ..
-            } => assert!(!all),
-            _ => panic!("expected Resume mode"),
+            } => {
+                assert!(include_stopped);
+                assert!(!all);
+            }
+            _ => panic!("expected Workers mode"),
         }
     }
 
@@ -1810,14 +1910,20 @@ mod tests {
     fn parse_resume_workspace_scope() {
         match parse_args_from(["resume", "--workspace", "/tmp/resume-workspace"]).unwrap() {
             Mode::Tui {
-                mode: LaunchMode::Resume { all },
+                mode:
+                    LaunchMode::Workers {
+                        include_stopped,
+                        all,
+                        ..
+                    },
                 workspace_root,
                 ..
             } => {
+                assert!(include_stopped);
                 assert!(!all);
                 assert_eq!(workspace_root, PathBuf::from("/tmp/resume-workspace"));
             }
-            _ => panic!("expected Resume mode"),
+            _ => panic!("expected Workers mode"),
         }
     }
 
@@ -1825,10 +1931,18 @@ mod tests {
     fn parse_resume_all_scope() {
         match parse_args_from(["resume", "--all"]).unwrap() {
             Mode::Tui {
-                mode: LaunchMode::Resume { all },
+                mode:
+                    LaunchMode::Workers {
+                        include_stopped,
+                        all,
+                        ..
+                    },
                 ..
-            } => assert!(all),
-            _ => panic!("expected Resume mode"),
+            } => {
+                assert!(include_stopped);
+                assert!(all);
+            }
+            _ => panic!("expected Workers mode"),
         }
     }
 
@@ -2228,7 +2342,10 @@ mod tests {
     fn parse_panel_mode() {
         match parse_args_from(["panel", "--workspace", "/tmp/other-workspace"]).unwrap() {
             Mode::Tui {
-                mode: LaunchMode::Panel,
+                mode:
+                    LaunchMode::Panel {
+                        include_stopped: false,
+                    },
                 workspace_root,
                 ..
             } => assert_eq!(workspace_root, PathBuf::from("/tmp/other-workspace")),

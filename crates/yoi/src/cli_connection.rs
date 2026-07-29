@@ -54,11 +54,12 @@ impl CliCommand {
 
     pub(crate) fn connection_requirement(self) -> CliConnectionRequirement {
         match self {
-            CliCommand::DefaultTui => CliConnectionRequirement::ConnectionAware,
-            CliCommand::Workers | CliCommand::Login => CliConnectionRequirement::BackendOnly,
-            CliCommand::Resume
-            | CliCommand::Panel
-            | CliCommand::Keys
+            CliCommand::DefaultTui
+            | CliCommand::Workers
+            | CliCommand::Resume
+            | CliCommand::Panel => CliConnectionRequirement::ConnectionAware,
+            CliCommand::Login => CliConnectionRequirement::BackendOnly,
+            CliCommand::Keys
             | CliCommand::SetupModel
             | CliCommand::WorkerRuntime
             | CliCommand::WorkerCleanup
@@ -182,6 +183,33 @@ pub(crate) fn resolve_backend_cli_connection<R: CliConnectionResolver + ?Sized>(
     }
 }
 
+pub(crate) fn resolve_connection_aware_cli_connection<R: CliConnectionResolver + ?Sized>(
+    resolver: &R,
+    command: CliCommand,
+    explicit_local: bool,
+    explicit_backend_url: Option<String>,
+    workspace_id: Option<&str>,
+) -> Result<Box<dyn Target>, ParseError> {
+    if explicit_local && explicit_backend_url.is_some() {
+        return Err(ParseError(
+            "--local and --backend are mutually exclusive".to_string(),
+        ));
+    }
+    if explicit_local {
+        return resolver.resolve_connection(command, CliConnectionInput::LocalDefault);
+    }
+    if explicit_backend_url.is_some() {
+        return resolver.resolve_connection(
+            command,
+            CliConnectionInput::BackendTarget {
+                explicit_backend_url,
+                workspace_id,
+            },
+        );
+    }
+    resolver.resolve_connection(command, CliConnectionInput::LocalDefault)
+}
+
 pub(crate) fn backend_target_option_error_for_local_command(
     command: CliCommand,
     option: &str,
@@ -209,22 +237,25 @@ mod tests {
 
     #[test]
     fn cli_command_connection_requirements_are_explicit() {
-        assert_eq!(
-            CliCommand::DefaultTui.connection_requirement(),
-            CliConnectionRequirement::ConnectionAware
-        );
-        assert_eq!(
-            CliCommand::Workers.connection_requirement(),
-            CliConnectionRequirement::BackendOnly
-        );
+        for command in [
+            CliCommand::DefaultTui,
+            CliCommand::Workers,
+            CliCommand::Resume,
+            CliCommand::Panel,
+        ] {
+            assert_eq!(
+                command.connection_requirement(),
+                CliConnectionRequirement::ConnectionAware,
+                "{} should be connection-aware",
+                command.display_name()
+            );
+        }
         assert_eq!(
             CliCommand::Login.connection_requirement(),
             CliConnectionRequirement::BackendOnly
         );
 
         for command in [
-            CliCommand::Resume,
-            CliCommand::Panel,
             CliCommand::Keys,
             CliCommand::SetupModel,
             CliCommand::WorkerRuntime,
@@ -251,7 +282,7 @@ mod tests {
         let resolver = ClientConfigCliConnectionResolver;
         let err = resolver
             .resolve_connection(
-                CliCommand::Resume,
+                CliCommand::Keys,
                 CliConnectionInput::BackendTarget {
                     explicit_backend_url: Some("http://127.0.0.1:8787".to_string()),
                     workspace_id: None,
@@ -261,7 +292,7 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "yoi resume uses a local connection target and cannot accept Backend target options"
+            "yoi keys uses a local connection target and cannot accept Backend target options"
         );
     }
 
@@ -269,12 +300,12 @@ mod tests {
     fn cli_connection_resolver_rejects_backend_only_local_default() {
         let resolver = ClientConfigCliConnectionResolver;
         let err = resolver
-            .resolve_connection(CliCommand::Workers, CliConnectionInput::LocalDefault)
+            .resolve_connection(CliCommand::Login, CliConnectionInput::LocalDefault)
             .unwrap_err();
 
         assert_eq!(
             err.to_string(),
-            "yoi workers requires a Backend connection target"
+            "yoi login requires a Backend connection target"
         );
     }
 
@@ -293,7 +324,8 @@ mod tests {
         let workers = target
             .list_workers(client::WorkerListRequest::new(None))
             .unwrap();
-        assert_eq!(workers.target.base_url, "http://127.0.0.1:8787");
-        assert_eq!(workers.target.workspace_id, None);
+        let backend_target = workers.backend_target.as_ref().unwrap();
+        assert_eq!(backend_target.base_url, "http://127.0.0.1:8787");
+        assert_eq!(backend_target.workspace_id, None);
     }
 }

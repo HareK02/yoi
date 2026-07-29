@@ -3,7 +3,8 @@ use std::io;
 use std::time::Duration;
 
 use client::{
-    BackendRuntimeListTarget, BackendRuntimeTarget, BackendWorkerSummary, list_backend_workers,
+    BackendRuntimeListTarget, BackendRuntimeTarget, BackendWorkerSummary,
+    list_backend_stopped_workers, list_backend_workers, restore_backend_worker,
 };
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::backend::CrosstermBackend;
@@ -18,13 +19,30 @@ use crate::console;
 const MAX_ROWS: usize = 10;
 const VIEWPORT_LINES: u16 = MAX_ROWS as u16 + 4;
 
-pub(crate) async fn run(target: BackendRuntimeListTarget) -> Result<(), Box<dyn Error>> {
-    let response = list_backend_workers(&target).await.map_err(|error| {
+pub(crate) async fn run(
+    target: BackendRuntimeListTarget,
+    include_stopped: bool,
+) -> Result<(), Box<dyn Error>> {
+    let mut response = list_backend_workers(&target).await.map_err(|error| {
         io::Error::other(format!(
             "failed to list Backend runtime workers from {}: {error}",
             target.base_url
         ))
     })?;
+    if include_stopped {
+        match list_backend_stopped_workers(&target).await {
+            Ok(stopped) => {
+                response.items.extend(stopped.items);
+                response.diagnostics.extend(stopped.diagnostics);
+            }
+            Err(error) => response.diagnostics.push(client::BackendDiagnostic {
+                code: "backend_stopped_workers_list_failed".to_string(),
+                severity: Some("error".to_string()),
+                message: error.to_string(),
+            }),
+        }
+    }
+    dedup_workers(&mut response.items);
     if response.items.is_empty() {
         let diagnostics = response
             .diagnostics
@@ -44,9 +62,34 @@ pub(crate) async fn run(target: BackendRuntimeListTarget) -> Result<(), Box<dyn 
     }
 
     let selected = pick_worker(target.clone(), response.items)?;
+    let worker = if selected.state == "stopped" {
+        let restore_target = BackendRuntimeTarget::new(
+            target.base_url.clone(),
+            selected.runtime_id.clone(),
+            selected.worker_id.clone(),
+        );
+        restore_backend_worker(&restore_target)
+            .await
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "failed to restore Backend worker {}/{}: {error}",
+                    selected.runtime_id, selected.worker_id
+                ))
+            })?
+            .result
+            .worker
+            .unwrap_or(selected)
+    } else {
+        selected
+    };
     let attach_target =
-        BackendRuntimeTarget::new(target.base_url, selected.runtime_id, selected.worker_id);
+        BackendRuntimeTarget::new(target.base_url, worker.runtime_id, worker.worker_id);
     console::run_backend_runtime(attach_target).await
+}
+
+fn dedup_workers(workers: &mut Vec<BackendWorkerSummary>) {
+    let mut seen = std::collections::HashSet::new();
+    workers.retain(|worker| seen.insert((worker.runtime_id.clone(), worker.worker_id.clone())));
 }
 
 fn pick_worker(

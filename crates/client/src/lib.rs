@@ -21,7 +21,7 @@ pub use backend_auth::{
     poll_device_login, start_device_login, wait_for_device_login,
 };
 pub use backend_runtime::{
-    BackendRuntimeClient, BackendRuntimeClientError, BackendRuntimeListResponse,
+    BackendDiagnostic, BackendRuntimeClient, BackendRuntimeClientError, BackendRuntimeListResponse,
     BackendRuntimeListTarget, BackendRuntimeSummary, BackendRuntimeTarget,
     BackendWorkerCapabilitySummary, BackendWorkerImplementationSummary,
     BackendWorkerRestoreResponse, BackendWorkerRestoreResult, BackendWorkerSummary,

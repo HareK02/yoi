@@ -54,11 +54,22 @@ impl BackendTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerListRequest {
     pub runtime_id: Option<String>,
+    pub include_stopped: bool,
 }
 
 impl WorkerListRequest {
     pub fn new(runtime_id: Option<String>) -> Self {
-        Self { runtime_id }
+        Self {
+            runtime_id,
+            include_stopped: false,
+        }
+    }
+
+    pub fn with_stopped(runtime_id: Option<String>) -> Self {
+        Self {
+            runtime_id,
+            include_stopped: true,
+        }
     }
 }
 
@@ -99,7 +110,9 @@ pub struct Dashboard {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerList {
-    pub target: BackendRuntimeListTarget,
+    pub local_runtime_command: Option<WorkerRuntimeCommand>,
+    pub backend_target: Option<BackendRuntimeListTarget>,
+    pub include_stopped: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,11 +195,18 @@ impl Target for LocalTarget {
         })
     }
 
-    fn list_workers(&self, _request: WorkerListRequest) -> Result<WorkerList, TargetError> {
-        Err(TargetError::unsupported(
-            "Backend runtime worker listing",
-            self.kind(),
-        ))
+    fn list_workers(&self, request: WorkerListRequest) -> Result<WorkerList, TargetError> {
+        if request.runtime_id.is_some() {
+            return Err(TargetError::unsupported(
+                "Explicit runtime id for local worker listing",
+                self.kind(),
+            ));
+        }
+        Ok(WorkerList {
+            local_runtime_command: Some(self.runtime_command()?),
+            backend_target: None,
+            include_stopped: request.include_stopped,
+        })
     }
 
     fn connect_worker(
@@ -226,11 +246,13 @@ impl Target for BackendTarget {
 
     fn list_workers(&self, request: WorkerListRequest) -> Result<WorkerList, TargetError> {
         Ok(WorkerList {
-            target: BackendRuntimeListTarget::new(
+            local_runtime_command: None,
+            backend_target: Some(BackendRuntimeListTarget::new(
                 self.base_url.clone(),
                 self.workspace_id.clone(),
                 request.runtime_id,
-            ),
+            )),
+            include_stopped: request.include_stopped,
         })
     }
 
@@ -259,9 +281,28 @@ mod tests {
             .list_workers(WorkerListRequest::new(Some("runtime-a".to_string())))
             .unwrap();
 
-        assert_eq!(workers.target.base_url, "http://127.0.0.1:8787");
-        assert_eq!(workers.target.workspace_id.as_deref(), Some("workspace-a"));
-        assert_eq!(workers.target.runtime_id.as_deref(), Some("runtime-a"));
+        assert_eq!(
+            workers.backend_target.as_ref().unwrap().base_url,
+            "http://127.0.0.1:8787"
+        );
+        assert_eq!(
+            workers
+                .backend_target
+                .as_ref()
+                .unwrap()
+                .workspace_id
+                .as_deref(),
+            Some("workspace-a")
+        );
+        assert_eq!(
+            workers
+                .backend_target
+                .as_ref()
+                .unwrap()
+                .runtime_id
+                .as_deref(),
+            Some("runtime-a")
+        );
     }
 
     #[test]
@@ -288,15 +329,14 @@ mod tests {
     }
 
     #[test]
-    fn local_target_rejects_backend_worker_operations() {
+    fn local_target_builds_local_worker_list() {
         let target = LocalTarget::new();
-        let err = target
-            .list_workers(WorkerListRequest::new(None))
-            .unwrap_err();
+        let workers = target
+            .list_workers(WorkerListRequest::with_stopped(None))
+            .unwrap();
 
-        assert_eq!(
-            err.to_string(),
-            "Backend runtime worker listing is not supported by local target"
-        );
+        assert!(workers.local_runtime_command.is_some());
+        assert!(workers.backend_target.is_none());
+        assert!(workers.include_stopped);
     }
 }
