@@ -720,7 +720,7 @@ fn parse_workers_args<R: CliConnectionResolver + ?Sized>(
         match arg.as_str() {
             "--help" | "-h" => {
                 return Err(ParseError(
-                    "usage: yoi [--local|--backend URL] [--workspace-id ID] workers [-r|--stopped] [--workspace PATH] [--runtime-id ID]".to_string(),
+                    "usage: yoi [--local|--backend <URL>] [--workspace-id <ID>] workers [-r|--stopped] [--workspace <PATH>] [--runtime-id <ID>]".to_string(),
                 ));
             }
             "-r" | "--restoreable" | "--stopped" => {
@@ -1589,15 +1589,80 @@ fn parse_session_id(value: &str) -> Result<SegmentId, ParseError> {
         .map_err(|_| ParseError(format!("invalid --session UUID: {value}")))
 }
 
+const TOP_LEVEL_HELP: &str = r#"yoi
+
+Usage:
+  yoi [TARGET] [CONSOLE_OPTIONS]
+  yoi [TARGET] workers [-r|--stopped] [--workspace <PATH>] [--runtime-id <ID>]
+  yoi [TARGET] resume [--workspace <PATH>|--all] [--runtime-id <ID>]
+  yoi [TARGET] panel [--workspace <PATH>]
+  yoi [--backend <URL>] login [--no-wait]
+  yoi <LOCAL_COMMAND> [OPTIONS]
+
+Target selection:
+  Target options are top-level options and must appear before the command.
+
+      --local              Use the local Worker runtime explicitly
+      --backend <URL>      Use a Workspace Backend explicitly
+      --workspace-id <ID>  Scope Backend routes to a Workspace id
+
+  If no target is explicit, connection-aware commands use the merged client config:
+      <data_dir>/client/config.toml
+      <cwd>/.yoi/client.config.toml
+
+  Supported client config keys:
+      default_connection = "local" | "backend"
+      default_backend = "<name>"
+      [backends.<name>] url = "https://backend.example"
+      [workspaces.<workspace_id>] backend = "<name>"
+
+Connection-aware commands:
+  yoi                         Local: open a new Console. Backend: open Backend Workers.
+  yoi workers                 List/select Workers for the selected target.
+  yoi workers -r              Include stopped Workers. --restoreable is accepted as a legacy alias.
+  yoi resume                  Open the Worker picker with stopped Workers included.
+  yoi panel                   Open the dashboard/panel TUI for the selected target.
+
+Console options:
+      --workspace <PATH>   Local workspace root for local Console/Worker lists (defaults to cwd)
+      --worker <NAME>      Open/create a named local Worker Console
+      --socket <PATH>      Attach to a local Worker socket; requires --worker
+      --session <UUID>     Resume a local session segment
+      --profile <REF>      Select a reusable Profile recipe for a fresh local Worker
+      --runtime-id <ID>    Backend Runtime id for Backend Worker list/attach
+      --worker-id <ID>     Backend Worker id to attach; requires --runtime-id
+
+Local commands:
+  keys                         Manage local model/API keys
+  setup-model                  Configure a local model provider
+  worker [WORKER_OPTIONS]      Run the local Worker runtime CLI
+  worker delete <NAME>         Delete local Worker records
+  worker prune                 Prune old local Worker records
+  ticket <COMMAND>             Manage Tickets through the local workspace authority
+  objective <COMMAND>          Manage Objectives through the local workspace authority
+  plugin <COMMAND>             Build/check/list/show plugins
+  mcp <COMMAND>                Inspect configured MCP servers
+  memory lint                  Lint local memory files
+  session <COMMAND>            Inspect/prune local session logs
+
+Backend-only commands:
+  login                        Run Backend device login and save the API token
+
+Standalone binaries:
+  yoi-workspace-server         Workspace Backend server/admin CLI
+  worker-runtime-rest-server   Worker Runtime REST server
+
+Options:
+  -h, --help                   Print help
+"#;
+
 fn print_help() {
-    println!(
-        "yoi\n\nUsage:\n  yoi [TARGET_OPTIONS] [OPTIONS]\n  yoi [TARGET_OPTIONS] resume [--workspace <PATH>] [--all] [--runtime-id <ID>]\n  yoi [TARGET_OPTIONS] workers [-r|--stopped] [--workspace <PATH>] [--runtime-id <ID>]\n  yoi [TARGET_OPTIONS] panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi worker [WORKER_OPTIONS]\n  yoi worker delete <NAME> [--force] [--dry-run]\n  yoi worker prune --older-than <DURATION> [--force] [--dry-run]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi session prune --unreferenced [--older-than <DURATION>] [--force] [--dry-run]\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi plugin new <rust-component-tool|rust-component-service> <PATH> [--json]\n  yoi plugin check <PATH_OR_PACKAGE> [--json]\n  yoi plugin pack <PATH> [--output <FILE>] [--json]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp show <SERVER> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp tools|resources|prompts [SERVER] [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nSurfaces:\n  Console   Single-Worker chat/client surface (default, --worker, yoi resume, Backend Runtime target)\n  Dashboard Workspace cockpit/action surface (yoi panel)\n  TUI       Terminal UI implementation umbrella for Console and Dashboard\n\nOptions:\n      --workspace <PATH> Runtime workspace root for default Console/--worker/workers (defaults to cwd)\n      --workspace-id <ID> Workspace identity for Backend scoped routes\n      --backend <URL>    Workspace Backend API URL for Backend Runtime attach/list\n      --runtime-id <ID>  Backend Runtime identity for attach/list\n      --worker <NAME>       Open the Worker Console by name (attach/restore/create)\n      --socket <PATH>    Attach a Worker Console to a specific socket with --worker\n      --session <UUID>   Resume a specific session segment in the Worker Console\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
-    );
+    println!("{TOP_LEVEL_HELP}");
 }
 
 fn print_resume_help() {
     println!(
-        "yoi resume\n\nUsage:\n  yoi resume [--workspace <PATH>] [--all]\n\nOptions:\n      --workspace <PATH> Open the Worker Console picker scoped to this workspace (defaults to cwd)\n      --all              Open the Worker Console picker across this host/data dir\n  -h, --help             Print help\n"
+        "yoi resume\n\nUsage:\n  yoi [TARGET] resume [--workspace <PATH>|--all] [--runtime-id <ID>]\n\nTarget options:\n      --local              Use local Worker records explicitly\n      --backend <URL>      Use Backend Worker records explicitly\n      --workspace-id <ID>  Scope Backend routes to a Workspace id\n\nOptions:\n      --workspace <PATH>   Open the Worker picker scoped to this local workspace (defaults to cwd)\n      --all                Open the Worker picker across this host/data dir\n      --runtime-id <ID>    Restrict Backend picker to a Runtime id\n  -h, --help               Print help\n"
     );
 }
 
@@ -1730,6 +1795,20 @@ backend = "shared"
                 .and_then(|workspace| workspace.backend.as_deref()),
             Some("shared")
         );
+    }
+
+    #[test]
+    fn top_level_help_matches_current_target_surface() {
+        assert!(TOP_LEVEL_HELP.contains("Target options are top-level options"));
+        assert!(TOP_LEVEL_HELP.contains("--local"));
+        assert!(TOP_LEVEL_HELP.contains("--backend <URL>"));
+        assert!(TOP_LEVEL_HELP.contains("<data_dir>/client/config.toml"));
+        assert!(TOP_LEVEL_HELP.contains("<cwd>/.yoi/client.config.toml"));
+        assert!(TOP_LEVEL_HELP.contains("yoi-workspace-server"));
+        assert!(TOP_LEVEL_HELP.contains("worker-runtime-rest-server"));
+        assert!(!TOP_LEVEL_HELP.contains("yoi workspace"));
+        assert!(!TOP_LEVEL_HELP.contains("yoi server"));
+        assert!(!TOP_LEVEL_HELP.contains("TARGET_OPTIONS"));
     }
 
     #[test]
