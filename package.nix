@@ -93,7 +93,7 @@ rustPlatform.buildRustPackage rec {
 
   postBuild = ''
     cargo build --offline --profile release -p yoi-workspace-server --bin yoi-server
-    cargo build --offline --profile release -p worker-runtime --bin yoi-runtime --features ws-server,fs-store
+    cargo build --offline --profile release -p worker-runtime --bin yoi-runtime
   '';
 
   # The package check is a credential-free install smoke check below. Running the

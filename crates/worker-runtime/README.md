@@ -8,7 +8,6 @@ From the repository root:
 
 ```bash
 cargo run -p worker-runtime \
-  --features ws-server,fs-store \
   --bin yoi-runtime \
   -- --bind 127.0.0.1:38800
 ```
@@ -23,7 +22,6 @@ To bind another address explicitly:
 
 ```bash
 cargo run -p worker-runtime \
-  --features ws-server,fs-store \
   --bin yoi-runtime \
   -- --bind 0.0.0.0:38800
 ```

@@ -137,7 +137,6 @@ For repository builds, the equivalent cargo command is:
 
 ```bash
 cargo run -p worker-runtime \
-  --features ws-server,fs-store \
   --bin yoi-runtime \
   -- --bind 127.0.0.1:38800
 ```

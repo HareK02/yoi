@@ -17,7 +17,7 @@ path = "src/worker_runtime_bin.rs"
 required-features = ["ws-server", "fs-store"]
 
 [features]
-default = []
+default = ["ws-server", "fs-store"]
 fs-store = []
 http-server = ["dep:axum", "dep:tower", "dep:reqwest"]
 ws-server = ["http-server", "axum/ws", "dep:futures", "tokio/sync"]

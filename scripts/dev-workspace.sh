@@ -307,7 +307,7 @@ build_runtime_backend() {
     log "building runtime binary"
     (
       cd "$ROOT_DIR"
-      run_cargo build -p worker-runtime --features ws-server,fs-store --bin yoi-runtime
+      run_cargo build -p worker-runtime --bin yoi-runtime
     )
   else
     log "runtime disabled by YOI_DEV_RUNTIME_ENABLED=0; skipping runtime build"
