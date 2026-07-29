@@ -2329,7 +2329,7 @@ fn dashboard_open_failure_keeps_composer_and_sets_notice() {
 
 #[test]
 fn dashboard_loading_app_defers_initial_snapshot_to_enter_reload() {
-    let app = DashboardApp::loading(WorkerRuntimeCommand::for_executable("/tmp/yoi"));
+    let app = DashboardApp::loading(WorkerRuntimeCommand::for_executable("/tmp/yoi"), false);
 
     assert!(app.panel.rows.is_empty());
     assert!(
@@ -3241,6 +3241,7 @@ fn app_with_panel(list: WorkerList, panel: WorkspacePanelViewModel) -> Dashboard
         refreshing: false,
         enter_reload: None,
         runtime_command: WorkerRuntimeCommand::for_executable("/tmp/yoi"),
+        include_stopped: false,
         last_companion_lifecycle_failure,
         last_orchestrator_lifecycle_failure,
         orchestrator_work_set: OrchestratorWorkSet::default(),
@@ -3392,7 +3393,7 @@ fn section_names<'a>(list: &'a WorkerList, section: &DashboardSection) -> Vec<&'
 
 #[test]
 fn ticket_action_error_records_f2_diagnostic_details() {
-    let mut app = DashboardApp::loading(WorkerRuntimeCommand::for_executable("/tmp/yoi"));
+    let mut app = DashboardApp::loading(WorkerRuntimeCommand::for_executable("/tmp/yoi"), false);
     let long_error = "root-clean failed for Ticket 00001KTWPE3KQ at /home/hare/Projects/yoi: dirty file crates/tui/src/dashboard.rs";
 
     app.finish_ticket_action_dispatch(Err(TicketActionError::Stale(long_error.to_string())));

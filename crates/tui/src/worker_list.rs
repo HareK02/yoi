@@ -126,6 +126,17 @@ impl WorkerList {
         self.selected_name = self.entries.get(index).map(|entry| entry.name.clone());
     }
 
+    pub(crate) fn retain_live_entries(&mut self) {
+        self.entries.retain(|entry| entry.live.is_some());
+        if !self
+            .selected_name
+            .as_ref()
+            .is_some_and(|selected| self.entries.iter().any(|entry| entry.name == *selected))
+        {
+            self.selected_name = self.entries.first().map(|entry| entry.name.clone());
+        }
+    }
+
     pub(crate) fn selected_entry(&self) -> Option<&WorkerListEntry> {
         let index = self.selected_index();
         self.entries.get(index)
@@ -734,6 +745,28 @@ mod tests {
             entry.attach_socket_path(),
             Some(Path::new("/tmp/runtime-only.sock"))
         );
+    }
+
+    #[test]
+    fn retain_live_entries_removes_stored_only_rows_and_reselects() {
+        let dir = tempdir().unwrap();
+        let store = FsStore::new(dir.path()).unwrap();
+        let session_id = new_session_id();
+        let segment_id = new_segment_id();
+        append_start(&store, session_id, segment_id, 10);
+        let mut list = WorkerList::from_sources(
+            SOURCE,
+            vec![metadata_info(&store, "stored", session_id, segment_id)],
+            vec![live_info("live", WorkerStatus::Idle)],
+            Some("stored".to_string()),
+            10,
+        );
+
+        list.retain_live_entries();
+
+        assert_eq!(list.entries.len(), 1);
+        assert_eq!(list.entries[0].name, "live");
+        assert_eq!(list.selected_entry().unwrap().name, "live");
     }
 
     #[test]

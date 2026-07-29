@@ -179,8 +179,8 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
             }
             Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
         },
-        LaunchMode::Panel { .. } => match target.dashboard() {
-            Ok(dashboard) => dashboard::launch(dashboard.runtime_command).await,
+        LaunchMode::Panel { include_stopped } => match target.dashboard() {
+            Ok(dashboard) => dashboard::launch(dashboard.runtime_command, include_stopped).await,
             Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
         },
     };

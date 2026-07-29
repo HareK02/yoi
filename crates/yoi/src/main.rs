@@ -20,7 +20,7 @@ use cli_connection::{
     resolve_backend_cli_connection, resolve_connection_aware_cli_connection,
     resolve_local_cli_connection,
 };
-use client::{BackendAuthTarget, Target, start_device_login, wait_for_device_login};
+use client::{BackendAuthTarget, Target, TargetKind, start_device_login, wait_for_device_login};
 use memory_lint::{LintCliOptions, LintStatus};
 use serde::{Deserialize, Serialize};
 use session_store::SegmentId;
@@ -388,19 +388,25 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             return Ok(Mode::Mcp(mcp_cli));
         }
         "panel" => {
-            let workspace_root = parse_panel_workspace(&args[1..])?;
+            let panel_options = parse_panel_args(&args[1..])?;
             let target = resolve_tui_target(
                 connection_resolver,
                 CliCommand::Panel,
                 &target_selection,
-                &workspace_root,
+                &panel_options.workspace_root,
             )?;
+            if panel_options.include_stopped && target.kind() == TargetKind::Backend {
+                return Err(ParseError(
+                    "yoi panel -r is only supported for local targets; Backend panel restore UI is not implemented"
+                        .to_string(),
+                ));
+            }
             return Ok(Mode::Tui {
                 target,
                 mode: LaunchMode::Panel {
-                    include_stopped: false,
+                    include_stopped: panel_options.include_stopped,
                 },
-                workspace_root,
+                workspace_root: panel_options.workspace_root,
             });
         }
         "keys" => {
@@ -1554,33 +1560,48 @@ fn mcp_usage() -> &'static str {
     "usage: yoi mcp list [--workspace PATH] [--profile REF] [--json]\n       yoi mcp show <server> [--workspace PATH] [--profile REF] [--json]\n       yoi mcp tools [server] [--workspace PATH] [--profile REF] [--json]\n       yoi mcp resources [server] [--workspace PATH] [--profile REF] [--json]\n       yoi mcp prompts [server] [--workspace PATH] [--profile REF] [--json]"
 }
 
-fn parse_panel_workspace(args: &[String]) -> Result<PathBuf, ParseError> {
-    if let Some(arg) = args.iter().find(|arg| is_backend_target_option(arg)) {
-        return Err(backend_target_option_error_for_local_command(
-            CliCommand::Panel,
-            arg,
-        ));
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PanelCliOptions {
+    workspace_root: PathBuf,
+    include_stopped: bool,
+}
 
-    match args {
-        [] => std::env::current_dir()
-            .map_err(|e| ParseError(format!("failed to resolve current directory: {e}"))),
-        [flag, value] if flag == "--workspace" => Ok(PathBuf::from(value)),
-        [flag] if flag.starts_with("--workspace=") => {
-            let value = flag.trim_start_matches("--workspace=");
-            if value.is_empty() {
-                Err(ParseError("--workspace requires a value".to_string()))
-            } else {
-                Ok(PathBuf::from(value))
+fn parse_panel_args(args: &[String]) -> Result<PanelCliOptions, ParseError> {
+    let mut workspace_root: Option<PathBuf> = None;
+    let mut include_stopped = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--workspace" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError("--workspace requires a path".to_string()))?;
+                workspace_root = Some(PathBuf::from(value));
+                i += 2;
+            }
+            arg if arg.starts_with("--workspace=") => {
+                let value = arg.trim_start_matches("--workspace=");
+                if value.is_empty() {
+                    return Err(ParseError("--workspace requires a path".to_string()));
+                }
+                workspace_root = Some(PathBuf::from(value));
+                i += 1;
+            }
+            "-r" | "--stopped" | "--restoreable" => {
+                include_stopped = true;
+                i += 1;
+            }
+            other => {
+                return Err(ParseError(format!(
+                    "unknown panel option `{other}`; usage: yoi [TARGET] panel [-r|--stopped] [--workspace <PATH>]"
+                )));
             }
         }
-        [flag] if flag == "--workspace" => {
-            Err(ParseError("--workspace requires a value".to_string()))
-        }
-        _ => Err(ParseError(
-            "yoi panel accepts only --workspace <PATH>".to_string(),
-        )),
     }
+    Ok(PanelCliOptions {
+        workspace_root: workspace_root.unwrap_or(current_dir()?),
+        include_stopped,
+    })
 }
 
 fn parse_session_id(value: &str) -> Result<SegmentId, ParseError> {
@@ -1595,7 +1616,7 @@ Usage:
   yoi [TARGET] [CONSOLE_OPTIONS]
   yoi [TARGET] workers [-r|--stopped] [--workspace <PATH>] [--runtime-id <ID>]
   yoi [TARGET] resume [--workspace <PATH>|--all] [--runtime-id <ID>]
-  yoi [TARGET] panel [--workspace <PATH>]
+  yoi [TARGET] panel [-r|--stopped] [--workspace <PATH>]
   yoi [--backend <URL>] login [--no-wait]
   yoi <LOCAL_COMMAND> [OPTIONS]
 
@@ -1622,6 +1643,7 @@ Connection-aware commands:
   yoi workers -r              Include stopped Workers. --restoreable is accepted as a legacy alias.
   yoi resume                  Open the Worker picker with stopped Workers included.
   yoi panel                   Open the dashboard/panel TUI for the selected target.
+  yoi panel -r                Local only: include stopped/restorable Worker rows.
 
 Console options:
       --workspace <PATH>   Local workspace root for local Console/Worker lists (defaults to cwd)
@@ -1813,12 +1835,6 @@ backend = "shared"
 
     #[test]
     fn parse_local_only_commands_reject_backend_target_options() {
-        let err = parse_args_from(["panel", "--runtime-id", "runtime-a"]).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "yoi panel uses a local connection target and cannot accept Backend target option `--runtime-id`"
-        );
-
         let err = parse_args_from(["keys", "--workspace-id=workspace-a"]).unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -2416,6 +2432,33 @@ backend = "shared"
             } => assert_eq!(workspace_root, PathBuf::from("/tmp/other-workspace")),
             _ => panic!("expected Panel mode"),
         }
+    }
+
+    #[test]
+    fn parse_panel_stopped_mode() {
+        for flag in ["-r", "--stopped", "--restoreable"] {
+            match parse_args_from(["panel", flag, "--workspace", "/tmp/other-workspace"]).unwrap() {
+                Mode::Tui {
+                    mode:
+                        LaunchMode::Panel {
+                            include_stopped: true,
+                        },
+                    workspace_root,
+                    ..
+                } => assert_eq!(workspace_root, PathBuf::from("/tmp/other-workspace")),
+                _ => panic!("expected Panel stopped mode for {flag}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_backend_panel_stopped_is_not_supported() {
+        let err =
+            parse_args_from(["--backend", "http://127.0.0.1:8787", "panel", "-r"]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "yoi panel -r is only supported for local targets; Backend panel restore UI is not implemented"
+        );
     }
 
     #[test]

@@ -118,8 +118,11 @@ pub(crate) enum DashboardOutcome {
     Open(OpenWorkerRequest),
 }
 
-pub(crate) async fn launch(runtime_command: WorkerRuntimeCommand) -> Result<(), Box<dyn Error>> {
-    let mut app = load_app(runtime_command.clone()).await?;
+pub(crate) async fn launch(
+    runtime_command: WorkerRuntimeCommand,
+    include_stopped: bool,
+) -> Result<(), Box<dyn Error>> {
+    let mut app = load_app(runtime_command.clone(), include_stopped).await?;
     let mut terminal = crate::console::enter_dashboard_fullscreen()?;
     loop {
         match run_loop(&mut terminal, &mut app).await? {
@@ -174,8 +177,9 @@ pub(crate) struct OpenWorkerRequest {
 
 pub(crate) async fn load_app(
     runtime_command: WorkerRuntimeCommand,
+    include_stopped: bool,
 ) -> Result<DashboardApp, DashboardError> {
-    Ok(DashboardApp::loading(runtime_command))
+    Ok(DashboardApp::loading(runtime_command, include_stopped))
 }
 
 async fn run_loop(
@@ -222,14 +226,14 @@ async fn run_loop(
         }
 
         if let Some(mode) = deferred_enter_reload.take() {
-            if pending_reload.start(mode) {
+            if pending_reload.start(mode, app.include_stopped) {
                 app.refreshing = true;
             }
         }
 
         let now = Instant::now();
         if now >= next_poll {
-            pending_reload.start(OrchestratorLifecycleMode::Observe);
+            pending_reload.start(OrchestratorLifecycleMode::Observe, app.include_stopped);
             next_poll = now + DASHBOARD_POLL_INTERVAL;
             continue;
         }
@@ -275,7 +279,8 @@ async fn run_loop(
                     terminal.draw(|f| render::draw(f, app))?;
                     let result = dispatch_ticket_action(request).await;
                     app.finish_ticket_action_dispatch(result);
-                    if pending_reload.start(OrchestratorLifecycleMode::Observe) {
+                    if pending_reload.start(OrchestratorLifecycleMode::Observe, app.include_stopped)
+                    {
                         app.refreshing = true;
                     }
                     next_poll = Instant::now() + DASHBOARD_POLL_INTERVAL;
@@ -311,7 +316,8 @@ async fn run_loop(
                         }
                         Err(error) => app.finish_ready_ticket_planning_return_error(error),
                     }
-                    if pending_reload.start(OrchestratorLifecycleMode::Observe) {
+                    if pending_reload.start(OrchestratorLifecycleMode::Observe, app.include_stopped)
+                    {
                         app.refreshing = true;
                     }
                     next_poll = Instant::now() + DASHBOARD_POLL_INTERVAL;
@@ -328,7 +334,8 @@ async fn run_loop(
                     terminal.draw(|f| render::draw(f, app))?;
                     let result = launch_intake_with_handoff(request).await;
                     app.finish_intake_launch(result);
-                    if pending_reload.start(OrchestratorLifecycleMode::Observe) {
+                    if pending_reload.start(OrchestratorLifecycleMode::Observe, app.include_stopped)
+                    {
                         app.refreshing = true;
                     }
                     next_poll = Instant::now() + DASHBOARD_POLL_INTERVAL;
@@ -345,7 +352,8 @@ async fn run_loop(
                     terminal.draw(|f| render::draw(f, app))?;
                     let result = dispatch_companion_message(request).await;
                     app.finish_companion_send(result);
-                    if pending_reload.start(OrchestratorLifecycleMode::Observe) {
+                    if pending_reload.start(OrchestratorLifecycleMode::Observe, app.include_stopped)
+                    {
                         app.refreshing = true;
                     }
                     next_poll = Instant::now() + DASHBOARD_POLL_INTERVAL;
@@ -366,7 +374,7 @@ struct PendingReload {
 }
 
 impl PendingReload {
-    fn start(&mut self, lifecycle_mode: OrchestratorLifecycleMode) -> bool {
+    fn start(&mut self, lifecycle_mode: OrchestratorLifecycleMode, include_stopped: bool) -> bool {
         if self.handle.is_some() {
             return false;
         }
@@ -382,7 +390,7 @@ impl PendingReload {
         self.handle = Some(tokio::spawn(async move {
             #[cfg(feature = "e2e-test")]
             crate::e2e_observer::hold_background_task_if_requested("reload").await;
-            load_dashboard_snapshot(None, lifecycle_mode).await
+            load_dashboard_snapshot(None, lifecycle_mode, include_stopped).await
         }));
         true
     }
@@ -1219,6 +1227,7 @@ pub(crate) struct DashboardApp {
     refreshing: bool,
     enter_reload: Option<OrchestratorLifecycleMode>,
     runtime_command: WorkerRuntimeCommand,
+    include_stopped: bool,
     last_companion_lifecycle_failure: Option<CompanionPanelState>,
     last_orchestrator_lifecycle_failure: Option<OrchestratorPanelState>,
     orchestrator_work_set: OrchestratorWorkSet,
@@ -1228,7 +1237,7 @@ pub(crate) struct DashboardApp {
 }
 
 impl DashboardApp {
-    fn loading(runtime_command: WorkerRuntimeCommand) -> Self {
+    fn loading(runtime_command: WorkerRuntimeCommand, include_stopped: bool) -> Self {
         let workspace_root = current_workspace_root();
         let mut panel = WorkspacePanelViewModel::empty(&workspace_root);
         panel
@@ -1257,6 +1266,7 @@ impl DashboardApp {
                 runtime_command: runtime_command.clone(),
             }),
             runtime_command,
+            include_stopped,
             last_companion_lifecycle_failure: None,
             last_orchestrator_lifecycle_failure: None,
             orchestrator_work_set: OrchestratorWorkSet::default(),
@@ -2511,6 +2521,7 @@ enum OrchestratorLifecycleMode {
 async fn load_dashboard_snapshot(
     selected_name: Option<String>,
     lifecycle_mode: OrchestratorLifecycleMode,
+    include_stopped: bool,
 ) -> Result<DashboardSnapshot, DashboardError> {
     let workspace_root = current_workspace_root();
     #[cfg(feature = "e2e-test")]
@@ -2524,7 +2535,8 @@ async fn load_dashboard_snapshot(
 
     #[cfg(feature = "e2e-test")]
     let source_started = Instant::now();
-    let mut list = load_worker_list(list_selected_name.clone(), MAX_ENTRIES).await?;
+    let mut list =
+        load_worker_list(list_selected_name.clone(), MAX_ENTRIES, include_stopped).await?;
     #[cfg(feature = "e2e-test")]
     source_timings.push(PanelE2eSourceTiming {
         source: "pod_metadata_status_probe.initial",
@@ -2564,7 +2576,7 @@ async fn load_dashboard_snapshot(
     if companion.reload_workers {
         #[cfg(feature = "e2e-test")]
         let source_started = Instant::now();
-        list = load_worker_list(list_selected_name.clone(), MAX_ENTRIES).await?;
+        list = load_worker_list(list_selected_name.clone(), MAX_ENTRIES, include_stopped).await?;
         #[cfg(feature = "e2e-test")]
         source_timings.push(PanelE2eSourceTiming {
             source: "pod_metadata_status_probe.after_companion_reload",
@@ -2622,7 +2634,7 @@ async fn load_dashboard_snapshot(
     if orchestrator.reload_workers {
         #[cfg(feature = "e2e-test")]
         let source_started = Instant::now();
-        list = load_worker_list(list_selected_name, MAX_ENTRIES).await?;
+        list = load_worker_list(list_selected_name, MAX_ENTRIES, include_stopped).await?;
         #[cfg(feature = "e2e-test")]
         source_timings.push(PanelE2eSourceTiming {
             source: "pod_metadata_status_probe.after_orchestrator_reload",
@@ -3420,6 +3432,7 @@ fn existing_ticket_claim_notice(
 async fn load_worker_list(
     selected_name: Option<String>,
     max_entries: usize,
+    include_stopped: bool,
 ) -> Result<WorkerList, DashboardError> {
     let store_dir = default_store_dir()?;
     let store = FsStore::new(&store_dir)?;
@@ -3429,14 +3442,18 @@ async fn load_worker_list(
     let live = read_reachable_live_worker_infos(&store)
         .await
         .unwrap_or_default();
-    Ok(WorkerList::from_workspace_sources(
+    let mut list = WorkerList::from_workspace_sources(
         WorkerVisibilitySource::ResumePicker,
         stored,
         live,
         selected_name,
         max_entries,
         &current_workspace_root(),
-    ))
+    );
+    if !include_stopped {
+        list.retain_live_entries();
+    }
+    Ok(list)
 }
 
 #[derive(Debug, Clone)]
