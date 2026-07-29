@@ -42,6 +42,6 @@ yoi ticket doctor
 
 Use work item review to verify that the implementation satisfies the ticket, not only that the diff looks plausible.
 
-## Current limitation
+## E2E validation
 
-End-to-end tests that spawn real processes are not yet designed. When changing Worker restoration, socket behavior, or orchestration, compensate with targeted unit/integration tests and concrete manual evidence in the implementation report.
+Real-process E2E tests are opt-in. Do not add or extend E2E coverage unless the work explicitly requires the E2E test to be designed and implemented. Otherwise validate the narrower parser, API, protocol, authority, or runtime boundary.

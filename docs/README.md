@@ -18,7 +18,8 @@ It is not a dumping ground for external research, old plans, API inventories, or
 10. [`design/workspace-runtime-docker.md`](design/workspace-runtime-docker.md) — the WebUI / Backend / Runtime split, Docker image layout, worker launch path, and workdir materialization boundary.
 11. [`development/server-runtime-auth.md`](development/server-runtime-auth.md) — manual Workspace Server / Runtime public-key exchange and authenticated Runtime startup checks.
 12. [`development/work-items.md`](development/work-items.md) — how project work is recorded and reviewed.
-13. [`development/validation.md`](development/validation.md) — how to check changes.
+13. [`development/rust-testing-strategy.md`](development/rust-testing-strategy.md) — what Yoi Rust tests should prove, where they belong, and how to name them.
+14. [`development/validation.md`](development/validation.md) — how to check changes.
 
 ## What belongs here
 

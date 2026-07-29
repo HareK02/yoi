@@ -38,7 +38,22 @@ Orchestrator の cwd が orchestration 用ブランチ/worktree の場合、通�
 
 ## 検証
 
-検証は変更内容に応じて `cargo test` / `cargo check` / `git diff --check` など、妥当な範囲で行う。重い検証は必要性が高い場合に選ぶ。
+開発中は、変更した契約を証明する最小の target / filter から実行する。
+
+```sh
+cargo test -p <crate> --lib <test-or-module-filter>
+cargo test -p <crate> --test <test-target> <test-filter>
+cargo check -p <crate> -p <dependent-crate>
+```
+
+完了前には変更内容に応じて、対象crate全体のtest、影響するfeature構成、依存crateのcheckを追加する。通常の差分検証には以下を使う。
+
+```sh
+cargo fmt --all -- --check
+git diff --check HEAD
+```
+
+workspace全体、E2E、Nix/Docker buildなどの重い検証は、変更した境界を狭い検証では証明できない場合や明示的に要求された場合に選ぶ。実行した検証が何を証明するのかを意識し、広い検証を形式的に回すだけにしない。
 
 ---
 

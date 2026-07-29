@@ -80,6 +80,6 @@ cargo check --workspace --all-targets
 cargo test --workspace
 ```
 
-E2E testing with real spawned processes is not yet designed. Keep changes scoped, preserve durable authority boundaries, and prefer clear type-safe structure over short-term compatibility layers.
+Real-process E2E testing is opt-in. Do not design or implement E2E coverage unless the work explicitly requires E2E; otherwise protect the narrower parser, API, protocol, authority, or runtime boundary.
 
 License: MIT. See [`LICENSE`](LICENSE).
