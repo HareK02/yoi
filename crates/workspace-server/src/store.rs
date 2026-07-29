@@ -77,6 +77,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "trusted remote runtime registry",
         apply: create_trusted_runtime_registry_tables,
     },
+    Migration {
+        version: 13,
+        name: "objective mutation audit events",
+        apply: create_objective_event_tables,
+    },
 ];
 
 struct Migration {
@@ -268,6 +273,16 @@ pub struct ObjectiveTicketLinkRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectiveEventRecord {
+    pub workspace_id: String,
+    pub objective_id: String,
+    pub event_id: String,
+    pub kind: String,
+    pub body_md: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObjectiveResourceRecord {
     pub workspace_id: String,
     pub objective_id: String,
@@ -335,6 +350,12 @@ pub trait ControlPlaneStore: Send + Sync {
         workspace_id: &str,
         objective_id: &str,
     ) -> Result<Vec<ObjectiveTicketLinkRecord>>;
+    fn insert_objective_event(&self, record: &ObjectiveEventRecord) -> Result<()>;
+    fn list_objective_events(
+        &self,
+        workspace_id: &str,
+        objective_id: &str,
+    ) -> Result<Vec<ObjectiveEventRecord>>;
     fn upsert_objective_resource(&self, record: &ObjectiveResourceRecord) -> Result<()>;
     fn list_objective_resources(
         &self,
@@ -787,6 +808,52 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 params![workspace_id, objective_id],
                 read_objective_ticket_link_record,
             )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
+        })
+    }
+
+    fn insert_objective_event(&self, record: &ObjectiveEventRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO objective_events (
+                    workspace_id, objective_id, event_id, kind, body_md, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+                params![
+                    record.workspace_id,
+                    record.objective_id,
+                    record.event_id,
+                    record.kind,
+                    record.body_md,
+                    record.created_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn list_objective_events(
+        &self,
+        workspace_id: &str,
+        objective_id: &str,
+    ) -> Result<Vec<ObjectiveEventRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"SELECT workspace_id, objective_id, event_id, kind, body_md, created_at
+                   FROM objective_events
+                   WHERE workspace_id = ?1 AND objective_id = ?2
+                   ORDER BY created_at ASC, event_id ASC"#,
+            )?;
+            let rows = stmt.query_map(params![workspace_id, objective_id], |row| {
+                Ok(ObjectiveEventRecord {
+                    workspace_id: row.get(0)?,
+                    objective_id: row.get(1)?,
+                    event_id: row.get(2)?,
+                    kind: row.get(3)?,
+                    body_md: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(Error::from)
         })
@@ -2089,6 +2156,22 @@ CREATE TABLE IF NOT EXISTS memory_staging_resolutions (
     Ok(())
 }
 
+fn create_objective_event_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+CREATE TABLE IF NOT EXISTS objective_events (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    objective_id TEXT NOT NULL REFERENCES objectives(objective_id) ON DELETE CASCADE,
+    event_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    body_md TEXT,
+    created_at TEXT NOT NULL
+);
+"#,
+    )?;
+    Ok(())
+}
+
 fn create_trusted_runtime_registry_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -2647,6 +2730,15 @@ CREATE TABLE IF NOT EXISTS objective_ticket_links (
     PRIMARY KEY (objective_id, ticket_id, kind)
 );
 
+CREATE TABLE IF NOT EXISTS objective_events (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    objective_id TEXT NOT NULL REFERENCES objectives(objective_id) ON DELETE CASCADE,
+    event_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    body_md TEXT,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS objective_resources (
     workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
     objective_id TEXT NOT NULL REFERENCES objectives(objective_id) ON DELETE CASCADE,
@@ -2818,7 +2910,7 @@ mod tests {
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 11);
+        assert_eq!(store.schema_version().await.unwrap(), 13);
 
         let record = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
@@ -2831,7 +2923,7 @@ mod tests {
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 11);
+        assert_eq!(reopened.schema_version().await.unwrap(), 13);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -3052,7 +3144,7 @@ mod tests {
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 11);
+        assert_eq!(store.schema_version().await.unwrap(), 13);
 
         store
             .with_conn(|conn| {
@@ -3146,7 +3238,7 @@ mod tests {
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 11);
+        assert_eq!(store.schema_version().await.unwrap(), 13);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -3184,7 +3276,7 @@ mod tests {
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 11);
+        assert_eq!(store.schema_version().await.unwrap(), 13);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -3358,7 +3450,7 @@ mod tests {
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 11);
+        assert_eq!(store.schema_version().await.unwrap(), 13);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),

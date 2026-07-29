@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use chrono::Utc;
+use project_record::{allocate_record_id, unix_epoch_millis_now};
 
 use ticket::{
     SqliteTicketBackend, TicketBackend, TicketIdOrSlug, TicketListQuery,
@@ -13,7 +14,7 @@ use crate::records::{
 };
 use crate::store::{
     ControlPlaneStore, MemoryDocumentRecord, MemoryStagingRecord, MemoryStagingResolutionRecord,
-    SqliteWorkspaceStore,
+    ObjectiveEventRecord, ObjectiveRecord, ObjectiveTicketLinkRecord, SqliteWorkspaceStore,
 };
 use crate::{Error, Result};
 
@@ -38,6 +39,27 @@ pub trait TicketAuthority {
 pub trait ObjectiveAuthority {
     fn list_objectives(&self, limit: usize) -> Result<ProjectRecordList<ObjectiveSummary>>;
     fn objective(&self, id: &str) -> Result<ObjectiveDetail>;
+    fn create_objective(&self, input: ObjectiveCreateInput) -> Result<ObjectiveDetail>;
+    fn edit_objective(&self, id: &str, input: ObjectiveEditInput) -> Result<ObjectiveDetail>;
+    fn set_objective_state(&self, id: &str, state: &str) -> Result<ObjectiveDetail>;
+    fn link_objective_ticket(&self, id: &str, ticket_id: &str) -> Result<ObjectiveDetail>;
+    fn unlink_objective_ticket(&self, id: &str, ticket_id: &str) -> Result<ObjectiveDetail>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectiveCreateInput {
+    pub title: String,
+    pub body_md: String,
+    pub state: String,
+    pub linked_tickets: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ObjectiveEditInput {
+    pub title: Option<String>,
+    pub old_string: Option<String>,
+    pub new_string: Option<String>,
+    pub replace_all: bool,
 }
 
 pub trait MemoryAuthority {
@@ -108,6 +130,75 @@ impl SqliteWorkspaceAuthority {
             workspace_id: workspace_id.clone(),
             store: SqliteWorkspaceStore::open(&database_path)?,
             ticket_backend: SqliteTicketBackend::new(database_path, workspace_id),
+        })
+    }
+
+    fn objective_record(&self, id: &str) -> Result<ObjectiveRecord> {
+        self.store
+            .get_objective(&self.workspace_id, id)?
+            .ok_or_else(|| unknown_objective_error(id))
+    }
+
+    fn objective_detail_from_record(&self, record: ObjectiveRecord) -> Result<ObjectiveDetail> {
+        let linked_tickets = self
+            .store
+            .list_objective_ticket_links(&self.workspace_id, &record.objective_id)?
+            .into_iter()
+            .map(|link| link.ticket_id)
+            .collect::<Vec<_>>();
+        let resources = self
+            .store
+            .list_objective_resources(&self.workspace_id, &record.objective_id)?
+            .into_iter()
+            .map(|resource| ObjectiveResourceSummary {
+                path: resource.resource_path,
+                media_type: resource.media_type,
+                bytes: resource.body.len(),
+                updated_at: resource.updated_at,
+            })
+            .collect();
+        let (body, body_truncated) = truncate_body(&record.body_md, DETAIL_BODY_LIMIT);
+        Ok(ObjectiveDetail {
+            id: record.objective_id,
+            title: record.title,
+            state: record.state,
+            created_at: Some(record.created_at),
+            updated_at: Some(record.updated_at),
+            linked_tickets,
+            resources,
+            body,
+            body_truncated,
+            record_source: RECORD_SOURCE_WORKSPACE_SQLITE.to_string(),
+        })
+    }
+
+    fn insert_objective_event(
+        &self,
+        objective_id: &str,
+        kind: &str,
+        body_md: Option<&str>,
+    ) -> Result<()> {
+        let event_id = allocate_record_id(
+            unix_epoch_millis_now().map_err(|err| {
+                invalid_objective_error(format!("failed to read objective event clock: {err}"))
+            })?,
+            |candidate| {
+                self.store
+                    .list_objective_events(&self.workspace_id, objective_id)
+                    .map(|events| events.iter().any(|event| event.event_id == candidate))
+                    .unwrap_or(true)
+            },
+        )
+        .map_err(|err| {
+            invalid_objective_error(format!("failed to allocate objective event id: {err}"))
+        })?;
+        self.store.insert_objective_event(&ObjectiveEventRecord {
+            workspace_id: self.workspace_id.clone(),
+            objective_id: objective_id.to_string(),
+            event_id,
+            kind: kind.to_string(),
+            body_md: body_md.map(str::to_string),
+            created_at: now_rfc3339(),
         })
     }
 }
@@ -189,52 +280,172 @@ impl ObjectiveAuthority for SqliteWorkspaceAuthority {
                 updated_at: Some(record.updated_at),
                 summary: summarize_body(&record.body_md),
                 linked_tickets,
-                record_source: "workspace-sqlite".to_string(),
+                record_source: RECORD_SOURCE_WORKSPACE_SQLITE.to_string(),
             });
         }
         Ok(ProjectRecordList {
             items,
             invalid_records: Vec::new(),
-            record_authority: "workspace-sqlite".to_string(),
+            record_authority: RECORD_SOURCE_WORKSPACE_SQLITE.to_string(),
         })
     }
 
     fn objective(&self, id: &str) -> Result<ObjectiveDetail> {
         validate_project_id(id)?;
-        let record = self
-            .store
-            .get_objective(&self.workspace_id, id)?
-            .ok_or_else(|| Error::Store(format!("unknown objective `{id}`")))?;
-        let linked_tickets = self
-            .store
-            .list_objective_ticket_links(&self.workspace_id, &record.objective_id)?
+        let record = self.objective_record(id)?;
+        self.objective_detail_from_record(record)
+    }
+
+    fn create_objective(&self, input: ObjectiveCreateInput) -> Result<ObjectiveDetail> {
+        validate_objective_title(&input.title)?;
+        validate_objective_state(&input.state)?;
+        for ticket_id in &input.linked_tickets {
+            validate_project_id(ticket_id)?;
+        }
+        let now = now_rfc3339();
+        let objective_id = allocate_record_id(
+            unix_epoch_millis_now().map_err(|err| {
+                invalid_objective_error(format!("failed to read objective clock: {err}"))
+            })?,
+            |candidate| {
+                self.store
+                    .get_objective(&self.workspace_id, candidate)
+                    .map(|record| record.is_some())
+                    .unwrap_or(true)
+            },
+        )
+        .map_err(|err| {
+            invalid_objective_error(format!("failed to allocate objective id: {err}"))
+        })?;
+        let record = ObjectiveRecord {
+            workspace_id: self.workspace_id.clone(),
+            objective_id: objective_id.clone(),
+            title: input.title.trim().to_string(),
+            state: input.state.trim().to_string(),
+            body_md: input.body_md,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        self.store.upsert_objective(&record)?;
+        let links = input
+            .linked_tickets
             .into_iter()
-            .map(|link| link.ticket_id)
-            .collect::<Vec<_>>();
-        let resources = self
-            .store
-            .list_objective_resources(&self.workspace_id, &record.objective_id)?
-            .into_iter()
-            .map(|resource| ObjectiveResourceSummary {
-                path: resource.resource_path,
-                media_type: resource.media_type,
-                bytes: resource.body.len(),
-                updated_at: resource.updated_at,
+            .map(|ticket_id| ObjectiveTicketLinkRecord {
+                workspace_id: self.workspace_id.clone(),
+                objective_id: objective_id.clone(),
+                ticket_id,
+                kind: "linked".to_string(),
+                created_at: now.clone(),
             })
-            .collect();
-        let (body, body_truncated) = truncate_body(&record.body_md, DETAIL_BODY_LIMIT);
-        Ok(ObjectiveDetail {
-            id: record.objective_id,
-            title: record.title,
-            state: record.state,
-            created_at: Some(record.created_at),
-            updated_at: Some(record.updated_at),
-            linked_tickets,
-            resources,
-            body,
-            body_truncated,
-            record_source: "workspace-sqlite".to_string(),
-        })
+            .collect::<Vec<_>>();
+        self.store
+            .replace_objective_ticket_links(&self.workspace_id, &objective_id, &links)?;
+        self.insert_objective_event(&objective_id, "create", Some(&record.body_md))?;
+        self.objective(&objective_id)
+    }
+
+    fn edit_objective(&self, id: &str, input: ObjectiveEditInput) -> Result<ObjectiveDetail> {
+        validate_project_id(id)?;
+        let mut record = self.objective_record(id)?;
+        let mut changed = false;
+        if let Some(title) = input.title {
+            validate_objective_title(&title)?;
+            let title = title.trim().to_string();
+            if title != record.title {
+                record.title = title;
+                changed = true;
+            }
+        }
+        match (input.old_string, input.new_string) {
+            (Some(old_string), Some(new_string)) => {
+                if old_string.is_empty() {
+                    return Err(invalid_objective_error("old_string must not be empty"));
+                }
+                let matches = record.body_md.matches(&old_string).count();
+                if matches == 0 {
+                    return Err(invalid_objective_error(
+                        "old_string was not found in objective body",
+                    ));
+                }
+                if matches > 1 && !input.replace_all {
+                    return Err(invalid_objective_error(format!(
+                        "old_string matched {matches} times; set replace_all = true or provide a unique string"
+                    )));
+                }
+                record.body_md = if input.replace_all {
+                    record.body_md.replace(&old_string, &new_string)
+                } else {
+                    record.body_md.replacen(&old_string, &new_string, 1)
+                };
+                changed = true;
+            }
+            (None, None) => {}
+            _ => {
+                return Err(invalid_objective_error(
+                    "old_string and new_string must be provided together",
+                ));
+            }
+        }
+        if !changed {
+            return Err(invalid_objective_error(
+                "objective edit must change title or body",
+            ));
+        }
+        record.updated_at = now_rfc3339();
+        self.store.upsert_objective(&record)?;
+        self.insert_objective_event(id, "edit", None)?;
+        self.objective(id)
+    }
+
+    fn set_objective_state(&self, id: &str, state: &str) -> Result<ObjectiveDetail> {
+        validate_project_id(id)?;
+        validate_objective_state(state)?;
+        let mut record = self.objective_record(id)?;
+        record.state = state.trim().to_string();
+        record.updated_at = now_rfc3339();
+        self.store.upsert_objective(&record)?;
+        self.insert_objective_event(id, "state", Some(&record.state))?;
+        self.objective(id)
+    }
+
+    fn link_objective_ticket(&self, id: &str, ticket_id: &str) -> Result<ObjectiveDetail> {
+        validate_project_id(id)?;
+        validate_project_id(ticket_id)?;
+        let _record = self.objective_record(id)?;
+        let now = now_rfc3339();
+        let mut links = self
+            .store
+            .list_objective_ticket_links(&self.workspace_id, id)?;
+        if !links.iter().any(|link| link.ticket_id == ticket_id) {
+            links.push(ObjectiveTicketLinkRecord {
+                workspace_id: self.workspace_id.clone(),
+                objective_id: id.to_string(),
+                ticket_id: ticket_id.to_string(),
+                kind: "linked".to_string(),
+                created_at: now,
+            });
+            self.store
+                .replace_objective_ticket_links(&self.workspace_id, id, &links)?;
+            self.insert_objective_event(id, "link_ticket", Some(ticket_id))?;
+        }
+        self.objective(id)
+    }
+
+    fn unlink_objective_ticket(&self, id: &str, ticket_id: &str) -> Result<ObjectiveDetail> {
+        validate_project_id(id)?;
+        validate_project_id(ticket_id)?;
+        let _record = self.objective_record(id)?;
+        let mut links = self
+            .store
+            .list_objective_ticket_links(&self.workspace_id, id)?;
+        let original_len = links.len();
+        links.retain(|link| link.ticket_id != ticket_id);
+        if links.len() != original_len {
+            self.store
+                .replace_objective_ticket_links(&self.workspace_id, id, &links)?;
+            self.insert_objective_event(id, "unlink_ticket", Some(ticket_id))?;
+        }
+        self.objective(id)
     }
 }
 
@@ -369,6 +580,38 @@ fn validate_non_empty(value: &str, field: &str) -> Result<()> {
         Err(Error::Store(format!("memory {field} must not be empty")))
     } else {
         Ok(())
+    }
+}
+
+fn validate_objective_title(title: &str) -> Result<()> {
+    if title.trim().is_empty() {
+        Err(invalid_objective_error("objective title must not be empty"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_objective_state(state: &str) -> Result<()> {
+    if state.trim().is_empty() {
+        Err(invalid_objective_error("objective state must not be empty"))
+    } else {
+        Ok(())
+    }
+}
+
+fn invalid_objective_error(message: impl Into<String>) -> Error {
+    Error::RuntimeOperationFailed {
+        runtime_id: "workspace-authority".to_string(),
+        code: "invalid_objective_request".to_string(),
+        message: message.into(),
+    }
+}
+
+fn unknown_objective_error(id: &str) -> Error {
+    Error::RuntimeOperationFailed {
+        runtime_id: "workspace-authority".to_string(),
+        code: "unknown_objective".to_string(),
+        message: format!("unknown objective `{id}`"),
     }
 }
 
@@ -548,6 +791,80 @@ mod tests {
         assert_eq!(
             authority.list_memory_staging_resolutions(20).unwrap().len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn objective_mutations_write_sqlite_records_and_audit_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("workspace.db");
+        let store = SqliteWorkspaceStore::open(&db_path).unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "workspace-test".to_string(),
+                owner_account_id: None,
+                display_name: "Workspace Test".to_string(),
+                state: "active".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+        let authority = SqliteWorkspaceAuthority::new(&db_path, "workspace-test").unwrap();
+
+        let created = authority
+            .create_objective(ObjectiveCreateInput {
+                title: "Create Objective".to_string(),
+                body_md: "Alpha body".to_string(),
+                state: "active".to_string(),
+                linked_tickets: vec!["00000000001J2".to_string()],
+            })
+            .unwrap();
+        assert_eq!(created.title, "Create Objective");
+        assert_eq!(created.linked_tickets, vec!["00000000001J2"]);
+
+        let edited = authority
+            .edit_objective(
+                &created.id,
+                ObjectiveEditInput {
+                    title: Some("Edited Objective".to_string()),
+                    old_string: Some("Alpha".to_string()),
+                    new_string: Some("Beta".to_string()),
+                    replace_all: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(edited.title, "Edited Objective");
+        assert_eq!(edited.body, "Beta body");
+
+        let state = authority
+            .set_objective_state(&created.id, "paused")
+            .unwrap();
+        assert_eq!(state.state, "paused");
+        assert_eq!(
+            authority
+                .link_objective_ticket(&created.id, "00000000001J3")
+                .unwrap()
+                .linked_tickets,
+            vec!["00000000001J2", "00000000001J3"]
+        );
+        assert_eq!(
+            authority
+                .unlink_objective_ticket(&created.id, "00000000001J2")
+                .unwrap()
+                .linked_tickets,
+            vec!["00000000001J3"]
+        );
+
+        let events = store
+            .list_objective_events("workspace-test", &created.id)
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["create", "edit", "state", "link_ticket", "unlink_ticket"]
         );
     }
 

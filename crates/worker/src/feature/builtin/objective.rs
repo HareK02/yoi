@@ -1,4 +1,5 @@
-//! Backend Workspace API backed Objective read tools.
+//!
+//! Objective tool registration backed by Workspace API authority.
 //!
 //! Objectives are project-level planning context. Runtime Workers may not know
 //! local `.yoi/objectives` paths, so model-visible Objective tools go through
@@ -43,23 +44,119 @@ impl WorkspaceHttpObjectiveBackend {
     }
 
     async fn show(&self, input: ObjectiveShowInput) -> Result<ToolOutput, ToolError> {
-        let id = input.id.trim();
-        if id.is_empty() || id.contains('/') {
-            return Err(ToolError::InvalidArgument(
-                "ObjectiveShow requires non-empty canonical id without '/'".to_string(),
-            ));
-        }
-        let url = format!(
-            "{}/api/w/{}/objectives/{}",
-            self.base_url, self.workspace_id, id
-        );
+        let id = validate_id(&input.id, "ObjectiveShow")?;
+        let url = self.objective_url(id);
         let response = get_json::<ObjectiveDetail>(&url)
             .await
             .map_err(backend_error)?;
-        Ok(ToolOutput {
-            summary: format!("Read objective {}", response.id),
-            content: Some(serde_json::to_string_pretty(&response).map_err(decode_error)?),
-        })
+        Ok(objective_output(
+            format!("Read objective {}", response.id),
+            response,
+        )?)
+    }
+
+    async fn create(&self, input: ObjectiveCreateInput) -> Result<ToolOutput, ToolError> {
+        if input.title.trim().is_empty() {
+            return Err(ToolError::InvalidArgument(
+                "ObjectiveCreate requires non-empty title".to_string(),
+            ));
+        }
+        let url = format!("{}/api/w/{}/objectives", self.base_url, self.workspace_id);
+        let response =
+            send_json::<ObjectiveCreateInput, ObjectiveDetail>(reqwest::Method::POST, &url, &input)
+                .await
+                .map_err(backend_error)?;
+        Ok(objective_output(
+            format!("Created objective {}", response.id),
+            response,
+        )?)
+    }
+
+    async fn edit(&self, input: ObjectiveEditInput) -> Result<ToolOutput, ToolError> {
+        let id = validate_id(&input.id, "ObjectiveEdit")?;
+        if input.title.is_none() && input.old_string.is_none() && input.new_string.is_none() {
+            return Err(ToolError::InvalidArgument(
+                "ObjectiveEdit requires title or old_string/new_string".to_string(),
+            ));
+        }
+        let url = self.objective_url(id);
+        let body = ObjectiveEditRequest {
+            title: input.title,
+            old_string: input.old_string,
+            new_string: input.new_string,
+            replace_all: input.replace_all,
+        };
+        let response =
+            send_json::<ObjectiveEditRequest, ObjectiveDetail>(reqwest::Method::PATCH, &url, &body)
+                .await
+                .map_err(backend_error)?;
+        Ok(objective_output(
+            format!("Edited objective {}", response.id),
+            response,
+        )?)
+    }
+
+    async fn set_state(&self, input: ObjectiveSetStateInput) -> Result<ToolOutput, ToolError> {
+        let id = validate_id(&input.id, "ObjectiveSetState")?;
+        if input.state.trim().is_empty() {
+            return Err(ToolError::InvalidArgument(
+                "ObjectiveSetState requires non-empty state".to_string(),
+            ));
+        }
+        let url = format!("{}/state", self.objective_url(id));
+        let response = send_json::<ObjectiveSetStateRequest, ObjectiveDetail>(
+            reqwest::Method::POST,
+            &url,
+            &ObjectiveSetStateRequest { state: input.state },
+        )
+        .await
+        .map_err(backend_error)?;
+        Ok(objective_output(
+            format!("Updated objective {} state", response.id),
+            response,
+        )?)
+    }
+
+    async fn link_ticket(&self, input: ObjectiveLinkTicketInput) -> Result<ToolOutput, ToolError> {
+        let id = validate_id(&input.id, "ObjectiveLinkTicket")?;
+        let ticket_id = validate_id(&input.ticket_id, "ObjectiveLinkTicket")?;
+        let url = format!("{}/ticket-links", self.objective_url(id));
+        let response = send_json::<ObjectiveLinkTicketRequest, ObjectiveDetail>(
+            reqwest::Method::POST,
+            &url,
+            &ObjectiveLinkTicketRequest {
+                ticket_id: ticket_id.to_string(),
+            },
+        )
+        .await
+        .map_err(backend_error)?;
+        Ok(objective_output(
+            format!("Linked ticket {ticket_id} to objective {}", response.id),
+            response,
+        )?)
+    }
+
+    async fn unlink_ticket(
+        &self,
+        input: ObjectiveUnlinkTicketInput,
+    ) -> Result<ToolOutput, ToolError> {
+        let id = validate_id(&input.id, "ObjectiveUnlinkTicket")?;
+        let ticket_id = validate_id(&input.ticket_id, "ObjectiveUnlinkTicket")?;
+        let url = format!("{}/ticket-links/{}", self.objective_url(id), ticket_id);
+        let response = delete_json::<ObjectiveDetail>(&url)
+            .await
+            .map_err(backend_error)?;
+        Ok(objective_output(
+            format!("Unlinked ticket {ticket_id} from objective {}", response.id),
+            response,
+        )?)
+    }
+
+    fn objective_url(&self, id: &str) -> String {
+        format!(
+            "{}/api/w/{}/objectives/{}",
+            self.base_url, self.workspace_id, id
+        )
     }
 }
 
@@ -88,12 +185,55 @@ async fn get_json<T: for<'de> Deserialize<'de>>(
     url: &str,
 ) -> Result<T, WorkspaceObjectiveBackendError> {
     let response = reqwest::Client::new().get(url).send().await?;
+    decode_response(response).await
+}
+
+async fn send_json<B: Serialize, T: for<'de> Deserialize<'de>>(
+    method: reqwest::Method,
+    url: &str,
+    body: &B,
+) -> Result<T, WorkspaceObjectiveBackendError> {
+    let response = reqwest::Client::new()
+        .request(method, url)
+        .json(body)
+        .send()
+        .await?;
+    decode_response(response).await
+}
+
+async fn delete_json<T: for<'de> Deserialize<'de>>(
+    url: &str,
+) -> Result<T, WorkspaceObjectiveBackendError> {
+    let response = reqwest::Client::new().delete(url).send().await?;
+    decode_response(response).await
+}
+
+async fn decode_response<T: for<'de> Deserialize<'de>>(
+    response: reqwest::Response,
+) -> Result<T, WorkspaceObjectiveBackendError> {
     let status = response.status();
     let body = response.text().await?;
     if !status.is_success() {
         return Err(WorkspaceObjectiveBackendError::Http { status, body });
     }
     serde_json::from_str(&body).map_err(Into::into)
+}
+
+fn objective_output(summary: String, response: ObjectiveDetail) -> Result<ToolOutput, ToolError> {
+    Ok(ToolOutput {
+        summary,
+        content: Some(serde_json::to_string_pretty(&response).map_err(decode_error)?),
+    })
+}
+
+fn validate_id<'a>(id: &'a str, tool_name: &str) -> Result<&'a str, ToolError> {
+    let id = id.trim();
+    if id.is_empty() || id.contains('/') {
+        return Err(ToolError::InvalidArgument(format!(
+            "{tool_name} requires non-empty canonical id without '/'"
+        )));
+    }
+    Ok(id)
 }
 
 pub fn workspace_http_objective_tools(
@@ -113,8 +253,43 @@ pub fn workspace_http_objective_tools(
             "ObjectiveShow",
             SHOW_DESCRIPTION,
             show_schema(),
-            backend,
+            backend.clone(),
             ObjectiveOperation::Show,
+        ),
+        objective_tool(
+            "ObjectiveCreate",
+            CREATE_DESCRIPTION,
+            create_schema(),
+            backend.clone(),
+            ObjectiveOperation::Create,
+        ),
+        objective_tool(
+            "ObjectiveEdit",
+            EDIT_DESCRIPTION,
+            edit_schema(),
+            backend.clone(),
+            ObjectiveOperation::Edit,
+        ),
+        objective_tool(
+            "ObjectiveSetState",
+            SET_STATE_DESCRIPTION,
+            set_state_schema(),
+            backend.clone(),
+            ObjectiveOperation::SetState,
+        ),
+        objective_tool(
+            "ObjectiveLinkTicket",
+            LINK_TICKET_DESCRIPTION,
+            link_ticket_schema(),
+            backend.clone(),
+            ObjectiveOperation::LinkTicket,
+        ),
+        objective_tool(
+            "ObjectiveUnlinkTicket",
+            UNLINK_TICKET_DESCRIPTION,
+            unlink_ticket_schema(),
+            backend,
+            ObjectiveOperation::UnlinkTicket,
         ),
     ]
 }
@@ -123,6 +298,11 @@ pub fn workspace_http_objective_tools(
 enum ObjectiveOperation {
     List,
     Show,
+    Create,
+    Edit,
+    SetState,
+    LinkTicket,
+    UnlinkTicket,
 }
 
 fn objective_tool(
@@ -167,6 +347,26 @@ impl Tool for WorkspaceHttpObjectiveTool {
                 let input = parse_input::<ObjectiveShowInput>(input_json)?;
                 self.backend.show(input).await
             }
+            ObjectiveOperation::Create => {
+                let input = parse_input::<ObjectiveCreateInput>(input_json)?;
+                self.backend.create(input).await
+            }
+            ObjectiveOperation::Edit => {
+                let input = parse_input::<ObjectiveEditInput>(input_json)?;
+                self.backend.edit(input).await
+            }
+            ObjectiveOperation::SetState => {
+                let input = parse_input::<ObjectiveSetStateInput>(input_json)?;
+                self.backend.set_state(input).await
+            }
+            ObjectiveOperation::LinkTicket => {
+                let input = parse_input::<ObjectiveLinkTicketInput>(input_json)?;
+                self.backend.link_ticket(input).await
+            }
+            ObjectiveOperation::UnlinkTicket => {
+                let input = parse_input::<ObjectiveUnlinkTicketInput>(input_json)?;
+                self.backend.unlink_ticket(input).await
+            }
         }
     }
 }
@@ -179,6 +379,16 @@ const LIST_DESCRIPTION: &str =
     "List Objective records through Backend Workspace API authority as bounded summaries.";
 const SHOW_DESCRIPTION: &str =
     "Show one Objective record by canonical id through Backend Workspace API authority.";
+const CREATE_DESCRIPTION: &str =
+    "Create an Objective record through Backend Workspace API authority.";
+const EDIT_DESCRIPTION: &str =
+    "Partially edit an Objective title and/or body through Backend Workspace API authority.";
+const SET_STATE_DESCRIPTION: &str =
+    "Set an Objective state through Backend Workspace API authority.";
+const LINK_TICKET_DESCRIPTION: &str =
+    "Link a Ticket id to an Objective through Backend Workspace API authority.";
+const UNLINK_TICKET_DESCRIPTION: &str =
+    "Unlink a Ticket id from an Objective through Backend Workspace API authority.";
 
 fn list_schema() -> serde_json::Value {
     json!({
@@ -191,12 +401,77 @@ fn list_schema() -> serde_json::Value {
 }
 
 fn show_schema() -> serde_json::Value {
+    id_schema(&["id"])
+}
+
+fn create_schema() -> serde_json::Value {
+    json!({
+        "type":"object",
+        "additionalProperties": false,
+        "required":["title"],
+        "properties":{
+            "title":{"type":"string","minLength":1},
+            "body_md":{"type":"string"},
+            "state":{"type":"string","default":"active"},
+            "linked_tickets":{"type":"array","items":{"type":"string"}}
+        }
+    })
+}
+
+fn edit_schema() -> serde_json::Value {
     json!({
         "type":"object",
         "additionalProperties": false,
         "required":["id"],
         "properties":{
+            "id":{"type":"string"},
+            "title":{"type":["string","null"]},
+            "old_string":{"type":["string","null"]},
+            "new_string":{"type":["string","null"]},
+            "replace_all":{"type":"boolean","default":false}
+        }
+    })
+}
+
+fn set_state_schema() -> serde_json::Value {
+    json!({
+        "type":"object",
+        "additionalProperties": false,
+        "required":["id","state"],
+        "properties":{
+            "id":{"type":"string"},
+            "state":{"type":"string","minLength":1}
+        }
+    })
+}
+
+fn link_ticket_schema() -> serde_json::Value {
+    id_ticket_schema(&["id", "ticket_id"])
+}
+
+fn unlink_ticket_schema() -> serde_json::Value {
+    id_ticket_schema(&["id", "ticket_id"])
+}
+
+fn id_schema(required: &[&str]) -> serde_json::Value {
+    json!({
+        "type":"object",
+        "additionalProperties": false,
+        "required": required,
+        "properties":{
             "id":{"type":"string"}
+        }
+    })
+}
+
+fn id_ticket_schema(required: &[&str]) -> serde_json::Value {
+    json!({
+        "type":"object",
+        "additionalProperties": false,
+        "required": required,
+        "properties":{
+            "id":{"type":"string"},
+            "ticket_id":{"type":"string"}
         }
     })
 }
@@ -209,6 +484,67 @@ struct ObjectiveListInput {
 #[derive(Debug, Deserialize)]
 struct ObjectiveShowInput {
     id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ObjectiveCreateInput {
+    title: String,
+    #[serde(default)]
+    body_md: String,
+    #[serde(default = "default_state")]
+    state: String,
+    #[serde(default)]
+    linked_tickets: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ObjectiveEditInput {
+    id: String,
+    title: Option<String>,
+    old_string: Option<String>,
+    new_string: Option<String>,
+    #[serde(default)]
+    replace_all: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ObjectiveEditRequest {
+    title: Option<String>,
+    old_string: Option<String>,
+    new_string: Option<String>,
+    replace_all: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ObjectiveSetStateInput {
+    id: String,
+    state: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ObjectiveSetStateRequest {
+    state: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ObjectiveLinkTicketInput {
+    id: String,
+    ticket_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ObjectiveUnlinkTicketInput {
+    id: String,
+    ticket_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ObjectiveLinkTicketRequest {
+    ticket_id: String,
+}
+
+fn default_state() -> String {
+    "active".to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -263,20 +599,37 @@ mod tests {
     }
 
     #[test]
-    fn workspace_http_objective_tools_include_read_only_objective_tools() {
+    fn workspace_http_objective_tools_include_objective_crud_tools() {
         let names = tool_names(workspace_http_objective_tools(
             "workspace".to_string(),
             "http://backend".to_string(),
         ));
 
-        assert_eq!(names, vec!["ObjectiveList", "ObjectiveShow"]);
+        assert_eq!(
+            names,
+            vec![
+                "ObjectiveCreate",
+                "ObjectiveEdit",
+                "ObjectiveLinkTicket",
+                "ObjectiveList",
+                "ObjectiveSetState",
+                "ObjectiveShow",
+                "ObjectiveUnlinkTicket",
+            ]
+        );
     }
 
     #[test]
-    fn objective_tool_schemas_are_bounded_and_read_only() {
+    fn objective_tool_schemas_are_bounded_and_mutation_scoped() {
         let list = list_schema();
         assert_eq!(list["properties"]["limit"]["maximum"], 1000);
         let show = show_schema();
         assert_eq!(show["required"][0], "id");
+        let create = create_schema();
+        assert_eq!(create["required"][0], "title");
+        let edit = edit_schema();
+        assert_eq!(edit["required"][0], "id");
+        let link = link_ticket_schema();
+        assert_eq!(link["required"], json!(["id", "ticket_id"]));
     }
 }

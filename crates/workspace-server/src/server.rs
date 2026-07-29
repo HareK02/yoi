@@ -43,7 +43,8 @@ use crate::auth::{
     session_set_cookie, token_hash,
 };
 use crate::authority::{
-    MemoryAuthority, ObjectiveAuthority, SqliteWorkspaceAuthority, TicketAuthority,
+    MemoryAuthority, ObjectiveAuthority, ObjectiveCreateInput, ObjectiveEditInput,
+    SqliteWorkspaceAuthority, TicketAuthority,
 };
 use crate::companion::{
     CompanionCancelRequest, CompanionConsole, CompanionMessageRequest, CompanionMessageResponse,
@@ -514,12 +515,24 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route("/api/objectives", get(list_objectives))
         .route(
             "/api/w/{workspace_id}/objectives",
-            get(scoped_list_objectives),
+            get(scoped_list_objectives).post(scoped_create_objective),
         )
         .route("/api/objectives/{id}", get(get_objective))
         .route(
-            "/api/w/{workspace_id}/objectives/{id}",
-            get(scoped_get_objective),
+            "/api/w/{workspace_id}/objectives/{objective_id}",
+            get(scoped_get_objective).patch(scoped_edit_objective),
+        )
+        .route(
+            "/api/w/{workspace_id}/objectives/{objective_id}/state",
+            post(scoped_set_objective_state),
+        )
+        .route(
+            "/api/w/{workspace_id}/objectives/{objective_id}/ticket-links",
+            post(scoped_link_objective_ticket),
+        )
+        .route(
+            "/api/w/{workspace_id}/objectives/{objective_id}/ticket-links/{ticket_id}",
+            delete(scoped_unlink_objective_ticket),
         )
         .route("/api/repositories", get(list_repositories))
         .route(
@@ -1196,6 +1209,53 @@ struct ObjectiveListQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct ObjectiveCreateRequest {
+    title: String,
+    #[serde(default)]
+    body_md: String,
+    #[serde(default = "default_objective_state")]
+    state: String,
+    #[serde(default)]
+    linked_tickets: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ObjectiveEditRequest {
+    title: Option<String>,
+    old_string: Option<String>,
+    new_string: Option<String>,
+    #[serde(default)]
+    replace_all: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ObjectiveStateRequest {
+    state: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ObjectiveLinkTicketRequest {
+    ticket_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScopedObjectivePath {
+    workspace_id: String,
+    objective_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScopedObjectiveTicketPath {
+    workspace_id: String,
+    objective_id: String,
+    ticket_id: String,
+}
+
+fn default_objective_state() -> String {
+    "active".to_string()
+}
+
+#[derive(Debug, Deserialize)]
 struct TranscriptQuery {
     start: Option<usize>,
     limit: Option<usize>,
@@ -1831,10 +1891,78 @@ async fn scoped_list_objectives(
 
 async fn scoped_get_objective(
     State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedRecordPath>,
+    AxumPath(path): AxumPath<ScopedObjectivePath>,
 ) -> ApiResult<Json<ObjectiveDetail>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    get_objective(State(api), AxumPath(path.id)).await
+    get_objective(State(api), AxumPath(path.objective_id)).await
+}
+
+async fn scoped_create_objective(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Json(request): Json<ObjectiveCreateRequest>,
+) -> ApiResult<Json<ObjectiveDetail>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    Ok(Json(api.authority.create_objective(
+        ObjectiveCreateInput {
+            title: request.title,
+            body_md: request.body_md,
+            state: request.state,
+            linked_tickets: request.linked_tickets,
+        },
+    )?))
+}
+
+async fn scoped_edit_objective(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedObjectivePath>,
+    Json(request): Json<ObjectiveEditRequest>,
+) -> ApiResult<Json<ObjectiveDetail>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    Ok(Json(api.authority.edit_objective(
+        &path.objective_id,
+        ObjectiveEditInput {
+            title: request.title,
+            old_string: request.old_string,
+            new_string: request.new_string,
+            replace_all: request.replace_all,
+        },
+    )?))
+}
+
+async fn scoped_set_objective_state(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedObjectivePath>,
+    Json(request): Json<ObjectiveStateRequest>,
+) -> ApiResult<Json<ObjectiveDetail>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    Ok(Json(
+        api.authority
+            .set_objective_state(&path.objective_id, &request.state)?,
+    ))
+}
+
+async fn scoped_link_objective_ticket(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedObjectivePath>,
+    Json(request): Json<ObjectiveLinkTicketRequest>,
+) -> ApiResult<Json<ObjectiveDetail>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    Ok(Json(api.authority.link_objective_ticket(
+        &path.objective_id,
+        &request.ticket_id,
+    )?))
+}
+
+async fn scoped_unlink_objective_ticket(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedObjectiveTicketPath>,
+) -> ApiResult<Json<ObjectiveDetail>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    Ok(Json(api.authority.unlink_objective_ticket(
+        &path.objective_id,
+        &path.ticket_id,
+    )?))
 }
 
 async fn scoped_list_repositories(
@@ -6690,7 +6818,9 @@ impl IntoResponse for ApiError {
                 StatusCode::CONFLICT
             }
             Error::RuntimeOperationFailed { code, .. }
-                if code == "unknown_profile_source" || code == "unknown_profile_selector" =>
+                if code == "unknown_profile_source"
+                    || code == "unknown_profile_selector"
+                    || code == "unknown_objective" =>
             {
                 StatusCode::NOT_FOUND
             }
@@ -6759,7 +6889,7 @@ mod tests {
     };
     use crate::store::{
         MemoryDocumentRecord, MemoryStagingRecord, ObjectiveRecord, ObjectiveResourceRecord,
-        ObjectiveTicketLinkRecord, SqliteWorkspaceStore,
+        ObjectiveTicketLinkRecord, SqliteWorkspaceStore, WorkspaceRecord,
     };
 
     const TEST_WORKSPACE_ID: &str = "0192f0e8-4d84-7d6e-a000-000000000001";
@@ -9674,6 +9804,103 @@ mod tests {
         assert_ne!(login_without_registered_passkey.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn objective_mutation_endpoints_round_trip_through_workspace_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_server_config(dir.path());
+        let store = Arc::new(SqliteWorkspaceStore::open(&config.database_path).unwrap());
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                owner_account_id: None,
+                display_name: "Test Workspace".to_string(),
+                state: "active".to_string(),
+                created_at: TEST_CREATED_AT.to_string(),
+                updated_at: TEST_CREATED_AT.to_string(),
+            })
+            .await
+            .unwrap();
+        let api = WorkspaceApi::new_with_execution_backend(
+            config,
+            store,
+            Arc::new(DeterministicExecutionBackend::default()),
+        )
+        .await
+        .unwrap();
+        let app = build_router(api);
+        let objectives_path = format!("/api/w/{TEST_WORKSPACE_ID}/objectives");
+
+        let created = request_json(
+            app.clone(),
+            "POST",
+            &objectives_path,
+            Some(json!({
+                "title": "Objective CRUD",
+                "body_md": "First body",
+                "state": "active",
+                "linked_tickets": ["00000000001J2"]
+            })),
+            StatusCode::OK,
+        )
+        .await;
+        let id = created["id"].as_str().unwrap().to_string();
+        assert_eq!(created["title"], "Objective CRUD");
+        assert_eq!(created["linked_tickets"], json!(["00000000001J2"]));
+
+        let edited = request_json(
+            app.clone(),
+            "PATCH",
+            &format!("{objectives_path}/{id}"),
+            Some(json!({
+                "title": "Objective CRUD updated",
+                "old_string": "First",
+                "new_string": "Updated"
+            })),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(edited["title"], "Objective CRUD updated");
+        assert_eq!(edited["body"], "Updated body");
+
+        let state = request_json(
+            app.clone(),
+            "POST",
+            &format!("{objectives_path}/{id}/state"),
+            Some(json!({ "state": "paused" })),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(state["state"], "paused");
+
+        let linked = request_json(
+            app.clone(),
+            "POST",
+            &format!("{objectives_path}/{id}/ticket-links"),
+            Some(json!({ "ticket_id": "00000000001J3" })),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(
+            linked["linked_tickets"],
+            json!(["00000000001J2", "00000000001J3"])
+        );
+
+        let unlinked = request_json(
+            app.clone(),
+            "DELETE",
+            &format!("{objectives_path}/{id}/ticket-links/00000000001J2"),
+            None,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(unlinked["linked_tickets"], json!(["00000000001J3"]));
+
+        let shown = get_json(app, &format!("{objectives_path}/{id}")).await;
+        assert_eq!(shown["title"], "Objective CRUD updated");
+        assert_eq!(shown["state"], "paused");
+        assert_eq!(shown["linked_tickets"], json!(["00000000001J3"]));
+    }
+
     async fn get_json(app: Router, uri: &str) -> Value {
         let response = app
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
@@ -9702,8 +9929,14 @@ mod tests {
             .oneshot(builder.body(request_body).unwrap())
             .await
             .unwrap();
-        assert_eq!(response.status(), expected_status, "{method} {uri}");
+        let status = response.status();
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            expected_status,
+            "{method} {uri}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
         serde_json::from_slice(&bytes).unwrap_or_else(
             |_| serde_json::json!({ "message": String::from_utf8_lossy(&bytes).to_string() }),
         )
