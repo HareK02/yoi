@@ -272,10 +272,6 @@ impl<T> RuntimeList<T> {
     }
 }
 
-fn is_retired_companion_worker(worker: &WorkerSummary) -> bool {
-    worker.profile.as_deref() == Some("builtin:companion")
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerLookupResult {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -948,7 +944,6 @@ impl RuntimeRegistry {
             items.extend(
                 list.items
                     .into_iter()
-                    .filter(|worker| !is_retired_companion_worker(worker))
                     .take(limit.saturating_sub(items.len())),
             );
         }
@@ -964,12 +959,7 @@ impl RuntimeRegistry {
         validate_backend_identifier("runtime_id", runtime_id)?;
         let runtime = self.runtime(runtime_id)?;
         let worker_list = runtime.list_workers(limit);
-        let mut items: Vec<_> = worker_list
-            .items
-            .into_iter()
-            .filter(|worker| !is_retired_companion_worker(worker))
-            .take(limit)
-            .collect();
+        let mut items: Vec<_> = worker_list.items.into_iter().take(limit).collect();
         items.truncate(limit);
         let mut diagnostics = worker_list.diagnostics;
         diagnostics.truncate(MAX_DIAGNOSTICS);
@@ -984,12 +974,7 @@ impl RuntimeRegistry {
         validate_backend_identifier("runtime_id", runtime_id)?;
         let runtime = self.runtime(runtime_id)?;
         let worker_list = runtime.list_stopped_workers(limit);
-        let mut items: Vec<_> = worker_list
-            .items
-            .into_iter()
-            .filter(|worker| !is_retired_companion_worker(worker))
-            .take(limit)
-            .collect();
+        let mut items: Vec<_> = worker_list.items.into_iter().take(limit).collect();
         items.truncate(limit);
         let mut diagnostics = worker_list.diagnostics;
         diagnostics.truncate(MAX_DIAGNOSTICS);
@@ -1020,7 +1005,6 @@ impl RuntimeRegistry {
                     .items
                     .into_iter()
                     .filter(|worker| worker.host_id == host_id)
-                    .filter(|worker| !is_retired_companion_worker(worker))
                     .take(limit.saturating_sub(items.len())),
             );
             if items.len() >= limit {
@@ -1047,12 +1031,6 @@ impl RuntimeRegistry {
         let worker = lookup.worker.ok_or_else(|| {
             operation_failed_or_unknown_worker(runtime_id, worker_id, lookup.diagnostics)
         })?;
-        if is_retired_companion_worker(&worker) {
-            return Err(RuntimeRegistryError::UnknownWorker {
-                runtime_id: runtime_id.to_string(),
-                worker_id: worker_id.to_string(),
-            });
-        }
         Ok(worker)
     }
 
@@ -4106,6 +4084,24 @@ mod tests {
         assert_eq!(listed.items[0].runtime_id, "runtime-b");
         assert_eq!(listed.items[0].host_id, "host-b");
         assert_eq!(listed.items[0].label, "worker from runtime b");
+    }
+
+    #[test]
+    fn registry_keeps_companion_profile_workers_visible() {
+        let mut runtime =
+            FixtureRuntime::with_worker("runtime-a", "host-a", "worker-a", "Companion Worker");
+        runtime.workers[0].profile = Some("builtin:companion".to_string());
+        let registry = RuntimeRegistry::new(vec![Arc::new(runtime)]);
+
+        let listed = registry.list_workers_for_runtime("runtime-a", 10).unwrap();
+        assert_eq!(listed.items.len(), 1);
+        assert_eq!(
+            listed.items[0].profile.as_deref(),
+            Some("builtin:companion")
+        );
+
+        let worker = registry.worker("runtime-a", "worker-a").unwrap();
+        assert_eq!(worker.profile.as_deref(), Some("builtin:companion"));
     }
 
     #[test]
