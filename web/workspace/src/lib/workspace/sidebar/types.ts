@@ -79,7 +79,6 @@ export type Worker = {
   host_id: string;
   display_name: string;
   label: string;
-  role?: string | null;
   profile?: string | null;
   singleton_key?: string | null;
   tags: string[];
@@ -233,6 +232,7 @@ export type BrowserWorkingDirectoryCreateRequest = {
 export type WorkerLaunchOptionsResponse = {
   workspace_id: string;
   runtimes: WorkerLaunchRuntimeOption[];
+  default_profile?: string | null;
   profiles: WorkerLaunchProfileCandidate[];
   repositories: WorkingDirectoryRepositoryOption[];
   working_directories: WorkingDirectorySummary[];

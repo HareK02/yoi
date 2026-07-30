@@ -45,7 +45,7 @@ struct SpawnWorkerInput {
     /// Profile selector for child role configuration. Omit or use `default`
     /// for the effective child default profile, use `inherit` to derive
     /// reusable config from the spawner, or use a registry selector such as
-    /// `project:coder`, `project:reviewer`, `builtin:default`, or an
+    /// `project:coder`, `project:reviewer`, `builtin:companion`, or an
     /// unambiguous profile slug. Raw/path selectors are rejected.
     #[serde(default)]
     profile: Option<String>,
@@ -1516,7 +1516,7 @@ max_tokens = 3333
         assert!(invalid.contains("Use `default`, `inherit`"));
         assert!(invalid.contains("`project:coder`"));
 
-        let default_config = build_spawn_config_json_for_profile(
+        let default_error = build_spawn_config_json_for_profile(
             &parent,
             &available,
             &project,
@@ -1525,8 +1525,8 @@ max_tokens = 3333
             &scope,
             SpawnProfileSelector::Default,
         )
-        .unwrap();
-        assert!(default_config.contains("\"name\":\"child\""));
+        .unwrap_err();
+        assert!(default_error.contains("no default profile is configured"));
 
         let user_config = tmp.path().join("user-profiles.toml");
         std::fs::write(&user_config, "[profile]\ncoder = \"user-coder.toml\"\n").unwrap();

@@ -1059,6 +1059,7 @@ pub struct RemoteRuntimeTestResponse {
 pub struct WorkerLaunchOptionsResponse {
     pub workspace_id: String,
     pub runtimes: Vec<WorkerLaunchRuntimeOption>,
+    pub default_profile: Option<String>,
     pub profiles: Vec<WorkerLaunchProfileCandidate>,
     pub repositories: Vec<WorkingDirectoryRepositoryOption>,
     pub working_directories: Vec<WorkingDirectorySummary>,
@@ -1128,7 +1129,8 @@ pub struct BrowserWorkerWorkingDirectorySelection {
 pub struct BrowserCreateWorkerRequest {
     pub runtime_id: String,
     pub display_name: String,
-    pub profile: String,
+    #[serde(default)]
+    pub profile: Option<String>,
     pub initial_text: String,
     #[serde(default)]
     pub working_directory: Option<BrowserWorkerWorkingDirectorySelection>,
@@ -1679,7 +1681,7 @@ fn start_memory_staging_consolidation(
                 acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                     expected_segments: 1,
                 },
-                profile: Some(profile_selector),
+                profile: profile_selector,
                 initial_input: Some(input),
                 working_directory_request: None,
                 resolved_working_directory_request: None,
@@ -1788,10 +1790,7 @@ fn try_reuse_memory_consolidation_worker(
 
 fn is_memory_consolidation_worker(worker: &WorkerSummary) -> bool {
     worker.singleton_key.as_deref() == Some(MEMORY_CONSOLIDATION_SINGLETON_KEY)
-        || [worker.profile.as_deref(), worker.role.as_deref()]
-            .into_iter()
-            .flatten()
-            .any(|value| value == MEMORY_CONSOLIDATION_PROFILE)
+        || worker.profile.as_deref() == Some(MEMORY_CONSOLIDATION_PROFILE)
 }
 
 fn memory_consolidation_input_content(candidate_count: usize, total_bytes: u64) -> String {
@@ -4261,20 +4260,40 @@ async fn create_workspace_worker(
     State(api): State<WorkspaceApi>,
     Json(request): Json<BrowserCreateWorkerRequest>,
 ) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
+    let profile = request
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|profile| !profile.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            crate::profile_settings::load_profile_settings(
+                &api.config.workspace_id,
+                &api.config.workspace_root,
+            )
+            .default_profile
+        })
+        .ok_or_else(|| {
+            settings_bad_request(
+                "workspace_default_profile_missing",
+                "profile is required because this Workspace has no default profile configured",
+            )
+        })?;
     let profile_selector =
-        profile_selector_for_candidate_with_root(&api.config.workspace_root, &request.profile)
-            .ok_or_else(|| {
+        profile_selector_for_candidate_with_root(&api.config.workspace_root, &profile).ok_or_else(
+            || {
                 settings_bad_request(
                     "unsupported_worker_profile",
                     "profile must be selected from Backend-published worker profile candidates",
                 )
-            })?;
-    let resolved_config_bundle = if request.profile.starts_with("project:") {
+            },
+        )?;
+    let resolved_config_bundle = if profile.starts_with("project:") {
         crate::profile_settings::build_workspace_profile_config_bundle(
             &api.config.workspace_root,
             &api.config.workspace_id,
             &api.config.workspace_created_at,
-            &request.profile,
+            &profile,
         )?
     } else {
         None
@@ -4320,7 +4339,7 @@ async fn create_workspace_worker(
                 acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                     expected_segments: if initial_input.is_some() { 1 } else { 0 },
                 },
-                profile: Some(profile_selector),
+                profile: profile_selector,
                 initial_input,
                 working_directory_request: None,
                 resolved_working_directory_request: None,
@@ -5773,10 +5792,32 @@ fn worker_launch_options_response(api: &WorkspaceApi) -> WorkerLaunchOptionsResp
             }
         })
         .collect();
+    let profile_settings = crate::profile_settings::load_profile_settings(
+        &api.config.workspace_id,
+        &api.config.workspace_root,
+    );
+    let profiles = profile_settings
+        .profiles
+        .into_iter()
+        .filter(|profile| {
+            !profile
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+        })
+        .map(|profile| WorkerLaunchProfileCandidate {
+            id: profile.profile_id,
+            label: profile.label,
+            description: profile
+                .description
+                .unwrap_or_else(|| "Workspace profile.".to_string()),
+        })
+        .collect();
     WorkerLaunchOptionsResponse {
         workspace_id: api.config.workspace_id.clone(),
         runtimes,
-        profiles: worker_profile_candidates_for_root(&api.config.workspace_root),
+        default_profile: profile_settings.default_profile,
+        profiles,
         repositories: working_directory_repository_options(api),
         working_directories: available_working_directory_summaries(api).unwrap_or_default(),
         diagnostics: Vec::new(),
@@ -5932,7 +5973,6 @@ fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> WorkerSummary 
         worker_id: record.runtime_worker_id.to_string(),
         runtime_id: record.runtime_id.clone(),
         host_id: "backend-registry".to_string(),
-        role: None,
         display_name: record.display_name.clone(),
         label: record.display_name.clone(),
         singleton_key: None,
@@ -6373,58 +6413,25 @@ fn working_directory_request_for_browser(
     })
 }
 
-#[cfg(test)]
-fn worker_profile_candidates() -> Vec<WorkerLaunchProfileCandidate> {
-    worker_profile_candidates_for_root(Path::new("."))
-        .into_iter()
-        .filter(|candidate| candidate.id == "builtin:coder" || candidate.id == "runtime_default")
-        .collect()
-}
-
-fn worker_profile_candidates_for_root(workspace_root: &Path) -> Vec<WorkerLaunchProfileCandidate> {
-    let mut candidates = vec![
-        WorkerLaunchProfileCandidate {
-            id: "builtin:coder".to_string(),
-            label: "Coding Worker".to_string(),
-            description: "Built-in coding role profile for implementation work.".to_string(),
-        },
-        WorkerLaunchProfileCandidate {
-            id: "runtime_default".to_string(),
-            label: "Runtime default".to_string(),
-            description: "Use the selected Runtime's default profile.".to_string(),
-        },
-    ];
-    candidates.extend(
-        crate::profile_settings::project_profile_candidates(workspace_root)
-            .into_iter()
-            .filter(|profile| profile.diagnostics.is_empty())
-            .map(|profile| WorkerLaunchProfileCandidate {
-                id: profile.profile_id,
-                label: profile.label,
-                description: profile
-                    .description
-                    .unwrap_or_else(|| "Workspace Decodal profile source.".to_string()),
-            }),
-    );
-    candidates
-}
-
-fn profile_selector_for_candidate(profile: &str) -> Option<ProfileSelector> {
-    crate::profile_settings::selector_for_builtin_candidate(profile)
-        .filter(|_| matches!(profile, "builtin:coder" | "runtime_default"))
-}
-
 fn profile_selector_for_candidate_with_root(
     workspace_root: &Path,
     profile: &str,
 ) -> Option<ProfileSelector> {
-    if profile_selector_for_candidate(profile).is_some() {
-        profile_selector_for_candidate(profile)
-    } else if crate::profile_settings::is_profile_candidate(workspace_root, profile) {
+    if let Some(selector @ ProfileSelector::Builtin(_)) =
         crate::profile_settings::selector_for_builtin_candidate(profile)
-    } else {
-        None
+    {
+        return Some(selector);
     }
+    crate::profile_settings::project_profile_candidates(workspace_root)
+        .into_iter()
+        .find(|candidate| {
+            candidate.profile_id == profile
+                && !candidate
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+        })
+        .and_then(|_| crate::profile_settings::selector_for_builtin_candidate(profile))
 }
 
 fn parse_runtime_worker_id_for_registry(worker_id: &str) -> ApiResult<u64> {
@@ -6441,7 +6448,7 @@ fn sanitize_worker_display_name(value: &str) -> Option<String> {
     if display_name.chars().any(char::is_control) {
         None
     } else if display_name.is_empty() {
-        Some("Coding Worker".to_string())
+        Some("Worker".to_string())
     } else {
         Some(display_name.chars().take(80).collect())
     }
@@ -7065,17 +7072,89 @@ mod tests {
 
     #[test]
     fn worker_profile_candidates_are_backend_published_and_mapped() {
-        let candidates = worker_profile_candidates();
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".yoi")).unwrap();
+        fs::write(
+            dir.path().join(".yoi/profiles.toml"),
+            "default = \"builtin:companion\"\n",
+        )
+        .unwrap();
+        let settings = crate::profile_settings::load_profile_settings("workspace-test", dir.path());
+        for expected in [
+            "builtin:companion",
+            "builtin:intake",
+            "builtin:orchestrator",
+            "builtin:coder",
+            "builtin:reviewer",
+        ] {
+            assert!(
+                settings
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.profile_id == expected),
+                "missing {expected}"
+            );
+        }
         assert!(
-            candidates
+            settings
+                .profiles
                 .iter()
-                .any(|candidate| candidate.id == "builtin:coder")
+                .all(|profile| profile.profile_id != "builtin:default")
+        );
+        assert_eq!(
+            settings.default_profile.as_deref(),
+            Some("builtin:companion")
         );
         assert!(matches!(
-            profile_selector_for_candidate("builtin:coder"),
+            profile_selector_for_candidate_with_root(dir.path(), "builtin:coder"),
             Some(ProfileSelector::Builtin(value)) if value == "builtin:coder"
         ));
-        assert!(profile_selector_for_candidate("free-text-profile").is_none());
+        assert!(
+            profile_selector_for_candidate_with_root(dir.path(), "free-text-profile").is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_launch_options_publish_every_valid_workspace_profile_and_default() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".yoi/profiles")).unwrap();
+        fs::write(
+            dir.path().join(".yoi/profiles.toml"),
+            concat!(
+                "default = \"builtin:companion\"\n",
+                "[profile.custom]\n",
+                "path = \".yoi/profiles/custom.dcdl\"\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".yoi/profiles/custom.dcdl"),
+            "slug = \"custom\"; description = \"Custom profile\";\n",
+        )
+        .unwrap();
+        let api = test_app(dir.path()).await;
+
+        let response = get_json(api, "/api/workers/launch-options").await;
+        assert_eq!(response["default_profile"], "builtin:companion");
+        let profiles = response["profiles"].as_array().unwrap();
+        for expected in [
+            "builtin:companion",
+            "builtin:intake",
+            "builtin:orchestrator",
+            "builtin:coder",
+            "builtin:reviewer",
+            "project:custom",
+        ] {
+            assert!(
+                profiles.iter().any(|profile| profile["id"] == expected),
+                "missing {expected}: {profiles:?}"
+            );
+        }
+        assert!(
+            profiles
+                .iter()
+                .all(|profile| profile["id"] != "builtin:default")
+        );
     }
 
     #[test]
@@ -7258,11 +7337,19 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.path().join(".yoi/profiles/bad.dcdl"), "not decodal").unwrap();
-        assert!(
-            worker_profile_candidates_for_root(dir.path())
-                .iter()
-                .all(|candidate| candidate.id != "project:bad")
-        );
+        let candidates =
+            crate::profile_settings::load_profile_settings("workspace-test", dir.path())
+                .profiles
+                .into_iter()
+                .filter(|profile| {
+                    !profile
+                        .diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+                })
+                .map(|profile| profile.profile_id)
+                .collect::<Vec<_>>();
+        assert!(!candidates.iter().any(|profile| profile == "project:bad"));
         assert!(profile_selector_for_candidate_with_root(dir.path(), "project:bad").is_none());
     }
 
@@ -7583,9 +7670,7 @@ mod tests {
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
-                    profile: Some(ProfileSelector::Builtin(
-                        MEMORY_CONSOLIDATION_PROFILE.to_string(),
-                    )),
+                    profile: ProfileSelector::Builtin(MEMORY_CONSOLIDATION_PROFILE.to_string()),
                     initial_input: None,
                     working_directory_request: None,
                     resolved_working_directory_request: None,
@@ -8141,7 +8226,9 @@ mod tests {
                 },
             },
             profiles: vec![worker_runtime::config_bundle::ConfigProfileDescriptor {
-                selector: worker_runtime::catalog::ProfileSelector::RuntimeDefault,
+                selector: worker_runtime::catalog::ProfileSelector::Builtin(
+                    "builtin:companion".to_string(),
+                ),
                 label: Some("server-test".to_string()),
             }],
             declarations: Vec::new(),
@@ -8154,7 +8241,9 @@ mod tests {
     fn runtime_create_request() -> worker_runtime::catalog::CreateWorkerRequest {
         let bundle = runtime_test_bundle();
         worker_runtime::catalog::CreateWorkerRequest {
-            profile: worker_runtime::catalog::ProfileSelector::RuntimeDefault,
+            profile: worker_runtime::catalog::ProfileSelector::Builtin(
+                "builtin:companion".to_string(),
+            ),
             display_name: None,
             profile_source: worker_runtime::catalog::ProfileSourceArchiveSource::Http {
                 location: worker_runtime::catalog::ProfileSourceArchiveHttpRef {
@@ -8534,8 +8623,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_worker_create_succeeds_and_preserves_unsupported_diagnostics() {
+    async fn browser_worker_create_uses_workspace_default_and_preserves_unsupported_diagnostics() {
         let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".yoi")).unwrap();
+        fs::write(
+            dir.path().join(".yoi/profiles.toml"),
+            "default = \"builtin:coder\"\n",
+        )
+        .unwrap();
         let app = test_app(dir.path()).await;
         let created = post_json(
             app.clone(),
@@ -8543,7 +8638,6 @@ mod tests {
             serde_json::json!({
                 "runtime_id": "embedded-worker-runtime",
                 "display_name": "",
-                "profile": "runtime_default",
                 "initial_text": ""
             }),
         )
@@ -8556,7 +8650,9 @@ mod tests {
             .iter()
             .find(|worker| worker["worker_id"] == created["worker_id"])
             .expect("created Worker should be listed");
-        assert_eq!(worker["label"], "Coding Worker");
+        assert_eq!(worker["label"], "Worker");
+        assert_eq!(worker["profile"], "builtin:coder");
+        assert!(worker.get("role").is_none());
         assert_eq!(worker["worker_id"], created["worker_id"]);
         let detail_path = format!(
             "/api/runtimes/{}/workers/{}",
@@ -8564,7 +8660,7 @@ mod tests {
             created["worker_id"].as_str().unwrap()
         );
         let detail = get_json(app.clone(), detail_path.as_str()).await;
-        assert_eq!(detail["label"], "Coding Worker");
+        assert_eq!(detail["label"], "Worker");
         assert_eq!(detail["worker_id"], created["worker_id"]);
         assert!(
             created["console_href"]
@@ -8607,7 +8703,7 @@ mod tests {
             Some(serde_json::json!({
                 "runtime_id": "remote-runtime",
                 "display_name": "Remote Worker",
-                "profile": "runtime_default",
+                "profile": "builtin:companion",
                 "initial_text": ""
             })),
             StatusCode::BAD_REQUEST,
@@ -8646,6 +8742,10 @@ mod tests {
                     "kind": "run_accepted",
                     "expected_segments": 0
                 },
+                "profile": {
+                    "kind": "builtin",
+                    "value": "builtin:coder"
+                },
                 "working_directory_request": {
                     "repository_id": TEST_REPOSITORY_ID,
                     "local_path": dir.path().display().to_string()
@@ -8680,6 +8780,10 @@ mod tests {
                 "acceptance": {
                     "kind": "run_accepted",
                     "expected_segments": 0
+                },
+                "profile": {
+                    "kind": "builtin",
+                    "value": "builtin:coder"
                 },
                 "working_directory_request": {
                     "repository_id": TEST_REPOSITORY_ID,
@@ -9259,7 +9363,7 @@ mod tests {
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
-                    profile: None,
+                    profile: ProfileSelector::Builtin("builtin:coder".to_string()),
                     initial_input: None,
                     working_directory_request: None,
                     resolved_working_directory_request: None,
@@ -9501,6 +9605,10 @@ mod tests {
                 "acceptance": {
                     "kind": "run_accepted",
                     "expected_segments": 0
+                },
+                "profile": {
+                    "kind": "builtin",
+                    "value": "builtin:coder"
                 }
             }),
         )

@@ -1,4 +1,4 @@
-import "./default.dcdl" // {
+import "./base.dcdl" // {
     slug = "orchestrator";
     description = "Ticket orchestrator profile.";
     scope = "workspace_write";

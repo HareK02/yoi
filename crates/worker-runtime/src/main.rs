@@ -91,9 +91,6 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
             ),
         ));
     }
-    if let Some(profile) = config.profile.clone() {
-        factory = factory.with_profile(profile);
-    }
     let backend = Arc::new(
         WorkerRuntimeExecutionBackend::new(factory)
             .map_err(ProcessError::WorkerAdapter)?
@@ -170,9 +167,6 @@ where
             }
             "--backend-resource-token" => {
                 config.backend_resource_token = Some(take_value(&flag, inline_value, &mut args)?);
-            }
-            "--profile" => {
-                config.profile = Some(take_value(&flag, inline_value, &mut args)?);
             }
             "--store" => {
                 let value = take_value(&flag, inline_value, &mut args)?;
@@ -286,7 +280,6 @@ struct ProcessConfig {
     no_store: bool,
     backend_resource_endpoint: Option<String>,
     backend_resource_token: Option<String>,
-    profile: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -308,7 +301,6 @@ impl ProcessConfig {
             no_store: false,
             backend_resource_endpoint: None,
             backend_resource_token: None,
-            profile: None,
         })
     }
 
@@ -804,7 +796,6 @@ Browsers must not connect to this Runtime process directly.
 Options:
   --bind <ADDR>                         Bind socket address (default: 127.0.0.1:38800)
   --display-name <NAME>                 Runtime display name
-  --profile <SELECTOR>                  Force spawned Workers to use a Profile selector
   --fs-root <PATH>                      Filesystem-backed storage root (default: user data dir)
   --fs-worker-dir <PATH>                Worker storage directory (default: <fs-root>/worker)
   --fs-runtime-dir <PATH>               Runtime catalog directory (default: <fs-root>/runtime)
@@ -852,6 +843,7 @@ mod tests {
         assert!(parse_args(["--worker-store-dir", "/tmp/sessions"]).is_err());
         assert!(parse_args(["--worker-metadata-dir", "/tmp/metadata"]).is_err());
         assert!(parse_args(["--worker-runtime-base-dir", "/tmp/runtime"]).is_err());
+        assert!(parse_args(["--profile", "builtin:coder"]).is_err());
     }
 
     #[test]
@@ -866,8 +858,6 @@ mod tests {
             "127.0.0.1:0",
             "--display-name",
             "Runtime Alpha",
-            "--profile",
-            "builtin:coder",
             "--local-token-env",
             "TEST_RUNTIME_TOKEN",
         ]);
@@ -881,8 +871,6 @@ mod tests {
             "127.0.0.1:0",
             "--display-name",
             "Runtime Alpha",
-            "--profile",
-            "builtin:coder",
             "--local-token-env",
             "TEST_RUNTIME_TOKEN",
         ])
@@ -894,7 +882,6 @@ mod tests {
 
         assert_eq!(config.http.bind_addr, "127.0.0.1:0".parse().unwrap());
         assert_eq!(config.http.display_name.as_deref(), Some("Runtime Alpha"));
-        assert_eq!(config.profile.as_deref(), Some("builtin:coder"));
         assert_eq!(config.http.local_token.as_deref(), Some("secret-token"));
     }
 

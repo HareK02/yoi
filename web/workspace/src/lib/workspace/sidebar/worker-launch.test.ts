@@ -38,6 +38,7 @@ const options: WorkerLaunchOptionsResponse = {
       diagnostics: [],
     },
   ],
+  default_profile: "builtin:coder",
   profiles: [
     { id: "builtin:companion", label: "Companion", description: "chat" },
     { id: "builtin:coder", label: "Coder", description: "code" },
@@ -65,7 +66,7 @@ const options: WorkerLaunchOptionsResponse = {
   diagnostics: [],
 };
 
-Deno.test("defaultWorkerLaunchForm chooses active runtime, coder profile, repository, and working directory", () => {
+Deno.test("defaultWorkerLaunchForm uses the Backend-published Workspace default profile", () => {
   const form = defaultWorkerLaunchForm(options, {
     runtime_id: "",
     display_name: "",
@@ -78,7 +79,7 @@ Deno.test("defaultWorkerLaunchForm chooses active runtime, coder profile, reposi
   });
 
   assertEquals(form.runtime_id, "remote");
-  assertEquals(form.display_name, "Coding Worker");
+  assertEquals(form.display_name, "Worker");
   assertEquals(form.profile, "builtin:coder");
   assertEquals(form.initial_text, "hello");
   assertEquals(form.working_directory_id, "wd-1-repo");

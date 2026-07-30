@@ -21,7 +21,6 @@ use crate::{
 };
 
 const PROFILE_FORMAT_V1: &str = "yoi.profile.v1";
-const BUILTIN_DEFAULT_PROFILE_NAME: &str = "default";
 const BUILTIN_MODEL_CATALOG: &str = include_str!("../../../resources/models/builtin.toml");
 const WORKSPACE_OVERRIDE_LOCAL_FILENAME: &str = "override.local.toml";
 
@@ -32,11 +31,6 @@ struct BuiltinProfile {
 }
 
 const BUILTIN_PROFILES: &[BuiltinProfile] = &[
-    BuiltinProfile {
-        name: BUILTIN_DEFAULT_PROFILE_NAME,
-        label: "builtin:default",
-        description: "Bundled default Yoi coding profile",
-    },
     BuiltinProfile {
         name: "companion",
         label: "builtin:companion",
@@ -300,23 +294,6 @@ impl ProfileRegistry {
     fn set_default(&mut self, default: ProfileDefault) {
         self.default = Some(default);
     }
-    fn set_builtin_default_if_available(&mut self) {
-        if self.default.is_some() {
-            return;
-        }
-        if self
-            .select_named(
-                Some(ProfileRegistrySource::Builtin),
-                BUILTIN_DEFAULT_PROFILE_NAME,
-            )
-            .is_ok()
-        {
-            self.default = Some(ProfileDefault {
-                source: Some(ProfileRegistrySource::Builtin),
-                name: BUILTIN_DEFAULT_PROFILE_NAME.to_string(),
-            });
-        }
-    }
     fn mark_default_flags(&mut self) {
         let Some(default) = self.default.clone() else {
             return;
@@ -366,7 +343,6 @@ impl ProfileDiscovery {
         if let Some(path) = &self.project_config {
             load_profile_registry_file(&mut registry, ProfileRegistrySource::Project, path)?;
         }
-        registry.set_builtin_default_if_available();
         registry.mark_default_flags();
         Ok(registry)
     }
@@ -886,9 +862,8 @@ fn read_profile_artifact_file(path: &Path) -> Result<serde_json::Value, ProfileE
 }
 
 fn builtin_profile_artifact(label: &str) -> Option<serde_json::Value> {
-    let mut value = builtin_default_profile_artifact();
+    let mut value = builtin_base_profile_artifact();
     match label {
-        "builtin:default" | "default" => Some(value),
         "builtin:companion" | "companion" => {
             apply_role_profile(
                 &mut value,
@@ -970,7 +945,7 @@ fn builtin_profile_artifact(label: &str) -> Option<serde_json::Value> {
     }
 }
 
-fn builtin_default_profile_artifact() -> serde_json::Value {
+fn builtin_base_profile_artifact() -> serde_json::Value {
     serde_json::json!({
         "slug": "default",
         "description": "Default Yoi coding profile.",
@@ -1395,16 +1370,18 @@ mod tests {
         );
     }
     #[test]
-    fn builtin_default_profile_is_registered_as_default() {
+    fn builtin_profiles_do_not_define_an_implicit_default() {
         let registry = ProfileDiscovery::with_sources(None, None)
             .discover()
             .unwrap();
-        let default = registry.default_entry().unwrap();
-        assert_eq!(default.source, ProfileRegistrySource::Builtin);
-        assert_eq!(default.name, BUILTIN_DEFAULT_PROFILE_NAME);
-        assert!(default.is_default);
-        assert_eq!(default.path, None);
-        assert_eq!(default.provenance, "builtin:default");
+        assert!(matches!(
+            registry.default_entry(),
+            Err(ProfileError::NoDefaultProfile)
+        ));
+        assert!(matches!(
+            registry.select(&ProfileSelector::Default),
+            Err(ProfileError::NoDefaultProfile)
+        ));
     }
     #[test]
     fn builtin_role_profiles_are_registered_and_resolve() {
@@ -1808,12 +1785,12 @@ worker_context_max_tokens = 68000
         assert!(err.to_string().contains("model.auth.file"));
     }
     #[test]
-    fn builtin_default_resolves_without_external_evaluator() {
+    fn builtin_companion_resolves_without_external_evaluator() {
         let tmp = TempDir::new().unwrap();
         let resolved = ProfileResolver::new()
             .with_workspace_base(tmp.path())
             .resolve(
-                &ProfileSelector::source_named(ProfileRegistrySource::Builtin, "default"),
+                &ProfileSelector::source_named(ProfileRegistrySource::Builtin, "companion"),
                 ProfileResolveOptions::with_worker_name("runtime-workspace"),
             )
             .unwrap();
@@ -1829,15 +1806,15 @@ worker_context_max_tokens = 68000
         assert!(!resolved.manifest.feature.ticket.orchestration_control);
         assert_eq!(
             resolved.profile.as_ref().unwrap().name.as_deref(),
-            Some("default")
+            Some("companion")
         );
         assert_eq!(
             resolved.source,
             ProfileSource::Registry {
                 source: ProfileRegistrySource::Builtin,
-                name: "default".into(),
+                name: "companion".into(),
                 path: None,
-                provenance: Some("builtin:default".into()),
+                provenance: Some("builtin:companion".into()),
             }
         );
     }

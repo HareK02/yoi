@@ -1,4 +1,4 @@
-import "./default.dcdl" // {
+import "./base.dcdl" // {
     slug = "memory-consolidation";
     description = "Memory staging consolidation profile.";
     scope = "workspace_read";

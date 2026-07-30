@@ -31,9 +31,9 @@
   let optionsError = $state<string | null>(null);
   let submitting = $state(false);
   let submitError = $state<DisplayError | null>(null);
-  let displayName = $state('Coding Worker');
+  let displayName = $state('Worker');
   let runtimeId = $state('');
-  let profile = $state('builtin:coder');
+  let profile = $state('');
   let initialText = $state('');
   let workingDirectoryId = $state('');
   let workingDirectoryRepositoryId = $state('');

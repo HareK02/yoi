@@ -363,7 +363,6 @@ mod tests {
             display_name: "label".to_string(),
             singleton_key: None,
             tags: Vec::new(),
-            role: None,
             profile: profile.map(str::to_string),
             workspace: BackendWorkerWorkspaceSummary {
                 visibility: "workspace".to_string(),

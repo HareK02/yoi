@@ -145,8 +145,6 @@ pub struct BackendWorkerSummary {
     pub display_name: String,
     pub label: String,
     #[serde(default)]
-    pub role: Option<String>,
-    #[serde(default)]
     pub profile: Option<String>,
     #[serde(default)]
     pub singleton_key: Option<String>,

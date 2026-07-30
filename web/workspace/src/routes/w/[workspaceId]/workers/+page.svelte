@@ -139,7 +139,7 @@
   }
 
   function workerProfile(worker: Worker): string {
-    return worker.profile ?? worker.role ?? 'unknown';
+    return worker.profile ?? 'unknown';
   }
 
   function workerDirectory(worker: Worker): string {

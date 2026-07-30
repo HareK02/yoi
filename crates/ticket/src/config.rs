@@ -1192,7 +1192,7 @@ root = ".yoi/tickets"
             temp.path(),
             r#"
 [roles.intake]
-profile = "builtin:default"
+profile = "builtin:companion"
 "#,
         );
 
@@ -1203,7 +1203,7 @@ profile = "builtin:default"
                 .unwrap()
                 .profile
                 .as_str(),
-            "builtin:default"
+            "builtin:companion"
         );
         assert_eq!(
             config
@@ -1313,7 +1313,7 @@ profile = "inherit"
             temp.path(),
             r#"
 [roles.investigator]
-profile = "builtin:default"
+profile = "builtin:companion"
 "#,
         );
 

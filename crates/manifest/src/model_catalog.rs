@@ -442,6 +442,23 @@ mod tests {
     }
 
     #[test]
+    fn codex_gpt56_sol_catalog_clamps_public_window_to_backend_limit() {
+        let providers = load_builtin_providers().unwrap();
+        let models = load_builtin_models().unwrap();
+        let manifest = ModelManifest {
+            ref_: Some("codex-oauth/gpt-5.6-sol".into()),
+            ..Default::default()
+        };
+        let cfg = resolve_with_catalogs(&manifest, &providers, &models).unwrap();
+        assert_eq!(cfg.model_id, "gpt-5.6-sol");
+        assert_eq!(cfg.context_window, 272_000);
+        assert_eq!(cfg.max_context_window, Some(272_000));
+        let capability = cfg.capability.expect("catalog capability");
+        assert!(capability.vision);
+        assert!(capability.reasoning.is_some());
+    }
+
+    #[test]
     fn codex_gpt55_catalog_records_effective_context_window() {
         let providers = load_builtin_providers().unwrap();
         let models = load_builtin_models().unwrap();

@@ -252,7 +252,7 @@ pub enum TicketRoleLaunchError {
     #[error(transparent)]
     LaunchConfig(#[from] TicketRoleLaunchConfigError),
     #[error(
-        "Ticket role `{role}` profile selector `{selector}` is not resolvable before launch: {message}. Configure `[ticket.roles.{role}].profile` with an executable concrete profile selector such as `builtin:default` or a project/user profile"
+        "Ticket role `{role}` profile selector `{selector}` is not resolvable before launch: {message}. Configure `[ticket.roles.{role}].profile` with an executable concrete profile selector such as `builtin:companion` or a project/user profile"
     )]
     ProfileResolution {
         role: TicketRole,
@@ -701,17 +701,20 @@ mod tests {
         let mut config = String::from("[ticket]\n");
         for role in roles {
             config.push_str(&format!(
-                "\n[ticket.roles.{role}]\nprofile = \"builtin:default\"\n"
+                "\n[ticket.roles.{role}]\nprofile = \"builtin:companion\"\n"
             ));
         }
         write_config(workspace, &config);
     }
 
     fn text_segment(plan: &TicketRoleLaunchPlan) -> &str {
-        match &plan.run_segments[1] {
-            Segment::Text { content } => content,
-            other => panic!("expected text segment, got {other:?}"),
-        }
+        plan.run_segments
+            .iter()
+            .find_map(|segment| match segment {
+                Segment::Text { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .expect("expected text segment")
     }
 
     async fn write_test_event<W>(writer: &mut W, event: Event)
@@ -949,7 +952,7 @@ profile = "project:no-such-ticket-role-profile"
         let plan = plan_ticket_role_launch(context).unwrap();
 
         assert_eq!(plan.role, TicketRole::Intake);
-        assert_eq!(plan.profile, "builtin:default");
+        assert_eq!(plan.profile, "builtin:companion");
     }
 
     #[test]
@@ -962,7 +965,7 @@ profile = "project:no-such-ticket-role-profile"
 language = "Japanese"
 
 [ticket.roles.intake]
-profile = "builtin:default"
+profile = "builtin:companion"
 "#,
         );
         let context = TicketRoleLaunchContext::new(temp.path(), TicketRole::Intake);
@@ -1024,7 +1027,7 @@ profile = "builtin:default"
             temp.path(),
             r#"
 [ticket.roles.reviewer]
-profile = "builtin:default"
+profile = "builtin:companion"
 launch_prompt = "$workspace/ticket/reviewer/launch"
 "#,
         );
@@ -1037,7 +1040,7 @@ launch_prompt = "$workspace/ticket/reviewer/launch"
         let text = text_segment(&plan);
 
         assert_eq!(plan.worker_name, "reviewer-fixed");
-        assert_eq!(plan.profile, "builtin:default");
+        assert_eq!(plan.profile, "builtin:companion");
         assert_eq!(
             plan.launch_prompt_ref.as_deref(),
             Some("$workspace/ticket/reviewer/launch")
@@ -1045,7 +1048,7 @@ launch_prompt = "$workspace/ticket/reviewer/launch"
         assert!(matches!(&plan.run_segments[0], Segment::Text { .. }));
         assert!(!text.contains("Configured launch_prompt"));
         assert!(!text.contains("$workspace/ticket/reviewer/launch"));
-        assert!(!text.contains("Profile selector: builtin:default"));
+        assert!(!text.contains("Profile selector: builtin:companion"));
         assert!(!text.contains("Role: reviewer"));
         assert!(!text.contains("system_instruction"));
         assert!(text.contains("Target Ticket:"));
@@ -1056,7 +1059,7 @@ launch_prompt = "$workspace/ticket/reviewer/launch"
             .spawn_config(WorkerRuntimeCommand::for_executable("/bin/yoi"))
             .unwrap();
         assert_eq!(spawn.worker_name, "reviewer-fixed");
-        assert_eq!(spawn.profile.as_deref(), Some("builtin:default"));
+        assert_eq!(spawn.profile.as_deref(), Some("builtin:companion"));
         assert_eq!(spawn.workspace_root, temp.path());
         assert!(spawn.cwd.is_none());
         assert_eq!(

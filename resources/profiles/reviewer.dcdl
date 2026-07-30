@@ -1,4 +1,4 @@
-import "./default.dcdl" // {
+import "./base.dcdl" // {
     slug = "reviewer";
     description = "Ticket review profile.";
     scope = "workspace_read";

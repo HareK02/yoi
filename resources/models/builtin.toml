@@ -32,6 +32,17 @@ context_window = 256000
 # Codex CLI's model catalog exposes these coding models with a 272k effective
 # context window on this route, even when public API docs advertise larger
 # model-family windows.
+# Codex currently caps the ChatGPT-backed route at 272k even though the public
+# GPT-5.6 Sol API model advertises a 1.05M context window. Keep both values so
+# resolution and compaction use the effective backend limit without losing the
+# underlying model capability.
+[[model]]
+id = "gpt-5.6-sol"
+provider = "codex-oauth"
+context_window = 1050000
+max_context_window = 272000
+capability = { tool_calling = "parallel", structured_output = "json_schema", reasoning = "effort", vision = true, prompt_caching = { kind = "auto" } }
+
 [[model]]
 id = "gpt-5.5"
 provider = "codex-oauth"

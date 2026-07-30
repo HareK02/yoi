@@ -1808,9 +1808,9 @@ mod ws_tests {
     }
 
     fn ws_create_request() -> CreateWorkerRequest {
-        let bundle = ws_test_bundle(ProfileSelector::RuntimeDefault);
+        let bundle = ws_test_bundle(ProfileSelector::Builtin("builtin:companion".to_string()));
         CreateWorkerRequest {
-            profile: ProfileSelector::RuntimeDefault,
+            profile: ProfileSelector::Builtin("builtin:companion".to_string()),
             display_name: None,
             profile_source: crate::catalog::ProfileSourceArchiveSource::Http {
                 location: crate::catalog::ProfileSourceArchiveHttpRef {
@@ -1845,7 +1845,9 @@ mod ws_tests {
             Runtime::with_execution_backend(RuntimeOptions::default(), Arc::new(WsBackend))
                 .unwrap();
         runtime
-            .store_config_bundle(ws_test_bundle(ProfileSelector::RuntimeDefault))
+            .store_config_bundle(ws_test_bundle(ProfileSelector::Builtin(
+                "builtin:companion".to_string(),
+            )))
             .unwrap();
         let worker = runtime
             .create_worker_scoped(

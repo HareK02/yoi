@@ -8,15 +8,8 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum ProfileSelector {
-    RuntimeDefault,
     Builtin(String),
     Named(String),
-}
-
-impl Default for ProfileSelector {
-    fn default() -> Self {
-        Self::RuntimeDefault
-    }
 }
 
 /// Runtime fetch/caching metadata for a Backend-authored Decodal profile source archive.

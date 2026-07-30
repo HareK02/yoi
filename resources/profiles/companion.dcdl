@@ -1,4 +1,4 @@
-import "./default.dcdl" // {
+import "./base.dcdl" // {
     slug = "companion";
     description = "Workspace companion profile.";
     scope = "workspace_write";

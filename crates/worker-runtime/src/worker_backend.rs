@@ -105,7 +105,6 @@ pub struct ProfileRuntimeWorkerFactory {
     profile_base_dir: PathBuf,
     store_dir: Option<PathBuf>,
     worker_metadata_dir: Option<PathBuf>,
-    profile: Option<String>,
     runtime_base_dir: RuntimeArtifactRoot,
     resource_client: Option<Arc<dyn BackendResourceClient>>,
     profile_archive_cache: Arc<ProfileSourceArchiveCache>,
@@ -118,7 +117,6 @@ impl ProfileRuntimeWorkerFactory {
             profile_base_dir,
             store_dir: None,
             worker_metadata_dir: None,
-            profile: None,
             runtime_base_dir: RuntimeArtifactRoot::owned(),
             resource_client: None,
             profile_archive_cache: Arc::new(ProfileSourceArchiveCache::default()),
@@ -132,13 +130,6 @@ impl ProfileRuntimeWorkerFactory {
 
     pub fn with_worker_metadata_dir(mut self, worker_metadata_dir: impl Into<PathBuf>) -> Self {
         self.worker_metadata_dir = Some(worker_metadata_dir.into());
-        self
-    }
-
-    /// Set the profile selector used for Runtime-created Workers. When unset,
-    /// normal default profile discovery is used.
-    pub fn with_profile(mut self, profile: impl Into<String>) -> Self {
-        self.profile = Some(profile.into());
         self
     }
 
@@ -184,37 +175,27 @@ impl ProfileRuntimeWorkerFactory {
 
     fn runtime_profile_value(
         profile: &crate::catalog::ProfileSelector,
-    ) -> Option<std::borrow::Cow<'_, str>> {
+    ) -> std::borrow::Cow<'_, str> {
         match profile {
-            crate::catalog::ProfileSelector::RuntimeDefault => None,
             crate::catalog::ProfileSelector::Named(name) => {
-                Some(std::borrow::Cow::Borrowed(name.as_str()))
+                std::borrow::Cow::Borrowed(name.as_str())
             }
             crate::catalog::ProfileSelector::Builtin(name) => {
                 if name.starts_with("builtin:") {
-                    Some(std::borrow::Cow::Borrowed(name.as_str()))
+                    std::borrow::Cow::Borrowed(name.as_str())
                 } else {
-                    Some(std::borrow::Cow::Owned(format!("builtin:{name}")))
+                    std::borrow::Cow::Owned(format!("builtin:{name}"))
                 }
             }
         }
     }
 
-    fn runtime_profile_for_request<'a>(
-        &'a self,
-        request: &'a CreateWorkerRequest,
-    ) -> Option<std::borrow::Cow<'a, str>> {
-        if let Some(profile) = self.profile.as_deref() {
-            return Some(std::borrow::Cow::Borrowed(profile));
-        }
+    fn runtime_profile_for_request(request: &CreateWorkerRequest) -> std::borrow::Cow<'_, str> {
         Self::runtime_profile_value(&request.profile)
     }
 
-    fn runtime_profile<'a>(
-        &'a self,
-        request: &'a WorkerExecutionSpawnRequest,
-    ) -> Option<std::borrow::Cow<'a, str>> {
-        self.runtime_profile_for_request(&request.request)
+    fn runtime_profile(request: &WorkerExecutionSpawnRequest) -> std::borrow::Cow<'_, str> {
+        Self::runtime_profile_for_request(&request.request)
     }
 
     fn restore_fallback_manifest(
@@ -368,7 +349,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         request: WorkerExecutionSpawnRequest,
     ) -> Result<WorkerHandle, String> {
         let worker_name = Self::runtime_worker_name(&request);
-        let profile = self.runtime_profile(&request);
+        let profile = Self::runtime_profile(&request);
         let has_local_filesystem = request.working_directory.is_some();
         let worker_root = request
             .working_directory
@@ -388,7 +369,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         let workspace_backend_ref =
             RuntimeWorkspaceBackendRef::from_worker_request(&request.request);
         let workspace_context = workspace_backend_ref.worker_context();
-        let selector = profile.as_deref().unwrap_or("builtin:default");
+        let selector = profile.as_ref();
         let archive = self
             .resolve_profile_source_archive(&request.request.profile_source)
             .await?;
@@ -1421,7 +1402,7 @@ mod tests {
                 },
             },
             profiles: vec![crate::config_bundle::ConfigProfileDescriptor {
-                selector: ProfileSelector::RuntimeDefault,
+                selector: ProfileSelector::Builtin("builtin:companion".to_string()),
                 label: Some("adapter-test".to_string()),
             }],
             declarations: Vec::new(),
@@ -1457,7 +1438,7 @@ mod tests {
     fn create_request(_name: &str) -> CreateWorkerRequest {
         let bundle = test_bundle();
         CreateWorkerRequest {
-            profile: ProfileSelector::RuntimeDefault,
+            profile: ProfileSelector::Builtin("builtin:companion".to_string()),
             display_name: None,
             profile_source: crate::catalog::ProfileSourceArchiveSource::Embedded {
                 archive: bundle.profile_source_archive.clone().unwrap(),
@@ -1654,15 +1635,15 @@ mod tests {
             ProfileRuntimeWorkerFactory::runtime_profile_value(
                 &crate::catalog::ProfileSelector::Builtin("coder".to_string())
             )
-            .as_deref(),
-            Some("builtin:coder")
+            .as_ref(),
+            "builtin:coder"
         );
         assert_eq!(
             ProfileRuntimeWorkerFactory::runtime_profile_value(
                 &crate::catalog::ProfileSelector::Builtin("builtin:coder".to_string())
             )
-            .as_deref(),
-            Some("builtin:coder")
+            .as_ref(),
+            "builtin:coder"
         );
     }
 

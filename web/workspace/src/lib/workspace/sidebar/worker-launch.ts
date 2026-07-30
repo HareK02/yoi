@@ -32,9 +32,9 @@ export function defaultWorkerLaunchForm(
     ) ??
       options?.runtimes.find((runtime) => runtime.can_spawn_worker) ??
       options?.runtimes[0];
-  const preferredProfile =
-    options?.profiles.find((candidate) => candidate.id === "builtin:coder") ??
-      options?.profiles[0];
+  const preferredProfile = options?.profiles.find((candidate) =>
+    candidate.id === options.default_profile
+  );
   const availableWorkingDirectories =
     options?.working_directories.filter((directory) =>
       directory.status === "active" &&
@@ -60,7 +60,7 @@ export function defaultWorkerLaunchForm(
 
   return {
     runtime_id: current.runtime_id || preferredRuntime?.runtime_id || "",
-    display_name: current.display_name || "Coding Worker",
+    display_name: current.display_name || "Worker",
     profile:
       options?.profiles.some((candidate) => candidate.id === current.profile)
         ? current.profile

@@ -699,10 +699,10 @@ description = "Project coder"
         .unwrap();
 
         let (choices, default_index) = profile_choices_for_cwd(&project);
-        assert_eq!(choices[0].selector.as_deref(), Some("builtin:default"));
+        assert_eq!(choices[0].selector.as_deref(), Some("builtin:companion"));
         assert_eq!(
             choices[0].label,
-            "builtin:default — Bundled default Yoi coding profile"
+            "builtin:companion — Bundled Companion role profile"
         );
         let project_index = choices
             .iter()

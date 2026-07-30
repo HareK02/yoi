@@ -2782,7 +2782,7 @@ fn dashboard_ticket_intake_finish_success_clears_composer_and_reports_pod() {
                 implementation_worktree_root: PathBuf::from("/tmp/workspace/.worktree"),
                 role: TicketRole::Intake,
                 worker_name: "intake-worker".to_string(),
-                profile: "builtin:default".to_string(),
+                profile: "builtin:companion".to_string(),
                 launch_prompt_ref: None,
                 run_segments: vec![],
             },

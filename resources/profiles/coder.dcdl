@@ -1,4 +1,4 @@
-import "./default.dcdl" // {
+import "./base.dcdl" // {
     slug = "coder";
     description = "Ticket implementation coder profile.";
     scope = "workspace_write";

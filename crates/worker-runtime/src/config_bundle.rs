@@ -353,7 +353,6 @@ pub(crate) fn validate_profile_selector(
     bundle_id: Option<&str>,
 ) -> Result<(), RuntimeError> {
     match selector {
-        ProfileSelector::RuntimeDefault => Ok(()),
         ProfileSelector::Builtin(value) | ProfileSelector::Named(value) => {
             if value.trim().is_empty() {
                 Err(RuntimeError::InvalidProfileSelector {
@@ -544,7 +543,6 @@ fn declaration_sort_key(declaration: &ConfigDeclaration) -> String {
 
 fn profile_sort_key(selector: &ProfileSelector) -> String {
     match selector {
-        ProfileSelector::RuntimeDefault => "runtime_default".to_string(),
         ProfileSelector::Builtin(value) => format!("builtin\0{value}"),
         ProfileSelector::Named(value) => format!("named\0{value}"),
     }

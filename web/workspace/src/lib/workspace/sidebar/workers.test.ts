@@ -18,7 +18,6 @@ function worker(overrides: Partial<Worker>): Worker {
     host_id: "host",
     display_name: "Worker 1",
     label: "Worker 1",
-    role: null,
     profile: null,
     singleton_key: null,
     tags: [],

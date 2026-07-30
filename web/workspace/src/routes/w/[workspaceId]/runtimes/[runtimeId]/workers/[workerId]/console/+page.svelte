@@ -1259,11 +1259,8 @@
                         <dd><code>{worker.host_id}</code></dd>
                     </div>
                     <div>
-                        <dt>Role / profile</dt>
-                        <dd>
-                            {worker.role ?? "unknown"} / {worker.profile ??
-                                "unknown"}
-                        </dd>
+                        <dt>Profile</dt>
+                        <dd>{worker.profile ?? "unknown"}</dd>
                     </div>
                     <div>
                         <dt>Workspace</dt>

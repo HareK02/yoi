@@ -19,21 +19,14 @@ const PROFILE_SOURCE_TREE_ID: &str = "project";
 const PROFILE_SOURCE_TREE_DISPLAY_ROOT: &str = "profiles";
 const MAX_PROFILE_SOURCE_BYTES: u64 = 256 * 1024;
 const BUILTIN_PROFILE_IDS: &[&str] = &[
-    "builtin:default",
     "builtin:companion",
     "builtin:intake",
     "builtin:orchestrator",
     "builtin:coder",
     "builtin:reviewer",
 ];
-const BUILTIN_PROFILE_SLUGS: &[&str] = &[
-    "default",
-    "companion",
-    "intake",
-    "orchestrator",
-    "coder",
-    "reviewer",
-];
+const BUILTIN_PROFILE_SLUGS: &[&str] =
+    &["companion", "intake", "orchestrator", "coder", "reviewer"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceMetadataSettingsResponse {
@@ -832,7 +825,6 @@ pub fn project_profile_candidates(workspace_root: &Path) -> Vec<WorkspaceProfile
 
 pub fn is_profile_candidate(workspace_root: &Path, profile_id: &str) -> bool {
     BUILTIN_PROFILE_IDS.contains(&profile_id)
-        || profile_id == "runtime_default"
         || project_profile_candidates(workspace_root)
             .into_iter()
             .any(|profile| profile.profile_id == profile_id)
@@ -840,7 +832,6 @@ pub fn is_profile_candidate(workspace_root: &Path, profile_id: &str) -> bool {
 
 fn builtin_profile_summaries(default_profile: Option<&str>) -> Vec<WorkspaceProfileSummary> {
     let labels = [
-        ("builtin:default", "Default", "Bundled default Yoi profile"),
         (
             "builtin:companion",
             "Companion",
@@ -1189,15 +1180,6 @@ fn build_profile_archive_from_tree_sources(
         let path = display_source_path(&entry.relative_path);
         if sources.contains_key(&path) {
             entrypoints.insert(project_selector(&entry.name), path);
-        }
-    }
-    if let Some(default) = registry
-        .default
-        .as_deref()
-        .filter(|value| value.starts_with("project:"))
-    {
-        if let Some(path) = entrypoints.get(default).cloned() {
-            entrypoints.insert("default".to_string(), path);
         }
     }
     build_profile_archive_from_source_set(entrypoints, sources)
@@ -1920,9 +1902,7 @@ pub fn selector_for_builtin_candidate(
     id: &str,
 ) -> Option<worker_runtime::catalog::ProfileSelector> {
     match id {
-        "runtime_default" => Some(worker_runtime::catalog::ProfileSelector::RuntimeDefault),
-        "builtin:default"
-        | "builtin:companion"
+        "builtin:companion"
         | "builtin:intake"
         | "builtin:orchestrator"
         | "builtin:coder"

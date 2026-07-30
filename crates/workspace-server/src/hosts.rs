@@ -234,7 +234,6 @@ pub struct WorkerSummary {
     pub display_name: String,
     /// Backward-compatible display label. New UI should prefer `display_name`.
     pub label: String,
-    pub role: Option<String>,
     pub profile: Option<String>,
     pub singleton_key: Option<String>,
     #[serde(default)]
@@ -274,8 +273,7 @@ impl<T> RuntimeList<T> {
 }
 
 fn is_retired_companion_worker(worker: &WorkerSummary) -> bool {
-    worker.role.as_deref() == Some("builtin:companion")
-        || worker.profile.as_deref() == Some("builtin:companion")
+    worker.profile.as_deref() == Some("builtin:companion")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -321,8 +319,7 @@ pub struct WorkerSpawnRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_worker_name: Option<String>,
     pub acceptance: WorkerSpawnAcceptanceRequirement,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile: Option<ProfileSelector>,
+    pub profile: ProfileSelector,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_input: Option<EmbeddedWorkerInput>,
     /// Optional safe working-directory creation request. The Workspace server resolves
@@ -1405,7 +1402,6 @@ impl EmbeddedWorkerRuntime {
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
             label: display.display_name,
-            role: profile.clone(),
             profile,
             singleton_key: display.singleton_key,
             tags: display.tags,
@@ -1445,7 +1441,6 @@ impl EmbeddedWorkerRuntime {
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
             label: display.display_name,
-            role: profile.clone(),
             profile,
             singleton_key: display.singleton_key,
             tags: display.tags,
@@ -1705,11 +1700,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             ));
         }
 
-        let profile = request
-            .profile
-            .clone()
-            .unwrap_or_else(|| embedded_profile_selector(&request.intent));
-        let profile_source = match default_profile_source_archive_source(&profile) {
+        let profile = request.profile.clone();
+        let profile_source = match profile_source_archive_source(&request, &profile) {
             Ok(source) => source,
             Err(error) => {
                 diagnostics.push(diagnostic(
@@ -2364,7 +2356,6 @@ impl RemoteWorkerRuntime {
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
             label: display.display_name,
-            role: profile.clone(),
             profile,
             singleton_key: display.singleton_key,
             tags: display.tags,
@@ -2408,7 +2399,6 @@ impl RemoteWorkerRuntime {
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
             label: display.display_name,
-            role: profile.clone(),
             profile,
             singleton_key: display.singleton_key,
             tags: display.tags,
@@ -2678,11 +2668,9 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 )],
             };
         }
-        let profile = request
-            .profile
-            .clone()
-            .unwrap_or_else(|| embedded_profile_selector(&request.intent));
-        let profile_source = match default_profile_source_archive_http_source(
+        let profile = request.profile.clone();
+        let profile_source = match profile_source_archive_http_source(
+            &request,
             &profile,
             &self.workspace_id,
             Some(self.runtime_id.as_str()),
@@ -2953,22 +2941,38 @@ fn embedded_worker_projection_diagnostics() -> Vec<RuntimeDiagnostic> {
     )]
 }
 
-fn default_profile_source_archive_source(
+fn profile_source_archive_for_request(
+    request: &WorkerSpawnRequest,
+    profile: &ProfileSelector,
+) -> Result<ProfileSourceArchive, String> {
+    if let Some(archive) = request
+        .resolved_config_bundle
+        .as_ref()
+        .and_then(|bundle| bundle.profile_source_archive.clone())
+    {
+        return Ok(archive);
+    }
+    builtin_profile_source_archive(profile)
+}
+
+fn profile_source_archive_source(
+    request: &WorkerSpawnRequest,
     profile: &ProfileSelector,
 ) -> Result<ProfileSourceArchiveSource, String> {
     Ok(ProfileSourceArchiveSource::Embedded {
-        archive: default_profile_source_archive(profile)?,
+        archive: profile_source_archive_for_request(request, profile)?,
     })
 }
 
-fn default_profile_source_archive_http_source(
+fn profile_source_archive_http_source(
+    request: &WorkerSpawnRequest,
     profile: &ProfileSelector,
     workspace_id: &str,
     runtime_id: Option<&str>,
     resource_broker: &BackendResourceBroker,
     backend_base_url: &str,
 ) -> Result<ProfileSourceArchiveSource, String> {
-    let archive = default_profile_source_archive(profile)?;
+    let archive = profile_source_archive_for_request(request, profile)?;
     let _handle = resource_broker.issue_profile_source_archive_handle(
         workspace_id.to_string(),
         runtime_id,
@@ -2999,7 +3003,7 @@ enum ProfileSourceArchiveTransport {
 }
 
 #[cfg(test)]
-fn default_embedded_config_bundle(
+fn builtin_profile_config_bundle(
     profile: &ProfileSelector,
     workspace_id: &str,
     runtime_id: Option<&str>,
@@ -3012,7 +3016,7 @@ fn default_embedded_config_bundle(
             .unwrap_or_else(|| "default".to_string())
             .replace([':', '/', ' '], "-")
     );
-    let archive = default_profile_source_archive(profile)?;
+    let archive = builtin_profile_source_archive(profile)?;
     let (profile_source_archive, profile_source_archive_handle) = match archive_transport {
         ProfileSourceArchiveTransport::Inline => (Some(archive), None),
         ProfileSourceArchiveTransport::BackendResourceHandle => {
@@ -3048,17 +3052,13 @@ fn default_embedded_config_bundle(
     .with_computed_digest())
 }
 
-fn default_profile_source_archive(
+fn builtin_profile_source_archive(
     profile: &ProfileSelector,
 ) -> Result<ProfileSourceArchive, String> {
-    let selected = embedded_profile_label(profile).unwrap_or_else(|| "default".to_string());
+    let selected = embedded_profile_label(profile)
+        .ok_or_else(|| "profile selector must identify a concrete profile".to_string())?;
     let selected_path = embedded_profile_path(profile)?;
     let mut entrypoints = BTreeMap::new();
-    entrypoints.insert("default".to_string(), "profiles/default.dcdl".to_string());
-    entrypoints.insert(
-        "builtin:default".to_string(),
-        "profiles/default.dcdl".to_string(),
-    );
     for slug in [
         "companion",
         "intake",
@@ -3073,8 +3073,8 @@ fn default_profile_source_archive(
 
     let mut sources = BTreeMap::new();
     sources.insert(
-        "profiles/default.dcdl".to_string(),
-        include_str!("../../../resources/profiles/default.dcdl").to_string(),
+        "profiles/base.dcdl".to_string(),
+        include_str!("../../../resources/profiles/base.dcdl").to_string(),
     );
     sources.insert(
         "profiles/companion.dcdl".to_string(),
@@ -3111,8 +3111,8 @@ fn default_profile_source_archive(
         "memory-consolidation",
     ] {
         imports.insert(
-            format!("profiles/{slug}.dcdl\0./default.dcdl"),
-            "profiles/default.dcdl".to_string(),
+            format!("profiles/{slug}.dcdl\0./base.dcdl"),
+            "profiles/base.dcdl".to_string(),
         );
     }
 
@@ -3127,9 +3127,7 @@ fn default_profile_source_archive(
 
 fn embedded_profile_path(profile: &ProfileSelector) -> Result<String, String> {
     match profile {
-        ProfileSelector::RuntimeDefault => Ok("profiles/default.dcdl".to_string()),
         ProfileSelector::Builtin(name) => match name.strip_prefix("builtin:").unwrap_or(name) {
-            "default" => Ok("profiles/default.dcdl".to_string()),
             "companion" => Ok("profiles/companion.dcdl".to_string()),
             "intake" => Ok("profiles/intake.dcdl".to_string()),
             "orchestrator" => Ok("profiles/orchestrator.dcdl".to_string()),
@@ -3142,31 +3140,8 @@ fn embedded_profile_path(profile: &ProfileSelector) -> Result<String, String> {
     }
 }
 
-fn embedded_profile_selector(intent: &WorkerSpawnIntent) -> ProfileSelector {
-    match intent {
-        WorkerSpawnIntent::TicketRole { role, .. } => {
-            ProfileSelector::Builtin(format!("builtin:{}", ticket_role_profile_slug(role)))
-        }
-        WorkerSpawnIntent::WorkspaceCompanion => {
-            ProfileSelector::Builtin("builtin:companion".to_string())
-        }
-        WorkerSpawnIntent::WorkspaceOrchestrator => ProfileSelector::RuntimeDefault,
-        WorkerSpawnIntent::WorkspaceCoding => ProfileSelector::Builtin("builtin:coder".to_string()),
-    }
-}
-
-fn ticket_role_profile_slug(role: &TicketWorkerRole) -> &'static str {
-    match role {
-        TicketWorkerRole::Intake => "intake",
-        TicketWorkerRole::Orchestrator => "orchestrator",
-        TicketWorkerRole::Coder => "coder",
-        TicketWorkerRole::Reviewer => "reviewer",
-    }
-}
-
 fn embedded_profile_label(profile: &ProfileSelector) -> Option<String> {
     Some(match profile {
-        ProfileSelector::RuntimeDefault => "runtime_default".to_string(),
         ProfileSelector::Builtin(name) | ProfileSelector::Named(name) => {
             if name.strip_prefix("builtin:").unwrap_or(name) == MEMORY_CONSOLIDATION_PROFILE {
                 MEMORY_CONSOLIDATION_PROFILE.to_string()
@@ -3227,21 +3202,18 @@ fn worker_display_metadata(
 }
 
 fn profile_display_name(profile_label: &str) -> String {
-    match profile_label {
-        "runtime_default" => "Default Worker".to_string(),
-        value => value
-            .split(['-', '_'])
-            .filter(|part| !part.is_empty())
-            .map(|part| {
-                let mut chars = part.chars();
-                match chars.next() {
-                    Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
-                    None => String::new(),
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
-    }
+    profile_label
+        .split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn embedded_input_rejected(
@@ -3632,7 +3604,6 @@ pub fn placeholder_worker(host_id: impl Into<String>) -> WorkerSummary {
         host_id,
         display_name: "Worker runtime actions are not implemented".to_string(),
         label: "Worker runtime actions are not implemented".to_string(),
-        role: None,
         profile: None,
         singleton_key: None,
         tags: Vec::new(),
@@ -3690,7 +3661,6 @@ mod tests {
         let broker = BackendResourceBroker::default();
         let runtime_id = "runtime-test";
         for selector in [
-            ProfileSelector::RuntimeDefault,
             ProfileSelector::Builtin("builtin:companion".to_string()),
             ProfileSelector::Builtin("builtin:intake".to_string()),
             ProfileSelector::Builtin("builtin:orchestrator".to_string()),
@@ -3698,7 +3668,7 @@ mod tests {
             ProfileSelector::Builtin("builtin:reviewer".to_string()),
             ProfileSelector::Builtin("builtin:memory-consolidation".to_string()),
         ] {
-            let bundle = default_embedded_config_bundle(
+            let bundle = builtin_profile_config_bundle(
                 &selector,
                 "workspace-test",
                 Some(runtime_id),
@@ -3724,9 +3694,7 @@ mod tests {
                     .verify()
                     .unwrap();
             let selector_key = match &selector {
-                ProfileSelector::RuntimeDefault => "default".to_string(),
-                ProfileSelector::Builtin(name) => name.clone(),
-                ProfileSelector::Named(name) => name.clone(),
+                ProfileSelector::Builtin(name) | ProfileSelector::Named(name) => name.clone(),
             };
             let manifest = archive
                 .resolve_profile(&selector_key, root.path(), "embedded-test-worker")
@@ -3745,7 +3713,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let broker = BackendResourceBroker::default();
         let runtime_id = "remote:test";
-        let bundle = default_embedded_config_bundle(
+        let bundle = builtin_profile_config_bundle(
             &ProfileSelector::Builtin("builtin:coder".to_string()),
             "workspace-test",
             Some(runtime_id),
@@ -3757,7 +3725,7 @@ mod tests {
         let archive = bundle
             .profile_source_archive
             .as_ref()
-            .expect("remote default bundle carries inline profile archive")
+            .expect("remote built-in bundle carries inline profile archive")
             .verify()
             .unwrap();
         let manifest = archive
@@ -3767,10 +3735,37 @@ mod tests {
     }
 
     #[test]
+    fn resolved_project_profile_archive_is_used_for_runtime_delivery() {
+        let broker = BackendResourceBroker::default();
+        let builtin_selector = ProfileSelector::Builtin("builtin:coder".to_string());
+        let archive = builtin_profile_source_archive(&builtin_selector)
+            .expect("build stand-in project profile archive");
+        let mut bundle = builtin_profile_config_bundle(
+            &builtin_selector,
+            "workspace-test",
+            Some("runtime-test"),
+            &broker,
+            ProfileSourceArchiveTransport::Inline,
+        )
+        .expect("build project profile bundle");
+        bundle.profile_source_archive = Some(archive.clone());
+        let mut request = embedded_spawn_request();
+        request.profile = ProfileSelector::Named("project:custom".to_string());
+        request.resolved_config_bundle = Some(bundle);
+
+        let delivered = profile_source_archive_for_request(&request, &request.profile)
+            .expect("resolve project profile archive");
+        assert_eq!(delivered.reference, archive.reference);
+        assert_eq!(delivered.content, archive.content);
+    }
+
+    #[test]
     fn remote_profile_source_archive_url_uses_workspace_id_not_host_id() {
         let broker = BackendResourceBroker::default();
         let runtime_id = "remote:test";
-        let source = default_profile_source_archive_http_source(
+        let request = embedded_spawn_request();
+        let source = profile_source_archive_http_source(
+            &request,
             &ProfileSelector::Builtin("builtin:coder".to_string()),
             "workspace-actual",
             Some(runtime_id),
@@ -3796,7 +3791,7 @@ mod tests {
         let broker = BackendResourceBroker::default();
         let runtime_id = "runtime-test";
         assert!(
-            default_embedded_config_bundle(
+            builtin_profile_config_bundle(
                 &ProfileSelector::Builtin("builtin:missing".to_string()),
                 "workspace-test",
                 Some(runtime_id),
@@ -3806,7 +3801,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            default_embedded_config_bundle(
+            builtin_profile_config_bundle(
                 &ProfileSelector::Named("custom".to_string()),
                 "workspace-test",
                 Some(runtime_id),
@@ -3966,7 +3961,6 @@ mod tests {
                     host_id: host_id.to_string(),
                     display_name: label.to_string(),
                     label: label.to_string(),
-                    role: None,
                     profile: None,
                     singleton_key: None,
                     tags: Vec::new(),
@@ -4158,7 +4152,7 @@ mod tests {
             acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                 expected_segments: 0,
             },
-            profile: None,
+            profile: ProfileSelector::Builtin("builtin:coder".to_string()),
             initial_input: None,
             working_directory_request: None,
             resolved_working_directory_request: None,
@@ -4284,7 +4278,7 @@ mod tests {
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
-                    profile: None,
+                    profile: ProfileSelector::Builtin("builtin:coder".to_string()),
                     initial_input: None,
                     working_directory_request: None,
                     resolved_working_directory_request: None,
@@ -4380,7 +4374,7 @@ mod tests {
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
-                    profile: Some(ProfileSelector::Builtin("builtin:coder".to_string())),
+                    profile: ProfileSelector::Builtin("builtin:coder".to_string()),
                     initial_input: None,
                     working_directory_request: None,
                     resolved_working_directory_request: None,
@@ -4412,7 +4406,7 @@ mod tests {
                     intent: WorkerSpawnIntent::WorkspaceCompanion,
                     requested_worker_name: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::SocketReady,
-                    profile: None,
+                    profile: ProfileSelector::Builtin("builtin:companion".to_string()),
                     initial_input: None,
                     working_directory_request: None,
                     resolved_working_directory_request: None,
