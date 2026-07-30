@@ -292,6 +292,7 @@ pub(crate) struct PersistedRuntimeState {
     pub(crate) next_event_id: u64,
     pub(crate) next_diagnostic_id: u64,
     pub(crate) workers: BTreeMap<WorkerId, PersistedWorkerRecord>,
+    pub(crate) workspace_owners: BTreeMap<String, String>,
     pub(crate) config_bundles: BTreeMap<String, ConfigBundle>,
     pub(crate) events: Vec<RuntimeEvent>,
     pub(crate) diagnostics: Vec<RuntimeDiagnostic>,
@@ -319,6 +320,8 @@ struct RuntimeSnapshot {
     next_diagnostic_id: u64,
     #[serde(default)]
     config_bundles: BTreeMap<String, ConfigBundle>,
+    #[serde(default)]
+    workspace_owners: BTreeMap<String, String>,
     diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -350,6 +353,7 @@ impl RuntimeSnapshot {
             next_event_id: state.next_event_id,
             next_diagnostic_id: state.next_diagnostic_id,
             config_bundles: state.config_bundles.clone(),
+            workspace_owners: state.workspace_owners.clone(),
             diagnostics: state.diagnostics.clone(),
         }
     }
@@ -389,6 +393,7 @@ impl RuntimeSnapshot {
             next_diagnostic_id: self.next_diagnostic_id,
             workers,
             config_bundles: self.config_bundles,
+            workspace_owners: self.workspace_owners,
             events,
             diagnostics: self.diagnostics,
         }

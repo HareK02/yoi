@@ -29,4 +29,4 @@ pub mod working_directory;
 #[cfg(feature = "fs-store")]
 pub use fs_store::{FsRuntimeStore, FsRuntimeStoreOptions};
 pub use management::{RuntimeLimits, RuntimeOptions};
-pub use runtime::Runtime;
+pub use runtime::{Runtime, RuntimeWorkspaceScope};

@@ -39,6 +39,22 @@ use std::sync::{Arc, Mutex, MutexGuard};
 #[cfg(feature = "ws-server")]
 use tokio::sync::broadcast;
 
+/// Workspace-scoped Runtime authorization context supplied by a trusted backend.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeWorkspaceScope {
+    pub workspace_id: String,
+    pub server_id: String,
+}
+
+impl RuntimeWorkspaceScope {
+    pub fn new(workspace_id: impl Into<String>, server_id: impl Into<String>) -> Self {
+        Self {
+            workspace_id: workspace_id.into(),
+            server_id: server_id.into(),
+        }
+    }
+}
+
 /// Concrete embedded Runtime domain entity.
 ///
 /// The default implementation is memory-backed and tools/provider-less by
@@ -327,22 +343,28 @@ impl Runtime {
     /// Create a Worker scoped to a workspace authorization context.
     pub fn create_worker_scoped(
         &self,
-        workspace_id: &str,
+        scope: &RuntimeWorkspaceScope,
         request: CreateWorkerRequest,
     ) -> Result<WorkerDetail, RuntimeError> {
-        self.create_worker_with_workspace(request, Some(workspace_id))
+        self.create_worker_with_workspace(request, Some(scope))
     }
 
     fn create_worker_with_workspace(
         &self,
         request: CreateWorkerRequest,
-        workspace_id: Option<&str>,
+        scope: Option<&RuntimeWorkspaceScope>,
     ) -> Result<WorkerDetail, RuntimeError> {
         let (backend, worker_ref, spawn_request) = {
             let mut state = self.lock()?;
             state.ensure_running()?;
             validate_create_worker_request(&request)?;
-            validate_create_workspace_scope(&request, workspace_id)?;
+            validate_create_workspace_scope(
+                &request,
+                scope.map(|scope| scope.workspace_id.as_str()),
+            )?;
+            if let Some(scope) = scope {
+                state.ensure_workspace_owner(scope, true)?;
+            };
             state.validate_worker_config_boundary(&request)?;
             if let Some(working_directory_id) = requested_primary_workdir_id(&request) {
                 if let Some(owner_worker_id) =
@@ -372,7 +394,7 @@ impl Runtime {
                 worker_ref: worker_ref.clone(),
                 worker_id: worker_id.clone(),
                 status: WorkerStatus::Stopped,
-                workspace_id: workspace_id.map(ToOwned::to_owned),
+                workspace_id: scope.map(|scope| scope.workspace_id.clone()),
                 request: request.clone(),
                 working_directory: None,
                 execution_handle: None,
@@ -468,13 +490,18 @@ impl Runtime {
     /// List Workers visible to a workspace-scoped Runtime authorization context.
     pub fn list_workers_scoped(
         &self,
-        workspace_id: &str,
+        scope: &RuntimeWorkspaceScope,
     ) -> Result<Vec<WorkerSummary>, RuntimeError> {
-        let state = self.lock()?;
+        let mut state = self.lock()?;
+        let visible_workspace = state.ensure_workspace_owner_for_existing_workers(scope)?;
+        if !visible_workspace {
+            return Ok(Vec::new());
+        }
+        state.persist_runtime_snapshot()?;
         Ok(state
             .workers
             .values()
-            .filter(|worker| worker.belongs_to_workspace(workspace_id))
+            .filter(|worker| worker.belongs_to_workspace(&scope.workspace_id))
             .map(WorkerRecord::summary)
             .collect())
     }
@@ -482,14 +509,20 @@ impl Runtime {
     /// List stopped Workers visible to a workspace-scoped Runtime authorization context.
     pub fn list_stopped_workers_scoped(
         &self,
-        workspace_id: &str,
+        scope: &RuntimeWorkspaceScope,
     ) -> Result<Vec<WorkerSummary>, RuntimeError> {
-        let state = self.lock()?;
+        let mut state = self.lock()?;
+        let visible_workspace = state.ensure_workspace_owner_for_existing_workers(scope)?;
+        if !visible_workspace {
+            return Ok(Vec::new());
+        }
+        state.persist_runtime_snapshot()?;
         Ok(state
             .workers
             .values()
             .filter(|worker| {
-                worker.status == WorkerStatus::Stopped && worker.belongs_to_workspace(workspace_id)
+                worker.status == WorkerStatus::Stopped
+                    && worker.belongs_to_workspace(&scope.workspace_id)
             })
             .map(WorkerRecord::summary)
             .collect())
@@ -498,17 +531,19 @@ impl Runtime {
     /// Fetch Worker detail through a workspace-scoped Runtime authorization context.
     pub fn worker_detail_scoped(
         &self,
-        workspace_id: &str,
+        scope: &RuntimeWorkspaceScope,
         worker_ref: &WorkerRef,
     ) -> Result<WorkerDetail, RuntimeError> {
-        let state = self.lock()?;
+        let mut state = self.lock()?;
         let worker = state.worker(worker_ref)?;
-        if !worker.belongs_to_workspace(workspace_id) {
+        if !worker.belongs_to_workspace(&scope.workspace_id) {
             return Err(RuntimeError::WorkerNotFound {
                 worker_id: worker_ref.worker_id,
             });
         }
-        Ok(worker.detail())
+        state.ensure_workspace_owner(scope, true)?;
+        state.persist_runtime_snapshot()?;
+        Ok(state.worker(worker_ref)?.detail())
     }
 
     /// Fetch Worker detail.  The supplied [`WorkerRef`] must match this Runtime.
@@ -520,27 +555,28 @@ impl Runtime {
 
     fn ensure_worker_in_workspace(
         &self,
-        workspace_id: &str,
+        scope: &RuntimeWorkspaceScope,
         worker_ref: &WorkerRef,
     ) -> Result<(), RuntimeError> {
-        let state = self.lock()?;
+        let mut state = self.lock()?;
         let worker = state.worker(worker_ref)?;
-        if worker.belongs_to_workspace(workspace_id) {
-            Ok(())
-        } else {
-            Err(RuntimeError::WorkerNotFound {
+        if !worker.belongs_to_workspace(&scope.workspace_id) {
+            return Err(RuntimeError::WorkerNotFound {
                 worker_id: worker_ref.worker_id,
-            })
+            });
         }
+        state.ensure_workspace_owner(scope, true)?;
+        state.persist_runtime_snapshot()?;
+        Ok(())
     }
 
     /// Attach a live execution through a workspace-scoped Runtime authorization context.
     pub fn restore_worker_scoped(
         &self,
-        workspace_id: &str,
+        scope: &RuntimeWorkspaceScope,
         worker_ref: &WorkerRef,
     ) -> Result<WorkerDetail, RuntimeError> {
-        self.ensure_worker_in_workspace(workspace_id, worker_ref)?;
+        self.ensure_worker_in_workspace(scope, worker_ref)?;
         self.restore_worker(worker_ref)
     }
 
@@ -635,11 +671,11 @@ impl Runtime {
     /// Accept input into a Worker through a workspace-scoped Runtime authorization context.
     pub fn send_input_scoped(
         &self,
-        workspace_id: &str,
+        scope: &RuntimeWorkspaceScope,
         worker_ref: &WorkerRef,
         input: WorkerInput,
     ) -> Result<WorkerInteractionAck, RuntimeError> {
-        self.ensure_worker_in_workspace(workspace_id, worker_ref)?;
+        self.ensure_worker_in_workspace(scope, worker_ref)?;
         self.send_input(worker_ref, input)
     }
 
@@ -717,12 +753,12 @@ impl Runtime {
     /// Return live completion entries through a workspace-scoped Runtime authorization context.
     pub fn worker_completions_scoped(
         &self,
-        workspace_id: &str,
+        scope: &RuntimeWorkspaceScope,
         worker_ref: &WorkerRef,
         kind: protocol::CompletionKind,
         prefix: &str,
     ) -> Result<Vec<protocol::CompletionEntry>, RuntimeError> {
-        self.ensure_worker_in_workspace(workspace_id, worker_ref)?;
+        self.ensure_worker_in_workspace(scope, worker_ref)?;
         self.worker_completions(worker_ref, kind, prefix)
     }
 
@@ -751,11 +787,11 @@ impl Runtime {
     /// Accept a protocol method through a workspace-scoped Runtime authorization context.
     pub fn send_protocol_method_scoped(
         &self,
-        workspace_id: &str,
+        scope: &RuntimeWorkspaceScope,
         worker_ref: &WorkerRef,
         method: Method,
     ) -> Result<Vec<Event>, RuntimeError> {
-        self.ensure_worker_in_workspace(workspace_id, worker_ref)?;
+        self.ensure_worker_in_workspace(scope, worker_ref)?;
         self.send_protocol_method(worker_ref, method)
     }
 
@@ -845,6 +881,10 @@ impl Runtime {
     fn rollback_failed_create(&self, worker_ref: &WorkerRef) -> Result<(), RuntimeError> {
         let mut state = self.lock()?;
         if let Some(record) = state.workers.remove(&worker_ref.worker_id) {
+            let workspace_id = record.workspace_id.clone();
+            if let Some(workspace_id) = workspace_id.as_deref() {
+                state.forget_workspace_owner_if_unused(workspace_id);
+            }
             state.events.retain(|event| {
                 event.id != record.last_event_id || event.worker_ref.as_ref() != Some(worker_ref)
             });
@@ -911,11 +951,11 @@ impl Runtime {
     /// Stop a Worker through a workspace-scoped Runtime authorization context.
     pub fn stop_worker_scoped(
         &self,
-        workspace_id: &str,
+        scope: &RuntimeWorkspaceScope,
         worker_ref: &WorkerRef,
         reason: Option<String>,
     ) -> Result<WorkerLifecycleAck, RuntimeError> {
-        self.ensure_worker_in_workspace(workspace_id, worker_ref)?;
+        self.ensure_worker_in_workspace(scope, worker_ref)?;
         self.stop_worker(worker_ref, reason)
     }
 
@@ -937,11 +977,11 @@ impl Runtime {
     /// Cancel a Worker through a workspace-scoped Runtime authorization context.
     pub fn cancel_worker_scoped(
         &self,
-        workspace_id: &str,
+        scope: &RuntimeWorkspaceScope,
         worker_ref: &WorkerRef,
         reason: Option<String>,
     ) -> Result<WorkerLifecycleAck, RuntimeError> {
-        self.ensure_worker_in_workspace(workspace_id, worker_ref)?;
+        self.ensure_worker_in_workspace(scope, worker_ref)?;
         self.cancel_worker(worker_ref, reason)
     }
 
@@ -963,10 +1003,10 @@ impl Runtime {
     /// Delete a non-running Worker through a workspace-scoped Runtime authorization context.
     pub fn delete_worker_scoped(
         &self,
-        workspace_id: &str,
+        scope: &RuntimeWorkspaceScope,
         worker_ref: &WorkerRef,
     ) -> Result<WorkerDeleteResult, RuntimeError> {
-        self.ensure_worker_in_workspace(workspace_id, worker_ref)?;
+        self.ensure_worker_in_workspace(scope, worker_ref)?;
         self.delete_worker(worker_ref)
     }
 
@@ -990,6 +1030,9 @@ impl Runtime {
                 worker_id: worker_ref.worker_id,
             }
         })?;
+        if let Some(workspace_id) = removed.workspace_id.as_deref() {
+            state.forget_workspace_owner_if_unused(workspace_id);
+        }
         #[cfg(feature = "ws-server")]
         state
             .observation_events
@@ -1373,6 +1416,7 @@ struct RuntimeState {
     #[cfg(feature = "fs-store")]
     next_diagnostic_id: u64,
     workers: BTreeMap<WorkerId, WorkerRecord>,
+    workspace_owners: BTreeMap<String, String>,
     config_bundles: BTreeMap<String, ConfigBundle>,
     events: Vec<RuntimeEvent>,
     diagnostics: Vec<RuntimeDiagnostic>,
@@ -1398,6 +1442,7 @@ impl RuntimeState {
             #[cfg(feature = "fs-store")]
             next_diagnostic_id: 1,
             workers: BTreeMap::new(),
+            workspace_owners: BTreeMap::new(),
             config_bundles: BTreeMap::new(),
             events: Vec::new(),
             diagnostics: Vec::new(),
@@ -1428,6 +1473,7 @@ impl RuntimeState {
             #[cfg(feature = "fs-store")]
             next_diagnostic_id: 1,
             workers: BTreeMap::new(),
+            workspace_owners: BTreeMap::new(),
             config_bundles: BTreeMap::new(),
             events: Vec::new(),
             diagnostics: Vec::new(),
@@ -1476,6 +1522,7 @@ impl RuntimeState {
             next_diagnostic_id,
             workers,
             config_bundles: persisted.config_bundles,
+            workspace_owners: persisted.workspace_owners,
             events: persisted.events,
             diagnostics,
             #[cfg(feature = "ws-server")]
@@ -1502,6 +1549,7 @@ impl RuntimeState {
                 .map(|(worker_id, worker)| (worker_id.clone(), worker.persisted_record()))
                 .collect(),
             config_bundles: self.config_bundles.clone(),
+            workspace_owners: self.workspace_owners.clone(),
             events: self.events.clone(),
             diagnostics: self.diagnostics.clone(),
         }
@@ -1642,6 +1690,59 @@ impl RuntimeState {
             });
         }
         Ok(())
+    }
+
+    fn ensure_workspace_owner(
+        &mut self,
+        scope: &RuntimeWorkspaceScope,
+        claim_if_missing: bool,
+    ) -> Result<bool, RuntimeError> {
+        if scope.workspace_id.trim().is_empty() {
+            return Err(RuntimeError::InvalidRequest(
+                "Runtime auth workspace_id must not be empty".to_string(),
+            ));
+        }
+        if scope.server_id.trim().is_empty() {
+            return Err(RuntimeError::InvalidRequest(
+                "Runtime auth server_id must not be empty".to_string(),
+            ));
+        }
+        match self.workspace_owners.get(&scope.workspace_id) {
+            Some(owner_server_id) if owner_server_id == &scope.server_id => Ok(true),
+            Some(owner_server_id) => Err(RuntimeError::WorkspaceOwnerMismatch {
+                workspace_id: scope.workspace_id.clone(),
+                owner_server_id: owner_server_id.clone(),
+                requester_server_id: scope.server_id.clone(),
+            }),
+            None if claim_if_missing => {
+                self.workspace_owners
+                    .insert(scope.workspace_id.clone(), scope.server_id.clone());
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    fn ensure_workspace_owner_for_existing_workers(
+        &mut self,
+        scope: &RuntimeWorkspaceScope,
+    ) -> Result<bool, RuntimeError> {
+        let has_workspace_worker = self
+            .workers
+            .values()
+            .any(|worker| worker.belongs_to_workspace(&scope.workspace_id));
+        self.ensure_workspace_owner(scope, has_workspace_worker)
+    }
+
+    fn forget_workspace_owner_if_unused(&mut self, workspace_id: &str) -> bool {
+        if self
+            .workers
+            .values()
+            .any(|worker| worker.belongs_to_workspace(workspace_id))
+        {
+            return false;
+        }
+        self.workspace_owners.remove(workspace_id).is_some()
     }
 
     fn worker(&self, worker_ref: &WorkerRef) -> Result<&WorkerRecord, RuntimeError> {
@@ -2064,6 +2165,10 @@ mod tests {
         request
     }
 
+    fn scope(workspace_id: &str, server_id: &str) -> RuntimeWorkspaceScope {
+        RuntimeWorkspaceScope::new(workspace_id, server_id)
+    }
+
     fn test_bundle_for_profile(profile: ProfileSelector) -> ConfigBundle {
         ConfigBundle {
             metadata: ConfigBundleMetadata {
@@ -2245,17 +2350,23 @@ mod tests {
     fn scoped_worker_access_hides_other_workspace_workers() {
         let runtime = runtime_with_backend();
         let workspace_a = runtime
-            .create_worker_scoped("workspace-a", scoped_task_request("a", "workspace-a"))
+            .create_worker_scoped(
+                &scope("workspace-a", "server-a"),
+                scoped_task_request("a", "workspace-a"),
+            )
             .unwrap();
         let workspace_b = runtime
-            .create_worker_scoped("workspace-b", scoped_task_request("b", "workspace-b"))
+            .create_worker_scoped(
+                &scope("workspace-b", "server-b"),
+                scoped_task_request("b", "workspace-b"),
+            )
             .unwrap();
 
         assert_eq!(workspace_a.workspace_id.as_deref(), Some("workspace-a"));
         assert_eq!(workspace_b.workspace_id.as_deref(), Some("workspace-b"));
         assert_eq!(
             runtime
-                .list_workers_scoped("workspace-a")
+                .list_workers_scoped(&scope("workspace-a", "server-a"))
                 .unwrap()
                 .into_iter()
                 .map(|worker| worker.worker_ref)
@@ -2264,7 +2375,7 @@ mod tests {
         );
         assert_eq!(
             runtime
-                .list_workers_scoped("workspace-b")
+                .list_workers_scoped(&scope("workspace-b", "server-b"))
                 .unwrap()
                 .into_iter()
                 .map(|worker| worker.worker_ref)
@@ -2273,13 +2384,13 @@ mod tests {
         );
 
         let detail_error = runtime
-            .worker_detail_scoped("workspace-a", &workspace_b.worker_ref)
+            .worker_detail_scoped(&scope("workspace-a", "server-a"), &workspace_b.worker_ref)
             .unwrap_err();
         assert!(matches!(detail_error, RuntimeError::WorkerNotFound { .. }));
 
         let input_error = runtime
             .send_input_scoped(
-                "workspace-a",
+                &scope("workspace-a", "server-a"),
                 &workspace_b.worker_ref,
                 WorkerInput::user("cross workspace"),
             )
@@ -2287,7 +2398,11 @@ mod tests {
         assert!(matches!(input_error, RuntimeError::WorkerNotFound { .. }));
 
         let protocol_error = runtime
-            .send_protocol_method_scoped("workspace-a", &workspace_b.worker_ref, Method::Shutdown)
+            .send_protocol_method_scoped(
+                &scope("workspace-a", "server-a"),
+                &workspace_b.worker_ref,
+                Method::Shutdown,
+            )
             .unwrap_err();
         assert!(matches!(
             protocol_error,
@@ -2303,11 +2418,60 @@ mod tests {
     }
 
     #[test]
+    fn workspace_owner_binding_rejects_other_backend_and_forgets_after_last_worker_delete() {
+        let runtime = runtime_with_backend();
+        let server_a = scope("workspace-a", "server-a");
+        let server_b = scope("workspace-a", "server-b");
+        let first = runtime
+            .create_worker_scoped(&server_a, scoped_task_request("first", "workspace-a"))
+            .unwrap();
+        let second = runtime
+            .create_worker_scoped(&server_a, scoped_task_request("second", "workspace-a"))
+            .unwrap();
+
+        let create_error = runtime
+            .create_worker_scoped(&server_b, scoped_task_request("stolen", "workspace-a"))
+            .unwrap_err();
+        assert!(matches!(
+            create_error,
+            RuntimeError::WorkspaceOwnerMismatch { .. }
+        ));
+        let read_error = runtime
+            .worker_detail_scoped(&server_b, &first.worker_ref)
+            .unwrap_err();
+        assert!(matches!(
+            read_error,
+            RuntimeError::WorkspaceOwnerMismatch { .. }
+        ));
+
+        runtime.stop_worker(&first.worker_ref, None).unwrap();
+        runtime.stop_worker(&second.worker_ref, None).unwrap();
+        runtime
+            .delete_worker_scoped(&server_a, &first.worker_ref)
+            .unwrap();
+        let still_owned_error = runtime
+            .create_worker_scoped(&server_b, scoped_task_request("still owned", "workspace-a"))
+            .unwrap_err();
+        assert!(matches!(
+            still_owned_error,
+            RuntimeError::WorkspaceOwnerMismatch { .. }
+        ));
+
+        runtime
+            .delete_worker_scoped(&server_a, &second.worker_ref)
+            .unwrap();
+        let rebound = runtime
+            .create_worker_scoped(&server_b, scoped_task_request("rebound", "workspace-a"))
+            .unwrap();
+        assert_eq!(rebound.workspace_id.as_deref(), Some("workspace-a"));
+    }
+
+    #[test]
     fn scoped_create_rejects_request_workspace_mismatch() {
         let runtime = runtime_with_backend();
         let error = runtime
             .create_worker_scoped(
-                "workspace-a",
+                &scope("workspace-a", "server-a"),
                 scoped_task_request("mismatch", "workspace-b"),
             )
             .unwrap_err();
@@ -2323,12 +2487,12 @@ mod tests {
         assert!(legacy.workspace_id.is_none());
         assert!(
             runtime
-                .list_workers_scoped("workspace-a")
+                .list_workers_scoped(&scope("workspace-a", "server-a"))
                 .unwrap()
                 .is_empty()
         );
         let detail_error = runtime
-            .worker_detail_scoped("workspace-a", &legacy.worker_ref)
+            .worker_detail_scoped(&scope("workspace-a", "server-a"), &legacy.worker_ref)
             .unwrap_err();
         assert!(matches!(detail_error, RuntimeError::WorkerNotFound { .. }));
     }
@@ -2337,15 +2501,23 @@ mod tests {
     fn stopped_worker_scoped_list_uses_workspace_boundary() {
         let runtime = runtime_with_backend();
         let workspace_a = runtime
-            .create_worker_scoped("workspace-a", scoped_task_request("a", "workspace-a"))
+            .create_worker_scoped(
+                &scope("workspace-a", "server-a"),
+                scoped_task_request("a", "workspace-a"),
+            )
             .unwrap();
         let workspace_b = runtime
-            .create_worker_scoped("workspace-b", scoped_task_request("b", "workspace-b"))
+            .create_worker_scoped(
+                &scope("workspace-b", "server-b"),
+                scoped_task_request("b", "workspace-b"),
+            )
             .unwrap();
         runtime.stop_worker(&workspace_a.worker_ref, None).unwrap();
         runtime.stop_worker(&workspace_b.worker_ref, None).unwrap();
 
-        let stopped = runtime.list_stopped_workers_scoped("workspace-a").unwrap();
+        let stopped = runtime
+            .list_stopped_workers_scoped(&scope("workspace-a", "server-a"))
+            .unwrap();
         assert_eq!(stopped.len(), 1);
         assert_eq!(stopped[0].worker_ref, workspace_a.worker_ref);
     }
@@ -3012,7 +3184,7 @@ mod tests {
         runtime.store_config_bundle(test_bundle()).unwrap();
         let scoped = runtime
             .create_worker_scoped(
-                "workspace-a",
+                &scope("workspace-a", "server-a"),
                 scoped_task_request("persist workspace", "workspace-a"),
             )
             .unwrap();
@@ -3037,7 +3209,7 @@ mod tests {
         assert_eq!(restored_scoped.workspace_id.as_deref(), Some("workspace-a"));
         assert_eq!(
             restored
-                .list_workers_scoped("workspace-a")
+                .list_workers_scoped(&scope("workspace-a", "server-a"))
                 .unwrap()
                 .into_iter()
                 .map(|worker| worker.worker_ref)
@@ -3045,16 +3217,29 @@ mod tests {
             vec![scoped.worker_ref.clone()]
         );
         let legacy_error = restored
-            .worker_detail_scoped("workspace-a", &legacy.worker_ref)
+            .worker_detail_scoped(&scope("workspace-a", "server-a"), &legacy.worker_ref)
             .unwrap_err();
         assert!(matches!(legacy_error, RuntimeError::WorkerNotFound { .. }));
         let recovered_legacy = restored
-            .worker_detail_scoped("workspace-b", &recoverable_legacy.worker_ref)
+            .worker_detail_scoped(
+                &scope("workspace-b", "server-b"),
+                &recoverable_legacy.worker_ref,
+            )
             .unwrap();
         assert_eq!(
             recovered_legacy.workspace_id.as_deref(),
             Some("workspace-b")
         );
+        let stolen_legacy_error = restored
+            .worker_detail_scoped(
+                &scope("workspace-b", "server-c"),
+                &recoverable_legacy.worker_ref,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            stolen_legacy_error,
+            RuntimeError::WorkspaceOwnerMismatch { .. }
+        ));
 
         let _ = std::fs::remove_dir_all(root);
     }

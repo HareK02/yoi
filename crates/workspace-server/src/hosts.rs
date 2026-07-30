@@ -3349,6 +3349,7 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
             workdir_diagnostic.message.clone(),
         ),
         EmbeddedRuntimeError::InvalidRequest(_)
+        | EmbeddedRuntimeError::WorkspaceOwnerMismatch { .. }
         | EmbeddedRuntimeError::ConfigBundleMissing { .. }
         | EmbeddedRuntimeError::ConfigBundleDigestMismatch { .. }
         | EmbeddedRuntimeError::InvalidProfileSelector { .. }

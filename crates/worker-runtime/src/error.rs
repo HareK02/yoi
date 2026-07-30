@@ -39,6 +39,15 @@ pub enum RuntimeError {
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 
+    #[error(
+        "workspace `{workspace_id}` is owned by Runtime server `{owner_server_id}`, not `{requester_server_id}`"
+    )]
+    WorkspaceOwnerMismatch {
+        workspace_id: String,
+        owner_server_id: String,
+        requester_server_id: String,
+    },
+
     #[error(transparent)]
     WorkingDirectory(#[from] WorkingDirectoryDiagnostic),
 
