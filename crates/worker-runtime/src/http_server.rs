@@ -116,6 +116,7 @@ pub async fn serve_runtime_http(
     listener: TcpListener,
     local_token: Option<String>,
 ) -> Result<(), RuntimeHttpServerError> {
+    let local_token = local_token.ok_or(RuntimeHttpServerError::AuthRequired)?;
     axum::serve(listener, runtime_http_router(runtime, local_token)).await?;
     Ok(())
 }
@@ -127,9 +128,12 @@ pub async fn serve_runtime_http_with_auth(
     local_token: Option<String>,
     auth: Option<RuntimeHttpAuthConfig>,
 ) -> Result<(), RuntimeHttpServerError> {
+    if local_token.is_none() && auth.is_none() {
+        return Err(RuntimeHttpServerError::AuthRequired);
+    }
     axum::serve(
         listener,
-        runtime_http_router_with_auth(runtime, local_token, auth),
+        runtime_http_router_with_optional_auth(runtime, local_token, auth),
     )
     .await?;
     Ok(())
@@ -140,12 +144,20 @@ pub async fn serve_runtime_http_with_auth(
 /// Handlers delegate to [`Runtime`] methods and keep Worker authority Runtime-local.
 /// The path contains only a Runtime-local `worker_id`; backend aliases are not
 /// accepted or forwarded as Runtime authority.
-pub fn runtime_http_router(runtime: Runtime, local_token: Option<String>) -> Router {
-    runtime_http_router_with_auth(runtime, local_token, None)
+pub fn runtime_http_router(runtime: Runtime, local_token: String) -> Router {
+    runtime_http_router_with_optional_auth(runtime, Some(local_token), None)
 }
 
 /// Build the REST router for an existing Runtime with signed capability-token auth.
 pub fn runtime_http_router_with_auth(
+    runtime: Runtime,
+    local_token: Option<String>,
+    auth: RuntimeHttpAuthConfig,
+) -> Router {
+    runtime_http_router_with_optional_auth(runtime, local_token, Some(auth))
+}
+
+fn runtime_http_router_with_optional_auth(
     runtime: Runtime,
     local_token: Option<String>,
     auth: Option<RuntimeHttpAuthConfig>,
@@ -1089,6 +1101,8 @@ fn code_for_runtime_error(error: &RuntimeError) -> String {
 pub enum RuntimeHttpServerError {
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
+    #[error("Runtime HTTP server requires capability-token auth or a local bearer token")]
+    AuthRequired,
     #[error("Runtime HTTP server I/O failed: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -1216,7 +1230,7 @@ mod tests {
         let (auth, signer) = auth_config_and_signer();
         let token_a = token_for_workspace(&signer, "workspace-a");
         let token_b = token_for_workspace(&signer, "workspace-b");
-        let app = runtime_http_router_with_auth(runtime, None, Some(auth));
+        let app = runtime_http_router_with_auth(runtime, None, auth);
 
         let create_a = scoped_task_request("a", "workspace-a");
         let response = app
@@ -1295,7 +1309,7 @@ mod tests {
                 .unwrap();
         let (auth, signer) = auth_config_and_signer();
         let token = token_for_workspace_with_permissions(&signer, "", ["workers:list"]);
-        let app = runtime_http_router_with_auth(runtime, None, Some(auth));
+        let app = runtime_http_router_with_auth(runtime, None, auth);
 
         let response = app
             .oneshot(bearer_request(
@@ -1316,7 +1330,7 @@ mod tests {
                 .unwrap();
         let (auth, signer) = auth_config_and_signer();
         let token = token_for_workspace_with_permissions(&signer, "workspace-a", ["workers:list"]);
-        let app = runtime_http_router_with_auth(runtime, None, Some(auth));
+        let app = runtime_http_router_with_auth(runtime, None, auth);
         let create = scoped_task_request("a", "workspace-a");
 
         let response = app
@@ -1413,16 +1427,18 @@ mod tests {
         }
     }
 
-    async fn json_request<T: Serialize>(
+    async fn authed_json_request<T: Serialize>(
         app: Router,
         method: Method,
         uri: &str,
+        token: &str,
         body: &T,
     ) -> axum::response::Response {
         app.oneshot(
             Request::builder()
                 .method(method)
                 .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(serde_json::to_vec(body).unwrap()))
                 .unwrap(),
@@ -1436,6 +1452,24 @@ mod tests {
             Request::builder()
                 .method(method)
                 .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn authed_empty_request(
+        app: Router,
+        method: Method,
+        uri: &str,
+        token: &str,
+    ) -> axum::response::Response {
+        app.oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1458,12 +1492,14 @@ mod tests {
                 "builtin:coder".to_string(),
             )))
             .unwrap();
-        let app = runtime_http_router(runtime.clone(), None);
+        let token = "local-token";
+        let app = runtime_http_router(runtime.clone(), token.to_string());
 
-        let response = json_request(
+        let response = authed_json_request(
             app.clone(),
             Method::POST,
             "/v1/workers",
+            token,
             &task_request("rest"),
         )
         .await;
@@ -1475,77 +1511,84 @@ mod tests {
         );
 
         let input = WorkerInput::user("hello from backend");
-        let response = json_request(
+        let response = authed_json_request(
             app.clone(),
             Method::POST,
             &format!("/v1/workers/{}/input", created.worker.worker_id),
+            token,
             &input,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let _input_ack: RuntimeHttpWorkerInputResponse = read_json(response).await;
 
-        let response = empty_request(
+        let response = authed_empty_request(
             app.clone(),
             Method::GET,
             &format!("/v1/workers/{}", created.worker.worker_id),
+            token,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let _detail: RuntimeHttpWorkerResponse = read_json(response).await;
 
-        let response = empty_request(
+        let response = authed_empty_request(
             app.clone(),
             Method::GET,
             &format!("/v1/workers/{}/transcript", created.worker.worker_id),
+            token,
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-        let response = empty_request(
+        let response = authed_empty_request(
             app.clone(),
             Method::POST,
             &format!("/v1/workers/{}/stop", created.worker.worker_id),
+            token,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let stop: RuntimeHttpWorkerLifecycleResponse = read_json(response).await;
         assert_eq!(stop.ack.worker_ref, created.worker.worker_ref);
 
-        let response = empty_request(
+        let response = authed_empty_request(
             app.clone(),
             Method::POST,
             &format!("/v1/workers/{}/restore", created.worker.worker_id),
+            token,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let restored: RuntimeHttpWorkerResponse = read_json(response).await;
         assert_eq!(restored.worker.status, WorkerStatus::Idle);
 
-        let response = empty_request(
+        let response = authed_empty_request(
             app.clone(),
             Method::POST,
             &format!("/v1/workers/{}/stop", created.worker.worker_id),
+            token,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
 
-        let response = empty_request(
+        let response = authed_empty_request(
             app.clone(),
             Method::POST,
             &format!("/v1/workers/{}/cancel", created.worker.worker_id),
+            token,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let cancel: RuntimeHttpWorkerLifecycleResponse = read_json(response).await;
         assert_eq!(cancel.ack.worker_ref, created.worker.worker_ref);
 
-        let response = empty_request(app.clone(), Method::GET, "/v1/workers").await;
+        let response = authed_empty_request(app.clone(), Method::GET, "/v1/workers", token).await;
         assert_eq!(response.status(), StatusCode::OK);
         let workers: RuntimeHttpWorkersResponse = read_json(response).await;
         assert_eq!(workers.workers.len(), 1);
 
-        let response = empty_request(app, Method::GET, "/v1/runtime").await;
+        let response = authed_empty_request(app, Method::GET, "/v1/runtime", token).await;
         assert_eq!(response.status(), StatusCode::OK);
         let summary: RuntimeHttpSummaryResponse = read_json(response).await;
         assert_eq!(summary.runtime.worker_count, 1);
@@ -1554,7 +1597,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_token_placeholder_rejects_missing_bearer_token() {
-        let app = runtime_http_router(Runtime::new_memory(), Some("local-token".to_string()));
+        let app = runtime_http_router(Runtime::new_memory(), "local-token".to_string());
 
         let response = empty_request(app.clone(), Method::GET, "/v1/runtime").await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -1577,13 +1620,29 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_errors_use_typed_rest_error_shape() {
-        let app = runtime_http_router(Runtime::new_memory(), None);
-        let response = empty_request(app, Method::GET, "/v1/workers/999").await;
+        let token = "local-token";
+        let app = runtime_http_router(Runtime::new_memory(), token.to_string());
+        let response = authed_empty_request(app, Method::GET, "/v1/workers/999", token).await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let error: RuntimeHttpErrorResponse = read_json(response).await;
         assert_eq!(error.error.code, "worker_not_found");
         assert!(error.error.message.contains("999"));
+    }
+
+    #[tokio::test]
+    async fn serve_runtime_http_rejects_missing_auth_configuration() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let error = serve_runtime_http(Runtime::new_memory(), listener, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RuntimeHttpServerError::AuthRequired));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let error = serve_runtime_http_with_auth(Runtime::new_memory(), listener, None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RuntimeHttpServerError::AuthRequired));
     }
 
     #[test]
@@ -1619,6 +1678,8 @@ mod ws_tests {
     use std::sync::Arc;
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::header as ws_header;
 
     struct WsBackend;
 
@@ -1725,12 +1786,18 @@ mod ws_tests {
         runtime
             .store_config_bundle(ws_test_bundle(ProfileSelector::RuntimeDefault))
             .unwrap();
-        let worker = runtime.create_worker(ws_create_request()).unwrap();
+        let worker = runtime
+            .create_worker_scoped("local", ws_create_request())
+            .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn({
             let runtime = runtime.clone();
-            async move { serve_runtime_http(runtime, listener, None).await.unwrap() }
+            async move {
+                serve_runtime_http(runtime, listener, Some("local-token".to_string()))
+                    .await
+                    .unwrap()
+            }
         });
         (
             runtime,
@@ -1740,6 +1807,15 @@ mod ws_tests {
                 worker.worker_ref.worker_id
             ),
         )
+    }
+
+    fn authed_ws_request(url: &str) -> tokio_tungstenite::tungstenite::http::Request<()> {
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert(
+            ws_header::AUTHORIZATION,
+            "Bearer local-token".parse().unwrap(),
+        );
+        request
     }
 
     async fn next_frame(
@@ -1757,7 +1833,7 @@ mod ws_tests {
     #[tokio::test]
     async fn protocol_ws_connect_sends_snapshot_and_live_worker_events() {
         let (runtime, worker_ref, url) = spawn_runtime_server().await;
-        let (mut stream, _) = connect_async(&url).await.unwrap();
+        let (mut stream, _) = connect_async(authed_ws_request(&url)).await.unwrap();
 
         assert!(matches!(
             next_frame(&mut stream).await,
@@ -1799,9 +1875,8 @@ mod ws_tests {
             )
             .unwrap();
 
-        let (mut stream, _) = connect_async(format!("{url}?cursor={}", first.cursor))
-            .await
-            .unwrap();
+        let resume_url = format!("{url}?cursor={}", first.cursor);
+        let (mut stream, _) = connect_async(authed_ws_request(&resume_url)).await.unwrap();
         assert!(matches!(
             next_frame(&mut stream).await,
             protocol::Event::Snapshot { .. }
@@ -1824,13 +1899,16 @@ mod ws_tests {
     #[tokio::test]
     async fn protocol_ws_reports_malformed_cursor_and_method_frame() {
         let (_runtime, _worker_ref, url) = spawn_runtime_server().await;
-        let (mut malformed, _) = connect_async(format!("{url}?cursor=bad")).await.unwrap();
+        let malformed_url = format!("{url}?cursor=bad");
+        let (mut malformed, _) = connect_async(authed_ws_request(&malformed_url))
+            .await
+            .unwrap();
         assert!(matches!(
             next_frame(&mut malformed).await,
             protocol::Event::Error { .. }
         ));
 
-        let (mut stream, _) = connect_async(&url).await.unwrap();
+        let (mut stream, _) = connect_async(authed_ws_request(&url)).await.unwrap();
         let _ = next_frame(&mut stream).await;
         stream.send(Message::Text("{}".into())).await.unwrap();
         assert!(matches!(
