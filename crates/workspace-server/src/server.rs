@@ -82,7 +82,7 @@ use crate::profile_settings::{
     UpdateWorkspaceMetadataRequest, UpdateWorkspaceProfileRegistryRequest,
     UpdateWorkspaceProfileSourceRequest, WriteWorkspaceProfileTreeFileRequest,
 };
-use crate::records::{ObjectiveDetail, ProjectRecordList, TicketDetail, TicketSummary};
+use crate::records::{ObjectiveDetail, ProjectRecordList, TicketDetail};
 use crate::repositories::{
     ConfiguredRepository, RepositoryListProjection, RepositoryLogRead, RepositoryLookupError,
     RepositoryRegistryReader, RepositorySummary,
@@ -576,14 +576,6 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/repositories/{repository_id}/log",
             get(scoped_repository_log),
-        )
-        .route(
-            "/api/repositories/{repository_id}/tickets",
-            get(repository_tickets),
-        )
-        .route(
-            "/api/w/{workspace_id}/repositories/{repository_id}/tickets",
-            get(scoped_repository_tickets),
         )
         .route("/api/hosts", get(list_hosts))
         .route("/api/w/{workspace_id}/hosts", get(scoped_list_hosts))
@@ -1198,31 +1190,8 @@ pub struct RepositoryLogResponse {
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RepositoryTicketsResponse {
-    pub workspace_id: String,
-    pub repository_id: String,
-    pub limit: usize,
-    pub columns: Vec<TicketKanbanColumn>,
-    pub invalid_records: Vec<crate::records::InvalidProjectRecord>,
-    pub record_authority: String,
-    pub source: String,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TicketKanbanColumn {
-    pub state: String,
-    pub items: Vec<TicketSummary>,
-}
-
 #[derive(Debug, Deserialize)]
 struct LogQuery {
-    limit: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TicketKanbanQuery {
     limit: Option<usize>,
 }
 
@@ -1254,6 +1223,11 @@ struct ObjectiveEditRequest {
     new_string: Option<String>,
     #[serde(default)]
     replace_all: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct TicketListQuery {
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1540,8 +1514,8 @@ async fn scoped_delete_profile_source(
 async fn scoped_list_tickets(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
-    Query(query): Query<TicketKanbanQuery>,
-) -> ApiResult<Json<ListResponse<crate::records::TicketSummary>>> {
+    Query(query): Query<TicketListQuery>,
+) -> ApiResult<Json<crate::records::TicketListResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     list_tickets(State(api), Query(query)).await
 }
@@ -2230,15 +2204,6 @@ async fn scoped_repository_log(
 ) -> ApiResult<Json<RepositoryLogResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     repository_log(State(api), AxumPath(path.repository_id), Query(query)).await
-}
-
-async fn scoped_repository_tickets(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedRepositoryPath>,
-    Query(query): Query<TicketKanbanQuery>,
-) -> ApiResult<Json<RepositoryTicketsResponse>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    repository_tickets(State(api), AxumPath(path.repository_id), Query(query)).await
 }
 
 async fn scoped_list_hosts(
@@ -4111,8 +4076,8 @@ fn companion_console_extension_point(status: &CompanionStatusResponse) -> Extens
 
 async fn list_tickets(
     State(api): State<WorkspaceApi>,
-    Query(query): Query<TicketKanbanQuery>,
-) -> ApiResult<Json<ListResponse<crate::records::TicketSummary>>> {
+    Query(query): Query<TicketListQuery>,
+) -> ApiResult<Json<crate::records::TicketListResponse>> {
     let requested_limit = query.limit.unwrap_or(api.config.max_records);
     let limit = requested_limit.min(1000);
     let ProjectRecordList {
@@ -4120,7 +4085,7 @@ async fn list_tickets(
         invalid_records,
         record_authority,
     } = api.authority.list_tickets(limit)?;
-    Ok(Json(ListResponse {
+    Ok(Json(crate::records::TicketListResponse {
         workspace_id: api.config.workspace_id,
         limit,
         items,
@@ -4208,35 +4173,6 @@ async fn repository_log(
         limit,
         items: commits,
         diagnostics: repository_diagnostics(diagnostics),
-    }))
-}
-
-async fn repository_tickets(
-    State(api): State<WorkspaceApi>,
-    AxumPath(repository_id): AxumPath<String>,
-    Query(query): Query<TicketKanbanQuery>,
-) -> ApiResult<Json<RepositoryTicketsResponse>> {
-    repository_lookup(api.repository_reader().summary(&repository_id))?;
-    let canonical_repository_id = repository_id;
-    let limit = query.limit.unwrap_or(api.config.max_records).min(200);
-    let ProjectRecordList {
-        items,
-        invalid_records,
-        record_authority,
-    } = api.authority.list_tickets(limit)?;
-    Ok(Json(RepositoryTicketsResponse {
-        workspace_id: api.config.workspace_id,
-        repository_id: canonical_repository_id,
-        limit,
-        columns: ticket_kanban_columns(items),
-        invalid_records,
-        record_authority,
-        source: "workspace_local_ticket_fallback".to_string(),
-        diagnostics: vec![RuntimeDiagnostic {
-            code: "repository_ticket_target_metadata_absent".to_string(),
-            severity: DiagnosticSeverity::Info,
-            message: "Ticket target Repository metadata is not available yet; Kanban groups all workspace-local Tickets by state as a read-only fallback.".to_string(),
-        }],
     }))
 }
 
@@ -6811,52 +6747,6 @@ fn repository_lookup<T>(result: std::result::Result<T, RepositoryLookupError>) -
     })
 }
 
-fn ticket_kanban_columns(items: Vec<TicketSummary>) -> Vec<TicketKanbanColumn> {
-    let mut columns = vec![
-        TicketKanbanColumn {
-            state: "planning".to_string(),
-            items: Vec::new(),
-        },
-        TicketKanbanColumn {
-            state: "ready".to_string(),
-            items: Vec::new(),
-        },
-        TicketKanbanColumn {
-            state: "queued".to_string(),
-            items: Vec::new(),
-        },
-        TicketKanbanColumn {
-            state: "inprogress".to_string(),
-            items: Vec::new(),
-        },
-        TicketKanbanColumn {
-            state: "done".to_string(),
-            items: Vec::new(),
-        },
-        TicketKanbanColumn {
-            state: "closed".to_string(),
-            items: Vec::new(),
-        },
-        TicketKanbanColumn {
-            state: "other".to_string(),
-            items: Vec::new(),
-        },
-    ];
-    for item in items {
-        let index = match item.state.as_str() {
-            "planning" => 0,
-            "ready" => 1,
-            "queued" => 2,
-            "inprogress" => 3,
-            "done" => 4,
-            "closed" => 5,
-            _ => 6,
-        };
-        columns[index].items.push(item);
-    }
-    columns
-}
-
 async fn static_or_spa_fallback(State(api): State<WorkspaceApi>, uri: Uri) -> Response {
     if uri.path().starts_with("/api/") || uri.path() == "/api" {
         return (
@@ -7990,6 +7880,40 @@ mod tests {
             workspace_id: TEST_WORKSPACE_ID.to_string(),
             id: ticket_id.clone(),
         };
+        let Json(related) = scoped_ticket_backend_operation(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            Json(TicketBackendOperation::Create {
+                input: ticket::NewTicket::new("Related Browser Ticket"),
+            }),
+        )
+        .await
+        .unwrap();
+        let related_ticket_id = match related {
+            TicketBackendHttpResponse::Ok {
+                result: ticket::TicketBackendOperationResult::TicketRef(ticket_ref),
+            } => ticket_ref.id,
+            other => panic!("unexpected related create response: {other:?}"),
+        };
+        let _ = scoped_ticket_backend_operation(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            Json(TicketBackendOperation::AddTicketRelation {
+                id: ticket_id.clone().into(),
+                relation: ticket::NewTicketRelation {
+                    kind: ticket::TicketRelationKind::Related,
+                    target: related_ticket_id.clone(),
+                    note: Some("Browser relation".to_string()),
+                    author: Some("browser-user".to_string()),
+                },
+            }),
+        )
+        .await
+        .unwrap();
 
         let Json(edited) = scoped_edit_ticket_item(
             State(api.clone()),
@@ -8013,6 +7937,10 @@ mod tests {
         assert_eq!(edited.body, "Updated from the Browser API.");
         assert_eq!(edited.repository_id.as_deref(), Some("main"));
         assert_eq!(edited.ref_selector.as_deref(), Some("feature/api"));
+        assert_eq!(edited.assignee, None);
+        assert_eq!(edited.relations.outgoing.len(), 1);
+        assert_eq!(edited.relations.outgoing[0].target, related_ticket_id);
+        assert_eq!(edited.relations.outgoing[0].kind, "related");
 
         let Json(commented) = scoped_append_ticket_event(
             State(api.clone()),
@@ -9408,19 +9336,17 @@ mod tests {
         assert_eq!(repository_log["default_selector"], "HEAD");
         assert_eq!(repository_log["limit"], 3);
 
-        let repository_tickets = get_json(app.clone(), "/api/repositories/main/tickets").await;
-        assert_eq!(repository_tickets["repository_id"], TEST_REPOSITORY_ID);
-        let ready_column = repository_tickets["columns"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|column| column["state"] == "ready")
+        let removed_repository_tickets = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/repositories/main/tickets")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
             .unwrap();
-        assert_eq!(ready_column["items"][0]["title"], "API Ticket");
-        assert_eq!(
-            repository_tickets["diagnostics"][0]["code"],
-            "repository_ticket_target_metadata_absent"
-        );
+        assert_eq!(removed_repository_tickets.status(), StatusCode::NOT_FOUND);
 
         let unknown_repository_response = app
             .clone()

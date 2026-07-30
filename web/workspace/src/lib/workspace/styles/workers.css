@@ -92,6 +92,30 @@
     margin-top: var(--space-2);
     color: var(--text-muted);
   }
+  .worker-ticket-context {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-4);
+    max-width: 48rem;
+    border: 1px solid var(--accent);
+    border-radius: 0.7rem;
+    background: var(--bg-raised);
+    padding: var(--space-3);
+  }
+  .worker-ticket-context > div {
+    display: grid;
+    gap: var(--space-1);
+  }
+  .worker-ticket-context span,
+  .worker-ticket-context code {
+    color: var(--text-muted);
+    font-size: 0.72rem;
+  }
+  .worker-ticket-context a {
+    color: var(--accent);
+    font-size: 0.78rem;
+  }
   .worker-launch-form {
     display: grid;
     gap: var(--space-5);

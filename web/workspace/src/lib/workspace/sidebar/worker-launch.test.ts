@@ -86,6 +86,28 @@ Deno.test("defaultWorkerLaunchForm chooses active runtime, coder profile, reposi
   assertEquals(form.working_directory_selector, "HEAD");
 });
 
+Deno.test("defaultWorkerLaunchForm preserves an available Ticket role profile", () => {
+  const reviewerOptions = {
+    ...options,
+    profiles: [
+      ...options.profiles,
+      { id: "builtin:reviewer", label: "Reviewer", description: "review" },
+    ],
+  };
+  const form = defaultWorkerLaunchForm(reviewerOptions, {
+    runtime_id: "",
+    display_name: "Review worker",
+    profile: "builtin:reviewer",
+    initial_text: "Review the ticket.",
+    working_directory_id: "",
+    working_directory_repository_id: "repo",
+    working_directory_selector: "HEAD",
+    relative_cwd: "",
+  });
+
+  assertEquals(form.profile, "builtin:reviewer");
+});
+
 Deno.test("defaultWorkerLaunchForm skips occupied working directories", () => {
   const form = defaultWorkerLaunchForm(
     {
@@ -116,8 +138,45 @@ Deno.test("defaultWorkerLaunchForm skips occupied working directories", () => {
   );
 
   assertEquals(form.working_directory_id, "");
-  assertEquals(form.working_directory_repository_id, "repo");
-  assertEquals(form.working_directory_selector, "HEAD");
+});
+
+Deno.test("defaultWorkerLaunchForm preserves a Ticket repository target", () => {
+  const form = defaultWorkerLaunchForm(
+    {
+      ...options,
+      repositories: [
+        ...options.repositories,
+        {
+          id: "ticket-repo",
+          display_name: "Ticket repo",
+          default_selector: "main",
+        },
+      ],
+      working_directories: [
+        options.working_directories[0],
+        {
+          ...options.working_directories[0],
+          working_directory_id: "ticket-workdir",
+          repository_id: "ticket-repo",
+          requested_selector: "work/ticket",
+        },
+      ],
+    },
+    {
+      runtime_id: "",
+      display_name: "Ticket worker",
+      profile: "builtin:coder",
+      initial_text: "Work on a ticket.",
+      working_directory_id: "",
+      working_directory_repository_id: "ticket-repo",
+      working_directory_selector: "work/ticket",
+      relative_cwd: "",
+    },
+  );
+
+  assertEquals(form.working_directory_id, "ticket-workdir");
+  assertEquals(form.working_directory_repository_id, "ticket-repo");
+  assertEquals(form.working_directory_selector, "work/ticket");
 });
 
 Deno.test("buildBrowserCreateWorkerRequest sends working_directory id and relative cwd only", () => {

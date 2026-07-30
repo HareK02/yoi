@@ -274,6 +274,7 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
             updated_at: ticket.meta.updated_at,
             queued_by: ticket.meta.queued_by,
             queued_at: ticket.meta.queued_at,
+            assignee: ticket.meta.assignee,
             repository_id: ticket.meta.repository_id,
             ref_selector: ticket.meta.ref_selector,
             risk_flags: ticket.meta.risk_flags,
@@ -287,6 +288,7 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
                 .into_iter()
                 .map(|artifact| artifact.relative_path.display().to_string())
                 .collect(),
+            relations: ticket.relations.into(),
             resolution: ticket
                 .resolution
                 .map(|resolution| resolution.as_str().to_string()),

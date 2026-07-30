@@ -3,6 +3,7 @@
   import SidebarOverride from '$lib/workspace/sidebar/SidebarOverride.svelte';
   import WorkspaceSidebar from '$lib/workspace/sidebar/WorkspaceSidebar.svelte';
   import '$lib/workspace/styles/workspace-pages.css';
+  import '$lib/workspace/styles/tickets.css';
   import '$lib/workspace/styles/workers.css';
   import type { LayoutProps } from './$types';
 

@@ -1,6 +1,5 @@
 <script lang="ts">
   import { formatDate } from '$lib/workspace/api/http';
-  import RepositoryTicketKanban from '$lib/workspace/pages/RepositoryTicketKanban.svelte';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
@@ -90,16 +89,5 @@
     <p class="error">{data.repositoryLogError}</p>
   {:else}
     <p>Loading repository commits…</p>
-  {/if}
-</section>
-
-<section class="card repository-tickets-card">
-  <h2>Repository Tickets</h2>
-  {#if data.repositoryTickets}
-    <RepositoryTicketKanban tickets={data.repositoryTickets} />
-  {:else if data.repositoryTicketsError}
-    <p class="error">{data.repositoryTicketsError}</p>
-  {:else}
-    <p>Loading repository tickets…</p>
   {/if}
 </section>
