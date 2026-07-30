@@ -6109,6 +6109,7 @@ dependencies = [
  "toml",
  "tower",
  "tracing",
+ "ts-rs",
  "url",
  "uuid",
  "webauthn-rs",

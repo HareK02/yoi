@@ -15,6 +15,8 @@ pub mod memory_staging;
 pub mod observation;
 pub mod profile_settings;
 pub mod records;
+#[cfg(feature = "typescript")]
+pub use records::ticket_api_typescript;
 pub mod repositories;
 pub mod resource_broker;
 pub mod server;

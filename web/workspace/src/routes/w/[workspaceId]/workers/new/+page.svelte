@@ -1,5 +1,6 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
+  import { untrack } from 'svelte';
   import { workspaceApiPath } from '$lib/workspace/api/http';
   import { buildBrowserCreateWorkerRequest, defaultWorkerLaunchForm } from '$lib/workspace/sidebar/worker-launch';
   import type {
@@ -23,6 +24,7 @@
 
   let { data }: PageProps = $props();
   let workspaceId = $derived(data.workspaceId);
+  const ticketContext = untrack(() => data.ticketContext);
 
   const NEW_WORKING_DIRECTORY_VALUE = '__new_working_directory__';
 
@@ -31,13 +33,23 @@
   let optionsError = $state<string | null>(null);
   let submitting = $state(false);
   let submitError = $state<DisplayError | null>(null);
-  let displayName = $state('Worker');
+  let displayName = $state(
+    ticketContext
+      ? `${ticketContext.ticketTitle} · ${ticketContext.ticketRole || 'Worker'}`
+      : 'Worker',
+  );
   let runtimeId = $state('');
-  let profile = $state('');
-  let initialText = $state('');
+  let profile = $state(
+    ticketContext
+      ? ticketContext.ticketRole === 'reviewer'
+        ? 'builtin:reviewer'
+        : 'builtin:coder'
+      : '',
+  );
+  let initialText = $state(ticketContext?.initialInput ?? '');
   let workingDirectoryId = $state('');
-  let workingDirectoryRepositoryId = $state('');
-  let workingDirectorySelector = $state('HEAD');
+  let workingDirectoryRepositoryId = $state(ticketContext?.repositoryId ?? '');
+  let workingDirectorySelector = $state(ticketContext?.refSelector ?? 'HEAD');
   let relativeCwd = $state('');
   let creatingWorkingDirectory = $state(false);
   let isNewWorkingDirectorySelected = $derived(workingDirectoryId === NEW_WORKING_DIRECTORY_VALUE);
@@ -107,7 +119,8 @@
       runtimeId = form.runtime_id;
       displayName = form.display_name;
       profile = form.profile;
-      workingDirectoryId = form.working_directory_id;
+      workingDirectoryId = form.working_directory_id ||
+        (ticketContext?.repositoryId ? NEW_WORKING_DIRECTORY_VALUE : '');
       workingDirectoryRepositoryId = form.working_directory_repository_id;
       workingDirectorySelector = form.working_directory_selector;
       relativeCwd = form.relative_cwd;
@@ -253,6 +266,17 @@
     </div>
     <a class="secondary-link" href={`/w/${workspaceId}`}>Back to workspace</a>
   </header>
+
+  {#if ticketContext}
+    <aside class="worker-ticket-context">
+      <div>
+        <span>Ticket {ticketContext.ticketRole || 'Worker'}</span>
+        <strong>{ticketContext.ticketTitle}</strong>
+        <code>{ticketContext.ticketId}</code>
+      </div>
+      <a href={`/w/${workspaceId}/tickets/${encodeURIComponent(ticketContext.ticketId)}`}>View ticket</a>
+    </aside>
+  {/if}
 
   {#if loading}
     <p class="section-state">Loading launch options…</p>

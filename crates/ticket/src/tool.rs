@@ -382,6 +382,12 @@ struct TicketCreateParams {
     /// Optional queued_at frontmatter value.
     #[serde(default)]
     queued_at: Option<String>,
+    /// Optional target Workspace repository id.
+    #[serde(default)]
+    repository_id: Option<String>,
+    /// Optional target Git ref selector. Requires `repository_id`.
+    #[serde(default)]
+    ref_selector: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -403,6 +409,9 @@ struct TicketEditItemParams {
     /// Replace every occurrence of `old_string`; by default exactly one occurrence is required.
     #[serde(default)]
     replace_all: bool,
+    /// Optional target repository/ref update.
+    #[serde(default)]
+    target: Option<crate::TicketTargetEdit>,
     /// Optional thread author for the audited item_edit event.
     #[serde(default)]
     author: Option<String>,
@@ -916,6 +925,8 @@ impl Tool for TicketCreateTool {
         input.workflow_state = params.state.map(TicketWorkflowStateParam::into_state);
         input.queued_by = params.queued_by;
         input.queued_at = params.queued_at;
+        input.repository_id = params.repository_id;
+        input.ref_selector = params.ref_selector;
 
         let created = self
             .backend
@@ -959,6 +970,7 @@ impl Tool for TicketEditItemTool {
             title: params.title,
             body: params.body.map(MarkdownText::new),
             body_replacement,
+            target: params.target,
             author: params.author,
         };
         let ticket = self

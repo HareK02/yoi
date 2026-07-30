@@ -1,82 +1,362 @@
 <script lang="ts">
-  import { formatDate, workspaceRoute } from '$lib/workspace/api/http';
-  import type { PageProps } from './$types';
+  import { untrack } from "svelte";
+  import RichMarkdown from "$lib/workspace/console/RichMarkdown.svelte";
+  import {
+    workspaceApiJsonWithBody,
+    workspaceApiPath,
+  } from "$lib/workspace/api/http";
+  import {
+    relationLabel,
+    TICKET_STATES,
+    ticketWorkerLaunchHref,
+  } from "$lib/workspace/tickets/ticket-panel";
+  import type { ApiResult } from "$lib/workspace/api/http";
+  import type {
+    RepositoryListResponse,
+    TicketDetail,
+  } from "$lib/workspace/sidebar/types";
 
-  let { data }: PageProps = $props();
+  const { data } = $props<{
+    data: {
+      workspaceId: string;
+      ticketId: string;
+      ticket: ApiResult<TicketDetail>;
+      repositories: ApiResult<RepositoryListResponse>;
+    };
+  }>();
+
+  const initialData = untrack(() => data);
+  const loadedTicket = initialData.ticket.data;
+  if (!loadedTicket) throw new Error(initialData.ticket.error ?? "ticket load failed");
+  const loadedRepositories = initialData.repositories.data;
+
+  let ticket = $state<TicketDetail>(loadedTicket);
+  let editing = $state(false);
+  let editTitle = $state(loadedTicket.title);
+  let editBody = $state(loadedTicket.body);
+  let repositoryId = $state(loadedTicket.repository_id ?? "");
+  let refSelector = $state(loadedTicket.ref_selector ?? "");
+  let nextState = $state(loadedTicket.state);
+  let transitionReason = $state("");
+  let threadRole = $state("comment");
+  let threadBody = $state("");
+  let reviewResult = $state("approve");
+  let reviewBody = $state("");
+  let resolution = $state("");
+  let busy = $state<string | null>(null);
+  let errorMessage = $state<string | null>(null);
+
+  const ticketPath = $derived(
+    workspaceApiPath(
+      data.workspaceId,
+      `/tickets/${encodeURIComponent(data.ticketId)}`,
+    ),
+  );
+
+  function applyTicket(updatedTicket: TicketDetail): void {
+    ticket = updatedTicket;
+    editTitle = ticket.title;
+    editBody = ticket.body;
+    repositoryId = ticket.repository_id ?? "";
+    refSelector = ticket.ref_selector ?? "";
+    nextState = ticket.state;
+  }
+
+  async function mutate(
+    action: string,
+    suffix: string,
+    body?: Record<string, unknown>,
+    method = "POST",
+  ): Promise<boolean> {
+    if (busy) return false;
+    busy = action;
+    errorMessage = null;
+    try {
+      const path = `${ticketPath}${suffix}`;
+      const response = await workspaceApiJsonWithBody<TicketDetail>(path, {
+        method,
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      });
+      applyTicket(response);
+      return true;
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : String(error);
+      return false;
+    } finally {
+      busy = null;
+    }
+  }
+
+  async function saveEdit(event: SubmitEvent) {
+    event.preventDefault();
+    if (
+      await mutate("edit", "", {
+        title: editTitle.trim(),
+        body: editBody,
+      }, "PATCH")
+    ) editing = false;
+  }
+
+  async function saveTarget(event: SubmitEvent) {
+    event.preventDefault();
+    await mutate("target", "", {
+      target: repositoryId
+        ? {
+          action: "set",
+          repository_id: repositoryId,
+          ref_selector: refSelector.trim() || null,
+        }
+        : { action: "clear" },
+    }, "PATCH");
+  }
+
+  async function transition(event: SubmitEvent) {
+    event.preventDefault();
+    if (
+      await mutate("state", "/state", {
+        state: nextState,
+        reason: transitionReason.trim() || null,
+      })
+    ) transitionReason = "";
+  }
+
+  async function appendThread(event: SubmitEvent) {
+    event.preventDefault();
+    if (!threadBody.trim()) return;
+    if (
+      await mutate("thread", "/thread", {
+        role: threadRole,
+        body: threadBody.trim(),
+      })
+    ) threadBody = "";
+  }
+
+  async function review(event: SubmitEvent) {
+    event.preventDefault();
+    if (!reviewBody.trim()) return;
+    if (
+      await mutate("review", "/review", {
+        result: reviewResult,
+        body: reviewBody.trim(),
+      })
+    ) reviewBody = "";
+  }
+
+  async function closeTicket(event: SubmitEvent) {
+    event.preventDefault();
+    if (!resolution.trim()) return;
+    if (
+      await mutate("close", "/close", { resolution: resolution.trim() })
+    ) resolution = "";
+  }
+
+  function eventTitle(kind: string): string {
+    return relationLabel(kind);
+  }
+
+  function prettyDate(value?: string | null): string {
+    if (!value) return "—";
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+  }
 </script>
 
-<svelte:head>
-  <title>{data.ticket.data?.title ?? data.ticketId} · Tickets · Yoi Workspace</title>
-  <meta name="description" content="Workspace Ticket detail" />
-</svelte:head>
+<svelte:head><title>{ticket.title} · Yoi</title></svelte:head>
 
-<section class="card">
-  <p class="breadcrumb"><a href={workspaceRoute(data.workspaceId, '/tickets')}>Tickets</a> / {data.ticketId}</p>
+<div class="workspace-page ticket-detail-page">
+  <a class="workspace-back-link" href={`/w/${encodeURIComponent(data.workspaceId)}/tickets`}>
+    ← Ticket board
+  </a>
 
-  {#if data.ticket.data}
-    <div class="detail-heading">
-      <div>
-        <p class="eyebrow">{data.ticket.data.id}</p>
-        <h2>{data.ticket.data.title}</h2>
+  <header class="ticket-detail-header">
+    <div>
+      <div class="ticket-detail-kicker">
+        <span class="workspace-status-pill" data-status={ticket.state}>{ticket.state}</span>
+        <code>{ticket.id}</code>
       </div>
-      <span class="state-pill">{data.ticket.data.state}</span>
+      <h1>{ticket.title}</h1>
+      <p>Updated {prettyDate(ticket.updated_at)}</p>
     </div>
+    <button class="workspace-secondary-button" type="button" onclick={() => editing = !editing}>
+      {editing ? "Cancel edit" : "Edit ticket"}
+    </button>
+  </header>
 
-    <dl class="ticket-detail-grid">
-      <div>
-        <dt>Priority</dt>
-        <dd>{data.ticket.data.priority ?? 'unspecified'}</dd>
-      </div>
-      <div>
-        <dt>Updated</dt>
-        <dd>{data.ticket.data.updated_at ? formatDate(data.ticket.data.updated_at) : 'unknown'}</dd>
-      </div>
-      <div>
-        <dt>Created</dt>
-        <dd>{data.ticket.data.created_at ? formatDate(data.ticket.data.created_at) : 'unknown'}</dd>
-      </div>
-      <div>
-        <dt>Events</dt>
-        <dd>{data.ticket.data.event_count}</dd>
-      </div>
-      <div>
-        <dt>Artifacts</dt>
-        <dd>{data.ticket.data.artifact_count}</dd>
-      </div>
-      <div>
-        <dt>Source</dt>
-        <dd>{data.ticket.data.record_source}</dd>
-      </div>
-      {#if data.ticket.data.queued_at || data.ticket.data.queued_by}
-        <div>
-          <dt>Queued</dt>
-          <dd>
-            {data.ticket.data.queued_at ? formatDate(data.ticket.data.queued_at) : 'queued'}{data.ticket.data.queued_by ? ` by ${data.ticket.data.queued_by}` : ''}
-          </dd>
-        </div>
-      {/if}
-    </dl>
-
-    {#if data.ticket.data.risk_flags.length > 0}
-      <div class="risk-flags" aria-label="Risk flags">
-        {#each data.ticket.data.risk_flags as flag}
-          <span>{flag}</span>
-        {/each}
-      </div>
-    {/if}
-
-    <section class="ticket-body" aria-labelledby="ticket-body-heading">
-      <div class="detail-heading compact">
-        <h3 id="ticket-body-heading">Body</h3>
-        {#if data.ticket.data.body_truncated}
-          <span class="warning-pill">truncated</span>
-        {/if}
-      </div>
-      <pre>{data.ticket.data.body || 'No body text is available.'}</pre>
-    </section>
-  {:else if data.ticket.error}
-    <p class="error">{data.ticket.error}</p>
-  {:else}
-    <p>Waiting for <code>/api/w/{data.workspaceId}/tickets/{data.ticketId}</code>…</p>
+  {#if errorMessage}
+    <div class="workspace-callout is-error" role="alert">{errorMessage}</div>
   {/if}
-</section>
+
+  {#if editing}
+    <form class="ticket-editor" onsubmit={saveEdit}>
+      <label>Title<input bind:value={editTitle} required /></label>
+      <label>Body<textarea bind:value={editBody} rows="12"></textarea></label>
+      <button class="workspace-primary-button" type="submit" disabled={busy === "edit" || !editTitle.trim()}>
+        {busy === "edit" ? "Saving…" : "Save changes"}
+      </button>
+    </form>
+  {/if}
+
+  <div class="ticket-detail-grid">
+    <main class="ticket-detail-main">
+      <section class="ticket-detail-section">
+        <div class="ticket-section-heading"><h2>Intent</h2></div>
+        {#if ticket.body}
+          <RichMarkdown text={ticket.body} />
+        {:else}
+          <p class="workspace-empty-copy">No body has been recorded.</p>
+        {/if}
+      </section>
+
+      <section class="ticket-detail-section">
+        <div class="ticket-section-heading">
+          <h2>Relations</h2>
+          <span>{ticket.relations.outgoing.length + ticket.relations.incoming.length}</span>
+        </div>
+        {#if ticket.relations.blockers.length > 0}
+          <div class="ticket-blocker-list">
+            {#each ticket.relations.blockers as blocker}
+              <a href={`/w/${encodeURIComponent(data.workspaceId)}/tickets/${encodeURIComponent(blocker.blocking_ticket)}`}>
+                <strong>Blocked by {blocker.blocking_ticket}</strong>
+                <span>{relationLabel(blocker.relation_kind)} · {blocker.blocking_state}</span>
+              </a>
+            {/each}
+          </div>
+        {/if}
+        <div class="ticket-relations-list">
+          {#each ticket.relations.outgoing as relation}
+            <a href={`/w/${encodeURIComponent(data.workspaceId)}/tickets/${encodeURIComponent(relation.target)}`}>
+              <span>{relationLabel(relation.kind)}</span>
+              <strong>{relation.target}</strong>
+              {#if relation.note}<small>{relation.note}</small>{/if}
+            </a>
+          {/each}
+          {#each ticket.relations.incoming as relation}
+            <a href={`/w/${encodeURIComponent(data.workspaceId)}/tickets/${encodeURIComponent(relation.source_ticket)}`}>
+              <span>{relationLabel(relation.inverse_kind)}</span>
+              <strong>{relation.source_ticket}</strong>
+              {#if relation.note}<small>{relation.note}</small>{/if}
+            </a>
+          {/each}
+          {#if ticket.relations.outgoing.length === 0 && ticket.relations.incoming.length === 0}
+            <p class="workspace-empty-copy">No Ticket relations.</p>
+          {/if}
+        </div>
+      </section>
+
+      <section class="ticket-detail-section">
+        <div class="ticket-section-heading">
+          <h2>Timeline</h2><span>{ticket.event_count}</span>
+        </div>
+        <div class="ticket-timeline">
+          {#each ticket.events as event (event.sequence)}
+            <article>
+              <div class="ticket-timeline-marker"></div>
+              <div>
+                <header>
+                  <strong>{event.heading ?? eventTitle(event.kind)}</strong>
+                  <time>{prettyDate(event.at)}</time>
+                </header>
+                {#if event.author}<p class="ticket-event-author">{event.author}</p>{/if}
+                {#if event.from || event.to}<p>{event.from ?? "—"} → {event.to ?? "—"}</p>{/if}
+                {#if event.reason}<p>{event.reason}</p>{/if}
+                {#if event.body}<RichMarkdown text={event.body} />{/if}
+              </div>
+            </article>
+          {:else}
+            <p class="workspace-empty-copy">No timeline events.</p>
+          {/each}
+        </div>
+      </section>
+    </main>
+
+    <aside class="ticket-control-rail">
+      <section class="ticket-control-card ticket-worker-card">
+        <header><h2>Start a Worker</h2><span>Ticket role</span></header>
+        <p class="ticket-assignment-line">
+          Assigned to <strong>{ticket.assignee ?? "Unassigned"}</strong>
+        </p>
+        <p>The common launch flow carries a short canonical Ticket message and the target below.</p>
+        <div class="ticket-role-actions">
+          <a class="workspace-primary-button" href={ticketWorkerLaunchHref(data.workspaceId, ticket, "coder")}>Coder</a>
+          <a class="workspace-secondary-button" href={ticketWorkerLaunchHref(data.workspaceId, ticket, "reviewer")}>Reviewer</a>
+        </div>
+      </section>
+
+      <section class="ticket-control-card">
+        <header><h2>Repository target</h2></header>
+        <form class="ticket-control-form" onsubmit={saveTarget}>
+          <label>Repository
+            <select bind:value={repositoryId}>
+              <option value="">Not assigned</option>
+              {#each loadedRepositories?.items ?? [] as repository}
+                <option value={repository.id}>{repository.display_name}</option>
+              {/each}
+            </select>
+          </label>
+          <label>Ref selector<input bind:value={refSelector} placeholder="branch, tag, or revision" /></label>
+          <button class="workspace-secondary-button" type="submit" disabled={busy === "target"}>
+            {busy === "target" ? "Saving…" : "Save target"}
+          </button>
+        </form>
+      </section>
+
+      <section class="ticket-control-card">
+        <header><h2>Workflow</h2></header>
+        <form class="ticket-control-form" onsubmit={transition}>
+          <label>State
+            <select bind:value={nextState}>
+              {#each TICKET_STATES as state}<option value={state}>{state}</option>{/each}
+            </select>
+          </label>
+          <label>Reason<input bind:value={transitionReason} placeholder="Optional decision context" /></label>
+          <button class="workspace-secondary-button" type="submit" disabled={busy === "state" || nextState === ticket.state}>
+            Apply state
+          </button>
+        </form>
+        {#if ticket.state === "ready"}
+          <button class="workspace-primary-button ticket-queue-button" type="button" disabled={busy === "queue"} onclick={() => mutate("queue", "/queue", {})}>
+            {busy === "queue" ? "Queueing…" : "Queue ticket"}
+          </button>
+        {/if}
+      </section>
+
+      <details class="ticket-control-card">
+        <summary>Append timeline event</summary>
+        <form class="ticket-control-form" onsubmit={appendThread}>
+          <label>Role<select bind:value={threadRole}>
+            <option value="comment">Comment</option>
+            <option value="plan">Plan</option>
+            <option value="decision">Decision</option>
+            <option value="implementation_report">Implementation report</option>
+          </select></label>
+          <label>Body<textarea bind:value={threadBody} rows="5" required></textarea></label>
+          <button class="workspace-secondary-button" type="submit" disabled={busy === "thread" || !threadBody.trim()}>Append event</button>
+        </form>
+      </details>
+
+      <details class="ticket-control-card">
+        <summary>Record review</summary>
+        <form class="ticket-control-form" onsubmit={review}>
+          <label>Result<select bind:value={reviewResult}>
+            <option value="approve">Approve</option>
+            <option value="request_changes">Request changes</option>
+          </select></label>
+          <label>Review body<textarea bind:value={reviewBody} rows="5" required></textarea></label>
+          <button class="workspace-secondary-button" type="submit" disabled={busy === "review" || !reviewBody.trim()}>Record review</button>
+        </form>
+      </details>
+
+      {#if ticket.state !== "closed"}
+        <details class="ticket-control-card ticket-close-card">
+          <summary>Close ticket</summary>
+          <form class="ticket-control-form" onsubmit={closeTicket}>
+            <label>Resolution<textarea bind:value={resolution} rows="5" required></textarea></label>
+            <button class="workspace-danger-button" type="submit" disabled={busy === "close" || !resolution.trim()}>Close ticket</button>
+          </form>
+        </details>
+      {:else if ticket.resolution}
+        <section class="ticket-control-card"><header><h2>Resolution</h2></header><RichMarkdown text={ticket.resolution} /></section>
+      {/if}
+    </aside>
+  </div>
+</div>
