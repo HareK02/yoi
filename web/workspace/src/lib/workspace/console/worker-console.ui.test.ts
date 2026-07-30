@@ -114,7 +114,9 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
   assert(
     workersPage.includes("workerConsoleHref(worker, data.workspaceId)") &&
       workersPage.includes('<table class="workers-table">') &&
-      workersPage.includes("workerDisplayName = worker.display_name || worker.label") &&
+      workersPage.includes(
+        "workerDisplayName = worker.display_name || worker.label",
+      ) &&
       workersPage.includes("worker <code>{worker.worker_id}</code>") &&
       workersPage.includes("Delete ${workerDisplayName}"),
     "dedicated Workers page should expose a table, console link target, and icon actions per Worker",
@@ -136,7 +138,7 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
   );
 });
 
-Deno.test("workspace Tickets surface uses read-only Backend Ticket APIs", async () => {
+Deno.test("workspace Tickets surface provides Kanban and lifecycle controls", async () => {
   const ticketsNav = await Deno.readTextFile(
     new URL("../sidebar/TicketsNavSection.svelte", import.meta.url),
   );
@@ -164,6 +166,24 @@ Deno.test("workspace Tickets surface uses read-only Backend Ticket APIs", async 
       import.meta.url,
     ),
   );
+  const ticketPanelModel = await Deno.readTextFile(
+    new URL("../tickets/ticket-panel.ts", import.meta.url),
+  );
+  const generatedTicketApi = await Deno.readTextFile(
+    new URL("../../generated/ticket-api.ts", import.meta.url),
+  );
+  const repositoryLoad = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/repositories/[repositoryId]/+page.ts",
+      import.meta.url,
+    ),
+  );
+  const repositoryPage = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/repositories/[repositoryId]/+page.svelte",
+      import.meta.url,
+    ),
+  );
 
   assert(
     ticketsNav.includes("workspaceRoute(workspaceId, '/tickets')") &&
@@ -171,26 +191,41 @@ Deno.test("workspace Tickets surface uses read-only Backend Ticket APIs", async 
     "Tickets sidebar section should link to the workspace Tickets surface",
   );
   assert(
-    ticketsLoad.includes(
-      '`${workspaceApiPath(params.workspaceId, "/tickets")}?limit=1000`',
-    ) &&
-      ticketsPage.includes("Notion-style filtering and sorting") &&
-      ticketsPage.includes("toggleSort('updated_at')") &&
-      ticketsPage.includes("bind:value={visibilityFilter}") &&
-      ticketsPage.includes("sortKey = $state<SortKey>('panel')") &&
-      ticketsPage.includes("workspace_action_priority") &&
-      ticketsPage.includes("bind:value={stateFilter}") &&
-      ticketsPage.includes(
-        "workspaceRoute(data.workspaceId, `/tickets/${ticket.id}`)",
-      ),
-    "Tickets list should read the workspace-scoped Ticket API and expose sortable/filterable table links",
+    ticketsLoad.includes("?limit=1000") &&
+      ticketsPage.includes("data.tickets.data?.items") &&
+      ticketsPage.includes("ticketLanes(tickets)") &&
+      ticketsPage.includes('class="ticket-kanban"') &&
+      ticketsPage.includes("lane.tickets"),
+    "Tickets list should load every workflow state and render a workspace Kanban board",
   );
   assert(
-    ticketDetailLoad.includes("`/tickets/${encodeURIComponent(ticketId)}`") &&
-      ticketDetailPage.includes("event_count") &&
-      ticketDetailPage.includes("artifact_count") &&
-      ticketDetailPage.includes("<pre>{data.ticket.data.body"),
-    "Ticket detail should read one Ticket record and expose body plus metadata without mutation controls",
+    ticketPanelModel.includes('label: "Ready + Planning"') &&
+      ticketPanelModel.includes('label: "In progress + Queued"') &&
+      ticketPanelModel.includes('label: "Done + Closed"') &&
+      ticketPanelModel.includes("updatedAt(right) - updatedAt(left)"),
+    "Ticket Kanban should combine related states and sort state priority before recency",
+  );
+  assert(
+    generatedTicketApi.includes("Generated from yoi-workspace-server") &&
+      generatedTicketApi.includes("export type TicketListResponse") &&
+      generatedTicketApi.includes("items: Array<TicketSummary>"),
+    "Ticket response types should come from the generated Server contract",
+  );
+  assert(
+    !repositoryLoad.includes("/tickets") &&
+      !repositoryPage.includes("Repository Tickets") &&
+      !repositoryPage.includes("RepositoryTicketKanban"),
+    "Repository detail should not keep a second Repository Tickets surface",
+  );
+  assert(
+    ticketDetailLoad.includes("/repositories") &&
+      ticketDetailPage.includes('mutate("state", "/state"') &&
+      ticketDetailPage.includes('mutate("queue", "/queue"') &&
+      ticketDetailPage.includes('mutate("review", "/review"') &&
+      ticketDetailPage.includes('mutate("close", "/close"') &&
+      ticketDetailPage.includes("ticketWorkerLaunchHref") &&
+      ticketDetailPage.includes("ticket.relations.outgoing"),
+    "Ticket detail should expose typed lifecycle actions, relations, target selection, and role Worker launch",
   );
 });
 
@@ -199,7 +234,10 @@ Deno.test("workspace Memory surfaces use read-only scoped memory APIs", async ()
     new URL("../sidebar/MemoryNavSection.svelte", import.meta.url),
   );
   const memoryDocumentLoad = await Deno.readTextFile(
-    new URL("./../../../routes/w/[workspaceId]/memory/+page.ts", import.meta.url),
+    new URL(
+      "./../../../routes/w/[workspaceId]/memory/+page.ts",
+      import.meta.url,
+    ),
   );
   const memoryDocumentPage = await Deno.readTextFile(
     new URL(

@@ -1,392 +1,76 @@
 <script lang="ts">
-  import { formatDate, workspaceRoute } from '$lib/workspace/api/http';
-  import type { TicketSummary } from '$lib/workspace/sidebar/types';
-  import type { PageProps } from './$types';
+  import { untrack } from "svelte";
+  import type { ApiResult } from "$lib/workspace/api/http";
+  import { ticketLanes } from "$lib/workspace/tickets/ticket-panel";
+  import type {
+    TicketListResponse,
+    TicketSummary,
+  } from "$lib/workspace/sidebar/types";
 
-  type SortKey = 'panel' | 'title' | 'state' | 'priority' | 'updated_at' | 'queued_at' | 'id';
-  type SortDirection = 'asc' | 'desc';
+  const { data } = $props<{
+    data: {
+      workspaceId: string;
+      tickets: ApiResult<TicketListResponse>;
+    };
+  }>();
 
-  let { data }: PageProps = $props();
+  const initialTickets = untrack(() => data.tickets.data?.items ?? []);
+  let tickets = $state<TicketSummary[]>(initialTickets);
+  let lanes = $derived(ticketLanes(tickets));
 
-  let query = $state('');
-  let visibilityFilter = $state<'open' | 'closed' | 'all'>('open');
-  let stateFilter = $state('all');
-  let priorityFilter = $state('all');
-  let queuedFilter = $state('all');
-  let sortKey = $state<SortKey>('panel');
-  let sortDirection = $state<SortDirection>('asc');
-
-  const tickets = $derived(data.tickets.data?.items ?? []);
-  const states = $derived(uniqueValues(tickets.map((ticket) => ticket.state)));
-  const priorities = $derived(uniqueValues(tickets.map((ticket) => ticket.priority).filter(isPresent)));
-  const filteredTickets = $derived(filterTickets(tickets));
-  const visibleTickets = $derived(sortTickets(filteredTickets));
-
-  function isPresent(value: string | null | undefined): value is string {
-    return Boolean(value && value.trim());
-  }
-
-  function uniqueValues(values: string[]): string[] {
-    return [...new Set(values.filter((value) => value.trim()))].sort((left, right) =>
-      left.localeCompare(right),
-    );
-  }
-
-  function filterTickets(items: TicketSummary[]): TicketSummary[] {
-    const needle = query.trim().toLowerCase();
-    return items.filter((ticket) => {
-      if (visibilityFilter === 'open' && ticket.state === 'closed') {
-        return false;
-      }
-      if (visibilityFilter === 'closed' && ticket.state !== 'closed') {
-        return false;
-      }
-      if (stateFilter !== 'all' && ticket.state !== stateFilter) {
-        return false;
-      }
-      if (priorityFilter !== 'all' && (ticket.priority ?? '') !== priorityFilter) {
-        return false;
-      }
-      if (queuedFilter === 'queued' && !ticket.queued_at) {
-        return false;
-      }
-      if (queuedFilter === 'unqueued' && ticket.queued_at) {
-        return false;
-      }
-      if (!needle) {
-        return true;
-      }
-      return [ticket.id, ticket.title, ticket.state, ticket.priority, ticket.queued_by, ticket.record_source]
-        .filter(isPresent)
-        .some((value) => value.toLowerCase().includes(needle));
-    });
-  }
-
-  function sortTickets(items: TicketSummary[]): TicketSummary[] {
-    return [...items].sort((left, right) => {
-      const result = compareTicketValues(left, right, sortKey);
-      return sortDirection === 'asc' ? result : -result;
-    });
-  }
-
-  function compareTicketValues(left: TicketSummary, right: TicketSummary, key: SortKey): number {
-    if (key === 'panel') {
-      return comparePanelOrder(left, right);
-    }
-    if (key === 'updated_at' || key === 'queued_at') {
-      return compareDate(left[key], right[key]);
-    }
-    return compareText(ticketValue(left, key), ticketValue(right, key));
-  }
-
-  function comparePanelOrder(left: TicketSummary, right: TicketSummary): number {
-    return compareNumber(panelActionPriority(left), panelActionPriority(right))
-      || compareDate(right.updated_at, left.updated_at)
-      || compareText(left.title, right.title);
-  }
-
-  function panelActionPriority(ticket: TicketSummary): number {
-    if (ticket.workspace_action_priority) {
-      if (ticket.workspace_action_priority === 'ready_for_queue') return 0;
-      if (ticket.workspace_action_priority === 'active_work') return 1;
-      if (ticket.workspace_action_priority === 'background') return 2;
-    }
-    if (ticket.state === 'ready') return 0;
-    if (ticket.state === 'queued' || ticket.state === 'inprogress') return 1;
-    return 2;
-  }
-
-  function compareNumber(left: number, right: number): number {
-    return left - right;
-  }
-
-  function ticketValue(ticket: TicketSummary, key: SortKey): string | null | undefined {
-    if (key === 'id') return ticket.id;
-    if (key === 'title') return ticket.title;
-    if (key === 'state') return ticket.state;
-    if (key === 'priority') return ticket.priority;
-    return null;
-  }
-
-  function compareText(left: string | null | undefined, right: string | null | undefined): number {
-    const leftText = left?.trim() ?? '';
-    const rightText = right?.trim() ?? '';
-    if (!leftText && rightText) return 1;
-    if (leftText && !rightText) return -1;
-    return leftText.localeCompare(rightText);
-  }
-
-  function compareDate(left: string | null | undefined, right: string | null | undefined): number {
-    const leftTime = left ? Date.parse(left) : Number.NEGATIVE_INFINITY;
-    const rightTime = right ? Date.parse(right) : Number.NEGATIVE_INFINITY;
-    return leftTime - rightTime;
-  }
-
-  function toggleSort(key: SortKey) {
-    if (sortKey === key) {
-      sortDirection = sortDirection === 'asc' ? 'desc' : 'asc';
-      return;
-    }
-    sortKey = key;
-    sortDirection = key === 'updated_at' || key === 'queued_at' ? 'desc' : 'asc';
-  }
-
-  function sortLabel(key: SortKey): string {
-    if (sortKey !== key) return '';
-    return sortDirection === 'asc' ? '↑' : '↓';
-  }
-
-  function resetFilters() {
-    query = '';
-    visibilityFilter = 'open';
-    stateFilter = 'all';
-    priorityFilter = 'all';
-    queuedFilter = 'all';
-    sortKey = 'panel';
-    sortDirection = 'asc';
+  function prettyDate(value?: string | null): string {
+    if (!value) return "—";
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString();
   }
 </script>
 
-<svelte:head>
-  <title>Tickets · Yoi Workspace</title>
-  <meta name="description" content="Workspace Tickets" />
-</svelte:head>
+<svelte:head><title>Tickets · Yoi</title></svelte:head>
 
-<section class="card ticket-database-card">
-  <div class="detail-heading">
+<div class="workspace-page ticket-panel-page">
+  <header class="workspace-page-header ticket-panel-header">
     <div>
-      <p class="eyebrow">Workspace records</p>
-      <h2>Tickets</h2>
+      <p class="workspace-eyebrow">Delivery</p>
+      <h1>Tickets</h1>
+      <p class="workspace-page-lede">
+        Plan, route, review, and close work without leaving the workspace.
+      </p>
     </div>
-    {#if data.tickets.data}
-      <span>{visibleTickets.length} / {data.tickets.data.items.length} ticket{data.tickets.data.items.length === 1 ? '' : 's'}</span>
-    {/if}
-  </div>
+    <div class="ticket-panel-summary" aria-label="Ticket summary">
+      <strong>{tickets.length}</strong>
+      <span>tickets</span>
+    </div>
+  </header>
 
-  <p class="section-note">
-    Tickets are read from the typed Ticket backend. This read-only table supports Notion-style filtering and sorting for browsing imported workspace Tickets.
-  </p>
+  <section class="ticket-kanban" aria-label="Ticket workflow board">
+    {#each lanes as lane (lane.id)}
+      <section class="ticket-lane" data-state={lane.id}>
+        <header class="ticket-lane-header">
+          <div>
+            <span class="ticket-state-dot"></span>
+            <h2>{lane.label}</h2>
+          </div>
+          <span class="ticket-lane-count">{lane.tickets.length}</span>
+        </header>
 
-  {#if data.tickets.data}
-    {#if data.tickets.data.items.length === 0}
-      <p>No Ticket records are present.</p>
-    {:else}
-      <div class="ticket-database-toolbar" aria-label="Ticket table controls">
-        <label class="ticket-filter ticket-search">
-          <span>Search</span>
-          <input bind:value={query} type="search" placeholder="Title, id, state, source…" />
-        </label>
-        <label class="ticket-filter">
-          <span>Visibility</span>
-          <select bind:value={visibilityFilter}>
-            <option value="open">Open</option>
-            <option value="closed">Closed</option>
-            <option value="all">All</option>
-          </select>
-        </label>
-        <label class="ticket-filter">
-          <span>State</span>
-          <select bind:value={stateFilter}>
-            <option value="all">All states</option>
-            {#each states as state}
-              <option value={state}>{state}</option>
-            {/each}
-          </select>
-        </label>
-        <label class="ticket-filter">
-          <span>Priority</span>
-          <select bind:value={priorityFilter}>
-            <option value="all">All priorities</option>
-            {#each priorities as priority}
-              <option value={priority}>{priority}</option>
-            {/each}
-          </select>
-        </label>
-        <label class="ticket-filter">
-          <span>Queue</span>
-          <select bind:value={queuedFilter}>
-            <option value="all">All</option>
-            <option value="queued">Queued</option>
-            <option value="unqueued">Unqueued</option>
-          </select>
-        </label>
-        <button class="secondary-button" type="button" onclick={() => toggleSort('panel')}>Panel order {sortLabel('panel')}</button>
-        <button class="secondary-button" type="button" onclick={resetFilters}>Reset</button>
-      </div>
-
-      <div class="ticket-table-wrap" aria-label="Workspace Tickets table">
-        <table class="ticket-table">
-          <thead>
-            <tr>
-              <th><button type="button" onclick={() => toggleSort('title')}>Title {sortLabel('title')}</button></th>
-              <th><button type="button" onclick={() => toggleSort('state')}>State {sortLabel('state')}</button></th>
-              <th><button type="button" onclick={() => toggleSort('priority')}>Priority {sortLabel('priority')}</button></th>
-              <th><button type="button" onclick={() => toggleSort('updated_at')}>Updated {sortLabel('updated_at')}</button></th>
-              <th><button type="button" onclick={() => toggleSort('queued_at')}>Queued {sortLabel('queued_at')}</button></th>
-              <th><button type="button" onclick={() => toggleSort('id')}>ID {sortLabel('id')}</button></th>
-            </tr>
-          </thead>
-          <tbody>
-            {#each visibleTickets as ticket (ticket.id)}
-              <tr>
-                <td class="ticket-title-cell">
-                  <a href={workspaceRoute(data.workspaceId, `/tickets/${ticket.id}`)}>{ticket.title}</a>
-                  <span>{ticket.record_source ?? 'ticket backend'}</span>
-                </td>
-                <td><span class="state-pill">{ticket.state}</span></td>
-                <td>{ticket.priority || '—'}</td>
-                <td>{ticket.updated_at ? formatDate(ticket.updated_at) : 'unknown'}</td>
-                <td>
-                  {#if ticket.queued_at}
-                    <span>{formatDate(ticket.queued_at)}</span>
-                    {#if ticket.queued_by}
-                      <small>{ticket.queued_by}</small>
-                    {/if}
-                  {:else}
-                    <span class="muted">—</span>
-                  {/if}
-                </td>
-                <td><code>{ticket.id}</code></td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-      </div>
-
-      {#if visibleTickets.length === 0}
-        <p class="section-note">No tickets match the current filters.</p>
-      {/if}
-    {/if}
-
-    {#if data.tickets.data.invalid_records.length > 0}
-      <p class="error">{data.tickets.data.invalid_records.length} invalid Ticket record(s) hidden.</p>
-    {/if}
-  {:else if data.tickets.error}
-    <p class="error">{data.tickets.error}</p>
-  {:else}
-    <p>Waiting for <code>/api/w/{data.workspaceId}/tickets</code>…</p>
-  {/if}
-</section>
-
-<style>
-  .ticket-database-card {
-    overflow: hidden;
-  }
-
-  .ticket-database-toolbar {
-    display: grid;
-    grid-template-columns: minmax(16rem, 1.8fr) repeat(4, minmax(9rem, 1fr)) auto auto;
-    gap: 0.75rem;
-    align-items: end;
-    margin: 1rem 0;
-  }
-
-  .ticket-filter {
-    display: grid;
-    gap: 0.35rem;
-    color: var(--text-muted);
-    font-size: 0.78rem;
-    font-weight: 600;
-    letter-spacing: 0.02em;
-    text-transform: uppercase;
-  }
-
-  .ticket-filter input,
-  .ticket-filter select {
-    min-height: 2.35rem;
-    border: 1px solid var(--line);
-    border-radius: 0.6rem;
-    background: var(--bg-raised);
-    color: inherit;
-    font: inherit;
-    font-weight: 500;
-    letter-spacing: normal;
-    padding: 0 0.7rem;
-    text-transform: none;
-  }
-
-  .secondary-button {
-    min-height: 2.35rem;
-    border: 1px solid var(--line);
-    border-radius: 0.6rem;
-    background: var(--bg-raised);
-    color: inherit;
-    cursor: pointer;
-    font: inherit;
-    font-weight: 600;
-    padding: 0 0.9rem;
-  }
-
-  .ticket-table-wrap {
-    border: 1px solid var(--line);
-    border-radius: 0.8rem;
-    overflow: auto;
-  }
-
-  .ticket-table {
-    width: 100%;
-    min-width: 58rem;
-    border-collapse: collapse;
-    background: var(--bg-raised);
-    color: var(--text);
-    font-size: 0.9rem;
-  }
-
-  .ticket-table th,
-  .ticket-table td {
-    border-bottom: 1px solid var(--line);
-    padding: 0.72rem 0.8rem;
-    text-align: left;
-    vertical-align: top;
-  }
-
-  .ticket-table th {
-    background: var(--bg-subtle);
-    color: var(--text-muted);
-    font-size: 0.76rem;
-    letter-spacing: 0.04em;
-    position: sticky;
-    text-transform: uppercase;
-    top: 0;
-    z-index: 1;
-  }
-
-  .ticket-table th button {
-    all: unset;
-    cursor: pointer;
-  }
-
-  .ticket-table tbody tr:hover {
-    background: var(--interactive-hover);
-  }
-
-  .ticket-title-cell {
-    min-width: 22rem;
-  }
-
-  .ticket-title-cell a {
-    color: inherit;
-    display: block;
-    font-weight: 700;
-    text-decoration: none;
-  }
-
-  .ticket-title-cell a:hover {
-    text-decoration: underline;
-  }
-
-  .ticket-title-cell span,
-  .ticket-table small,
-  .muted {
-    color: var(--text-muted);
-    display: block;
-    font-size: 0.78rem;
-    margin-top: 0.2rem;
-  }
-
-  @media (max-width: 900px) {
-    .ticket-database-toolbar {
-      grid-template-columns: 1fr;
-    }
-  }
-</style>
+        <div class="ticket-lane-cards">
+          {#each lane.tickets as ticket (ticket.id)}
+            <a
+              class="ticket-card"
+              href={`/w/${encodeURIComponent(data.workspaceId)}/tickets/${encodeURIComponent(ticket.id)}`}
+            >
+              <span class="ticket-card-id">{ticket.id}</span>
+              <strong>{ticket.title}</strong>
+              <div class="ticket-card-meta">
+                <span>{ticket.state} · {ticket.priority}</span>
+                <time>{prettyDate(ticket.updated_at)}</time>
+              </div>
+            </a>
+          {:else}
+            <div class="ticket-lane-empty">No tickets</div>
+          {/each}
+        </div>
+      </section>
+    {/each}
+  </section>
+</div>

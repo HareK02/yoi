@@ -390,62 +390,17 @@ export type MemoryStagingListResponse = {
   items: MemoryStagingEntry[];
 };
 
-export type TicketSummary = {
-  id: string;
-  title: string;
-  state: string;
-  priority?: string | null;
-  updated_at?: string | null;
-  queued_by?: string | null;
-  queued_at?: string | null;
-  workspace_action_priority?:
-    | "ready_for_queue"
-    | "active_work"
-    | "background"
-    | null;
-  record_source?: string;
-};
-
-export type TicketListResponse = {
-  workspace_id: string;
-  limit: number;
-  items: TicketSummary[];
-  invalid_records: InvalidProjectRecord[];
-  record_authority: string;
-};
-
-export type TicketDetail = {
-  id: string;
-  title: string;
-  state: string;
-  priority?: string | null;
-  created_at?: string | null;
-  updated_at?: string | null;
-  queued_by?: string | null;
-  queued_at?: string | null;
-  risk_flags: string[];
-  body: string;
-  body_truncated: boolean;
-  event_count: number;
-  artifact_count: number;
-  record_source: string;
-};
-
-export type TicketKanbanColumn = {
-  state: string;
-  items: TicketSummary[];
-};
-
-export type RepositoryTicketsResponse = {
-  workspace_id: string;
-  repository_id: string;
-  limit: number;
-  columns: TicketKanbanColumn[];
-  invalid_records: InvalidProjectRecord[];
-  record_authority: string;
-  source: string;
-  diagnostics: Diagnostic[];
-};
+export type {
+  DerivedTicketRelation,
+  TicketDetail,
+  TicketEventDetail,
+  TicketListResponse,
+  TicketRelation,
+  TicketRelationBlocker,
+  TicketRelationNotice,
+  TicketRelationView,
+  TicketSummary,
+} from "$lib/generated/ticket-api";
 
 export type ObjectiveSummary = {
   id: string;

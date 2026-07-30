@@ -1,20 +1,29 @@
 import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
-import type { TicketDetail } from "$lib/workspace/sidebar/types";
+import type {
+  RepositoryListResponse,
+  TicketDetail,
+} from "$lib/workspace/sidebar/types";
 import type { PageLoad } from "./$types";
 
 export const load = (async ({ fetch, params }) => {
-  const ticketId = params.ticketId;
-  const ticket = await loadJson<TicketDetail>(
-    fetch,
-    workspaceApiPath(
-      params.workspaceId,
-      `/tickets/${encodeURIComponent(ticketId)}`,
+  const [ticket, repositories] = await Promise.all([
+    loadJson<TicketDetail>(
+      fetch,
+      workspaceApiPath(
+        params.workspaceId,
+        `/tickets/${encodeURIComponent(params.ticketId)}`,
+      ),
     ),
-  );
+    loadJson<RepositoryListResponse>(
+      fetch,
+      workspaceApiPath(params.workspaceId, "/repositories"),
+    ),
+  ]);
 
   return {
     workspaceId: params.workspaceId,
-    ticketId,
+    ticketId: params.ticketId,
     ticket,
+    repositories,
   };
 }) satisfies PageLoad;

@@ -51,7 +51,17 @@ export function defaultWorkerLaunchForm(
     selectedRuntime?.working_directory_required === false;
   const preferredWorkingDirectory = workdirlessRuntime
     ? undefined
-    : availableWorkingDirectories[0];
+    : availableWorkingDirectories.find((directory) =>
+      Boolean(current.working_directory_repository_id) &&
+      directory.repository_id === current.working_directory_repository_id &&
+      (!current.working_directory_selector ||
+        directory.requested_selector === current.working_directory_selector)
+    ) ?? availableWorkingDirectories.find((directory) =>
+      Boolean(current.working_directory_repository_id) &&
+      directory.repository_id === current.working_directory_repository_id
+    ) ?? (current.working_directory_repository_id
+      ? undefined
+      : availableWorkingDirectories[0]);
   const preferredRepository =
     options?.repositories.find((repository) =>
       repository.id === current.working_directory_repository_id

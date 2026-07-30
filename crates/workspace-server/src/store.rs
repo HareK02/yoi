@@ -82,6 +82,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "objective mutation audit events",
         apply: create_objective_event_tables,
     },
+    Migration {
+        version: 14,
+        name: "remove unused control-plane Ticket tables",
+        apply: remove_unused_control_plane_ticket_tables,
+    },
 ];
 
 struct Migration {
@@ -2156,6 +2161,20 @@ CREATE TABLE IF NOT EXISTS memory_staging_resolutions (
     Ok(())
 }
 
+fn remove_unused_control_plane_ticket_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+DROP TABLE IF EXISTS ticket_target_paths;
+DROP TABLE IF EXISTS ticket_worker_links;
+DROP TABLE IF EXISTS ticket_targets;
+DROP TABLE IF EXISTS ticket_relations;
+DROP TABLE IF EXISTS ticket_events;
+DROP TABLE IF EXISTS tickets;
+"#,
+    )?;
+    Ok(())
+}
+
 fn create_objective_event_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -2649,68 +2668,6 @@ CREATE TABLE IF NOT EXISTS workspaces (
     updated_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS tickets (
-    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-    ticket_id TEXT PRIMARY KEY,
-    title TEXT NOT NULL,
-    state TEXT NOT NULL,
-    priority TEXT,
-    assignee_kind TEXT,
-    assignee_key TEXT,
-    assignee_display TEXT,
-    body_md TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    closed_at TEXT,
-    resolution_event_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS ticket_events (
-    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-    event_id TEXT PRIMARY KEY,
-    ticket_id TEXT NOT NULL REFERENCES tickets(ticket_id) ON DELETE CASCADE,
-    event_seq INTEGER NOT NULL,
-    kind TEXT NOT NULL,
-    activity_id TEXT,
-    author_kind TEXT NOT NULL,
-    author_key TEXT NOT NULL,
-    author_display TEXT NOT NULL,
-    author_source_kind TEXT,
-    author_source_key TEXT,
-    created_at TEXT NOT NULL,
-    body_md TEXT,
-    subject_kind TEXT,
-    subject_id TEXT,
-    previous_state TEXT,
-    new_state TEXT,
-    status TEXT,
-    artifact_id TEXT,
-    worker_ref_kind TEXT,
-    worker_ref_key TEXT,
-    worker_display TEXT,
-    host_ref_kind TEXT,
-    host_ref_key TEXT,
-    host_display TEXT,
-    repository_id TEXT,
-    caused_by_event_id TEXT,
-    UNIQUE (ticket_id, event_seq)
-);
-
-CREATE TABLE IF NOT EXISTS ticket_relations (
-    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-    source_ticket_id TEXT NOT NULL REFERENCES tickets(ticket_id) ON DELETE CASCADE,
-    target_ticket_id TEXT NOT NULL REFERENCES tickets(ticket_id) ON DELETE CASCADE,
-    kind TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    author_kind TEXT NOT NULL,
-    author_key TEXT NOT NULL,
-    author_display TEXT NOT NULL,
-    author_source_kind TEXT,
-    author_source_key TEXT,
-    note TEXT,
-    PRIMARY KEY (source_ticket_id, target_ticket_id, kind)
-);
-
 CREATE TABLE IF NOT EXISTS objectives (
     workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
     objective_id TEXT PRIMARY KEY,
@@ -2793,43 +2750,6 @@ CREATE TABLE IF NOT EXISTS repositories (
     updated_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS ticket_targets (
-    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-    ticket_id TEXT NOT NULL REFERENCES tickets(ticket_id) ON DELETE CASCADE,
-    target_id TEXT NOT NULL,
-    repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
-    role TEXT NOT NULL,
-    intent TEXT NOT NULL,
-    ref_selector TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (ticket_id, target_id)
-);
-
-CREATE TABLE IF NOT EXISTS ticket_target_paths (
-    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-    ticket_id TEXT NOT NULL,
-    target_id TEXT NOT NULL,
-    path TEXT NOT NULL,
-    PRIMARY KEY (ticket_id, target_id, path),
-    FOREIGN KEY (ticket_id, target_id) REFERENCES ticket_targets(ticket_id, target_id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS ticket_worker_links (
-    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-    ticket_id TEXT NOT NULL REFERENCES tickets(ticket_id) ON DELETE CASCADE,
-    worker_ref_kind TEXT NOT NULL,
-    worker_ref_key TEXT NOT NULL,
-    worker_display TEXT,
-    role TEXT NOT NULL,
-    status TEXT NOT NULL,
-    activity_id TEXT,
-    assigned_at TEXT,
-    released_at TEXT,
-    last_event_id TEXT,
-    PRIMARY KEY (ticket_id, worker_ref_kind, worker_ref_key, role)
-);
-
 CREATE TABLE IF NOT EXISTS artifacts (
     workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
     artifact_id TEXT PRIMARY KEY,
@@ -2904,13 +2824,40 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    #[test]
+    fn removes_unused_control_plane_ticket_tables() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+CREATE TABLE tickets (ticket_id TEXT PRIMARY KEY);
+CREATE TABLE ticket_events (event_id TEXT PRIMARY KEY, ticket_id TEXT REFERENCES tickets(ticket_id));
+CREATE TABLE ticket_relations (source_ticket_id TEXT, target_ticket_id TEXT);
+CREATE TABLE ticket_targets (ticket_id TEXT, target_id TEXT, PRIMARY KEY (ticket_id, target_id));
+CREATE TABLE ticket_target_paths (ticket_id TEXT, target_id TEXT, path TEXT);
+CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
+"#,
+        )
+        .unwrap();
+        remove_unused_control_plane_ticket_tables(&conn).unwrap();
+        for table in [
+            "tickets",
+            "ticket_events",
+            "ticket_relations",
+            "ticket_targets",
+            "ticket_target_paths",
+            "ticket_worker_links",
+        ] {
+            assert!(!table_exists(&conn, table).unwrap(), "{table} still exists");
+        }
+    }
+
     #[tokio::test]
     async fn migrates_sqlite_and_preserves_workspace_record() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 13);
+        assert_eq!(store.schema_version().await.unwrap(), 14);
 
         let record = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
@@ -2923,7 +2870,7 @@ mod tests {
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 13);
+        assert_eq!(reopened.schema_version().await.unwrap(), 14);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -2939,9 +2886,6 @@ mod tests {
         let tables = table_names(&conn);
         for expected in [
             "workspaces",
-            "tickets",
-            "ticket_events",
-            "ticket_relations",
             "objectives",
             "objective_ticket_links",
             "objective_resources",
@@ -2949,9 +2893,6 @@ mod tests {
             "workspace_memory_documents",
             "memory_staging_resolutions",
             "repositories",
-            "ticket_targets",
-            "ticket_target_paths",
-            "ticket_worker_links",
             "artifacts",
             "audit_events",
             "worker_registry",
@@ -2977,6 +2918,12 @@ mod tests {
             "actors",
             "validation_results",
             "ci_results",
+            "tickets",
+            "ticket_events",
+            "ticket_relations",
+            "ticket_targets",
+            "ticket_target_paths",
+            "ticket_worker_links",
         ] {
             assert!(
                 !tables.contains(forbidden),
@@ -3015,39 +2962,6 @@ mod tests {
                 "auth_ref_key",
                 "created_at",
                 "updated_at",
-            ],
-        );
-        assert_columns(
-            &conn,
-            "ticket_events",
-            [
-                "workspace_id",
-                "event_id",
-                "ticket_id",
-                "event_seq",
-                "kind",
-                "activity_id",
-                "author_kind",
-                "author_key",
-                "author_display",
-                "author_source_kind",
-                "author_source_key",
-                "created_at",
-                "body_md",
-                "subject_kind",
-                "subject_id",
-                "previous_state",
-                "new_state",
-                "status",
-                "artifact_id",
-                "worker_ref_kind",
-                "worker_ref_key",
-                "worker_display",
-                "host_ref_kind",
-                "host_ref_key",
-                "host_display",
-                "repository_id",
-                "caused_by_event_id",
             ],
         );
         assert_columns(
@@ -3098,7 +3012,7 @@ mod tests {
             ],
         );
 
-        for table in ["workspaces", "repositories", "ticket_events", "artifacts"] {
+        for table in ["workspaces", "repositories", "artifacts"] {
             let columns = table_columns(&conn, table).unwrap();
             for forbidden_column in [
                 "payload",
@@ -3144,7 +3058,7 @@ mod tests {
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 13);
+        assert_eq!(store.schema_version().await.unwrap(), 14);
 
         store
             .with_conn(|conn| {
@@ -3152,9 +3066,6 @@ mod tests {
                 for expected in [
                     "workspaces",
                     "repositories",
-                    "tickets",
-                    "ticket_events",
-                    "ticket_worker_links",
                     "artifacts",
                     "audit_events",
                     "workspace_memory_documents",
@@ -3172,7 +3083,19 @@ mod tests {
                         "missing {expected} after upgrade"
                     );
                 }
-                for forbidden in ["runs", "hosts", "workers", "actors", "validation_results"] {
+                for forbidden in [
+                    "runs",
+                    "hosts",
+                    "workers",
+                    "actors",
+                    "validation_results",
+                    "tickets",
+                    "ticket_events",
+                    "ticket_relations",
+                    "ticket_targets",
+                    "ticket_target_paths",
+                    "ticket_worker_links",
+                ] {
                     assert!(
                         !tables.contains(forbidden),
                         "upgraded schema must not retain forbidden canonical table {forbidden}"
@@ -3238,7 +3161,7 @@ mod tests {
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 13);
+        assert_eq!(store.schema_version().await.unwrap(), 14);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -3276,7 +3199,7 @@ mod tests {
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 13);
+        assert_eq!(store.schema_version().await.unwrap(), 14);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -3450,7 +3373,7 @@ mod tests {
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 13);
+        assert_eq!(store.schema_version().await.unwrap(), 14);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),
