@@ -20,6 +20,11 @@ use protocol::stream::{decode_method, encode_event};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ticket::{
+    MarkdownText, NewTicketEvent, TicketBackend, TicketBodyReplacement, TicketEventKind,
+    TicketIdOrSlug, TicketItemEdit, TicketReview, TicketReviewResult, TicketStateChange,
+    TicketTargetEdit, TicketWorkflowState,
+};
+use ticket::{
     SqliteTicketBackend, TicketBackendHttpResponse, TicketBackendOperation,
     execute_ticket_backend_operation,
 };
@@ -511,7 +516,30 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             "/api/w/{workspace_id}/skills/{name}/activate",
             get(scoped_activate_skill),
         )
-        .route("/api/w/{workspace_id}/tickets/{id}", get(scoped_get_ticket))
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}",
+            get(scoped_get_ticket).patch(scoped_edit_ticket_item),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/state",
+            post(scoped_transition_ticket_state),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/events",
+            post(scoped_append_ticket_event),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/reviews",
+            post(scoped_review_ticket),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/queue",
+            post(scoped_queue_ticket),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/close",
+            post(scoped_close_ticket),
+        )
         .route("/api/objectives", get(list_objectives))
         .route(
             "/api/w/{workspace_id}/objectives",
@@ -1524,6 +1552,220 @@ async fn scoped_get_ticket(
 ) -> ApiResult<Json<TicketDetail>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     get_ticket(State(api), AxumPath(path.id)).await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserEditTicketRequest {
+    title: Option<String>,
+    body: Option<String>,
+    old_string: Option<String>,
+    new_string: Option<String>,
+    #[serde(default)]
+    replace_all: bool,
+    target: Option<TicketTargetEdit>,
+    author: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserTransitionTicketStateRequest {
+    state: TicketWorkflowState,
+    reason: Option<String>,
+    body: Option<String>,
+    author: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BrowserTicketThreadRole {
+    Comment,
+    Plan,
+    Decision,
+    ImplementationReport,
+}
+
+impl From<BrowserTicketThreadRole> for TicketEventKind {
+    fn from(role: BrowserTicketThreadRole) -> Self {
+        match role {
+            BrowserTicketThreadRole::Comment => Self::Comment,
+            BrowserTicketThreadRole::Plan => Self::Plan,
+            BrowserTicketThreadRole::Decision => Self::Decision,
+            BrowserTicketThreadRole::ImplementationReport => Self::ImplementationReport,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserAppendTicketEventRequest {
+    role: BrowserTicketThreadRole,
+    body: String,
+    author: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserReviewTicketRequest {
+    result: TicketReviewResult,
+    body: String,
+    author: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserQueueTicketRequest {
+    queued_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserCloseTicketRequest {
+    resolution: String,
+}
+
+fn browser_ticket_backend(api: &WorkspaceApi) -> Result<SqliteTicketBackend> {
+    let config = ticket::config::TicketConfig::load_workspace(&api.config.workspace_root)
+        .map_err(|error| Error::Config(format!("load Ticket workspace settings: {error}")))?;
+    Ok(SqliteTicketBackend::new(
+        api.config.database_path.clone(),
+        api.config.workspace_id.clone(),
+    )
+    .with_record_language(config.ticket_record_language()))
+}
+
+fn browser_ticket_detail(api: &WorkspaceApi, ticket_id: &str) -> ApiResult<Json<TicketDetail>> {
+    Ok(Json(api.authority.ticket(ticket_id)?))
+}
+
+async fn scoped_edit_ticket_item(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRecordPath>,
+    Json(request): Json<BrowserEditTicketRequest>,
+) -> ApiResult<Json<TicketDetail>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    if let Some(TicketTargetEdit::Set { repository_id, .. }) = request.target.as_ref() {
+        if !api
+            .store
+            .list_repositories(&api.config.workspace_id)?
+            .iter()
+            .any(|repository| repository.repository_id == *repository_id)
+        {
+            return Err(settings_bad_request(
+                "unknown_ticket_repository",
+                "repository_id must identify a repository registered in this Workspace",
+            ));
+        }
+    }
+    browser_ticket_backend(&api)?
+        .edit_item(
+            TicketIdOrSlug::Id(path.id.clone()),
+            TicketItemEdit {
+                title: request.title,
+                body: request.body.map(MarkdownText::new),
+                body_replacement: match (request.old_string, request.new_string) {
+                    (Some(old_string), Some(new_string)) => Some(TicketBodyReplacement {
+                        old_string,
+                        new_string,
+                        replace_all: request.replace_all,
+                    }),
+                    (None, None) => None,
+                    _ => {
+                        return Err(settings_bad_request(
+                            "invalid_ticket_edit_replacement",
+                            "old_string and new_string must be provided together",
+                        ));
+                    }
+                },
+                target: request.target,
+                author: request.author,
+            },
+        )
+        .map_err(Error::from)?;
+    browser_ticket_detail(&api, &path.id)
+}
+
+async fn scoped_transition_ticket_state(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRecordPath>,
+    Json(request): Json<BrowserTransitionTicketStateRequest>,
+) -> ApiResult<Json<TicketDetail>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let current = api.authority.ticket(&path.id)?;
+    let mut change = TicketStateChange::new(
+        current.state,
+        request.state.as_str(),
+        request
+            .reason
+            .unwrap_or_else(|| "state changed from Web Ticket API".to_owned()),
+        request.body.unwrap_or_default(),
+    );
+    change.author = request.author;
+    browser_ticket_backend(&api)?
+        .set_workflow_state(TicketIdOrSlug::Id(path.id.clone()), change)
+        .map_err(Error::from)?;
+    browser_ticket_detail(&api, &path.id)
+}
+
+async fn scoped_append_ticket_event(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRecordPath>,
+    Json(request): Json<BrowserAppendTicketEventRequest>,
+) -> ApiResult<Json<TicketDetail>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let mut event = NewTicketEvent::new(request.role.into(), request.body);
+    event.author = request.author;
+    browser_ticket_backend(&api)?
+        .add_event(TicketIdOrSlug::Id(path.id.clone()), event)
+        .map_err(Error::from)?;
+    browser_ticket_detail(&api, &path.id)
+}
+
+async fn scoped_review_ticket(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRecordPath>,
+    Json(request): Json<BrowserReviewTicketRequest>,
+) -> ApiResult<Json<TicketDetail>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    browser_ticket_backend(&api)?
+        .review(
+            TicketIdOrSlug::Id(path.id.clone()),
+            TicketReview {
+                result: request.result,
+                body: MarkdownText::new(request.body),
+                author: request.author,
+            },
+        )
+        .map_err(Error::from)?;
+    browser_ticket_detail(&api, &path.id)
+}
+
+async fn scoped_queue_ticket(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRecordPath>,
+    Json(request): Json<BrowserQueueTicketRequest>,
+) -> ApiResult<Json<TicketDetail>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let queued_by = request.queued_by.as_deref().unwrap_or("web");
+    browser_ticket_backend(&api)?
+        .queue_ready(TicketIdOrSlug::Id(path.id.clone()), queued_by)
+        .map_err(Error::from)?;
+    browser_ticket_detail(&api, &path.id)
+}
+
+async fn scoped_close_ticket(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRecordPath>,
+    Json(request): Json<BrowserCloseTicketRequest>,
+) -> ApiResult<Json<TicketDetail>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    browser_ticket_backend(&api)?
+        .close(
+            TicketIdOrSlug::Id(path.id.clone()),
+            MarkdownText::new(request.resolution),
+        )
+        .map_err(Error::from)?;
+    browser_ticket_detail(&api, &path.id)
 }
 
 async fn scoped_ticket_backend_operation(
@@ -4329,19 +4571,35 @@ async fn create_workspace_worker(
             },
         )
         .map_err(|err| err.into_error())?;
+    Ok(Json(record_browser_worker_spawn(
+        &api,
+        request.runtime_id,
+        display_name,
+        selected_working_directory_id,
+        result,
+    )?))
+}
+
+fn record_browser_worker_spawn(
+    api: &WorkspaceApi,
+    requested_runtime_id: String,
+    display_name: String,
+    selected_working_directory_id: Option<String>,
+    result: WorkerSpawnResult,
+) -> ApiResult<BrowserCreateWorkerResponse> {
     if result.state != WorkerOperationState::Accepted {
         return Err(worker_create_not_accepted_error(
-            request.runtime_id.clone(),
+            requested_runtime_id.clone(),
             result.diagnostics,
         ));
     }
     let worker = result.worker.ok_or_else(|| Error::RuntimeOperationFailed {
-        runtime_id: request.runtime_id.clone(),
+        runtime_id: requested_runtime_id,
         code: "workspace_worker_create_missing_summary".to_string(),
         message: "Runtime completed worker creation without returning a Worker summary".to_string(),
     })?;
     let worker_record = record_worker_summary(
-        &api,
+        api,
         &worker,
         display_name.as_str(),
         worker.profile.clone(),
@@ -4349,13 +4607,9 @@ async fn create_workspace_worker(
     )?;
     if let Some(working_directory) = worker.working_directory.as_ref() {
         let workdir_record =
-            workdir_record_from_summary(&api, worker.runtime_id.as_str(), working_directory);
+            workdir_record_from_summary(api, worker.runtime_id.as_str(), working_directory);
         api.store.upsert_workdir_registry(&workdir_record)?;
-        link_worker_to_workdir(
-            &api,
-            &worker_record,
-            &working_directory.working_directory_id,
-        )?;
+        link_worker_to_workdir(api, &worker_record, &working_directory.working_directory_id)?;
     }
     if let Some(workdir_id) = selected_working_directory_id.as_deref() {
         if api
@@ -4370,7 +4624,7 @@ async fn create_workspace_worker(
             {
                 if let Some(status) = result.working_directory {
                     let record = workdir_record_from_summary(
-                        &api,
+                        api,
                         worker.runtime_id.as_str(),
                         &status.summary,
                     );
@@ -4383,7 +4637,7 @@ async fn create_workspace_worker(
             .get_workdir_registry(&api.config.workspace_id, workdir_id)?
             .is_some()
         {
-            link_worker_to_workdir(&api, &worker_record, workdir_id)?;
+            link_worker_to_workdir(api, &worker_record, workdir_id)?;
         }
     }
     let runtime_id = worker.runtime_id.clone();
@@ -4395,14 +4649,14 @@ async fn create_workspace_worker(
         encode_path_segment(&runtime_id),
         encode_path_segment(&worker_id)
     );
-    Ok(Json(BrowserCreateWorkerResponse {
+    Ok(BrowserCreateWorkerResponse {
         workspace_id,
         runtime_id,
         worker_id,
         console_href,
         worker,
         diagnostics: result.diagnostics,
-    }))
+    })
 }
 
 async fn post_internal_runtime_resource_fetch(
@@ -6749,6 +7003,7 @@ fn workspace_id_mismatch_error() -> ApiError {
     )
 }
 
+#[derive(Debug)]
 struct ApiError {
     error: Error,
     diagnostics: Vec<RuntimeDiagnostic>,
@@ -6761,6 +7016,22 @@ impl From<Error> for ApiError {
                 code: code.clone(),
                 severity: DiagnosticSeverity::Error,
                 message: sanitize_backend_error(message),
+            }],
+            Error::Ticket(ticket_error) => vec![RuntimeDiagnostic {
+                code: match ticket_error {
+                    ticket::TicketError::NotFound(_) => "ticket_not_found",
+                    ticket::TicketError::Ambiguous { .. } => "ticket_ambiguous",
+                    ticket::TicketError::Locked { .. } => "ticket_locked",
+                    ticket::TicketError::Conflict(_) => "ticket_conflict",
+                    ticket::TicketError::InvalidPathComponent(_)
+                    | ticket::TicketError::PathEscapesRoot { .. } => "invalid_ticket_request",
+                    ticket::TicketError::Io { .. }
+                    | ticket::TicketError::Parse { .. }
+                    | ticket::TicketError::Sqlite(_) => "ticket_backend_error",
+                }
+                .to_string(),
+                severity: DiagnosticSeverity::Error,
+                message: sanitize_backend_error(&ticket_error.to_string()),
             }],
             _ => Vec::new(),
         };
@@ -6778,6 +7049,16 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.error {
             Error::InvalidRuntimeIdentifier { .. } => StatusCode::BAD_REQUEST,
+            Error::Ticket(ticket::TicketError::NotFound(_)) => StatusCode::NOT_FOUND,
+            Error::Ticket(
+                ticket::TicketError::Ambiguous { .. }
+                | ticket::TicketError::Locked { .. }
+                | ticket::TicketError::Conflict(_),
+            ) => StatusCode::CONFLICT,
+            Error::Ticket(
+                ticket::TicketError::InvalidPathComponent(_)
+                | ticket::TicketError::PathEscapesRoot { .. },
+            ) => StatusCode::BAD_REQUEST,
             Error::InvalidRecordId(_)
             | Error::MissingFrontmatter(_)
             | Error::UnknownHost(_)
@@ -6895,6 +7176,21 @@ mod tests {
     const TEST_WORKSPACE_ID: &str = "0192f0e8-4d84-7d6e-a000-000000000001";
     const TEST_REPOSITORY_ID: &str = "main";
     const TEST_CREATED_AT: &str = "2026-06-23T06:43:28Z";
+
+    #[test]
+    fn ticket_api_errors_preserve_http_status() {
+        let not_found = ApiError::from(Error::Ticket(ticket::TicketError::NotFound(
+            "0000000000000".to_string(),
+        )))
+        .into_response();
+        assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+
+        let conflict = ApiError::from(Error::Ticket(ticket::TicketError::Conflict(
+            "invalid transition".to_string(),
+        )))
+        .into_response();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    }
 
     #[test]
     fn backend_worker_projection_preserves_missing_rows_links_and_redacts_paths() {
@@ -7667,6 +7963,127 @@ mod tests {
                 .unwrap();
             assert!(status.success());
         }
+    }
+
+    #[tokio::test]
+    async fn ticket_browser_endpoints_mutate_typed_backend_and_return_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let Json(created) = scoped_ticket_backend_operation(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            Json(TicketBackendOperation::Create {
+                input: ticket::NewTicket::new("Browser Ticket API"),
+            }),
+        )
+        .await
+        .unwrap();
+        let ticket_id = match created {
+            TicketBackendHttpResponse::Ok {
+                result: ticket::TicketBackendOperationResult::TicketRef(ticket_ref),
+            } => ticket_ref.id,
+            other => panic!("unexpected create response: {other:?}"),
+        };
+        let path = || ScopedRecordPath {
+            workspace_id: TEST_WORKSPACE_ID.to_string(),
+            id: ticket_id.clone(),
+        };
+
+        let Json(edited) = scoped_edit_ticket_item(
+            State(api.clone()),
+            AxumPath(path()),
+            Json(BrowserEditTicketRequest {
+                title: Some("Browser Ticket API edited".to_string()),
+                body: Some("Updated from the Browser API.".to_string()),
+                old_string: None,
+                new_string: None,
+                replace_all: false,
+                target: Some(TicketTargetEdit::Set {
+                    repository_id: "main".to_string(),
+                    ref_selector: Some("feature/api".to_string()),
+                }),
+                author: Some("browser-user".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(edited.title, "Browser Ticket API edited");
+        assert_eq!(edited.body, "Updated from the Browser API.");
+        assert_eq!(edited.repository_id.as_deref(), Some("main"));
+        assert_eq!(edited.ref_selector.as_deref(), Some("feature/api"));
+
+        let Json(commented) = scoped_append_ticket_event(
+            State(api.clone()),
+            AxumPath(path()),
+            Json(BrowserAppendTicketEventRequest {
+                role: BrowserTicketThreadRole::Comment,
+                body: "API comment".to_string(),
+                author: Some("browser-user".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(commented.events.iter().any(|event| {
+            event.kind == "comment" && event.body.as_deref() == Some("API comment")
+        }));
+
+        let Json(ready) = scoped_transition_ticket_state(
+            State(api.clone()),
+            AxumPath(path()),
+            Json(BrowserTransitionTicketStateRequest {
+                state: TicketWorkflowState::Ready,
+                reason: Some("intake complete".to_string()),
+                body: Some("Ready for queue".to_string()),
+                author: Some("browser-user".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ready.state, "ready");
+
+        let Json(queued) = scoped_queue_ticket(
+            State(api.clone()),
+            AxumPath(path()),
+            Json(BrowserQueueTicketRequest {
+                queued_by: Some("browser-user".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(queued.state, "queued");
+        assert_eq!(queued.queued_by.as_deref(), Some("browser-user"));
+
+        let Json(reviewed) = scoped_review_ticket(
+            State(api.clone()),
+            AxumPath(path()),
+            Json(BrowserReviewTicketRequest {
+                result: TicketReviewResult::Approve,
+                body: "API review".to_string(),
+                author: Some("reviewer".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(reviewed.events.iter().any(|event| {
+            event.kind == "review" && event.body.as_deref() == Some("API review")
+        }));
+
+        let Json(closed) = scoped_close_ticket(
+            State(api),
+            AxumPath(path()),
+            Json(BrowserCloseTicketRequest {
+                resolution: "Closed through the Browser API.".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(closed.state, "closed");
+        assert_eq!(
+            closed.resolution.as_deref(),
+            Some("Closed through the Browser API.")
+        );
     }
 
     #[tokio::test]

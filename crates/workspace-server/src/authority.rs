@@ -10,7 +10,7 @@ use ticket::{
 
 use crate::records::{
     ObjectiveDetail, ObjectiveResourceSummary, ObjectiveSummary, ProjectRecordList, TicketDetail,
-    TicketSummary, summarize_body, truncate_body, validate_project_id,
+    TicketEventDetail, TicketSummary, summarize_body, truncate_body, validate_project_id,
 };
 use crate::store::{
     ControlPlaneStore, MemoryDocumentRecord, MemoryStagingRecord, MemoryStagingResolutionRecord,
@@ -19,6 +19,8 @@ use crate::store::{
 use crate::{Error, Result};
 
 const DETAIL_BODY_LIMIT: usize = 64 * 1024;
+const TICKET_EVENT_LIMIT: usize = 100;
+const TICKET_EVENT_BODY_LIMIT: usize = 16 * 1024;
 const DEFAULT_MEMORY_DOCUMENT_BODY: &str = "# Memory\n\n";
 const RECORD_SOURCE_WORKSPACE_SQLITE: &str = "workspace-sqlite";
 
@@ -244,6 +246,25 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
             .show(TicketIdOrSlug::Id(id.to_string()))?;
         let (body, body_truncated) =
             truncate_body(ticket.document.body.as_str(), DETAIL_BODY_LIMIT);
+        let event_start = ticket.events.len().saturating_sub(TICKET_EVENT_LIMIT);
+        let events = ticket.events[event_start..]
+            .iter()
+            .enumerate()
+            .map(|(index, event)| TicketEventDetail {
+                sequence: event_start + index,
+                kind: event.kind.as_str().to_owned(),
+                author: event.author.clone(),
+                at: event.at.clone(),
+                status: event.status.clone(),
+                from: event.from.clone(),
+                to: event.to.clone(),
+                reason: event.reason.clone(),
+                state_field: event.state_field.clone(),
+                heading: event.heading.clone(),
+                body: (!event.body.as_str().is_empty())
+                    .then(|| truncate_body(event.body.as_str(), TICKET_EVENT_BODY_LIMIT).0),
+            })
+            .collect();
         Ok(TicketDetail {
             id: ticket.meta.id,
             title: ticket.meta.title,
@@ -253,11 +274,22 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
             updated_at: ticket.meta.updated_at,
             queued_by: ticket.meta.queued_by,
             queued_at: ticket.meta.queued_at,
+            repository_id: ticket.meta.repository_id,
+            ref_selector: ticket.meta.ref_selector,
             risk_flags: ticket.meta.risk_flags,
             body,
             body_truncated,
             event_count: ticket.events.len(),
+            events,
             artifact_count: ticket.artifacts.len(),
+            artifacts: ticket
+                .artifacts
+                .into_iter()
+                .map(|artifact| artifact.relative_path.display().to_string())
+                .collect(),
+            resolution: ticket
+                .resolution
+                .map(|resolution| resolution.as_str().to_string()),
             record_source: "sqlite_yoi_ticket".to_string(),
         })
     }

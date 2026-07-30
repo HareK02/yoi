@@ -495,6 +495,8 @@ pub struct NewTicket {
     pub workflow_state: Option<TicketWorkflowState>,
     pub queued_by: Option<String>,
     pub queued_at: Option<String>,
+    pub repository_id: Option<String>,
+    pub ref_selector: Option<String>,
 }
 
 impl NewTicket {
@@ -513,8 +515,49 @@ impl NewTicket {
             workflow_state: None,
             queued_by: None,
             queued_at: None,
+            repository_id: None,
+            ref_selector: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum TicketTargetEdit {
+    Set {
+        repository_id: String,
+        ref_selector: Option<String>,
+    },
+    Clear,
+}
+
+impl TicketTargetEdit {
+    fn validate(&self) -> Result<()> {
+        if let Self::Set {
+            repository_id,
+            ref_selector,
+        } = self
+        {
+            validate_ticket_target(Some(repository_id), ref_selector.as_deref())?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_ticket_target(repository_id: Option<&str>, ref_selector: Option<&str>) -> Result<()> {
+    let Some(repository_id) = repository_id else {
+        if ref_selector.is_some() {
+            return Err(TicketError::Conflict(
+                "ref_selector requires repository_id".to_string(),
+            ));
+        }
+        return Ok(());
+    };
+    validate_required_event_value("repository_id", repository_id)?;
+    if let Some(ref_selector) = ref_selector {
+        validate_required_event_value("ref_selector", ref_selector)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -525,6 +568,7 @@ pub struct TicketItemEdit {
     pub body: Option<MarkdownText>,
     #[serde(default)]
     pub body_replacement: Option<TicketBodyReplacement>,
+    pub target: Option<TicketTargetEdit>,
     pub author: Option<String>,
 }
 
@@ -560,12 +604,18 @@ impl TicketItemEdit {
         if let Some(replacement) = &self.body_replacement {
             replacement.validate()?;
         }
+        if let Some(target) = &self.target {
+            target.validate()?;
+        }
 
         Ok(())
     }
 
     fn has_changes(&self) -> bool {
-        self.title.is_some() || self.body.is_some() || self.body_replacement.is_some()
+        self.title.is_some()
+            || self.body.is_some()
+            || self.body_replacement.is_some()
+            || self.target.is_some()
     }
 }
 
@@ -1373,6 +1423,8 @@ pub struct TicketMeta {
     pub workflow_state_explicit: bool,
     pub queued_by: Option<String>,
     pub queued_at: Option<String>,
+    pub repository_id: Option<String>,
+    pub ref_selector: Option<String>,
     pub raw: BTreeMap<String, String>,
 }
 
@@ -2298,6 +2350,8 @@ CREATE TABLE IF NOT EXISTS typed_tickets (
     queued_by TEXT,
     queued_at TEXT,
     resolution TEXT,
+    repository_id TEXT,
+    ref_selector TEXT,
     PRIMARY KEY (workspace_id, ticket_id)
 );
 CREATE TABLE IF NOT EXISTS typed_ticket_labels (
@@ -2368,7 +2422,11 @@ CREATE TABLE IF NOT EXISTS typed_ticket_artifacts (
     PRIMARY KEY (workspace_id, ticket_id, relative_path),
     FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
 );
-"#).map_err(sqlite_err)
+"#)
+        .map_err(sqlite_err)?;
+        ensure_sqlite_ticket_column(conn, "repository_id", "TEXT")?;
+        ensure_sqlite_ticket_column(conn, "ref_selector", "TEXT")?;
+        Ok(())
     }
 
     fn with_write<R>(&self, op: impl FnOnce(&Connection) -> Result<R>) -> Result<R> {
@@ -2475,9 +2533,9 @@ CREATE TABLE IF NOT EXISTS typed_ticket_artifacts (
 
     fn insert_ticket(&self, conn: &Connection, ticket: &Ticket) -> Result<()> {
         conn.execute(r#"INSERT INTO typed_tickets
-            (workspace_id, ticket_id, slug, title, status, kind, priority, body, created_at, updated_at, assignee, readiness, workflow_state, workflow_state_explicit, queued_by, queued_at, resolution)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"#,
-            params![self.workspace_id, ticket.meta.id, ticket.meta.slug, ticket.meta.title, ticket.meta.status.as_str(), ticket.meta.kind, ticket.meta.priority, ticket.document.body.as_str(), ticket.meta.created_at, ticket.meta.updated_at, ticket.meta.assignee, ticket.meta.readiness, ticket.meta.workflow_state.as_str(), if ticket.meta.workflow_state_explicit { 1 } else { 0 }, ticket.meta.queued_by, ticket.meta.queued_at, ticket.resolution.as_ref().map(|body| body.as_str())]
+            (workspace_id, ticket_id, slug, title, status, kind, priority, body, created_at, updated_at, assignee, readiness, workflow_state, workflow_state_explicit, queued_by, queued_at, resolution, repository_id, ref_selector)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)"#,
+            params![self.workspace_id, ticket.meta.id, ticket.meta.slug, ticket.meta.title, ticket.meta.status.as_str(), ticket.meta.kind, ticket.meta.priority, ticket.document.body.as_str(), ticket.meta.created_at, ticket.meta.updated_at, ticket.meta.assignee, ticket.meta.readiness, ticket.meta.workflow_state.as_str(), if ticket.meta.workflow_state_explicit { 1 } else { 0 }, ticket.meta.queued_by, ticket.meta.queued_at, ticket.resolution.as_ref().map(|body| body.as_str()), ticket.meta.repository_id, ticket.meta.ref_selector]
         ).map_err(sqlite_err)?;
         self.insert_ordered_values(
             conn,
@@ -2565,12 +2623,14 @@ CREATE TABLE IF NOT EXISTS typed_ticket_artifacts (
             workflow_state_explicit: row.get::<_, i64>(13)? != 0,
             queued_by: row.get(14)?,
             queued_at: row.get(15)?,
+            repository_id: row.get(16)?,
+            ref_selector: row.get(17)?,
             raw: BTreeMap::new(),
         })
     }
 
     fn load_ticket(&self, conn: &Connection, ticket_id: &str) -> Result<Ticket> {
-        let (mut meta, body, resolution): (TicketMeta, String, Option<String>) = conn.query_row(r#"SELECT ticket_id, slug, title, status, kind, priority, created_at, updated_at, assignee, readiness, body, resolution, workflow_state, workflow_state_explicit, queued_by, queued_at FROM typed_tickets WHERE workspace_id = ?1 AND ticket_id = ?2"#,
+        let (mut meta, body, resolution): (TicketMeta, String, Option<String>) = conn.query_row(r#"SELECT ticket_id, slug, title, status, kind, priority, created_at, updated_at, assignee, readiness, body, resolution, workflow_state, workflow_state_explicit, queued_by, queued_at, repository_id, ref_selector FROM typed_tickets WHERE workspace_id = ?1 AND ticket_id = ?2"#,
             params![self.workspace_id, ticket_id], |row| Ok((Self::ticket_meta_from_row(row)?, row.get(10)?, row.get(11)?))).optional().map_err(sqlite_err)?.ok_or_else(|| TicketError::NotFound(ticket_id.to_string()))?;
         meta.labels = self.load_ordered_values(conn, "typed_ticket_labels", "label", ticket_id)?;
         meta.risk_flags =
@@ -2733,7 +2793,7 @@ CREATE TABLE IF NOT EXISTS typed_ticket_artifacts (
         conn: &Connection,
         filter: TicketListQuery,
     ) -> Result<Vec<TicketSummary>> {
-        let mut stmt = conn.prepare(r#"SELECT ticket_id, slug, title, status, kind, priority, created_at, updated_at, assignee, readiness, body, resolution, workflow_state, workflow_state_explicit, queued_by, queued_at FROM typed_tickets WHERE workspace_id = ?1 ORDER BY ticket_id ASC"#).map_err(sqlite_err)?;
+        let mut stmt = conn.prepare(r#"SELECT ticket_id, slug, title, status, kind, priority, created_at, updated_at, assignee, readiness, body, resolution, workflow_state, workflow_state_explicit, queued_by, queued_at, repository_id, ref_selector FROM typed_tickets WHERE workspace_id = ?1 ORDER BY ticket_id ASC"#).map_err(sqlite_err)?;
         let rows = stmt
             .query_map(params![self.workspace_id], Self::ticket_meta_from_row)
             .map_err(sqlite_err)?;
@@ -2806,6 +2866,30 @@ CREATE TABLE IF NOT EXISTS typed_ticket_artifacts (
     }
 }
 
+fn ensure_sqlite_ticket_column(
+    conn: &rusqlite::Connection,
+    name: &str,
+    sql_type: &str,
+) -> Result<()> {
+    let mut statement = conn
+        .prepare("PRAGMA table_info(typed_tickets)")
+        .map_err(sqlite_err)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(sqlite_err)?;
+    for column in columns {
+        if column.map_err(sqlite_err)? == name {
+            return Ok(());
+        }
+    }
+    conn.execute(
+        format!("ALTER TABLE typed_tickets ADD COLUMN {name} {sql_type}").as_str(),
+        [],
+    )
+    .map_err(sqlite_err)?;
+    Ok(())
+}
+
 fn finish_sqlite_transaction<R>(conn: &Connection, result: Result<R>) -> Result<R> {
     match result {
         Ok(output) => {
@@ -2865,6 +2949,10 @@ impl TicketBackend for SqliteTicketBackend {
                     "ticket title must not be empty".to_string(),
                 ));
             }
+            validate_ticket_target(
+                input.repository_id.as_deref(),
+                input.ref_selector.as_deref(),
+            )?;
             let base_millis = unix_epoch_millis_now().map_err(|err| {
                 TicketError::Conflict(format!("failed to read ticket id timestamp: {err}"))
             })?;
@@ -2900,6 +2988,8 @@ impl TicketBackend for SqliteTicketBackend {
                 workflow_state_explicit: true,
                 queued_by: input.queued_by,
                 queued_at: input.queued_at,
+                repository_id: input.repository_id,
+                ref_selector: input.ref_selector,
                 raw: BTreeMap::new(),
             };
             let body = if input.body.as_str() == DEFAULT_TICKET_BODY {
@@ -2948,7 +3038,7 @@ impl TicketBackend for SqliteTicketBackend {
             edit.validate_body_edit_request()?;
             if !edit.has_changes() {
                 return Err(TicketError::Conflict(
-                    "TicketEditItem requires at least one of title, body, or body_replacement"
+                    "TicketEditItem requires at least one of title, body, body_replacement, or target"
                         .to_string(),
                 ));
             }
@@ -2986,6 +3076,20 @@ impl TicketBackend for SqliteTicketBackend {
             if let Some(body) = updated_body.as_ref() {
                 conn.execute("UPDATE typed_tickets SET body = ?3, updated_at = ?4 WHERE workspace_id = ?1 AND ticket_id = ?2", params![self.workspace_id, ticket_id, body.as_str(), now]).map_err(sqlite_err)?;
             }
+            if let Some(target) = edit.target.as_ref() {
+                let (repository_id, ref_selector) = match target {
+                    TicketTargetEdit::Set {
+                        repository_id,
+                        ref_selector,
+                    } => (Some(repository_id.as_str()), ref_selector.as_deref()),
+                    TicketTargetEdit::Clear => (None, None),
+                };
+                conn.execute(
+                    "UPDATE typed_tickets SET repository_id = ?3, ref_selector = ?4, updated_at = ?5 WHERE workspace_id = ?1 AND ticket_id = ?2",
+                    params![self.workspace_id, ticket_id, repository_id, ref_selector, now],
+                )
+                .map_err(sqlite_err)?;
+            }
 
             let mut changes = Vec::new();
             if edit.title.is_some() {
@@ -2993,6 +3097,9 @@ impl TicketBackend for SqliteTicketBackend {
             }
             if !matches!(body_edit_audit, TicketBodyEditAudit::None) {
                 changes.push("body");
+            }
+            if edit.target.is_some() {
+                changes.push("target");
             }
             let mut attributes = BTreeMap::new();
             attributes.insert("changes".to_string(), changes.join(","));
@@ -3305,6 +3412,10 @@ impl TicketBackend for LocalTicketBackend {
                 "ticket title must not be empty".to_string(),
             ));
         }
+        validate_ticket_target(
+            input.repository_id.as_deref(),
+            input.ref_selector.as_deref(),
+        )?;
         let base_millis = unix_epoch_millis_now().map_err(|err| {
             TicketError::Conflict(format!("failed to read ticket id timestamp: {err}"))
         })?;
@@ -3375,6 +3486,18 @@ impl TicketBackend for LocalTicketBackend {
                 format_yaml_string_scalar(queued_at.as_str()),
             ));
         }
+        if let Some(repository_id) = input.repository_id {
+            fields.push((
+                "repository_id".to_string(),
+                format_yaml_string_scalar(repository_id.as_str()),
+            ));
+        }
+        if let Some(ref_selector) = input.ref_selector {
+            fields.push((
+                "ref_selector".to_string(),
+                format_yaml_string_scalar(ref_selector.as_str()),
+            ));
+        }
         let item_body = if input.body.as_str() == DEFAULT_TICKET_BODY {
             self.generated_default_body()
         } else {
@@ -3426,6 +3549,48 @@ impl TicketBackend for LocalTicketBackend {
                 }
             })?;
         }
+        if let Some(target) = edit.target.as_ref() {
+            match target {
+                TicketTargetEdit::Set {
+                    repository_id,
+                    ref_selector,
+                } => {
+                    content = replace_frontmatter_fields(
+                        &content,
+                        &[("repository_id", repository_id.as_str())],
+                    )
+                    .map_err(|message| TicketError::Parse {
+                        path: item.clone(),
+                        message,
+                    })?;
+                    if let Some(ref_selector) = ref_selector {
+                        content = replace_frontmatter_fields(
+                            &content,
+                            &[("ref_selector", ref_selector.as_str())],
+                        )
+                        .map_err(|message| TicketError::Parse {
+                            path: item.clone(),
+                            message,
+                        })?;
+                    } else {
+                        content = remove_frontmatter_fields(&content, &["ref_selector"]).map_err(
+                            |message| TicketError::Parse {
+                                path: item.clone(),
+                                message,
+                            },
+                        )?;
+                    }
+                }
+                TicketTargetEdit::Clear => {
+                    content =
+                        remove_frontmatter_fields(&content, &["repository_id", "ref_selector"])
+                            .map_err(|message| TicketError::Parse {
+                                path: item.clone(),
+                                message,
+                            })?;
+                }
+            }
+        }
         if let Some(body) = edit.body.as_ref() {
             content = replace_item_body(&content, body.as_str()).map_err(|message| {
                 TicketError::Parse {
@@ -3460,6 +3625,9 @@ impl TicketBackend for LocalTicketBackend {
         }
         if !matches!(body_edit_audit, TicketBodyEditAudit::None) {
             changes.push("body");
+        }
+        if edit.target.is_some() {
+            changes.push("target");
         }
         let mut attrs = Vec::new();
         attrs.push(("changes", changes.join(",")));
@@ -4104,6 +4272,8 @@ struct TicketItemFrontmatter {
     state_explicit: bool,
     queued_by: Option<String>,
     queued_at: Option<String>,
+    repository_id: Option<String>,
+    ref_selector: Option<String>,
     raw: BTreeMap<String, String>,
 }
 
@@ -4211,6 +4381,8 @@ fn parse_ticket_frontmatter(content: &str) -> std::result::Result<TicketItemFron
         state_explicit,
         queued_by: yaml_string(&mapping, "queued_by")?,
         queued_at: yaml_string(&mapping, "queued_at")?,
+        repository_id: yaml_string(&mapping, "repository_id")?,
+        ref_selector: yaml_string(&mapping, "ref_selector")?,
         raw,
     })
 }
@@ -4340,6 +4512,8 @@ fn ticket_meta(frontmatter: TicketItemFrontmatter, id: String) -> TicketMeta {
         workflow_state_explicit: frontmatter.state_explicit,
         queued_by: frontmatter.queued_by,
         queued_at: frontmatter.queued_at,
+        repository_id: frontmatter.repository_id,
+        ref_selector: frontmatter.ref_selector,
         raw: frontmatter.raw,
     }
 }
@@ -5032,6 +5206,37 @@ fn replace_frontmatter_fields(
     Ok(out)
 }
 
+fn remove_frontmatter_fields(
+    content: &str,
+    fields: &[&str],
+) -> std::result::Result<String, String> {
+    let mut lines: Vec<String> = content.lines().map(ToOwned::to_owned).collect();
+    if lines.first().map(String::as_str) != Some("---") {
+        return Err("item.md missing frontmatter opener".to_string());
+    }
+    let Some(end) = lines
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find_map(|(idx, line)| (line == "---").then_some(idx))
+    else {
+        return Err("item.md missing frontmatter closer".to_string());
+    };
+    for index in (1..end).rev() {
+        let should_remove = lines[index]
+            .split_once(':')
+            .is_some_and(|(key, _)| fields.contains(&key.trim()));
+        if should_remove {
+            lines.remove(index);
+        }
+    }
+    let mut out = lines.join("\n");
+    if content.ends_with('\n') {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 fn replace_item_body(content: &str, body: &str) -> std::result::Result<String, String> {
     let mut lines = content.lines();
     if lines.next() != Some("---") {
@@ -5692,6 +5897,56 @@ mod tests {
         LocalTicketBackend::new(dir.path().join("tickets"))
     }
 
+    fn assert_ticket_target_edit_semantics<B: TicketBackend>(backend: &B) {
+        let mut input = NewTicket::new("Target Ticket");
+        input.repository_id = Some("main".to_string());
+        input.ref_selector = Some("feature/api".to_string());
+        let created = backend.create(input).unwrap();
+        let ticket = backend
+            .show(TicketIdOrSlug::Id(created.id.clone()))
+            .unwrap();
+        assert_eq!(ticket.meta.repository_id.as_deref(), Some("main"));
+        assert_eq!(ticket.meta.ref_selector.as_deref(), Some("feature/api"));
+
+        let edited = backend
+            .edit_item(
+                TicketIdOrSlug::Id(created.id.clone()),
+                TicketItemEdit {
+                    target: Some(TicketTargetEdit::Set {
+                        repository_id: "secondary".to_string(),
+                        ref_selector: None,
+                    }),
+                    author: Some("tester".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(edited.meta.repository_id.as_deref(), Some("secondary"));
+        assert_eq!(edited.meta.ref_selector, None);
+        let edit_event = edited
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.kind == TicketEventKind::Other("item_edit".to_string()))
+            .expect("item_edit event");
+        assert_eq!(
+            edit_event.attributes.get("changes"),
+            Some(&"target".to_string())
+        );
+
+        let cleared = backend
+            .edit_item(
+                TicketIdOrSlug::Id(created.id),
+                TicketItemEdit {
+                    target: Some(TicketTargetEdit::Clear),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(cleared.meta.repository_id, None);
+        assert_eq!(cleared.meta.ref_selector, None);
+    }
+
     fn assert_partial_body_replacement_semantics<B: TicketBackend>(backend: &B) {
         let mut input = NewTicket::new("Body Edit Ticket");
         input.body = MarkdownText::new("alpha\nbeta\nalpha\n");
@@ -6090,6 +6345,38 @@ state: planning
         assert!(record.meta.workflow_state_explicit);
         let report = backend.doctor().unwrap();
         assert!(report.is_ok(), "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn local_backend_persists_and_edits_ticket_target() {
+        let tmp = TempDir::new().unwrap();
+        let backend = backend(&tmp);
+        assert_ticket_target_edit_semantics(&backend);
+    }
+
+    #[test]
+    fn sqlite_backend_persists_and_edits_ticket_target() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteTicketBackend::new(tmp.path().join("workspace.db"), "workspace-test");
+        assert_ticket_target_edit_semantics(&backend);
+    }
+
+    #[test]
+    fn sqlite_ticket_target_columns_are_added_to_existing_table() {
+        let tmp = TempDir::new().unwrap();
+        let conn = rusqlite::Connection::open(tmp.path().join("workspace.db")).unwrap();
+        conn.execute_batch("CREATE TABLE typed_tickets (ticket_id TEXT PRIMARY KEY);")
+            .unwrap();
+        ensure_sqlite_ticket_column(&conn, "repository_id", "TEXT").unwrap();
+        ensure_sqlite_ticket_column(&conn, "ref_selector", "TEXT").unwrap();
+        let mut statement = conn.prepare("PRAGMA table_info(typed_tickets)").unwrap();
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "repository_id"));
+        assert!(columns.iter().any(|column| column == "ref_selector"));
     }
 
     #[test]

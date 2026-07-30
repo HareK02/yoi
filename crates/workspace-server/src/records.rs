@@ -41,12 +41,32 @@ pub struct TicketDetail {
     pub updated_at: Option<String>,
     pub queued_by: Option<String>,
     pub queued_at: Option<String>,
+    pub repository_id: Option<String>,
+    pub ref_selector: Option<String>,
     pub risk_flags: Vec<String>,
     pub body: String,
     pub body_truncated: bool,
     pub event_count: usize,
+    pub events: Vec<TicketEventDetail>,
     pub artifact_count: usize,
+    pub artifacts: Vec<String>,
+    pub resolution: Option<String>,
     pub record_source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TicketEventDetail {
+    pub sequence: usize,
+    pub kind: String,
+    pub author: Option<String>,
+    pub at: Option<String>,
+    pub status: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub reason: Option<String>,
+    pub state_field: Option<String>,
+    pub heading: Option<String>,
+    pub body: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
