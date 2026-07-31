@@ -272,7 +272,6 @@
       <h1 id="new-worker-heading">New Worker</h1>
       <p>Create a Worker on a selected Runtime. Workdir-less conversation Workers are only available on embedded Runtime.</p>
     </div>
-    <a class="secondary-link" href={`/w/${workspaceId}`}>Back to workspace</a>
   </header>
 
   {#if ticketContext}

@@ -2,6 +2,7 @@
   import { page } from '$app/state';
   import { setContext } from 'svelte';
   import WorkspaceAlerts from '$lib/workspace/alerts/WorkspaceAlerts.svelte';
+  import { provideHeaderController, type HeaderController } from '$lib/workspace/header/context';
   import GlobalSidebar from '$lib/workspace/sidebar/GlobalSidebar.svelte';
   import SidebarFrame from '$lib/workspace/sidebar/SidebarFrame.svelte';
   import { SIDEBAR_CONTEXT, type SidebarSnippet } from '$lib/workspace/sidebar/context';
@@ -10,7 +11,9 @@
 
   let { children }: LayoutProps = $props();
   let sidebar = $state<SidebarSnippet | null>(null);
+  const headerController = $state<HeaderController>({ content: null });
 
+  provideHeaderController(headerController);
   setContext(SIDEBAR_CONTEXT, {
     setSidebar(snippet: SidebarSnippet) {
       sidebar = snippet;
@@ -32,6 +35,9 @@
     {/if}
   </SidebarFrame>
   <header class="workspace-topbar">
+    <div class="workspace-topbar-location">
+      {#if headerController.content}{@render headerController.content()}{/if}
+    </div>
     <nav class="workspace-topbar-actions" aria-label="Global navigation">
       <a class="topbar-icon-button" href="/account" aria-label="Open Account" title="Account">
         <svg class="topbar-icon" aria-hidden="true" viewBox="0 0 24 24">
@@ -64,13 +70,19 @@
     grid-row: 1;
     display: flex;
     align-items: center;
-    justify-content: flex-end;
+    justify-content: space-between;
+    gap: var(--space-4);
     min-width: 0;
     min-height: 3.25rem;
     padding: 0 var(--space-5);
     border-bottom: 1px solid var(--line);
     background: color-mix(in srgb, var(--bg-raised) 88%, transparent);
     backdrop-filter: blur(14px);
+  }
+
+  .workspace-topbar-location {
+    min-width: 0;
+    overflow: hidden;
   }
 
   .workspace-topbar-actions {

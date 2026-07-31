@@ -164,15 +164,10 @@
 <svelte:head><title>{ticket.title} · Yoi</title></svelte:head>
 
 <div class="workspace-page ticket-detail-page">
-  <a class="workspace-back-link" href={`/w/${encodeURIComponent(data.workspaceId)}/tickets`}>
-    ← Ticket board
-  </a>
-
   <header class="ticket-detail-header">
     <div>
       <div class="ticket-detail-kicker">
         <span class="workspace-status-pill" data-status={ticket.state}>{ticket.state}</span>
-        <code>{ticket.id}</code>
       </div>
       <h1>{ticket.title}</h1>
       <p>Updated {prettyDate(ticket.updated_at)}</p>

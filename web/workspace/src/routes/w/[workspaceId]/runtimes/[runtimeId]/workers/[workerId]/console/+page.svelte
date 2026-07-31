@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { tick } from "svelte";
+    import { tick, untrack } from "svelte";
     import ConsoleLineItem from "$lib/workspace/console/ConsoleLineItem.svelte";
     import ConsoleTimeline from "$lib/workspace/console/ConsoleTimeline.svelte";
     import { chatSubmit } from "$lib/workspace/console/chat-submit";
@@ -35,6 +35,8 @@
             workspaceId: string;
             runtimeId: string;
             workerId: string;
+            worker: Worker | null;
+            workerError: string | null;
         };
     };
 
@@ -84,9 +86,11 @@
         client: number;
     };
 
-    let worker = $state<Worker | null>(null);
-    let liveWorkerState = $state<string | null>(null);
-    let workerError = $state<string | null>(null);
+    let worker = $state<Worker | null>(untrack(() => data.worker));
+    let liveWorkerState = $state<string | null>(
+        untrack(() => data.worker?.state ?? null),
+    );
+    let workerError = $state<string | null>(untrack(() => data.workerError));
     let draft = $state("");
     let completionEntries = $state<ComposerCompletionEntry[]>([]);
     let completionToken = $state<ComposerCompletionToken | null>(null);
@@ -193,7 +197,7 @@
     }
 
     async function loadConsoleData(target: ConsoleTarget) {
-        await loadWorker(target);
+        if (!worker) await loadWorker(target);
     }
 
     function advanceReloadToken(): number {
@@ -1101,10 +1105,7 @@
 </svelte:head>
 
 <div class="console-shell worker-console-shell">
-    <section class="console-header card">
-        <div>
-            <h2>{worker?.label ?? workerId}</h2>
-        </div>
+    <section class="console-header card" aria-label="Worker controls">
         <div class="console-header-actions">
             <div
                 class="console-status-pill"
@@ -1413,7 +1414,7 @@
     .console-header {
         display: flex;
         align-items: flex-start;
-        justify-content: space-between;
+        justify-content: flex-end;
         gap: var(--space-4);
     }
 

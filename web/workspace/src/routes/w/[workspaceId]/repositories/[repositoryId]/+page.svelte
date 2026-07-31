@@ -15,7 +15,6 @@
     <div class="repository-detail-heading">
       <div>
         <h3>{data.repository.item.display_name}</h3>
-        <p><code>{data.repository.item.id}</code></p>
       </div>
       <span class="status-pill" class:warn={data.repository.item.git?.status !== 'clean'}>{data.repository.item.git?.status ?? 'not observed'}</span>
     </div>

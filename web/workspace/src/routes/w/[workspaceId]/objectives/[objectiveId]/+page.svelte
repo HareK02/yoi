@@ -42,7 +42,6 @@
     <div class="objective-title-row detail">
       <div>
         <h3>{data.objective.title}</h3>
-        <p><code>{data.objective.id}</code></p>
       </div>
       <span class="state-pill">{data.objective.state}</span>
     </div>

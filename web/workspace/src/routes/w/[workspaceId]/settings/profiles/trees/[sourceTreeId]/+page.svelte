@@ -7,7 +7,7 @@
     fetchProfileTreeFile,
     writeProfileTreeFile,
   } from '$lib/workspace/settings/profile-api';
-  import { profileSettingsHref, virtualProfilePathForCreate } from '$lib/workspace/settings/profile-routes';
+  import { virtualProfilePathForCreate } from '$lib/workspace/settings/profile-routes';
   import type { Diagnostic } from '$lib/workspace/settings/model';
   import type {
     WorkspaceProfileSourceTreeFileResponse,
@@ -122,10 +122,8 @@
 <section class="card settings-section" aria-labelledby="profile-tree-title">
   <header class="settings-section-header">
     <div>
-      <p class="eyebrow">Profile source tree</p>
-      <h2 id="profile-tree-title">{sourceTreeId}</h2>
+      <h2 id="profile-tree-title">Profile source tree</h2>
     </div>
-    <a href={profileSettingsHref(workspaceId)}>Back to profiles</a>
   </header>
 
   {#if loading}
