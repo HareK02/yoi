@@ -2161,6 +2161,8 @@ mod tests {
         request.workspace_api = Some(WorkspaceApiRef {
             workspace_id: workspace_id.to_string(),
             base_url: format!("https://workspace.example/{workspace_id}"),
+            runtime_id: None,
+            access_token: None,
         });
         request
     }

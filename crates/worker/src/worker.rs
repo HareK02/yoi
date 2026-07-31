@@ -143,77 +143,296 @@ pub enum WorkspaceIdError {
     Empty,
 }
 
-/// Narrow path-free workspace API handle injected by Runtime/host code.
-///
-/// This is deliberately not a filesystem authority surface. A Worker may have a
-/// workspace client without local filesystem authority, or neither. Local
-/// path-backed implementations are represented only as a capability marker here;
-/// the actual paths remain under [`WorkerFilesystemAuthority::Local`] or in host
-/// adapter code.
+/// One authority-bound operation sent through the Runtime-supplied Workspace client.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorkspaceClient {
-    /// Runtime/host supplied an HTTP workspace API endpoint.
-    Http {
-        workspace_id: String,
-        base_url: String,
-    },
-    /// Runtime/host supplied a workspace API handle. The string is an opaque
-    /// diagnostic/backend kind, not an endpoint, path, or secret-bearing value.
-    Available { kind: String },
-    /// Workspace-aware operations must fail closed or stay disabled.
-    Unavailable { reason: String },
+pub struct WorkspaceRequest {
+    pub method: WorkspaceRequestMethod,
+    pub path: String,
+    pub body: Option<String>,
 }
 
-impl WorkspaceClient {
-    pub fn available(kind: impl Into<String>) -> Self {
-        Self::Available { kind: kind.into() }
+impl WorkspaceRequest {
+    pub fn get(path: impl Into<String>) -> Self {
+        Self {
+            method: WorkspaceRequestMethod::Get,
+            path: path.into(),
+            body: None,
+        }
     }
 
-    pub fn http(workspace_id: impl Into<String>, base_url: impl Into<String>) -> Self {
-        Self::Http {
+    pub fn json(
+        method: WorkspaceRequestMethod,
+        path: impl Into<String>,
+        body: impl Into<String>,
+    ) -> Self {
+        Self {
+            method,
+            path: path.into(),
+            body: Some(body.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceRequestMethod {
+    Get,
+    Post,
+    Put,
+    Patch,
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceResponse {
+    pub status: u16,
+    pub body: String,
+}
+
+impl WorkspaceResponse {
+    pub fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WorkspaceClientError {
+    #[error("workspace client is unavailable: {0}")]
+    Unavailable(String),
+    #[error("workspace request path must start with '/': {0}")]
+    InvalidPath(String),
+    #[error("workspace request failed: {0}")]
+    Request(String),
+}
+
+/// Path-free Workspace operation authority injected by Runtime/host code.
+///
+/// Workers receive this trait object rather than a Backend URL. The concrete
+/// implementation is responsible for binding Runtime/Worker identity and
+/// forwarding operations to the Workspace authority.
+pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
+    fn workspace_id(&self) -> Option<&str>;
+    fn kind(&self) -> &str;
+    fn is_available(&self) -> bool;
+    fn execute(&self, request: WorkspaceRequest)
+    -> Result<WorkspaceResponse, WorkspaceClientError>;
+}
+
+/// HTTP forwarding client created by Runtime for one concrete Worker execution.
+///
+/// The upstream endpoint and source headers are private implementation details;
+/// model-visible tools can only submit [`WorkspaceRequest`] values through the
+/// [`WorkspaceClient`] trait.
+pub struct RuntimeWorkspaceHttpClient {
+    workspace_id: String,
+    base_url: String,
+    worker_id: String,
+    access_token: Option<String>,
+}
+
+impl std::fmt::Debug for RuntimeWorkspaceHttpClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeWorkspaceHttpClient")
+            .field("workspace_id", &self.workspace_id)
+            .field("base_url", &self.base_url)
+            .field("worker_id", &self.worker_id)
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
+}
+
+impl RuntimeWorkspaceHttpClient {
+    pub fn new(
+        workspace_id: impl Into<String>,
+        base_url: impl Into<String>,
+        worker_id: impl Into<String>,
+    ) -> Self {
+        Self {
             workspace_id: workspace_id.into(),
-            base_url: base_url.into(),
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            worker_id: worker_id.into(),
+            access_token: None,
         }
     }
 
-    pub fn unavailable(reason: impl Into<String>) -> Self {
-        Self::Unavailable {
-            reason: reason.into(),
+    pub fn with_access_token(mut self, access_token: Option<String>) -> Self {
+        self.access_token = access_token;
+        self
+    }
+}
+
+impl WorkspaceClient for RuntimeWorkspaceHttpClient {
+    fn workspace_id(&self) -> Option<&str> {
+        Some(&self.workspace_id)
+    }
+
+    fn kind(&self) -> &str {
+        "runtime-http-proxy"
+    }
+
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn execute(
+        &self,
+        request: WorkspaceRequest,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        let base_url = self.base_url.clone();
+        let worker_id = self.worker_id.clone();
+        let access_token = self.access_token.clone();
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return std::thread::spawn(move || {
+                execute_runtime_workspace_http(
+                    &base_url,
+                    &worker_id,
+                    access_token.as_deref(),
+                    request,
+                )
+            })
+            .join()
+            .map_err(|_| {
+                WorkspaceClientError::Request("workspace request thread panicked".to_string())
+            })?;
         }
+        execute_runtime_workspace_http(&base_url, &worker_id, access_token.as_deref(), request)
+    }
+}
+
+fn execute_runtime_workspace_http(
+    base_url: &str,
+    worker_id: &str,
+    access_token: Option<&str>,
+    request: WorkspaceRequest,
+) -> Result<WorkspaceResponse, WorkspaceClientError> {
+    if !request.path.starts_with('/') || request.path.starts_with("//") {
+        return Err(WorkspaceClientError::InvalidPath(request.path));
+    }
+    let url = format!("{base_url}{}", request.path);
+    let method = match request.method {
+        WorkspaceRequestMethod::Get => reqwest::Method::GET,
+        WorkspaceRequestMethod::Post => reqwest::Method::POST,
+        WorkspaceRequestMethod::Put => reqwest::Method::PUT,
+        WorkspaceRequestMethod::Patch => reqwest::Method::PATCH,
+        WorkspaceRequestMethod::Delete => reqwest::Method::DELETE,
+    };
+    let client = reqwest::blocking::Client::new();
+    let mut request_builder = client
+        .request(method, url)
+        .header("x-yoi-worker-id", worker_id);
+    if let Some(access_token) = access_token {
+        request_builder = request_builder.bearer_auth(access_token);
+    }
+    if let Some(body) = request.body {
+        request_builder = request_builder
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+    }
+    let response = request_builder
+        .send()
+        .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
+    let status = response.status().as_u16();
+    let body = response
+        .text()
+        .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
+    Ok(WorkspaceResponse { status, body })
+}
+
+#[derive(Debug)]
+struct MarkerWorkspaceClient {
+    workspace_id: Option<String>,
+    kind: String,
+    available: bool,
+    reason: String,
+}
+
+impl WorkspaceClient for MarkerWorkspaceClient {
+    fn workspace_id(&self) -> Option<&str> {
+        self.workspace_id.as_deref()
     }
 
-    pub fn local_filesystem() -> Self {
-        Self::available("local-filesystem")
+    fn kind(&self) -> &str {
+        &self.kind
     }
 
-    pub fn is_available(&self) -> bool {
-        matches!(self, Self::Available { .. } | Self::Http { .. })
+    fn is_available(&self) -> bool {
+        self.available
     }
+
+    fn execute(
+        &self,
+        _request: WorkspaceRequest,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        Err(WorkspaceClientError::Unavailable(self.reason.clone()))
+    }
+}
+
+pub fn unavailable_workspace_client(
+    workspace_id: Option<&WorkspaceId>,
+    reason: impl Into<String>,
+) -> Arc<dyn WorkspaceClient> {
+    Arc::new(MarkerWorkspaceClient {
+        workspace_id: workspace_id.map(|id| id.as_str().to_string()),
+        kind: "unavailable".to_string(),
+        available: false,
+        reason: reason.into(),
+    })
+}
+
+pub fn marker_workspace_client(
+    workspace_id: Option<&WorkspaceId>,
+    kind: impl Into<String>,
+) -> Arc<dyn WorkspaceClient> {
+    let kind = kind.into();
+    Arc::new(MarkerWorkspaceClient {
+        workspace_id: workspace_id.map(|id| id.as_str().to_string()),
+        reason: format!("workspace client kind `{kind}` does not expose Workspace operations"),
+        kind,
+        available: true,
+    })
 }
 
 /// Workspace context supplied to a Worker separately from filesystem authority.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct WorkerWorkspaceContext {
     workspace_id: Option<WorkspaceId>,
-    client: WorkspaceClient,
+    client: Arc<dyn WorkspaceClient>,
+}
+
+impl std::fmt::Debug for WorkerWorkspaceContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkerWorkspaceContext")
+            .field("workspace_id", &self.workspace_id)
+            .field("client_kind", &self.client.kind())
+            .field("client_available", &self.client.is_available())
+            .finish()
+    }
 }
 
 impl WorkerWorkspaceContext {
     pub fn no_workspace() -> Self {
         Self {
             workspace_id: None,
-            client: WorkspaceClient::unavailable("no workspace configured"),
+            client: unavailable_workspace_client(None, "no workspace configured"),
         }
     }
 
     pub fn unavailable(workspace_id: Option<WorkspaceId>, reason: impl Into<String>) -> Self {
+        let client = unavailable_workspace_client(workspace_id.as_ref(), reason);
         Self {
             workspace_id,
-            client: WorkspaceClient::unavailable(reason),
+            client,
         }
     }
 
-    pub fn with_client(workspace_id: Option<WorkspaceId>, client: WorkspaceClient) -> Self {
+    pub fn with_client(
+        workspace_id: Option<WorkspaceId>,
+        client: Arc<dyn WorkspaceClient>,
+    ) -> Self {
         Self {
             workspace_id,
             client,
@@ -221,15 +440,23 @@ impl WorkerWorkspaceContext {
     }
 
     pub fn local_filesystem(workspace_id: Option<WorkspaceId>) -> Self {
-        Self::with_client(workspace_id, WorkspaceClient::local_filesystem())
+        let client = marker_workspace_client(workspace_id.as_ref(), "local-filesystem");
+        Self {
+            workspace_id,
+            client,
+        }
     }
 
     pub fn workspace_id(&self) -> Option<&WorkspaceId> {
         self.workspace_id.as_ref()
     }
 
-    pub fn client(&self) -> &WorkspaceClient {
-        &self.client
+    pub fn client(&self) -> &dyn WorkspaceClient {
+        self.client.as_ref()
+    }
+
+    pub fn client_handle(&self) -> Arc<dyn WorkspaceClient> {
+        self.client.clone()
     }
 }
 
@@ -926,8 +1153,12 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
 
     /// Narrow workspace client/availability handle injected by Runtime/host.
     /// This never grants local filesystem authority.
-    pub fn workspace_client(&self) -> &WorkspaceClient {
+    pub fn workspace_client(&self) -> &dyn WorkspaceClient {
         self.workspace_context.client()
+    }
+
+    pub fn workspace_client_handle(&self) -> Arc<dyn WorkspaceClient> {
+        self.workspace_context.client_handle()
     }
 
     async fn resident_summary_from_workspace_authority(
@@ -3197,7 +3428,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             items_to_extract,
         );
         let session_explore_state =
-            SessionExploreState::new(session_view, self.workspace_client().clone(), source);
+            SessionExploreState::new(session_view, self.workspace_client_handle(), source);
         let input_text = render_extract_input(session_explore_state.view());
         let mut internal_tools = Vec::new();
         let mut internal_hook_builder = HookRegistryBuilder::new();
@@ -3464,7 +3695,7 @@ impl WorkerAuditBase {
 
     async fn emit(
         &self,
-        workspace_client: &WorkspaceClient,
+        workspace_client: &dyn WorkspaceClient,
         event_tx: Option<&broadcast::Sender<Event>>,
         status: memory::audit::WorkerLifecycleStatus,
         reason: impl Into<String>,
@@ -4936,7 +5167,7 @@ mod spawned_context_tests {
             false,
             WorkerWorkspaceContext::with_client(
                 Some(workspace_id.clone()),
-                WorkspaceClient::available("test-api"),
+                marker_workspace_client(Some(&workspace_id), "test-api"),
             ),
             WorkerFilesystemAuthority::None,
             manifest.scope.clone(),
@@ -5773,7 +6004,11 @@ mod build_summary_prompt_tests {
         });
         WorkerWorkspaceContext::with_client(
             Some(WorkspaceId::new("test-memory").unwrap()),
-            WorkspaceClient::http("test-memory", format!("http://{addr}")),
+            Arc::new(RuntimeWorkspaceHttpClient::new(
+                "test-memory",
+                format!("http://{addr}"),
+                "test-worker",
+            )),
         )
     }
 
@@ -5905,7 +6140,11 @@ mod build_summary_prompt_tests {
                 store,
                 WorkerWorkspaceContext::with_client(
                     Some(WorkspaceId::new("ws-skill").unwrap()),
-                    WorkspaceClient::http("ws-skill", format!("http://{addr}")),
+                    Arc::new(RuntimeWorkspaceHttpClient::new(
+                        "ws-skill",
+                        format!("http://{addr}"),
+                        "test-worker",
+                    )),
                 ),
                 authority,
                 scope,

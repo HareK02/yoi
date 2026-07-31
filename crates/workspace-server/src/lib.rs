@@ -85,6 +85,10 @@ pub enum Error {
     UnknownRepository(String),
     #[error("workspace id does not match this Workspace backend")]
     WorkspaceIdMismatch,
+    #[error("Ticket assignment conflict: {0}")]
+    TicketAssignmentConflict(String),
+    #[error("Worker Workspace authentication failed: {0}")]
+    WorkerWorkspaceAuthentication(String),
     #[error("workspace identity error: {0}")]
     WorkspaceIdentity(String),
     #[error("store error: {0}")]

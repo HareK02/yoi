@@ -29,7 +29,7 @@ const FINISH_EXTRACTION_DESCRIPTION: &str = "Finish the extract worker run after
 #[derive(Clone)]
 pub(crate) struct SessionExploreState {
     view: Arc<SessionReferenceView>,
-    workspace_client: WorkspaceClient,
+    workspace_client: Arc<dyn WorkspaceClient>,
     source: SourceRef,
     extract_run_id: String,
     staged: Arc<Mutex<Vec<String>>>,
@@ -39,7 +39,7 @@ pub(crate) struct SessionExploreState {
 impl SessionExploreState {
     pub(crate) fn new(
         view: SessionReferenceView,
-        workspace_client: WorkspaceClient,
+        workspace_client: Arc<dyn WorkspaceClient>,
         source: SourceRef,
     ) -> Self {
         Self {
@@ -615,7 +615,7 @@ mod tests {
 
     fn stub_memory_backend_response(
         body: &'static str,
-    ) -> (WorkspaceClient, mpsc::Receiver<String>) {
+    ) -> (Arc<dyn WorkspaceClient>, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = mpsc::channel();
@@ -659,7 +659,11 @@ mod tests {
             stream.write_all(response.as_bytes()).unwrap();
         });
         (
-            WorkspaceClient::http("test-workspace", format!("http://{addr}")),
+            Arc::new(crate::worker::RuntimeWorkspaceHttpClient::new(
+                "test-workspace",
+                format!("http://{addr}"),
+                "test-worker",
+            )),
             rx,
         )
     }
@@ -668,7 +672,7 @@ mod tests {
     fn descriptor_declares_session_explore_tools() {
         let state = SessionExploreState::new(
             SessionReferenceView::new("segment-1", vec![Item::user_message("remember this")]),
-            WorkspaceClient::available("test-backend"),
+            crate::worker::marker_workspace_client(None, "test-backend"),
             SourceRef {
                 segment_id: "segment-1".to_string(),
                 range: [0, 0],

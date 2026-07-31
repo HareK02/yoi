@@ -4,7 +4,10 @@
 //! module only resolves the local backend root, declares the built-in feature,
 //! and contributes those tools through the normal feature registry path.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use ticket::{
     LocalTicketBackend, MarkdownText, NewOrchestrationPlanRecord, NewTicket, NewTicketEvent,
@@ -22,6 +25,7 @@ use crate::feature::{
     FeatureInstructionContribution, FeatureInstructionDeclaration, FeatureInstructionId,
     FeatureModule, ToolContribution, ToolDeclaration,
 };
+use crate::worker::{WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod};
 
 const FEATURE_ID: &str = "ticket";
 const FEATURE_NAME: &str = "Ticket tools";
@@ -183,13 +187,8 @@ const ORCHESTRATION_CONTROL_ADDITIONAL_TOOL_NAMES: &[&str] = &[
 
 #[derive(Clone, Debug)]
 pub enum TicketFeatureBackend {
-    Local {
-        root: PathBuf,
-    },
-    WorkspaceHttp {
-        workspace_id: String,
-        base_url: String,
-    },
+    Local { root: PathBuf },
+    WorkspaceClient(Arc<dyn WorkspaceClient>),
 }
 
 impl From<PathBuf> for TicketFeatureBackend {
@@ -274,7 +273,7 @@ impl TicketFeature {
     pub fn backend_root(&self) -> Option<&Path> {
         match &self.backend {
             TicketFeatureBackend::Local { root } => Some(root),
-            TicketFeatureBackend::WorkspaceHttp { .. } => None,
+            TicketFeatureBackend::WorkspaceClient(_) => None,
         }
     }
 
@@ -321,15 +320,9 @@ impl TicketFeature {
                         .into(),
                 )
             }
-            TicketFeatureBackend::WorkspaceHttp {
-                workspace_id,
-                base_url,
-            } => Some(
-                TicketToolBackend::new(WorkspaceHttpTicketBackend::new(
-                    workspace_id.clone(),
-                    base_url.clone(),
-                ))
-                .with_record_language(self.record_language.as_deref()),
+            TicketFeatureBackend::WorkspaceClient(client) => Some(
+                TicketToolBackend::new(WorkspaceHttpTicketBackend::new(client.clone()))
+                    .with_record_language(self.record_language.as_deref()),
             ),
         }
     }
@@ -386,22 +379,18 @@ impl FeatureModule for TicketFeature {
 
 #[derive(Clone, Debug)]
 struct WorkspaceHttpTicketBackend {
-    workspace_id: String,
-    base_url: String,
+    client: Arc<dyn WorkspaceClient>,
 }
 
 impl WorkspaceHttpTicketBackend {
-    fn new(workspace_id: String, base_url: String) -> Self {
-        Self {
-            workspace_id,
-            base_url: base_url.trim_end_matches('/').to_string(),
-        }
+    fn new(client: Arc<dyn WorkspaceClient>) -> Self {
+        Self { client }
     }
 
     fn endpoint(&self) -> String {
         format!(
-            "{}/api/w/{}/tickets/backend",
-            self.base_url, self.workspace_id
+            "/api/w/{}/tickets/backend",
+            self.client.workspace_id().unwrap_or_default()
         )
     }
 
@@ -409,44 +398,44 @@ impl WorkspaceHttpTicketBackend {
         &self,
         operation: TicketBackendOperation,
     ) -> TicketResult<TicketBackendOperationResult> {
+        let client = self.client.clone();
         let endpoint = self.endpoint();
         if tokio::runtime::Handle::try_current().is_ok() {
-            return std::thread::spawn(move || Self::invoke_http(endpoint, operation))
+            return std::thread::spawn(move || Self::invoke_client(client, endpoint, operation))
                 .join()
                 .map_err(|_| {
                     TicketError::Conflict("ticket backend request thread panicked".to_string())
                 })?;
         }
-        Self::invoke_http(endpoint, operation)
+        Self::invoke_client(client, endpoint, operation)
     }
 
-    fn invoke_http(
+    fn invoke_client(
+        client: Arc<dyn WorkspaceClient>,
         endpoint: String,
         operation: TicketBackendOperation,
     ) -> TicketResult<TicketBackendOperationResult> {
         let body = serde_json::to_string(&operation).map_err(|error| {
             TicketError::Conflict(format!("serialize ticket operation: {error}"))
         })?;
-        let response = reqwest::blocking::Client::new()
-            .post(endpoint)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body)
-            .send()
+        let response = client
+            .execute(WorkspaceRequest::json(
+                WorkspaceRequestMethod::Post,
+                endpoint,
+                body,
+            ))
             .map_err(|error| {
                 TicketError::Conflict(format!("ticket backend request failed: {error}"))
             })?;
-        let status = response.status();
-        let text = response.text().map_err(|error| {
-            TicketError::Conflict(format!("ticket backend response failed: {error}"))
-        })?;
-        if !status.is_success() {
+        if !response.is_success() {
             return Err(TicketError::Conflict(format!(
-                "ticket backend returned HTTP {status}: {text}"
+                "ticket backend returned HTTP {}: {}",
+                response.status, response.body
             )));
         }
-        match serde_json::from_str::<TicketBackendHttpResponse>(&text).map_err(|error| {
-            TicketError::Conflict(format!("decode ticket backend response: {error}"))
-        })? {
+        match serde_json::from_str::<TicketBackendHttpResponse>(&response.body).map_err(
+            |error| TicketError::Conflict(format!("decode ticket backend response: {error}")),
+        )? {
             TicketBackendHttpResponse::Ok { result } => Ok(result),
             TicketBackendHttpResponse::Error { message } => Err(TicketError::Conflict(message)),
         }
@@ -1126,8 +1115,13 @@ provider = "github"
 
     #[tokio::test(flavor = "multi_thread")]
     async fn workspace_http_backend_invoke_is_safe_inside_async_context() {
-        let backend =
-            WorkspaceHttpTicketBackend::new("workspace-a".to_string(), "not-a-url".to_string());
+        let backend = WorkspaceHttpTicketBackend::new(Arc::new(
+            crate::worker::RuntimeWorkspaceHttpClient::new(
+                "workspace-a",
+                "not-a-url",
+                "test-worker",
+            ),
+        ));
 
         let error = backend
             .invoke(TicketBackendOperation::DefaultIntakeReadyStateChangeBody {
@@ -1167,7 +1161,9 @@ provider = "github"
             .unwrap();
         });
 
-        let backend = WorkspaceHttpTicketBackend::new("workspace-a".to_string(), base_url);
+        let backend = WorkspaceHttpTicketBackend::new(Arc::new(
+            crate::worker::RuntimeWorkspaceHttpClient::new("workspace-a", base_url, "test-worker"),
+        ));
         let created = backend.create(NewTicket::new("HTTP ticket")).unwrap();
 
         server.join().unwrap();

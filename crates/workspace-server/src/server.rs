@@ -91,8 +91,9 @@ use crate::resource_broker::BackendResourceBroker;
 use crate::skills;
 use crate::store::{
     AccountRecord, ApiTokenRecord, AuthChallengeRecord, BrowserSessionRecord, ControlPlaneStore,
-    DeviceLoginFlowRecord, PasskeyCredentialRecord, RepositoryRecord, UserRecord,
-    WorkdirRegistryRecord, WorkerRegistryRecord, WorkerWorkdirLinkRecord, WorkspaceRecord,
+    DeviceLoginFlowRecord, PasskeyCredentialRecord, RepositoryRecord, TicketNotificationRecipient,
+    TicketWorkerAssignmentRecord, UserRecord, WorkdirRegistryRecord, WorkerRegistryRecord,
+    WorkerWorkdirLinkRecord, WorkerWorkspaceCredentialRecord, WorkspaceRecord,
 };
 use crate::{Error, Result};
 use worker_runtime::catalog::{
@@ -521,6 +522,12 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             get(scoped_get_ticket).patch(scoped_edit_ticket_item),
         )
         .route(
+            "/api/w/{workspace_id}/tickets/{id}/assignment",
+            get(scoped_get_ticket_worker_assignment)
+                .put(scoped_set_ticket_worker_assignment)
+                .delete(scoped_clear_ticket_worker_assignment),
+        )
+        .route(
             "/api/w/{workspace_id}/tickets/{id}/state",
             post(scoped_transition_ticket_state),
         )
@@ -780,7 +787,22 @@ pub async fn serve(
     listener: TcpListener,
 ) -> Result<()> {
     let api = WorkspaceApi::new(config, store).await?;
-    axum::serve(listener, build_router(api)).await?;
+    let dispatcher_api = api.clone();
+    let dispatcher_workspace_id = dispatcher_api.config.workspace_id.clone();
+    let dispatcher = tokio::spawn(async move {
+        loop {
+            let api = dispatcher_api.clone();
+            let workspace_id = dispatcher_workspace_id.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                dispatch_pending_ticket_notifications(&api, &workspace_id)
+            })
+            .await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
+    let result = axum::serve(listener, build_router(api)).await;
+    dispatcher.abort();
+    result?;
     Ok(())
 }
 
@@ -1530,6 +1552,142 @@ async fn scoped_get_ticket(
     get_ticket(State(api), AxumPath(path.id)).await
 }
 
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct TicketWorkerAssignmentResponse {
+    workspace_id: String,
+    ticket_id: String,
+    assignment: Option<TicketWorkerAssignmentRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct TicketWorkerAssignmentMutationResponse {
+    workspace_id: String,
+    ticket_id: String,
+    assignment: Option<TicketWorkerAssignmentRecord>,
+    previous_assignment_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetTicketWorkerAssignmentRequest {
+    runtime_id: String,
+    worker_id: String,
+    expected_assignment_id: Option<String>,
+    assigned_by: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClearTicketWorkerAssignmentQuery {
+    expected_assignment_id: Option<String>,
+    actor: Option<String>,
+}
+
+async fn scoped_get_ticket_worker_assignment(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRecordPath>,
+) -> ApiResult<Json<TicketWorkerAssignmentResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let ticket = api.authority.ticket(&path.id)?;
+    let assignment = api
+        .store
+        .get_current_ticket_worker_assignment(&path.workspace_id, &ticket.id)?;
+    Ok(Json(TicketWorkerAssignmentResponse {
+        workspace_id: path.workspace_id,
+        ticket_id: ticket.id,
+        assignment,
+    }))
+}
+
+async fn scoped_set_ticket_worker_assignment(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRecordPath>,
+    Json(request): Json<SetTicketWorkerAssignmentRequest>,
+) -> ApiResult<Json<TicketWorkerAssignmentMutationResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let ticket = api.authority.ticket(&path.id)?;
+    let runtime_id = require_ticket_assignment_value("runtime_id", request.runtime_id)?;
+    let worker_id = require_ticket_assignment_value("worker_id", request.worker_id)?;
+    let expected_assignment_id = request
+        .expected_assignment_id
+        .map(|value| require_ticket_assignment_value("expected_assignment_id", value))
+        .transpose()?;
+    let assigned_by = request
+        .assigned_by
+        .map(|value| require_ticket_assignment_value("assigned_by", value))
+        .transpose()?
+        .unwrap_or_else(|| "workspace-api".to_string());
+    let worker = api
+        .runtime
+        .worker(&runtime_id, &worker_id)
+        .map_err(|err| err.into_error())?;
+    let assigned_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let record = TicketWorkerAssignmentRecord {
+        workspace_id: path.workspace_id.clone(),
+        ticket_id: ticket.id.clone(),
+        assignment_id: new_id("tasg"),
+        runtime_id: worker.runtime_id,
+        worker_id: worker.worker_id,
+        assigned_by,
+        assigned_at,
+    };
+    let update = api.store.set_current_ticket_worker_assignment(
+        &record,
+        expected_assignment_id.as_deref(),
+        &new_id("tasev"),
+    )?;
+    Ok(Json(TicketWorkerAssignmentMutationResponse {
+        workspace_id: path.workspace_id,
+        ticket_id: ticket.id,
+        assignment: Some(update.current),
+        previous_assignment_id: update.previous.map(|assignment| assignment.assignment_id),
+    }))
+}
+
+async fn scoped_clear_ticket_worker_assignment(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRecordPath>,
+    Query(query): Query<ClearTicketWorkerAssignmentQuery>,
+) -> ApiResult<Json<TicketWorkerAssignmentMutationResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let ticket = api.authority.ticket(&path.id)?;
+    let expected_assignment_id = query
+        .expected_assignment_id
+        .map(|value| require_ticket_assignment_value("expected_assignment_id", value))
+        .transpose()?;
+    let actor = query
+        .actor
+        .map(|value| require_ticket_assignment_value("actor", value))
+        .transpose()?
+        .unwrap_or_else(|| "workspace-api".to_string());
+    let previous = api.store.clear_current_ticket_worker_assignment(
+        &path.workspace_id,
+        &ticket.id,
+        expected_assignment_id.as_deref(),
+        &new_id("tasev"),
+        &actor,
+        &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+    )?;
+    Ok(Json(TicketWorkerAssignmentMutationResponse {
+        workspace_id: path.workspace_id,
+        ticket_id: ticket.id,
+        assignment: None,
+        previous_assignment_id: previous.map(|assignment| assignment.assignment_id),
+    }))
+}
+
+fn require_ticket_assignment_value(field: &str, value: String) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(Error::RuntimeOperationFailed {
+            runtime_id: "workspace-server".to_string(),
+            code: "invalid_ticket_assignment".to_string(),
+            message: format!("{field} must not be empty"),
+        });
+    }
+    Ok(value.to_string())
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BrowserEditTicketRequest {
@@ -1747,7 +1905,8 @@ async fn scoped_close_ticket(
 async fn scoped_ticket_backend_operation(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
-    Json(operation): Json<TicketBackendOperation>,
+    headers: HeaderMap,
+    Json(mut operation): Json<TicketBackendOperation>,
 ) -> ApiResult<Json<TicketBackendHttpResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let config = ticket::config::TicketConfig::load_workspace(&api.config.workspace_root)
@@ -1757,13 +1916,323 @@ async fn scoped_ticket_backend_operation(
         api.config.workspace_id.clone(),
     )
     .with_record_language(config.ticket_record_language());
+    let target = ticket_mutation_target(&operation).cloned();
+    let source = target
+        .as_ref()
+        .map(|_| authenticate_worker_mutation_source(&api, &path.workspace_id, &headers))
+        .transpose()?;
+    if let (Some(source), Some(target)) = (source.as_ref(), target.as_ref()) {
+        bind_worker_ticket_operation_source(
+            &api,
+            &path.workspace_id,
+            source,
+            target,
+            &mut operation,
+        )?;
+    }
+    let before = target.as_ref().and_then(|id| backend.show(id.clone()).ok());
     let response = match execute_ticket_backend_operation(&backend, operation) {
-        Ok(result) => TicketBackendHttpResponse::Ok { result },
+        Ok(result) => {
+            if let (Some(source), Some(target)) = (source, target) {
+                let after = backend.show(target).map_err(Error::from)?;
+                enqueue_worker_ticket_notification(
+                    &api,
+                    &path.workspace_id,
+                    &source,
+                    before.as_ref(),
+                    &after,
+                )?;
+                dispatch_pending_ticket_notifications(&api, &path.workspace_id);
+            }
+            TicketBackendHttpResponse::Ok { result }
+        }
         Err(error) => TicketBackendHttpResponse::Error {
             message: error.to_string(),
         },
     };
     Ok(Json(response))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerMutationSource {
+    runtime_id: String,
+    worker_id: String,
+}
+
+fn ticket_mutation_target(operation: &TicketBackendOperation) -> Option<&TicketIdOrSlug> {
+    match operation {
+        TicketBackendOperation::EditItem { id, .. }
+        | TicketBackendOperation::AddEvent { id, .. }
+        | TicketBackendOperation::AddStateChanged { id, .. }
+        | TicketBackendOperation::AddIntakeSummary { id, .. }
+        | TicketBackendOperation::SetStateField { id, .. }
+        | TicketBackendOperation::SetWorkflowState { id, .. }
+        | TicketBackendOperation::MarkIntakeReady { id, .. }
+        | TicketBackendOperation::QueueReady { id, .. }
+        | TicketBackendOperation::Review { id, .. }
+        | TicketBackendOperation::Close { id, .. }
+        | TicketBackendOperation::AddTicketRelation { id, .. }
+        | TicketBackendOperation::AddOrchestrationPlanRecord { id, .. } => Some(id),
+        _ => None,
+    }
+}
+
+fn bind_worker_ticket_operation_source(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    source: &WorkerMutationSource,
+    target: &TicketIdOrSlug,
+    operation: &mut TicketBackendOperation,
+) -> Result<()> {
+    let mut author = format!("worker:{}/{}", source.runtime_id, source.worker_id);
+    if let TicketBackendOperation::AddEvent { event, .. } = operation {
+        if event.kind == TicketEventKind::ImplementationReport {
+            let target_query = match target {
+                TicketIdOrSlug::Id(value)
+                | TicketIdOrSlug::Slug(value)
+                | TicketIdOrSlug::Query(value) => value.as_str(),
+            };
+            let ticket = api.authority.ticket(target_query)?;
+            let assignment = api
+                .store
+                .get_current_ticket_worker_assignment(workspace_id, &ticket.id)?
+                .ok_or_else(|| {
+                    Error::TicketAssignmentConflict(format!(
+                        "Ticket {} has no current Worker assignment",
+                        ticket.id
+                    ))
+                })?;
+            if assignment.runtime_id != source.runtime_id
+                || assignment.worker_id != source.worker_id
+            {
+                return Err(Error::TicketAssignmentConflict(format!(
+                    "Worker {}/{} does not hold current assignment {} for Ticket {}",
+                    source.runtime_id, source.worker_id, assignment.assignment_id, ticket.id
+                )));
+            }
+            author.push_str(&format!(" assignment:{}", assignment.assignment_id));
+        }
+    }
+    match operation {
+        TicketBackendOperation::EditItem { edit, .. } => edit.author = Some(author),
+        TicketBackendOperation::AddEvent { event, .. } => event.author = Some(author),
+        TicketBackendOperation::AddStateChanged { change, .. } => change.author = Some(author),
+        TicketBackendOperation::AddIntakeSummary { summary, .. } => summary.author = Some(author),
+        TicketBackendOperation::QueueReady { queued_by, .. } => *queued_by = author,
+        TicketBackendOperation::Review { review, .. } => review.author = Some(author),
+        TicketBackendOperation::AddTicketRelation { relation, .. } => {
+            relation.author = Some(author)
+        }
+        TicketBackendOperation::AddOrchestrationPlanRecord { record, .. } => {
+            record.author = Some(author)
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn authenticate_worker_mutation_source(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    headers: &HeaderMap,
+) -> Result<WorkerMutationSource> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            Error::WorkerWorkspaceAuthentication("missing Runtime Workspace credential".to_string())
+        })?;
+    let worker_id = headers
+        .get("x-yoi-worker-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            Error::WorkerWorkspaceAuthentication("missing Runtime-bound Worker id".to_string())
+        })?;
+    let credential = api
+        .store
+        .authenticate_worker_workspace_credential(token, workspace_id, worker_id)?
+        .ok_or_else(|| {
+            Error::WorkerWorkspaceAuthentication("invalid Runtime Workspace credential".to_string())
+        })?;
+    api.runtime
+        .worker(&credential.runtime_id, worker_id)
+        .map_err(|_| {
+            Error::WorkerWorkspaceAuthentication(
+                "credential does not identify a current Runtime Worker".to_string(),
+            )
+        })?;
+    Ok(WorkerMutationSource {
+        runtime_id: credential.runtime_id,
+        worker_id: worker_id.to_string(),
+    })
+}
+
+fn enqueue_worker_ticket_notification(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    source: &WorkerMutationSource,
+    before: Option<&ticket::Ticket>,
+    after: &ticket::Ticket,
+) -> Result<()> {
+    let mut recipients = Vec::new();
+    if let Some(assignment) = api
+        .store
+        .get_current_ticket_worker_assignment(workspace_id, &after.meta.id)?
+    {
+        if assignment.runtime_id != source.runtime_id || assignment.worker_id != source.worker_id {
+            recipients.push(TicketNotificationRecipient {
+                runtime_id: assignment.runtime_id,
+                worker_id: assignment.worker_id,
+                recipient_kind: "assigned".to_string(),
+            });
+        }
+    }
+    let previous_state = before
+        .map(|ticket| ticket.meta.workflow_state.as_str().to_string())
+        .unwrap_or_else(|| after.meta.workflow_state.as_str().to_string());
+    let current_state = after.meta.workflow_state.as_str().to_string();
+    if matches!(previous_state.as_str(), "queued" | "inprogress")
+        || matches!(current_state.as_str(), "queued" | "inprogress")
+    {
+        if let Some(orchestrator) = find_workspace_orchestrator(api) {
+            if orchestrator.runtime_id != source.runtime_id
+                || orchestrator.worker_id != source.worker_id
+            {
+                recipients.push(TicketNotificationRecipient {
+                    runtime_id: orchestrator.runtime_id,
+                    worker_id: orchestrator.worker_id,
+                    recipient_kind: "orchestrator".to_string(),
+                });
+            }
+        }
+    }
+    recipients.sort_by(|left, right| {
+        (&left.runtime_id, &left.worker_id).cmp(&(&right.runtime_id, &right.worker_id))
+    });
+    recipients.dedup_by(|left, right| {
+        left.runtime_id == right.runtime_id && left.worker_id == right.worker_id
+    });
+    api.store.enqueue_ticket_notification(
+        &new_id("tnfy"),
+        workspace_id,
+        &after.meta.id,
+        after.events.len().saturating_sub(1) as i64,
+        &source.runtime_id,
+        &source.worker_id,
+        &previous_state,
+        &current_state,
+        &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        &recipients,
+    )
+}
+
+fn dispatch_pending_ticket_notifications(api: &WorkspaceApi, workspace_id: &str) {
+    let Ok(deliveries) = api
+        .store
+        .list_pending_ticket_notification_deliveries(workspace_id, 100)
+    else {
+        return;
+    };
+    for delivery in deliveries {
+        if !ticket_notification_recipient_is_current(api, &delivery) {
+            let _ = api.store.mark_ticket_notification_delivered(
+                &delivery.notification_id,
+                &delivery.recipient_runtime_id,
+                &delivery.recipient_worker_id,
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            );
+            continue;
+        }
+        let result = api.runtime.send_input(
+            &delivery.recipient_runtime_id,
+            &delivery.recipient_worker_id,
+            WorkerInputRequest {
+                kind: WorkerInputKind::System,
+                content: format!(
+                    "Ticket notification: workspace_id={} ticket_id={} event_sequence={}. Reread the Ticket before acting.",
+                    delivery.workspace_id, delivery.ticket_id, delivery.event_sequence
+                ),
+                segments: None,
+            },
+        );
+        match result {
+            Ok(result) if result.state == WorkerOperationState::Accepted => {
+                let _ = api.store.mark_ticket_notification_delivered(
+                    &delivery.notification_id,
+                    &delivery.recipient_runtime_id,
+                    &delivery.recipient_worker_id,
+                    &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                );
+            }
+            Ok(result) => {
+                let _ = api.store.mark_ticket_notification_failed(
+                    &delivery.notification_id,
+                    &delivery.recipient_runtime_id,
+                    &delivery.recipient_worker_id,
+                    &format!("Runtime rejected notification: {:?}", result.diagnostics),
+                );
+            }
+            Err(error) => {
+                let _ = api.store.mark_ticket_notification_failed(
+                    &delivery.notification_id,
+                    &delivery.recipient_runtime_id,
+                    &delivery.recipient_worker_id,
+                    &error.into_error().to_string(),
+                );
+            }
+        }
+    }
+}
+
+fn find_workspace_orchestrator(api: &WorkspaceApi) -> Option<WorkerSummary> {
+    let is_orchestrator = |worker: &WorkerSummary| {
+        worker.singleton_key.as_deref() == Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY)
+    };
+    if let Some(worker) = api
+        .runtime
+        .list_workers(1000)
+        .items
+        .into_iter()
+        .find(is_orchestrator)
+    {
+        return Some(worker);
+    }
+    for runtime in api.runtime.list_runtimes(1000).items {
+        if let Ok(stopped) = api
+            .runtime
+            .list_stopped_workers_for_runtime(&runtime.runtime_id, 1000)
+        {
+            if let Some(worker) = stopped.items.into_iter().find(is_orchestrator) {
+                return Some(worker);
+            }
+        }
+    }
+    None
+}
+
+fn ticket_notification_recipient_is_current(
+    api: &WorkspaceApi,
+    delivery: &crate::store::TicketNotificationDeliveryRecord,
+) -> bool {
+    match delivery.recipient_kind.as_str() {
+        "assigned" => api
+            .store
+            .get_current_ticket_worker_assignment(&delivery.workspace_id, &delivery.ticket_id)
+            .ok()
+            .flatten()
+            .is_some_and(|assignment| {
+                assignment.runtime_id == delivery.recipient_runtime_id
+                    && assignment.worker_id == delivery.recipient_worker_id
+            }),
+        "orchestrator" => find_workspace_orchestrator(api).is_some_and(|worker| {
+            worker.runtime_id == delivery.recipient_runtime_id
+                && worker.worker_id == delivery.recipient_worker_id
+        }),
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1903,6 +2372,7 @@ fn start_memory_staging_consolidation(
                 resolved_working_directory_request: None,
                 resolved_working_directory: None,
                 resolved_config_bundle,
+                resolved_workspace_api: None,
             },
         )
         .map_err(|err| err.into_error())?;
@@ -3145,7 +3615,14 @@ async fn scoped_restore_runtime_worker(
     AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
 ) -> ApiResult<Json<WorkerRestoreResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    restore_runtime_worker(State(api), AxumPath((path.runtime_id, path.worker_id))).await
+    let workspace_id = path.workspace_id.clone();
+    let response = restore_runtime_worker(
+        State(api.clone()),
+        AxumPath((path.runtime_id, path.worker_id)),
+    )
+    .await?;
+    dispatch_pending_ticket_notifications(&api, &workspace_id);
+    Ok(response)
 }
 
 async fn scoped_pin_runtime_worker(
@@ -4523,6 +5000,7 @@ async fn create_workspace_worker(
                 resolved_working_directory_request: None,
                 resolved_working_directory,
                 resolved_config_bundle,
+                resolved_workspace_api: None,
             },
         )
         .map_err(|err| err.into_error())?;
@@ -4844,6 +5322,23 @@ async fn create_runtime_worker(
             .map(|claim| claim.working_directory_id.clone())
     };
     let requested_worker_name = request.requested_worker_name.clone();
+    if let Some(base_url) = api.config.backend_base_url.clone() {
+        let credential = WorkerWorkspaceCredentialRecord {
+            credential_id: new_id("wac"),
+            token: mint_secret("wac"),
+            workspace_id: api.config.workspace_id.clone(),
+            runtime_id: runtime_id.clone(),
+            worker_id: None,
+            created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        };
+        api.store.upsert_worker_workspace_credential(&credential)?;
+        request.resolved_workspace_api = Some(worker_runtime::catalog::WorkspaceApiRef {
+            workspace_id: api.config.workspace_id.clone(),
+            base_url,
+            runtime_id: Some(runtime_id.clone()),
+            access_token: Some(credential.token),
+        });
+    }
     let result = api
         .runtime
         .spawn_worker(&runtime_id, request)
@@ -6945,6 +7440,8 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.error {
+            Error::TicketAssignmentConflict(_) => StatusCode::CONFLICT,
+            Error::WorkerWorkspaceAuthentication(_) => StatusCode::UNAUTHORIZED,
             Error::InvalidRuntimeIdentifier { .. } => StatusCode::BAD_REQUEST,
             Error::Ticket(ticket::TicketError::NotFound(_)) => StatusCode::NOT_FOUND,
             Error::Ticket(
@@ -7862,6 +8359,7 @@ mod tests {
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
                     resolved_config_bundle,
+                    resolved_workspace_api: None,
                 },
             )
             .unwrap();
@@ -7941,6 +8439,363 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ticket_assignment_endpoints_read_and_clear_current_assignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let Json(created) = scoped_ticket_backend_operation(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            HeaderMap::new(),
+            Json(TicketBackendOperation::Create {
+                input: ticket::NewTicket::new("Assigned Ticket"),
+            }),
+        )
+        .await
+        .unwrap();
+        let ticket_id = match created {
+            TicketBackendHttpResponse::Ok {
+                result: ticket::TicketBackendOperationResult::TicketRef(ticket_ref),
+            } => ticket_ref.id,
+            other => panic!("unexpected create response: {other:?}"),
+        };
+        let assignment = TicketWorkerAssignmentRecord {
+            workspace_id: TEST_WORKSPACE_ID.to_string(),
+            ticket_id: ticket_id.clone(),
+            assignment_id: "assignment-api-1".to_string(),
+            runtime_id: "embedded".to_string(),
+            worker_id: "42".to_string(),
+            assigned_by: "test-user".to_string(),
+            assigned_at: TEST_CREATED_AT.to_string(),
+        };
+        api.store
+            .set_current_ticket_worker_assignment(&assignment, None, "event-api-1")
+            .unwrap();
+        let path = || ScopedRecordPath {
+            workspace_id: TEST_WORKSPACE_ID.to_string(),
+            id: ticket_id.clone(),
+        };
+
+        let Json(read) = scoped_get_ticket_worker_assignment(State(api.clone()), AxumPath(path()))
+            .await
+            .unwrap();
+        assert_eq!(read.assignment, Some(assignment));
+
+        let stale = scoped_clear_ticket_worker_assignment(
+            State(api.clone()),
+            AxumPath(path()),
+            Query(ClearTicketWorkerAssignmentQuery {
+                expected_assignment_id: Some("stale-assignment".to_string()),
+                actor: Some("test-user".to_string()),
+            }),
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+
+        let Json(cleared) = scoped_clear_ticket_worker_assignment(
+            State(api.clone()),
+            AxumPath(path()),
+            Query(ClearTicketWorkerAssignmentQuery {
+                expected_assignment_id: Some("assignment-api-1".to_string()),
+                actor: Some("test-user".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            cleared.previous_assignment_id.as_deref(),
+            Some("assignment-api-1")
+        );
+        assert_eq!(cleared.assignment, None);
+    }
+
+    #[tokio::test]
+    async fn authenticated_worker_ticket_mutation_routes_durable_assignment_notification() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let spawn = |name: &str| WorkerSpawnRequest {
+            requested_worker_name: Some(name.to_string()),
+            intent: WorkerSpawnIntent::TicketRole {
+                ticket_id: name.to_string(),
+                role: TicketWorkerRole::Coder,
+            },
+            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                expected_segments: 0,
+            },
+            profile: ProfileSelector::Builtin("builtin:coder".to_string()),
+            initial_input: None,
+            working_directory_request: None,
+            resolved_working_directory_request: None,
+            resolved_working_directory: None,
+            resolved_config_bundle: None,
+            resolved_workspace_api: None,
+        };
+        let source_worker = api
+            .runtime
+            .spawn_worker(EMBEDDED_WORKER_RUNTIME_ID, spawn("source-worker"))
+            .unwrap()
+            .worker
+            .unwrap();
+        let recipient_worker = api
+            .runtime
+            .spawn_worker(EMBEDDED_WORKER_RUNTIME_ID, spawn("recipient-worker"))
+            .unwrap()
+            .worker
+            .unwrap();
+        let backend = browser_ticket_backend(&api).unwrap();
+        let ticket_ref = backend
+            .create(ticket::NewTicket::new("Notify assigned Worker"))
+            .unwrap();
+        api.store
+            .set_current_ticket_worker_assignment(
+                &TicketWorkerAssignmentRecord {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    ticket_id: ticket_ref.id.clone(),
+                    assignment_id: "notify-assignment".to_string(),
+                    runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                    worker_id: recipient_worker.worker_id.clone(),
+                    assigned_by: "test-user".to_string(),
+                    assigned_at: TEST_CREATED_AT.to_string(),
+                },
+                None,
+                "notify-assignment-event",
+            )
+            .unwrap();
+        api.store
+            .upsert_worker_workspace_credential(&WorkerWorkspaceCredentialRecord {
+                credential_id: "source-credential".to_string(),
+                token: "source-secret".to_string(),
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                worker_id: Some(source_worker.worker_id.clone()),
+                created_at: TEST_CREATED_AT.to_string(),
+            })
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer source-secret"),
+        );
+        headers.insert(
+            "x-yoi-worker-id",
+            axum::http::HeaderValue::from_str(&source_worker.worker_id).unwrap(),
+        );
+        let Json(response) = scoped_ticket_backend_operation(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            headers.clone(),
+            Json(TicketBackendOperation::AddEvent {
+                id: ticket_ref.id.clone().into(),
+                event: NewTicketEvent::new(TicketEventKind::Comment, "implementation update"),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(response, TicketBackendHttpResponse::Ok { .. }));
+        assert!(
+            api.store
+                .list_pending_ticket_notification_deliveries(TEST_WORKSPACE_ID, 10)
+                .unwrap()
+                .is_empty(),
+            "accepted Runtime system input must complete the outbox delivery"
+        );
+
+        let stale_report = scoped_ticket_backend_operation(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            headers.clone(),
+            Json(TicketBackendOperation::AddEvent {
+                id: ticket_ref.id.clone().into(),
+                event: NewTicketEvent::new(
+                    TicketEventKind::ImplementationReport,
+                    "stale assignment report",
+                ),
+            }),
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(stale_report.status(), StatusCode::CONFLICT);
+
+        api.store
+            .set_current_ticket_worker_assignment(
+                &TicketWorkerAssignmentRecord {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    ticket_id: ticket_ref.id.clone(),
+                    assignment_id: "source-assignment".to_string(),
+                    runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                    worker_id: source_worker.worker_id.clone(),
+                    assigned_by: "test-user".to_string(),
+                    assigned_at: TEST_CREATED_AT.to_string(),
+                },
+                Some("notify-assignment"),
+                "source-assignment-event",
+            )
+            .unwrap();
+        let _ = scoped_ticket_backend_operation(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            headers.clone(),
+            Json(TicketBackendOperation::AddEvent {
+                id: ticket_ref.id.clone().into(),
+                event: NewTicketEvent::new(
+                    TicketEventKind::ImplementationReport,
+                    "current assignment report",
+                ),
+            }),
+        )
+        .await
+        .unwrap();
+        let reported = backend.show(ticket_ref.id.clone().into()).unwrap();
+        assert!(
+            reported
+                .events
+                .last()
+                .unwrap()
+                .author
+                .as_deref()
+                .is_some_and(|author| {
+                    author.contains(&source_worker.worker_id)
+                        && author.contains("assignment:source-assignment")
+                })
+        );
+
+        let unauthorized = scoped_ticket_backend_operation(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            HeaderMap::new(),
+            Json(TicketBackendOperation::AddEvent {
+                id: ticket_ref.id.clone().into(),
+                event: NewTicketEvent::new(TicketEventKind::Comment, "spoofed update"),
+            }),
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn queued_ticket_mutation_targets_current_orchestrator() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let source = api
+            .runtime
+            .spawn_worker(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                WorkerSpawnRequest {
+                    requested_worker_name: Some("orchestrator-source".to_string()),
+                    intent: WorkerSpawnIntent::TicketRole {
+                        ticket_id: "source-ticket".to_string(),
+                        role: TicketWorkerRole::Coder,
+                    },
+                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                        expected_segments: 0,
+                    },
+                    profile: ProfileSelector::Builtin("builtin:coder".to_string()),
+                    initial_input: None,
+                    working_directory_request: None,
+                    resolved_working_directory_request: None,
+                    resolved_working_directory: None,
+                    resolved_config_bundle: None,
+                    resolved_workspace_api: None,
+                },
+            )
+            .unwrap()
+            .worker
+            .unwrap();
+        let orchestrator = api
+            .runtime
+            .spawn_worker(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                WorkerSpawnRequest {
+                    requested_worker_name: Some("workspace-orchestrator".to_string()),
+                    intent: WorkerSpawnIntent::WorkspaceOrchestrator,
+                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                        expected_segments: 0,
+                    },
+                    profile: ProfileSelector::Builtin("builtin:orchestrator".to_string()),
+                    initial_input: None,
+                    working_directory_request: None,
+                    resolved_working_directory_request: None,
+                    resolved_working_directory: None,
+                    resolved_config_bundle: None,
+                    resolved_workspace_api: None,
+                },
+            )
+            .unwrap()
+            .worker
+            .unwrap();
+        api.runtime
+            .stop_worker(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                &orchestrator.worker_id,
+                WorkerLifecycleRequest {
+                    reason: Some("test pending delivery".to_string()),
+                },
+            )
+            .unwrap();
+        api.store
+            .upsert_worker_workspace_credential(&WorkerWorkspaceCredentialRecord {
+                credential_id: "orchestrator-source-credential".to_string(),
+                token: "orchestrator-source-secret".to_string(),
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                worker_id: Some(source.worker_id.clone()),
+                created_at: TEST_CREATED_AT.to_string(),
+            })
+            .unwrap();
+        let backend = browser_ticket_backend(&api).unwrap();
+        let mut input = ticket::NewTicket::new("Queued notification");
+        input.workflow_state = Some(TicketWorkflowState::Queued);
+        let ticket_ref = backend.create(input).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer orchestrator-source-secret"),
+        );
+        headers.insert(
+            "x-yoi-worker-id",
+            axum::http::HeaderValue::from_str(&source.worker_id).unwrap(),
+        );
+        let _ = scoped_ticket_backend_operation(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            headers,
+            Json(TicketBackendOperation::AddEvent {
+                id: ticket_ref.id.clone().into(),
+                event: NewTicketEvent::new(TicketEventKind::Comment, "queued update"),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api.store
+                .count_ticket_notification_deliveries_for_recipient(
+                    TEST_WORKSPACE_ID,
+                    &ticket_ref.id,
+                    EMBEDDED_WORKER_RUNTIME_ID,
+                    &orchestrator.worker_id,
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn ticket_browser_endpoints_mutate_typed_backend_and_return_thread() {
         let dir = tempfile::tempdir().unwrap();
         let api = test_api(dir.path()).await;
@@ -7949,6 +8804,7 @@ mod tests {
             AxumPath(ScopedWorkspacePath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
             }),
+            HeaderMap::new(),
             Json(TicketBackendOperation::Create {
                 input: ticket::NewTicket::new("Browser Ticket API"),
             }),
@@ -7970,6 +8826,7 @@ mod tests {
             AxumPath(ScopedWorkspacePath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
             }),
+            HeaderMap::new(),
             Json(TicketBackendOperation::Create {
                 input: ticket::NewTicket::new("Related Browser Ticket"),
             }),
@@ -7982,23 +8839,18 @@ mod tests {
             } => ticket_ref.id,
             other => panic!("unexpected related create response: {other:?}"),
         };
-        let _ = scoped_ticket_backend_operation(
-            State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-            }),
-            Json(TicketBackendOperation::AddTicketRelation {
-                id: ticket_id.clone().into(),
-                relation: ticket::NewTicketRelation {
+        browser_ticket_backend(&api)
+            .unwrap()
+            .add_ticket_relation(
+                ticket_id.clone().into(),
+                ticket::NewTicketRelation {
                     kind: ticket::TicketRelationKind::Related,
                     target: related_ticket_id.clone(),
                     note: Some("Browser relation".to_string()),
                     author: Some("browser-user".to_string()),
                 },
-            }),
-        )
-        .await
-        .unwrap();
+            )
+            .unwrap();
 
         let Json(edited) = scoped_edit_ticket_item(
             State(api.clone()),
@@ -8117,6 +8969,7 @@ mod tests {
             AxumPath(ScopedWorkspacePath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
             }),
+            HeaderMap::new(),
             Json(TicketBackendOperation::Create {
                 input: ticket::NewTicket::new("Endpoint configured root"),
             }),
@@ -9712,6 +10565,7 @@ mod tests {
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
                     resolved_config_bundle: None,
+                    resolved_workspace_api: None,
                 },
             )
             .expect("spawn worker");

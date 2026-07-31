@@ -20,27 +20,25 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
-use crate::worker::WorkspaceClient;
+use crate::worker::{
+    WorkspaceClient, WorkspaceClientError, WorkspaceRequest, WorkspaceRequestMethod,
+};
 
 #[derive(Clone, Debug)]
 pub struct WorkspaceHttpMemoryBackend {
-    workspace_id: String,
-    base_url: String,
+    client: Arc<dyn WorkspaceClient>,
 }
 
 impl WorkspaceHttpMemoryBackend {
-    pub fn new(workspace_id: impl Into<String>, base_url: impl Into<String>) -> Self {
-        Self {
-            workspace_id: workspace_id.into(),
-            base_url: base_url.into(),
-        }
+    pub fn new(client: Arc<dyn WorkspaceClient>) -> Self {
+        Self { client }
     }
 
     pub async fn execute_operation(
         &self,
         operation: MemoryBackendOperation,
     ) -> Result<MemoryBackendOperationResult, WorkspaceMemoryBackendError> {
-        execute_http_memory_backend(&self.workspace_id, &self.base_url, operation).await
+        execute_memory_backend(self.client.as_ref(), operation).await
     }
 
     async fn execute(&self, operation: MemoryBackendOperation) -> Result<ToolOutput, ToolError> {
@@ -59,7 +57,7 @@ pub enum WorkspaceMemoryBackendError {
     #[error("workspace memory backend is unavailable: {reason}")]
     Unavailable { reason: String },
     #[error("workspace memory backend request failed: {0}")]
-    Request(#[from] reqwest::Error),
+    Request(#[from] WorkspaceClientError),
     #[error("workspace memory backend returned HTTP {status}: {body}")]
     Http {
         status: reqwest::StatusCode,
@@ -71,73 +69,49 @@ pub enum WorkspaceMemoryBackendError {
     Backend(String),
 }
 
-impl WorkspaceClient {
+impl dyn WorkspaceClient + '_ {
     pub async fn execute_memory_backend_operation(
         &self,
         operation: MemoryBackendOperation,
     ) -> Result<MemoryBackendOperationResult, WorkspaceMemoryBackendError> {
-        match self {
-            WorkspaceClient::Http {
-                workspace_id,
-                base_url,
-            } => execute_http_memory_backend(workspace_id, base_url, operation).await,
-            WorkspaceClient::Available { kind } => Err(WorkspaceMemoryBackendError::Unavailable {
-                reason: format!(
-                    "workspace client kind `{kind}` does not expose the Backend Workspace API"
-                ),
-            }),
-            WorkspaceClient::Unavailable { reason } => {
-                Err(WorkspaceMemoryBackendError::Unavailable {
-                    reason: reason.clone(),
-                })
-            }
-        }
+        execute_memory_backend(self, operation).await
     }
 
     pub async fn request_memory_staging_consolidation(
         &self,
         operation: MemoryConsolidateStagingOperation,
     ) -> Result<MemoryConsolidationOutput, WorkspaceMemoryBackendError> {
-        match self {
-            WorkspaceClient::Http {
-                workspace_id,
-                base_url,
-            } => execute_http_memory_consolidation(workspace_id, base_url, operation).await,
-            WorkspaceClient::Available { kind } => Err(WorkspaceMemoryBackendError::Unavailable {
-                reason: format!(
-                    "workspace client kind `{kind}` does not expose the Backend Workspace API"
-                ),
-            }),
-            WorkspaceClient::Unavailable { reason } => {
-                Err(WorkspaceMemoryBackendError::Unavailable {
-                    reason: reason.clone(),
-                })
-            }
-        }
+        execute_memory_consolidation(self, operation).await
     }
 }
 
-async fn execute_http_memory_backend(
-    workspace_id: &str,
-    base_url: &str,
+async fn execute_memory_backend(
+    client: &dyn WorkspaceClient,
     operation: MemoryBackendOperation,
 ) -> Result<MemoryBackendOperationResult, WorkspaceMemoryBackendError> {
-    let url = format!(
-        "{}/api/w/{}/memory/backend",
-        base_url.trim_end_matches('/'),
-        workspace_id
-    );
-    let response = reqwest::Client::new()
-        .post(url)
-        .json(&operation)
-        .send()
-        .await?;
-    let status = response.status();
-    let body = response.text().await?;
-    if !status.is_success() {
-        return Err(WorkspaceMemoryBackendError::Http { status, body });
+    let workspace_id =
+        client
+            .workspace_id()
+            .ok_or_else(|| WorkspaceMemoryBackendError::Unavailable {
+                reason: format!(
+                    "workspace client kind `{}` has no workspace id",
+                    client.kind()
+                ),
+            })?;
+    let response = client.execute(WorkspaceRequest::json(
+        WorkspaceRequestMethod::Post,
+        format!("/api/w/{workspace_id}/memory/backend"),
+        serde_json::to_string(&operation)?,
+    ))?;
+    let status = reqwest::StatusCode::from_u16(response.status)
+        .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    if !response.is_success() {
+        return Err(WorkspaceMemoryBackendError::Http {
+            status,
+            body: response.body,
+        });
     }
-    match serde_json::from_str::<MemoryBackendHttpResponse>(&body)? {
+    match serde_json::from_str::<MemoryBackendHttpResponse>(&response.body)? {
         MemoryBackendHttpResponse::Ok { result } => Ok(result),
         MemoryBackendHttpResponse::Error { message } => {
             Err(WorkspaceMemoryBackendError::Backend(message))
@@ -145,34 +119,37 @@ async fn execute_http_memory_backend(
     }
 }
 
-async fn execute_http_memory_consolidation(
-    workspace_id: &str,
-    base_url: &str,
+async fn execute_memory_consolidation(
+    client: &dyn WorkspaceClient,
     operation: MemoryConsolidateStagingOperation,
 ) -> Result<MemoryConsolidationOutput, WorkspaceMemoryBackendError> {
-    let url = format!(
-        "{}/api/w/{}/memory/consolidation",
-        base_url.trim_end_matches('/'),
-        workspace_id
-    );
-    let response = reqwest::Client::new()
-        .post(url)
-        .json(&operation)
-        .send()
-        .await?;
-    let status = response.status();
-    let body = response.text().await?;
-    if !status.is_success() {
-        return Err(WorkspaceMemoryBackendError::Http { status, body });
+    let workspace_id =
+        client
+            .workspace_id()
+            .ok_or_else(|| WorkspaceMemoryBackendError::Unavailable {
+                reason: format!(
+                    "workspace client kind `{}` has no workspace id",
+                    client.kind()
+                ),
+            })?;
+    let response = client.execute(WorkspaceRequest::json(
+        WorkspaceRequestMethod::Post,
+        format!("/api/w/{workspace_id}/memory/consolidation"),
+        serde_json::to_string(&operation)?,
+    ))?;
+    let status = reqwest::StatusCode::from_u16(response.status)
+        .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    if !response.is_success() {
+        return Err(WorkspaceMemoryBackendError::Http {
+            status,
+            body: response.body,
+        });
     }
-    serde_json::from_str::<MemoryConsolidationOutput>(&body).map_err(Into::into)
+    serde_json::from_str::<MemoryConsolidationOutput>(&response.body).map_err(Into::into)
 }
 
-pub fn workspace_http_memory_tools(
-    workspace_id: impl Into<String>,
-    base_url: impl Into<String>,
-) -> Vec<ToolDefinition> {
-    let backend = WorkspaceHttpMemoryBackend::new(workspace_id, base_url);
+pub fn workspace_http_memory_tools(client: Arc<dyn WorkspaceClient>) -> Vec<ToolDefinition> {
+    let backend = WorkspaceHttpMemoryBackend::new(client);
     vec![
         memory_tool(
             "MemoryReadDocument",
@@ -215,13 +192,10 @@ pub fn workspace_http_memory_tools(
 }
 
 pub fn workspace_http_memory_consolidation_tools(
-    workspace_id: impl Into<String>,
-    base_url: impl Into<String>,
+    client: Arc<dyn WorkspaceClient>,
 ) -> Vec<ToolDefinition> {
-    let workspace_id = workspace_id.into();
-    let base_url = base_url.into();
-    let mut tools = workspace_http_memory_tools(workspace_id.clone(), base_url.clone());
-    let backend = WorkspaceHttpMemoryBackend::new(workspace_id, base_url);
+    let mut tools = workspace_http_memory_tools(client.clone());
+    let backend = WorkspaceHttpMemoryBackend::new(client);
     tools.extend([
         memory_tool(
             "MemoryStagingList",
@@ -370,6 +344,14 @@ mod tests {
     use super::*;
     use llm_engine::tool::ToolDefinition;
 
+    fn test_client() -> Arc<dyn WorkspaceClient> {
+        Arc::new(crate::worker::RuntimeWorkspaceHttpClient::new(
+            "workspace",
+            "http://backend",
+            "test-worker",
+        ))
+    }
+
     fn tool_names(definitions: Vec<ToolDefinition>) -> Vec<String> {
         let mut names = definitions
             .into_iter()
@@ -390,10 +372,7 @@ mod tests {
 
     #[test]
     fn normal_workspace_memory_tools_do_not_include_staging_tools() {
-        let names = tool_names(workspace_http_memory_tools(
-            "workspace".to_string(),
-            "http://backend".to_string(),
-        ));
+        let names = tool_names(workspace_http_memory_tools(test_client()));
 
         assert!(names.contains(&"MemoryQuery".to_string()));
         assert!(names.contains(&"MemoryReadDocument".to_string()));
@@ -410,7 +389,7 @@ mod tests {
     #[test]
     fn document_update_schema_is_edit_like_and_staging_close_has_no_legacy_kinds() {
         let update_schema = tool_meta(
-            workspace_http_memory_tools("workspace".to_string(), "http://backend".to_string()),
+            workspace_http_memory_tools(test_client()),
             "MemoryUpdateDocument",
         );
         assert_eq!(
@@ -423,10 +402,7 @@ mod tests {
         assert!(update_schema["properties"].get("body_md").is_none());
 
         let close_schema_text = tool_meta(
-            workspace_http_memory_consolidation_tools(
-                "workspace".to_string(),
-                "http://backend".to_string(),
-            ),
+            workspace_http_memory_consolidation_tools(test_client()),
             "MemoryStagingClose",
         )
         .to_string();
@@ -440,10 +416,7 @@ mod tests {
 
     #[test]
     fn consolidation_workspace_memory_tools_include_staging_tools() {
-        let names = tool_names(workspace_http_memory_consolidation_tools(
-            "workspace".to_string(),
-            "http://backend".to_string(),
-        ));
+        let names = tool_names(workspace_http_memory_consolidation_tools(test_client()));
 
         assert!(names.contains(&"MemoryQuery".to_string()));
         assert!(names.contains(&"MemoryReadDocument".to_string()));

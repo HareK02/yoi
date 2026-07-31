@@ -23,6 +23,7 @@ use crate::execution::{
     WorkerExecutionRestoreRequest, WorkerExecutionResult, WorkerExecutionRunState,
     WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
 };
+use crate::identity::WorkerRef;
 use crate::interaction::{WorkerInput, WorkerInputKind};
 use crate::resource::{BackendResourceClient, ProfileSourceArchiveCache};
 use crate::working_directory::{
@@ -40,8 +41,8 @@ use tokio::sync::broadcast;
 #[cfg(feature = "ws-server")]
 use worker::ipc::protocol_session::{live_log_entry_event, subscribe_worker_protocol_session};
 use worker::{
-    PromptLoader, Worker, WorkerController, WorkerError, WorkerFilesystemAuthority, WorkerHandle,
-    WorkerWorkspaceContext, WorkspaceClient, WorkspaceId,
+    PromptLoader, RuntimeWorkspaceHttpClient, Worker, WorkerController, WorkerError,
+    WorkerFilesystemAuthority, WorkerHandle, WorkerWorkspaceContext, WorkspaceId,
 };
 
 const DEFAULT_BACKEND_ID: &str = "worker-crate";
@@ -259,6 +260,7 @@ enum RuntimeWorkspaceBackendRef {
     Http {
         workspace_id: String,
         base_url: String,
+        access_token: Option<String>,
     },
 }
 
@@ -268,20 +270,29 @@ impl RuntimeWorkspaceBackendRef {
             return Self::Http {
                 workspace_id: api.workspace_id.clone(),
                 base_url: api.base_url.clone(),
+                access_token: api.access_token.clone(),
             };
         }
         Self::None
     }
 
-    fn worker_context(&self) -> WorkerWorkspaceContext {
+    fn worker_context(&self, worker_ref: &WorkerRef) -> WorkerWorkspaceContext {
         match self {
             Self::None => WorkerWorkspaceContext::no_workspace(),
             Self::Http {
                 workspace_id,
                 base_url,
+                access_token,
             } => WorkerWorkspaceContext::with_client(
                 WorkspaceId::new(workspace_id.clone()).ok(),
-                WorkspaceClient::http(workspace_id.clone(), base_url.clone()),
+                Arc::new(
+                    RuntimeWorkspaceHttpClient::new(
+                        workspace_id.clone(),
+                        base_url.clone(),
+                        worker_ref.worker_id.to_string(),
+                    )
+                    .with_access_token(access_token.clone()),
+                ),
             ),
         }
     }
@@ -368,7 +379,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             .unwrap_or(WorkerFilesystemAuthority::None);
         let workspace_backend_ref =
             RuntimeWorkspaceBackendRef::from_worker_request(&request.request);
-        let workspace_context = workspace_backend_ref.worker_context();
+        let workspace_context = workspace_backend_ref.worker_context(&request.worker_ref);
         let selector = profile.as_ref();
         let archive = self
             .resolve_profile_source_archive(&request.request.profile_source)
@@ -442,7 +453,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             .unwrap_or(WorkerFilesystemAuthority::None);
         let workspace_backend_ref =
             RuntimeWorkspaceBackendRef::from_worker_request(&request.request);
-        let workspace_context = workspace_backend_ref.worker_context();
+        let workspace_context = workspace_backend_ref.worker_context(&request.worker_ref);
         let (manifest, loader) = Self::restore_fallback_manifest(&worker_name)?;
 
         let store_dir = self.store_dir()?;
@@ -1276,7 +1287,7 @@ mod tests {
         store_dir: PathBuf,
         worker_metadata_dir: PathBuf,
         observed_cwds: Arc<Mutex<Vec<PathBuf>>>,
-        observed_workspace_clients: Arc<Mutex<Vec<WorkspaceClient>>>,
+        observed_workspace_clients: Arc<Mutex<Vec<(String, Option<String>, bool)>>>,
     }
 
     #[async_trait]
@@ -1325,11 +1336,13 @@ mod tests {
                 .unwrap_or_else(|| self.cwd.clone());
             let workspace_backend_ref =
                 RuntimeWorkspaceBackendRef::from_worker_request(&request.request);
-            let workspace_context = workspace_backend_ref.worker_context();
-            self.observed_workspace_clients
-                .lock()
-                .unwrap()
-                .push(workspace_context.client().clone());
+            let workspace_context = workspace_backend_ref.worker_context(&request.worker_ref);
+            let workspace_client = workspace_context.client();
+            self.observed_workspace_clients.lock().unwrap().push((
+                workspace_client.kind().to_string(),
+                workspace_client.workspace_id().map(str::to_string),
+                workspace_client.is_available(),
+            ));
             let scope = Scope::writable(&scope_root).map_err(|err| err.to_string())?;
             let worker = Worker::new(
                 manifest,
@@ -1673,6 +1686,8 @@ mod tests {
         request.workspace_api = Some(crate::catalog::WorkspaceApiRef {
             workspace_id: "ws-test".to_string(),
             base_url: "http://127.0.0.1:3999".to_string(),
+            runtime_id: None,
+            access_token: None,
         });
         let detail = runtime.create_worker(request).unwrap();
 
@@ -1704,7 +1719,11 @@ mod tests {
         assert!(observed_cwds.lock().unwrap().is_empty());
         assert_eq!(
             observed_workspace_clients.lock().unwrap().as_slice(),
-            &[WorkspaceClient::http("ws-test", "http://127.0.0.1:3999")]
+            &[(
+                "runtime-http-proxy".to_string(),
+                Some("ws-test".to_string()),
+                true,
+            )]
         );
         let names = captured_tool_names(&client, 0);
         for forbidden in core_filesystem_tool_names() {
@@ -1781,9 +1800,7 @@ mod tests {
         assert!(cwd.join("README.md").exists());
         assert_eq!(
             observed_workspace_clients.lock().unwrap().as_slice(),
-            &[WorkspaceClient::Unavailable {
-                reason: "no workspace configured".to_string()
-            }]
+            &[("unavailable".to_string(), None, false)]
         );
     }
 
