@@ -1451,6 +1451,8 @@ mod tests {
     fn create_request(_name: &str) -> CreateWorkerRequest {
         let bundle = test_bundle();
         CreateWorkerRequest {
+            idempotency_key: None,
+            idempotency_fingerprint: None,
             profile: ProfileSelector::Builtin("builtin:companion".to_string()),
             display_name: None,
             profile_source: crate::catalog::ProfileSourceArchiveSource::Embedded {

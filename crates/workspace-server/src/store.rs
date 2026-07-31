@@ -107,6 +107,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "atomic Ticket notification identity credentials and cursors",
         apply: strengthen_ticket_notifications,
     },
+    Migration {
+        version: 19,
+        name: "crash safe Worker lifecycle assignment reservations",
+        apply: strengthen_ticket_assignment_lifecycle_reservations,
+    },
 ];
 
 struct Migration {
@@ -580,8 +585,15 @@ pub trait ControlPlaneStore: Send + Sync {
         operation_id: &str,
         ticket_id: &str,
         runtime_id: &str,
-        worker_id: &str,
+        worker_id: Option<&str>,
+        request_fingerprint: &str,
         created_at: &str,
+    ) -> Result<()>;
+    fn bind_ticket_assignment_operation_worker(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+        worker_id: &str,
     ) -> Result<()>;
     fn get_current_ticket_worker_assignment(
         &self,
@@ -1799,15 +1811,16 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         operation_id: &str,
         ticket_id: &str,
         runtime_id: &str,
-        worker_id: &str,
+        worker_id: Option<&str>,
+        request_fingerprint: &str,
         created_at: &str,
     ) -> Result<()> {
         self.with_conn(|conn| {
             let inserted = conn.execute(
                 r#"INSERT OR IGNORE INTO ticket_assignment_operations (
                     workspace_id, operation_id, action, ticket_id, runtime_id, worker_id,
-                    assignment_id, expected_assignment_id, created_at
-                ) VALUES (?1, ?2, 'assign', ?3, ?4, ?5, NULL, NULL, ?6)"#,
+                    assignment_id, expected_assignment_id, created_at, request_fingerprint
+                ) VALUES (?1, ?2, 'assign', ?3, ?4, ?5, NULL, NULL, ?6, ?7)"#,
                 params![
                     workspace_id,
                     operation_id,
@@ -1815,6 +1828,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     runtime_id,
                     worker_id,
                     created_at,
+                    request_fingerprint,
                 ],
             )?;
             if inserted > 0 {
@@ -1829,8 +1843,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             if existing.action == "assign"
                 && existing.ticket_id == ticket_id
                 && existing.runtime_id.as_deref() == Some(runtime_id)
-                && existing.worker_id.as_deref() == Some(worker_id)
+                && (worker_id.is_none() || existing.worker_id.as_deref() == worker_id)
                 && existing.expected_assignment_id.is_none()
+                && existing.request_fingerprint.as_deref() == Some(request_fingerprint)
             {
                 Ok(())
             } else {
@@ -1838,6 +1853,29 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     "assignment operation {operation_id} was already used with different input"
                 )))
             }
+        })
+    }
+
+    fn bind_ticket_assignment_operation_worker(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+        worker_id: &str,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            let updated = conn.execute(
+                r#"UPDATE ticket_assignment_operations
+                   SET worker_id = ?3
+                   WHERE workspace_id = ?1 AND operation_id = ?2
+                     AND assignment_id IS NULL AND (worker_id IS NULL OR worker_id = ?3)"#,
+                params![workspace_id, operation_id, worker_id],
+            )?;
+            if updated == 1 {
+                return Ok(());
+            }
+            Err(Error::TicketAssignmentConflict(format!(
+                "assignment operation {operation_id} cannot bind Worker {worker_id}"
+            )))
         })
     }
 
@@ -1890,11 +1928,30 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                         params![record.workspace_id, record.ticket_id, assignment_id],
                         read_ticket_worker_assignment_record,
                     )?;
+                    let previous = if existing.action == "reassign" {
+                        existing
+                            .expected_assignment_id
+                            .as_deref()
+                            .map(|previous_assignment_id| {
+                                tx.query_row(
+                                    r#"SELECT workspace_id, ticket_id, assignment_id, runtime_id, worker_id,
+                                              assigned_by, assigned_at
+                                       FROM ticket_worker_assignments
+                                       WHERE workspace_id = ?1 AND ticket_id = ?2 AND assignment_id = ?3"#,
+                                    params![
+                                        record.workspace_id,
+                                        record.ticket_id,
+                                        previous_assignment_id,
+                                    ],
+                                    read_ticket_worker_assignment_record,
+                                )
+                            })
+                            .transpose()?
+                    } else {
+                        None
+                    };
                     tx.commit()?;
-                    return Ok(TicketWorkerAssignmentUpdate {
-                        current,
-                        previous: None,
-                    });
+                    return Ok(TicketWorkerAssignmentUpdate { current, previous });
                 }
                 reserved_operation = true;
             }
@@ -3003,6 +3060,7 @@ pub struct TicketAssignmentOperationRecord {
     pub worker_id: Option<String>,
     pub assignment_id: Option<String>,
     pub expected_assignment_id: Option<String>,
+    pub request_fingerprint: Option<String>,
 }
 
 fn read_assignment_operation(
@@ -3011,7 +3069,8 @@ fn read_assignment_operation(
     operation_id: &str,
 ) -> Result<Option<TicketAssignmentOperationRecord>> {
     conn.query_row(
-        r#"SELECT action, ticket_id, runtime_id, worker_id, assignment_id, expected_assignment_id
+        r#"SELECT action, ticket_id, runtime_id, worker_id, assignment_id, expected_assignment_id,
+                  request_fingerprint
            FROM ticket_assignment_operations
            WHERE workspace_id = ?1 AND operation_id = ?2"#,
         params![workspace_id, operation_id],
@@ -3023,6 +3082,7 @@ fn read_assignment_operation(
                 worker_id: row.get(3)?,
                 assignment_id: row.get(4)?,
                 expected_assignment_id: row.get(5)?,
+                request_fingerprint: row.get(6)?,
             })
         },
     )
@@ -3392,6 +3452,15 @@ CREATE TABLE ticket_notification_cursors (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (workspace_id, ticket_id, runtime_id, worker_id)
 );
+"#,
+    )?;
+    Ok(())
+}
+
+fn strengthen_ticket_assignment_lifecycle_reservations(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+ALTER TABLE ticket_assignment_operations ADD COLUMN request_fingerprint TEXT;
 "#,
     )?;
     Ok(())
@@ -4079,7 +4148,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 18);
+        assert_eq!(store.schema_version().await.unwrap(), 19);
 
         let record = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
@@ -4092,7 +4161,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 18);
+        assert_eq!(reopened.schema_version().await.unwrap(), 19);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -4102,7 +4171,8 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
     #[tokio::test]
     async fn ticket_worker_assignment_replaces_current_and_preserves_audit_history() {
         let dir = tempfile::tempdir().unwrap();
-        let store = SqliteWorkspaceStore::open(dir.path().join("server.db")).unwrap();
+        let db = dir.path().join("server.db");
+        let store = SqliteWorkspaceStore::open(&db).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "workspace-a".to_string(),
@@ -4204,6 +4274,16 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
             .unwrap();
         assert_eq!(replaced.current, second);
         assert_eq!(replaced.previous, Some(first.clone()));
+        let replayed_reassignment = store
+            .set_current_ticket_worker_assignment(
+                &second,
+                Some("assignment-1"),
+                "ignored-reassign-event",
+                "operation-2",
+                true,
+            )
+            .unwrap();
+        assert_eq!(replayed_reassignment, replaced);
         assert_eq!(
             store
                 .get_current_ticket_worker_assignment("workspace-a", "ticket-1")
@@ -4254,8 +4334,27 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
                 "reserved-operation",
                 "ticket-3",
                 "runtime-3",
-                "worker-3",
+                None,
+                "sha256:reserved",
                 "2026-07-31T00:00:05Z",
+            )
+            .unwrap();
+        drop(store);
+        let store = SqliteWorkspaceStore::open(&db).unwrap();
+        let pending = store
+            .get_ticket_assignment_operation("workspace-a", "reserved-operation")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.worker_id, None);
+        assert_eq!(
+            pending.request_fingerprint.as_deref(),
+            Some("sha256:reserved")
+        );
+        store
+            .bind_ticket_assignment_operation_worker(
+                "workspace-a",
+                "reserved-operation",
+                "worker-3",
             )
             .unwrap();
         let reserved_assignment = TicketWorkerAssignmentRecord {
@@ -4652,7 +4751,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 18);
+        assert_eq!(store.schema_version().await.unwrap(), 19);
 
         store
             .with_conn(|conn| {
@@ -4755,7 +4854,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 18);
+        assert_eq!(store.schema_version().await.unwrap(), 19);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -4793,7 +4892,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 18);
+        assert_eq!(store.schema_version().await.unwrap(), 19);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -4967,7 +5066,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 18);
+        assert_eq!(store.schema_version().await.unwrap(), 19);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),

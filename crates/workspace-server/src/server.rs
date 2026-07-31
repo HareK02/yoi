@@ -1774,11 +1774,14 @@ fn existing_lifecycle_assignment_worker(
     let Some(worker_id) = operation.worker_id else {
         return Ok(None);
     };
-    Ok(Some(
-        api.runtime
-            .worker(runtime_id, &worker_id)
-            .map_err(|error| error.into_error())?,
-    ))
+    let worker = api
+        .runtime
+        .worker(runtime_id, &worker_id)
+        .map_err(|error| error.into_error())?;
+    if operation.assignment_id.is_none() && worker.state == "stopped" {
+        return Ok(None);
+    }
+    Ok(Some(worker))
 }
 
 fn require_ticket_assignment_value(field: &str, value: String) -> Result<String> {
@@ -2258,6 +2261,16 @@ impl WorkerTicketSourceContext {
     }
 }
 
+fn worker_source_actor_role(is_current_assignment: bool, is_orchestrator: bool) -> &'static str {
+    if is_current_assignment {
+        "coder"
+    } else if is_orchestrator {
+        "orchestrator"
+    } else {
+        "worker"
+    }
+}
+
 fn worker_ticket_source_context(
     api: &WorkspaceApi,
     workspace_id: &str,
@@ -2271,17 +2284,13 @@ fn worker_ticket_source_context(
             .flatten()
     });
     let orchestrator = find_workspace_orchestrator(api);
-    let actor_role = if assignment.as_ref().is_some_and(|assignment| {
+    let is_current_assignment = assignment.as_ref().is_some_and(|assignment| {
         assignment.runtime_id == source.runtime_id && assignment.worker_id == source.worker_id
-    }) {
-        "assigned"
-    } else if orchestrator.as_ref().is_some_and(|worker| {
+    });
+    let is_orchestrator = orchestrator.as_ref().is_some_and(|worker| {
         worker.runtime_id == source.runtime_id && worker.worker_id == source.worker_id
-    }) {
-        "orchestrator"
-    } else {
-        "worker"
-    };
+    });
+    let actor_role = worker_source_actor_role(is_current_assignment, is_orchestrator);
     WorkerTicketSourceContext {
         workspace_id: workspace_id.to_string(),
         runtime_id: source.runtime_id.clone(),
@@ -3987,6 +3996,25 @@ async fn scoped_restore_runtime_worker(
         }
     };
     if let Some(assignment) = assignment_request.as_ref() {
+        let fingerprint = format!(
+            "sha256:{}",
+            Sha256::digest(format!(
+                "restore\0{}\0{}\0{}",
+                assignment.ticket_id, runtime_id, worker_id
+            ))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+        );
+        api.store.reserve_ticket_assignment_operation(
+            &workspace_id,
+            &assignment.operation_id,
+            &assignment.ticket_id,
+            &runtime_id,
+            Some(&worker_id),
+            &fingerprint,
+            &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        )?;
         if let Some(worker) = existing_lifecycle_assignment_worker(&api, assignment, &runtime_id)? {
             if worker.worker_id != worker_id {
                 return Err(Error::TicketAssignmentConflict(format!(
@@ -4015,14 +4043,6 @@ async fn scoped_restore_runtime_worker(
     )
     .await?;
     if let Some(assignment) = assignment_request.as_ref() {
-        api.store.reserve_ticket_assignment_operation(
-            &workspace_id,
-            &assignment.operation_id,
-            &assignment.ticket_id,
-            &runtime_id,
-            &worker_id,
-            &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-        )?;
         assign_ticket_worker_from_lifecycle(&api, assignment, &runtime_id, &worker_id)?;
     }
     dispatch_pending_ticket_notifications(&api, &workspace_id);
@@ -5760,6 +5780,21 @@ async fn create_runtime_worker(
             access_token: Some(credential.token),
         });
     }
+    let spawn_idempotency =
+        crate::hosts::worker_spawn_idempotency(&request).map_err(Error::Config)?;
+    if let (Some(assignment), Some((_, fingerprint))) =
+        (lifecycle_assignment.as_ref(), spawn_idempotency.as_ref())
+    {
+        api.store.reserve_ticket_assignment_operation(
+            &api.config.workspace_id,
+            &assignment.operation_id,
+            &assignment.ticket_id,
+            &runtime_id,
+            None,
+            fingerprint,
+            &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        )?;
+    }
     let result = api
         .runtime
         .spawn_worker(&runtime_id, request)
@@ -5778,13 +5813,10 @@ async fn create_runtime_worker(
             WorkerRegistryDisplayNamePolicy::UseProvided,
         )?;
         if let Some(assignment) = lifecycle_assignment.as_ref() {
-            api.store.reserve_ticket_assignment_operation(
+            api.store.bind_ticket_assignment_operation_worker(
                 &api.config.workspace_id,
                 &assignment.operation_id,
-                &assignment.ticket_id,
-                &runtime_id,
                 &worker.worker_id,
-                &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
             )?;
             assign_ticket_worker_from_lifecycle(&api, assignment, &runtime_id, &worker.worker_id)?;
         }
@@ -8871,6 +8903,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn worker_source_actor_roles_use_canonical_vocabulary() {
+        assert_eq!(worker_source_actor_role(true, false), "coder");
+        assert_eq!(worker_source_actor_role(false, true), "orchestrator");
+        assert_eq!(worker_source_actor_role(false, false), "worker");
+        assert_eq!(worker_source_actor_role(true, true), "coder");
+    }
+
     #[tokio::test]
     async fn ticket_assignment_endpoints_read_and_clear_current_assignment() {
         let dir = tempfile::tempdir().unwrap();
@@ -9169,7 +9209,7 @@ mod tests {
                 .attributes
                 .get("source_actor_role")
                 .map(String::as_str),
-            Some("assigned")
+            Some("coder")
         );
 
         let unauthorized = scoped_ticket_backend_operation(
@@ -9455,16 +9495,39 @@ mod tests {
                 TEST_CREATED_AT,
             )
             .unwrap();
+        let pending_request = WorkerSpawnRequest {
+            ticket_assignment: Some(crate::hosts::WorkerTicketAssignmentRequest {
+                ticket_id: second_ticket.id.clone(),
+                operation_id: "pending-spawn-operation".to_string(),
+            }),
+            ..request
+        };
+        let (_, pending_fingerprint) = crate::hosts::worker_spawn_idempotency(&pending_request)
+            .unwrap()
+            .unwrap();
         api.store
             .reserve_ticket_assignment_operation(
                 TEST_WORKSPACE_ID,
                 "pending-spawn-operation",
                 &second_ticket.id,
                 EMBEDDED_WORKER_RUNTIME_ID,
-                &first_worker.worker_id,
+                None,
+                &pending_fingerprint,
                 TEST_CREATED_AT,
             )
             .unwrap();
+        let spawned_before_backend_failure = api
+            .runtime
+            .spawn_worker(EMBEDDED_WORKER_RUNTIME_ID, pending_request.clone())
+            .unwrap()
+            .worker
+            .unwrap();
+        assert!(
+            api.store
+                .get_ticket_assignment_operation(TEST_WORKSPACE_ID, "pending-spawn-operation")
+                .unwrap()
+                .is_some_and(|operation| operation.worker_id.is_none())
+        );
         let worker_count_before_retry = api.runtime.list_workers(100).items.len();
         let Json(reconciled) = scoped_create_runtime_worker(
             State(api.clone()),
@@ -9472,17 +9535,14 @@ mod tests {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
             }),
-            Json(WorkerSpawnRequest {
-                ticket_assignment: Some(crate::hosts::WorkerTicketAssignmentRequest {
-                    ticket_id: second_ticket.id.clone(),
-                    operation_id: "pending-spawn-operation".to_string(),
-                }),
-                ..request
-            }),
+            Json(pending_request),
         )
         .await
         .unwrap();
-        assert_eq!(reconciled.worker.unwrap().worker_id, first_worker.worker_id);
+        assert_eq!(
+            reconciled.worker.unwrap().worker_id,
+            spawned_before_backend_failure.worker_id
+        );
         assert_eq!(
             api.runtime.list_workers(100).items.len(),
             worker_count_before_retry,
@@ -10101,6 +10161,8 @@ mod tests {
     fn runtime_create_request() -> worker_runtime::catalog::CreateWorkerRequest {
         let bundle = runtime_test_bundle();
         worker_runtime::catalog::CreateWorkerRequest {
+            idempotency_key: None,
+            idempotency_fingerprint: None,
             profile: worker_runtime::catalog::ProfileSelector::Builtin(
                 "builtin:companion".to_string(),
             ),

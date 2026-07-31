@@ -315,6 +315,20 @@ pub struct WorkerTicketAssignmentRequest {
     pub operation_id: String,
 }
 
+pub(crate) fn worker_spawn_idempotency(
+    request: &WorkerSpawnRequest,
+) -> Result<Option<(String, String)>, String> {
+    let Some(assignment) = request.ticket_assignment.as_ref() else {
+        return Ok(None);
+    };
+    let encoded = serde_json::to_vec(request)
+        .map_err(|error| format!("serialize Worker spawn idempotency input: {error}"))?;
+    Ok(Some((
+        assignment.operation_id.clone(),
+        format!("sha256:{}", digest_hex(&encoded, 64)),
+    )))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerSpawnRequest {
@@ -1708,7 +1722,14 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 };
             }
         };
+        let (idempotency_key, idempotency_fingerprint) = worker_spawn_idempotency(&request)
+            .expect("WorkerSpawnRequest serialization is infallible")
+            .map_or((None, None), |(key, fingerprint)| {
+                (Some(key), Some(fingerprint))
+            });
         let create_request = CreateWorkerRequest {
+            idempotency_key,
+            idempotency_fingerprint,
             profile,
             display_name: request.requested_worker_name.clone(),
             config_bundle: None,
@@ -2685,7 +2706,14 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 };
             }
         };
+        let (idempotency_key, idempotency_fingerprint) = worker_spawn_idempotency(&request)
+            .expect("WorkerSpawnRequest serialization is infallible")
+            .map_or((None, None), |(key, fingerprint)| {
+                (Some(key), Some(fingerprint))
+            });
         let create = CreateWorkerRequest {
+            idempotency_key,
+            idempotency_fingerprint,
             profile,
             display_name: request.requested_worker_name.clone(),
             config_bundle: None,
