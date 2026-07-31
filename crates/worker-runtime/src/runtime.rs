@@ -370,16 +370,6 @@ impl Runtime {
             if let Some(scope) = scope {
                 state.ensure_workspace_owner(scope, true)?;
             };
-            state.validate_worker_config_boundary(&request)?;
-            if let Some(working_directory_id) = requested_primary_workdir_id(&request) {
-                if let Some(owner_worker_id) =
-                    state.primary_worker_id_for_workdir(working_directory_id)
-                {
-                    return Err(RuntimeError::InvalidRequest(format!(
-                        "working directory {working_directory_id} is already assigned to worker {owner_worker_id}"
-                    )));
-                }
-            }
             if let Some(idempotency_key) = request.idempotency_key.as_deref() {
                 let workspace_id = scope.map(|scope| scope.workspace_id.as_str());
                 if let Some(existing) = state.workers.values().find(|record| {
@@ -392,6 +382,16 @@ impl Runtime {
                         )));
                     }
                     return Ok(existing.detail());
+                }
+            }
+            state.validate_worker_config_boundary(&request)?;
+            if let Some(working_directory_id) = requested_primary_workdir_id(&request) {
+                if let Some(owner_worker_id) =
+                    state.primary_worker_id_for_workdir(working_directory_id)
+                {
+                    return Err(RuntimeError::InvalidRequest(format!(
+                        "working directory {working_directory_id} is already assigned to worker {owner_worker_id}"
+                    )));
                 }
             }
             let backend = state.execution_backend.clone().ok_or_else(|| {
@@ -2127,7 +2127,9 @@ fn input_protocol_event(input: &WorkerInput) -> protocol::Event {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{ConfigBundleRef, ProfileSelector, WorkspaceApiRef};
+    use crate::catalog::{
+        ConfigBundleRef, ProfileSelector, WorkingDirectoryClaim, WorkspaceApiRef,
+    };
     use crate::config_bundle::{
         ConfigBundle, ConfigBundleMetadata, ConfigBundleProvenance, ConfigDeclaration,
         ConfigDeclarationKind, ConfigProfileDescriptor,
@@ -2641,11 +2643,20 @@ mod tests {
         let mut request = task_request("idempotent");
         request.idempotency_key = Some("operation-1".to_string());
         request.idempotency_fingerprint = Some("sha256:input-1".to_string());
+        request.working_directory = Some(WorkingDirectoryClaim {
+            working_directory_id: "workdir-idempotent".to_string(),
+            relative_cwd: None,
+        });
 
         let first = runtime.create_worker(request.clone()).unwrap();
+        let workdir_count_after_first = runtime.list_working_directories().unwrap().len();
         let replayed = runtime.create_worker(request.clone()).unwrap();
         assert_eq!(replayed.worker_ref, first.worker_ref);
         assert_eq!(runtime.list_workers().unwrap().len(), 1);
+        assert_eq!(
+            runtime.list_working_directories().unwrap().len(),
+            workdir_count_after_first
+        );
 
         request.idempotency_fingerprint = Some("sha256:different".to_string());
         let error = runtime.create_worker(request).unwrap_err();
