@@ -14,26 +14,27 @@ use llm_engine::tool::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::worker::{WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod};
+
 #[derive(Clone, Debug)]
 pub struct WorkspaceHttpObjectiveBackend {
-    workspace_id: String,
-    base_url: String,
+    client: Arc<dyn WorkspaceClient>,
 }
 
 impl WorkspaceHttpObjectiveBackend {
-    pub fn new(workspace_id: impl Into<String>, base_url: impl Into<String>) -> Self {
-        Self {
-            workspace_id: workspace_id.into(),
-            base_url: base_url.into().trim_end_matches('/').to_string(),
-        }
+    pub fn new(client: Arc<dyn WorkspaceClient>) -> Self {
+        Self { client }
     }
 
     async fn list(&self, input: ObjectiveListInput) -> Result<ToolOutput, ToolError> {
-        let mut url = format!("{}/api/w/{}/objectives", self.base_url, self.workspace_id);
+        let mut url = format!(
+            "/api/w/{}/objectives",
+            self.client.workspace_id().unwrap_or_default()
+        );
         if let Some(limit) = input.limit {
             url.push_str(&format!("?limit={}", limit.min(1000)));
         }
-        let response = get_json::<ObjectiveListResponse>(&url)
+        let response = get_json::<ObjectiveListResponse>(self.client.as_ref(), &url)
             .await
             .map_err(backend_error)?;
         let count = response.items.len();
@@ -46,7 +47,7 @@ impl WorkspaceHttpObjectiveBackend {
     async fn show(&self, input: ObjectiveShowInput) -> Result<ToolOutput, ToolError> {
         let id = validate_id(&input.id, "ObjectiveShow")?;
         let url = self.objective_url(id);
-        let response = get_json::<ObjectiveDetail>(&url)
+        let response = get_json::<ObjectiveDetail>(self.client.as_ref(), &url)
             .await
             .map_err(backend_error)?;
         Ok(objective_output(
@@ -61,11 +62,18 @@ impl WorkspaceHttpObjectiveBackend {
                 "ObjectiveCreate requires non-empty title".to_string(),
             ));
         }
-        let url = format!("{}/api/w/{}/objectives", self.base_url, self.workspace_id);
-        let response =
-            send_json::<ObjectiveCreateInput, ObjectiveDetail>(reqwest::Method::POST, &url, &input)
-                .await
-                .map_err(backend_error)?;
+        let url = format!(
+            "/api/w/{}/objectives",
+            self.client.workspace_id().unwrap_or_default()
+        );
+        let response = send_json::<ObjectiveCreateInput, ObjectiveDetail>(
+            self.client.as_ref(),
+            reqwest::Method::POST,
+            &url,
+            &input,
+        )
+        .await
+        .map_err(backend_error)?;
         Ok(objective_output(
             format!("Created objective {}", response.id),
             response,
@@ -86,10 +94,14 @@ impl WorkspaceHttpObjectiveBackend {
             new_string: input.new_string,
             replace_all: input.replace_all,
         };
-        let response =
-            send_json::<ObjectiveEditRequest, ObjectiveDetail>(reqwest::Method::PATCH, &url, &body)
-                .await
-                .map_err(backend_error)?;
+        let response = send_json::<ObjectiveEditRequest, ObjectiveDetail>(
+            self.client.as_ref(),
+            reqwest::Method::PATCH,
+            &url,
+            &body,
+        )
+        .await
+        .map_err(backend_error)?;
         Ok(objective_output(
             format!("Edited objective {}", response.id),
             response,
@@ -105,6 +117,7 @@ impl WorkspaceHttpObjectiveBackend {
         }
         let url = format!("{}/state", self.objective_url(id));
         let response = send_json::<ObjectiveSetStateRequest, ObjectiveDetail>(
+            self.client.as_ref(),
             reqwest::Method::POST,
             &url,
             &ObjectiveSetStateRequest { state: input.state },
@@ -122,6 +135,7 @@ impl WorkspaceHttpObjectiveBackend {
         let ticket_id = validate_id(&input.ticket_id, "ObjectiveLinkTicket")?;
         let url = format!("{}/ticket-links", self.objective_url(id));
         let response = send_json::<ObjectiveLinkTicketRequest, ObjectiveDetail>(
+            self.client.as_ref(),
             reqwest::Method::POST,
             &url,
             &ObjectiveLinkTicketRequest {
@@ -143,7 +157,7 @@ impl WorkspaceHttpObjectiveBackend {
         let id = validate_id(&input.id, "ObjectiveUnlinkTicket")?;
         let ticket_id = validate_id(&input.ticket_id, "ObjectiveUnlinkTicket")?;
         let url = format!("{}/ticket-links/{}", self.objective_url(id), ticket_id);
-        let response = delete_json::<ObjectiveDetail>(&url)
+        let response = delete_json::<ObjectiveDetail>(self.client.as_ref(), &url)
             .await
             .map_err(backend_error)?;
         Ok(objective_output(
@@ -153,17 +167,15 @@ impl WorkspaceHttpObjectiveBackend {
     }
 
     fn objective_url(&self, id: &str) -> String {
-        format!(
-            "{}/api/w/{}/objectives/{}",
-            self.base_url, self.workspace_id, id
-        )
+        let workspace_id = self.client.workspace_id().unwrap_or_default();
+        format!("/api/w/{workspace_id}/objectives/{id}")
     }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceObjectiveBackendError {
     #[error("workspace objective backend request failed: {0}")]
-    Request(#[from] reqwest::Error),
+    Request(#[from] crate::worker::WorkspaceClientError),
     #[error("workspace objective backend returned HTTP {status}: {body}")]
     Http {
         status: reqwest::StatusCode,
@@ -182,41 +194,55 @@ fn backend_error(error: WorkspaceObjectiveBackendError) -> ToolError {
 }
 
 async fn get_json<T: for<'de> Deserialize<'de>>(
-    url: &str,
+    client: &dyn WorkspaceClient,
+    path: &str,
 ) -> Result<T, WorkspaceObjectiveBackendError> {
-    let response = reqwest::Client::new().get(url).send().await?;
-    decode_response(response).await
+    decode_response(client.execute(WorkspaceRequest::get(path))?)
 }
 
 async fn send_json<B: Serialize, T: for<'de> Deserialize<'de>>(
+    client: &dyn WorkspaceClient,
     method: reqwest::Method,
-    url: &str,
+    path: &str,
     body: &B,
 ) -> Result<T, WorkspaceObjectiveBackendError> {
-    let response = reqwest::Client::new()
-        .request(method, url)
-        .json(body)
-        .send()
-        .await?;
-    decode_response(response).await
+    let method = match method {
+        reqwest::Method::POST => WorkspaceRequestMethod::Post,
+        reqwest::Method::PUT => WorkspaceRequestMethod::Put,
+        reqwest::Method::PATCH => WorkspaceRequestMethod::Patch,
+        reqwest::Method::DELETE => WorkspaceRequestMethod::Delete,
+        _ => WorkspaceRequestMethod::Get,
+    };
+    decode_response(client.execute(WorkspaceRequest::json(
+        method,
+        path,
+        serde_json::to_string(body)?,
+    ))?)
 }
 
 async fn delete_json<T: for<'de> Deserialize<'de>>(
-    url: &str,
+    client: &dyn WorkspaceClient,
+    path: &str,
 ) -> Result<T, WorkspaceObjectiveBackendError> {
-    let response = reqwest::Client::new().delete(url).send().await?;
-    decode_response(response).await
+    decode_response(client.execute(WorkspaceRequest {
+        method: WorkspaceRequestMethod::Delete,
+        path: path.to_string(),
+        body: None,
+    })?)
 }
 
-async fn decode_response<T: for<'de> Deserialize<'de>>(
-    response: reqwest::Response,
+fn decode_response<T: for<'de> Deserialize<'de>>(
+    response: crate::worker::WorkspaceResponse,
 ) -> Result<T, WorkspaceObjectiveBackendError> {
-    let status = response.status();
-    let body = response.text().await?;
-    if !status.is_success() {
-        return Err(WorkspaceObjectiveBackendError::Http { status, body });
+    let status = reqwest::StatusCode::from_u16(response.status)
+        .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    if !response.is_success() {
+        return Err(WorkspaceObjectiveBackendError::Http {
+            status,
+            body: response.body,
+        });
     }
-    serde_json::from_str(&body).map_err(Into::into)
+    serde_json::from_str(&response.body).map_err(Into::into)
 }
 
 fn objective_output(summary: String, response: ObjectiveDetail) -> Result<ToolOutput, ToolError> {
@@ -236,11 +262,8 @@ fn validate_id<'a>(id: &'a str, tool_name: &str) -> Result<&'a str, ToolError> {
     Ok(id)
 }
 
-pub fn workspace_http_objective_tools(
-    workspace_id: impl Into<String>,
-    base_url: impl Into<String>,
-) -> Vec<ToolDefinition> {
-    let backend = WorkspaceHttpObjectiveBackend::new(workspace_id, base_url);
+pub fn workspace_http_objective_tools(client: Arc<dyn WorkspaceClient>) -> Vec<ToolDefinition> {
+    let backend = WorkspaceHttpObjectiveBackend::new(client);
     vec![
         objective_tool(
             "ObjectiveList",
@@ -600,10 +623,13 @@ mod tests {
 
     #[test]
     fn workspace_http_objective_tools_include_objective_crud_tools() {
-        let names = tool_names(workspace_http_objective_tools(
-            "workspace".to_string(),
-            "http://backend".to_string(),
-        ));
+        let names = tool_names(workspace_http_objective_tools(Arc::new(
+            crate::worker::RuntimeWorkspaceHttpClient::new(
+                "workspace",
+                "http://backend",
+                "test-worker",
+            ),
+        )));
 
         assert_eq!(
             names,

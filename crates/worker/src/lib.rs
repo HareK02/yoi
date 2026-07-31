@@ -40,6 +40,9 @@ pub use runtime::dir::RuntimeDir;
 pub use segment_log_sink::SegmentLogSink;
 pub use shared_state::WorkerSharedState;
 pub use worker::{
-    LocalWorkingDirectory, Worker, WorkerError, WorkerFilesystemAuthority, WorkerRunResult,
-    WorkerWorkspaceContext, WorkspaceClient, WorkspaceId, WorkspaceIdError, apply_worker_manifest,
+    LocalWorkingDirectory, RuntimeWorkspaceHttpClient, Worker, WorkerError,
+    WorkerFilesystemAuthority, WorkerRunResult, WorkerWorkspaceContext, WorkspaceClient,
+    WorkspaceClientError, WorkspaceId, WorkspaceIdError, WorkspaceRequest, WorkspaceRequestMethod,
+    WorkspaceResponse, apply_worker_manifest, marker_workspace_client,
+    unavailable_workspace_client,
 };

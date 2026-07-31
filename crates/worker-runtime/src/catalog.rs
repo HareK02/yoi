@@ -172,10 +172,29 @@ pub struct WorkingDirectoryStatus {
     pub summary: WorkingDirectorySummary,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceApiRef {
     pub workspace_id: String,
     pub base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
+}
+
+impl std::fmt::Debug for WorkspaceApiRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkspaceApiRef")
+            .field("workspace_id", &self.workspace_id)
+            .field("base_url", &self.base_url)
+            .field("runtime_id", &self.runtime_id)
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
 }
 
 /// Canonical Runtime Worker creation request.
@@ -189,6 +208,10 @@ pub struct WorkspaceApiRef {
 /// summarized without exposing raw host paths.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateWorkerRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_fingerprint: Option<String>,
     pub profile: ProfileSelector,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,

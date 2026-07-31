@@ -26,7 +26,7 @@ use crate::shutdown_after_idle::{
 use crate::spawn::comm_tools::{read_worker_output_tool, send_to_worker_tool, stop_worker_tool};
 use crate::spawn::registry::SpawnedWorkerRegistry;
 use crate::spawn::tool::spawn_worker_tool;
-use crate::worker::{SystemItemCommitter, Worker, WorkerError, WorkerRunResult, WorkspaceClient};
+use crate::worker::{SystemItemCommitter, Worker, WorkerError, WorkerRunResult};
 use protocol::{
     AlertLevel, AlertSource, ErrorCode, Event, Method, RewindTargetId, RunResult, Segment,
     TurnResult, WorkerStatus,
@@ -627,21 +627,16 @@ where
         // Ticket tools are typed operations over the current workspace Ticket backend.
         // Workspace access must be authority-bound to the Backend Workspace API; the
         // Worker must not fall back to a local `.yoi/tickets` store.
-        let ticket_backend = match worker.workspace_client() {
-            WorkspaceClient::Http {
-                workspace_id,
-                base_url,
-            } => crate::feature::builtin::ticket::TicketFeatureBackend::WorkspaceHttp {
-                workspace_id: workspace_id.clone(),
-                base_url: base_url.clone(),
-            },
-            _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "ticket tools require Backend Workspace API authority",
-                ));
-            }
-        };
+        let workspace_client = worker.workspace_client_handle();
+        if !workspace_client.is_available() || workspace_client.workspace_id().is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ticket tools require Backend Workspace API authority",
+            ));
+        }
+        let ticket_backend = crate::feature::builtin::ticket::TicketFeatureBackend::WorkspaceClient(
+            workspace_client,
+        );
         feature_registry.add_module(
             crate::feature::builtin::ticket::ticket_tools_feature_with_backend(
                 ticket_backend,
@@ -668,21 +663,16 @@ where
     }
 
     {
-        let workspace_client = worker.workspace_client().clone();
+        let workspace_client = worker.workspace_client_handle();
         let engine = worker.engine_mut();
 
         // Objective tools expose read-only project Objective context through the
         // Backend Workspace API. Workers must not guess local `.yoi/objectives`
         // paths or read Objective files directly.
         if feature_config.objective.enabled {
-            if let WorkspaceClient::Http {
-                workspace_id,
-                base_url,
-            } = &workspace_client
-            {
+            if workspace_client.is_available() && workspace_client.workspace_id().is_some() {
                 for definition in crate::feature::builtin::objective::workspace_http_objective_tools(
-                    workspace_id.clone(),
-                    base_url.clone(),
+                    workspace_client.clone(),
                 ) {
                     engine.register_tool(definition);
                 }
@@ -705,20 +695,14 @@ where
                     "[feature.memory].enabled = true requires a [memory] configuration section",
                 )
             })?;
-            if let WorkspaceClient::Http {
-                workspace_id,
-                base_url,
-            } = workspace_client
-            {
+            if workspace_client.is_available() && workspace_client.workspace_id().is_some() {
                 let definitions = if feature_config.memory.staging {
                     crate::feature::builtin::memory::workspace_http_memory_consolidation_tools(
-                        workspace_id,
-                        base_url,
+                        workspace_client.clone(),
                     )
                 } else {
                     crate::feature::builtin::memory::workspace_http_memory_tools(
-                        workspace_id,
-                        base_url,
+                        workspace_client.clone(),
                     )
                 };
                 for definition in definitions {

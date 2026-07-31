@@ -128,7 +128,7 @@ pub enum SkillClientError {
     #[error("workspace client kind `{0}` does not expose direct Skill HTTP operations")]
     UnsupportedClient(String),
     #[error("Skill request failed: {0}")]
-    Request(#[from] reqwest::Error),
+    Request(#[from] crate::worker::WorkspaceClientError),
     #[error("Skill API response JSON is invalid: {0}")]
     Json(#[from] serde_json::Error),
     #[error("Skill API returned HTTP {status}: {body}")]
@@ -140,7 +140,7 @@ pub enum SkillClientError {
     InvalidBaseUrl(String),
 }
 
-impl WorkspaceClient {
+impl dyn WorkspaceClient + '_ {
     pub fn list_skills(&self) -> Result<SkillCatalogResponse, SkillClientError> {
         self.get_skill_json("skills")
     }
@@ -157,29 +157,21 @@ impl WorkspaceClient {
         &self,
         path: &str,
     ) -> Result<T, SkillClientError> {
-        let Self::Http {
-            workspace_id,
-            base_url,
-        } = self
-        else {
-            return match self {
-                Self::Available { kind } => Err(SkillClientError::UnsupportedClient(kind.clone())),
-                Self::Unavailable { reason } => Err(SkillClientError::Unavailable(reason.clone())),
-                Self::Http { .. } => unreachable!(),
-            };
-        };
-        if base_url.trim().is_empty() {
-            return Err(SkillClientError::InvalidBaseUrl(base_url.clone()));
+        let workspace_id = self
+            .workspace_id()
+            .ok_or_else(|| SkillClientError::UnsupportedClient(self.kind().to_string()))?;
+        let response = self.execute(crate::worker::WorkspaceRequest::get(format!(
+            "/api/w/{workspace_id}/{path}"
+        )))?;
+        let status = reqwest::StatusCode::from_u16(response.status)
+            .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+        if !response.is_success() {
+            return Err(SkillClientError::Http {
+                status,
+                body: response.body,
+            });
         }
-        let base = base_url.trim_end_matches('/');
-        let url = format!("{base}/api/w/{workspace_id}/{path}");
-        let response = reqwest::blocking::Client::new().get(url).send()?;
-        let status = response.status();
-        let body = response.text()?;
-        if !status.is_success() {
-            return Err(SkillClientError::Http { status, body });
-        }
-        Ok(serde_json::from_str(&body)?)
+        Ok(serde_json::from_str(&response.body)?)
     }
 }
 
@@ -201,13 +193,23 @@ mod tests {
             let mut request_line = String::new();
             reader.read_line(&mut request_line).unwrap();
             assert!(request_line.starts_with("GET /api/w/ws-1/skills HTTP/1.1"));
+            let mut worker_header = None;
+            let mut authorization = None;
             loop {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
+                if let Some(value) = line.strip_prefix("x-yoi-worker-id: ") {
+                    worker_header = Some(value.trim().to_string());
+                }
+                if let Some(value) = line.strip_prefix("authorization: ") {
+                    authorization = Some(value.trim().to_string());
+                }
                 if line == "\r\n" || line.is_empty() {
                     break;
                 }
             }
+            assert_eq!(worker_header.as_deref(), Some("test-worker"));
+            assert_eq!(authorization.as_deref(), Some("Bearer test-credential"));
             let body = serde_json::json!({
                 "authority": "workspace-backend-skills-v0",
                 "entries": [{
@@ -229,8 +231,13 @@ mod tests {
             .unwrap();
         });
 
-        let client = WorkspaceClient::http("ws-1", format!("http://{addr}"));
-        let catalog = client.list_skills().unwrap();
+        let client = crate::worker::RuntimeWorkspaceHttpClient::new(
+            "ws-1",
+            format!("http://{addr}"),
+            "test-worker",
+        )
+        .with_access_token(Some("test-credential".to_string()));
+        let catalog = (&client as &dyn WorkspaceClient).list_skills().unwrap();
         assert_eq!(catalog.entries[0].name, "triage-errors");
         assert_eq!(catalog.entries[0].provenance.id, "workspace:triage-errors");
         handle.join().unwrap();

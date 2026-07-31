@@ -92,6 +92,31 @@ const MIGRATIONS: &[Migration] = &[
         name: "separate workdir creation evidence from current revision observation",
         apply: add_workdir_revision_observations,
     },
+    Migration {
+        version: 16,
+        name: "ticket worker current assignment authority",
+        apply: create_ticket_worker_assignment_tables,
+    },
+    Migration {
+        version: 17,
+        name: "worker workspace credentials and Ticket notification outbox",
+        apply: create_ticket_notification_tables,
+    },
+    Migration {
+        version: 18,
+        name: "bidirectional idempotent Ticket Worker assignments",
+        apply: strengthen_ticket_worker_assignments,
+    },
+    Migration {
+        version: 19,
+        name: "atomic Ticket notification identity credentials and cursors",
+        apply: strengthen_ticket_notifications,
+    },
+    Migration {
+        version: 20,
+        name: "reconcile Workdir revision and crash safe Worker lifecycle reservations",
+        apply: strengthen_ticket_assignment_lifecycle_reservations,
+    },
 ];
 
 struct Migration {
@@ -235,6 +260,72 @@ pub struct WorkerRegistryRecord {
     pub diagnostics_ref: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TicketWorkerAssignmentRecord {
+    pub workspace_id: String,
+    pub ticket_id: String,
+    pub assignment_id: String,
+    pub runtime_id: String,
+    pub worker_id: String,
+    pub assigned_by: String,
+    pub assigned_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TicketWorkerAssignmentEventRecord {
+    pub workspace_id: String,
+    pub ticket_id: String,
+    pub event_id: String,
+    pub action: String,
+    pub assignment_id: Option<String>,
+    pub previous_assignment_id: Option<String>,
+    pub actor: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TicketWorkerAssignmentUpdate {
+    pub current: TicketWorkerAssignmentRecord,
+    pub previous: Option<TicketWorkerAssignmentRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerWorkspaceCredentialRecord {
+    pub credential_id: String,
+    pub token: String,
+    pub workspace_id: String,
+    pub runtime_id: String,
+    pub worker_id: Option<String>,
+    pub created_at: String,
+    pub expires_at: String,
+    pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TicketNotificationRecipient {
+    pub runtime_id: String,
+    pub worker_id: String,
+    pub recipient_kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TicketNotificationDeliveryRecord {
+    pub notification_id: String,
+    pub workspace_id: String,
+    pub ticket_id: String,
+    pub event_sequence: i64,
+    pub event_kind: String,
+    pub source_operation_kind: String,
+    pub source_actor_role: String,
+    pub source_assignment_id: Option<String>,
+    pub source_runtime_id: String,
+    pub source_worker_id: String,
+    pub recipient_runtime_id: String,
+    pub recipient_worker_id: String,
+    pub recipient_kind: String,
+    pub attempts: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -489,6 +580,146 @@ pub trait ControlPlaneStore: Send + Sync {
         runtime_id: &str,
         runtime_worker_id: u64,
     ) -> Result<bool>;
+
+    fn get_ticket_assignment_operation(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+    ) -> Result<Option<TicketAssignmentOperationRecord>>;
+    fn reserve_ticket_assignment_operation(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+        ticket_id: &str,
+        runtime_id: &str,
+        worker_id: Option<&str>,
+        request_fingerprint: &str,
+        created_at: &str,
+    ) -> Result<()>;
+    fn bind_ticket_assignment_operation_worker(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+        worker_id: &str,
+    ) -> Result<()>;
+    fn get_current_ticket_worker_assignment(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+    ) -> Result<Option<TicketWorkerAssignmentRecord>>;
+    fn set_current_ticket_worker_assignment(
+        &self,
+        record: &TicketWorkerAssignmentRecord,
+        expected_assignment_id: Option<&str>,
+        event_id: &str,
+        operation_id: &str,
+        allow_reassign: bool,
+    ) -> Result<TicketWorkerAssignmentUpdate>;
+    fn clear_current_ticket_worker_assignment(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+        expected_assignment_id: Option<&str>,
+        operation_id: &str,
+        event_id: &str,
+        actor: &str,
+        created_at: &str,
+    ) -> Result<Option<TicketWorkerAssignmentRecord>>;
+    fn list_ticket_worker_assignment_events(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TicketWorkerAssignmentEventRecord>>;
+
+    fn upsert_worker_workspace_credential(
+        &self,
+        record: &WorkerWorkspaceCredentialRecord,
+    ) -> Result<()>;
+    fn authenticate_worker_workspace_credential(
+        &self,
+        token: &str,
+        workspace_id: &str,
+        worker_id: &str,
+    ) -> Result<Option<WorkerWorkspaceCredentialRecord>>;
+    fn refresh_worker_workspace_credential(
+        &self,
+        token: &str,
+        workspace_id: &str,
+        worker_id: &str,
+        new_token: &str,
+        new_expires_at: &str,
+    ) -> Result<Option<WorkerWorkspaceCredentialRecord>>;
+    fn revoke_worker_workspace_credentials(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        worker_id: &str,
+        revoked_at: &str,
+    ) -> Result<()>;
+    fn enqueue_ticket_notification(
+        &self,
+        notification_id: &str,
+        workspace_id: &str,
+        ticket_id: &str,
+        event_sequence: i64,
+        source_runtime_id: &str,
+        source_worker_id: &str,
+        previous_state: &str,
+        current_state: &str,
+        created_at: &str,
+        recipients: &[TicketNotificationRecipient],
+    ) -> Result<()>;
+    fn list_pending_ticket_notification_deliveries(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TicketNotificationDeliveryRecord>>;
+    fn count_ticket_notification_deliveries_for_recipient(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+        runtime_id: &str,
+        worker_id: &str,
+    ) -> Result<usize>;
+    fn mark_ticket_notification_delivered(
+        &self,
+        notification_id: &str,
+        recipient_runtime_id: &str,
+        recipient_worker_id: &str,
+        delivered_at: &str,
+    ) -> Result<()>;
+    fn mark_ticket_notification_failed(
+        &self,
+        notification_id: &str,
+        recipient_runtime_id: &str,
+        recipient_worker_id: &str,
+        error: &str,
+    ) -> Result<()>;
+    fn reroute_ticket_notification_delivery(
+        &self,
+        notification_id: &str,
+        old_runtime_id: &str,
+        old_worker_id: &str,
+        new_runtime_id: &str,
+        new_worker_id: &str,
+    ) -> Result<()>;
+    fn upsert_ticket_notification_cursor(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+        runtime_id: &str,
+        worker_id: &str,
+        event_index: i64,
+        updated_at: &str,
+    ) -> Result<()>;
+    fn get_ticket_notification_cursor(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+        runtime_id: &str,
+        worker_id: &str,
+    ) -> Result<Option<i64>>;
 
     fn upsert_workdir_registry(&self, record: &WorkdirRegistryRecord) -> Result<()>;
     fn get_workdir_registry(
@@ -1573,6 +1804,790 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn get_ticket_assignment_operation(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+    ) -> Result<Option<TicketAssignmentOperationRecord>> {
+        self.with_conn(|conn| read_assignment_operation(conn, workspace_id, operation_id))
+    }
+
+    fn reserve_ticket_assignment_operation(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+        ticket_id: &str,
+        runtime_id: &str,
+        worker_id: Option<&str>,
+        request_fingerprint: &str,
+        created_at: &str,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            let inserted = conn.execute(
+                r#"INSERT OR IGNORE INTO ticket_assignment_operations (
+                    workspace_id, operation_id, action, ticket_id, runtime_id, worker_id,
+                    assignment_id, expected_assignment_id, created_at, request_fingerprint
+                ) VALUES (?1, ?2, 'assign', ?3, ?4, ?5, NULL, NULL, ?6, ?7)"#,
+                params![
+                    workspace_id,
+                    operation_id,
+                    ticket_id,
+                    runtime_id,
+                    worker_id,
+                    created_at,
+                    request_fingerprint,
+                ],
+            )?;
+            if inserted > 0 {
+                return Ok(());
+            }
+            let existing = read_assignment_operation(conn, workspace_id, operation_id)?
+                .ok_or_else(|| {
+                    Error::TicketAssignmentConflict(format!(
+                        "assignment operation {operation_id} could not be reserved"
+                    ))
+                })?;
+            if existing.action == "assign"
+                && existing.ticket_id == ticket_id
+                && existing.runtime_id.as_deref() == Some(runtime_id)
+                && (worker_id.is_none() || existing.worker_id.as_deref() == worker_id)
+                && existing.expected_assignment_id.is_none()
+                && existing.request_fingerprint.as_deref() == Some(request_fingerprint)
+            {
+                Ok(())
+            } else {
+                Err(Error::TicketAssignmentConflict(format!(
+                    "assignment operation {operation_id} was already used with different input"
+                )))
+            }
+        })
+    }
+
+    fn bind_ticket_assignment_operation_worker(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+        worker_id: &str,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            let updated = conn.execute(
+                r#"UPDATE ticket_assignment_operations
+                   SET worker_id = ?3
+                   WHERE workspace_id = ?1 AND operation_id = ?2
+                     AND assignment_id IS NULL AND (worker_id IS NULL OR worker_id = ?3)"#,
+                params![workspace_id, operation_id, worker_id],
+            )?;
+            if updated == 1 {
+                return Ok(());
+            }
+            Err(Error::TicketAssignmentConflict(format!(
+                "assignment operation {operation_id} cannot bind Worker {worker_id}"
+            )))
+        })
+    }
+
+    fn get_current_ticket_worker_assignment(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+    ) -> Result<Option<TicketWorkerAssignmentRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                current_ticket_worker_assignment_select_sql().as_str(),
+                params![workspace_id, ticket_id],
+                read_ticket_worker_assignment_record,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn set_current_ticket_worker_assignment(
+        &self,
+        record: &TicketWorkerAssignmentRecord,
+        expected_assignment_id: Option<&str>,
+        event_id: &str,
+        operation_id: &str,
+        allow_reassign: bool,
+    ) -> Result<TicketWorkerAssignmentUpdate> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut reserved_operation = false;
+            if let Some(existing) =
+                read_assignment_operation(&tx, &record.workspace_id, operation_id)?
+            {
+                if existing.action != if allow_reassign { "reassign" } else { "assign" }
+                    || existing.ticket_id != record.ticket_id
+                    || existing.runtime_id.as_deref() != Some(record.runtime_id.as_str())
+                    || existing.worker_id.as_deref() != Some(record.worker_id.as_str())
+                    || existing.expected_assignment_id.as_deref() != expected_assignment_id
+                {
+                    return Err(Error::TicketAssignmentConflict(format!(
+                        "assignment operation {operation_id} was already used with different input"
+                    )));
+                }
+                if let Some(assignment_id) = existing.assignment_id {
+                    let current = tx.query_row(
+                        r#"SELECT workspace_id, ticket_id, assignment_id, runtime_id, worker_id,
+                                  assigned_by, assigned_at
+                           FROM ticket_worker_assignments
+                           WHERE workspace_id = ?1 AND ticket_id = ?2 AND assignment_id = ?3"#,
+                        params![record.workspace_id, record.ticket_id, assignment_id],
+                        read_ticket_worker_assignment_record,
+                    )?;
+                    let previous = if existing.action == "reassign" {
+                        existing
+                            .expected_assignment_id
+                            .as_deref()
+                            .map(|previous_assignment_id| {
+                                tx.query_row(
+                                    r#"SELECT workspace_id, ticket_id, assignment_id, runtime_id, worker_id,
+                                              assigned_by, assigned_at
+                                       FROM ticket_worker_assignments
+                                       WHERE workspace_id = ?1 AND ticket_id = ?2 AND assignment_id = ?3"#,
+                                    params![
+                                        record.workspace_id,
+                                        record.ticket_id,
+                                        previous_assignment_id,
+                                    ],
+                                    read_ticket_worker_assignment_record,
+                                )
+                            })
+                            .transpose()?
+                    } else {
+                        None
+                    };
+                    tx.commit()?;
+                    return Ok(TicketWorkerAssignmentUpdate { current, previous });
+                }
+                reserved_operation = true;
+            }
+            let previous = tx
+                .query_row(
+                    current_ticket_worker_assignment_select_sql().as_str(),
+                    params![record.workspace_id, record.ticket_id],
+                    read_ticket_worker_assignment_record,
+                )
+                .optional()?;
+            if previous.is_some() && !allow_reassign {
+                return Err(Error::TicketAssignmentConflict(format!(
+                    "Ticket {} is already assigned; use the explicit reassign operation",
+                    record.ticket_id
+                )));
+            }
+            if allow_reassign {
+                let expected_assignment_id = expected_assignment_id.ok_or_else(|| {
+                    Error::TicketAssignmentConflict(
+                        "reassign requires expected_assignment_id".to_string(),
+                    )
+                })?;
+                require_expected_ticket_assignment(
+                    record.ticket_id.as_str(),
+                    previous.as_ref(),
+                    Some(expected_assignment_id),
+                )?;
+            } else if expected_assignment_id.is_some() {
+                return Err(Error::TicketAssignmentConflict(
+                    "assign does not accept expected_assignment_id".to_string(),
+                ));
+            }
+            tx.execute(
+                r#"INSERT INTO ticket_worker_assignments (
+                    workspace_id, ticket_id, assignment_id, runtime_id, worker_id,
+                    assigned_by, assigned_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+                params![
+                    record.workspace_id,
+                    record.ticket_id,
+                    record.assignment_id,
+                    record.runtime_id,
+                    record.worker_id,
+                    record.assigned_by,
+                    record.assigned_at,
+                ],
+            )?;
+            let current_write = if allow_reassign {
+                tx.execute(
+                    r#"UPDATE ticket_current_worker_assignments
+                       SET assignment_id = ?3, runtime_id = ?4, worker_id = ?5, updated_at = ?6
+                       WHERE workspace_id = ?1 AND ticket_id = ?2"#,
+                    params![
+                        record.workspace_id,
+                        record.ticket_id,
+                        record.assignment_id,
+                        record.runtime_id,
+                        record.worker_id,
+                        record.assigned_at,
+                    ],
+                )
+            } else {
+                tx.execute(
+                    r#"INSERT INTO ticket_current_worker_assignments (
+                        workspace_id, ticket_id, assignment_id, runtime_id, worker_id, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+                    params![
+                        record.workspace_id,
+                        record.ticket_id,
+                        record.assignment_id,
+                        record.runtime_id,
+                        record.worker_id,
+                        record.assigned_at,
+                    ],
+                )
+            };
+            if let Err(error) = current_write {
+                return Err(map_assignment_constraint(
+                    error,
+                    &record.ticket_id,
+                    &record.worker_id,
+                ));
+            }
+            tx.execute(
+                r#"INSERT INTO ticket_worker_assignment_events (
+                    workspace_id, ticket_id, event_id, action, assignment_id,
+                    previous_assignment_id, actor, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+                params![
+                    record.workspace_id,
+                    record.ticket_id,
+                    event_id,
+                    if previous.is_some() {
+                        "reassigned"
+                    } else {
+                        "assigned"
+                    },
+                    record.assignment_id,
+                    previous
+                        .as_ref()
+                        .map(|assignment| assignment.assignment_id.as_str()),
+                    record.assigned_by,
+                    record.assigned_at,
+                ],
+            )?;
+            if reserved_operation {
+                let updated = tx.execute(
+                    r#"UPDATE ticket_assignment_operations
+                       SET assignment_id = ?3
+                       WHERE workspace_id = ?1 AND operation_id = ?2 AND assignment_id IS NULL"#,
+                    params![record.workspace_id, operation_id, record.assignment_id],
+                )?;
+                if updated != 1 {
+                    return Err(Error::TicketAssignmentConflict(format!(
+                        "assignment operation {operation_id} reservation was not current"
+                    )));
+                }
+            } else {
+                tx.execute(
+                    r#"INSERT INTO ticket_assignment_operations (
+                        workspace_id, operation_id, action, ticket_id, runtime_id, worker_id,
+                        assignment_id, expected_assignment_id, created_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+                    params![
+                        record.workspace_id,
+                        operation_id,
+                        if allow_reassign { "reassign" } else { "assign" },
+                        record.ticket_id,
+                        record.runtime_id,
+                        record.worker_id,
+                        record.assignment_id,
+                        expected_assignment_id,
+                        record.assigned_at,
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(TicketWorkerAssignmentUpdate {
+                current: record.clone(),
+                previous,
+            })
+        })
+    }
+
+    fn clear_current_ticket_worker_assignment(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+        expected_assignment_id: Option<&str>,
+        operation_id: &str,
+        event_id: &str,
+        actor: &str,
+        created_at: &str,
+    ) -> Result<Option<TicketWorkerAssignmentRecord>> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            if let Some(existing) = read_assignment_operation(&tx, workspace_id, operation_id)? {
+                if existing.action != "unassign"
+                    || existing.ticket_id != ticket_id
+                    || existing.expected_assignment_id.as_deref() != expected_assignment_id
+                {
+                    return Err(Error::TicketAssignmentConflict(format!(
+                        "assignment operation {operation_id} was already used with different input"
+                    )));
+                }
+                let assignment = existing
+                    .assignment_id
+                    .map(|assignment_id| {
+                        tx.query_row(
+                            r#"SELECT workspace_id, ticket_id, assignment_id, runtime_id, worker_id,
+                                      assigned_by, assigned_at
+                               FROM ticket_worker_assignments
+                               WHERE workspace_id = ?1 AND ticket_id = ?2 AND assignment_id = ?3"#,
+                            params![workspace_id, ticket_id, assignment_id],
+                            read_ticket_worker_assignment_record,
+                        )
+                    })
+                    .transpose()?;
+                tx.commit()?;
+                return Ok(assignment);
+            }
+            let previous = tx
+                .query_row(
+                    current_ticket_worker_assignment_select_sql().as_str(),
+                    params![workspace_id, ticket_id],
+                    read_ticket_worker_assignment_record,
+                )
+                .optional()?;
+            require_expected_ticket_assignment(ticket_id, previous.as_ref(), expected_assignment_id)?;
+            let Some(previous) = previous else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            tx.execute(
+                "DELETE FROM ticket_current_worker_assignments WHERE workspace_id = ?1 AND ticket_id = ?2",
+                params![workspace_id, ticket_id],
+            )?;
+            tx.execute(
+                r#"INSERT INTO ticket_worker_assignment_events (
+                    workspace_id, ticket_id, event_id, action, assignment_id,
+                    previous_assignment_id, actor, created_at
+                ) VALUES (?1, ?2, ?3, 'unassigned', NULL, ?4, ?5, ?6)"#,
+                params![
+                    workspace_id,
+                    ticket_id,
+                    event_id,
+                    previous.assignment_id,
+                    actor,
+                    created_at,
+                ],
+            )?;
+            tx.execute(
+                r#"INSERT INTO ticket_assignment_operations (
+                    workspace_id, operation_id, action, ticket_id, runtime_id, worker_id,
+                    assignment_id, expected_assignment_id, created_at
+                ) VALUES (?1, ?2, 'unassign', ?3, ?4, ?5, ?6, ?7, ?8)"#,
+                params![
+                    workspace_id,
+                    operation_id,
+                    ticket_id,
+                    previous.runtime_id,
+                    previous.worker_id,
+                    previous.assignment_id,
+                    expected_assignment_id,
+                    created_at,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(Some(previous))
+        })
+    }
+
+    fn list_ticket_worker_assignment_events(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TicketWorkerAssignmentEventRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"SELECT workspace_id, ticket_id, event_id, action, assignment_id,
+                          previous_assignment_id, actor, created_at
+                   FROM ticket_worker_assignment_events
+                   WHERE workspace_id = ?1 AND ticket_id = ?2
+                   ORDER BY created_at DESC, event_id DESC
+                   LIMIT ?3"#,
+            )?;
+            let rows = stmt.query_map(
+                params![workspace_id, ticket_id, limit as i64],
+                read_ticket_worker_assignment_event_record,
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
+        })
+    }
+
+    fn upsert_worker_workspace_credential(
+        &self,
+        record: &WorkerWorkspaceCredentialRecord,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO worker_workspace_credentials (
+                    credential_id, token, workspace_id, runtime_id, worker_id, created_at,
+                    expires_at, revoked_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                ON CONFLICT(credential_id) DO UPDATE SET
+                    token = excluded.token,
+                    workspace_id = excluded.workspace_id,
+                    runtime_id = excluded.runtime_id,
+                    worker_id = excluded.worker_id,
+                    created_at = excluded.created_at,
+                    expires_at = excluded.expires_at,
+                    revoked_at = excluded.revoked_at"#,
+                params![
+                    record.credential_id,
+                    record.token,
+                    record.workspace_id,
+                    record.runtime_id,
+                    record.worker_id,
+                    record.created_at,
+                    record.expires_at,
+                    record.revoked_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn authenticate_worker_workspace_credential(
+        &self,
+        token: &str,
+        workspace_id: &str,
+        worker_id: &str,
+    ) -> Result<Option<WorkerWorkspaceCredentialRecord>> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let record = tx
+                .query_row(
+                    r#"SELECT credential_id, token, workspace_id, runtime_id, worker_id, created_at,
+                              expires_at, revoked_at
+                       FROM worker_workspace_credentials
+                       WHERE token = ?1 AND workspace_id = ?2
+                         AND revoked_at IS NULL AND datetime(expires_at) > datetime('now')"#,
+                    params![token, workspace_id],
+                    |row| {
+                        Ok(WorkerWorkspaceCredentialRecord {
+                            credential_id: row.get(0)?,
+                            token: row.get(1)?,
+                            workspace_id: row.get(2)?,
+                            runtime_id: row.get(3)?,
+                            worker_id: row.get(4)?,
+                            created_at: row.get(5)?,
+                            expires_at: row.get(6)?,
+                            revoked_at: row.get(7)?,
+                        })
+                    },
+                )
+                .optional()?;
+            let Some(mut record) = record else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            if record.worker_id.as_deref().is_some_and(|bound| bound != worker_id) {
+                tx.commit()?;
+                return Ok(None);
+            }
+            if record.worker_id.is_none() {
+                tx.execute(
+                    "UPDATE worker_workspace_credentials SET worker_id = ?1 WHERE credential_id = ?2 AND worker_id IS NULL",
+                    params![worker_id, record.credential_id],
+                )?;
+                record.worker_id = Some(worker_id.to_string());
+            }
+            tx.commit()?;
+            Ok(Some(record))
+        })
+    }
+
+    fn refresh_worker_workspace_credential(
+        &self,
+        token: &str,
+        workspace_id: &str,
+        worker_id: &str,
+        new_token: &str,
+        new_expires_at: &str,
+    ) -> Result<Option<WorkerWorkspaceCredentialRecord>> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let record = tx
+                .query_row(
+                    r#"SELECT credential_id, runtime_id, created_at FROM worker_workspace_credentials
+                       WHERE token = ?1 AND workspace_id = ?2 AND worker_id = ?3 AND revoked_at IS NULL"#,
+                    params![token, workspace_id, worker_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+                )
+                .optional()?;
+            let Some((credential_id, runtime_id, created_at)) = record else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            tx.execute(
+                "UPDATE worker_workspace_credentials SET token = ?1, expires_at = ?2 WHERE credential_id = ?3",
+                params![new_token, new_expires_at, credential_id],
+            )?;
+            tx.commit()?;
+            Ok(Some(WorkerWorkspaceCredentialRecord {
+                credential_id,
+                token: new_token.to_string(),
+                workspace_id: workspace_id.to_string(),
+                runtime_id,
+                worker_id: Some(worker_id.to_string()),
+                created_at,
+                expires_at: new_expires_at.to_string(),
+                revoked_at: None,
+            }))
+        })
+    }
+
+    fn revoke_worker_workspace_credentials(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        worker_id: &str,
+        revoked_at: &str,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"UPDATE worker_workspace_credentials SET revoked_at = ?4
+                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3 AND revoked_at IS NULL"#,
+                params![workspace_id, runtime_id, worker_id, revoked_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn enqueue_ticket_notification(
+        &self,
+        notification_id: &str,
+        workspace_id: &str,
+        ticket_id: &str,
+        event_sequence: i64,
+        source_runtime_id: &str,
+        source_worker_id: &str,
+        previous_state: &str,
+        current_state: &str,
+        created_at: &str,
+        recipients: &[TicketNotificationRecipient],
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                r#"INSERT INTO ticket_notification_outbox (
+                    notification_id, workspace_id, ticket_id, event_sequence,
+                    source_runtime_id, source_worker_id, previous_state, current_state, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+                params![
+                    notification_id,
+                    workspace_id,
+                    ticket_id,
+                    event_sequence,
+                    source_runtime_id,
+                    source_worker_id,
+                    previous_state,
+                    current_state,
+                    created_at,
+                ],
+            )?;
+            for recipient in recipients {
+                tx.execute(
+                    r#"INSERT OR IGNORE INTO ticket_notification_deliveries (
+                        notification_id, recipient_runtime_id, recipient_worker_id,
+                        recipient_kind, attempts
+                    ) VALUES (?1, ?2, ?3, ?4, 0)"#,
+                    params![
+                        notification_id,
+                        recipient.runtime_id,
+                        recipient.worker_id,
+                        recipient.recipient_kind,
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    fn list_pending_ticket_notification_deliveries(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TicketNotificationDeliveryRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"SELECT o.notification_id, o.workspace_id, o.ticket_id, o.event_sequence,
+                          o.event_kind, o.source_operation_kind, o.source_actor_role,
+                          o.source_assignment_id, o.source_runtime_id, o.source_worker_id,
+                          d.recipient_runtime_id, d.recipient_worker_id, d.recipient_kind, d.attempts
+                   FROM ticket_notification_deliveries AS d
+                   JOIN ticket_notification_outbox AS o ON o.notification_id = d.notification_id
+                   WHERE o.workspace_id = ?1 AND d.delivered_at IS NULL
+                   ORDER BY o.created_at ASC, o.notification_id ASC
+                   LIMIT ?2"#,
+            )?;
+            let rows = stmt.query_map(params![workspace_id, limit as i64], |row| {
+                Ok(TicketNotificationDeliveryRecord {
+                    notification_id: row.get(0)?,
+                    workspace_id: row.get(1)?,
+                    ticket_id: row.get(2)?,
+                    event_sequence: row.get(3)?,
+                    event_kind: row.get(4)?,
+                    source_operation_kind: row.get(5)?,
+                    source_actor_role: row.get(6)?,
+                    source_assignment_id: row.get(7)?,
+                    source_runtime_id: row.get(8)?,
+                    source_worker_id: row.get(9)?,
+                    recipient_runtime_id: row.get(10)?,
+                    recipient_worker_id: row.get(11)?,
+                    recipient_kind: row.get(12)?,
+                    attempts: row.get(13)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
+        })
+    }
+
+    fn count_ticket_notification_deliveries_for_recipient(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+        runtime_id: &str,
+        worker_id: &str,
+    ) -> Result<usize> {
+        self.with_conn(|conn| {
+            let count = conn.query_row(
+                r#"SELECT COUNT(*)
+                   FROM ticket_notification_deliveries AS d
+                   JOIN ticket_notification_outbox AS o ON o.notification_id = d.notification_id
+                   WHERE o.workspace_id = ?1 AND o.ticket_id = ?2
+                     AND d.recipient_runtime_id = ?3 AND d.recipient_worker_id = ?4"#,
+                params![workspace_id, ticket_id, runtime_id, worker_id],
+                |row| row.get::<_, i64>(0),
+            )?;
+            Ok(count as usize)
+        })
+    }
+
+    fn mark_ticket_notification_delivered(
+        &self,
+        notification_id: &str,
+        recipient_runtime_id: &str,
+        recipient_worker_id: &str,
+        delivered_at: &str,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"UPDATE ticket_notification_deliveries
+                   SET delivered_at = ?4, last_error = NULL, attempts = attempts + 1
+                   WHERE notification_id = ?1 AND recipient_runtime_id = ?2 AND recipient_worker_id = ?3"#,
+                params![notification_id, recipient_runtime_id, recipient_worker_id, delivered_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn mark_ticket_notification_failed(
+        &self,
+        notification_id: &str,
+        recipient_runtime_id: &str,
+        recipient_worker_id: &str,
+        error: &str,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"UPDATE ticket_notification_deliveries
+                   SET last_error = ?4, attempts = attempts + 1
+                   WHERE notification_id = ?1 AND recipient_runtime_id = ?2 AND recipient_worker_id = ?3"#,
+                params![notification_id, recipient_runtime_id, recipient_worker_id, error],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn reroute_ticket_notification_delivery(
+        &self,
+        notification_id: &str,
+        old_runtime_id: &str,
+        old_worker_id: &str,
+        new_runtime_id: &str,
+        new_worker_id: &str,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let recipient_kind: Option<String> = tx
+                .query_row(
+                    r#"SELECT recipient_kind FROM ticket_notification_deliveries
+                       WHERE notification_id = ?1 AND recipient_runtime_id = ?2 AND recipient_worker_id = ?3"#,
+                    params![notification_id, old_runtime_id, old_worker_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(recipient_kind) = recipient_kind {
+                tx.execute(
+                    r#"INSERT OR IGNORE INTO ticket_notification_deliveries (
+                        notification_id, recipient_runtime_id, recipient_worker_id, recipient_kind, attempts
+                    ) VALUES (?1, ?2, ?3, ?4, 0)"#,
+                    params![notification_id, new_runtime_id, new_worker_id, recipient_kind],
+                )?;
+                tx.execute(
+                    r#"DELETE FROM ticket_notification_deliveries
+                       WHERE notification_id = ?1 AND recipient_runtime_id = ?2 AND recipient_worker_id = ?3"#,
+                    params![notification_id, old_runtime_id, old_worker_id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    fn upsert_ticket_notification_cursor(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+        runtime_id: &str,
+        worker_id: &str,
+        event_index: i64,
+        updated_at: &str,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO ticket_notification_cursors (
+                    workspace_id, ticket_id, runtime_id, worker_id, last_event_index, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT(workspace_id, ticket_id, runtime_id, worker_id) DO UPDATE SET
+                    last_event_index = MAX(last_event_index, excluded.last_event_index),
+                    updated_at = excluded.updated_at"#,
+                params![
+                    workspace_id,
+                    ticket_id,
+                    runtime_id,
+                    worker_id,
+                    event_index,
+                    updated_at
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn get_ticket_notification_cursor(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+        runtime_id: &str,
+        worker_id: &str,
+    ) -> Result<Option<i64>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                r#"SELECT last_event_index FROM ticket_notification_cursors
+                   WHERE workspace_id = ?1 AND ticket_id = ?2 AND runtime_id = ?3 AND worker_id = ?4"#,
+                params![workspace_id, ticket_id, runtime_id, worker_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
     fn upsert_workdir_registry(&self, record: &WorkdirRegistryRecord) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute(
@@ -2008,6 +3023,111 @@ fn read_worker_registry_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Work
     })
 }
 
+fn current_ticket_worker_assignment_select_sql() -> String {
+    "SELECT a.workspace_id, a.ticket_id, a.assignment_id, a.runtime_id, a.worker_id, \
+            a.assigned_by, a.assigned_at \
+     FROM ticket_current_worker_assignments AS current \
+     JOIN ticket_worker_assignments AS a \
+       ON a.workspace_id = current.workspace_id \
+      AND a.ticket_id = current.ticket_id \
+      AND a.assignment_id = current.assignment_id \
+     WHERE current.workspace_id = ?1 AND current.ticket_id = ?2"
+        .to_owned()
+}
+
+fn read_ticket_worker_assignment_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<TicketWorkerAssignmentRecord> {
+    Ok(TicketWorkerAssignmentRecord {
+        workspace_id: row.get(0)?,
+        ticket_id: row.get(1)?,
+        assignment_id: row.get(2)?,
+        runtime_id: row.get(3)?,
+        worker_id: row.get(4)?,
+        assigned_by: row.get(5)?,
+        assigned_at: row.get(6)?,
+    })
+}
+
+fn read_ticket_worker_assignment_event_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<TicketWorkerAssignmentEventRecord> {
+    Ok(TicketWorkerAssignmentEventRecord {
+        workspace_id: row.get(0)?,
+        ticket_id: row.get(1)?,
+        event_id: row.get(2)?,
+        action: row.get(3)?,
+        assignment_id: row.get(4)?,
+        previous_assignment_id: row.get(5)?,
+        actor: row.get(6)?,
+        created_at: row.get(7)?,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketAssignmentOperationRecord {
+    pub action: String,
+    pub ticket_id: String,
+    pub runtime_id: Option<String>,
+    pub worker_id: Option<String>,
+    pub assignment_id: Option<String>,
+    pub expected_assignment_id: Option<String>,
+    pub request_fingerprint: Option<String>,
+}
+
+fn read_assignment_operation(
+    conn: &Connection,
+    workspace_id: &str,
+    operation_id: &str,
+) -> Result<Option<TicketAssignmentOperationRecord>> {
+    conn.query_row(
+        r#"SELECT action, ticket_id, runtime_id, worker_id, assignment_id, expected_assignment_id,
+                  request_fingerprint
+           FROM ticket_assignment_operations
+           WHERE workspace_id = ?1 AND operation_id = ?2"#,
+        params![workspace_id, operation_id],
+        |row| {
+            Ok(TicketAssignmentOperationRecord {
+                action: row.get(0)?,
+                ticket_id: row.get(1)?,
+                runtime_id: row.get(2)?,
+                worker_id: row.get(3)?,
+                assignment_id: row.get(4)?,
+                expected_assignment_id: row.get(5)?,
+                request_fingerprint: row.get(6)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Error::from)
+}
+
+fn map_assignment_constraint(error: rusqlite::Error, ticket_id: &str, worker_id: &str) -> Error {
+    if matches!(error, rusqlite::Error::SqliteFailure(_, _)) {
+        Error::TicketAssignmentConflict(format!(
+            "Ticket {ticket_id} or Worker {worker_id} already has a current assignment"
+        ))
+    } else {
+        Error::Sqlite(error)
+    }
+}
+
+fn require_expected_ticket_assignment(
+    ticket_id: &str,
+    current: Option<&TicketWorkerAssignmentRecord>,
+    expected_assignment_id: Option<&str>,
+) -> Result<()> {
+    let Some(expected_assignment_id) = expected_assignment_id else {
+        return Ok(());
+    };
+    if current.map(|assignment| assignment.assignment_id.as_str()) == Some(expected_assignment_id) {
+        return Ok(());
+    }
+    Err(Error::TicketAssignmentConflict(format!(
+        "Ticket {ticket_id} is no longer assigned to {expected_assignment_id}"
+    )))
+}
+
 fn workdir_registry_select_sql(where_clause: &str) -> String {
     format!(
         "SELECT workspace_id, workdir_id, runtime_id, repository_id, \
@@ -2191,14 +3311,202 @@ DROP TABLE IF EXISTS tickets;
 }
 
 fn add_workdir_revision_observations(conn: &Connection) -> Result<()> {
+    if column_exists(conn, "workdir_registry", "selector")?
+        && !column_exists(conn, "workdir_registry", "creation_selector")?
+    {
+        conn.execute_batch(
+            "ALTER TABLE workdir_registry RENAME COLUMN selector TO creation_selector;",
+        )?;
+    }
+    if column_exists(conn, "workdir_registry", "resolved_commit")?
+        && !column_exists(conn, "workdir_registry", "creation_ref")?
+    {
+        conn.execute_batch(
+            "ALTER TABLE workdir_registry RENAME COLUMN resolved_commit TO creation_ref;",
+        )?;
+    }
+    if !column_exists(conn, "workdir_registry", "current_selector")? {
+        conn.execute_batch("ALTER TABLE workdir_registry ADD COLUMN current_selector TEXT;")?;
+    }
+    if !column_exists(conn, "workdir_registry", "current_ref")? {
+        conn.execute_batch("ALTER TABLE workdir_registry ADD COLUMN current_ref TEXT;")?;
+    }
+    Ok(())
+}
+
+fn create_ticket_worker_assignment_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
-ALTER TABLE workdir_registry RENAME COLUMN selector TO creation_selector;
-ALTER TABLE workdir_registry RENAME COLUMN resolved_commit TO creation_ref;
-ALTER TABLE workdir_registry ADD COLUMN current_selector TEXT;
-ALTER TABLE workdir_registry ADD COLUMN current_ref TEXT;
+CREATE TABLE IF NOT EXISTS ticket_worker_assignments (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    ticket_id TEXT NOT NULL,
+    assignment_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    assigned_by TEXT NOT NULL,
+    assigned_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, assignment_id),
+    UNIQUE (workspace_id, ticket_id, assignment_id)
+);
+
+CREATE TABLE IF NOT EXISTS ticket_current_worker_assignments (
+    workspace_id TEXT NOT NULL,
+    ticket_id TEXT NOT NULL,
+    assignment_id TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, ticket_id),
+    FOREIGN KEY (workspace_id, ticket_id, assignment_id)
+        REFERENCES ticket_worker_assignments(workspace_id, ticket_id, assignment_id)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS ticket_worker_assignment_events (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    ticket_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('assigned', 'reassigned', 'unassigned')),
+    assignment_id TEXT,
+    previous_assignment_id TEXT,
+    actor TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ticket_assignments_worker
+    ON ticket_worker_assignments(workspace_id, runtime_id, worker_id, assigned_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ticket_assignment_events_ticket
+    ON ticket_worker_assignment_events(workspace_id, ticket_id, created_at DESC);
 "#,
     )?;
+    Ok(())
+}
+
+fn create_ticket_notification_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+CREATE TABLE IF NOT EXISTS worker_workspace_credentials (
+    credential_id TEXT PRIMARY KEY,
+    token TEXT NOT NULL UNIQUE,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    runtime_id TEXT NOT NULL,
+    worker_id TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ticket_notification_outbox (
+    notification_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    ticket_id TEXT NOT NULL,
+    event_sequence INTEGER NOT NULL,
+    source_runtime_id TEXT NOT NULL,
+    source_worker_id TEXT NOT NULL,
+    previous_state TEXT NOT NULL,
+    current_state TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ticket_notification_deliveries (
+    notification_id TEXT NOT NULL REFERENCES ticket_notification_outbox(notification_id) ON DELETE CASCADE,
+    recipient_runtime_id TEXT NOT NULL,
+    recipient_worker_id TEXT NOT NULL,
+    recipient_kind TEXT NOT NULL CHECK (recipient_kind IN ('assigned', 'orchestrator')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    delivered_at TEXT,
+    last_error TEXT,
+    PRIMARY KEY (notification_id, recipient_runtime_id, recipient_worker_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ticket_notification_pending
+    ON ticket_notification_deliveries(delivered_at, attempts);
+"#,
+    )?;
+    Ok(())
+}
+
+fn strengthen_ticket_worker_assignments(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+ALTER TABLE ticket_current_worker_assignments RENAME TO ticket_current_worker_assignments_v16;
+
+CREATE TABLE ticket_current_worker_assignments (
+    workspace_id TEXT NOT NULL,
+    ticket_id TEXT NOT NULL,
+    assignment_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, ticket_id),
+    UNIQUE (workspace_id, runtime_id, worker_id),
+    FOREIGN KEY (workspace_id, ticket_id, assignment_id)
+        REFERENCES ticket_worker_assignments(workspace_id, ticket_id, assignment_id)
+        ON DELETE CASCADE
+);
+
+INSERT INTO ticket_current_worker_assignments (
+    workspace_id, ticket_id, assignment_id, runtime_id, worker_id, updated_at
+)
+SELECT current.workspace_id, current.ticket_id, current.assignment_id,
+       assignment.runtime_id, assignment.worker_id, current.updated_at
+FROM ticket_current_worker_assignments_v16 AS current
+JOIN ticket_worker_assignments AS assignment
+  ON assignment.workspace_id = current.workspace_id
+ AND assignment.ticket_id = current.ticket_id
+ AND assignment.assignment_id = current.assignment_id;
+
+DROP TABLE ticket_current_worker_assignments_v16;
+
+CREATE TABLE ticket_assignment_operations (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    operation_id TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('assign', 'reassign', 'unassign')),
+    ticket_id TEXT NOT NULL,
+    runtime_id TEXT,
+    worker_id TEXT,
+    assignment_id TEXT,
+    expected_assignment_id TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, operation_id)
+);
+"#,
+    )?;
+    Ok(())
+}
+
+fn strengthen_ticket_notifications(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+ALTER TABLE worker_workspace_credentials ADD COLUMN expires_at TEXT;
+ALTER TABLE worker_workspace_credentials ADD COLUMN revoked_at TEXT;
+ALTER TABLE ticket_notification_outbox ADD COLUMN event_kind TEXT NOT NULL DEFAULT 'comment';
+ALTER TABLE ticket_notification_outbox ADD COLUMN source_operation_kind TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE ticket_notification_outbox ADD COLUMN source_actor_role TEXT NOT NULL DEFAULT 'worker';
+ALTER TABLE ticket_notification_outbox ADD COLUMN source_assignment_id TEXT;
+
+CREATE TABLE ticket_notification_cursors (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    ticket_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    last_event_index INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, ticket_id, runtime_id, worker_id)
+);
+"#,
+    )?;
+    Ok(())
+}
+
+fn strengthen_ticket_assignment_lifecycle_reservations(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "ticket_assignment_operations", "request_fingerprint")? {
+        conn.execute_batch(
+            "ALTER TABLE ticket_assignment_operations ADD COLUMN request_fingerprint TEXT;",
+        )?;
+    }
+    // The Workdir and Ticket branches both used schema version 15 before
+    // integration. A database that ran the Ticket branch through v19 still
+    // needs the Workdir revision projection while already having the lifecycle
+    // reservation column. Reconcile both shapes at the combined v20 boundary.
+    add_workdir_revision_observations(conn)?;
     Ok(())
 }
 
@@ -2884,7 +4192,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 15);
+        assert_eq!(store.schema_version().await.unwrap(), 20);
 
         let record = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
@@ -2897,10 +4205,409 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 15);
+        assert_eq!(reopened.schema_version().await.unwrap(), 20);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
+        );
+    }
+
+    #[tokio::test]
+    async fn ticket_worker_assignment_replaces_current_and_preserves_audit_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("server.db");
+        let store = SqliteWorkspaceStore::open(&db).unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "workspace-a".to_string(),
+                owner_account_id: None,
+                display_name: "Workspace A".to_string(),
+                state: "active".to_string(),
+                created_at: "2026-07-31T00:00:00Z".to_string(),
+                updated_at: "2026-07-31T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let first = TicketWorkerAssignmentRecord {
+            workspace_id: "workspace-a".to_string(),
+            ticket_id: "ticket-1".to_string(),
+            assignment_id: "assignment-1".to_string(),
+            runtime_id: "runtime-1".to_string(),
+            worker_id: "worker-1".to_string(),
+            assigned_by: "user-1".to_string(),
+            assigned_at: "2026-07-31T00:00:01Z".to_string(),
+        };
+        let created = store
+            .set_current_ticket_worker_assignment(&first, None, "event-1", "operation-1", false)
+            .unwrap();
+        assert_eq!(created.current, first);
+        assert_eq!(created.previous, None);
+        let retried = store
+            .set_current_ticket_worker_assignment(
+                &TicketWorkerAssignmentRecord {
+                    assignment_id: "ignored-retry-assignment".to_string(),
+                    ..first.clone()
+                },
+                None,
+                "ignored-retry-event",
+                "operation-1",
+                false,
+            )
+            .unwrap();
+        assert_eq!(retried.current, first);
+        assert_eq!(
+            store
+                .list_ticket_worker_assignment_events("workspace-a", "ticket-1", 10)
+                .unwrap()
+                .len(),
+            1,
+            "idempotent retry must not append another assignment event"
+        );
+        let implicit_reassign = store
+            .set_current_ticket_worker_assignment(
+                &TicketWorkerAssignmentRecord {
+                    assignment_id: "implicit-reassign".to_string(),
+                    worker_id: "worker-other".to_string(),
+                    ..first.clone()
+                },
+                None,
+                "implicit-event",
+                "implicit-operation",
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            implicit_reassign,
+            Error::TicketAssignmentConflict(_)
+        ));
+        let worker_conflict = store
+            .set_current_ticket_worker_assignment(
+                &TicketWorkerAssignmentRecord {
+                    ticket_id: "ticket-2".to_string(),
+                    assignment_id: "worker-conflict".to_string(),
+                    ..first.clone()
+                },
+                None,
+                "worker-conflict-event",
+                "worker-conflict-operation",
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            worker_conflict,
+            Error::TicketAssignmentConflict(_)
+        ));
+
+        let second = TicketWorkerAssignmentRecord {
+            assignment_id: "assignment-2".to_string(),
+            runtime_id: "runtime-2".to_string(),
+            worker_id: "worker-2".to_string(),
+            assigned_by: "user-2".to_string(),
+            assigned_at: "2026-07-31T00:00:02Z".to_string(),
+            ..first.clone()
+        };
+        let replaced = store
+            .set_current_ticket_worker_assignment(
+                &second,
+                Some("assignment-1"),
+                "event-2",
+                "operation-2",
+                true,
+            )
+            .unwrap();
+        assert_eq!(replaced.current, second);
+        assert_eq!(replaced.previous, Some(first.clone()));
+        let replayed_reassignment = store
+            .set_current_ticket_worker_assignment(
+                &second,
+                Some("assignment-1"),
+                "ignored-reassign-event",
+                "operation-2",
+                true,
+            )
+            .unwrap();
+        assert_eq!(replayed_reassignment, replaced);
+        assert_eq!(
+            store
+                .get_current_ticket_worker_assignment("workspace-a", "ticket-1")
+                .unwrap(),
+            Some(second.clone())
+        );
+
+        let stale = store
+            .clear_current_ticket_worker_assignment(
+                "workspace-a",
+                "ticket-1",
+                Some("assignment-1"),
+                "unassign-operation-stale",
+                "event-stale",
+                "user-1",
+                "2026-07-31T00:00:03Z",
+            )
+            .unwrap_err();
+        assert!(matches!(stale, Error::TicketAssignmentConflict(_)));
+
+        let cleared = store
+            .clear_current_ticket_worker_assignment(
+                "workspace-a",
+                "ticket-1",
+                Some("assignment-2"),
+                "unassign-operation-2",
+                "event-3",
+                "user-2",
+                "2026-07-31T00:00:03Z",
+            )
+            .unwrap();
+        assert_eq!(cleared, Some(second.clone()));
+        let retried_clear = store
+            .clear_current_ticket_worker_assignment(
+                "workspace-a",
+                "ticket-1",
+                Some("assignment-2"),
+                "unassign-operation-2",
+                "ignored-clear-event",
+                "user-2",
+                "2026-07-31T00:00:04Z",
+            )
+            .unwrap();
+        assert_eq!(retried_clear, Some(second));
+        store
+            .reserve_ticket_assignment_operation(
+                "workspace-a",
+                "reserved-operation",
+                "ticket-3",
+                "runtime-3",
+                None,
+                "sha256:reserved",
+                "2026-07-31T00:00:05Z",
+            )
+            .unwrap();
+        drop(store);
+        let store = SqliteWorkspaceStore::open(&db).unwrap();
+        let pending = store
+            .get_ticket_assignment_operation("workspace-a", "reserved-operation")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.worker_id, None);
+        assert_eq!(
+            pending.request_fingerprint.as_deref(),
+            Some("sha256:reserved")
+        );
+        store
+            .bind_ticket_assignment_operation_worker(
+                "workspace-a",
+                "reserved-operation",
+                "worker-3",
+            )
+            .unwrap();
+        let reserved_assignment = TicketWorkerAssignmentRecord {
+            workspace_id: "workspace-a".to_string(),
+            ticket_id: "ticket-3".to_string(),
+            assignment_id: "assignment-3".to_string(),
+            runtime_id: "runtime-3".to_string(),
+            worker_id: "worker-3".to_string(),
+            assigned_by: "runtime".to_string(),
+            assigned_at: "2026-07-31T00:00:06Z".to_string(),
+        };
+        let completed_reservation = store
+            .set_current_ticket_worker_assignment(
+                &reserved_assignment,
+                None,
+                "reserved-event",
+                "reserved-operation",
+                false,
+            )
+            .unwrap();
+        assert_eq!(completed_reservation.current, reserved_assignment);
+        assert_eq!(
+            store
+                .get_ticket_assignment_operation("workspace-a", "reserved-operation")
+                .unwrap()
+                .and_then(|operation| operation.assignment_id),
+            Some("assignment-3".to_string())
+        );
+        assert_eq!(
+            store
+                .get_current_ticket_worker_assignment("workspace-a", "ticket-1")
+                .unwrap(),
+            None
+        );
+
+        let events = store
+            .list_ticket_worker_assignment_events("workspace-a", "ticket-1", 10)
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.action.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unassigned", "reassigned", "assigned"]
+        );
+        assert_eq!(events[1].assignment_id.as_deref(), Some("assignment-2"));
+        assert_eq!(
+            events[1].previous_assignment_id.as_deref(),
+            Some("assignment-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_credential_binds_once_and_notification_outbox_is_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteWorkspaceStore::open(dir.path().join("server.db")).unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "workspace-a".to_string(),
+                owner_account_id: None,
+                display_name: "Workspace A".to_string(),
+                state: "active".to_string(),
+                created_at: "2026-07-31T00:00:00Z".to_string(),
+                updated_at: "2026-07-31T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_worker_workspace_credential(&WorkerWorkspaceCredentialRecord {
+                credential_id: "credential-1".to_string(),
+                token: "secret-token".to_string(),
+                workspace_id: "workspace-a".to_string(),
+                runtime_id: "runtime-1".to_string(),
+                worker_id: None,
+                created_at: "2026-07-31T00:00:01Z".to_string(),
+                expires_at: "2099-01-01T00:00:00Z".to_string(),
+                revoked_at: None,
+            })
+            .unwrap();
+        let bound = store
+            .authenticate_worker_workspace_credential("secret-token", "workspace-a", "worker-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound.worker_id.as_deref(), Some("worker-1"));
+        let refreshed = store
+            .refresh_worker_workspace_credential(
+                "secret-token",
+                "workspace-a",
+                "worker-1",
+                "refreshed-token",
+                "2099-02-01T00:00:00Z",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.token, "refreshed-token");
+        assert!(store
+            .authenticate_worker_workspace_credential(
+                "secret-token",
+                "workspace-a",
+                "worker-1",
+            )
+            .unwrap()
+            .is_none());
+        assert!(
+            store
+                .authenticate_worker_workspace_credential(
+                    "refreshed-token",
+                    "workspace-a",
+                    "worker-1",
+                )
+                .unwrap()
+                .is_some()
+        );
+        store
+            .revoke_worker_workspace_credentials(
+                "workspace-a",
+                "runtime-1",
+                "worker-1",
+                "2026-08-01T00:00:00Z",
+            )
+            .unwrap();
+        assert!(
+            store
+                .authenticate_worker_workspace_credential(
+                    "refreshed-token",
+                    "workspace-a",
+                    "worker-1",
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .authenticate_worker_workspace_credential(
+                    "secret-token",
+                    "workspace-a",
+                    "worker-2",
+                )
+                .unwrap()
+                .is_none()
+        );
+
+        store
+            .enqueue_ticket_notification(
+                "notification-1",
+                "workspace-a",
+                "ticket-1",
+                4,
+                "runtime-1",
+                "worker-1",
+                "queued",
+                "inprogress",
+                "2026-07-31T00:00:02Z",
+                &[TicketNotificationRecipient {
+                    runtime_id: "runtime-1".to_string(),
+                    worker_id: "worker-2".to_string(),
+                    recipient_kind: "assigned".to_string(),
+                }],
+            )
+            .unwrap();
+        let pending = store
+            .list_pending_ticket_notification_deliveries("workspace-a", 10)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].event_sequence, 4);
+        store
+            .reroute_ticket_notification_delivery(
+                "notification-1",
+                "runtime-1",
+                "worker-2",
+                "runtime-2",
+                "worker-3",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .count_ticket_notification_deliveries_for_recipient(
+                    "workspace-a",
+                    "ticket-1",
+                    "runtime-1",
+                    "worker-2",
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .count_ticket_notification_deliveries_for_recipient(
+                    "workspace-a",
+                    "ticket-1",
+                    "runtime-2",
+                    "worker-3",
+                )
+                .unwrap(),
+            1
+        );
+        store
+            .mark_ticket_notification_delivered(
+                "notification-1",
+                "runtime-2",
+                "worker-3",
+                "2026-07-31T00:00:03Z",
+            )
+            .unwrap();
+        assert!(
+            store
+                .list_pending_ticket_notification_deliveries("workspace-a", 10)
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -2923,6 +4630,9 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
             "artifacts",
             "audit_events",
             "worker_registry",
+            "ticket_worker_assignments",
+            "ticket_current_worker_assignments",
+            "ticket_worker_assignment_events",
             "workdir_registry",
             "worker_workdir_links",
             "accounts",
@@ -3103,7 +4813,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 15);
+        assert_eq!(store.schema_version().await.unwrap(), 20);
 
         store
             .with_conn(|conn| {
@@ -3259,10 +4969,37 @@ INSERT INTO workdir_registry (
         );
     }
 
+    #[test]
+    fn combined_v20_migration_reconciles_ticket_branch_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+CREATE TABLE workdir_registry (
+    selector TEXT,
+    resolved_commit TEXT
+);
+CREATE TABLE ticket_assignment_operations (
+    request_fingerprint TEXT
+);
+"#,
+        )
+        .unwrap();
+
+        strengthen_ticket_assignment_lifecycle_reservations(&conn).unwrap();
+
+        assert!(column_exists(&conn, "workdir_registry", "creation_selector").unwrap());
+        assert!(column_exists(&conn, "workdir_registry", "creation_ref").unwrap());
+        assert!(column_exists(&conn, "workdir_registry", "current_selector").unwrap());
+        assert!(column_exists(&conn, "workdir_registry", "current_ref").unwrap());
+        assert!(
+            column_exists(&conn, "ticket_assignment_operations", "request_fingerprint").unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 15);
+        assert_eq!(store.schema_version().await.unwrap(), 20);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -3300,7 +5037,7 @@ INSERT INTO workdir_registry (
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 15);
+        assert_eq!(store.schema_version().await.unwrap(), 20);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -3478,7 +5215,7 @@ INSERT INTO workdir_registry (
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 15);
+        assert_eq!(store.schema_version().await.unwrap(), 20);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),

@@ -1153,6 +1153,8 @@ mod tests {
         request.workspace_api = Some(WorkspaceApiRef {
             workspace_id: workspace_id.to_string(),
             base_url: format!("https://workspace.example/{workspace_id}"),
+            runtime_id: None,
+            access_token: None,
         });
         request
     }
@@ -1410,6 +1412,8 @@ mod tests {
         let profile = ProfileSelector::Builtin("builtin:coder".to_string());
         let bundle = test_bundle(profile.clone());
         CreateWorkerRequest {
+            idempotency_key: None,
+            idempotency_fingerprint: None,
             profile,
             display_name: None,
             profile_source: crate::catalog::ProfileSourceArchiveSource::Http {
@@ -1810,6 +1814,8 @@ mod ws_tests {
     fn ws_create_request() -> CreateWorkerRequest {
         let bundle = ws_test_bundle(ProfileSelector::Builtin("builtin:companion".to_string()));
         CreateWorkerRequest {
+            idempotency_key: None,
+            idempotency_fingerprint: None,
             profile: ProfileSelector::Builtin("builtin:companion".to_string()),
             display_name: None,
             profile_source: crate::catalog::ProfileSourceArchiveSource::Http {

@@ -354,6 +354,11 @@ impl Runtime {
         request: CreateWorkerRequest,
         scope: Option<&RuntimeWorkspaceScope>,
     ) -> Result<WorkerDetail, RuntimeError> {
+        if request.idempotency_key.is_some() != request.idempotency_fingerprint.is_some() {
+            return Err(RuntimeError::InvalidRequest(
+                "idempotency_key and idempotency_fingerprint must be provided together".to_string(),
+            ));
+        }
         let (backend, worker_ref, spawn_request) = {
             let mut state = self.lock()?;
             state.ensure_running()?;
@@ -365,6 +370,20 @@ impl Runtime {
             if let Some(scope) = scope {
                 state.ensure_workspace_owner(scope, true)?;
             };
+            if let Some(idempotency_key) = request.idempotency_key.as_deref() {
+                let workspace_id = scope.map(|scope| scope.workspace_id.as_str());
+                if let Some(existing) = state.workers.values().find(|record| {
+                    record.workspace_id.as_deref() == workspace_id
+                        && record.request.idempotency_key.as_deref() == Some(idempotency_key)
+                }) {
+                    if existing.request.idempotency_fingerprint != request.idempotency_fingerprint {
+                        return Err(RuntimeError::InvalidRequest(format!(
+                            "worker creation idempotency key {idempotency_key} was already used with different input"
+                        )));
+                    }
+                    return Ok(existing.detail());
+                }
+            }
             state.validate_worker_config_boundary(&request)?;
             if let Some(working_directory_id) = requested_primary_workdir_id(&request) {
                 if let Some(owner_worker_id) =
@@ -2108,7 +2127,9 @@ fn input_protocol_event(input: &WorkerInput) -> protocol::Event {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{ConfigBundleRef, ProfileSelector, WorkspaceApiRef};
+    use crate::catalog::{
+        ConfigBundleRef, ProfileSelector, WorkingDirectoryClaim, WorkspaceApiRef,
+    };
     use crate::config_bundle::{
         ConfigBundle, ConfigBundleMetadata, ConfigBundleProvenance, ConfigDeclaration,
         ConfigDeclarationKind, ConfigProfileDescriptor,
@@ -2126,6 +2147,8 @@ mod tests {
         let profile = ProfileSelector::Builtin("builtin:coder".to_string());
         let bundle = test_bundle_for_profile(profile.clone());
         CreateWorkerRequest {
+            idempotency_key: None,
+            idempotency_fingerprint: None,
             profile,
             display_name: None,
             profile_source: crate::catalog::ProfileSourceArchiveSource::Http {
@@ -2161,6 +2184,8 @@ mod tests {
         request.workspace_api = Some(WorkspaceApiRef {
             workspace_id: workspace_id.to_string(),
             base_url: format!("https://workspace.example/{workspace_id}"),
+            runtime_id: None,
+            access_token: None,
         });
         request
     }
@@ -2610,6 +2635,33 @@ mod tests {
             unsupported_err,
             RuntimeError::UnsupportedConfigDeclaration { .. }
         ));
+    }
+
+    #[test]
+    fn create_worker_idempotency_reuses_worker_and_rejects_different_input() {
+        let runtime = runtime_with_backend();
+        let mut request = task_request("idempotent");
+        request.idempotency_key = Some("operation-1".to_string());
+        request.idempotency_fingerprint = Some("sha256:input-1".to_string());
+        request.working_directory = Some(WorkingDirectoryClaim {
+            working_directory_id: "workdir-idempotent".to_string(),
+            relative_cwd: None,
+        });
+
+        let first = runtime.create_worker(request.clone()).unwrap();
+        let workdir_count_after_first = runtime.list_working_directories().unwrap().len();
+        let replayed = runtime.create_worker(request.clone()).unwrap();
+        assert_eq!(replayed.worker_ref, first.worker_ref);
+        assert_eq!(runtime.list_workers().unwrap().len(), 1);
+        assert_eq!(
+            runtime.list_working_directories().unwrap().len(),
+            workdir_count_after_first
+        );
+
+        request.idempotency_fingerprint = Some("sha256:different".to_string());
+        let error = runtime.create_worker(request).unwrap_err();
+        assert!(matches!(error, RuntimeError::InvalidRequest(_)));
+        assert_eq!(runtime.list_workers().unwrap().len(), 1);
     }
 
     #[test]

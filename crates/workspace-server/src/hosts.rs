@@ -310,12 +310,35 @@ pub struct WorkerSpawnWorkingDirectoryRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct WorkerTicketAssignmentRequest {
+    pub ticket_id: String,
+    pub operation_id: String,
+}
+
+pub(crate) fn worker_spawn_idempotency(
+    request: &WorkerSpawnRequest,
+) -> Result<Option<(String, String)>, String> {
+    let Some(assignment) = request.ticket_assignment.as_ref() else {
+        return Ok(None);
+    };
+    let encoded = serde_json::to_vec(request)
+        .map_err(|error| format!("serialize Worker spawn idempotency input: {error}"))?;
+    Ok(Some((
+        assignment.operation_id.clone(),
+        format!("sha256:{}", digest_hex(&encoded, 64)),
+    )))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerSpawnRequest {
     pub intent: WorkerSpawnIntent,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_worker_name: Option<String>,
     pub acceptance: WorkerSpawnAcceptanceRequirement,
     pub profile: ProfileSelector,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_assignment: Option<WorkerTicketAssignmentRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_input: Option<EmbeddedWorkerInput>,
     /// Optional safe working-directory creation request. The Workspace server resolves
@@ -329,6 +352,8 @@ pub struct WorkerSpawnRequest {
     pub resolved_working_directory: Option<WorkingDirectoryClaim>,
     #[serde(skip, default)]
     pub resolved_config_bundle: Option<ConfigBundle>,
+    #[serde(skip, default)]
+    pub resolved_workspace_api: Option<WorkspaceApiRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -427,6 +452,8 @@ pub struct WorkerStopResult {
 pub struct WorkerLifecycleRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_assignment: Option<WorkerTicketAssignmentRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1695,7 +1722,14 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 };
             }
         };
+        let (idempotency_key, idempotency_fingerprint) = worker_spawn_idempotency(&request)
+            .expect("WorkerSpawnRequest serialization is infallible")
+            .map_or((None, None), |(key, fingerprint)| {
+                (Some(key), Some(fingerprint))
+            });
         let create_request = CreateWorkerRequest {
+            idempotency_key,
+            idempotency_fingerprint,
             profile,
             display_name: request.requested_worker_name.clone(),
             config_bundle: None,
@@ -1703,13 +1737,16 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             initial_input: request.initial_input.clone(),
             working_directory_request: request.resolved_working_directory_request.clone(),
             working_directory: request.resolved_working_directory.clone(),
-            workspace_api: self
-                .backend_base_url
-                .as_ref()
-                .map(|base_url| WorkspaceApiRef {
-                    workspace_id: self.workspace_id.clone(),
-                    base_url: base_url.clone(),
-                }),
+            workspace_api: request.resolved_workspace_api.clone().or_else(|| {
+                self.backend_base_url
+                    .as_ref()
+                    .map(|base_url| WorkspaceApiRef {
+                        workspace_id: self.workspace_id.clone(),
+                        base_url: base_url.clone(),
+                        runtime_id: Some(self.runtime_id.clone()),
+                        access_token: None,
+                    })
+            }),
         };
         match self.runtime.create_worker(create_request) {
             Ok(detail) => WorkerSpawnResult {
@@ -2669,7 +2706,14 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 };
             }
         };
+        let (idempotency_key, idempotency_fingerprint) = worker_spawn_idempotency(&request)
+            .expect("WorkerSpawnRequest serialization is infallible")
+            .map_or((None, None), |(key, fingerprint)| {
+                (Some(key), Some(fingerprint))
+            });
         let create = CreateWorkerRequest {
+            idempotency_key,
+            idempotency_fingerprint,
             profile,
             display_name: request.requested_worker_name.clone(),
             config_bundle: None,
@@ -2677,9 +2721,13 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             initial_input: request.initial_input.clone(),
             working_directory_request: request.resolved_working_directory_request.clone(),
             working_directory: request.resolved_working_directory.clone(),
-            workspace_api: Some(WorkspaceApiRef {
-                workspace_id: self.workspace_id.clone(),
-                base_url: self.backend_base_url.clone(),
+            workspace_api: request.resolved_workspace_api.clone().or_else(|| {
+                Some(WorkspaceApiRef {
+                    workspace_id: self.workspace_id.clone(),
+                    base_url: self.backend_base_url.clone(),
+                    runtime_id: Some(self.runtime_id.clone()),
+                    access_token: None,
+                })
             }),
         };
         match self.post_json::<_, RuntimeHttpWorkerResponse>("/v1/workers", &create) {
@@ -3121,8 +3169,11 @@ fn embedded_profile_path(profile: &ProfileSelector) -> Result<String, String> {
 fn embedded_profile_label(profile: &ProfileSelector) -> Option<String> {
     Some(match profile {
         ProfileSelector::Builtin(name) | ProfileSelector::Named(name) => {
-            if name.strip_prefix("builtin:").unwrap_or(name) == MEMORY_CONSOLIDATION_PROFILE {
+            let builtin_name = name.strip_prefix("builtin:").unwrap_or(name);
+            if builtin_name == MEMORY_CONSOLIDATION_PROFILE {
                 MEMORY_CONSOLIDATION_PROFILE.to_string()
+            } else if builtin_name == WORKSPACE_ORCHESTRATOR_PROFILE {
+                WORKSPACE_ORCHESTRATOR_PROFILE.to_string()
             } else {
                 safe_display_hint(name)
             }
@@ -3132,6 +3183,8 @@ fn embedded_profile_label(profile: &ProfileSelector) -> Option<String> {
 
 const MEMORY_CONSOLIDATION_PROFILE: &str = "memory-consolidation";
 const MEMORY_CONSOLIDATION_SINGLETON_KEY: &str = "workspace-memory-consolidation";
+const WORKSPACE_ORCHESTRATOR_PROFILE: &str = "orchestrator";
+pub(crate) const WORKSPACE_ORCHESTRATOR_SINGLETON_KEY: &str = "workspace-orchestrator";
 
 struct WorkerDisplayMetadata {
     display_name: String,
@@ -3157,6 +3210,20 @@ fn worker_display_metadata(
         return WorkerDisplayMetadata {
             display_name: "Memory Consolidation".to_string(),
             singleton_key: Some(MEMORY_CONSOLIDATION_SINGLETON_KEY.to_string()),
+            tags,
+        };
+    }
+    if profile_label == Some(WORKSPACE_ORCHESTRATOR_PROFILE) {
+        let mut tags = vec!["orchestrator".to_string(), "singleton".to_string()];
+        if internal {
+            tags.insert(0, "internal".to_string());
+        }
+        return WorkerDisplayMetadata {
+            display_name: requested_display_name
+                .filter(|value| !value.trim().is_empty())
+                .map(safe_display_hint)
+                .unwrap_or_else(|| "Workspace Orchestrator".to_string()),
+            singleton_key: Some(WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string()),
             tags,
         };
     }
@@ -4149,11 +4216,13 @@ mod tests {
                 expected_segments: 0,
             },
             profile: ProfileSelector::Builtin("builtin:coder".to_string()),
+            ticket_assignment: None,
             initial_input: None,
             working_directory_request: None,
             resolved_working_directory_request: None,
             resolved_working_directory: None,
             resolved_config_bundle: None,
+            resolved_workspace_api: None,
         }
     }
 
@@ -4275,11 +4344,13 @@ mod tests {
                         expected_segments: 0,
                     },
                     profile: ProfileSelector::Builtin("builtin:coder".to_string()),
+                    ticket_assignment: None,
                     initial_input: None,
                     working_directory_request: None,
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
                     resolved_config_bundle: None,
+                    resolved_workspace_api: None,
                 },
             )
             .unwrap();
@@ -4371,11 +4442,13 @@ mod tests {
                         expected_segments: 0,
                     },
                     profile: ProfileSelector::Builtin("builtin:coder".to_string()),
+                    ticket_assignment: None,
                     initial_input: None,
                     working_directory_request: None,
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
                     resolved_config_bundle: None,
+                    resolved_workspace_api: None,
                 },
             )
             .unwrap();
@@ -4403,11 +4476,13 @@ mod tests {
                     requested_worker_name: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::SocketReady,
                     profile: ProfileSelector::Builtin("builtin:companion".to_string()),
+                    ticket_assignment: None,
                     initial_input: None,
                     working_directory_request: None,
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
                     resolved_config_bundle: None,
+                    resolved_workspace_api: None,
                 },
             )
             .unwrap();
