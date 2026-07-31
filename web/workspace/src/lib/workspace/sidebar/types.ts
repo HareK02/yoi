@@ -128,10 +128,11 @@ export type WorkingDirectoryOccupancy = {
 export type WorkingDirectorySummary = {
   working_directory_id: string;
   repository_id: string;
-  requested_selector?: string | null;
+  creation_selector?: string | null;
+  creation_ref?: string | null;
+  current_selector?: string | null;
+  current_ref?: string | null;
   materializer_kind: string;
-  resolved_commit: string;
-  resolved_tree?: string | null;
   status: string;
   cleanliness?: string | null;
   primary_worker_id?: number | null;

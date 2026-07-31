@@ -1,6 +1,7 @@
 <script lang="ts">
   import { pushWorkspaceAlert } from '$lib/workspace/alerts/store';
   import { workspaceApiPath } from '$lib/workspace/api/http';
+  import { formatCurrentWorkdirRevision } from '$lib/workspace/settings/workdir-revision';
   import type {
     CleanupWorkdirCandidate,
     RuntimeCleanupExecutionResponse,
@@ -23,12 +24,13 @@
     workdirs = data.workdirs?.items ?? [];
   });
 
-  function commitLabel(workdir: WorkingDirectorySummary): string {
-    return workdir.resolved_commit ? workdir.resolved_commit.slice(0, 12) : '—';
+  function repositoryProvider(workdir: WorkingDirectorySummary): string | null {
+    return data.repositories?.items.find((repository) => repository.id === workdir.repository_id)
+      ?.provider ?? null;
   }
 
-  function selectorLabel(workdir: WorkingDirectorySummary): string {
-    return workdir.requested_selector ?? 'HEAD';
+  function currentRevision(workdir: WorkingDirectorySummary): string {
+    return formatCurrentWorkdirRevision(workdir, repositoryProvider(workdir));
   }
 
   function cleanupCandidate(workdir: WorkingDirectorySummary): CleanupWorkdirCandidate | undefined {
@@ -125,8 +127,7 @@
           <tr>
             <th>Workdir</th>
             <th>Repository</th>
-            <th>Selector</th>
-            <th>Commit</th>
+            <th>Revision</th>
             <th>Status</th>
             <th>Cleanliness</th>
             <th>Occupied by</th>
@@ -139,8 +140,7 @@
             <tr>
               <td><code>{workdir.working_directory_id}</code></td>
               <td>{workdir.repository_id}</td>
-              <td>{selectorLabel(workdir)}</td>
-              <td><code>{commitLabel(workdir)}</code></td>
+              <td><code>{currentRevision(workdir)}</code></td>
               <td>{workdir.status}</td>
               <td>{workdir.cleanliness ?? 'unknown'}</td>
               <td>

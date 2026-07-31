@@ -143,13 +143,19 @@ pub struct WorkingDirectoryOccupancy {
 pub struct WorkingDirectorySummary {
     pub working_directory_id: String,
     pub repository_id: String,
+    /// Selector used to create this Workdir, retained as immutable materialization evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub requested_selector: Option<String>,
+    pub creation_selector: Option<String>,
+    /// Provider-specific immutable ref resolved when this Workdir was created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_ref: Option<String>,
+    /// Selector currently observed from the materialized Workdir, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_selector: Option<String>,
+    /// Provider-specific immutable ref currently observed from the materialized Workdir.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_ref: Option<String>,
     pub materializer_kind: MaterializerKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolved_commit: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolved_tree: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanup_target: Option<WorkingDirectoryCleanupTarget>,
     pub status: WorkingDirectoryStatusKind,

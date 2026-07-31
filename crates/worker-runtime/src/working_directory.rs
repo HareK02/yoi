@@ -40,10 +40,11 @@ impl WorkingDirectory {
         WorkingDirectorySummary {
             working_directory_id: self.id.clone(),
             repository_id: self.repository_id.clone(),
-            requested_selector: self.evidence.requested_selector.clone(),
+            creation_selector: self.evidence.requested_selector.clone(),
+            creation_ref: Some(self.evidence.resolved_commit.clone()),
+            current_selector: None,
+            current_ref: None,
             materializer_kind: self.materializer_kind.clone(),
-            resolved_commit: Some(self.evidence.resolved_commit.clone()),
-            resolved_tree: self.evidence.resolved_tree.clone(),
             cleanup_target: Some(self.cleanup_target.clone()),
             status: self.status.clone(),
             cleanliness: None,
@@ -88,6 +89,9 @@ impl WorkingDirectoryBinding {
         }
         let mut summary = working_directory.status_summary();
         summary.cleanliness = if summary.status == WorkingDirectoryStatusKind::Active {
+            let (current_selector, current_ref) = binding_current_revision(self);
+            summary.current_selector = current_selector;
+            summary.current_ref = current_ref;
             Some(binding_cleanliness(self))
         } else {
             Some("unknown".to_string())
@@ -171,6 +175,22 @@ fn binding_paths_are_available(binding: &WorkingDirectoryBinding) -> bool {
     source_repository_path.is_dir()
 }
 
+fn binding_current_revision(binding: &WorkingDirectoryBinding) -> (Option<String>, Option<String>) {
+    let current_ref = git_stdout(binding.root(), ["rev-parse", "HEAD"])
+        .ok()
+        .filter(|value| !value.is_empty());
+    if current_ref.is_none() {
+        return (None, None);
+    }
+    let current_selector = git_stdout(
+        binding.root(),
+        ["symbolic-ref", "--short", "--quiet", "HEAD"],
+    )
+    .ok()
+    .filter(|value| !value.is_empty());
+    (current_selector, current_ref)
+}
+
 fn binding_cleanliness(binding: &WorkingDirectoryBinding) -> String {
     match git_stdout(binding.root(), ["status", "--porcelain"]) {
         Ok(output) if output.is_empty() => "clean".to_string(),
@@ -208,10 +228,11 @@ impl LocalGitWorktreeMaterializer {
             summary: WorkingDirectorySummary {
                 working_directory_id: working_directory_id.to_string(),
                 repository_id: "unknown".to_string(),
-                requested_selector: None,
+                creation_selector: None,
+                creation_ref: None,
+                current_selector: None,
+                current_ref: None,
                 materializer_kind: MaterializerKind::LocalGitWorktree,
-                resolved_commit: None,
-                resolved_tree: None,
                 cleanup_target: Some(WorkingDirectoryCleanupTarget {
                     kind: "local_git_worktree".to_string(),
                     working_directory_id: working_directory_id.to_string(),
@@ -930,10 +951,37 @@ mod tests {
             listed[0].summary.working_directory_id,
             working_directory.working_directory.id
         );
+        assert_eq!(listed[0].summary.creation_selector.as_deref(), Some("HEAD"));
+        assert_eq!(listed[0].summary.current_selector, None);
         assert_eq!(
-            listed[0].summary.requested_selector.as_deref(),
-            Some("HEAD")
+            listed[0].summary.current_ref,
+            listed[0].summary.creation_ref
         );
+    }
+
+    #[test]
+    fn working_directory_observes_current_selector_and_ref_without_changing_creation_evidence() {
+        let repo = create_clean_repo();
+        let runtime_root = tempfile::tempdir().unwrap();
+        let materializer = LocalGitWorktreeMaterializer::new(runtime_root.path());
+        let working_directory = materializer.create(&request(repo.path())).unwrap();
+        let bound = materializer
+            .bind_working_directory(&working_directory.working_directory.id, None)
+            .unwrap();
+        let initial_ref = bound.status().summary.creation_ref.expect("creation ref");
+
+        git(&bound.root, &["switch", "-c", "observed-branch"]);
+        fs::write(bound.root.join("observed.txt"), "observed\n").unwrap();
+        git(&bound.root, &["add", "observed.txt"]);
+        git(&bound.root, &["commit", "-m", "advance workdir"]);
+
+        let summary = materializer.list_working_directories().unwrap()[0]
+            .summary
+            .clone();
+        assert_eq!(summary.creation_selector.as_deref(), Some("HEAD"));
+        assert_eq!(summary.creation_ref.as_deref(), Some(initial_ref.as_str()));
+        assert_eq!(summary.current_selector.as_deref(), Some("observed-branch"));
+        assert_ne!(summary.current_ref.as_deref(), Some(initial_ref.as_str()));
     }
 
     #[test]

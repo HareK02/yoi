@@ -110,7 +110,7 @@
             </span>
             <span class="item-meta">
               worker {worker.worker_id} · {worker.profile ? `${worker.profile} · ` : ''}{worker.state} · 🖥 {worker.host_id}
-              {worker.working_directory ? ` · wd:${worker.working_directory.repository_id}@${worker.working_directory.resolved_commit.slice(0, 8)}` : ''}
+              {worker.working_directory?.current_ref ? ` · wd:${worker.working_directory.repository_id}@${worker.working_directory.current_ref.slice(0, 8)}` : ''}
             </span>
           </a>
         </li>

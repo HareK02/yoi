@@ -2,12 +2,14 @@
   import { goto } from '$app/navigation';
   import { untrack } from 'svelte';
   import { workspaceApiPath } from '$lib/workspace/api/http';
+  import { formatCurrentWorkdirRevision } from '$lib/workspace/settings/workdir-revision';
   import { buildBrowserCreateWorkerRequest, defaultWorkerLaunchForm } from '$lib/workspace/sidebar/worker-launch';
   import type {
     BrowserCreateWorkerResponse,
     BrowserWorkingDirectoryCreateResponse,
     Diagnostic,
     WorkerLaunchOptionsResponse,
+    WorkingDirectorySummary,
   } from '$lib/workspace/sidebar/types';
   import type { PageProps } from './$types';
 
@@ -21,6 +23,12 @@
     message?: string;
     diagnostics?: Diagnostic[];
   };
+
+  function workdirOptionLabel(directory: WorkingDirectorySummary): string {
+    const provider = data.repositories?.items.find((repository) => repository.id === directory.repository_id)
+      ?.provider;
+    return `${directory.repository_id} · ${formatCurrentWorkdirRevision(directory, provider)}`;
+  }
 
   let { data }: PageProps = $props();
   let workspaceId = $derived(data.workspaceId);
@@ -296,7 +304,7 @@
               <option value="" disabled>Select workdir</option>
               {#each availableWorkingDirectories as directory}
                 <option value={directory.working_directory_id}>
-                  {directory.repository_id} · {directory.requested_selector ?? 'HEAD'}
+                  {workdirOptionLabel(directory)}
                 </option>
               {/each}
               <option value={NEW_WORKING_DIRECTORY_VALUE}>New workdir…</option>

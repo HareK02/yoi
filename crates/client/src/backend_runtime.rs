@@ -119,12 +119,14 @@ pub struct BackendWorkingDirectorySummary {
     pub working_directory_id: String,
     pub repository_id: String,
     #[serde(default)]
-    pub requested_selector: Option<String>,
+    pub creation_selector: Option<String>,
+    #[serde(default)]
+    pub creation_ref: Option<String>,
+    #[serde(default)]
+    pub current_selector: Option<String>,
+    #[serde(default)]
+    pub current_ref: Option<String>,
     pub materializer_kind: String,
-    #[serde(default)]
-    pub resolved_commit: Option<String>,
-    #[serde(default)]
-    pub resolved_tree: Option<String>,
     #[serde(default)]
     pub cleanup_target: Option<BackendWorkingDirectoryCleanupTarget>,
     pub status: String,

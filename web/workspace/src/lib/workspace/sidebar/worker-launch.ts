@@ -55,7 +55,8 @@ export function defaultWorkerLaunchForm(
       Boolean(current.working_directory_repository_id) &&
       directory.repository_id === current.working_directory_repository_id &&
       (!current.working_directory_selector ||
-        directory.requested_selector === current.working_directory_selector)
+        (directory.current_selector ?? directory.creation_selector) ===
+          current.working_directory_selector)
     ) ?? availableWorkingDirectories.find((directory) =>
       Boolean(current.working_directory_repository_id) &&
       directory.repository_id === current.working_directory_repository_id

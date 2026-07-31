@@ -2,6 +2,7 @@
   import { pushWorkspaceAlert } from '$lib/workspace/alerts/store';
   import { workspaceApiPath } from '$lib/workspace/api/http';
   import { workerConsoleHref } from '$lib/workspace/console/model';
+  import { formatCurrentWorkdirRevision } from '$lib/workspace/settings/workdir-revision';
   import { canOpenWorkerConsole } from '$lib/workspace/sidebar/workers';
   import type { CleanupWorkerCandidate, RuntimeCleanupExecutionResponse, RuntimeCleanupPlanResponse, Worker } from '$lib/workspace/sidebar/types';
   import type { PageProps } from './$types';
@@ -145,9 +146,9 @@
   function workerDirectory(worker: Worker): string {
     const directory = worker.working_directory;
     if (!directory) return '—';
-    const selector = directory.requested_selector ?? 'HEAD';
-    const commit = directory.resolved_commit ? directory.resolved_commit.slice(0, 12) : null;
-    return commit ? `${directory.repository_id} · ${selector} · ${commit}` : `${directory.repository_id} · ${selector}`;
+    const provider = data.repositories?.items.find((repository) => repository.id === directory.repository_id)
+      ?.provider;
+    return `${directory.repository_id} · ${formatCurrentWorkdirRevision(directory, provider)}`;
   }
 </script>
 

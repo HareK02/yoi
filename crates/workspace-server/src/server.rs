@@ -2381,12 +2381,14 @@ fn create_working_directory_for_runtime(
         workdir_id: workdir_id.clone(),
         runtime_id: runtime_id.clone(),
         repository_id: working_directory_request.repository.id.clone(),
-        selector: working_directory_request
+        creation_selector: working_directory_request
             .repository
             .selector
             .as_ref()
             .map(|selector| selector.as_ref().to_string()),
-        resolved_commit: None,
+        creation_ref: None,
+        current_selector: None,
+        current_ref: None,
         materialization_status: "pending".to_string(),
         cleanliness: "unknown".to_string(),
         created_at: now_registry_timestamp(),
@@ -6264,12 +6266,14 @@ fn upsert_pending_backend_workdir(
         workdir_id: workdir_id.clone(),
         runtime_id: runtime_id.to_string(),
         repository_id: request.repository.id.clone(),
-        selector: request
+        creation_selector: request
             .repository
             .selector
             .as_ref()
             .map(|selector| selector.as_ref().to_string()),
-        resolved_commit: None,
+        creation_ref: None,
+        current_selector: None,
+        current_ref: None,
         materialization_status: "pending".to_string(),
         cleanliness: "unknown".to_string(),
         created_at: timestamp.clone(),
@@ -6417,8 +6421,10 @@ fn workdir_record_from_summary(
         workdir_id: summary.working_directory_id.clone(),
         runtime_id: runtime_id.to_string(),
         repository_id: summary.repository_id.clone(),
-        selector: summary.requested_selector.clone(),
-        resolved_commit: summary.resolved_commit.clone(),
+        creation_selector: summary.creation_selector.clone(),
+        creation_ref: summary.creation_ref.clone(),
+        current_selector: summary.current_selector.clone(),
+        current_ref: summary.current_ref.clone(),
         materialization_status: match summary.status {
             WorkingDirectoryStatusKind::Active => "present",
             WorkingDirectoryStatusKind::CleanupPending => "pending",
@@ -6449,11 +6455,11 @@ fn preserve_workdir_identity_for_corrupted_summary(
     if record.repository_id == "unknown" {
         record.repository_id = existing.repository_id.clone();
     }
-    if record.selector.is_none() {
-        record.selector = existing.selector.clone();
+    if record.creation_selector.is_none() {
+        record.creation_selector = existing.creation_selector.clone();
     }
-    if record.resolved_commit.is_none() {
-        record.resolved_commit = existing.resolved_commit.clone();
+    if record.creation_ref.is_none() {
+        record.creation_ref = existing.creation_ref.clone();
     }
 }
 
@@ -6469,10 +6475,11 @@ fn workdir_summary_from_record(record: &WorkdirRegistryRecord) -> WorkingDirecto
     WorkingDirectorySummary {
         working_directory_id: record.workdir_id.clone(),
         repository_id: record.repository_id.clone(),
-        requested_selector: record.selector.clone(),
+        creation_selector: record.creation_selector.clone(),
+        creation_ref: record.creation_ref.clone(),
+        current_selector: record.current_selector.clone(),
+        current_ref: record.current_ref.clone(),
         materializer_kind: MaterializerKind::LocalGitWorktree,
-        resolved_commit: record.resolved_commit.clone(),
-        resolved_tree: None,
         cleanup_target: Some(worker_runtime::catalog::WorkingDirectoryCleanupTarget {
             kind: "local_git_worktree".to_string(),
             working_directory_id: record.workdir_id.clone(),
@@ -7110,8 +7117,10 @@ mod tests {
             workdir_id: "0000019a00000000000".to_string(),
             runtime_id: "embedded".to_string(),
             repository_id: "repo".to_string(),
-            selector: Some("develop".to_string()),
-            resolved_commit: Some("abcdef".to_string()),
+            creation_selector: Some("develop".to_string()),
+            creation_ref: Some("abcdef".to_string()),
+            current_selector: None,
+            current_ref: Some("fedcba".to_string()),
             materialization_status: "missing".to_string(),
             cleanliness: "clean".to_string(),
             created_at: "1".to_string(),
@@ -7135,6 +7144,13 @@ mod tests {
             working_directory.status,
             WorkingDirectoryStatusKind::NotFound
         );
+        assert_eq!(
+            working_directory.creation_selector.as_deref(),
+            Some("develop")
+        );
+        assert_eq!(working_directory.creation_ref.as_deref(), Some("abcdef"));
+        assert_eq!(working_directory.current_selector, None);
+        assert_eq!(working_directory.current_ref.as_deref(), Some("fedcba"));
         let occupied_by = working_directory.occupied_by.as_ref().unwrap();
         assert_eq!(occupied_by.runtime_id, "embedded");
         assert_eq!(occupied_by.runtime_worker_id, 1);
@@ -7155,8 +7171,10 @@ mod tests {
                 workdir_id: "managed".to_string(),
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 repository_id: "repo".to_string(),
-                selector: None,
-                resolved_commit: None,
+                creation_selector: None,
+                creation_ref: None,
+                current_selector: None,
+                current_ref: None,
                 materialization_status: "present".to_string(),
                 cleanliness: "clean".to_string(),
                 created_at: "1".to_string(),
@@ -7169,8 +7187,10 @@ mod tests {
                 workdir_id: "runtime-direct".to_string(),
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 repository_id: "repo".to_string(),
-                selector: None,
-                resolved_commit: None,
+                creation_selector: None,
+                creation_ref: None,
+                current_selector: None,
+                current_ref: None,
                 materialization_status: "present".to_string(),
                 cleanliness: "unknown".to_string(),
                 created_at: "1".to_string(),
@@ -7240,8 +7260,10 @@ mod tests {
             workdir_id: "runtime-direct".to_string(),
             runtime_id: "embedded".to_string(),
             repository_id: "repo".to_string(),
-            selector: None,
-            resolved_commit: None,
+            creation_selector: None,
+            creation_ref: None,
+            current_selector: None,
+            current_ref: None,
             materialization_status: "present".to_string(),
             cleanliness: "unknown".to_string(),
             created_at: "1".to_string(),
@@ -8236,8 +8258,10 @@ mod tests {
                 workdir_id: workdir_id.to_string(),
                 runtime_id: "runtime-test".to_string(),
                 repository_id: "repo-test".to_string(),
-                selector: Some("HEAD".to_string()),
-                resolved_commit: None,
+                creation_selector: Some("HEAD".to_string()),
+                creation_ref: None,
+                current_selector: None,
+                current_ref: None,
                 materialization_status: status.to_string(),
                 cleanliness: cleanliness.to_string(),
                 created_at: now.clone(),

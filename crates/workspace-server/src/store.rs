@@ -87,6 +87,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "remove unused control-plane Ticket tables",
         apply: remove_unused_control_plane_ticket_tables,
     },
+    Migration {
+        version: 15,
+        name: "separate workdir creation evidence from current revision observation",
+        apply: add_workdir_revision_observations,
+    },
 ];
 
 struct Migration {
@@ -238,8 +243,10 @@ pub struct WorkdirRegistryRecord {
     pub workdir_id: String,
     pub runtime_id: String,
     pub repository_id: String,
-    pub selector: Option<String>,
-    pub resolved_commit: Option<String>,
+    pub creation_selector: Option<String>,
+    pub creation_ref: Option<String>,
+    pub current_selector: Option<String>,
+    pub current_ref: Option<String>,
     pub materialization_status: String,
     pub cleanliness: String,
     pub created_at: String,
@@ -1570,14 +1577,17 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_conn(|conn| {
             conn.execute(
                 r#"INSERT INTO workdir_registry (
-                    workspace_id, workdir_id, runtime_id, repository_id, selector, resolved_commit,
+                    workspace_id, workdir_id, runtime_id, repository_id,
+                    creation_selector, creation_ref, current_selector, current_ref,
                     materialization_status, cleanliness, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                 ON CONFLICT(workspace_id, workdir_id) DO UPDATE SET
                     runtime_id = excluded.runtime_id,
                     repository_id = excluded.repository_id,
-                    selector = excluded.selector,
-                    resolved_commit = excluded.resolved_commit,
+                    creation_selector = excluded.creation_selector,
+                    creation_ref = excluded.creation_ref,
+                    current_selector = excluded.current_selector,
+                    current_ref = excluded.current_ref,
                     materialization_status = excluded.materialization_status,
                     cleanliness = excluded.cleanliness,
                     updated_at = excluded.updated_at"#,
@@ -1586,8 +1596,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     record.workdir_id,
                     record.runtime_id,
                     record.repository_id,
-                    record.selector,
-                    record.resolved_commit,
+                    record.creation_selector,
+                    record.creation_ref,
+                    record.current_selector,
+                    record.current_ref,
                     record.materialization_status,
                     record.cleanliness,
                     record.created_at,
@@ -1998,7 +2010,8 @@ fn read_worker_registry_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Work
 
 fn workdir_registry_select_sql(where_clause: &str) -> String {
     format!(
-        "SELECT workspace_id, workdir_id, runtime_id, repository_id, selector, resolved_commit, \
+        "SELECT workspace_id, workdir_id, runtime_id, repository_id, \
+         creation_selector, creation_ref, current_selector, current_ref, \
          materialization_status, cleanliness, created_at, updated_at \
          FROM workdir_registry {where_clause}"
     )
@@ -2012,12 +2025,14 @@ fn read_workdir_registry_record(
         workdir_id: row.get(1)?,
         runtime_id: row.get(2)?,
         repository_id: row.get(3)?,
-        selector: row.get(4)?,
-        resolved_commit: row.get(5)?,
-        materialization_status: row.get(6)?,
-        cleanliness: row.get(7)?,
-        created_at: row.get(8)?,
-        updated_at: row.get(9)?,
+        creation_selector: row.get(4)?,
+        creation_ref: row.get(5)?,
+        current_selector: row.get(6)?,
+        current_ref: row.get(7)?,
+        materialization_status: row.get(8)?,
+        cleanliness: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
     })
 }
 
@@ -2170,6 +2185,18 @@ DROP TABLE IF EXISTS ticket_targets;
 DROP TABLE IF EXISTS ticket_relations;
 DROP TABLE IF EXISTS ticket_events;
 DROP TABLE IF EXISTS tickets;
+"#,
+    )?;
+    Ok(())
+}
+
+fn add_workdir_revision_observations(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+ALTER TABLE workdir_registry RENAME COLUMN selector TO creation_selector;
+ALTER TABLE workdir_registry RENAME COLUMN resolved_commit TO creation_ref;
+ALTER TABLE workdir_registry ADD COLUMN current_selector TEXT;
+ALTER TABLE workdir_registry ADD COLUMN current_ref TEXT;
 "#,
     )?;
     Ok(())
@@ -2857,7 +2884,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 14);
+        assert_eq!(store.schema_version().await.unwrap(), 15);
 
         let record = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
@@ -2870,7 +2897,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 14);
+        assert_eq!(reopened.schema_version().await.unwrap(), 15);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -2984,6 +3011,24 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         );
         assert_columns(
             &conn,
+            "workdir_registry",
+            [
+                "workspace_id",
+                "workdir_id",
+                "runtime_id",
+                "repository_id",
+                "creation_selector",
+                "creation_ref",
+                "materialization_status",
+                "cleanliness",
+                "created_at",
+                "updated_at",
+                "current_selector",
+                "current_ref",
+            ],
+        );
+        assert_columns(
+            &conn,
             "artifacts",
             [
                 "workspace_id",
@@ -3058,7 +3103,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 14);
+        assert_eq!(store.schema_version().await.unwrap(), 15);
 
         store
             .with_conn(|conn| {
@@ -3158,10 +3203,66 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         );
     }
 
+    #[test]
+    fn workdir_revision_migration_preserves_creation_evidence_and_leaves_observation_unknown() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+CREATE TABLE workdir_registry (
+    workspace_id TEXT NOT NULL,
+    workdir_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    repository_id TEXT NOT NULL,
+    selector TEXT,
+    resolved_commit TEXT,
+    materialization_status TEXT NOT NULL,
+    cleanliness TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, workdir_id)
+);
+INSERT INTO workdir_registry (
+    workspace_id, workdir_id, runtime_id, repository_id, selector, resolved_commit,
+    materialization_status, cleanliness, created_at, updated_at
+) VALUES (
+    'workspace', 'workdir', 'runtime', 'repository', 'develop', 'abcdef',
+    'present', 'clean', '1', '2'
+);
+"#,
+        )
+        .unwrap();
+
+        add_workdir_revision_observations(&conn).unwrap();
+
+        let values = conn
+            .query_row(
+                "SELECT creation_selector, creation_ref, current_selector, current_ref FROM workdir_registry",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            values,
+            (
+                Some("develop".to_string()),
+                Some("abcdef".to_string()),
+                None,
+                None,
+            )
+        );
+    }
+
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 14);
+        assert_eq!(store.schema_version().await.unwrap(), 15);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -3199,7 +3300,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 14);
+        assert_eq!(store.schema_version().await.unwrap(), 15);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -3313,8 +3414,10 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
             workdir_id: "0000019a00000000001".to_string(),
             runtime_id: "embedded".to_string(),
             repository_id: "repo".to_string(),
-            selector: Some("develop".to_string()),
-            resolved_commit: Some("abcdef".to_string()),
+            creation_selector: Some("develop".to_string()),
+            creation_ref: Some("abcdef".to_string()),
+            current_selector: None,
+            current_ref: Some("abcdef".to_string()),
             materialization_status: "not_found".to_string(),
             cleanliness: "clean".to_string(),
             created_at: "2".to_string(),
@@ -3326,8 +3429,10 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
             workdir_id: "runtime-direct".to_string(),
             runtime_id: "embedded".to_string(),
             repository_id: "repo".to_string(),
-            selector: Some("feature".to_string()),
-            resolved_commit: Some("123456".to_string()),
+            creation_selector: Some("feature".to_string()),
+            creation_ref: Some("123456".to_string()),
+            current_selector: Some("feature".to_string()),
+            current_ref: Some("123456".to_string()),
             materialization_status: "present".to_string(),
             cleanliness: "unknown".to_string(),
             created_at: "3".to_string(),
@@ -3373,7 +3478,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 14);
+        assert_eq!(store.schema_version().await.unwrap(), 15);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),
