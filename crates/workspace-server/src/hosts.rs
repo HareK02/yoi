@@ -310,12 +310,21 @@ pub struct WorkerSpawnWorkingDirectoryRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct WorkerTicketAssignmentRequest {
+    pub ticket_id: String,
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerSpawnRequest {
     pub intent: WorkerSpawnIntent,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_worker_name: Option<String>,
     pub acceptance: WorkerSpawnAcceptanceRequirement,
     pub profile: ProfileSelector,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_assignment: Option<WorkerTicketAssignmentRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_input: Option<EmbeddedWorkerInput>,
     /// Optional safe working-directory creation request. The Workspace server resolves
@@ -429,6 +438,8 @@ pub struct WorkerStopResult {
 pub struct WorkerLifecycleRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_assignment: Option<WorkerTicketAssignmentRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4177,6 +4188,7 @@ mod tests {
                 expected_segments: 0,
             },
             profile: ProfileSelector::Builtin("builtin:coder".to_string()),
+            ticket_assignment: None,
             initial_input: None,
             working_directory_request: None,
             resolved_working_directory_request: None,
@@ -4304,6 +4316,7 @@ mod tests {
                         expected_segments: 0,
                     },
                     profile: ProfileSelector::Builtin("builtin:coder".to_string()),
+                    ticket_assignment: None,
                     initial_input: None,
                     working_directory_request: None,
                     resolved_working_directory_request: None,
@@ -4401,6 +4414,7 @@ mod tests {
                         expected_segments: 0,
                     },
                     profile: ProfileSelector::Builtin("builtin:coder".to_string()),
+                    ticket_assignment: None,
                     initial_input: None,
                     working_directory_request: None,
                     resolved_working_directory_request: None,
@@ -4434,6 +4448,7 @@ mod tests {
                     requested_worker_name: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::SocketReady,
                     profile: ProfileSelector::Builtin("builtin:companion".to_string()),
+                    ticket_assignment: None,
                     initial_input: None,
                     working_directory_request: None,
                     resolved_working_directory_request: None,

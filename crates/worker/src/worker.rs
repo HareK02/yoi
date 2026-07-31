@@ -226,7 +226,7 @@ pub struct RuntimeWorkspaceHttpClient {
     workspace_id: String,
     base_url: String,
     worker_id: String,
-    access_token: Option<String>,
+    access_token: Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for RuntimeWorkspaceHttpClient {
@@ -238,7 +238,11 @@ impl std::fmt::Debug for RuntimeWorkspaceHttpClient {
             .field("worker_id", &self.worker_id)
             .field(
                 "access_token",
-                &self.access_token.as_ref().map(|_| "[redacted]"),
+                &self
+                    .access_token
+                    .lock()
+                    .ok()
+                    .and_then(|token| token.as_ref().map(|_| "[redacted]")),
             )
             .finish()
     }
@@ -254,12 +258,12 @@ impl RuntimeWorkspaceHttpClient {
             workspace_id: workspace_id.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             worker_id: worker_id.into(),
-            access_token: None,
+            access_token: Mutex::new(None),
         }
     }
 
-    pub fn with_access_token(mut self, access_token: Option<String>) -> Self {
-        self.access_token = access_token;
+    pub fn with_access_token(self, access_token: Option<String>) -> Self {
+        *self.access_token.lock().expect("new credential mutex") = access_token;
         self
     }
 }
@@ -283,23 +287,91 @@ impl WorkspaceClient for RuntimeWorkspaceHttpClient {
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         let base_url = self.base_url.clone();
         let worker_id = self.worker_id.clone();
-        let access_token = self.access_token.clone();
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return std::thread::spawn(move || {
-                execute_runtime_workspace_http(
+        let access_token = self
+            .access_token
+            .lock()
+            .map_err(|_| {
+                WorkspaceClientError::Request("workspace credential lock poisoned".to_string())
+            })?
+            .clone();
+        let request_copy = request.clone();
+        let result = if tokio::runtime::Handle::try_current().is_ok() {
+            std::thread::spawn(move || {
+                execute_runtime_workspace_http_with_refresh(
                     &base_url,
                     &worker_id,
-                    access_token.as_deref(),
-                    request,
+                    access_token,
+                    request_copy,
                 )
             })
             .join()
             .map_err(|_| {
                 WorkspaceClientError::Request("workspace request thread panicked".to_string())
-            })?;
+            })?
+        } else {
+            execute_runtime_workspace_http_with_refresh(
+                &base_url,
+                &worker_id,
+                access_token,
+                request,
+            )
+        }?;
+        if let Some(new_token) = result.1 {
+            *self.access_token.lock().map_err(|_| {
+                WorkspaceClientError::Request("workspace credential lock poisoned".to_string())
+            })? = Some(new_token);
         }
-        execute_runtime_workspace_http(&base_url, &worker_id, access_token.as_deref(), request)
+        Ok(result.0)
     }
+}
+
+fn execute_runtime_workspace_http_with_refresh(
+    base_url: &str,
+    worker_id: &str,
+    access_token: Option<String>,
+    request: WorkspaceRequest,
+) -> Result<(WorkspaceResponse, Option<String>), WorkspaceClientError> {
+    let response = execute_runtime_workspace_http(
+        base_url,
+        worker_id,
+        access_token.as_deref(),
+        request.clone(),
+    )?;
+    if response.status != 401 {
+        return Ok((response, None));
+    }
+    let Some(expired_token) = access_token else {
+        return Ok((response, None));
+    };
+    let workspace_id = request
+        .path
+        .strip_prefix("/api/w/")
+        .and_then(|path| path.split('/').next())
+        .ok_or_else(|| WorkspaceClientError::InvalidPath(request.path.clone()))?;
+    let refresh_url = format!("{base_url}/api/w/{workspace_id}/worker-credentials/refresh");
+    let refresh = reqwest::blocking::Client::new()
+        .post(refresh_url)
+        .bearer_auth(expired_token)
+        .header("x-yoi-worker-id", worker_id)
+        .send()
+        .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
+    if !refresh.status().is_success() {
+        return Ok((response, None));
+    }
+    let body: serde_json::Value = refresh
+        .json()
+        .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
+    let new_token = body
+        .get("access_token")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            WorkspaceClientError::Request(
+                "Workspace credential refresh response omitted access_token".to_string(),
+            )
+        })?
+        .to_string();
+    let retried = execute_runtime_workspace_http(base_url, worker_id, Some(&new_token), request)?;
+    Ok((retried, Some(new_token)))
 }
 
 fn execute_runtime_workspace_http(
@@ -6183,6 +6255,74 @@ mod build_summary_prompt_tests {
                     && body == history_text
             )
         }));
+    }
+
+    #[test]
+    fn runtime_workspace_client_refreshes_expired_credential_and_retries() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for step in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut first_line = String::new();
+                reader.read_line(&mut first_line).unwrap();
+                let mut authorization = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if let Some(value) = line.strip_prefix("authorization: ") {
+                        authorization = value.trim().to_string();
+                    }
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                match step {
+                    0 => {
+                        assert_eq!(authorization, "Bearer expired-token");
+                        stream
+                            .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                            .unwrap();
+                    }
+                    1 => {
+                        assert!(first_line.contains("/worker-credentials/refresh"));
+                        assert_eq!(authorization, "Bearer expired-token");
+                        let body =
+                            r#"{"access_token":"fresh-token","expires_at":"2099-01-01T00:00:00Z"}"#;
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .unwrap();
+                    }
+                    _ => {
+                        assert_eq!(authorization, "Bearer fresh-token");
+                        stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                            .unwrap();
+                    }
+                }
+            }
+        });
+        let client = RuntimeWorkspaceHttpClient::new(
+            "workspace-refresh",
+            format!("http://{address}"),
+            "worker-refresh",
+        )
+        .with_access_token(Some("expired-token".to_string()));
+        let response = client
+            .execute(WorkspaceRequest::get(
+                "/api/w/workspace-refresh/tickets/backend",
+            ))
+            .unwrap();
+        assert_eq!(response.status, 200);
+        server.join().unwrap();
     }
 
     fn minimal_manifest() -> WorkerManifest {

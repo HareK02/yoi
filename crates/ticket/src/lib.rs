@@ -9,6 +9,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::Utc;
 use fs4::fs_std::FileExt;
@@ -2274,11 +2275,40 @@ impl LocalTicketBackend {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqliteTicketMutationEvent {
+    pub workspace_id: String,
+    pub ticket_id: String,
+    pub event_index: i64,
+    pub event_kind: TicketEventKind,
+}
+
+pub type SqliteTicketMutationHook =
+    dyn Fn(&Connection, &SqliteTicketMutationEvent) -> Result<()> + Send + Sync;
+
+#[derive(Clone)]
 pub struct SqliteTicketBackend {
     db_path: PathBuf,
     workspace_id: String,
     record_language: Option<String>,
+    event_attributes: BTreeMap<String, String>,
+    mutation_hook: Option<Arc<SqliteTicketMutationHook>>,
+}
+
+impl fmt::Debug for SqliteTicketBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SqliteTicketBackend")
+            .field("db_path", &self.db_path)
+            .field("workspace_id", &self.workspace_id)
+            .field("record_language", &self.record_language)
+            .field("event_attributes", &self.event_attributes)
+            .field(
+                "mutation_hook",
+                &self.mutation_hook.as_ref().map(|_| "configured"),
+            )
+            .finish()
+    }
 }
 
 impl SqliteTicketBackend {
@@ -2287,7 +2317,19 @@ impl SqliteTicketBackend {
             db_path: db_path.into(),
             workspace_id: workspace_id.into(),
             record_language: None,
+            event_attributes: BTreeMap::new(),
+            mutation_hook: None,
         }
+    }
+
+    pub fn with_event_attributes(mut self, attributes: BTreeMap<String, String>) -> Self {
+        self.event_attributes = attributes;
+        self
+    }
+
+    pub fn with_mutation_hook(mut self, hook: Arc<SqliteTicketMutationHook>) -> Self {
+        self.mutation_hook = Some(hook);
+        self
     }
 
     pub fn with_record_language(mut self, language: Option<&str>) -> Self {
@@ -2506,9 +2548,24 @@ CREATE TABLE IF NOT EXISTS typed_ticket_artifacts (
             conn.execute("INSERT INTO typed_ticket_event_references (workspace_id, ticket_id, event_index, ordinal, kind, target) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![self.workspace_id, ticket_id, next_index, ordinal as i64, reference.kind, reference.target]).map_err(sqlite_err)?;
         }
-        for (key, value) in &event.attributes {
+        let mut attributes = event.attributes.clone();
+        for (key, value) in &self.event_attributes {
+            attributes.insert(key.clone(), value.clone());
+        }
+        for (key, value) in &attributes {
             conn.execute("INSERT INTO typed_ticket_event_attributes (workspace_id, ticket_id, event_index, key, value) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![self.workspace_id, ticket_id, next_index, key, value]).map_err(sqlite_err)?;
+        }
+        if let Some(hook) = &self.mutation_hook {
+            hook(
+                conn,
+                &SqliteTicketMutationEvent {
+                    workspace_id: self.workspace_id.clone(),
+                    ticket_id: ticket_id.to_string(),
+                    event_index: next_index,
+                    event_kind: event.kind.clone(),
+                },
+            )?;
         }
         Ok(())
     }
@@ -2718,6 +2775,9 @@ CREATE TABLE IF NOT EXISTS typed_ticket_artifacts (
         for row in rows {
             let (index, kind, author, at, status, from, to, reason, state_field, heading, body) =
                 row.map_err(sqlite_err)?;
+            let mut attributes = self.load_event_attributes(conn, ticket_id, index)?;
+            attributes.insert("event_id".to_string(), format!("{ticket_id}:{index}"));
+            attributes.insert("event_sequence".to_string(), index.to_string());
             events.push(TicketEvent {
                 kind: TicketEventKind::from(kind.as_str()),
                 author,
@@ -2730,7 +2790,7 @@ CREATE TABLE IF NOT EXISTS typed_ticket_artifacts (
                 heading,
                 body: MarkdownText::new(body),
                 references: self.load_event_references(conn, ticket_id, index)?,
-                attributes: self.load_event_attributes(conn, ticket_id, index)?,
+                attributes,
             });
         }
         Ok(events)
@@ -6391,6 +6451,41 @@ state: planning
         let tmp = TempDir::new().unwrap();
         let backend = SqliteTicketBackend::new(tmp.path().join("workspace.db"), "workspace-test");
         assert_partial_body_replacement_semantics(&backend);
+    }
+
+    #[test]
+    fn sqlite_mutation_hook_failure_rolls_back_ticket_event() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("workspace.db");
+        let backend = SqliteTicketBackend::new(&db_path, "workspace-test");
+        let created = backend.create(NewTicket::new("Atomic mutation")).unwrap();
+        let before = backend
+            .show(TicketIdOrSlug::Id(created.id.clone()))
+            .unwrap()
+            .events
+            .len();
+        let failing = backend.clone().with_mutation_hook(Arc::new(|_, event| {
+            Err(TicketError::Conflict(format!(
+                "reject outbox for {}:{}",
+                event.ticket_id, event.event_index
+            )))
+        }));
+        assert!(
+            failing
+                .add_event(
+                    TicketIdOrSlug::Id(created.id.clone()),
+                    NewTicketEvent::new(TicketEventKind::Comment, "must roll back"),
+                )
+                .is_err()
+        );
+        let after = backend.show(TicketIdOrSlug::Id(created.id)).unwrap();
+        assert_eq!(after.events.len(), before);
+        assert!(
+            after
+                .events
+                .iter()
+                .all(|event| event.body.as_str() != "must roll back")
+        );
     }
 
     #[test]
