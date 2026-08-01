@@ -52,5 +52,4 @@ impl WorkerInput {
 pub struct WorkerInteractionAck {
     pub worker_ref: WorkerRef,
     pub status: WorkerStatus,
-    pub event_id: u64,
 }

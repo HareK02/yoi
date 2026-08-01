@@ -18,7 +18,7 @@ use crate::config_bundle::{ConfigBundle, ConfigBundleAvailability, ConfigBundleS
 use crate::error::RuntimeError;
 use crate::identity::{WorkerId, WorkerRef};
 use crate::interaction::{WorkerInput, WorkerInteractionAck};
-use crate::management::{RuntimeLimits, RuntimeSummary, WorkerDeleteResult};
+use crate::management::{RuntimeSummary, WorkerDeleteResult};
 #[cfg(feature = "ws-server")]
 use crate::observation::WorkerObservationCursor;
 #[cfg(feature = "ws-server")]
@@ -68,8 +68,6 @@ pub struct RuntimeHttpServerConfig {
     pub bind_addr: SocketAddr,
     /// Optional display label surfaced by `GET /v1/runtime`.
     pub display_name: Option<String>,
-    /// Bounded Runtime API limits.
-    pub limits: RuntimeLimits,
     /// v0 store selection for the Runtime process.
     pub store: RuntimeHttpStoreSelection,
     /// Minimal local bearer token placeholder for backend-to-Runtime calls.
@@ -84,7 +82,6 @@ impl Default for RuntimeHttpServerConfig {
         Self {
             bind_addr: default_runtime_http_bind_addr(),
             display_name: None,
-            limits: RuntimeLimits::default(),
             store: RuntimeHttpStoreSelection::Memory,
             local_token: None,
             auth: None,
@@ -97,7 +94,6 @@ impl fmt::Debug for RuntimeHttpServerConfig {
         f.debug_struct("RuntimeHttpServerConfig")
             .field("bind_addr", &self.bind_addr)
             .field("display_name", &self.display_name)
-            .field("limits", &self.limits)
             .field("store", &self.store)
             .field(
                 "local_token",

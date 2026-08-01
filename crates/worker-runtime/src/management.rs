@@ -18,34 +18,10 @@ pub enum RuntimeStatus {
     Stopped,
 }
 
-/// Guardrails for bounded Runtime APIs.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeLimits {
-    pub max_event_batch_items: usize,
-}
-
-impl Default for RuntimeLimits {
-    fn default() -> Self {
-        Self {
-            max_event_batch_items: 256,
-        }
-    }
-}
-
 /// Options used to construct an embedded memory Runtime.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeOptions {
     pub display_name: Option<String>,
-    pub limits: RuntimeLimits,
-}
-
-impl Default for RuntimeOptions {
-    fn default() -> Self {
-        Self {
-            display_name: None,
-            limits: RuntimeLimits::default(),
-        }
-    }
 }
 
 fn unknown_platform_component() -> String {
@@ -69,7 +45,6 @@ pub struct RuntimeSummary {
     pub stopped_worker_count: usize,
     pub cancelled_worker_count: usize,
     pub diagnostic_count: usize,
-    pub limits: RuntimeLimits,
     #[serde(default = "unknown_platform_component")]
     pub os: String,
     #[serde(default = "unknown_platform_component")]

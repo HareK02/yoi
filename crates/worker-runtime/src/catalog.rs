@@ -261,7 +261,6 @@ pub struct WorkerSummary {
     pub profile_source: ProfileSourceArchiveRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_bundle: Option<ConfigBundleRef>,
-    pub last_event_id: u64,
 }
 
 /// Full Worker catalog/lifecycle detail.
@@ -280,7 +279,6 @@ pub struct WorkerDetail {
     pub profile_source: ProfileSourceArchiveRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_bundle: Option<ConfigBundleRef>,
-    pub last_event_id: u64,
 }
 
 /// Acknowledgement returned by stop/cancel lifecycle operations.
@@ -288,5 +286,4 @@ pub struct WorkerDetail {
 pub struct WorkerLifecycleAck {
     pub worker_ref: WorkerRef,
     pub status: WorkerStatus,
-    pub event_id: u64,
 }

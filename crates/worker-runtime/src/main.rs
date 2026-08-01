@@ -107,7 +107,6 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
         RuntimeHttpStoreSelection::Fs { root } => {
             let mut options = FsRuntimeStoreOptions::new(root.clone());
             options.display_name = config.http.display_name.clone();
-            options.limits = config.http.limits.clone();
             Runtime::with_fs_store_and_execution_backend(options, backend)
                 .map_err(ProcessError::Runtime)
         }
@@ -120,7 +119,6 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
 fn runtime_options_from_http(config: &RuntimeHttpServerConfig) -> RuntimeOptions {
     RuntimeOptions {
         display_name: config.display_name.clone(),
-        limits: config.limits.clone(),
     }
 }
 
@@ -207,10 +205,6 @@ where
                 }
                 config.http.local_token = Some(value);
             }
-            "--max-event-batch-items" => {
-                config.http.limits.max_event_batch_items =
-                    parse_usize_flag(&flag, take_value(&flag, inline_value, &mut args)?)?;
-            }
             _ => {
                 return Err(ProcessError::usage(format!("unknown argument `{flag}`")));
             }
@@ -253,12 +247,6 @@ fn ensure_no_inline_value(flag: &str, inline_value: Option<&str>) -> Result<(), 
         )));
     }
     Ok(())
-}
-
-fn parse_usize_flag(flag: &str, value: String) -> Result<usize, ProcessError> {
-    value
-        .parse::<usize>()
-        .map_err(|error| ProcessError::usage(format!("invalid {flag} value `{value}`: {error}")))
 }
 
 fn apply_store_selection(config: &mut ProcessConfig) {
@@ -806,7 +794,6 @@ Options:
   --no-store                            Disable Runtime catalog persistence for ephemeral runs
   --local-token <TOKEN>                 Minimal local bearer token placeholder
   --local-token-env <ENV>               Read local bearer token placeholder from env
-  --max-event-batch-items <N>           Override event batch limit
   -h, --help                            Show this help
 
 Auth commands:

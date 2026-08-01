@@ -3,18 +3,16 @@ use crate::config_bundle::ConfigBundle;
 use crate::diagnostics::{DiagnosticSeverity, RuntimeDiagnostic};
 use crate::error::RuntimeError;
 use crate::identity::{WorkerId, WorkerRef};
-use crate::management::{RuntimeBackendKind, RuntimeLimits, RuntimeStatus};
-use crate::observation::{EventCursor, RuntimeEvent, RuntimeEventBatch};
+use crate::management::{RuntimeBackendKind, RuntimeStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const SCHEMA_VERSION: u32 = 1;
 const RUNTIME_FILE: &str = "runtime.json";
-const EVENTS_FILE: &str = "events.jsonl";
 const WORKERS_DIR: &str = "workers";
 const LEGACY_RUNTIMES_DIR: &str = "runtimes";
 const WORKER_FILE: &str = "worker.json";
@@ -28,7 +26,6 @@ pub struct FsRuntimeStoreOptions {
     /// Root directory containing this Runtime's store data.
     pub root: PathBuf,
     pub display_name: Option<String>,
-    pub limits: RuntimeLimits,
 }
 
 impl FsRuntimeStoreOptions {
@@ -36,7 +33,6 @@ impl FsRuntimeStoreOptions {
         Self {
             root: root.into(),
             display_name: None,
-            limits: RuntimeLimits::default(),
         }
     }
 }
@@ -59,43 +55,6 @@ impl FsRuntimeStore {
         &self.root
     }
 
-    /// Read persisted Runtime events directly from the event log with the same
-    /// bounded cursor semantics as [`crate::Runtime::read_events`].
-    pub fn read_events(
-        &self,
-        cursor: &EventCursor,
-        limit: usize,
-        max_limit: usize,
-    ) -> Result<RuntimeEventBatch, RuntimeError> {
-        if limit > max_limit {
-            return Err(RuntimeError::LimitTooLarge {
-                requested: limit,
-                max: max_limit,
-            });
-        }
-
-        let events = read_json_lines::<RuntimeEvent>(&self.events_path(), "read events")?;
-        let mut selected = Vec::new();
-        for event in events
-            .iter()
-            .filter(|event| event.id >= cursor.next_event_id)
-            .take(limit)
-        {
-            selected.push(event.clone());
-        }
-        let next_event_id = selected
-            .last()
-            .map(|event| event.id + 1)
-            .unwrap_or(cursor.next_event_id);
-        let has_more = events.iter().any(|event| event.id >= next_event_id);
-
-        Ok(RuntimeEventBatch {
-            cursor: EventCursor { next_event_id },
-            events: selected,
-            has_more,
-        })
-    }
-
     pub(crate) fn open_or_create(root: PathBuf) -> Result<OpenedFsRuntimeStore, RuntimeError> {
         let existed = root.exists();
         if existed && !root.is_dir() {
@@ -115,6 +74,18 @@ impl FsRuntimeStore {
             path: root.join(WORKERS_DIR),
             source,
         })?;
+        let legacy_events = root.join("events.jsonl");
+        match fs::remove_file(&legacy_events) {
+            Ok(()) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(RuntimeError::StoreIo {
+                    operation: "remove legacy runtime events",
+                    path: legacy_events,
+                    source,
+                });
+            }
+        }
 
         let store = Self { root };
         let state = if existed {
@@ -165,19 +136,11 @@ impl FsRuntimeStore {
         })
     }
 
-    pub(crate) fn append_event(&self, event: &RuntimeEvent) -> Result<(), RuntimeError> {
-        if let Some(worker_ref) = &event.worker_ref {
-            self.ensure_worker_ref(worker_ref)?;
-        }
-        append_json_line(&self.events_path(), event, "append event")
-    }
-
     pub(crate) fn load_runtime_state(&self) -> Result<PersistedRuntimeState, RuntimeError> {
         let runtime_path = self.runtime_path();
         let mut snapshot: RuntimeSnapshot = read_json(&runtime_path, "read runtime snapshot")?;
         snapshot.validate(&runtime_path)?;
 
-        let events = read_json_lines::<RuntimeEvent>(&self.events_path(), "read events")?;
         let workers_dir = self.root.join(WORKERS_DIR);
         if !workers_dir.exists() {
             return Err(RuntimeError::StoreMissing {
@@ -250,7 +213,7 @@ impl FsRuntimeStore {
             }
         }
 
-        Ok(snapshot.into_persisted(events, workers))
+        Ok(snapshot.into_persisted(workers))
     }
 
     fn ensure_worker_ref(&self, _worker_ref: &WorkerRef) -> Result<(), RuntimeError> {
@@ -259,10 +222,6 @@ impl FsRuntimeStore {
 
     fn runtime_path(&self) -> PathBuf {
         self.root.join(RUNTIME_FILE)
-    }
-
-    fn events_path(&self) -> PathBuf {
-        self.root.join(EVENTS_FILE)
     }
 
     fn worker_dir(&self, worker_id: &WorkerId) -> PathBuf {
@@ -287,14 +246,11 @@ pub(crate) struct OpenedFsRuntimeStore {
 pub(crate) struct PersistedRuntimeState {
     pub(crate) display_name: Option<String>,
     pub(crate) status: RuntimeStatus,
-    pub(crate) limits: RuntimeLimits,
     pub(crate) next_worker_sequence: u64,
-    pub(crate) next_event_id: u64,
     pub(crate) next_diagnostic_id: u64,
     pub(crate) workers: BTreeMap<WorkerId, PersistedWorkerRecord>,
     pub(crate) workspace_owners: BTreeMap<String, String>,
     pub(crate) config_bundles: BTreeMap<String, ConfigBundle>,
-    pub(crate) events: Vec<RuntimeEvent>,
     pub(crate) diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -305,7 +261,6 @@ pub(crate) struct PersistedWorkerRecord {
     pub(crate) request: CreateWorkerRequest,
     pub(crate) workspace_id: Option<String>,
     pub(crate) working_directory: Option<WorkingDirectoryStatus>,
-    pub(crate) last_event_id: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -314,9 +269,7 @@ struct RuntimeSnapshot {
     display_name: Option<String>,
     backend: RuntimeBackendKind,
     status: RuntimeStatus,
-    limits: RuntimeLimits,
     next_worker_sequence: u64,
-    next_event_id: u64,
     next_diagnostic_id: u64,
     #[serde(default)]
     config_bundles: BTreeMap<String, ConfigBundle>,
@@ -348,9 +301,7 @@ impl RuntimeSnapshot {
             display_name: state.display_name.clone(),
             backend: RuntimeBackendKind::FsStore,
             status: state.status,
-            limits: state.limits.clone(),
             next_worker_sequence: state.next_worker_sequence,
-            next_event_id: state.next_event_id,
             next_diagnostic_id: state.next_diagnostic_id,
             config_bundles: state.config_bundles.clone(),
             workspace_owners: state.workspace_owners.clone(),
@@ -381,20 +332,16 @@ impl RuntimeSnapshot {
 
     fn into_persisted(
         self,
-        events: Vec<RuntimeEvent>,
         workers: BTreeMap<WorkerId, PersistedWorkerRecord>,
     ) -> PersistedRuntimeState {
         PersistedRuntimeState {
             display_name: self.display_name,
             status: self.status,
-            limits: self.limits,
             next_worker_sequence: self.next_worker_sequence,
-            next_event_id: self.next_event_id,
             next_diagnostic_id: self.next_diagnostic_id,
             workers,
             config_bundles: self.config_bundles,
             workspace_owners: self.workspace_owners,
-            events,
             diagnostics: self.diagnostics,
         }
     }
@@ -414,7 +361,6 @@ struct WorkerSnapshot {
     /// write the removed execution projection.
     #[serde(default, rename = "execution", skip_serializing)]
     legacy_execution: Option<LegacyWorkerExecutionProjection>,
-    last_event_id: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -433,7 +379,6 @@ impl WorkerSnapshot {
             workspace_id: worker.workspace_id.clone(),
             working_directory: worker.working_directory.clone(),
             legacy_execution: None,
-            last_event_id: worker.last_event_id,
         }
     }
 
@@ -477,7 +422,6 @@ impl WorkerSnapshot {
                 self.legacy_execution
                     .and_then(|execution| execution.working_directory)
             }),
-            last_event_id: self.last_event_id,
         }
     }
 }
@@ -524,11 +468,6 @@ fn migrate_legacy_single_runtime_layout(root: &Path) -> Result<(), RuntimeError>
         &legacy_dir.join(RUNTIME_FILE),
         &root.join(RUNTIME_FILE),
         "migrate legacy runtime snapshot",
-    )?;
-    rename_if_exists(
-        &legacy_dir.join(EVENTS_FILE),
-        &root.join(EVENTS_FILE),
-        "migrate legacy runtime events",
     )?;
     rename_if_exists(
         &legacy_dir.join(WORKERS_DIR),
@@ -579,42 +518,6 @@ where
         path: path.to_path_buf(),
         message: source.to_string(),
     })
-}
-
-fn read_json_lines<T>(path: &Path, operation: &'static str) -> Result<Vec<T>, RuntimeError>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    let file = File::open(path).map_err(|source| match source.kind() {
-        std::io::ErrorKind::NotFound => RuntimeError::StoreMissing {
-            operation,
-            path: path.to_path_buf(),
-        },
-        _ => RuntimeError::StoreIo {
-            operation,
-            path: path.to_path_buf(),
-            source,
-        },
-    })?;
-    let reader = BufReader::new(file);
-    let mut items = Vec::new();
-    for (index, line) in reader.lines().enumerate() {
-        let line = line.map_err(|source| RuntimeError::StoreIo {
-            operation,
-            path: path.to_path_buf(),
-            source,
-        })?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let item = serde_json::from_str(&line).map_err(|source| RuntimeError::StoreCorrupt {
-            operation,
-            path: path.to_path_buf(),
-            message: format!("line {}: {source}", index + 1),
-        })?;
-        items.push(item);
-    }
-    Ok(items)
 }
 
 fn atomic_write_json<T>(path: &Path, value: &T, operation: &'static str) -> Result<(), RuntimeError>
@@ -674,44 +577,6 @@ where
         let _ = fs::remove_file(&tmp_path);
     }
     write_result
-}
-
-fn append_json_line<T>(path: &Path, value: &T, operation: &'static str) -> Result<(), RuntimeError>
-where
-    T: Serialize,
-{
-    let parent = path.parent().ok_or_else(|| RuntimeError::StoreCorrupt {
-        operation,
-        path: path.to_path_buf(),
-        message: "path has no parent directory".to_string(),
-    })?;
-    fs::create_dir_all(parent).map_err(|source| RuntimeError::StoreIo {
-        operation,
-        path: parent.to_path_buf(),
-        source,
-    })?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|source| RuntimeError::StoreIo {
-            operation,
-            path: path.to_path_buf(),
-            source,
-        })?;
-    serde_json::to_writer(&mut file, value).map_err(|source| RuntimeError::StoreCorrupt {
-        operation,
-        path: path.to_path_buf(),
-        message: format!("serialize json: {source}"),
-    })?;
-    file.write_all(b"\n")
-        .and_then(|()| file.flush())
-        .and_then(|()| file.sync_all())
-        .map_err(|source| RuntimeError::StoreIo {
-            operation,
-            path: path.to_path_buf(),
-            source,
-        })
 }
 
 fn tmp_path_for(path: &Path) -> PathBuf {

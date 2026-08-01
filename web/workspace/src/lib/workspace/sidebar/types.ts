@@ -253,7 +253,6 @@ export type WorkerInputResult = {
   state: WorkerOperationState;
   runtime_id: string;
   worker_id: string;
-  event_id?: number | null;
   diagnostics: Diagnostic[];
 };
 

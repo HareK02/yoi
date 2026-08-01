@@ -22,12 +22,7 @@ use crate::fs_store::{
 use crate::identity::{WorkerId, WorkerRef};
 use crate::interaction::{WorkerInput, WorkerInputKind, WorkerInteractionAck};
 use crate::management::{
-    RuntimeBackendKind, RuntimeLimits, RuntimeOptions, RuntimeStatus, RuntimeSummary,
-    WorkerDeleteResult,
-};
-use crate::observation::{
-    EventCursor, EventSubscription, EventSubscriptionMode, RuntimeEvent, RuntimeEventBatch,
-    RuntimeEventKind,
+    RuntimeBackendKind, RuntimeOptions, RuntimeStatus, RuntimeSummary, WorkerDeleteResult,
 };
 #[cfg(feature = "ws-server")]
 use crate::observation::{WorkerObservationCursor, WorkerObservationEvent};
@@ -62,7 +57,7 @@ impl RuntimeWorkspaceScope {
     }
 }
 
-const RUNTIME_EVENT_SUBSCRIPTION_QUEUE_CAPACITY: usize = 256;
+const SUBSCRIPTION_QUEUE_CAPACITY: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct RuntimeSubscriptionUpdate {
@@ -130,7 +125,7 @@ impl Drop for RuntimeEventSelectorSubscription {
             return;
         };
         if let Ok(mut state) = runtime.lock() {
-            state.event_subscriptions.remove(&self.subscription_id);
+            state.subscriptions.remove(&self.subscription_id);
         }
     }
 }
@@ -148,15 +143,14 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    /// Create a memory-backed Runtime with generated identity and default limits.
+    /// Create a memory-backed Runtime with generated identity.
     pub fn new_memory() -> Self {
         Self::with_options(RuntimeOptions::default())
     }
 
     /// Create a memory-backed Runtime with explicit options.
     pub fn with_options(options: RuntimeOptions) -> Self {
-        let mut state = RuntimeState::new(options.display_name, options.limits);
-        state.push_event(None, RuntimeEventKind::RuntimeStarted, "runtime started");
+        let state = RuntimeState::new(options.display_name);
         Self {
             inner: Arc::new(Mutex::new(state)),
         }
@@ -200,12 +194,8 @@ impl Runtime {
         let mut state = if let Some(persisted) = opened.state {
             RuntimeState::from_persisted(persisted, opened.store)?
         } else {
-            let mut state =
-                RuntimeState::new_fs_backed(options.display_name, options.limits, opened.store);
-            let event_id =
-                state.push_event(None, RuntimeEventKind::RuntimeStarted, "runtime started");
+            let state = RuntimeState::new_fs_backed(options.display_name, opened.store);
             state.persist_runtime_snapshot()?;
-            state.persist_event_by_id(event_id)?;
             state
         };
         state.execution_backend = execution_backend;
@@ -241,7 +231,6 @@ impl Runtime {
             stopped_worker_count,
             cancelled_worker_count,
             diagnostic_count: state.diagnostics.len(),
-            limits: state.limits.clone(),
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
             worker_creation_available: state.execution_backend.is_some(),
@@ -294,22 +283,25 @@ impl Runtime {
 
     /// Stop the Runtime.  v0 keeps data readable after stop, but rejects new
     /// create/send/worker lifecycle mutations.
-    pub fn stop_runtime(&self) -> Result<u64, RuntimeError> {
+    pub fn stop_runtime(&self) -> Result<(), RuntimeError> {
         let mut state = self.lock()?;
         if state.status == RuntimeStatus::Stopped {
-            return Ok(state.last_event_id());
+            return Ok(());
         }
         state.status = RuntimeStatus::Stopped;
-        for worker in state.workers.values_mut() {
+        let mut stopped = Vec::new();
+        for (worker_id, worker) in &mut state.workers {
             if worker.status.is_active() {
                 worker.status = WorkerStatus::Stopped;
+                stopped.push(*worker_id);
             }
         }
-        let event_id = state.push_event(None, RuntimeEventKind::RuntimeStopped, "runtime stopped");
+        for worker_id in stopped {
+            state.publish_worker_upsert(worker_id)?;
+        }
         state.persist_runtime_snapshot()?;
         state.persist_workers()?;
-        state.persist_event_by_id(event_id)?;
-        Ok(event_id)
+        Ok(())
     }
 
     /// Create a Runtime-owned working directory through the attached execution backend.
@@ -483,11 +475,6 @@ impl Runtime {
             let worker_id = WorkerId::generated(state.next_worker_sequence);
             state.next_worker_sequence += 1;
             let worker_ref = WorkerRef::new(worker_id.clone());
-            let event_id = state.push_event(
-                Some(worker_ref.clone()),
-                RuntimeEventKind::WorkerCreated,
-                format!("worker {worker_id} created"),
-            );
 
             let record = WorkerRecord {
                 worker_ref: worker_ref.clone(),
@@ -497,7 +484,6 @@ impl Runtime {
                 request: request.clone(),
                 working_directory: None,
                 execution_handle: None,
-                last_event_id: event_id,
             };
             state.workers.insert(worker_id, record);
             let spawn_request = WorkerExecutionSpawnRequest {
@@ -617,11 +603,11 @@ impl Runtime {
         let snapshot_revision = state.subscription_revision;
         let subscription_id = state.next_event_subscription_id;
         state.next_event_subscription_id = state.next_event_subscription_id.saturating_add(1);
-        let (sender, receiver) = mpsc::channel(RUNTIME_EVENT_SUBSCRIPTION_QUEUE_CAPACITY);
+        let (sender, receiver) = mpsc::channel(SUBSCRIPTION_QUEUE_CAPACITY);
         let lagged = Arc::new(AtomicBool::new(false));
-        state.event_subscriptions.insert(
+        state.subscriptions.insert(
             subscription_id,
-            RuntimeEventSubscriptionSink {
+            SubscriptionSink {
                 selector: selector.clone(),
                 workspace_id: scope.map(|scope| scope.workspace_id.clone()),
                 sender,
@@ -977,13 +963,7 @@ impl Runtime {
 
         let mut state = self.lock()?;
         state.ensure_running()?;
-        let event_id = state.push_event(
-            Some(worker_ref.clone()),
-            RuntimeEventKind::WorkerInputAccepted,
-            "worker input accepted",
-        );
         let worker = state.worker_mut(worker_ref)?;
-        worker.last_event_id = event_id;
         worker.status = worker_status_from_run_state(dispatch_result.run_state);
         let status = worker.status;
         #[cfg(feature = "ws-server")]
@@ -994,12 +974,10 @@ impl Runtime {
         state.publish_worker_upsert(worker_ref.worker_id)?;
         state.persist_runtime_snapshot()?;
         state.persist_worker(&worker_ref.worker_id)?;
-        state.persist_event_by_id(event_id)?;
 
         Ok(WorkerInteractionAck {
             worker_ref: worker_ref.clone(),
             status,
-            event_id,
         })
     }
 
@@ -1128,7 +1106,6 @@ impl Runtime {
         state.publish_worker_upsert(worker_ref.worker_id)?;
         state.persist_runtime_snapshot()?;
         state.persist_worker(&worker_ref.worker_id)?;
-        state.persist_event_by_id(detail.last_event_id)?;
         Ok(detail)
     }
 
@@ -1139,9 +1116,6 @@ impl Runtime {
             if let Some(workspace_id) = workspace_id.as_deref() {
                 state.forget_workspace_owner_if_unused(workspace_id);
             }
-            state.events.retain(|event| {
-                event.id != record.last_event_id || event.worker_ref.as_ref() != Some(worker_ref)
-            });
             state.publish_worker_removed(worker_ref.worker_id, workspace_id.as_deref())?;
         }
         Ok(())
@@ -1215,19 +1189,15 @@ impl Runtime {
         self.stop_worker(worker_ref, reason)
     }
 
-    /// Stop a Worker.  Repeated stops are idempotent and return the last event id.
+    /// Stop a Worker. Repeated stops are idempotent.
     pub fn stop_worker(
         &self,
         worker_ref: &WorkerRef,
         reason: Option<String>,
     ) -> Result<WorkerLifecycleAck, RuntimeError> {
         self.dispatch_lifecycle_to_backend(worker_ref, WorkerExecutionOperation::Stop)?;
-        self.transition_worker(
-            worker_ref,
-            WorkerStatus::Stopped,
-            RuntimeEventKind::WorkerStopped,
-            reason.unwrap_or_else(|| "worker stopped".to_string()),
-        )
+        let _ = reason;
+        self.transition_worker(worker_ref, WorkerStatus::Stopped)
     }
 
     /// Cancel a Worker through a workspace-scoped Runtime authorization context.
@@ -1241,19 +1211,15 @@ impl Runtime {
         self.cancel_worker(worker_ref, reason)
     }
 
-    /// Cancel a Worker.  Repeated cancels are idempotent and return the last event id.
+    /// Cancel a Worker. Repeated cancels are idempotent.
     pub fn cancel_worker(
         &self,
         worker_ref: &WorkerRef,
         reason: Option<String>,
     ) -> Result<WorkerLifecycleAck, RuntimeError> {
         self.dispatch_lifecycle_to_backend(worker_ref, WorkerExecutionOperation::Cancel)?;
-        self.transition_worker(
-            worker_ref,
-            WorkerStatus::Cancelled,
-            RuntimeEventKind::WorkerCancelled,
-            reason.unwrap_or_else(|| "worker cancelled".to_string()),
-        )
+        let _ = reason;
+        self.transition_worker(worker_ref, WorkerStatus::Cancelled)
     }
 
     /// Delete a non-running Worker through a workspace-scoped Runtime authorization context.
@@ -1294,74 +1260,12 @@ impl Runtime {
         state
             .observation_events
             .retain(|event| event.worker_ref != *worker_ref);
-        let event_id = state.push_event(
-            Some(worker_ref.clone()),
-            RuntimeEventKind::WorkerDeleted,
-            "worker deleted",
-        );
         state.publish_worker_removed(worker_ref.worker_id, removed_workspace_id.as_deref())?;
         state.persist_runtime_snapshot()?;
         state.delete_worker_snapshot(&worker_ref.worker_id)?;
-        state.persist_event_by_id(event_id)?;
         Ok(WorkerDeleteResult {
             worker_id: removed.worker_id,
             deleted: true,
-        })
-    }
-
-    /// Cursor pointing to the beginning of Runtime events.
-    pub fn event_cursor_from_start(&self) -> Result<EventCursor, RuntimeError> {
-        Ok(EventCursor { next_event_id: 1 })
-    }
-
-    /// Cursor pointing after the current last event.
-    pub fn event_cursor_now(&self) -> Result<EventCursor, RuntimeError> {
-        let state = self.lock()?;
-        Ok(EventCursor {
-            next_event_id: state.last_event_id() + 1,
-        })
-    }
-
-    /// Poll Runtime events from a cursor.
-    pub fn read_events(
-        &self,
-        cursor: &EventCursor,
-        limit: usize,
-    ) -> Result<RuntimeEventBatch, RuntimeError> {
-        let state = self.lock()?;
-        if limit > state.limits.max_event_batch_items {
-            return Err(RuntimeError::LimitTooLarge {
-                requested: limit,
-                max: state.limits.max_event_batch_items,
-            });
-        }
-
-        let mut events = Vec::new();
-        for event in state
-            .events
-            .iter()
-            .filter(|event| event.id >= cursor.next_event_id)
-            .take(limit)
-        {
-            events.push(event.clone());
-        }
-        let next_event_id = events
-            .last()
-            .map(|event| event.id + 1)
-            .unwrap_or(cursor.next_event_id);
-        let has_more = state.events.iter().any(|event| event.id >= next_event_id);
-        Ok(RuntimeEventBatch {
-            cursor: EventCursor { next_event_id },
-            events,
-            has_more,
-        })
-    }
-
-    /// Create a poll-only placeholder subscription boundary for future streaming.
-    pub fn subscribe_events(&self, cursor: EventCursor) -> Result<EventSubscription, RuntimeError> {
-        Ok(EventSubscription {
-            cursor,
-            mode: EventSubscriptionMode::PollOnly,
         })
     }
 
@@ -1492,8 +1396,6 @@ impl Runtime {
         &self,
         worker_ref: &WorkerRef,
         status: WorkerStatus,
-        event_kind: RuntimeEventKind,
-        reason: String,
     ) -> Result<WorkerLifecycleAck, RuntimeError> {
         let mut state = self.lock()?;
         state.ensure_running()?;
@@ -1505,25 +1407,20 @@ impl Runtime {
                 return Ok(WorkerLifecycleAck {
                     worker_ref: worker_ref.clone(),
                     status: worker.status,
-                    event_id: worker.last_event_id,
                 });
             }
         }
 
-        let event_id = state.push_event(Some(worker_ref.clone()), event_kind, reason);
         let worker = state.worker_mut(worker_ref)?;
         worker.status = status;
         worker.execution_handle = None;
-        worker.last_event_id = event_id;
         let status = worker.status;
         state.publish_worker_upsert(worker_ref.worker_id)?;
         state.persist_runtime_snapshot()?;
         state.persist_worker(&worker_ref.worker_id)?;
-        state.persist_event_by_id(event_id)?;
         Ok(WorkerLifecycleAck {
             worker_ref: worker_ref.clone(),
             status,
-            event_id,
         })
     }
 
@@ -1633,22 +1530,15 @@ impl Runtime {
     ) -> Result<(), RuntimeError> {
         let mut state = self.lock()?;
         state.ensure_worker_ref(worker_ref)?;
-        let event_id = state.push_event(
-            Some(worker_ref.clone()),
-            RuntimeEventKind::WorkerExecutionRestored,
-            format!("worker {} execution restored", worker_ref.worker_id),
-        );
         {
             let worker = state.worker_mut(worker_ref)?;
             worker.execution_handle = Some(handle);
             worker.status = worker_status_from_run_state(run_state);
             worker.working_directory = working_directory;
-            worker.last_event_id = event_id;
         }
         state.publish_worker_upsert(worker_ref.worker_id)?;
         state.persist_runtime_snapshot()?;
         state.persist_worker(&worker_ref.worker_id)?;
-        state.persist_event_by_id(event_id)?;
         Ok(())
     }
 
@@ -1666,7 +1556,7 @@ enum RuntimePersistence {
 }
 
 #[derive(Debug)]
-struct RuntimeEventSubscriptionSink {
+struct SubscriptionSink {
     selector: EventSubscriptionSelector,
     workspace_id: Option<String>,
     sender: mpsc::Sender<RuntimeSubscriptionUpdate>,
@@ -1680,21 +1570,18 @@ struct RuntimeState {
     #[cfg_attr(not(feature = "fs-store"), allow(dead_code))]
     persistence: RuntimePersistence,
     status: RuntimeStatus,
-    limits: RuntimeLimits,
     execution_backend: Option<WorkerExecutionBackendRef>,
     next_worker_sequence: u64,
-    next_event_id: u64,
     #[cfg(feature = "fs-store")]
     next_diagnostic_id: u64,
     workers: BTreeMap<WorkerId, WorkerRecord>,
     workspace_owners: BTreeMap<String, String>,
     config_bundles: BTreeMap<String, ConfigBundle>,
-    events: Vec<RuntimeEvent>,
     diagnostics: Vec<RuntimeDiagnostic>,
     subscription_revision: u64,
     worker_subject_revisions: BTreeMap<WorkerId, u64>,
     next_event_subscription_id: u64,
-    event_subscriptions: BTreeMap<u64, RuntimeEventSubscriptionSink>,
+    subscriptions: BTreeMap<u64, SubscriptionSink>,
     #[cfg(feature = "ws-server")]
     next_observation_sequence: u64,
     #[cfg(feature = "ws-server")]
@@ -1704,27 +1591,24 @@ struct RuntimeState {
 }
 
 impl RuntimeState {
-    fn new(display_name: Option<String>, limits: RuntimeLimits) -> Self {
+    fn new(display_name: Option<String>) -> Self {
         Self {
             display_name,
             backend: RuntimeBackendKind::Memory,
             persistence: RuntimePersistence::Memory,
             status: RuntimeStatus::Running,
-            limits,
             execution_backend: None,
             next_worker_sequence: 1,
-            next_event_id: 1,
             #[cfg(feature = "fs-store")]
             next_diagnostic_id: 1,
             workers: BTreeMap::new(),
             workspace_owners: BTreeMap::new(),
             config_bundles: BTreeMap::new(),
-            events: Vec::new(),
             diagnostics: Vec::new(),
             subscription_revision: 0,
             worker_subject_revisions: BTreeMap::new(),
             next_event_subscription_id: 1,
-            event_subscriptions: BTreeMap::new(),
+            subscriptions: BTreeMap::new(),
             #[cfg(feature = "ws-server")]
             next_observation_sequence: 1,
             #[cfg(feature = "ws-server")]
@@ -1735,31 +1619,24 @@ impl RuntimeState {
     }
 
     #[cfg(feature = "fs-store")]
-    fn new_fs_backed(
-        display_name: Option<String>,
-        limits: RuntimeLimits,
-        store: FsRuntimeStore,
-    ) -> Self {
+    fn new_fs_backed(display_name: Option<String>, store: FsRuntimeStore) -> Self {
         Self {
             display_name,
             backend: RuntimeBackendKind::FsStore,
             persistence: RuntimePersistence::Fs(store),
             status: RuntimeStatus::Running,
-            limits,
             execution_backend: None,
             next_worker_sequence: 1,
-            next_event_id: 1,
             #[cfg(feature = "fs-store")]
             next_diagnostic_id: 1,
             workers: BTreeMap::new(),
             workspace_owners: BTreeMap::new(),
             config_bundles: BTreeMap::new(),
-            events: Vec::new(),
             diagnostics: Vec::new(),
             subscription_revision: 0,
             worker_subject_revisions: BTreeMap::new(),
             next_event_subscription_id: 1,
-            event_subscriptions: BTreeMap::new(),
+            subscriptions: BTreeMap::new(),
             #[cfg(feature = "ws-server")]
             next_observation_sequence: 1,
             #[cfg(feature = "ws-server")]
@@ -1788,7 +1665,6 @@ impl RuntimeState {
                     request: worker.request,
                     working_directory: worker.working_directory,
                     execution_handle: None,
-                    last_event_id: worker.last_event_id,
                 },
             );
         }
@@ -1798,20 +1674,17 @@ impl RuntimeState {
             backend: RuntimeBackendKind::FsStore,
             persistence: RuntimePersistence::Fs(store),
             status: persisted.status,
-            limits: persisted.limits,
             execution_backend: None,
             next_worker_sequence: persisted.next_worker_sequence,
-            next_event_id: persisted.next_event_id,
             next_diagnostic_id,
             workers,
             config_bundles: persisted.config_bundles,
             workspace_owners: persisted.workspace_owners,
-            events: persisted.events,
             diagnostics,
             subscription_revision: 0,
             worker_subject_revisions: BTreeMap::new(),
             next_event_subscription_id: 1,
-            event_subscriptions: BTreeMap::new(),
+            subscriptions: BTreeMap::new(),
             #[cfg(feature = "ws-server")]
             next_observation_sequence: 1,
             #[cfg(feature = "ws-server")]
@@ -1826,9 +1699,7 @@ impl RuntimeState {
         PersistedRuntimeState {
             display_name: self.display_name.clone(),
             status: self.status,
-            limits: self.limits.clone(),
             next_worker_sequence: self.next_worker_sequence,
-            next_event_id: self.next_event_id,
             next_diagnostic_id: self.next_diagnostic_id,
             workers: self
                 .workers
@@ -1837,7 +1708,6 @@ impl RuntimeState {
                 .collect(),
             config_bundles: self.config_bundles.clone(),
             workspace_owners: self.workspace_owners.clone(),
-            events: self.events.clone(),
             diagnostics: self.diagnostics.clone(),
         }
     }
@@ -1881,23 +1751,6 @@ impl RuntimeState {
     }
 
     #[cfg(feature = "fs-store")]
-    fn persist_event_by_id(&self, event_id: u64) -> Result<(), RuntimeError> {
-        if let Some(store) = self.fs_store() {
-            let event = self
-                .events
-                .iter()
-                .find(|event| event.id == event_id)
-                .ok_or_else(|| RuntimeError::StoreCorrupt {
-                    operation: "persist event",
-                    path: store.runtime_dir().to_path_buf(),
-                    message: format!("event {event_id} is missing from runtime state"),
-                })?;
-            store.append_event(event)?;
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "fs-store")]
     fn persist_workers(&self) -> Result<(), RuntimeError> {
         if self.fs_store().is_some() {
             for worker_id in self.workers.keys() {
@@ -1919,11 +1772,6 @@ impl RuntimeState {
 
     #[cfg(not(feature = "fs-store"))]
     fn delete_worker_snapshot(&self, _worker_id: &WorkerId) -> Result<(), RuntimeError> {
-        Ok(())
-    }
-
-    #[cfg(not(feature = "fs-store"))]
-    fn persist_event_by_id(&self, _event_id: u64) -> Result<(), RuntimeError> {
         Ok(())
     }
 
@@ -2191,7 +2039,7 @@ impl RuntimeState {
         update: RuntimeSubscriptionUpdate,
     ) {
         let mut closed = Vec::new();
-        for (subscription_id, sink) in &self.event_subscriptions {
+        for (subscription_id, sink) in &self.subscriptions {
             if sink
                 .workspace_id
                 .as_deref()
@@ -2221,7 +2069,7 @@ impl RuntimeState {
             }
         }
         for subscription_id in closed {
-            self.event_subscriptions.remove(&subscription_id);
+            self.subscriptions.remove(&subscription_id);
         }
     }
 
@@ -2268,27 +2116,6 @@ impl RuntimeState {
         self.publish_worker_upsert(worker_ref.worker_id)?;
         self.persist_runtime_snapshot()?;
         Ok(())
-    }
-
-    fn push_event(
-        &mut self,
-        worker_ref: Option<WorkerRef>,
-        kind: RuntimeEventKind,
-        message: impl Into<String>,
-    ) -> u64 {
-        let id = self.next_event_id;
-        self.next_event_id += 1;
-        self.events.push(RuntimeEvent {
-            id,
-            worker_ref,
-            kind,
-            message: message.into(),
-        });
-        id
-    }
-
-    fn last_event_id(&self) -> u64 {
-        self.next_event_id.saturating_sub(1)
     }
 
     #[cfg(feature = "ws-server")]
@@ -2391,7 +2218,6 @@ struct WorkerRecord {
     request: CreateWorkerRequest,
     working_directory: Option<CatalogWorkingDirectoryStatus>,
     execution_handle: Option<WorkerExecutionHandle>,
-    last_event_id: u64,
 }
 
 impl WorkerRecord {
@@ -2410,7 +2236,6 @@ impl WorkerRecord {
             display_name: self.request.display_name.clone(),
             profile_source: self.request.profile_source.reference(),
             config_bundle: self.request.config_bundle.clone(),
-            last_event_id: self.last_event_id,
         }
     }
 
@@ -2425,7 +2250,6 @@ impl WorkerRecord {
             display_name: self.request.display_name.clone(),
             profile_source: self.request.profile_source.reference(),
             config_bundle: self.request.config_bundle.clone(),
-            last_event_id: self.last_event_id,
         }
     }
 
@@ -2437,7 +2261,6 @@ impl WorkerRecord {
             request: self.request.clone(),
             workspace_id: self.workspace_id.clone(),
             working_directory: self.working_directory.clone(),
-            last_event_id: self.last_event_id,
         }
     }
 }
@@ -2882,7 +2705,7 @@ mod tests {
             payload => panic!("unexpected subscription payload: {payload:?}"),
         }
 
-        runtime.stop_worker(&created.worker_ref, None).unwrap();
+        runtime.stop_runtime().unwrap();
         let update = receive_subscription_update(&mut subscription).unwrap();
         assert_eq!(update.subject_revision, 2);
         match update.payload {
@@ -2977,14 +2800,11 @@ mod tests {
             .unwrap();
         {
             let mut state = runtime.lock().unwrap();
-            for _ in 0..=RUNTIME_EVENT_SUBSCRIPTION_QUEUE_CAPACITY {
+            for _ in 0..=SUBSCRIPTION_QUEUE_CAPACITY {
                 state.publish_worker_upsert(created.worker_id).unwrap();
             }
         }
-        assert_eq!(
-            subscription.receiver.len(),
-            RUNTIME_EVENT_SUBSCRIPTION_QUEUE_CAPACITY
-        );
+        assert_eq!(subscription.receiver.len(), SUBSCRIPTION_QUEUE_CAPACITY);
         assert!(matches!(
             receive_subscription_update(&mut subscription),
             Err(RuntimeSubscriptionRecvError::Lagged)
@@ -2997,9 +2817,9 @@ mod tests {
         let subscription = runtime
             .subscribe_event_selector(EventSubscriptionSelector::RuntimeWorkers)
             .unwrap();
-        assert_eq!(runtime.lock().unwrap().event_subscriptions.len(), 1);
+        assert_eq!(runtime.lock().unwrap().subscriptions.len(), 1);
         drop(subscription);
-        assert!(runtime.lock().unwrap().event_subscriptions.is_empty());
+        assert!(runtime.lock().unwrap().subscriptions.is_empty());
     }
 
     #[test]
@@ -3347,15 +3167,6 @@ mod tests {
             RuntimeError::InvalidInitialInputKind { .. }
         ));
         assert!(runtime.list_workers().unwrap().is_empty());
-        let events = runtime
-            .read_events(&runtime.event_cursor_from_start().unwrap(), 16)
-            .unwrap();
-        assert!(
-            events
-                .events
-                .iter()
-                .all(|event| event.kind != RuntimeEventKind::WorkerCreated)
-        );
     }
 
     #[test]
@@ -3550,14 +3361,6 @@ mod tests {
             runtime.worker_detail(&detail.worker_ref).unwrap().status,
             WorkerStatus::Stopped
         );
-        let events = runtime
-            .read_events(&runtime.event_cursor_from_start().unwrap(), 16)
-            .unwrap()
-            .events;
-        assert!(events.iter().any(|event| {
-            event.kind == RuntimeEventKind::WorkerStopped
-                && event.worker_ref.as_ref() == Some(&detail.worker_ref)
-        }));
     }
 
     #[test]
@@ -3586,9 +3389,6 @@ mod tests {
     fn send_input_records_protocol_observations() {
         let runtime = Runtime::with_execution_backend(
             RuntimeOptions {
-                limits: RuntimeLimits {
-                    max_event_batch_items: 16,
-                },
                 ..RuntimeOptions::default()
             },
             Arc::new(TestExecutionBackend::default()),
@@ -3597,7 +3397,7 @@ mod tests {
         runtime.store_config_bundle(test_bundle()).unwrap();
         let detail = runtime.create_worker(task_request("chat")).unwrap();
 
-        let first = runtime
+        runtime
             .send_input(&detail.worker_ref, WorkerInput::user("hello"))
             .unwrap();
         runtime
@@ -3607,7 +3407,6 @@ mod tests {
         let observations = runtime
             .read_worker_observation_events(&detail.worker_ref, WorkerObservationCursor::zero())
             .unwrap();
-        assert_eq!(first.event_id, 3);
         assert_eq!(observations.len(), 2);
         assert!(matches!(
             observations[0].payload,
@@ -3665,7 +3464,6 @@ mod tests {
     #[test]
     fn stop_then_cancel_preserves_stopped_terminal_state() {
         let runtime = runtime_with_backend();
-        let cursor = runtime.event_cursor_from_start().unwrap();
         let worker = runtime
             .create_worker(task_request("stable stopped"))
             .unwrap();
@@ -3679,7 +3477,6 @@ mod tests {
 
         assert_eq!(stop_ack.status, WorkerStatus::Stopped);
         assert_eq!(cancel_ack.status, WorkerStatus::Stopped);
-        assert_eq!(cancel_ack.event_id, stop_ack.event_id);
         assert_eq!(
             runtime.worker_detail(&worker.worker_ref).unwrap().status,
             WorkerStatus::Stopped
@@ -3689,28 +3486,11 @@ mod tests {
         assert_eq!(summary.active_worker_count, 0);
         assert_eq!(summary.stopped_worker_count, 1);
         assert_eq!(summary.cancelled_worker_count, 0);
-
-        let events = runtime.read_events(&cursor, 10).unwrap().events;
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event.kind == RuntimeEventKind::WorkerStopped)
-                .count(),
-            1
-        );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event.kind == RuntimeEventKind::WorkerCancelled)
-                .count(),
-            0
-        );
     }
 
     #[test]
     fn cancel_then_stop_preserves_cancelled_terminal_state() {
         let runtime = runtime_with_backend();
-        let cursor = runtime.event_cursor_from_start().unwrap();
         let worker = runtime
             .create_worker(task_request("stable cancelled"))
             .unwrap();
@@ -3724,7 +3504,6 @@ mod tests {
 
         assert_eq!(cancel_ack.status, WorkerStatus::Cancelled);
         assert_eq!(stop_ack.status, WorkerStatus::Cancelled);
-        assert_eq!(stop_ack.event_id, cancel_ack.event_id);
         assert_eq!(
             runtime.worker_detail(&worker.worker_ref).unwrap().status,
             WorkerStatus::Cancelled
@@ -3734,46 +3513,6 @@ mod tests {
         assert_eq!(summary.active_worker_count, 0);
         assert_eq!(summary.stopped_worker_count, 0);
         assert_eq!(summary.cancelled_worker_count, 1);
-
-        let events = runtime.read_events(&cursor, 10).unwrap().events;
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event.kind == RuntimeEventKind::WorkerCancelled)
-                .count(),
-            1
-        );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event.kind == RuntimeEventKind::WorkerStopped)
-                .count(),
-            0
-        );
-    }
-
-    #[test]
-    fn event_cursor_and_poll_only_subscription_are_bounded_placeholders() {
-        let runtime = runtime_with_backend();
-        let cursor = runtime.event_cursor_from_start().unwrap();
-        let subscription = runtime.subscribe_events(cursor.clone()).unwrap();
-        assert_eq!(subscription.mode, EventSubscriptionMode::PollOnly);
-
-        let worker = runtime.create_worker(task_request("events")).unwrap();
-        runtime
-            .send_input(&worker.worker_ref, WorkerInput::user("eventful"))
-            .unwrap();
-
-        let batch = runtime.read_events(&cursor, 2).unwrap();
-        assert_eq!(batch.events.len(), 2);
-        assert!(batch.has_more);
-        assert_eq!(batch.events[0].kind, RuntimeEventKind::RuntimeStarted);
-        assert_eq!(batch.events[1].kind, RuntimeEventKind::WorkerCreated);
-
-        let next = runtime.read_events(&batch.cursor, 2).unwrap();
-        assert_eq!(next.events.len(), 1);
-        assert_eq!(next.events[0].kind, RuntimeEventKind::WorkerInputAccepted);
-        assert!(!next.has_more);
     }
 
     #[cfg(feature = "fs-store")]
@@ -3801,15 +3540,12 @@ mod tests {
 
     #[cfg(feature = "fs-store")]
     #[test]
-    fn fs_store_restores_workers_and_events_but_not_protocol_observations() {
+    fn fs_store_restores_workers_without_legacy_event_or_protocol_observation_logs() {
         let root = fs_store_root("restore");
         let runtime = Runtime::with_fs_store_and_execution_backend(
             crate::fs_store::FsRuntimeStoreOptions {
                 root: root.clone(),
                 display_name: Some("filesystem runtime".to_string()),
-                limits: RuntimeLimits {
-                    max_event_batch_items: 2,
-                },
             },
             Arc::new(TestExecutionBackend::default()),
         )
@@ -3836,22 +3572,23 @@ mod tests {
                 .unwrap();
         assert!(worker_snapshot.get("status").is_none());
         assert!(worker_snapshot.get("execution").is_none());
+        assert!(!root.join("events.jsonl").exists());
         std::fs::write(
             worker_store_dir.join("observations.jsonl"),
             b"{\"legacy\":true}\n",
         )
         .unwrap();
-        let store = runtime_store(&runtime);
+        std::fs::write(root.join("events.jsonl"), b"obsolete runtime event\n").unwrap();
         drop(runtime);
 
         let restored = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
             root: root.clone(),
             display_name: None,
-            limits: RuntimeLimits::default(),
         })
         .unwrap();
         let restored_worker = restored.worker_detail(&worker.worker_ref).unwrap();
         assert_eq!(restored_worker.status, WorkerStatus::Stopped);
+        assert!(!root.join("events.jsonl").exists());
         assert!(!worker_store_dir.join("observations.jsonl").exists());
         #[cfg(feature = "ws-server")]
         {
@@ -3861,15 +3598,6 @@ mod tests {
             assert!(observations.is_empty());
         }
 
-        let cursor = restored.event_cursor_from_start().unwrap();
-        let batch = restored.read_events(&cursor, 2).unwrap();
-        assert_eq!(batch.events.len(), 2);
-        assert!(batch.has_more);
-        assert_eq!(batch.events[0].kind, RuntimeEventKind::RuntimeStarted);
-        assert_eq!(batch.events[1].kind, RuntimeEventKind::WorkerCreated);
-
-        let direct_events = store.read_events(&cursor, 2, 2).unwrap();
-        assert_eq!(direct_events.events, batch.events);
         #[cfg(feature = "ws-server")]
         {
             let observation = restored
@@ -3899,7 +3627,6 @@ mod tests {
             crate::fs_store::FsRuntimeStoreOptions {
                 root: root.clone(),
                 display_name: None,
-                limits: RuntimeLimits::default(),
             },
             Arc::new(TestExecutionBackend::default()),
         )
@@ -3925,7 +3652,6 @@ mod tests {
         let restored = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
             root: root.clone(),
             display_name: None,
-            limits: RuntimeLimits::default(),
         })
         .unwrap();
         let restored_scoped = restored.worker_detail(&scoped.worker_ref).unwrap();
@@ -3975,7 +3701,6 @@ mod tests {
             crate::fs_store::FsRuntimeStoreOptions {
                 root: root.clone(),
                 display_name: None,
-                limits: RuntimeLimits::default(),
             },
             Arc::new(TestExecutionBackend::default()),
         )
@@ -3989,7 +3714,6 @@ mod tests {
         let backendless = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
             root: root.clone(),
             display_name: None,
-            limits: RuntimeLimits::default(),
         })
         .unwrap();
         let stopped_worker = backendless.worker_detail(&worker.worker_ref).unwrap();
@@ -4001,7 +3725,6 @@ mod tests {
             crate::fs_store::FsRuntimeStoreOptions {
                 root: root.clone(),
                 display_name: None,
-                limits: RuntimeLimits::default(),
             },
             restoring_backend.clone(),
         )
@@ -4013,18 +3736,6 @@ mod tests {
         restored
             .send_input(&worker.worker_ref, WorkerInput::user("after restart"))
             .unwrap();
-        let cursor = restored.event_cursor_from_start().unwrap();
-        assert!(
-            restored
-                .read_events(&cursor, 16)
-                .unwrap()
-                .events
-                .iter()
-                .any(
-                    |event| event.kind == RuntimeEventKind::WorkerExecutionRestored
-                        && event.worker_ref.as_ref() == Some(&worker.worker_ref)
-                )
-        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4037,7 +3748,6 @@ mod tests {
             crate::fs_store::FsRuntimeStoreOptions {
                 root: root.clone(),
                 display_name: None,
-                limits: RuntimeLimits::default(),
             },
             Arc::new(TestExecutionBackend::default()),
         )
@@ -4057,7 +3767,6 @@ mod tests {
             crate::fs_store::FsRuntimeStoreOptions {
                 root: root.clone(),
                 display_name: None,
-                limits: RuntimeLimits::default(),
             },
             restoring_backend.clone(),
         )
@@ -4094,7 +3803,6 @@ mod tests {
         let corrupt_runtime = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
             root: corrupt_root.clone(),
             display_name: None,
-            limits: RuntimeLimits::default(),
         })
         .unwrap();
         let corrupt_store = runtime_store(&corrupt_runtime);
@@ -4107,7 +3815,6 @@ mod tests {
         let err = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
             root: corrupt_root.clone(),
             display_name: None,
-            limits: RuntimeLimits::default(),
         })
         .unwrap_err();
         assert!(matches!(err, RuntimeError::StoreCorrupt { .. }));
@@ -4118,7 +3825,6 @@ mod tests {
             crate::fs_store::FsRuntimeStoreOptions {
                 root: missing_root.clone(),
                 display_name: None,
-                limits: RuntimeLimits::default(),
             },
             Arc::new(TestExecutionBackend::default()),
         )
@@ -4138,7 +3844,6 @@ mod tests {
         let loaded = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
             root: missing_root.clone(),
             display_name: None,
-            limits: RuntimeLimits::default(),
         })
         .expect("invalid worker snapshot should not make runtime store unreadable");
         assert!(loaded.list_workers().unwrap().is_empty());

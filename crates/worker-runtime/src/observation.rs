@@ -1,56 +1,6 @@
 use crate::identity::WorkerRef;
 use serde::{Deserialize, Serialize};
 
-/// Event cursor.  `next_event_id` is the first event id that should be returned
-/// by the next poll.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EventCursor {
-    pub next_event_id: u64,
-}
-
-/// Placeholder subscription handle for future streaming APIs.  v0 is explicit
-/// poll-only so HTTP/WS/SSE dependencies are not pulled into this crate.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EventSubscription {
-    pub cursor: EventCursor,
-    pub mode: EventSubscriptionMode,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EventSubscriptionMode {
-    PollOnly,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeEvent {
-    pub id: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worker_ref: Option<WorkerRef>,
-    pub kind: RuntimeEventKind,
-    pub message: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RuntimeEventKind {
-    RuntimeStarted,
-    RuntimeStopped,
-    WorkerCreated,
-    WorkerExecutionRestored,
-    WorkerInputAccepted,
-    WorkerStopped,
-    WorkerCancelled,
-    WorkerDeleted,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeEventBatch {
-    pub cursor: EventCursor,
-    pub events: Vec<RuntimeEvent>,
-    pub has_more: bool,
-}
-
 /// Runtime-local cursor for worker-scoped WebSocket observation.
 #[cfg(feature = "ws-server")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

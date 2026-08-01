@@ -494,8 +494,6 @@ pub struct WorkerLifecycleResult {
     pub state: WorkerOperationState,
     pub runtime_id: String,
     pub worker_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub event_id: Option<u64>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -549,8 +547,6 @@ pub struct WorkerInputResult {
     pub state: WorkerOperationState,
     pub runtime_id: String,
     pub worker_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub event_id: Option<u64>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -795,7 +791,6 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
             state: WorkerOperationState::Unsupported,
             runtime_id: self.runtime_id().to_string(),
             worker_id: worker_id.to_string(),
-            event_id: None,
             diagnostics: vec![diagnostic(
                 "worker_stop_pending",
                 DiagnosticSeverity::Info,
@@ -815,7 +810,6 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
             state: WorkerOperationState::Unsupported,
             runtime_id: self.runtime_id().to_string(),
             worker_id: worker_id.to_string(),
-            event_id: None,
             diagnostics: vec![diagnostic(
                 "worker_cancel_pending",
                 DiagnosticSeverity::Info,
@@ -852,7 +846,6 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
             state: WorkerOperationState::Unsupported,
             runtime_id: self.runtime_id().to_string(),
             worker_id: worker_id.to_string(),
-            event_id: None,
             diagnostics: vec![diagnostic(
                 "worker_input_pending",
                 DiagnosticSeverity::Info,
@@ -1413,7 +1406,6 @@ impl EmbeddedWorkerRuntime {
             FsRuntimeStoreOptions {
                 root: store_root.into(),
                 display_name: Some("embedded".to_string()),
-                limits: EmbeddedRuntimeOptions::default().limits,
             },
             backend,
         )?;
@@ -1944,11 +1936,10 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             );
         };
         match self.runtime.stop_worker(&worker_ref, request.reason) {
-            Ok(ack) => WorkerLifecycleResult {
+            Ok(_) => WorkerLifecycleResult {
                 state: WorkerOperationState::Accepted,
                 runtime_id: self.runtime_id.clone(),
                 worker_id: worker_id.to_string(),
-                event_id: Some(ack.event_id),
                 diagnostics: Vec::new(),
             },
             Err(error) => embedded_lifecycle_rejected(
@@ -1989,11 +1980,10 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             );
         };
         match self.runtime.cancel_worker(&worker_ref, request.reason) {
-            Ok(ack) => WorkerLifecycleResult {
+            Ok(_) => WorkerLifecycleResult {
                 state: WorkerOperationState::Accepted,
                 runtime_id: self.runtime_id.clone(),
                 worker_id: worker_id.to_string(),
-                event_id: Some(ack.event_id),
                 diagnostics: Vec::new(),
             },
             Err(error) => embedded_lifecycle_rejected(
@@ -2120,11 +2110,10 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             segments: request.segments,
         };
         match self.runtime.send_input(&worker_ref, input) {
-            Ok(ack) => WorkerInputResult {
+            Ok(_) => WorkerInputResult {
                 state: WorkerOperationState::Accepted,
                 runtime_id: self.runtime_id.clone(),
                 worker_id: worker_id.to_string(),
-                event_id: Some(ack.event_id),
                 diagnostics: Vec::new(),
             },
             Err(error) => embedded_input_rejected(
@@ -2545,7 +2534,6 @@ impl RemoteWorkerRuntime {
             state: WorkerOperationState::Accepted,
             runtime_id: self.runtime_id.clone(),
             worker_id: worker_id.to_string(),
-            event_id: Some(response.ack.event_id),
             diagnostics: vec![diagnostic(
                 "remote_runtime_lifecycle_accepted",
                 DiagnosticSeverity::Info,
@@ -2991,11 +2979,10 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             &format!("/v1/workers/{worker_id}/input"),
             &input,
         ) {
-            Ok(response) => WorkerInputResult {
+            Ok(_) => WorkerInputResult {
                 state: WorkerOperationState::Accepted,
                 runtime_id: self.runtime_id.clone(),
                 worker_id: worker_id.to_string(),
-                event_id: Some(response.ack.event_id),
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => remote_input_rejected(&self.runtime_id, worker_id, diagnostic),
@@ -3390,7 +3377,6 @@ fn embedded_input_rejected(
         state: WorkerOperationState::Rejected,
         runtime_id: runtime_id.to_string(),
         worker_id: worker_id.to_string(),
-        event_id: None,
         diagnostics: vec![diagnostic],
     }
 }
@@ -3404,7 +3390,6 @@ fn remote_input_rejected(
         state: WorkerOperationState::Rejected,
         runtime_id: runtime_id.to_string(),
         worker_id: worker_id.to_string(),
-        event_id: None,
         diagnostics: vec![diagnostic],
     }
 }
@@ -3418,7 +3403,6 @@ fn embedded_lifecycle_rejected(
         state: WorkerOperationState::Rejected,
         runtime_id: runtime_id.to_string(),
         worker_id: worker_id.to_string(),
-        event_id: None,
         diagnostics: vec![diagnostic],
     }
 }
@@ -3432,7 +3416,6 @@ fn remote_lifecycle_rejected(
         state: WorkerOperationState::Rejected,
         runtime_id: runtime_id.to_string(),
         worker_id: worker_id.to_string(),
-        event_id: None,
         diagnostics: vec![diagnostic],
     }
 }
@@ -4689,8 +4672,7 @@ mod tests {
                 json!({
                     "ack": {
                         "worker_ref": { "runtime_id": "remote:primary", "worker_id": 1 },
-                        "status": "running",
-                        "event_id": 8
+                        "status": "running"
                     }
                 })
                 .to_string(),
@@ -4749,7 +4731,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(input.state, WorkerOperationState::Accepted);
-        assert_eq!(input.event_id, Some(8));
 
         server.join().expect("mock remote server finished");
         let browser_payload = serde_json::to_string(&(workers, input)).unwrap();
@@ -5023,8 +5004,7 @@ mod tests {
                 "size_bytes": 0,
                 "source_graph": { "source_count": 0, "total_source_bytes": 0, "entrypoints": {}, "import_count": 0 }
             },
-            "config_bundle": { "id": "remote-bundle", "digest": "remote-digest" },
-            "last_event_id": 0
+            "config_bundle": { "id": "remote-bundle", "digest": "remote-digest" }
         })
     }
 }

@@ -4487,7 +4487,8 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
     #[tokio::test]
     async fn worker_credential_binds_once_and_notification_outbox_is_durable() {
         let dir = tempfile::tempdir().unwrap();
-        let store = SqliteWorkspaceStore::open(dir.path().join("server.db")).unwrap();
+        let db = dir.path().join("server.db");
+        let store = SqliteWorkspaceStore::open(&db).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "workspace-a".to_string(),
@@ -4592,6 +4593,9 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
                 }],
             )
             .unwrap();
+
+        drop(store);
+        let store = SqliteWorkspaceStore::open(&db).unwrap();
         let pending = store
             .list_pending_ticket_notification_deliveries("workspace-a", 10)
             .unwrap();
