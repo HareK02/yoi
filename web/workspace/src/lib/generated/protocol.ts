@@ -115,6 +115,11 @@ export type EventSubscriptionSelector = { "topic": "runtime_workers" } | { "topi
 
 export type SubscriptionWorker = { worker_id: SubscriptionWorkerId,
 /**
+ * Set by the Workspace Server when projecting a Runtime-owned Worker to clients.
+ * Runtime producers leave this unset because the connection identifies the Runtime.
+ */
+runtime_id?: string | null,
+/**
  * Producer-owned monotonic revision for this Worker subject.
  */
 subject_revision: number, state: SubscriptionWorkerState, workspace_id?: string | null, display_name?: string | null, profile?: string | null, working_directory_id?: SubscriptionWorkdirId | null, };

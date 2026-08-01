@@ -520,6 +520,10 @@ pub enum SubscriptionWorkerState {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct SubscriptionWorker {
     pub worker_id: SubscriptionWorkerId,
+    /// Set by the Workspace Server when projecting a Runtime-owned Worker to clients.
+    /// Runtime producers leave this unset because the connection identifies the Runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
     /// Producer-owned monotonic revision for this Worker subject.
     pub subject_revision: u64,
     pub state: SubscriptionWorkerState,
@@ -536,6 +540,9 @@ pub struct SubscriptionWorker {
 impl SubscriptionWorker {
     pub fn validate(&self) -> Result<(), SubscriptionValidationError> {
         self.worker_id.validate()?;
+        if let Some(runtime_id) = &self.runtime_id {
+            validate_identifier("runtime_id", runtime_id, MAX_RESOURCE_ID_BYTES)?;
+        }
         if let Some(working_directory_id) = &self.working_directory_id {
             working_directory_id.validate()?;
         }
@@ -742,6 +749,7 @@ mod tests {
     fn worker(value: &str) -> SubscriptionWorker {
         SubscriptionWorker {
             worker_id: worker_id(value),
+            runtime_id: None,
             subject_revision: 0,
             state: SubscriptionWorkerState::Idle,
             workspace_id: Some("workspace-1".to_string()),

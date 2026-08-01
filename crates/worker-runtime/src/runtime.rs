@@ -2117,6 +2117,7 @@ impl RuntimeState {
         };
         Ok(SubscriptionWorker {
             worker_id,
+            runtime_id: None,
             subject_revision: self
                 .worker_subject_revisions
                 .get(&worker.worker_id)
