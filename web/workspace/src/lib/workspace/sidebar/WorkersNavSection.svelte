@@ -1,8 +1,8 @@
 <script lang="ts">
-  import { workspaceApiPath } from '$lib/workspace/api/http';
   import { workerConsoleHref } from '$lib/workspace/console/model';
+  import { workspaceWorkersStore } from './worker-subscription';
   import { canShowWorkerInSidebar } from './workers';
-  import type { ListResponse, Worker } from './types';
+  import type { Worker } from './types';
 
   const MAX_VISIBLE_WORKERS = 6;
 
@@ -12,61 +12,18 @@
   };
 
   let { currentPath = '/', workspaceId }: Props = $props();
-
-  function workerApiPath(path: string): string {
-    return workspaceApiPath(workspaceId, path);
-  }
-
   let loading = $state(true);
   let error = $state<string | null>(null);
   let workers = $state<Worker[]>([]);
-  let placeholder = $state<string | null>(null);
 
   $effect(() => {
-    if (!workspaceId) {
-      loading = false;
-      workers = [];
-      return;
-    }
-
-    const controller = new AbortController();
-    void loadWorkers(controller.signal);
-    return () => controller.abort();
+    const subscription = workspaceWorkersStore(workspaceId);
+    return subscription.subscribe((state) => {
+      loading = state.loading;
+      error = state.error;
+      workers = state.workers.filter(canShowWorkerInSidebar).slice(0, MAX_VISIBLE_WORKERS);
+    });
   });
-
-  async function loadWorkers(signal?: AbortSignal) {
-    loading = true;
-    error = null;
-    placeholder = null;
-    try {
-      const response = await fetch(workerApiPath('/workers'), { signal });
-      if (response.status === 404) {
-        workers = [];
-        placeholder = 'Worker API is not integrated in this build yet.';
-        return;
-      }
-      if (!response.ok) {
-        throw new Error(`workers request failed (${response.status})`);
-      }
-      const payload = (await response.json()) as ListResponse<Worker>;
-      workers = Array.isArray(payload.items)
-        ? payload.items.filter(canShowWorkerInSidebar).slice(0, MAX_VISIBLE_WORKERS)
-        : [];
-      if (workers.length === 0) {
-        placeholder = 'No workers reported by the current API.';
-      }
-    } catch (err) {
-      if (err instanceof DOMException && err.name === 'AbortError') {
-        return;
-      }
-      error = err instanceof Error ? err.message : 'workers request failed';
-      workers = [];
-    } finally {
-      if (!signal?.aborted) {
-        loading = false;
-      }
-    }
-  }
 </script>
 
 <section class="nav-section" aria-labelledby="workers-heading">
@@ -94,11 +51,10 @@
 
   {#if loading}
     <p class="section-state">Checking workers…</p>
-  {:else if error}
-    <p class="section-state error">{error}</p>
   {:else if workers.length === 0}
-    <p class="section-state">{placeholder ?? 'Workers will appear here when an API is connected.'}</p>
+    <p class="section-state" class:error={Boolean(error)}>{error ?? 'No Workers are active.'}</p>
   {:else}
+    {#if error}<p class="section-state error">{error}</p>{/if}
     <ul class="nav-list" aria-label="Workers">
       {#each workers as worker (`${worker.runtime_id}:${worker.worker_id}`)}
         {@const href = workerConsoleHref(worker, workspaceId)}
