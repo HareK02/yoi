@@ -1,7 +1,6 @@
-import { browser } from '$app/environment';
 import { readable, type Readable } from 'svelte/store';
-import type { SubscriptionFrame, SubscriptionWorker } from '$lib/generated/protocol';
-import { workspaceApiPath } from '$lib/workspace/api/http';
+import type { SubscriptionWorker } from '$lib/generated/protocol';
+import { workspaceMultiplexer } from '$lib/workspace/multiplexer';
 import {
   applyWorkspaceWorkersFrame,
   createWorkspaceWorkersProjection,
@@ -22,15 +21,11 @@ export function workspaceWorkersStore(workspaceId: string): Readable<WorkspaceWo
   const store = readable<WorkspaceWorkersState>(
     { loading: true, error: null, workers: [] },
     (set) => {
-      if (!browser || !workspaceId) {
+      if (!workspaceId) {
         set({ loading: false, error: null, workers: [] });
         return;
       }
-      let closed = false;
-      let socket: WebSocket | null = null;
-      let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
       const projection = createWorkspaceWorkersProjection();
-
       const publish = (loading = false, error: string | null = null) => {
         const workers = [...projection.workers.values()]
           .map(projectWorker)
@@ -40,61 +35,33 @@ export function workspaceWorkersStore(workspaceId: string): Readable<WorkspaceWo
           );
         set({ loading, error, workers });
       };
-      const connect = () => {
-        if (closed) return;
-        const url = new URL(workspaceApiPath(workspaceId, '/protocol/ws'), window.location.origin);
-        url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-        socket = new WebSocket(url);
-        socket.addEventListener('open', () => {
-          const frame: SubscriptionFrame = {
-            protocol_version: 1,
-            frame: 'request',
-            message: {
-              method: 'subscribe_events',
-              params: {
-                request_id: crypto.randomUUID(),
-                selector: { topic: 'workspace_workers' },
-              },
-            },
-          };
-          socket?.send(JSON.stringify(frame));
-        });
-        socket.addEventListener('message', (message) => {
-          try {
-            const frame = JSON.parse(String(message.data)) as SubscriptionFrame;
-            let closedMessage: string | null = null;
-            if (frame.frame === 'event' && frame.message.event === 'subscription_closed') {
-              closedMessage = frame.message.data.message;
-            } else if (
-              frame.frame === 'response' &&
-              frame.message.result === 'subscription_rejected'
-            ) {
-              closedMessage = frame.message.payload.message;
+      const subscription = workspaceMultiplexer(workspaceId).subscribe(
+        { topic: 'workspace_workers' },
+        {
+          onFrame: (frame) => {
+            try {
+              if (frame.frame === 'event' && frame.message.event === 'subscription_closed') {
+                throw new Error(frame.message.data.message);
+              }
+              if (
+                frame.frame === 'response' &&
+                frame.message.result === 'subscription_rejected'
+              ) {
+                throw new Error(frame.message.payload.message);
+              }
+              applyWorkspaceWorkersFrame(projection, frame);
+              publish(false, null);
+            } catch (error) {
+              publish(false, error instanceof Error ? error.message : 'invalid Worker subscription frame');
             }
-            if (closedMessage) {
-              socket?.close();
-              throw new Error(closedMessage);
-            }
-            applyWorkspaceWorkersFrame(projection, frame);
-            publish(false, null);
-          } catch (error) {
-            publish(false, error instanceof Error ? error.message : 'invalid Worker subscription frame');
-          }
-        });
-        socket.addEventListener('close', () => {
-          socket = null;
-          if (closed) return;
-          publish(projection.workers.size === 0, 'Worker subscription disconnected; reconnecting…');
-          reconnectTimer = setTimeout(connect, 500);
-        });
-        socket.addEventListener('error', () => socket?.close());
-      };
-      connect();
-      return () => {
-        closed = true;
-        if (reconnectTimer) clearTimeout(reconnectTimer);
-        socket?.close();
-      };
+          },
+          onStatus: (status, message) => {
+            if (status === 'connecting') publish(projection.workers.size === 0, null);
+            if (status === 'closed') publish(projection.workers.size === 0, message ?? null);
+          },
+        },
+      );
+      return () => subscription.close();
     },
   );
   stores.set(workspaceId, store);

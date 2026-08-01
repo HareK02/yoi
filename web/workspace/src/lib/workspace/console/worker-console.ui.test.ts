@@ -310,7 +310,8 @@ Deno.test("Worker Console uses protocol observation events without transcript fe
   assert(
     consolePage.includes("connectProtocolTransport") &&
       consolePage.includes("handleIncomingProtocolEvent") &&
-      consolePage.includes("/protocol/ws") &&
+      consolePage.includes("workspaceMultiplexer") &&
+      consolePage.includes('topic: "worker_protocol"') &&
       !consolePage.includes("seenObservationEventIds") &&
       consolePage.includes("createConsoleProjector") &&
       consolePage.includes("consoleProjector.append(eventBatch)") &&
@@ -541,7 +542,8 @@ Deno.test("Worker Console page is routed by runtime_id and worker_id through bac
   );
   assert(
     !consolePage.includes("/transcript") &&
-      consolePage.includes("/protocol/ws") &&
+      consolePage.includes("workspaceMultiplexer") &&
+      consolePage.includes("sendWorkerMethod") &&
       !consolePage.includes("/events" + "/ws") &&
       !consolePage.includes("/input") &&
       !consolePage.includes("/completions"),
@@ -706,5 +708,27 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
     rootLayoutLoad.includes('"/account"') &&
       rootLayoutLoad.includes('"/login/device"'),
     "Root layout should not redirect account and device-login public routes to a workspace",
+  );
+});
+
+Deno.test("Workspace Worker list and Console share the multiplexed connection", async () => {
+  const consolePage = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      import.meta.url,
+    ),
+  );
+  const sidebarStore = await Deno.readTextFile(
+    new URL("./../sidebar/worker-subscription.ts", import.meta.url),
+  );
+  const multiplexer = await Deno.readTextFile(
+    new URL("./../multiplexer.ts", import.meta.url),
+  );
+  assert(
+    consolePage.includes("workspaceMultiplexer(workspaceId)") &&
+      sidebarStore.includes("workspaceMultiplexer(workspaceId)") &&
+      multiplexer.includes("const multiplexers = new Map") &&
+      multiplexer.includes("frame: 'worker_protocol'"),
+    "Sidebar and Console should share one Workspace multiplexer and route Worker methods through a subscription lane",
   );
 });

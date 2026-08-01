@@ -24,6 +24,7 @@
     } from "$lib/workspace/console/model";
     import type { Event as ProtocolEvent, Method as ProtocolMethod, RewindTarget, Segment } from "$lib/generated/protocol";
     import { workspaceApiPath } from "$lib/workspace/api/http";
+    import { workspaceMultiplexer, type WorkspaceMultiplexerSubscription } from "$lib/workspace/multiplexer";
     import type {
         Diagnostic,
         Worker,
@@ -105,7 +106,7 @@
     let protocolState = $state<"connecting" | "open" | "closed" | "error">(
         "connecting",
     );
-    let protocolSocket: WebSocket | null = null;
+    let protocolSubscription: WorkspaceMultiplexerSubscription | null = null;
     let pendingCompletionRequest: {
         resolve: (entries: ComposerCompletionEntry[]) => void;
         reject: (error: Error) => void;
@@ -514,80 +515,76 @@
             return;
         }
         protocolState = "connecting";
-        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const wsPath = workerApiPath(
-            `/runtimes/${encodeURIComponent(target.runtimeId)}/workers/${encodeURIComponent(
-                target.workerId,
-            )}/protocol/ws`,
+        const subscription = workspaceMultiplexer(workspaceId).subscribe(
+            {
+                topic: "worker_protocol",
+                worker_id: target.workerId,
+                runtime_id: target.runtimeId,
+            },
+            {
+                onFrame: (frame) => {
+                    if (token !== reloadToken) return;
+                    try {
+                        if (
+                            frame.frame === "response" &&
+                            frame.message.result === "subscribed" &&
+                            frame.message.payload.snapshot.topic === "worker_protocol"
+                        ) {
+                            for (const event of frame.message.payload.snapshot.data.events) {
+                                handleIncomingProtocolEvent(event);
+                            }
+                            protocolState = "open";
+                        } else if (
+                            frame.frame === "event" &&
+                            frame.message.event === "event" &&
+                            frame.message.data.payload.event === "worker_protocol"
+                        ) {
+                            handleIncomingProtocolEvent(frame.message.data.payload.data.event);
+                        } else if (
+                            frame.frame === "event" &&
+                            frame.message.event === "subscription_closed"
+                        ) {
+                            protocolState = "closed";
+                            rejectPendingCompletion(new Error(frame.message.data.message));
+                        } else if (
+                            frame.frame === "response" &&
+                            frame.message.result === "subscription_rejected"
+                        ) {
+                            protocolState = "error";
+                            throw new Error(frame.message.payload.message);
+                        }
+                    } catch (error) {
+                        streamDiagnostics = [
+                            ...streamDiagnostics,
+                            {
+                                code: "worker_protocol_frame_invalid",
+                                severity: "warning",
+                                message: error instanceof Error ? error.message : String(error),
+                            },
+                        ];
+                    }
+                },
+                onStatus: (status) => {
+                    if (token !== reloadToken) return;
+                    protocolState = status === "open" ? "connecting" : status;
+                    if (status === "closed") {
+                        rejectPendingCompletion(new Error("Worker protocol WebSocket closed."));
+                    }
+                },
+            },
         );
-        const ws = new WebSocket(
-            `${protocol}//${window.location.host}${wsPath}`,
-        );
-        protocolSocket = ws;
-
-        ws.onopen = () => {
-            if (token === reloadToken) {
-                protocolState = "open";
-            }
-        };
-        ws.onmessage = (message) => {
-            if (token !== reloadToken) {
-                return;
-            }
-            try {
-                handleIncomingProtocolEvent(
-                    JSON.parse(String(message.data)) as ProtocolEvent,
-                );
-            } catch (error) {
-                streamDiagnostics = [
-                    ...streamDiagnostics,
-                    {
-                        code: "worker_protocol_frame_invalid",
-                        severity: "warning",
-                        message:
-                            error instanceof Error ? error.message : String(error),
-                    },
-                ];
-            }
-        };
-        ws.onerror = () => {
-            if (token === reloadToken) {
-                protocolState = "error";
-                streamDiagnostics = [
-                    ...streamDiagnostics,
-                    {
-                        code: "worker_protocol_ws_error",
-                        severity: "error",
-                        message: "Worker protocol WebSocket failed.",
-                    },
-                ];
-            }
-        };
-        ws.onclose = () => {
-            if (protocolSocket === ws) {
-                protocolSocket = null;
-            }
-            if (token === reloadToken && protocolState !== "error") {
-                protocolState = "closed";
-            }
-            rejectPendingCompletion(
-                new Error("Worker protocol WebSocket closed."),
-            );
-        };
-
+        protocolSubscription = subscription;
         return () => {
-            if (protocolSocket === ws) {
-                protocolSocket = null;
-            }
-            ws.close();
+            if (protocolSubscription === subscription) protocolSubscription = null;
+            subscription.close();
         };
     }
 
     function sendProtocolMethod(method: ProtocolMethod) {
-        if (!protocolSocket || protocolSocket.readyState !== WebSocket.OPEN) {
+        if (!protocolSubscription || protocolState !== "open") {
             throw new Error("Worker protocol WebSocket is not open.");
         }
-        protocolSocket.send(JSON.stringify(method));
+        protocolSubscription.sendWorkerMethod(method);
     }
 
     function handleProtocolCommandEvent(event: ProtocolEvent) {
