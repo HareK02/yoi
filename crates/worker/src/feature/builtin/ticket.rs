@@ -12,10 +12,10 @@ use std::{
 use ticket::{
     LocalTicketBackend, MarkdownText, NewOrchestrationPlanRecord, NewTicket, NewTicketEvent,
     NewTicketRelation, OrchestrationPlanKind, OrchestrationPlanRecord, Result as TicketResult,
-    Ticket, TicketBackend, TicketBackendHttpResponse, TicketBackendOperation,
-    TicketBackendOperationResult, TicketDoctorReport, TicketError, TicketIdOrSlug,
-    TicketIntakeSummary, TicketListQuery, TicketRef, TicketRelation, TicketRelationKind,
-    TicketRelationView, TicketReview, TicketStateChange, TicketSummary,
+    Ticket, TicketBackend, TicketBackendOperation, TicketBackendOperationResult,
+    TicketDoctorReport, TicketError, TicketIdOrSlug, TicketIntakeSummary, TicketListQuery,
+    TicketRef, TicketRelation, TicketRelationKind, TicketRelationView, TicketReview,
+    TicketStateChange, TicketSummary,
     config::{DEFAULT_TICKET_BACKEND_RELATIVE_PATH, TicketConfig},
     tool::{TICKET_TOOL_NAMES, TicketToolBackend, ticket_tool_description, ticket_tools},
 };
@@ -387,57 +387,310 @@ impl WorkspaceHttpTicketBackend {
         Self { client }
     }
 
-    fn endpoint(&self) -> String {
-        format!(
-            "/api/w/{}/tickets/backend",
-            self.client.workspace_id().unwrap_or_default()
-        )
-    }
-
     fn invoke(
         &self,
         operation: TicketBackendOperation,
     ) -> TicketResult<TicketBackendOperationResult> {
         let client = self.client.clone();
-        let endpoint = self.endpoint();
+        let workspace_id = self.client.workspace_id().unwrap_or_default().to_string();
         if tokio::runtime::Handle::try_current().is_ok() {
-            return std::thread::spawn(move || Self::invoke_client(client, endpoint, operation))
-                .join()
-                .map_err(|_| {
-                    TicketError::Conflict("ticket backend request thread panicked".to_string())
-                })?;
+            return std::thread::spawn(move || {
+                Self::invoke_client(client, workspace_id, operation)
+            })
+            .join()
+            .map_err(|_| {
+                TicketError::Conflict("ticket REST request thread panicked".to_string())
+            })?;
         }
-        Self::invoke_client(client, endpoint, operation)
+        Self::invoke_client(client, workspace_id, operation)
+    }
+
+    fn ticket_path(id: &TicketIdOrSlug) -> String {
+        let value = match id {
+            TicketIdOrSlug::Id(value)
+            | TicketIdOrSlug::Slug(value)
+            | TicketIdOrSlug::Query(value) => value,
+        };
+        let mut encoded = String::with_capacity(value.len());
+        for byte in value.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                encoded.push(byte as char);
+            } else {
+                use std::fmt::Write as _;
+                let _ = write!(encoded, "%{byte:02X}");
+            }
+        }
+        encoded
+    }
+
+    fn request<T: serde::de::DeserializeOwned>(
+        client: Arc<dyn WorkspaceClient>,
+        method: WorkspaceRequestMethod,
+        endpoint: String,
+        body: Option<serde_json::Value>,
+    ) -> TicketResult<T> {
+        let request = match body {
+            Some(body) => WorkspaceRequest::json(method, endpoint, body.to_string()),
+            None if method == WorkspaceRequestMethod::Get => WorkspaceRequest::get(endpoint),
+            None => WorkspaceRequest {
+                method,
+                path: endpoint,
+                body: None,
+            },
+        };
+        let response = client.execute(request).map_err(|error| {
+            TicketError::Conflict(format!("ticket REST request failed: {error}"))
+        })?;
+        if !response.is_success() {
+            return Err(TicketError::Conflict(format!(
+                "ticket REST API returned HTTP {}: {}",
+                response.status, response.body
+            )));
+        }
+        serde_json::from_str(&response.body)
+            .map_err(|error| TicketError::Conflict(format!("decode ticket REST response: {error}")))
+    }
+
+    fn request_unit(
+        client: Arc<dyn WorkspaceClient>,
+        method: WorkspaceRequestMethod,
+        endpoint: String,
+        body: Option<serde_json::Value>,
+    ) -> TicketResult<TicketBackendOperationResult> {
+        let request = match body {
+            Some(body) => WorkspaceRequest::json(method, endpoint, body.to_string()),
+            None => WorkspaceRequest {
+                method,
+                path: endpoint,
+                body: None,
+            },
+        };
+        let response = client.execute(request).map_err(|error| {
+            TicketError::Conflict(format!("ticket REST request failed: {error}"))
+        })?;
+        if !response.is_success() {
+            return Err(TicketError::Conflict(format!(
+                "ticket REST API returned HTTP {}: {}",
+                response.status, response.body
+            )));
+        }
+        Ok(TicketBackendOperationResult::Unit)
     }
 
     fn invoke_client(
         client: Arc<dyn WorkspaceClient>,
-        endpoint: String,
+        workspace_id: String,
         operation: TicketBackendOperation,
     ) -> TicketResult<TicketBackendOperationResult> {
-        let body = serde_json::to_string(&operation).map_err(|error| {
-            TicketError::Conflict(format!("serialize ticket operation: {error}"))
-        })?;
-        let response = client
-            .execute(WorkspaceRequest::json(
+        let base = format!("/api/w/{workspace_id}/tickets");
+        match operation {
+            TicketBackendOperation::DefaultIntakeReadyStateChangeBody { from } => {
+                let value = Self::request::<String>(
+                    client,
+                    WorkspaceRequestMethod::Post,
+                    format!("{base}/default-intake-ready-body"),
+                    Some(serde_json::json!({ "from": from })),
+                )?;
+                Ok(TicketBackendOperationResult::Text(value))
+            }
+            TicketBackendOperation::List { filter } => {
+                let state = match filter.state {
+                    ticket::TicketStateSelector::Active => "active".to_string(),
+                    ticket::TicketStateSelector::All => "all".to_string(),
+                    ticket::TicketStateSelector::States(states) => states
+                        .into_iter()
+                        .map(|state| state.as_str().to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                };
+                let tickets = Self::request(
+                    client,
+                    WorkspaceRequestMethod::Get,
+                    format!("{base}/search?state={state}"),
+                    None,
+                )?;
+                Ok(TicketBackendOperationResult::Tickets(tickets))
+            }
+            TicketBackendOperation::Show { id } => {
+                let ticket = Self::request(
+                    client,
+                    WorkspaceRequestMethod::Get,
+                    format!("{base}/{}/record", Self::ticket_path(&id)),
+                    None,
+                )?;
+                Ok(TicketBackendOperationResult::Ticket(ticket))
+            }
+            TicketBackendOperation::Create { input } => {
+                let ticket = Self::request(
+                    client,
+                    WorkspaceRequestMethod::Post,
+                    base,
+                    Some(serde_json::to_value(input).map_err(|error| {
+                        TicketError::Conflict(format!("serialize Ticket create: {error}"))
+                    })?),
+                )?;
+                Ok(TicketBackendOperationResult::TicketRef(ticket))
+            }
+            TicketBackendOperation::EditItem { id, edit } => {
+                let ticket = Self::request(
+                    client,
+                    WorkspaceRequestMethod::Patch,
+                    format!("{base}/{}/item", Self::ticket_path(&id)),
+                    Some(serde_json::to_value(edit).map_err(|error| {
+                        TicketError::Conflict(format!("serialize Ticket edit: {error}"))
+                    })?),
+                )?;
+                Ok(TicketBackendOperationResult::Ticket(ticket))
+            }
+            TicketBackendOperation::DependencyCheck { id } => {
+                let check = Self::request(
+                    client,
+                    WorkspaceRequestMethod::Get,
+                    format!("{base}/{}/dependency-check", Self::ticket_path(&id)),
+                    None,
+                )?;
+                Ok(TicketBackendOperationResult::DependencyCheck(check))
+            }
+            TicketBackendOperation::AddEvent { id, event } => Self::request_unit(
+                client,
                 WorkspaceRequestMethod::Post,
-                endpoint,
-                body,
-            ))
-            .map_err(|error| {
-                TicketError::Conflict(format!("ticket backend request failed: {error}"))
-            })?;
-        if !response.is_success() {
-            return Err(TicketError::Conflict(format!(
-                "ticket backend returned HTTP {}: {}",
-                response.status, response.body
-            )));
-        }
-        match serde_json::from_str::<TicketBackendHttpResponse>(&response.body).map_err(
-            |error| TicketError::Conflict(format!("decode ticket backend response: {error}")),
-        )? {
-            TicketBackendHttpResponse::Ok { result } => Ok(result),
-            TicketBackendHttpResponse::Error { message } => Err(TicketError::Conflict(message)),
+                format!("{base}/{}/thread-events", Self::ticket_path(&id)),
+                Some(serde_json::to_value(event).map_err(|error| {
+                    TicketError::Conflict(format!("serialize Ticket event: {error}"))
+                })?),
+            ),
+            TicketBackendOperation::AddStateChanged { id, change } => Self::request_unit(
+                client,
+                WorkspaceRequestMethod::Post,
+                format!("{base}/{}/state-changes", Self::ticket_path(&id)),
+                Some(serde_json::to_value(change).map_err(|error| {
+                    TicketError::Conflict(format!("serialize Ticket state change: {error}"))
+                })?),
+            ),
+            TicketBackendOperation::AddIntakeSummary { id, summary } => Self::request_unit(
+                client,
+                WorkspaceRequestMethod::Post,
+                format!("{base}/{}/intake-summaries", Self::ticket_path(&id)),
+                Some(serde_json::to_value(summary).map_err(|error| {
+                    TicketError::Conflict(format!("serialize Ticket intake summary: {error}"))
+                })?),
+            ),
+            TicketBackendOperation::SetStateField { id, field, change } => Self::request_unit(
+                client,
+                WorkspaceRequestMethod::Post,
+                format!(
+                    "{base}/{}/state-fields/{}",
+                    Self::ticket_path(&id),
+                    Self::ticket_path(&TicketIdOrSlug::Query(field))
+                ),
+                Some(serde_json::to_value(change).map_err(|error| {
+                    TicketError::Conflict(format!("serialize Ticket state field change: {error}"))
+                })?),
+            ),
+            TicketBackendOperation::SetWorkflowState { id, change } => Self::request_unit(
+                client,
+                WorkspaceRequestMethod::Post,
+                format!("{base}/{}/workflow-state", Self::ticket_path(&id)),
+                Some(serde_json::to_value(change).map_err(|error| {
+                    TicketError::Conflict(format!("serialize Ticket workflow change: {error}"))
+                })?),
+            ),
+            TicketBackendOperation::MarkIntakeReady {
+                id,
+                summary,
+                change,
+            } => Self::request_unit(
+                client,
+                WorkspaceRequestMethod::Post,
+                format!("{base}/{}/intake-ready", Self::ticket_path(&id)),
+                Some(serde_json::json!({ "summary": summary, "change": change })),
+            ),
+            TicketBackendOperation::QueueReady { id, .. } => Self::request_unit(
+                client,
+                WorkspaceRequestMethod::Post,
+                format!("{base}/{}/workflow/queue", Self::ticket_path(&id)),
+                None,
+            ),
+            TicketBackendOperation::Review { id, review } => Self::request_unit(
+                client,
+                WorkspaceRequestMethod::Post,
+                format!("{base}/{}/workflow/review", Self::ticket_path(&id)),
+                Some(serde_json::to_value(review).map_err(|error| {
+                    TicketError::Conflict(format!("serialize Ticket review: {error}"))
+                })?),
+            ),
+            TicketBackendOperation::Close { id, resolution } => Self::request_unit(
+                client,
+                WorkspaceRequestMethod::Post,
+                format!("{base}/{}/workflow/close", Self::ticket_path(&id)),
+                Some(serde_json::to_value(resolution).map_err(|error| {
+                    TicketError::Conflict(format!("serialize Ticket close: {error}"))
+                })?),
+            ),
+            TicketBackendOperation::AddTicketRelation { id, relation } => {
+                let relation = Self::request(
+                    client,
+                    WorkspaceRequestMethod::Post,
+                    format!("{base}/{}/relations", Self::ticket_path(&id)),
+                    Some(serde_json::to_value(relation).map_err(|error| {
+                        TicketError::Conflict(format!("serialize Ticket relation: {error}"))
+                    })?),
+                )?;
+                Ok(TicketBackendOperationResult::Relation(relation))
+            }
+            TicketBackendOperation::QueryTicketRelations { ticket, kind } => {
+                let relations = Self::request(
+                    client,
+                    WorkspaceRequestMethod::Post,
+                    format!("{base}/relations/search"),
+                    Some(serde_json::json!({ "ticket": ticket, "kind": kind })),
+                )?;
+                Ok(TicketBackendOperationResult::Relations(relations))
+            }
+            TicketBackendOperation::RelationView { id } => {
+                let view = Self::request(
+                    client,
+                    WorkspaceRequestMethod::Get,
+                    format!("{base}/{}/relation-view", Self::ticket_path(&id)),
+                    None,
+                )?;
+                Ok(TicketBackendOperationResult::RelationView(view))
+            }
+            TicketBackendOperation::AddOrchestrationPlanRecord { id, record } => {
+                let record = Self::request(
+                    client,
+                    WorkspaceRequestMethod::Post,
+                    format!("{base}/{}/orchestration-plans", Self::ticket_path(&id)),
+                    Some(serde_json::to_value(record).map_err(|error| {
+                        TicketError::Conflict(format!(
+                            "serialize Ticket orchestration plan: {error}"
+                        ))
+                    })?),
+                )?;
+                Ok(TicketBackendOperationResult::OrchestrationPlanRecord(
+                    record,
+                ))
+            }
+            TicketBackendOperation::QueryOrchestrationPlanRecords { ticket, kind } => {
+                let records = Self::request(
+                    client,
+                    WorkspaceRequestMethod::Post,
+                    format!("{base}/orchestration-plans/search"),
+                    Some(serde_json::json!({ "ticket": ticket, "kind": kind })),
+                )?;
+                Ok(TicketBackendOperationResult::OrchestrationPlanRecords(
+                    records,
+                ))
+            }
+            TicketBackendOperation::Doctor => {
+                let report = Self::request(
+                    client,
+                    WorkspaceRequestMethod::Get,
+                    format!("{base}/doctor"),
+                    None,
+                )?;
+                Ok(TicketBackendOperationResult::DoctorReport(report))
+            }
         }
     }
 }
@@ -1129,7 +1382,42 @@ provider = "github"
             })
             .unwrap_err();
 
-        assert!(error.to_string().contains("ticket backend request failed"));
+        assert!(error.to_string().contains("ticket REST request failed"));
+    }
+
+    #[test]
+    fn workspace_http_backend_posts_ticket_event_subresource() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 8192];
+            let size = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..size]);
+            assert!(
+                request
+                    .starts_with("POST /api/w/workspace-a/tickets/01TEST/thread-events HTTP/1.1")
+            );
+            assert!(!request.contains("\"operation\""));
+            assert!(request.contains("\"kind\":\"comment\""));
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+        let client = Arc::new(crate::worker::RuntimeWorkspaceHttpClient::new(
+            "workspace-a",
+            format!("http://{address}"),
+            "worker-a",
+        ));
+        let backend = WorkspaceHttpTicketBackend::new(client);
+
+        backend
+            .add_event(
+                TicketIdOrSlug::Id("01TEST".to_string()),
+                NewTicketEvent::new(ticket::TicketEventKind::Comment, "REST comment"),
+            )
+            .unwrap();
+        server.join().unwrap();
     }
 
     #[test]
@@ -1141,15 +1429,13 @@ provider = "github"
             let mut buffer = [0_u8; 8192];
             let len = stream.read(&mut buffer).unwrap();
             let request = String::from_utf8_lossy(&buffer[..len]);
-            assert!(request.starts_with("POST /api/w/workspace-a/tickets/backend HTTP/1.1"));
-            assert!(request.contains("\"operation\":\"create\""));
+            assert!(request.starts_with("POST /api/w/workspace-a/tickets HTTP/1.1"));
+            assert!(!request.contains("\"operation\""));
             assert!(request.contains("\"title\":\"HTTP ticket\""));
-            let response_body = serde_json::to_string(&TicketBackendHttpResponse::Ok {
-                result: TicketBackendOperationResult::TicketRef(TicketRef {
-                    id: "01TEST".to_string(),
-                    slug: "http-ticket".to_string(),
-                    status: ticket::TicketStatus::Open,
-                }),
+            let response_body = serde_json::to_string(&TicketRef {
+                id: "01TEST".to_string(),
+                slug: "http-ticket".to_string(),
+                status: ticket::TicketStatus::Open,
             })
             .unwrap();
             write!(

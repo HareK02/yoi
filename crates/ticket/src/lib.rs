@@ -1791,17 +1791,6 @@ where
     })
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum TicketBackendHttpResponse {
-    Ok {
-        result: TicketBackendOperationResult,
-    },
-    Error {
-        message: String,
-    },
-}
-
 #[derive(Debug, Clone)]
 pub struct LocalTicketBackend {
     root: PathBuf,

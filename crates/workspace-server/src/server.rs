@@ -8,7 +8,7 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION, ORIGIN, SET_COOKIE};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use chrono::{Duration, SecondsFormat, Utc};
 use futures::{SinkExt, StreamExt};
@@ -26,7 +26,7 @@ use ticket::{
     TicketTargetEdit, TicketWorkflowState,
 };
 use ticket::{
-    SqliteTicketBackend, TicketBackendHttpResponse, TicketBackendOperation,
+    SqliteTicketBackend, TicketBackendOperation, TicketBackendOperationResult,
     execute_ticket_backend_operation,
 };
 use tokio::net::TcpListener;
@@ -65,7 +65,8 @@ use crate::hosts::{
     WorkerInputKind, WorkerInputRequest, WorkerInputResult, WorkerLifecycleRequest,
     WorkerLifecycleResult, WorkerOperationState, WorkerRestoreResult,
     WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult,
-    WorkerSpawnWorkingDirectoryRequest, WorkerSummary, WorkerWorkspaceSummary,
+    WorkerSpawnWorkingDirectoryRequest, WorkerSummary, WorkerWorkspaceApiResult,
+    WorkerWorkspaceSummary,
 };
 use crate::identity::WorkspaceIdentity;
 use crate::memory_backend::execute_memory_backend_operation_with_authority;
@@ -101,7 +102,7 @@ use worker_runtime::catalog::{
     ConfigBundleRef, MaterializerKind, ProfileSelector,
     RepositorySelector as RuntimeRepositorySelector, WorkingDirectoryClaim,
     WorkingDirectoryOccupancy, WorkingDirectoryRepository, WorkingDirectoryRequest,
-    WorkingDirectoryStatusKind, WorkingDirectorySummary,
+    WorkingDirectoryStatusKind, WorkingDirectorySummary, WorkspaceApiRef,
 };
 use worker_runtime::config_bundle::ConfigBundle;
 use worker_runtime::http_server::{
@@ -248,6 +249,7 @@ pub struct WorkspaceApi {
     companion: Arc<CompanionConsole>,
     observation_proxy: BackendObservationProxy,
     resource_broker: BackendResourceBroker,
+    credential_operation_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl WorkspaceApi {
@@ -311,14 +313,6 @@ impl WorkspaceApi {
                 execution_backend,
             )
             .map(|runtime| runtime.with_resource_broker(resource_broker.clone()))
-            .map(|runtime| {
-                runtime.with_backend_base_url(
-                    config
-                        .backend_base_url
-                        .clone()
-                        .unwrap_or_else(|| "http://127.0.0.1:8787".to_string()),
-                )
-            })
             .map_err(|err| {
                 crate::Error::Store(format!("invalid embedded Worker backend: {err}"))
             })?,
@@ -351,11 +345,170 @@ impl WorkspaceApi {
             companion,
             observation_proxy,
             resource_broker,
+            credential_operation_lock: Arc::new(std::sync::Mutex::new(())),
         })
     }
 
     pub fn workspace_id(&self) -> &str {
         self.config.workspace_id.as_str()
+    }
+
+    fn mint_worker_workspace_credential(
+        &self,
+        runtime_id: &str,
+        worker_id: Option<&str>,
+    ) -> ApiResult<(WorkerWorkspaceCredentialRecord, WorkspaceApiRef)> {
+        let now = Utc::now();
+        let token = mint_secret("wac");
+        let credential = WorkerWorkspaceCredentialRecord {
+            credential_id: new_id("wac"),
+            token: token.clone(),
+            workspace_id: self.config.workspace_id.clone(),
+            runtime_id: runtime_id.to_string(),
+            worker_id: worker_id.map(ToOwned::to_owned),
+            created_at: now.to_rfc3339_opts(SecondsFormat::Secs, true),
+            expires_at: (now + chrono::Duration::hours(1))
+                .to_rfc3339_opts(SecondsFormat::Secs, true),
+            revoked_at: None,
+        };
+        self.store.upsert_worker_workspace_credential(&credential)?;
+        Ok((
+            credential,
+            WorkspaceApiRef {
+                workspace_id: self.config.workspace_id.clone(),
+                base_url: self
+                    .config
+                    .backend_base_url
+                    .clone()
+                    .unwrap_or_else(|| "http://127.0.0.1:8787".to_string())
+                    .trim_end_matches('/')
+                    .to_string(),
+                runtime_id: Some(runtime_id.to_string()),
+                access_token: Some(token),
+            },
+        ))
+    }
+
+    fn revoke_credential_record(
+        &self,
+        credential: &mut WorkerWorkspaceCredentialRecord,
+    ) -> ApiResult<()> {
+        credential.revoked_at = Some(Utc::now().to_rfc3339());
+        self.store.upsert_worker_workspace_credential(credential)?;
+        Ok(())
+    }
+
+    fn spawn_workspace_worker(
+        &self,
+        runtime_id: &str,
+        mut request: WorkerSpawnRequest,
+    ) -> ApiResult<WorkerSpawnResult> {
+        let (mut credential, workspace_api) =
+            self.mint_worker_workspace_credential(runtime_id, None)?;
+        request.resolved_workspace_api = Some(workspace_api.clone());
+        let result = match self.runtime.spawn_worker(runtime_id, request) {
+            Ok(result) => result,
+            Err(error) => {
+                self.revoke_credential_record(&mut credential)?;
+                return Err(error.into_error().into());
+            }
+        };
+        let Some(worker) = result.worker.as_ref() else {
+            self.revoke_credential_record(&mut credential)?;
+            return Ok(result);
+        };
+        let replacement = match self.runtime.replace_worker_workspace_api(
+            runtime_id,
+            &worker.worker_id,
+            workspace_api,
+        ) {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                let _ = self.runtime.delete_worker(runtime_id, &worker.worker_id);
+                self.revoke_credential_record(&mut credential)?;
+                return Err(error.into_error().into());
+            }
+        };
+        if replacement.state != WorkerOperationState::Accepted {
+            let _ = self.runtime.delete_worker(runtime_id, &worker.worker_id);
+            self.revoke_credential_record(&mut credential)?;
+            return Err(Error::RuntimeOperationFailed {
+                runtime_id: runtime_id.to_string(),
+                code: "worker_workspace_api_replace_failed".to_string(),
+                message: replacement
+                    .diagnostics
+                    .first()
+                    .map(|diagnostic| diagnostic.message.clone())
+                    .unwrap_or_else(|| {
+                        "Runtime rejected Workspace API replacement after spawn".to_string()
+                    }),
+            }
+            .into());
+        }
+        credential.worker_id = Some(worker.worker_id.clone());
+        self.store.upsert_worker_workspace_credential(&credential)?;
+        self.store.revoke_worker_workspace_credentials_except(
+            &self.config.workspace_id,
+            runtime_id,
+            &worker.worker_id,
+            &credential.credential_id,
+            &Utc::now().to_rfc3339(),
+        )?;
+        Ok(result)
+    }
+
+    fn rotate_worker_workspace_credential(
+        &self,
+        runtime_id: &str,
+        worker_id: &str,
+    ) -> ApiResult<WorkerWorkspaceApiResult> {
+        let _credential_guard = self.credential_operation_lock.lock().map_err(|_| {
+            Error::Config("Workspace credential operation lock poisoned".to_string())
+        })?;
+        let (mut credential, workspace_api) =
+            self.mint_worker_workspace_credential(runtime_id, Some(worker_id))?;
+        let result =
+            match self
+                .runtime
+                .replace_worker_workspace_api(runtime_id, worker_id, workspace_api)
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    self.revoke_credential_record(&mut credential)?;
+                    return Err(error.into_error().into());
+                }
+            };
+        if result.state != WorkerOperationState::Accepted {
+            self.revoke_credential_record(&mut credential)?;
+            return Ok(result);
+        }
+        self.store.revoke_worker_workspace_credentials_except(
+            &self.config.workspace_id,
+            runtime_id,
+            worker_id,
+            &credential.credential_id,
+            &Utc::now().to_rfc3339(),
+        )?;
+        Ok(result)
+    }
+
+    fn restore_workspace_worker(
+        &self,
+        runtime_id: &str,
+        worker_id: &str,
+    ) -> ApiResult<WorkerRestoreResult> {
+        let rotation = self.rotate_worker_workspace_credential(runtime_id, worker_id)?;
+        if rotation.state != WorkerOperationState::Accepted {
+            return Ok(WorkerRestoreResult {
+                state: rotation.state,
+                worker: rotation.worker,
+                diagnostics: rotation.diagnostics,
+            });
+        }
+        Ok(self
+            .runtime
+            .restore_worker(runtime_id, worker_id)
+            .map_err(|error| error.into_error())?)
     }
 
     fn repository_reader(&self) -> RepositoryRegistryReader {
@@ -489,14 +642,13 @@ pub fn build_router(api: WorkspaceApi) -> Router {
                 .delete(scoped_delete_profile_source),
         )
         .route("/api/tickets", get(list_tickets))
-        .route("/api/w/{workspace_id}/tickets", get(scoped_list_tickets))
+        .route(
+            "/api/w/{workspace_id}/tickets",
+            get(scoped_list_tickets).post(scoped_create_ticket_record),
+        )
         .route(
             "/api/w/{workspace_id}/worker-credentials/refresh",
             post(scoped_refresh_worker_workspace_credential),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/backend",
-            post(scoped_ticket_backend_operation),
         )
         .route(
             "/api/w/{workspace_id}/memory",
@@ -521,6 +673,86 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/skills/{name}/activate",
             get(scoped_activate_skill),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/default-intake-ready-body",
+            post(scoped_default_intake_ready_body),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/search",
+            get(scoped_list_ticket_summaries),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/doctor",
+            get(scoped_ticket_doctor),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/relations/search",
+            post(scoped_query_ticket_relations),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/orchestration-plans/search",
+            post(scoped_query_ticket_orchestration_plans),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/record",
+            get(scoped_get_ticket_record),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/item",
+            patch(scoped_edit_ticket_record_item),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/dependency-check",
+            get(scoped_ticket_dependency_check),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/thread-events",
+            post(scoped_add_ticket_thread_event),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/state-changes",
+            post(scoped_add_ticket_state_change),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/intake-summaries",
+            post(scoped_add_ticket_intake_summary),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/state-fields/{field}",
+            post(scoped_set_ticket_state_field),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/workflow-state",
+            post(scoped_set_ticket_workflow_state),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/intake-ready",
+            post(scoped_prepare_ticket_intake_ready),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/workflow/queue",
+            post(scoped_queue_ticket_record),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/workflow/review",
+            post(scoped_review_ticket_record),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/workflow/close",
+            post(scoped_close_ticket_record),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/relation-view",
+            get(scoped_ticket_relation_view),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/relations",
+            post(scoped_record_ticket_relation),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/orchestration-plans",
+            post(scoped_record_ticket_orchestration_plan),
         )
         .route(
             "/api/w/{workspace_id}/tickets/{id}",
@@ -2022,6 +2254,10 @@ async fn scoped_refresh_worker_workspace_credential(
     headers: HeaderMap,
 ) -> ApiResult<Json<WorkerWorkspaceCredentialRefreshResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
+    let _credential_guard = api
+        .credential_operation_lock
+        .lock()
+        .map_err(|_| Error::Config("Workspace credential operation lock poisoned".to_string()))?;
     let token = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -2063,13 +2299,19 @@ async fn scoped_refresh_worker_workspace_credential(
     }))
 }
 
-async fn scoped_ticket_backend_operation(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+async fn execute_worker_ticket_rest_operation(
+    api: &WorkspaceApi,
+    workspace_id: &str,
     headers: HeaderMap,
-    Json(mut operation): Json<TicketBackendOperation>,
-) -> ApiResult<Json<TicketBackendHttpResponse>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
+    mut operation: TicketBackendOperation,
+) -> ApiResult<TicketBackendOperationResult> {
+    validate_workspace_scope(api, workspace_id)?;
+    if headers.get(axum::http::header::AUTHORIZATION).is_none() {
+        return Err(Error::WorkerWorkspaceAuthentication(
+            "missing Runtime Workspace credential".to_string(),
+        )
+        .into());
+    }
     let config = ticket::config::TicketConfig::load_workspace(&api.config.workspace_root)
         .map_err(|error| Error::Config(format!("load Ticket workspace settings: {error}")))?;
     let mut backend = SqliteTicketBackend::new(
@@ -2081,64 +2323,535 @@ async fn scoped_ticket_backend_operation(
     let is_mutation = operation_kind != "read";
     let target = ticket_mutation_target(&operation).cloned();
     let read_target = ticket_read_target(&operation).cloned();
-    let has_worker_credential = headers.contains_key(axum::http::header::AUTHORIZATION);
-    let source = if is_mutation || (read_target.is_some() && has_worker_credential) {
-        Some(authenticate_worker_mutation_source(
-            &api,
-            &path.workspace_id,
-            &headers,
-        )?)
-    } else {
-        None
-    };
+    let source = authenticate_worker_mutation_source(api, workspace_id, &headers)?;
     let before = target.as_ref().and_then(|id| backend.show(id.clone()).ok());
-    if let Some(source) = source.as_ref() {
-        bind_worker_ticket_operation_source(source, &mut operation);
-        let source_context =
-            worker_ticket_source_context(&api, &path.workspace_id, source, before.as_ref());
-        backend = backend
-            .with_event_attributes(source_context.attributes(operation_kind))
-            .with_mutation_hook(build_ticket_notification_hook(
-                &api,
-                source_context,
-                operation_kind,
-                before
-                    .as_ref()
-                    .map(|ticket| ticket.meta.workflow_state.as_str().to_string())
-                    .unwrap_or_else(|| ticket_operation_initial_state(&operation)),
-            ));
+    bind_worker_ticket_operation_source(&source, &mut operation);
+    let source_context = worker_ticket_source_context(api, workspace_id, &source, before.as_ref());
+    backend = backend
+        .with_event_attributes(source_context.attributes(operation_kind))
+        .with_mutation_hook(build_ticket_notification_hook(
+            api,
+            source_context,
+            operation_kind,
+            before
+                .as_ref()
+                .map(|ticket| ticket.meta.workflow_state.as_str().to_string())
+                .unwrap_or_else(|| ticket_operation_initial_state(&operation)),
+        ));
+
+    let result = execute_ticket_backend_operation(&backend, operation).map_err(Error::from)?;
+    if let Some(read_target) = read_target.as_ref()
+        && let Ok(ticket) = backend.show(read_target.clone())
+        && let Some(event_index) = ticket.events.last().and_then(|event| {
+            event
+                .attributes
+                .get("event_sequence")
+                .and_then(|value| value.parse::<i64>().ok())
+        })
+    {
+        api.store.upsert_ticket_notification_cursor(
+            workspace_id,
+            &ticket.meta.id,
+            &source.runtime_id,
+            &source.worker_id,
+            event_index,
+            &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        )?;
     }
-    let response = match execute_ticket_backend_operation(&backend, operation) {
-        Ok(result) => {
-            if let (Some(source), Some(read_target)) = (source.as_ref(), read_target.as_ref()) {
-                if let Ok(ticket) = backend.show(read_target.clone()) {
-                    if let Some(event_index) = ticket.events.last().and_then(|event| {
-                        event
-                            .attributes
-                            .get("event_sequence")
-                            .and_then(|value| value.parse::<i64>().ok())
-                    }) {
-                        api.store.upsert_ticket_notification_cursor(
-                            &path.workspace_id,
-                            &ticket.meta.id,
-                            &source.runtime_id,
-                            &source.worker_id,
-                            event_index,
-                            &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-                        )?;
-                    }
-                }
+    if is_mutation {
+        dispatch_pending_ticket_notifications(api, workspace_id);
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+async fn execute_worker_ticket_test_operation(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    headers: HeaderMap,
+    Json(operation): Json<TicketBackendOperation>,
+) -> ApiResult<Json<TicketBackendOperationResult>> {
+    execute_worker_ticket_rest_operation(&api, &path.workspace_id, headers, operation)
+        .await
+        .map(Json)
+}
+
+fn ticket_rest_result<T>(
+    result: TicketBackendOperationResult,
+    extract: impl FnOnce(TicketBackendOperationResult) -> Option<T>,
+) -> ApiResult<Json<T>> {
+    extract(result).map(Json).ok_or_else(|| {
+        Error::Config("Ticket REST handler received an unexpected backend result".to_string())
+            .into()
+    })
+}
+
+fn ticket_rest_unit(result: TicketBackendOperationResult) -> ApiResult<StatusCode> {
+    match result {
+        TicketBackendOperationResult::Unit => Ok(StatusCode::NO_CONTENT),
+        _ => Err(Error::Config(
+            "Ticket REST handler received an unexpected backend result".to_string(),
+        )
+        .into()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DefaultIntakeReadyBodyRequest {
+    from: String,
+}
+
+async fn scoped_default_intake_ready_body(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    headers: HeaderMap,
+    Json(request): Json<DefaultIntakeReadyBodyRequest>,
+) -> ApiResult<Json<String>> {
+    let result = execute_worker_ticket_rest_operation(
+        &api,
+        &path.workspace_id,
+        headers,
+        TicketBackendOperation::DefaultIntakeReadyStateChangeBody { from: request.from },
+    )
+    .await?;
+    ticket_rest_result(result, |result| match result {
+        TicketBackendOperationResult::Text(body) => Some(body),
+        _ => None,
+    })
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TicketSummarySearchQuery {
+    state: Option<String>,
+}
+
+async fn scoped_list_ticket_summaries(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    headers: HeaderMap,
+    Query(query): Query<TicketSummarySearchQuery>,
+) -> ApiResult<Json<Vec<ticket::TicketSummary>>> {
+    let filter = match query.state.as_deref().unwrap_or("active") {
+        "active" => ticket::TicketListQuery::active(),
+        "all" => ticket::TicketListQuery::all(),
+        states => {
+            let mut selected = Vec::new();
+            for state in states.split(',') {
+                selected.push(ticket::TicketListState::parse(state).ok_or_else(|| {
+                    Error::Ticket(ticket::TicketError::InvalidPathComponent(state.to_string()))
+                })?);
             }
-            if is_mutation && source.is_some() {
-                dispatch_pending_ticket_notifications(&api, &path.workspace_id);
-            }
-            TicketBackendHttpResponse::Ok { result }
+            ticket::TicketListQuery::states(selected)
         }
-        Err(error) => TicketBackendHttpResponse::Error {
-            message: error.to_string(),
-        },
     };
-    Ok(Json(response))
+    let result = execute_worker_ticket_rest_operation(
+        &api,
+        &path.workspace_id,
+        headers,
+        TicketBackendOperation::List { filter },
+    )
+    .await?;
+    ticket_rest_result(result, |result| match result {
+        TicketBackendOperationResult::Tickets(tickets) => Some(tickets),
+        _ => None,
+    })
+}
+
+async fn scoped_get_ticket_record(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, id)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ticket::Ticket>> {
+    let result = execute_worker_ticket_rest_operation(
+        &api,
+        &workspace_id,
+        headers,
+        TicketBackendOperation::Show {
+            id: TicketIdOrSlug::Query(id),
+        },
+    )
+    .await?;
+    ticket_rest_result(result, |result| match result {
+        TicketBackendOperationResult::Ticket(ticket) => Some(ticket),
+        _ => None,
+    })
+}
+
+async fn scoped_create_ticket_record(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    headers: HeaderMap,
+    Json(input): Json<ticket::NewTicket>,
+) -> ApiResult<Json<ticket::TicketRef>> {
+    let result = execute_worker_ticket_rest_operation(
+        &api,
+        &path.workspace_id,
+        headers,
+        TicketBackendOperation::Create { input },
+    )
+    .await?;
+    ticket_rest_result(result, |result| match result {
+        TicketBackendOperationResult::TicketRef(ticket) => Some(ticket),
+        _ => None,
+    })
+}
+
+async fn scoped_edit_ticket_record_item(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, id)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+    Json(edit): Json<TicketItemEdit>,
+) -> ApiResult<Json<ticket::Ticket>> {
+    let result = execute_worker_ticket_rest_operation(
+        &api,
+        &workspace_id,
+        headers,
+        TicketBackendOperation::EditItem {
+            id: TicketIdOrSlug::Query(id),
+            edit,
+        },
+    )
+    .await?;
+    ticket_rest_result(result, |result| match result {
+        TicketBackendOperationResult::Ticket(ticket) => Some(ticket),
+        _ => None,
+    })
+}
+
+async fn scoped_ticket_dependency_check(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, id)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ticket::TicketDependencyCheck>> {
+    let result = execute_worker_ticket_rest_operation(
+        &api,
+        &workspace_id,
+        headers,
+        TicketBackendOperation::DependencyCheck {
+            id: TicketIdOrSlug::Query(id),
+        },
+    )
+    .await?;
+    ticket_rest_result(result, |result| match result {
+        TicketBackendOperationResult::DependencyCheck(check) => Some(check),
+        _ => None,
+    })
+}
+
+async fn scoped_add_ticket_thread_event(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, id)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+    Json(event): Json<NewTicketEvent>,
+) -> ApiResult<StatusCode> {
+    let result = execute_worker_ticket_rest_operation(
+        &api,
+        &workspace_id,
+        headers,
+        TicketBackendOperation::AddEvent {
+            id: TicketIdOrSlug::Query(id),
+            event,
+        },
+    )
+    .await?;
+    ticket_rest_unit(result)
+}
+
+async fn scoped_add_ticket_state_change(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, id)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+    Json(change): Json<TicketStateChange>,
+) -> ApiResult<StatusCode> {
+    let result = execute_worker_ticket_rest_operation(
+        &api,
+        &workspace_id,
+        headers,
+        TicketBackendOperation::AddStateChanged {
+            id: TicketIdOrSlug::Query(id),
+            change,
+        },
+    )
+    .await?;
+    ticket_rest_unit(result)
+}
+
+async fn scoped_add_ticket_intake_summary(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, id)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+    Json(summary): Json<ticket::TicketIntakeSummary>,
+) -> ApiResult<StatusCode> {
+    let result = execute_worker_ticket_rest_operation(
+        &api,
+        &workspace_id,
+        headers,
+        TicketBackendOperation::AddIntakeSummary {
+            id: TicketIdOrSlug::Query(id),
+            summary,
+        },
+    )
+    .await?;
+    ticket_rest_unit(result)
+}
+
+#[derive(Debug, Deserialize)]
+struct TicketIntakeReadyRequest {
+    summary: ticket::TicketIntakeSummary,
+    change: TicketStateChange,
+}
+
+async fn scoped_set_ticket_state_field(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, id, field)): AxumPath<(String, String, String)>,
+    headers: HeaderMap,
+    Json(change): Json<TicketStateChange>,
+) -> ApiResult<StatusCode> {
+    let result = execute_worker_ticket_rest_operation(
+        &api,
+        &workspace_id,
+        headers,
+        TicketBackendOperation::SetStateField {
+            id: TicketIdOrSlug::Query(id),
+            field,
+            change,
+        },
+    )
+    .await?;
+    ticket_rest_unit(result)
+}
+
+async fn scoped_set_ticket_workflow_state(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, id)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+    Json(change): Json<TicketStateChange>,
+) -> ApiResult<StatusCode> {
+    let result = execute_worker_ticket_rest_operation(
+        &api,
+        &workspace_id,
+        headers,
+        TicketBackendOperation::SetWorkflowState {
+            id: TicketIdOrSlug::Query(id),
+            change,
+        },
+    )
+    .await?;
+    ticket_rest_unit(result)
+}
+
+async fn scoped_prepare_ticket_intake_ready(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, id)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<TicketIntakeReadyRequest>,
+) -> ApiResult<StatusCode> {
+    let result = execute_worker_ticket_rest_operation(
+        &api,
+        &workspace_id,
+        headers,
+        TicketBackendOperation::MarkIntakeReady {
+            id: TicketIdOrSlug::Query(id),
+            summary: request.summary,
+            change: request.change,
+        },
+    )
+    .await?;
+    ticket_rest_unit(result)
+}
+
+async fn scoped_queue_ticket_record(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, id)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    let result = execute_worker_ticket_rest_operation(
+        &api,
+        &workspace_id,
+        headers,
+        TicketBackendOperation::QueueReady {
+            id: TicketIdOrSlug::Query(id),
+            queued_by: String::new(),
+        },
+    )
+    .await?;
+    ticket_rest_unit(result)
+}
+
+async fn scoped_review_ticket_record(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, id)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+    Json(review): Json<TicketReview>,
+) -> ApiResult<StatusCode> {
+    let result = execute_worker_ticket_rest_operation(
+        &api,
+        &workspace_id,
+        headers,
+        TicketBackendOperation::Review {
+            id: TicketIdOrSlug::Query(id),
+            review,
+        },
+    )
+    .await?;
+    ticket_rest_unit(result)
+}
+
+async fn scoped_close_ticket_record(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, id)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+    Json(resolution): Json<MarkdownText>,
+) -> ApiResult<StatusCode> {
+    let result = execute_worker_ticket_rest_operation(
+        &api,
+        &workspace_id,
+        headers,
+        TicketBackendOperation::Close {
+            id: TicketIdOrSlug::Query(id),
+            resolution,
+        },
+    )
+    .await?;
+    ticket_rest_unit(result)
+}
+
+async fn scoped_record_ticket_relation(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, id)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+    Json(relation): Json<ticket::NewTicketRelation>,
+) -> ApiResult<Json<ticket::TicketRelation>> {
+    let result = execute_worker_ticket_rest_operation(
+        &api,
+        &workspace_id,
+        headers,
+        TicketBackendOperation::AddTicketRelation {
+            id: TicketIdOrSlug::Query(id),
+            relation,
+        },
+    )
+    .await?;
+    ticket_rest_result(result, |result| match result {
+        TicketBackendOperationResult::Relation(relation) => Some(relation),
+        _ => None,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct TicketRelationSearchRequest {
+    ticket: Option<TicketIdOrSlug>,
+    kind: Option<ticket::TicketRelationKind>,
+}
+
+async fn scoped_query_ticket_relations(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    headers: HeaderMap,
+    Json(query): Json<TicketRelationSearchRequest>,
+) -> ApiResult<Json<Vec<ticket::TicketRelation>>> {
+    let result = execute_worker_ticket_rest_operation(
+        &api,
+        &path.workspace_id,
+        headers,
+        TicketBackendOperation::QueryTicketRelations {
+            ticket: query.ticket,
+            kind: query.kind,
+        },
+    )
+    .await?;
+    ticket_rest_result(result, |result| match result {
+        TicketBackendOperationResult::Relations(relations) => Some(relations),
+        _ => None,
+    })
+}
+
+async fn scoped_ticket_relation_view(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, id)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ticket::TicketRelationView>> {
+    let result = execute_worker_ticket_rest_operation(
+        &api,
+        &workspace_id,
+        headers,
+        TicketBackendOperation::RelationView {
+            id: TicketIdOrSlug::Query(id),
+        },
+    )
+    .await?;
+    ticket_rest_result(result, |result| match result {
+        TicketBackendOperationResult::RelationView(view) => Some(view),
+        _ => None,
+    })
+}
+
+async fn scoped_record_ticket_orchestration_plan(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, id)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+    Json(record): Json<ticket::NewOrchestrationPlanRecord>,
+) -> ApiResult<Json<ticket::OrchestrationPlanRecord>> {
+    let result = execute_worker_ticket_rest_operation(
+        &api,
+        &workspace_id,
+        headers,
+        TicketBackendOperation::AddOrchestrationPlanRecord {
+            id: TicketIdOrSlug::Query(id),
+            record,
+        },
+    )
+    .await?;
+    ticket_rest_result(result, |result| match result {
+        TicketBackendOperationResult::OrchestrationPlanRecord(record) => Some(record),
+        _ => None,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct TicketOrchestrationPlanSearchRequest {
+    ticket: Option<TicketIdOrSlug>,
+    kind: Option<ticket::OrchestrationPlanKind>,
+}
+
+async fn scoped_query_ticket_orchestration_plans(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    headers: HeaderMap,
+    Json(query): Json<TicketOrchestrationPlanSearchRequest>,
+) -> ApiResult<Json<Vec<ticket::OrchestrationPlanRecord>>> {
+    let result = execute_worker_ticket_rest_operation(
+        &api,
+        &path.workspace_id,
+        headers,
+        TicketBackendOperation::QueryOrchestrationPlanRecords {
+            ticket: query.ticket,
+            kind: query.kind,
+        },
+    )
+    .await?;
+    ticket_rest_result(result, |result| match result {
+        TicketBackendOperationResult::OrchestrationPlanRecords(records) => Some(records),
+        _ => None,
+    })
+}
+
+async fn scoped_ticket_doctor(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ticket::TicketDoctorReport>> {
+    let result = execute_worker_ticket_rest_operation(
+        &api,
+        &path.workspace_id,
+        headers,
+        TicketBackendOperation::Doctor,
+    )
+    .await?;
+    ticket_rest_result(result, |result| match result {
+        TicketBackendOperationResult::DoctorReport(report) => Some(report),
+        _ => None,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2697,27 +3410,24 @@ fn start_memory_staging_consolidation(
         content: input_content,
         segments: None,
     };
-    let result = api
-        .runtime
-        .spawn_worker(
-            &runtime_id,
-            WorkerSpawnRequest {
-                requested_worker_name: Some(MEMORY_CONSOLIDATION_PROFILE.to_string()),
-                intent: WorkerSpawnIntent::WorkspaceOrchestrator,
-                acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                    expected_segments: 1,
-                },
-                profile: profile_selector,
-                ticket_assignment: None,
-                initial_input: Some(input),
-                working_directory_request: None,
-                resolved_working_directory_request: None,
-                resolved_working_directory: None,
-                resolved_config_bundle,
-                resolved_workspace_api: None,
+    let result = api.spawn_workspace_worker(
+        &runtime_id,
+        WorkerSpawnRequest {
+            requested_worker_name: Some(MEMORY_CONSOLIDATION_PROFILE.to_string()),
+            intent: WorkerSpawnIntent::WorkspaceOrchestrator,
+            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                expected_segments: 1,
             },
-        )
-        .map_err(|err| err.into_error())?;
+            profile: profile_selector,
+            ticket_assignment: None,
+            initial_input: Some(input),
+            working_directory_request: None,
+            resolved_working_directory_request: None,
+            resolved_working_directory: None,
+            resolved_config_bundle,
+            resolved_workspace_api: None,
+        },
+    )?;
     if result.state != WorkerOperationState::Accepted {
         return Ok(MemoryConsolidationOutput {
             status: "skipped_spawn_rejected".to_string(),
@@ -5410,27 +6120,24 @@ async fn create_workspace_worker(
     if resolved_working_directory.is_none() {
         reject_no_workdir_for_non_embedded_runtime(&request.runtime_id)?;
     }
-    let result = api
-        .runtime
-        .spawn_worker(
-            &request.runtime_id,
-            WorkerSpawnRequest {
-                requested_worker_name: Some(display_name.clone()),
-                intent: WorkerSpawnIntent::WorkspaceCoding,
-                acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                    expected_segments: if initial_input.is_some() { 1 } else { 0 },
-                },
-                profile: profile_selector,
-                ticket_assignment: None,
-                initial_input,
-                working_directory_request: None,
-                resolved_working_directory_request: None,
-                resolved_working_directory,
-                resolved_config_bundle,
-                resolved_workspace_api: None,
+    let result = api.spawn_workspace_worker(
+        &request.runtime_id,
+        WorkerSpawnRequest {
+            requested_worker_name: Some(display_name.clone()),
+            intent: WorkerSpawnIntent::WorkspaceCoding,
+            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                expected_segments: if initial_input.is_some() { 1 } else { 0 },
             },
-        )
-        .map_err(|err| err.into_error())?;
+            profile: profile_selector,
+            ticket_assignment: None,
+            initial_input,
+            working_directory_request: None,
+            resolved_working_directory_request: None,
+            resolved_working_directory,
+            resolved_config_bundle,
+            resolved_workspace_api: None,
+        },
+    )?;
     Ok(Json(record_browser_worker_spawn(
         &api,
         request.runtime_id,
@@ -5604,10 +6311,7 @@ async fn restore_runtime_worker(
     State(api): State<WorkspaceApi>,
     AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
 ) -> ApiResult<Json<WorkerRestoreResponse>> {
-    let mut result = api
-        .runtime
-        .restore_worker(&runtime_id, &worker_id)
-        .map_err(|err| err.into_error())?;
+    let mut result = api.restore_workspace_worker(&runtime_id, &worker_id)?;
     if let Some(worker) = result.worker.as_ref() {
         let record = sync_worker_observation(&api, worker)?;
         let links = api.store.list_worker_workdir_links(
@@ -5762,26 +6466,6 @@ async fn create_runtime_worker(
             .map(|claim| claim.working_directory_id.clone())
     };
     let requested_worker_name = request.requested_worker_name.clone();
-    if let Some(base_url) = api.config.backend_base_url.clone() {
-        let credential = WorkerWorkspaceCredentialRecord {
-            credential_id: new_id("wac"),
-            token: mint_secret("wac"),
-            workspace_id: api.config.workspace_id.clone(),
-            runtime_id: runtime_id.clone(),
-            worker_id: None,
-            created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-            expires_at: (Utc::now() + chrono::Duration::hours(1))
-                .to_rfc3339_opts(SecondsFormat::Secs, true),
-            revoked_at: None,
-        };
-        api.store.upsert_worker_workspace_credential(&credential)?;
-        request.resolved_workspace_api = Some(worker_runtime::catalog::WorkspaceApiRef {
-            workspace_id: api.config.workspace_id.clone(),
-            base_url,
-            runtime_id: Some(runtime_id.clone()),
-            access_token: Some(credential.token),
-        });
-    }
     let spawn_idempotency =
         crate::hosts::worker_spawn_idempotency(&request).map_err(Error::Config)?;
     if let (Some(assignment), Some((_, fingerprint))) =
@@ -5797,10 +6481,7 @@ async fn create_runtime_worker(
             &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
         )?;
     }
-    let result = api
-        .runtime
-        .spawn_worker(&runtime_id, request)
-        .map_err(|err| err.into_error())?;
+    let result = api.spawn_workspace_worker(&runtime_id, request)?;
     if let Some(worker) = result.worker.as_ref() {
         let display_name = requested_worker_name
             .as_deref()
@@ -8042,6 +8723,15 @@ mod tests {
     const TEST_REPOSITORY_ID: &str = "main";
     const TEST_CREATED_AT: &str = "2026-06-23T06:43:28Z";
 
+    fn test_worker_workspace_api(runtime_id: &str) -> WorkspaceApiRef {
+        WorkspaceApiRef {
+            workspace_id: TEST_WORKSPACE_ID.to_string(),
+            base_url: "http://127.0.0.1:8787".to_string(),
+            runtime_id: Some(runtime_id.to_string()),
+            access_token: Some("workspace-access-token".to_string()),
+        }
+    }
+
     #[test]
     fn ticket_api_errors_preserve_http_status() {
         let not_found = ApiError::from(Error::Ticket(ticket::TicketError::NotFound(
@@ -8693,6 +9383,17 @@ mod tests {
             }
         }
 
+        fn replace_workspace_access_token(
+            &self,
+            _handle: &worker_runtime::execution::WorkerExecutionHandle,
+            _access_token: String,
+        ) -> worker_runtime::execution::WorkerExecutionResult {
+            worker_runtime::execution::WorkerExecutionResult::accepted(
+                worker_runtime::execution::WorkerExecutionOperation::ReplaceWorkspaceAccessToken,
+                worker_runtime::execution::WorkerExecutionRunState::Idle,
+            )
+        }
+
         fn dispatch_input(
             &self,
             handle: &worker_runtime::execution::WorkerExecutionHandle,
@@ -8846,7 +9547,9 @@ mod tests {
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
                     resolved_config_bundle,
-                    resolved_workspace_api: None,
+                    resolved_workspace_api: Some(test_worker_workspace_api(
+                        EMBEDDED_WORKER_RUNTIME_ID,
+                    )),
                 },
             )
             .unwrap();
@@ -9022,7 +9725,7 @@ mod tests {
             resolved_working_directory_request: None,
             resolved_working_directory: None,
             resolved_config_bundle: None,
-            resolved_workspace_api: None,
+            resolved_workspace_api: Some(test_worker_workspace_api(EMBEDDED_WORKER_RUNTIME_ID)),
         };
         let source_worker = api
             .runtime
@@ -9078,23 +9781,29 @@ mod tests {
             "x-yoi-worker-id",
             axum::http::HeaderValue::from_str(&source_worker.worker_id).unwrap(),
         );
-        let Json(response) = scoped_ticket_backend_operation(
-            State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-            }),
-            headers.clone(),
-            Json(TicketBackendOperation::AddEvent {
-                id: ticket_ref.id.clone().into(),
-                event: NewTicketEvent::new(TicketEventKind::Comment, "implementation update"),
-            }),
-        )
-        .await
-        .unwrap();
-        assert!(
-            matches!(response, TicketBackendHttpResponse::Ok { .. }),
-            "unexpected response: {response:?}"
-        );
+        let response = build_router(api.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/w/{TEST_WORKSPACE_ID}/tickets/{}/thread-events",
+                        ticket_ref.id
+                    ))
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer source-secret")
+                    .header("x-yoi-worker-id", &source_worker.worker_id)
+                    .body(Body::from(
+                        serde_json::to_vec(&NewTicketEvent::new(
+                            TicketEventKind::Comment,
+                            "implementation update",
+                        ))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let committed = backend.show(ticket_ref.id.clone().into()).unwrap();
         let committed_event = committed.events.last().unwrap();
         assert_eq!(
@@ -9126,18 +9835,22 @@ mod tests {
             .unwrap()
             .parse::<i64>()
             .unwrap();
-        let _ = scoped_ticket_backend_operation(
-            State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-            }),
-            headers.clone(),
-            Json(TicketBackendOperation::Show {
-                id: ticket_ref.id.clone().into(),
-            }),
-        )
-        .await
-        .unwrap();
+        let response = build_router(api.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/api/w/{TEST_WORKSPACE_ID}/tickets/{}/record",
+                        ticket_ref.id
+                    ))
+                    .header("authorization", "Bearer source-secret")
+                    .header("x-yoi-worker-id", &source_worker.worker_id)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             api.store
                 .get_ticket_notification_cursor(
@@ -9157,7 +9870,7 @@ mod tests {
             "accepted Runtime system input must complete the outbox delivery"
         );
 
-        let Json(stale_report) = scoped_ticket_backend_operation(
+        let Json(stale_report) = execute_worker_ticket_test_operation(
             State(api.clone()),
             AxumPath(ScopedWorkspacePath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
@@ -9173,7 +9886,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(stale_report, TicketBackendHttpResponse::Ok { .. }));
+        assert!(matches!(stale_report, TicketBackendOperationResult::Unit));
         let non_assigned_report = backend.show(ticket_ref.id.clone().into()).unwrap();
         assert!(
             !non_assigned_report
@@ -9201,7 +9914,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        let _ = scoped_ticket_backend_operation(
+        let _ = execute_worker_ticket_test_operation(
             State(api.clone()),
             AxumPath(ScopedWorkspacePath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
@@ -9234,7 +9947,7 @@ mod tests {
             Some("coder")
         );
 
-        let unauthorized = scoped_ticket_backend_operation(
+        let unauthorized = execute_worker_ticket_test_operation(
             State(api.clone()),
             AxumPath(ScopedWorkspacePath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
@@ -9275,7 +9988,9 @@ mod tests {
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
                     resolved_config_bundle: None,
-                    resolved_workspace_api: None,
+                    resolved_workspace_api: Some(test_worker_workspace_api(
+                        EMBEDDED_WORKER_RUNTIME_ID,
+                    )),
                 },
             )
             .unwrap()
@@ -9298,7 +10013,9 @@ mod tests {
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
                     resolved_config_bundle: None,
-                    resolved_workspace_api: None,
+                    resolved_workspace_api: Some(test_worker_workspace_api(
+                        EMBEDDED_WORKER_RUNTIME_ID,
+                    )),
                 },
             )
             .unwrap()
@@ -9339,7 +10056,7 @@ mod tests {
             "x-yoi-worker-id",
             axum::http::HeaderValue::from_str(&source.worker_id).unwrap(),
         );
-        let _ = scoped_ticket_backend_operation(
+        let _ = execute_worker_ticket_test_operation(
             State(api.clone()),
             AxumPath(ScopedWorkspacePath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
@@ -9362,6 +10079,66 @@ mod tests {
                 )
                 .unwrap(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_credential_rotation_revokes_prior_bound_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let result = api
+            .spawn_workspace_worker(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                WorkerSpawnRequest {
+                    requested_worker_name: Some("credential-boundary".to_string()),
+                    intent: WorkerSpawnIntent::WorkspaceCoding,
+                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                        expected_segments: 0,
+                    },
+                    profile: ProfileSelector::Builtin("builtin:coder".to_string()),
+                    ticket_assignment: None,
+                    initial_input: None,
+                    working_directory_request: None,
+                    resolved_working_directory_request: None,
+                    resolved_working_directory: None,
+                    resolved_config_bundle: None,
+                    resolved_workspace_api: Some(test_worker_workspace_api(
+                        "embedded-worker-runtime",
+                    )),
+                },
+            )
+            .unwrap();
+        let worker = result.worker.unwrap();
+        let old_token = "legacy-worker-token";
+        api.store
+            .upsert_worker_workspace_credential(&WorkerWorkspaceCredentialRecord {
+                credential_id: new_id("wac"),
+                token: old_token.to_string(),
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                worker_id: Some(worker.worker_id.clone()),
+                created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                expires_at: (Utc::now() + chrono::Duration::hours(1))
+                    .to_rfc3339_opts(SecondsFormat::Secs, true),
+                revoked_at: None,
+            })
+            .unwrap();
+
+        let rotation = api
+            .rotate_worker_workspace_credential(EMBEDDED_WORKER_RUNTIME_ID, &worker.worker_id)
+            .unwrap();
+
+        assert_eq!(rotation.state, WorkerOperationState::Accepted);
+        assert!(
+            api.store
+                .authenticate_worker_workspace_credential(
+                    old_token,
+                    TEST_WORKSPACE_ID,
+                    &worker.worker_id,
+                )
+                .unwrap()
+                .is_none(),
+            "repair must revoke the prior bound credential"
         );
     }
 
@@ -9517,13 +10294,15 @@ mod tests {
                 TEST_CREATED_AT,
             )
             .unwrap();
-        let pending_request = WorkerSpawnRequest {
+        let mut pending_request = WorkerSpawnRequest {
             ticket_assignment: Some(crate::hosts::WorkerTicketAssignmentRequest {
                 ticket_id: second_ticket.id.clone(),
                 operation_id: "pending-spawn-operation".to_string(),
             }),
             ..request
         };
+        pending_request.resolved_workspace_api =
+            Some(test_worker_workspace_api(EMBEDDED_WORKER_RUNTIME_ID));
         let (_, pending_fingerprint) = crate::hosts::worker_spawn_idempotency(&pending_request)
             .unwrap()
             .unwrap();
@@ -9710,7 +10489,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_backend_endpoint_uses_workspace_sqlite_backend() {
+    async fn ticket_rest_operations_use_workspace_sqlite_backend() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".yoi")).unwrap();
         fs::write(
@@ -10569,6 +11348,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ticket_rest_search_requires_worker_credential_and_rpc_route_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let app = build_router(api);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/api/w/{TEST_WORKSPACE_ID}/tickets/search?state=active"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/w/{TEST_WORKSPACE_ID}/tickets/backend"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
     async fn browser_worker_create_uses_workspace_default_and_preserves_unsupported_diagnostics() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".yoi")).unwrap();
@@ -11314,7 +12128,9 @@ mod tests {
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
                     resolved_config_bundle: None,
-                    resolved_workspace_api: None,
+                    resolved_workspace_api: Some(test_worker_workspace_api(
+                        "embedded-worker-runtime",
+                    )),
                 },
             )
             .expect("spawn worker");

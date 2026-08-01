@@ -215,6 +215,13 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
     fn is_available(&self) -> bool;
     fn execute(&self, request: WorkspaceRequest)
     -> Result<WorkspaceResponse, WorkspaceClientError>;
+
+    /// Replace the Runtime-issued Workspace access token for this live client.
+    fn replace_access_token(&self, _access_token: String) -> Result<(), WorkspaceClientError> {
+        Err(WorkspaceClientError::Unavailable(
+            "Workspace client does not support access token replacement".to_string(),
+        ))
+    }
 }
 
 /// HTTP forwarding client created by Runtime for one concrete Worker execution.
@@ -322,6 +329,13 @@ impl WorkspaceClient for RuntimeWorkspaceHttpClient {
             })? = Some(new_token);
         }
         Ok(result.0)
+    }
+
+    fn replace_access_token(&self, access_token: String) -> Result<(), WorkspaceClientError> {
+        *self.access_token.lock().map_err(|_| {
+            WorkspaceClientError::Request("workspace credential lock poisoned".to_string())
+        })? = Some(access_token);
+        Ok(())
     }
 }
 
@@ -6318,11 +6332,26 @@ mod build_summary_prompt_tests {
         .with_access_token(Some("expired-token".to_string()));
         let response = client
             .execute(WorkspaceRequest::get(
-                "/api/w/workspace-refresh/tickets/backend",
+                "/api/w/workspace-refresh/tickets/search",
             ))
             .unwrap();
         assert_eq!(response.status, 200);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn runtime_workspace_client_can_install_missing_access_token() {
+        let client =
+            RuntimeWorkspaceHttpClient::new("workspace-a", "https://workspace.example", "worker-a");
+
+        client
+            .replace_access_token("replacement-token".to_string())
+            .unwrap();
+
+        assert_eq!(
+            client.access_token.lock().unwrap().as_deref(),
+            Some("replacement-token")
+        );
     }
 
     fn minimal_manifest() -> WorkerManifest {

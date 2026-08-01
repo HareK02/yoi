@@ -1124,6 +1124,34 @@ where
         result
     }
 
+    fn replace_workspace_access_token(
+        &self,
+        handle: &WorkerExecutionHandle,
+        access_token: String,
+    ) -> WorkerExecutionResult {
+        let (worker, _busy) = match self.get_execution(handle) {
+            Ok(execution) => execution,
+            Err(mut result) => {
+                result.operation = WorkerExecutionOperation::ReplaceWorkspaceAccessToken;
+                return result;
+            }
+        };
+        worker
+            .replace_workspace_access_token(access_token)
+            .map(|_| {
+                WorkerExecutionResult::accepted(
+                    WorkerExecutionOperation::ReplaceWorkspaceAccessToken,
+                    WorkerExecutionRunState::Idle,
+                )
+            })
+            .unwrap_or_else(|error| {
+                WorkerExecutionResult::errored(
+                    WorkerExecutionOperation::ReplaceWorkspaceAccessToken,
+                    error.to_string(),
+                )
+            })
+    }
+
     fn stop_worker(&self, handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
         if handle.backend_id() != self.backend_id() {
             return WorkerExecutionResult::rejected(

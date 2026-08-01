@@ -650,6 +650,14 @@ pub trait ControlPlaneStore: Send + Sync {
         new_token: &str,
         new_expires_at: &str,
     ) -> Result<Option<WorkerWorkspaceCredentialRecord>>;
+    fn revoke_worker_workspace_credentials_except(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        worker_id: &str,
+        active_credential_id: &str,
+        revoked_at: &str,
+    ) -> Result<()>;
     fn revoke_worker_workspace_credentials(
         &self,
         workspace_id: &str,
@@ -2335,6 +2343,31 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 expires_at: new_expires_at.to_string(),
                 revoked_at: None,
             }))
+        })
+    }
+
+    fn revoke_worker_workspace_credentials_except(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        worker_id: &str,
+        active_credential_id: &str,
+        revoked_at: &str,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"UPDATE worker_workspace_credentials SET revoked_at = ?5
+                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
+                     AND credential_id <> ?4 AND revoked_at IS NULL"#,
+                params![
+                    workspace_id,
+                    runtime_id,
+                    worker_id,
+                    active_credential_id,
+                    revoked_at
+                ],
+            )?;
+            Ok(())
         })
     }
 

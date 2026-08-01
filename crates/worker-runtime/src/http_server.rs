@@ -12,7 +12,7 @@ use crate::auth::{
 };
 use crate::catalog::{
     ConfigBundleRef, CreateWorkerRequest, WorkerDetail, WorkerLifecycleAck, WorkerSummary,
-    WorkingDirectoryRequest, WorkingDirectoryStatus,
+    WorkingDirectoryRequest, WorkingDirectoryStatus, WorkspaceApiRef,
 };
 use crate::config_bundle::{ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary};
 use crate::error::RuntimeError;
@@ -194,6 +194,10 @@ fn runtime_http_router_with_optional_auth(
         .route("/v1/workers/{worker_id}/input", post(send_worker_input))
         .route("/v1/workers/{worker_id}/restore", post(restore_worker))
         .route(
+            "/v1/workers/{worker_id}/workspace-api",
+            post(replace_worker_workspace_api),
+        )
+        .route(
             "/v1/workers/{worker_id}/completions",
             post(worker_completions),
         )
@@ -280,6 +284,12 @@ pub struct RuntimeHttpWorkingDirectoryResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeHttpWorkerResponse {
     pub worker: WorkerDetail,
+}
+
+/// Replace the Workspace API binding for an existing Worker.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeHttpWorkerWorkspaceApiRequest {
+    pub workspace_api: WorkspaceApiRef,
 }
 
 /// Worker delete response.
@@ -504,6 +514,28 @@ async fn create_worker(
     let worker = match auth_workspace_scope(&state, auth.as_ref())? {
         Some(scope) => state.runtime.create_worker_scoped(&scope, request),
         None => state.runtime.create_worker(request),
+    }
+    .map_err(RuntimeHttpRestError::runtime)?;
+    Ok(Json(RuntimeHttpWorkerResponse { worker }))
+}
+
+async fn replace_worker_workspace_api(
+    State(state): State<RuntimeHttpState>,
+    auth: Option<Extension<RuntimeAuthContext>>,
+    Path(worker_id): Path<String>,
+    body: Result<Json<RuntimeHttpWorkerWorkspaceApiRequest>, JsonRejection>,
+) -> RestResult<RuntimeHttpWorkerResponse> {
+    let Json(request) = body.map_err(RuntimeHttpRestError::json_rejection)?;
+    let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
+    let worker = match auth_workspace_scope(&state, auth.as_ref())? {
+        Some(scope) => state.runtime.replace_worker_workspace_api_scoped(
+            &scope,
+            &worker_ref,
+            request.workspace_api,
+        ),
+        None => state
+            .runtime
+            .replace_worker_workspace_api(&worker_ref, request.workspace_api),
     }
     .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkerResponse { worker }))
@@ -958,6 +990,9 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
         return Some("workers:create");
     }
     if path.starts_with("/v1/config-bundles") || path.starts_with("/v1/working-directories") {
+        return Some("workers:create");
+    }
+    if path.ends_with("/workspace-api") {
         return Some("workers:create");
     }
     if path.ends_with("/input") || path.ends_with("/restore") {
@@ -1484,6 +1519,17 @@ mod tests {
             )
         }
 
+        fn replace_workspace_access_token(
+            &self,
+            _handle: &WorkerExecutionHandle,
+            _access_token: String,
+        ) -> WorkerExecutionResult {
+            WorkerExecutionResult::accepted(
+                WorkerExecutionOperation::ReplaceWorkspaceAccessToken,
+                WorkerExecutionRunState::Idle,
+            )
+        }
+
         fn stop_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
             WorkerExecutionResult::accepted(
                 WorkerExecutionOperation::Stop,
@@ -1574,6 +1620,23 @@ mod tests {
             created.worker.worker_ref.worker_id,
             created.worker.worker_id
         );
+
+        let response = authed_json_request(
+            app.clone(),
+            Method::POST,
+            &format!("/v1/workers/{}/workspace-api", created.worker.worker_id),
+            token,
+            &RuntimeHttpWorkerWorkspaceApiRequest {
+                workspace_api: WorkspaceApiRef {
+                    workspace_id: "local".to_string(),
+                    base_url: "http://127.0.0.1:8787".to_string(),
+                    runtime_id: None,
+                    access_token: Some("workspace-access-token".to_string()),
+                },
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
 
         let input = WorkerInput::user("hello from backend");
         let response = authed_json_request(

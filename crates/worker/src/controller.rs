@@ -26,7 +26,10 @@ use crate::shutdown_after_idle::{
 use crate::spawn::comm_tools::{read_worker_output_tool, send_to_worker_tool, stop_worker_tool};
 use crate::spawn::registry::SpawnedWorkerRegistry;
 use crate::spawn::tool::spawn_worker_tool;
-use crate::worker::{SystemItemCommitter, Worker, WorkerError, WorkerRunResult};
+use crate::worker::{
+    SystemItemCommitter, Worker, WorkerError, WorkerRunResult, WorkspaceClient,
+    WorkspaceClientError,
+};
 use protocol::{
     AlertLevel, AlertSource, ErrorCode, Event, Method, RewindTargetId, RunResult, Segment,
     TurnResult, WorkerStatus,
@@ -40,6 +43,7 @@ use protocol::{
 pub struct WorkerHandle {
     method_tx: mpsc::Sender<Method>,
     event_tx: broadcast::Sender<Event>,
+    workspace_client: Arc<dyn WorkspaceClient>,
     pub shared_state: Arc<WorkerSharedState>,
     pub runtime_dir: Arc<RuntimeDir>,
     pub alerter: Alerter,
@@ -112,6 +116,14 @@ impl WorkerHandle {
     /// Emit a user-facing alert. Thin wrapper over `Alerter::alert`.
     pub fn alert(&self, level: AlertLevel, source: AlertSource, message: String) {
         self.alerter.alert(level, source, message);
+    }
+
+    /// Replace the Runtime-issued Workspace access token used by this live Worker.
+    pub fn replace_workspace_access_token(
+        &self,
+        access_token: String,
+    ) -> Result<(), WorkspaceClientError> {
+        self.workspace_client.replace_access_token(access_token)
     }
 }
 
@@ -234,6 +246,7 @@ impl WorkerController {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (method_tx, method_rx) = mpsc::channel::<Method>(32);
         let (event_tx, _) = broadcast::channel::<Event>(256);
+        let workspace_client = worker.workspace_client_handle();
         let alerter = Alerter::new(event_tx.clone());
         let in_flight = InFlightEvents::new(event_tx.clone());
         worker.attach_in_flight_events(in_flight.clone());
@@ -352,6 +365,7 @@ impl WorkerController {
         let handle = WorkerHandle {
             method_tx,
             event_tx: event_tx.clone(),
+            workspace_client,
             shared_state: shared_state.clone(),
             runtime_dir: runtime_dir.clone(),
             alerter: alerter.clone(),

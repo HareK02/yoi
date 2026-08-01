@@ -34,7 +34,8 @@ use worker_runtime::http_server::{
     RuntimeHttpErrorResponse, RuntimeHttpSummaryResponse, RuntimeHttpWorkerCompletionsRequest,
     RuntimeHttpWorkerCompletionsResponse, RuntimeHttpWorkerDeleteResponse,
     RuntimeHttpWorkerInputResponse, RuntimeHttpWorkerLifecycleRequest,
-    RuntimeHttpWorkerLifecycleResponse, RuntimeHttpWorkerResponse, RuntimeHttpWorkersResponse,
+    RuntimeHttpWorkerLifecycleResponse, RuntimeHttpWorkerResponse,
+    RuntimeHttpWorkerWorkspaceApiRequest, RuntimeHttpWorkersResponse,
     RuntimeHttpWorkingDirectoriesResponse, RuntimeHttpWorkingDirectoryResponse,
 };
 use worker_runtime::identity::{WorkerId as EmbeddedWorkerId, WorkerRef as EmbeddedWorkerRef};
@@ -261,6 +262,14 @@ pub struct WorkerRestoreResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerWorkspaceApiResult {
+    pub state: WorkerOperationState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker: Option<WorkerSummary>,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeList<T> {
     pub items: Vec<T>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
@@ -413,6 +422,30 @@ pub struct ConfigBundleCheckResult {
 pub struct ConfigBundleListResult {
     pub bundles: Vec<ConfigBundleSummary>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+fn required_worker_workspace_api(
+    request: &WorkerSpawnRequest,
+) -> Result<WorkspaceApiRef, RuntimeDiagnostic> {
+    let workspace_api = request.resolved_workspace_api.clone().ok_or_else(|| {
+        diagnostic(
+            "worker_workspace_credential_missing",
+            DiagnosticSeverity::Error,
+            "Workspace-bound Worker spawn requires a resolved Workspace API credential",
+        )
+    })?;
+    if workspace_api
+        .access_token
+        .as_deref()
+        .is_none_or(|token| token.trim().is_empty())
+    {
+        return Err(diagnostic(
+            "worker_workspace_credential_missing",
+            DiagnosticSeverity::Error,
+            "Workspace-bound Worker spawn requires a non-empty Workspace API access token",
+        ));
+    }
+    Ok(workspace_api)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -618,6 +651,24 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
                 "worker_restore_unsupported",
                 DiagnosticSeverity::Info,
                 format!("runtime does not implement worker restore for `{worker_id}`"),
+            )],
+        }
+    }
+
+    fn replace_worker_workspace_api(
+        &self,
+        worker_id: &str,
+        _workspace_api: WorkspaceApiRef,
+    ) -> WorkerWorkspaceApiResult {
+        WorkerWorkspaceApiResult {
+            state: WorkerOperationState::Unsupported,
+            worker: None,
+            diagnostics: vec![diagnostic(
+                "worker_workspace_api_replace_unsupported",
+                DiagnosticSeverity::Info,
+                format!(
+                    "runtime does not support replacing the Workspace API for worker `{worker_id}`"
+                ),
             )],
         }
     }
@@ -1072,6 +1123,18 @@ impl RuntimeRegistry {
         Ok(runtime.restore_worker(worker_id))
     }
 
+    pub fn replace_worker_workspace_api(
+        &self,
+        runtime_id: &str,
+        worker_id: &str,
+        workspace_api: WorkspaceApiRef,
+    ) -> Result<WorkerWorkspaceApiResult, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        validate_backend_identifier("worker_id", worker_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        Ok(runtime.replace_worker_workspace_api(worker_id, workspace_api))
+    }
+
     pub fn spawn_worker(
         &self,
         runtime_id: &str,
@@ -1312,8 +1375,6 @@ impl RuntimeRegistry {
 pub struct EmbeddedWorkerRuntime {
     runtime_id: String,
     host_id: String,
-    workspace_id: String,
-    backend_base_url: Option<String>,
     runtime: worker_runtime::Runtime,
     execution_enabled: bool,
     resource_broker: BackendResourceBroker,
@@ -1366,18 +1427,11 @@ impl EmbeddedWorkerRuntime {
         self
     }
 
-    pub fn with_backend_base_url(mut self, backend_base_url: impl Into<String>) -> Self {
-        self.backend_base_url = Some(backend_base_url.into().trim_end_matches('/').to_string());
-        self
-    }
-
     pub fn from_runtime(workspace_id: impl AsRef<str>, runtime: worker_runtime::Runtime) -> Self {
         let workspace_id = workspace_id.as_ref().to_string();
         Self {
             runtime_id: EMBEDDED_RUNTIME_ID.to_string(),
             host_id: host_id_for_embedded_workspace(&workspace_id),
-            workspace_id,
-            backend_base_url: None,
             runtime,
             execution_enabled: false,
             resource_broker: BackendResourceBroker::default(),
@@ -1626,6 +1680,39 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         }
     }
 
+    fn replace_worker_workspace_api(
+        &self,
+        worker_id: &str,
+        workspace_api: WorkspaceApiRef,
+    ) -> WorkerWorkspaceApiResult {
+        let Some(worker_ref) = self.worker_ref(worker_id) else {
+            return WorkerWorkspaceApiResult {
+                state: WorkerOperationState::Rejected,
+                worker: None,
+                diagnostics: vec![diagnostic(
+                    "embedded_worker_id_invalid",
+                    DiagnosticSeverity::Warning,
+                    "Worker id was empty and cannot receive Workspace access".to_string(),
+                )],
+            };
+        };
+        match self
+            .runtime
+            .replace_worker_workspace_api(&worker_ref, workspace_api)
+        {
+            Ok(detail) => WorkerWorkspaceApiResult {
+                state: WorkerOperationState::Accepted,
+                worker: Some(self.map_worker_detail(detail)),
+                diagnostics: Vec::new(),
+            },
+            Err(err) => WorkerWorkspaceApiResult {
+                state: WorkerOperationState::Rejected,
+                worker: None,
+                diagnostics: vec![embedded_runtime_diagnostic(&err)],
+            },
+        }
+    }
+
     fn create_working_directory(
         &self,
         _request: WorkingDirectoryRequest,
@@ -1727,6 +1814,18 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             .map_or((None, None), |(key, fingerprint)| {
                 (Some(key), Some(fingerprint))
             });
+        let workspace_api = match required_worker_workspace_api(&request) {
+            Ok(workspace_api) => workspace_api,
+            Err(diagnostic) => {
+                diagnostics.push(diagnostic);
+                return WorkerSpawnResult {
+                    state: WorkerOperationState::Rejected,
+                    worker: None,
+                    acceptance_evidence: Vec::new(),
+                    diagnostics,
+                };
+            }
+        };
         let create_request = CreateWorkerRequest {
             idempotency_key,
             idempotency_fingerprint,
@@ -1737,16 +1836,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             initial_input: request.initial_input.clone(),
             working_directory_request: request.resolved_working_directory_request.clone(),
             working_directory: request.resolved_working_directory.clone(),
-            workspace_api: request.resolved_workspace_api.clone().or_else(|| {
-                self.backend_base_url
-                    .as_ref()
-                    .map(|base_url| WorkspaceApiRef {
-                        workspace_id: self.workspace_id.clone(),
-                        base_url: base_url.clone(),
-                        runtime_id: Some(self.runtime_id.clone()),
-                        access_token: None,
-                    })
-            }),
+            workspace_api: Some(workspace_api),
         };
         match self.runtime.create_worker(create_request) {
             Ok(detail) => WorkerSpawnResult {
@@ -2602,6 +2692,28 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         }
     }
 
+    fn replace_worker_workspace_api(
+        &self,
+        worker_id: &str,
+        workspace_api: WorkspaceApiRef,
+    ) -> WorkerWorkspaceApiResult {
+        match self.post_json::<_, RuntimeHttpWorkerResponse>(
+            &format!("/v1/workers/{worker_id}/workspace-api"),
+            &RuntimeHttpWorkerWorkspaceApiRequest { workspace_api },
+        ) {
+            Ok(response) => WorkerWorkspaceApiResult {
+                state: WorkerOperationState::Accepted,
+                worker: Some(self.map_worker_detail(response.worker)),
+                diagnostics: Vec::new(),
+            },
+            Err(diagnostic) => WorkerWorkspaceApiResult {
+                state: WorkerOperationState::Rejected,
+                worker: None,
+                diagnostics: vec![diagnostic],
+            },
+        }
+    }
+
     fn create_working_directory(
         &self,
         request: WorkingDirectoryRequest,
@@ -2711,6 +2823,17 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             .map_or((None, None), |(key, fingerprint)| {
                 (Some(key), Some(fingerprint))
             });
+        let workspace_api = match required_worker_workspace_api(&request) {
+            Ok(workspace_api) => workspace_api,
+            Err(diagnostic) => {
+                return WorkerSpawnResult {
+                    state: WorkerOperationState::Rejected,
+                    worker: None,
+                    acceptance_evidence: Vec::new(),
+                    diagnostics: vec![diagnostic],
+                };
+            }
+        };
         let create = CreateWorkerRequest {
             idempotency_key,
             idempotency_fingerprint,
@@ -2721,14 +2844,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             initial_input: request.initial_input.clone(),
             working_directory_request: request.resolved_working_directory_request.clone(),
             working_directory: request.resolved_working_directory.clone(),
-            workspace_api: request.resolved_workspace_api.clone().or_else(|| {
-                Some(WorkspaceApiRef {
-                    workspace_id: self.workspace_id.clone(),
-                    base_url: self.backend_base_url.clone(),
-                    runtime_id: Some(self.runtime_id.clone()),
-                    access_token: None,
-                })
-            }),
+            workspace_api: Some(workspace_api),
         };
         match self.post_json::<_, RuntimeHttpWorkerResponse>("/v1/workers", &create) {
             Ok(response) => WorkerSpawnResult {
@@ -3700,6 +3816,15 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
 
+    fn test_workspace_api() -> WorkspaceApiRef {
+        WorkspaceApiRef {
+            workspace_id: "workspace-test".to_string(),
+            base_url: "http://127.0.0.1:8787".to_string(),
+            runtime_id: Some("runtime-test".to_string()),
+            access_token: Some("workspace-access-token".to_string()),
+        }
+    }
+
     #[test]
     fn embedded_builtin_decodal_profiles_resolve_through_archive() {
         let root = tempfile::tempdir().unwrap();
@@ -4222,8 +4347,29 @@ mod tests {
             resolved_working_directory_request: None,
             resolved_working_directory: None,
             resolved_config_bundle: None,
-            resolved_workspace_api: None,
+            resolved_workspace_api: Some(test_workspace_api()),
         }
+    }
+
+    #[test]
+    fn embedded_runtime_rejects_tokenless_workspace_spawn() {
+        let runtime = EmbeddedWorkerRuntime::new_memory_with_execution_backend(
+            "local:test",
+            Arc::new(AcceptingExecutionBackend::default()),
+        )
+        .expect("test backend should connect");
+        let mut request = embedded_spawn_request();
+        request.resolved_workspace_api = None;
+
+        let spawned = runtime.spawn_worker(request);
+
+        assert_eq!(spawned.state, WorkerOperationState::Rejected);
+        assert!(
+            spawned
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == "worker_workspace_credential_missing" })
+        );
     }
 
     #[test]
@@ -4350,7 +4496,7 @@ mod tests {
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
                     resolved_config_bundle: None,
-                    resolved_workspace_api: None,
+                    resolved_workspace_api: Some(test_workspace_api()),
                 },
             )
             .unwrap();
@@ -4448,7 +4594,7 @@ mod tests {
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
                     resolved_config_bundle: None,
-                    resolved_workspace_api: None,
+                    resolved_workspace_api: Some(test_workspace_api()),
                 },
             )
             .unwrap();
@@ -4482,7 +4628,7 @@ mod tests {
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
                     resolved_config_bundle: None,
-                    resolved_workspace_api: None,
+                    resolved_workspace_api: Some(test_workspace_api()),
                 },
             )
             .unwrap();

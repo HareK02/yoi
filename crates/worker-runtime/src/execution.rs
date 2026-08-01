@@ -31,6 +31,7 @@ pub enum WorkerExecutionOperation {
     Restore,
     Input,
     ProtocolMethod,
+    ReplaceWorkspaceAccessToken,
     Stop,
     Cancel,
 }
@@ -331,6 +332,17 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         Vec::new()
     }
 
+    fn replace_workspace_access_token(
+        &self,
+        _handle: &WorkerExecutionHandle,
+        _access_token: String,
+    ) -> WorkerExecutionResult {
+        WorkerExecutionResult::unsupported(
+            WorkerExecutionOperation::ReplaceWorkspaceAccessToken,
+            "execution backend does not support replacing Workspace access tokens",
+        )
+    }
+
     fn stop_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
         WorkerExecutionResult::unsupported(
             WorkerExecutionOperation::Stop,
@@ -441,6 +453,15 @@ impl WorkerExecutionBackendRef {
         prefix: &str,
     ) -> Vec<protocol::CompletionEntry> {
         self.backend.worker_completions(handle, kind, prefix)
+    }
+
+    pub(crate) fn replace_workspace_access_token(
+        &self,
+        handle: &WorkerExecutionHandle,
+        access_token: String,
+    ) -> WorkerExecutionResult {
+        self.backend
+            .replace_workspace_access_token(handle, access_token)
     }
 
     pub(crate) fn stop_worker(&self, handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
