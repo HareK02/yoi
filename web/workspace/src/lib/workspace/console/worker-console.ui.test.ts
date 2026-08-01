@@ -560,10 +560,11 @@ Deno.test("Worker Console page is routed by runtime_id and worker_id through bac
     "reload token advancement should not synchronously read and write the rune state",
   );
   assert(
-    consolePage.includes("advanceReloadToken();") &&
-      consolePage.includes("void loadConsoleData(target);") &&
+    consolePage.includes("const token = advanceReloadToken();") &&
+      consolePage.includes("worker = targetWorker;") &&
+      consolePage.includes("if (!targetWorker) void loadWorker(target, token);") &&
       !consolePage.includes("void refreshConsole();\n  });\n\n  $effect"),
-    "target-change effect should load data without depending on manual refresh state reads",
+    "target-change effect should install route data and guard fallback loading with the new target token",
   );
   assert(
     consolePage.includes(
@@ -725,10 +726,18 @@ Deno.test("Workspace Worker list and Console share the multiplexed connection", 
     new URL("./../multiplexer.ts", import.meta.url),
   );
   assert(
-    consolePage.includes("workspaceMultiplexer(workspaceId)") &&
+    consolePage.includes("workspaceMultiplexer(target.workspaceId)") &&
       sidebarStore.includes("workspaceMultiplexer(workspaceId)") &&
       multiplexer.includes("const multiplexers = new Map") &&
       multiplexer.includes("frame: 'worker_protocol'"),
     "Sidebar and Console should share one Workspace multiplexer and route Worker methods through a subscription lane",
+  );
+  assert(
+    multiplexer.includes("this.#socket?.readyState === WebSocket.OPEN") &&
+      multiplexer.includes("this.#sendSubscribe(subscription)") &&
+      consolePage.includes("const targetWorker = data.worker") &&
+      consolePage.includes("worker = targetWorker") &&
+      consolePage.includes("const consoleTarget = $derived({ workspaceId, runtimeId, workerId })"),
+    "A reused Console route should subscribe immediately on the live Workspace socket and install the new route Worker",
   );
 });

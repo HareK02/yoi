@@ -140,11 +140,12 @@
     let reloadToken = $state(0);
 
     type ConsoleTarget = {
+        workspaceId: string;
         runtimeId: string;
         workerId: string;
     };
 
-    const consoleTarget = $derived({ runtimeId, workerId });
+    const consoleTarget = $derived({ workspaceId, runtimeId, workerId });
 
     const lines = $derived(consoleProjection.lines);
     const timelineLayout = $derived(
@@ -179,26 +180,25 @@
         return response.json() as Promise<T>;
     }
 
-    async function loadWorker(target: ConsoleTarget) {
+    async function loadWorker(target: ConsoleTarget, token: number) {
         workerError = null;
         try {
             const payload = await getJson<Worker>(
-                workerApiPath(
+                workspaceApiPath(
+                    target.workspaceId,
                     `/runtimes/${encodeURIComponent(target.runtimeId)}/workers/${encodeURIComponent(target.workerId)}`,
                 ),
             );
+            if (token !== reloadToken) return;
             worker = payload;
             liveWorkerState = payload.state;
         } catch (error) {
+            if (token !== reloadToken) return;
             workerError =
                 error instanceof Error ? error.message : String(error);
             worker = null;
             liveWorkerState = null;
         }
-    }
-
-    async function loadConsoleData(target: ConsoleTarget) {
-        if (!worker) await loadWorker(target);
     }
 
     function advanceReloadToken(): number {
@@ -515,7 +515,7 @@
             return;
         }
         protocolState = "connecting";
-        const subscription = workspaceMultiplexer(workspaceId).subscribe(
+        const subscription = workspaceMultiplexer(target.workspaceId).subscribe(
             {
                 topic: "worker_protocol",
                 worker_id: target.workerId,
@@ -1083,11 +1083,16 @@
 
     $effect(() => {
         const target = consoleTarget;
+        const targetWorker = data.worker;
+        const targetWorkerError = data.workerError;
         resetObservedEvents();
-        liveWorkerState = null;
+        worker = targetWorker;
+        workerError = targetWorkerError;
+        liveWorkerState = targetWorker?.state ?? null;
         streamDiagnostics = [];
-        advanceReloadToken();
-        void loadConsoleData(target);
+        protocolState = "connecting";
+        const token = advanceReloadToken();
+        if (!targetWorker) void loadWorker(target, token);
     });
 
     $effect(() => connectProtocolTransport(worker, reloadToken, consoleTarget));

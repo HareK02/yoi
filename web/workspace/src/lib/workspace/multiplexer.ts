@@ -54,15 +54,21 @@ export class WorkspaceMultiplexer {
     listener: Listener,
   ): WorkspaceMultiplexerSubscription {
     const clientId = crypto.randomUUID();
-    this.#subscriptions.set(clientId, {
+    const subscription: ActiveSubscription = {
       clientId,
       selector,
       listener,
       requestId: null,
       subscriptionId: null,
-    });
+    };
+    this.#subscriptions.set(clientId, subscription);
     this.#closed = false;
-    this.#ensureConnected();
+    if (this.#socket?.readyState === WebSocket.OPEN) {
+      subscription.listener.onStatus?.('open');
+      this.#sendSubscribe(subscription);
+    } else {
+      this.#ensureConnected();
+    }
     return {
       close: () => this.#remove(clientId),
       sendWorkerMethod: (method) => this.#sendWorkerMethod(clientId, method),
