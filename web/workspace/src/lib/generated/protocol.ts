@@ -111,7 +111,7 @@ export type SubscriptionWorkerIds = Array<SubscriptionWorkerId>;
 
 export type SubscriptionWorkerState = "idle" | "running" | "paused" | "stopped" | "cancelled";
 
-export type EventSubscriptionSelector = { "topic": "runtime_workers" } | { "topic": "worker_lifecycle", worker_ids: SubscriptionWorkerIds, } | { "topic": "worker_protocol", worker_id: SubscriptionWorkerId, } | { "topic": "workspace_workers" } | { "topic": "workspace_workdirs" };
+export type EventSubscriptionSelector = { "topic": "runtime_workers" } | { "topic": "worker_lifecycle", worker_ids: SubscriptionWorkerIds, } | { "topic": "worker_protocol", worker_id: SubscriptionWorkerId, runtime_id?: string | null, } | { "topic": "workspace_workers" } | { "topic": "workspace_workdirs" };
 
 export type SubscriptionWorker = { worker_id: SubscriptionWorkerId,
 /**
@@ -136,13 +136,15 @@ export type SubscriptionTerminationCode = "lagged" | "resource_gone" | "unauthor
 
 export type SubscriptionRequest = { "method": "subscribe_events", "params": { request_id: SubscriptionRequestId, selector: EventSubscriptionSelector, } } | { "method": "unsubscribe_events", "params": { request_id: SubscriptionRequestId, subscription_id: SubscriptionId, } };
 
+export type SubscriptionWorkerProtocolMethod = { subscription_id: SubscriptionId, method: Method, };
+
 export type SubscriptionResponse = { "result": "subscribed", "payload": { request_id: SubscriptionRequestId, subscription_id: SubscriptionId, selector: EventSubscriptionSelector, snapshot_revision: number, snapshot: SubscriptionSnapshot, } } | { "result": "unsubscribed", "payload": { request_id: SubscriptionRequestId, subscription_id: SubscriptionId, } } | { "result": "subscription_rejected", "payload": { request_id: SubscriptionRequestId, subscription_id?: SubscriptionId | null, code: SubscriptionRejectionCode, message: string, } };
 
 export type SubscriptionEvent = { "event": "event", "data": { subscription_id: SubscriptionId, subject_revision: number, payload: SubscriptionEventPayload, } } | { "event": "subscription_closed", "data": { subscription_id: SubscriptionId, code: SubscriptionTerminationCode, message: string, } };
 
-export type SubscriptionFramePayload = { "frame": "request", "message": SubscriptionRequest } | { "frame": "response", "message": SubscriptionResponse } | { "frame": "event", "message": SubscriptionEvent };
+export type SubscriptionFramePayload = { "frame": "request", "message": SubscriptionRequest } | { "frame": "response", "message": SubscriptionResponse } | { "frame": "event", "message": SubscriptionEvent } | { "frame": "worker_protocol", "message": SubscriptionWorkerProtocolMethod };
 
-export type SubscriptionFrame = { protocol_version: number, } & ({ "frame": "request", "message": SubscriptionRequest } | { "frame": "response", "message": SubscriptionResponse } | { "frame": "event", "message": SubscriptionEvent });
+export type SubscriptionFrame = { protocol_version: number, } & ({ "frame": "request", "message": SubscriptionRequest } | { "frame": "response", "message": SubscriptionResponse } | { "frame": "event", "message": SubscriptionEvent } | { "frame": "worker_protocol", "message": SubscriptionWorkerProtocolMethod });
 
 export type Method = { "method": "run", "params": { input: Array<Segment>, } } | { "method": "notify", "params": { message: string, auto_run?: boolean, } } | { "method": "worker_event", "params": WorkerEvent } | { "method": "resume" } | { "method": "cancel" } | { "method": "pause" } | { "method": "compact" } | { "method": "list_rewind_targets" } | { "method": "rewind_to", "params": { target: RewindTargetId, expected_head_entries: number, } } | { "method": "shutdown" } | { "method": "list_completions", "params": { kind: CompletionKind, prefix: string, } } | { "method": "list_workers" } | { "method": "restore_worker", "params": { name: string, } } | { "method": "register_peer", "params": { name: string, } };
 

@@ -12,7 +12,8 @@ use crate::{
         SubscriptionFramePayload, SubscriptionId, SubscriptionRejectionCode, SubscriptionRequest,
         SubscriptionRequestId, SubscriptionResponse, SubscriptionSnapshot,
         SubscriptionTerminationCode, SubscriptionWorkdir, SubscriptionWorkdirId,
-        SubscriptionWorker, SubscriptionWorkerId, SubscriptionWorkerIds, SubscriptionWorkerState,
+        SubscriptionWorker, SubscriptionWorkerId, SubscriptionWorkerIds,
+        SubscriptionWorkerProtocolMethod, SubscriptionWorkerState,
     },
 };
 
@@ -71,6 +72,7 @@ pub fn generated_protocol_types() -> String {
     push_decl::<SubscriptionRejectionCode>(&cfg, &mut output);
     push_decl::<SubscriptionTerminationCode>(&cfg, &mut output);
     push_decl::<SubscriptionRequest>(&cfg, &mut output);
+    push_decl::<SubscriptionWorkerProtocolMethod>(&cfg, &mut output);
     push_decl::<SubscriptionResponse>(&cfg, &mut output);
     push_decl::<SubscriptionEvent>(&cfg, &mut output);
     push_decl::<SubscriptionFramePayload>(&cfg, &mut output);

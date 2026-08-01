@@ -248,6 +248,8 @@ pub enum EventSubscriptionSelector {
     },
     WorkerProtocol {
         worker_id: SubscriptionWorkerId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime_id: Option<String>,
     },
     /// Server-derived Workspace projection. Workspace identity comes from the
     /// authenticated connection and is deliberately absent from this selector.
@@ -260,7 +262,16 @@ impl EventSubscriptionSelector {
     pub fn validate(&self) -> Result<(), SubscriptionValidationError> {
         match self {
             Self::WorkerLifecycle { worker_ids } => worker_ids.validate(),
-            Self::WorkerProtocol { worker_id } => worker_id.validate(),
+            Self::WorkerProtocol {
+                worker_id,
+                runtime_id,
+            } => {
+                worker_id.validate()?;
+                if let Some(runtime_id) = runtime_id {
+                    validate_identifier("runtime_id", runtime_id, MAX_RESOURCE_ID_BYTES)?;
+                }
+                Ok(())
+            }
             Self::RuntimeWorkers | Self::WorkspaceWorkers | Self::WorkspaceWorkdirs => Ok(()),
         }
     }
@@ -271,6 +282,7 @@ impl EventSubscriptionSelector {
             Self::WorkerLifecycle { worker_ids } => worker_ids.contains(worker_id),
             Self::WorkerProtocol {
                 worker_id: selected,
+                ..
             } => selected == worker_id,
             Self::WorkspaceWorkdirs => false,
         }
@@ -312,6 +324,7 @@ pub enum SubscriptionFramePayload {
     Request(SubscriptionRequest),
     Response(SubscriptionResponse),
     Event(SubscriptionEvent),
+    WorkerProtocol(SubscriptionWorkerProtocolMethod),
 }
 
 impl SubscriptionFramePayload {
@@ -320,7 +333,21 @@ impl SubscriptionFramePayload {
             Self::Request(request) => request.validate(),
             Self::Response(response) => response.validate(),
             Self::Event(event) => event.validate(),
+            Self::WorkerProtocol(message) => message.validate(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct SubscriptionWorkerProtocolMethod {
+    pub subscription_id: SubscriptionId,
+    pub method: crate::Method,
+}
+
+impl SubscriptionWorkerProtocolMethod {
+    pub fn validate(&self) -> Result<(), SubscriptionValidationError> {
+        self.subscription_id.validate()
     }
 }
 
@@ -617,6 +644,7 @@ impl SubscriptionSnapshot {
             (
                 EventSubscriptionSelector::WorkerProtocol {
                     worker_id: selected,
+                    ..
                 },
                 Self::WorkerProtocol { worker_id, .. },
             ) if selected == worker_id => worker_id.validate(),
@@ -703,6 +731,7 @@ impl SubscriptionEventPayload {
             (
                 EventSubscriptionSelector::WorkerProtocol {
                     worker_id: selected,
+                    ..
                 },
                 Self::WorkerProtocol { worker_id, .. },
             ) if selected == worker_id => Ok(()),
@@ -889,6 +918,37 @@ mod tests {
             event.validate_for_selector(&EventSubscriptionSelector::WorkspaceWorkdirs),
             Err(SubscriptionValidationError::SelectorEventMismatch)
         ));
+    }
+
+    #[test]
+    fn worker_protocol_method_uses_subscription_lane() {
+        let frame = SubscriptionFrame::new(SubscriptionFramePayload::WorkerProtocol(
+            SubscriptionWorkerProtocolMethod {
+                subscription_id: subscription_id(),
+                method: crate::Method::ListCompletions {
+                    kind: crate::CompletionKind::File,
+                    prefix: "src/".to_string(),
+                },
+            },
+        ));
+        frame.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(frame).unwrap(),
+            serde_json::json!({
+                "protocol_version": 1,
+                "frame": "worker_protocol",
+                "message": {
+                    "subscription_id": "subscription-1",
+                    "method": {
+                        "method": "list_completions",
+                        "params": {
+                            "kind": "file",
+                            "prefix": "src/"
+                        }
+                    }
+                }
+            })
+        );
     }
 
     #[test]

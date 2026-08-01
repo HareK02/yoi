@@ -3807,10 +3807,9 @@ async fn scoped_workspace_protocol_ws(
     {
         return Err(StatusCode::FORBIDDEN.into_response());
     }
-    let broker = api.runtime_subscription_broker().clone();
     Ok(ws
         .on_upgrade(move |socket| {
-            crate::workspace_subscription::serve_workspace_subscription(broker, socket)
+            crate::workspace_subscription::serve_workspace_subscription(api, socket)
         })
         .into_response())
 }
@@ -6683,6 +6682,131 @@ async fn worker_protocol_ws(
         }
     };
     ws.on_upgrade(move |socket| worker_protocol_ws_session(source, socket))
+}
+
+pub(crate) struct WorkspaceWorkerProtocolConnection {
+    pub(crate) methods: tokio::sync::mpsc::Sender<protocol::Method>,
+    pub(crate) events: tokio::sync::mpsc::Receiver<protocol::Event>,
+}
+
+pub(crate) async fn connect_workspace_worker_protocol(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+    worker_id: &str,
+) -> Result<WorkspaceWorkerProtocolConnection> {
+    let source = match api.observation_proxy.source(runtime_id, worker_id) {
+        Ok(source) => source,
+        Err(ObservationProxyError::WorkerNotFound(_)) => api
+            .runtime
+            .observation_source(runtime_id, worker_id)
+            .map_err(|error| error.into_error())?,
+        Err(error) => {
+            return Err(Error::RuntimeOperationFailed {
+                runtime_id: runtime_id.to_string(),
+                code: error.code().to_string(),
+                message: error.message().to_string(),
+            });
+        }
+    };
+    match source {
+        RuntimeObservationSource::RemoteWs(config) => connect_remote_worker_protocol(config).await,
+        RuntimeObservationSource::Embedded(source) => {
+            connect_embedded_worker_protocol(source).await
+        }
+    }
+}
+
+async fn connect_remote_worker_protocol(
+    config: RuntimeObservationSourceConfig,
+) -> Result<WorkspaceWorkerProtocolConnection> {
+    let mut request = config
+        .endpoint
+        .clone()
+        .into_client_request()
+        .map_err(|error| Error::Config(format!("invalid Runtime protocol endpoint: {error}")))?;
+    if let Some(token) = &config.bearer_token {
+        request.headers_mut().insert(
+            "authorization",
+            format!("Bearer {token}").parse().map_err(|error| {
+                Error::Config(format!("invalid Runtime authorization: {error}"))
+            })?,
+        );
+    }
+    let (socket, _) =
+        connect_async(request)
+            .await
+            .map_err(|error| Error::RuntimeOperationFailed {
+                runtime_id: config.runtime_id.clone(),
+                code: "worker_protocol_connect_failed".to_string(),
+                message: error.to_string(),
+            })?;
+    let (mut sink, mut stream) = socket.split();
+    let (methods, mut method_receiver) = tokio::sync::mpsc::channel(256);
+    let (event_sender, events) = tokio::sync::mpsc::channel(512);
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                method = method_receiver.recv() => {
+                    let Some(method) = method else { break };
+                    let Ok(text) = protocol::stream::encode_method(&method) else { break };
+                    if sink.send(TungsteniteMessage::Text(text.into())).await.is_err() { break; }
+                }
+                message = stream.next() => match message {
+                    Some(Ok(TungsteniteMessage::Text(text))) => {
+                        let Ok(event) = protocol::stream::decode_event(text.as_ref()) else { break; };
+                        if event_sender.send(event).await.is_err() { break; }
+                    }
+                    Some(Ok(TungsteniteMessage::Ping(value))) => {
+                        if sink.send(TungsteniteMessage::Pong(value)).await.is_err() { break; }
+                    }
+                    Some(Ok(TungsteniteMessage::Pong(_))) => {}
+                    _ => break,
+                }
+            }
+        }
+    });
+    Ok(WorkspaceWorkerProtocolConnection { methods, events })
+}
+
+async fn connect_embedded_worker_protocol(
+    source: crate::observation::EmbeddedRuntimeObservationSource,
+) -> Result<WorkspaceWorkerProtocolConnection> {
+    let mut upstream =
+        RuntimeObservationClient::connect(&RuntimeObservationSource::Embedded(source.clone()))
+            .await
+            .map_err(|error| Error::RuntimeOperationFailed {
+                runtime_id: source.runtime_id.clone(),
+                code: error.code().to_string(),
+                message: error.message().to_string(),
+            })?;
+    let (methods, mut method_receiver) = tokio::sync::mpsc::channel(256);
+    let (event_sender, events) = tokio::sync::mpsc::channel(512);
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                method = method_receiver.recv() => {
+                    let Some(method) = method else { break };
+                    match source.runtime.send_protocol_method(&source.worker_ref, method) {
+                        Ok(direct_events) => {
+                            for event in direct_events {
+                                if event_sender.send(event).await.is_err() { return; }
+                            }
+                        }
+                        Err(error) => {
+                            if event_sender.send(protocol_error_event(error.to_string())).await.is_err() { return; }
+                        }
+                    }
+                }
+                event = upstream.next_event() => match event {
+                    Ok(event) => {
+                        if event_sender.send(event.payload).await.is_err() { break; }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+    Ok(WorkspaceWorkerProtocolConnection { methods, events })
 }
 
 async fn worker_protocol_ws_session(source: RuntimeObservationSource, socket: WebSocket) {
@@ -12716,6 +12840,29 @@ mod tests {
             .unwrap()
             .to_string();
 
+        let spawn_request = WorkerSpawnRequest {
+            intent: WorkerSpawnIntent::WorkspaceCompanion,
+            requested_worker_name: Some("multiplexed-console".to_string()),
+            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                expected_segments: 0,
+            },
+            profile: worker_runtime::catalog::ProfileSelector::Builtin(
+                "builtin:companion".to_string(),
+            ),
+            ticket_assignment: None,
+            initial_input: None,
+            working_directory_request: None,
+            resolved_working_directory_request: None,
+            resolved_working_directory: None,
+            resolved_config_bundle: Some(runtime_test_bundle()),
+            resolved_workspace_api: None,
+        };
+        let spawned = api
+            .spawn_workspace_worker(EMBEDDED_WORKER_RUNTIME_ID, spawn_request)
+            .unwrap();
+        assert_eq!(spawned.state, WorkerOperationState::Accepted);
+        let worker_id = spawned.worker.unwrap().worker_id;
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = build_router(api);
@@ -12757,6 +12904,141 @@ mod tests {
                 }
             )
         ));
+
+        let subscribe_protocol = protocol::subscription::SubscriptionFrame::new(
+            protocol::subscription::SubscriptionFramePayload::Request(
+                protocol::subscription::SubscriptionRequest::SubscribeEvents {
+                    request_id: protocol::subscription::SubscriptionRequestId::new("request-2")
+                        .unwrap(),
+                    selector: protocol::subscription::EventSubscriptionSelector::WorkerProtocol {
+                        worker_id: protocol::subscription::SubscriptionWorkerId::new(
+                            worker_id.clone(),
+                        )
+                        .unwrap(),
+                        runtime_id: Some(EMBEDDED_WORKER_RUNTIME_ID.to_string()),
+                    },
+                },
+            ),
+        );
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&subscribe_protocol).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+        let protocol_subscription_id = loop {
+            let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                continue;
+            };
+            let frame: protocol::subscription::SubscriptionFrame =
+                serde_json::from_str(text.as_str()).unwrap();
+            if let protocol::subscription::SubscriptionFramePayload::Response(
+                protocol::subscription::SubscriptionResponse::Subscribed {
+                    subscription_id,
+                    selector:
+                        protocol::subscription::EventSubscriptionSelector::WorkerProtocol { .. },
+                    ..
+                },
+            ) = frame.payload
+            {
+                break subscription_id;
+            }
+        };
+        let second_subscribe = protocol::subscription::SubscriptionFrame::new(
+            protocol::subscription::SubscriptionFramePayload::Request(
+                protocol::subscription::SubscriptionRequest::SubscribeEvents {
+                    request_id: protocol::subscription::SubscriptionRequestId::new("request-3")
+                        .unwrap(),
+                    selector: protocol::subscription::EventSubscriptionSelector::WorkerProtocol {
+                        worker_id: protocol::subscription::SubscriptionWorkerId::new(
+                            worker_id.clone(),
+                        )
+                        .unwrap(),
+                        runtime_id: Some(EMBEDDED_WORKER_RUNTIME_ID.to_string()),
+                    },
+                },
+            ),
+        );
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&second_subscribe).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+        let second_protocol_subscription_id = loop {
+            let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                continue;
+            };
+            let frame: protocol::subscription::SubscriptionFrame =
+                serde_json::from_str(text.as_str()).unwrap();
+            if let protocol::subscription::SubscriptionFramePayload::Response(
+                protocol::subscription::SubscriptionResponse::Subscribed {
+                    subscription_id,
+                    selector:
+                        protocol::subscription::EventSubscriptionSelector::WorkerProtocol { .. },
+                    ..
+                },
+            ) = frame.payload
+            {
+                break subscription_id;
+            }
+        };
+        assert_ne!(protocol_subscription_id, second_protocol_subscription_id);
+        let unsubscribe = protocol::subscription::SubscriptionFrame::new(
+            protocol::subscription::SubscriptionFramePayload::Request(
+                protocol::subscription::SubscriptionRequest::UnsubscribeEvents {
+                    request_id: protocol::subscription::SubscriptionRequestId::new("request-4")
+                        .unwrap(),
+                    subscription_id: protocol_subscription_id,
+                },
+            ),
+        );
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&unsubscribe).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+
+        let method = protocol::subscription::SubscriptionFrame::new(
+            protocol::subscription::SubscriptionFramePayload::WorkerProtocol(
+                protocol::subscription::SubscriptionWorkerProtocolMethod {
+                    subscription_id: second_protocol_subscription_id.clone(),
+                    method: protocol::Method::ListCompletions {
+                        kind: protocol::CompletionKind::File,
+                        prefix: String::new(),
+                    },
+                },
+            ),
+        );
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&method).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+        loop {
+            let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                continue;
+            };
+            let frame: protocol::subscription::SubscriptionFrame =
+                serde_json::from_str(text.as_str()).unwrap();
+            if matches!(
+                frame.payload,
+                protocol::subscription::SubscriptionFramePayload::Event(
+                    protocol::subscription::SubscriptionEvent::Event {
+                        subscription_id,
+                        payload: protocol::subscription::SubscriptionEventPayload::WorkerProtocol {
+                            event: protocol::Event::Completions { .. },
+                            ..
+                        },
+                        ..
+                    }
+                ) if subscription_id == second_protocol_subscription_id
+            ) {
+                break;
+            }
+        }
         server.abort();
     }
 

@@ -772,7 +772,9 @@ async fn handle_frame(
                 send_subscribe(socket, state, selector).await?;
             }
         }
-        SubscriptionFramePayload::Request(_) => return Err(()),
+        SubscriptionFramePayload::Request(_) | SubscriptionFramePayload::WorkerProtocol(_) => {
+            return Err(());
+        }
     }
     Ok(())
 }
