@@ -21,6 +21,8 @@ use crate::interaction::{WorkerInput, WorkerInteractionAck};
 use crate::management::{RuntimeLimits, RuntimeSummary, WorkerDeleteResult};
 #[cfg(feature = "ws-server")]
 use crate::observation::WorkerObservationCursor;
+#[cfg(feature = "ws-server")]
+use crate::runtime::RuntimeSubscriptionRecvError;
 use crate::{Runtime, RuntimeWorkspaceScope};
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::{JsonRejection, QueryRejection};
@@ -33,10 +35,18 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 #[cfg(feature = "ws-server")]
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 #[cfg(feature = "ws-server")]
 use protocol::stream::{decode_method, encode_event};
+#[cfg(feature = "ws-server")]
+use protocol::subscription::{
+    SubscriptionEvent, SubscriptionFrame, SubscriptionFramePayload, SubscriptionId,
+    SubscriptionRejectionCode, SubscriptionRequest, SubscriptionResponse,
+    SubscriptionTerminationCode,
+};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "ws-server")]
+use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 #[cfg(feature = "fs-store")]
@@ -205,10 +215,12 @@ fn runtime_http_router_with_optional_auth(
         .route("/v1/workers/{worker_id}/cancel", post(cancel_worker));
 
     #[cfg(feature = "ws-server")]
-    let router = router.route(
-        "/v1/workers/{worker_id}/protocol/ws",
-        get(worker_protocol_ws),
-    );
+    let router = router
+        .route("/v1/protocol/ws", get(runtime_protocol_ws))
+        .route(
+            "/v1/workers/{worker_id}/protocol/ws",
+            get(worker_protocol_ws),
+        );
 
     router
         .with_state(state.clone())
@@ -553,6 +565,272 @@ async fn restore_worker(
     }
     .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkerResponse { worker }))
+}
+
+#[cfg(feature = "ws-server")]
+const RUNTIME_PROTOCOL_OUTBOUND_CAPACITY: usize = 256;
+
+#[cfg(feature = "ws-server")]
+async fn runtime_protocol_ws(
+    State(state): State<RuntimeHttpState>,
+    auth: Option<Extension<RuntimeAuthContext>>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> Result<Response, Response> {
+    let scope =
+        auth_workspace_scope(&state, auth.as_ref()).map_err(|error| error.into_response())?;
+    Ok(ws
+        .on_upgrade(move |socket| runtime_protocol_ws_session(state.runtime, scope, socket))
+        .into_response())
+}
+
+#[cfg(feature = "ws-server")]
+async fn runtime_protocol_ws_session(
+    runtime: Runtime,
+    scope: Option<RuntimeWorkspaceScope>,
+    socket: axum::extract::ws::WebSocket,
+) {
+    let (mut socket_sender, mut socket_receiver) = socket.split();
+    let (outbound, mut outbound_receiver) = tokio::sync::mpsc::channel::<axum::extract::ws::Message>(
+        RUNTIME_PROTOCOL_OUTBOUND_CAPACITY,
+    );
+    let writer = tokio::spawn(async move {
+        while let Some(message) = outbound_receiver.recv().await {
+            if socket_sender.send(message).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut next_subscription_id = 1_u64;
+    let mut subscriptions = HashMap::<SubscriptionId, tokio::task::JoinHandle<()>>::new();
+    while let Some(message) = socket_receiver.next().await {
+        let Ok(message) = message else {
+            break;
+        };
+        match message {
+            axum::extract::ws::Message::Text(text) => {
+                let Ok(frame) = serde_json::from_str::<SubscriptionFrame>(text.as_str()) else {
+                    break;
+                };
+                let request_id = subscription_frame_request_id(&frame);
+                if let Err(error) = frame.validate() {
+                    let Some(request_id) = request_id else {
+                        break;
+                    };
+                    let code = if frame.protocol_version
+                        != protocol::subscription::SUBSCRIPTION_PROTOCOL_VERSION
+                    {
+                        SubscriptionRejectionCode::UnsupportedProtocolVersion
+                    } else {
+                        SubscriptionRejectionCode::InvalidRequest
+                    };
+                    if send_runtime_subscription_frame(
+                        &outbound,
+                        SubscriptionFrame::new(SubscriptionFramePayload::Response(
+                            SubscriptionResponse::SubscriptionRejected {
+                                request_id,
+                                subscription_id: None,
+                                code,
+                                message: error.to_string(),
+                            },
+                        )),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
+
+                subscriptions.retain(|_, task| !task.is_finished());
+                let SubscriptionFramePayload::Request(request) = frame.payload else {
+                    break;
+                };
+                match request {
+                    SubscriptionRequest::SubscribeEvents {
+                        request_id,
+                        selector,
+                    } => {
+                        let subscription = match scope.as_ref() {
+                            Some(scope) => {
+                                runtime.subscribe_event_selector_scoped(scope, selector.clone())
+                            }
+                            None => runtime.subscribe_event_selector(selector.clone()),
+                        };
+                        let mut subscription = match subscription {
+                            Ok(subscription) => subscription,
+                            Err(error) => {
+                                if send_runtime_subscription_frame(
+                                    &outbound,
+                                    SubscriptionFrame::new(SubscriptionFramePayload::Response(
+                                        SubscriptionResponse::SubscriptionRejected {
+                                            request_id,
+                                            subscription_id: None,
+                                            code: runtime_subscription_rejection_code(&error),
+                                            message: error.to_string(),
+                                        },
+                                    )),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
+                        };
+                        let subscription_id = SubscriptionId::new(format!(
+                            "runtime-subscription-{next_subscription_id}"
+                        ))
+                        .expect("generated Runtime subscription id is valid");
+                        next_subscription_id = next_subscription_id.saturating_add(1);
+                        let response = SubscriptionFrame::new(SubscriptionFramePayload::Response(
+                            SubscriptionResponse::Subscribed {
+                                request_id,
+                                subscription_id: subscription_id.clone(),
+                                selector: selector.clone(),
+                                snapshot_revision: subscription.snapshot_revision(),
+                                snapshot: subscription.snapshot().clone(),
+                            },
+                        ));
+                        if send_runtime_subscription_frame(&outbound, response)
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+
+                        let event_outbound = outbound.clone();
+                        let event_subscription_id = subscription_id.clone();
+                        let task = tokio::spawn(async move {
+                            loop {
+                                let frame = match subscription.recv().await {
+                                    Ok(update) => SubscriptionFrame::new(
+                                        SubscriptionFramePayload::Event(
+                                            SubscriptionEvent::Event {
+                                                subscription_id: event_subscription_id.clone(),
+                                                subject_revision: update.subject_revision,
+                                                payload: update.payload,
+                                            },
+                                        ),
+                                    ),
+                                    Err(RuntimeSubscriptionRecvError::Lagged) => {
+                                        SubscriptionFrame::new(SubscriptionFramePayload::Event(
+                                            SubscriptionEvent::SubscriptionClosed {
+                                                subscription_id: event_subscription_id.clone(),
+                                                code: SubscriptionTerminationCode::Lagged,
+                                                message: "Runtime subscription lagged; resubscribe for a fresh snapshot"
+                                                    .to_string(),
+                                            },
+                                        ))
+                                    }
+                                    Err(RuntimeSubscriptionRecvError::Closed) => {
+                                        SubscriptionFrame::new(SubscriptionFramePayload::Event(
+                                            SubscriptionEvent::SubscriptionClosed {
+                                                subscription_id: event_subscription_id.clone(),
+                                                code: SubscriptionTerminationCode::ServerShutdown,
+                                                message: "Runtime subscription closed".to_string(),
+                                            },
+                                        ))
+                                    }
+                                };
+                                let terminal = matches!(
+                                    &frame.payload,
+                                    SubscriptionFramePayload::Event(
+                                        SubscriptionEvent::SubscriptionClosed { .. }
+                                    )
+                                );
+                                if send_runtime_subscription_frame(&event_outbound, frame)
+                                    .await
+                                    .is_err()
+                                    || terminal
+                                {
+                                    break;
+                                }
+                            }
+                        });
+                        subscriptions.insert(subscription_id, task);
+                    }
+                    SubscriptionRequest::UnsubscribeEvents {
+                        request_id,
+                        subscription_id,
+                    } => {
+                        if let Some(task) = subscriptions.remove(&subscription_id) {
+                            task.abort();
+                        }
+                        if send_runtime_subscription_frame(
+                            &outbound,
+                            SubscriptionFrame::new(SubscriptionFramePayload::Response(
+                                SubscriptionResponse::Unsubscribed {
+                                    request_id,
+                                    subscription_id,
+                                },
+                            )),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            axum::extract::ws::Message::Ping(payload) => {
+                if outbound
+                    .send(axum::extract::ws::Message::Pong(payload))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            axum::extract::ws::Message::Pong(_) => {}
+            axum::extract::ws::Message::Close(_) => break,
+            axum::extract::ws::Message::Binary(_) => break,
+        }
+    }
+
+    for (_, task) in subscriptions {
+        task.abort();
+    }
+    drop(outbound);
+    let _ = writer.await;
+}
+
+#[cfg(feature = "ws-server")]
+fn subscription_frame_request_id(
+    frame: &SubscriptionFrame,
+) -> Option<protocol::subscription::SubscriptionRequestId> {
+    let SubscriptionFramePayload::Request(request) = &frame.payload else {
+        return None;
+    };
+    Some(match request {
+        SubscriptionRequest::SubscribeEvents { request_id, .. }
+        | SubscriptionRequest::UnsubscribeEvents { request_id, .. } => request_id.clone(),
+    })
+}
+
+#[cfg(feature = "ws-server")]
+fn runtime_subscription_rejection_code(error: &RuntimeError) -> SubscriptionRejectionCode {
+    match error {
+        RuntimeError::WorkerNotFound { .. } => SubscriptionRejectionCode::ResourceNotFound,
+        RuntimeError::InvalidRequest(_) => SubscriptionRejectionCode::UnsupportedSelector,
+        _ => SubscriptionRejectionCode::Internal,
+    }
+}
+
+#[cfg(feature = "ws-server")]
+async fn send_runtime_subscription_frame(
+    outbound: &tokio::sync::mpsc::Sender<axum::extract::ws::Message>,
+    frame: SubscriptionFrame,
+) -> Result<(), ()> {
+    frame.validate().map_err(|_| ())?;
+    let text = serde_json::to_string(&frame).map_err(|_| ())?;
+    outbound
+        .send(axum::extract::ws::Message::Text(text.into()))
+        .await
+        .map_err(|_| ())
 }
 
 #[cfg(feature = "ws-server")]
@@ -1000,6 +1278,9 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     }
     if path.ends_with("/stop") || path.ends_with("/cancel") {
         return Some("workers:stop");
+    }
+    if path == "/v1/protocol/ws" {
+        return Some("workers:list");
     }
     if path.ends_with("/protocol") || path.ends_with("/protocol/ws") {
         return Some("workers:protocol");
@@ -1963,6 +2244,138 @@ mod ws_tests {
             panic!("expected text frame");
         };
         serde_json::from_str(&text).unwrap()
+    }
+
+    async fn next_subscription_frame(
+        stream: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> SubscriptionFrame {
+        let message = stream.next().await.unwrap().unwrap();
+        let Message::Text(text) = message else {
+            panic!("expected text frame");
+        };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    async fn send_subscription_request(
+        stream: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        request: SubscriptionRequest,
+    ) {
+        let frame = SubscriptionFrame::new(SubscriptionFramePayload::Request(request));
+        stream
+            .send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
+            .await
+            .unwrap();
+    }
+
+    fn runtime_protocol_url(worker_protocol_url: &str) -> String {
+        let base = worker_protocol_url
+            .split_once("/v1/workers/")
+            .map(|(base, _)| base)
+            .unwrap();
+        format!("{base}/v1/protocol/ws")
+    }
+
+    #[tokio::test]
+    async fn runtime_protocol_ws_subscribes_and_filters_worker_lifecycle() {
+        let (runtime, worker_ref, worker_url) = spawn_runtime_server().await;
+        let other = runtime
+            .create_worker_scoped(
+                &RuntimeWorkspaceScope::new("local", "local-token"),
+                ws_create_request(),
+            )
+            .unwrap();
+        let url = runtime_protocol_url(&worker_url);
+        let (mut stream, _) = connect_async(authed_ws_request(&url)).await.unwrap();
+        let request_id = protocol::subscription::SubscriptionRequestId::new("subscribe-1").unwrap();
+        send_subscription_request(
+            &mut stream,
+            SubscriptionRequest::SubscribeEvents {
+                request_id: request_id.clone(),
+                selector: protocol::subscription::EventSubscriptionSelector::WorkerLifecycle {
+                    worker_ids: protocol::subscription::SubscriptionWorkerIds::new([
+                        protocol::subscription::SubscriptionWorkerId::new(
+                            worker_ref.worker_id.to_string(),
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap(),
+                },
+            },
+        )
+        .await;
+        let subscribed = next_subscription_frame(&mut stream).await;
+        let SubscriptionFramePayload::Response(SubscriptionResponse::Subscribed {
+            request_id: response_request_id,
+            subscription_id,
+            snapshot,
+            ..
+        }) = subscribed.payload
+        else {
+            panic!("expected subscribed response");
+        };
+        assert_eq!(response_request_id, request_id);
+        let protocol::subscription::SubscriptionSnapshot::Workers { workers } = snapshot else {
+            panic!("expected Worker snapshot");
+        };
+        assert_eq!(workers.len(), 1);
+        assert_eq!(
+            workers[0].worker_id.as_str(),
+            worker_ref.worker_id.to_string()
+        );
+
+        runtime
+            .observe_worker_event(
+                &other.worker_ref,
+                protocol::Event::Status {
+                    status: protocol::WorkerStatus::Running,
+                },
+            )
+            .unwrap();
+        runtime
+            .observe_worker_event(
+                &worker_ref,
+                protocol::Event::Status {
+                    status: protocol::WorkerStatus::Running,
+                },
+            )
+            .unwrap();
+        let event = next_subscription_frame(&mut stream).await;
+        assert!(matches!(
+            event.payload,
+            SubscriptionFramePayload::Event(SubscriptionEvent::Event {
+                subscription_id: delivered_subscription_id,
+                payload: protocol::subscription::SubscriptionEventPayload::WorkerUpserted {
+                    worker
+                },
+                ..
+            }) if delivered_subscription_id == subscription_id
+                && worker.worker_id.as_str() == worker_ref.worker_id.to_string()
+                && worker.state == protocol::subscription::SubscriptionWorkerState::Running
+        ));
+
+        let unsubscribe_request_id =
+            protocol::subscription::SubscriptionRequestId::new("unsubscribe-1").unwrap();
+        send_subscription_request(
+            &mut stream,
+            SubscriptionRequest::UnsubscribeEvents {
+                request_id: unsubscribe_request_id.clone(),
+                subscription_id: subscription_id.clone(),
+            },
+        )
+        .await;
+        let unsubscribed = next_subscription_frame(&mut stream).await;
+        assert!(matches!(
+            unsubscribed.payload,
+            SubscriptionFramePayload::Response(SubscriptionResponse::Unsubscribed {
+                request_id,
+                subscription_id: response_subscription_id,
+            }) if request_id == unsubscribe_request_id
+                && response_subscription_id == subscription_id
+        ));
     }
 
     #[tokio::test]
