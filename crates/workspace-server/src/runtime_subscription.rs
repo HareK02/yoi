@@ -148,6 +148,45 @@ impl RuntimeSubscriptionBroker {
         generation
     }
 
+    pub fn register_embedded_runtime(
+        &self,
+        runtime_id: impl Into<String>,
+        runtime: worker_runtime::Runtime,
+    ) -> u64 {
+        let runtime_id = runtime_id.into();
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let (commands, receiver) = mpsc::unbounded_channel();
+        let status = Arc::new(RwLock::new(RuntimeSubscriptionBrokerStatus {
+            connection_generation: generation,
+            connected: true,
+            ..Default::default()
+        }));
+        let previous = self
+            .registrations
+            .write()
+            .expect("broker registry poisoned")
+            .insert(
+                runtime_id.clone(),
+                Registration {
+                    generation,
+                    commands: commands.clone(),
+                    status: status.clone(),
+                },
+            );
+        if let Some(previous) = previous {
+            let _ = previous.commands.send(Command::Shutdown(generation));
+        }
+        tokio::spawn(run_embedded_connection(
+            runtime_id,
+            runtime,
+            self.workspace_id.to_string(),
+            generation,
+            receiver,
+            status,
+        ));
+        generation
+    }
+
     pub fn unregister_runtime(&self, runtime_id: &str) {
         if let Some(registration) = self
             .registrations
@@ -280,6 +319,112 @@ impl State {
             );
         }
     }
+}
+
+struct EmbeddedEntry {
+    downstreams: HashMap<u64, mpsc::Sender<BrokerSubscriptionEvent>>,
+    snapshot_revision: u64,
+    snapshot: SubscriptionSnapshot,
+    task: tokio::task::JoinHandle<()>,
+}
+
+async fn run_embedded_connection(
+    runtime_id: String,
+    runtime: worker_runtime::Runtime,
+    _workspace_id: String,
+    generation: u64,
+    mut commands: mpsc::UnboundedReceiver<Command>,
+    status: Arc<RwLock<RuntimeSubscriptionBrokerStatus>>,
+) {
+    let (updates, mut update_receiver) = mpsc::unbounded_channel();
+    let mut entries = HashMap::<EventSubscriptionSelector, EmbeddedEntry>::new();
+    let mut downstream_index = HashMap::<u64, EventSubscriptionSelector>::new();
+    loop {
+        tokio::select! {
+            command = commands.recv() => match command {
+                Some(Command::Subscribe { downstream_id, selector, events }) => {
+                    downstream_index.insert(downstream_id, selector.clone());
+                    if let Some(entry) = entries.get_mut(&selector) {
+                        let _ = events.try_send(BrokerSubscriptionEvent::Snapshot {
+                            connection_generation: generation,
+                            snapshot_revision: entry.snapshot_revision,
+                            snapshot: entry.snapshot.clone(),
+                        });
+                        entry.downstreams.insert(downstream_id, events);
+                    } else {
+                        match runtime.subscribe_event_selector(selector.clone()) {
+                            Ok(mut subscription) => {
+                                let snapshot_revision = subscription.snapshot_revision();
+                                let snapshot = project_snapshot_runtime(subscription.snapshot().clone(), &runtime_id);
+                                let _ = events.try_send(BrokerSubscriptionEvent::Snapshot { connection_generation: generation, snapshot_revision, snapshot: snapshot.clone() });
+                                let sender = updates.clone();
+                                let task_selector = selector.clone();
+                                let task_runtime_id = runtime_id.clone();
+                                let task = tokio::spawn(async move {
+                                    while let Ok(update) = subscription.recv().await {
+                                        let payload = project_payload_runtime(update.payload, &task_runtime_id);
+                                        if sender.send((task_selector.clone(), update.subject_revision, payload)).is_err() { break; }
+                                    }
+                                });
+                                entries.insert(selector, EmbeddedEntry { downstreams: HashMap::from([(downstream_id, events)]), snapshot_revision, snapshot, task });
+                            }
+                            Err(error) => {
+                                let _ = events.try_send(BrokerSubscriptionEvent::Rejected { connection_generation: generation, code: SubscriptionRejectionCode::UnsupportedSelector, message: error.to_string() });
+                            }
+                        }
+                    }
+                }
+                Some(Command::Unsubscribe(id)) => {
+                    if let Some(selector) = downstream_index.remove(&id) {
+                        let empty = entries.get_mut(&selector).is_some_and(|entry| { entry.downstreams.remove(&id); entry.downstreams.is_empty() });
+                        if empty { if let Some(entry) = entries.remove(&selector) { entry.task.abort(); } }
+                    }
+                }
+                Some(Command::Shutdown(replacement)) => {
+                    for entry in entries.values_mut() {
+                        broadcast(&mut entry.downstreams, BrokerSubscriptionEvent::Closed { connection_generation: generation, code: SubscriptionTerminationCode::ServerShutdown, message: format!("embedded Runtime generation {generation} was fenced by {replacement}") });
+                        entry.task.abort();
+                    }
+                    return;
+                }
+                None => return,
+            },
+            update = update_receiver.recv() => {
+                let Some((selector, subject_revision, payload)) = update else { return; };
+                if let Some(entry) = entries.get_mut(&selector) {
+                    broadcast(&mut entry.downstreams, BrokerSubscriptionEvent::Event { connection_generation: generation, subject_revision, payload });
+                }
+            }
+        }
+        *status.write().expect("broker status poisoned") = RuntimeSubscriptionBrokerStatus {
+            connection_generation: generation,
+            connected: true,
+            desired_selectors: entries.len(),
+            upstream_subscriptions: entries.len(),
+        };
+    }
+}
+
+fn project_snapshot_runtime(
+    mut snapshot: SubscriptionSnapshot,
+    runtime_id: &str,
+) -> SubscriptionSnapshot {
+    if let SubscriptionSnapshot::Workers { workers } = &mut snapshot {
+        for worker in workers {
+            worker.runtime_id = Some(runtime_id.to_string());
+        }
+    }
+    snapshot
+}
+
+fn project_payload_runtime(
+    mut payload: SubscriptionEventPayload,
+    runtime_id: &str,
+) -> SubscriptionEventPayload {
+    if let SubscriptionEventPayload::WorkerUpserted { worker } = &mut payload {
+        worker.runtime_id = Some(runtime_id.to_string());
+    }
+    payload
 }
 
 async fn run_connection(

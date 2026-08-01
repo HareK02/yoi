@@ -1427,6 +1427,10 @@ impl EmbeddedWorkerRuntime {
         self
     }
 
+    pub(crate) fn subscription_runtime(&self) -> worker_runtime::Runtime {
+        self.runtime.clone()
+    }
+
     pub fn from_runtime(workspace_id: impl AsRef<str>, runtime: worker_runtime::Runtime) -> Self {
         let workspace_id = workspace_id.as_ref().to_string();
         Self {

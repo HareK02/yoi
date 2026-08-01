@@ -308,19 +308,20 @@ impl WorkspaceApi {
             .await?;
         import_configured_repositories(store.as_ref(), &config)?;
         config.repositories = load_configured_repositories_from_store(store.as_ref(), &config)?;
-        let runtime = RuntimeRegistry::for_workspace(
-            EmbeddedWorkerRuntime::new_fs_store_with_execution_backend(
-                config.workspace_id.clone(),
-                config.embedded_runtime_store_root.clone(),
-                execution_backend,
-            )
-            .map(|runtime| runtime.with_resource_broker(resource_broker.clone()))
-            .map_err(|err| {
-                crate::Error::Store(format!("invalid embedded Worker backend: {err}"))
-            })?,
-        );
+        let embedded_runtime = EmbeddedWorkerRuntime::new_fs_store_with_execution_backend(
+            config.workspace_id.clone(),
+            config.embedded_runtime_store_root.clone(),
+            execution_backend,
+        )
+        .map(|runtime| runtime.with_resource_broker(resource_broker.clone()))
+        .map_err(|err| crate::Error::Store(format!("invalid embedded Worker backend: {err}")))?;
+        let embedded_subscription_runtime = embedded_runtime.subscription_runtime();
+        let embedded_runtime_id = EMBEDDED_WORKER_RUNTIME_ID.to_string();
+        let runtime = RuntimeRegistry::for_workspace(embedded_runtime);
         let runtime_subscription_broker =
             RuntimeSubscriptionBroker::new(config.workspace_id.clone());
+        runtime_subscription_broker
+            .register_embedded_runtime(embedded_runtime_id, embedded_subscription_runtime);
         for remote_config in config.remote_runtime_sources.iter().cloned() {
             let remote_runtime = RemoteWorkerRuntime::new(
                 remote_config.clone(),

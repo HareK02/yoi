@@ -276,3 +276,40 @@ async fn reconnect_resubscribes_and_replaces_state_from_fresh_snapshot() {
     assert_eq!(workers.len(), 2);
     restarted.abort();
 }
+
+#[tokio::test]
+async fn embedded_runtime_uses_in_process_subscription_source() {
+    let (runtime, _config, server) = fixture().await;
+    let worker = runtime.list_workers().unwrap().remove(0);
+    let broker = RuntimeSubscriptionBroker::new("local");
+    broker.register_embedded_runtime("embedded-worker-runtime", runtime.clone());
+    let mut subscription = broker
+        .subscribe(
+            "embedded-worker-runtime",
+            EventSubscriptionSelector::RuntimeWorkers,
+        )
+        .unwrap();
+    let BrokerSubscriptionEvent::Snapshot { snapshot, .. } = next_snapshot(&mut subscription).await
+    else {
+        panic!("expected embedded snapshot");
+    };
+    let SubscriptionSnapshot::Workers { workers } = snapshot else {
+        panic!("expected Worker snapshot");
+    };
+    assert_eq!(
+        workers[0].runtime_id.as_deref(),
+        Some("embedded-worker-runtime")
+    );
+    runtime
+        .observe_worker_event(
+            &worker.worker_ref,
+            protocol::Event::Status {
+                status: protocol::WorkerStatus::Running,
+            },
+        )
+        .unwrap();
+    assert!(matches!(next_event(&mut subscription).await,
+        BrokerSubscriptionEvent::Event { payload: SubscriptionEventPayload::WorkerUpserted { worker }, .. }
+        if worker.runtime_id.as_deref() == Some("embedded-worker-runtime") && worker.state == SubscriptionWorkerState::Running));
+    server.abort();
+}
