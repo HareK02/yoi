@@ -283,6 +283,7 @@ async fn embedded_runtime_uses_in_process_subscription_source() {
     let worker = runtime.list_workers().unwrap().remove(0);
     let broker = RuntimeSubscriptionBroker::new("local");
     broker.register_embedded_runtime("embedded-worker-runtime", runtime.clone());
+    assert_eq!(broker.runtime_ids(), vec!["embedded-worker-runtime"]);
     let mut subscription = broker
         .subscribe(
             "embedded-worker-runtime",

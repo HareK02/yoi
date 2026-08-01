@@ -200,6 +200,18 @@ impl RuntimeSubscriptionBroker {
         }
     }
 
+    pub fn runtime_ids(&self) -> Vec<String> {
+        let mut runtime_ids = self
+            .registrations
+            .read()
+            .expect("broker registry poisoned")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        runtime_ids.sort();
+        runtime_ids
+    }
+
     pub fn status(&self, runtime_id: &str) -> Option<RuntimeSubscriptionBrokerStatus> {
         let status = self
             .registrations
