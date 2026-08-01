@@ -242,6 +242,7 @@ impl RuntimeSubscriptionBroker {
             })?;
         let downstream_id = self.next_downstream.fetch_add(1, Ordering::Relaxed);
         let (events, receiver) = mpsc::channel(DOWNSTREAM_QUEUE_CAPACITY);
+        let initial_events = events.clone();
         registration
             .commands
             .send(Command::Subscribe {
@@ -250,6 +251,17 @@ impl RuntimeSubscriptionBroker {
                 events,
             })
             .map_err(|_| RuntimeSubscriptionBrokerError::Closed)?;
+        let initial_status = registration
+            .status
+            .read()
+            .expect("broker status poisoned")
+            .clone();
+        if !initial_status.connected {
+            let _ = initial_events.try_send(BrokerSubscriptionEvent::Disconnected {
+                connection_generation: initial_status.connection_generation,
+                message: "Runtime subscription connection is not currently available".to_string(),
+            });
+        }
         Ok(BrokerSubscription {
             downstream_id,
             runtime_id: runtime_id.to_string(),
@@ -291,6 +303,7 @@ impl SelectorState {
 }
 
 struct State {
+    runtime_id: String,
     generation: u64,
     next_request: u64,
     selectors: HashMap<EventSubscriptionSelector, SelectorState>,
@@ -299,8 +312,9 @@ struct State {
     upstream_index: HashMap<SubscriptionId, EventSubscriptionSelector>,
 }
 impl State {
-    fn new(generation: u64) -> Self {
+    fn new(runtime_id: String, generation: u64) -> Self {
         Self {
+            runtime_id,
             generation,
             next_request: 1,
             selectors: HashMap::new(),
@@ -433,8 +447,17 @@ fn project_payload_runtime(
     mut payload: SubscriptionEventPayload,
     runtime_id: &str,
 ) -> SubscriptionEventPayload {
-    if let SubscriptionEventPayload::WorkerUpserted { worker } = &mut payload {
-        worker.runtime_id = Some(runtime_id.to_string());
+    match &mut payload {
+        SubscriptionEventPayload::WorkerUpserted { worker } => {
+            worker.runtime_id = Some(runtime_id.to_string());
+        }
+        SubscriptionEventPayload::WorkerRemoved {
+            runtime_id: projected_runtime_id,
+            ..
+        } => {
+            *projected_runtime_id = Some(runtime_id.to_string());
+        }
+        _ => {}
     }
     payload
 }
@@ -446,7 +469,7 @@ async fn run_connection(
     mut commands: mpsc::UnboundedReceiver<Command>,
     status: Arc<RwLock<RuntimeSubscriptionBrokerStatus>>,
 ) {
-    let mut state = State::new(generation);
+    let mut state = State::new(config.runtime_id.clone(), generation);
     let mut disconnect_notified = false;
     loop {
         update_status(&status, &state, false);
@@ -653,6 +676,7 @@ async fn handle_frame(
             if state.pending.remove(&request_id) != Some(selector.clone()) {
                 return Err(());
             }
+            let snapshot = project_snapshot_runtime(snapshot, &state.runtime_id);
             let entry = state.selectors.get_mut(&selector).ok_or(())?;
             entry.pending = false;
             entry.upstream_id = Some(subscription_id.clone());
@@ -704,6 +728,7 @@ async fn handle_frame(
                 .cloned()
                 .ok_or(())?;
             payload.validate_for_selector(&selector).map_err(|_| ())?;
+            let payload = project_payload_runtime(payload, &state.runtime_id);
             let entry = state.selectors.get_mut(&selector).ok_or(())?;
             if let Some(subject) = event_subject(&payload) {
                 let revision = entry.revisions.entry(subject).or_insert(0);
@@ -793,7 +818,16 @@ fn snapshot_revisions(snapshot: &SubscriptionSnapshot) -> HashMap<String, u64> {
     match snapshot {
         SubscriptionSnapshot::Workers { workers } => workers
             .iter()
-            .map(|worker| (worker.worker_id.to_string(), worker.subject_revision))
+            .map(|worker| {
+                (
+                    format!(
+                        "{}:{}",
+                        worker.runtime_id.as_deref().unwrap_or_default(),
+                        worker.worker_id
+                    ),
+                    worker.subject_revision,
+                )
+            })
             .collect(),
         SubscriptionSnapshot::WorkerProtocol { worker_id, .. } => {
             HashMap::from([(worker_id.to_string(), 0)])
@@ -803,9 +837,20 @@ fn snapshot_revisions(snapshot: &SubscriptionSnapshot) -> HashMap<String, u64> {
 }
 fn event_subject(payload: &SubscriptionEventPayload) -> Option<String> {
     Some(match payload {
-        SubscriptionEventPayload::WorkerUpserted { worker } => worker.worker_id.to_string(),
-        SubscriptionEventPayload::WorkerRemoved { worker_id }
-        | SubscriptionEventPayload::WorkerProtocol { worker_id, .. } => worker_id.to_string(),
+        SubscriptionEventPayload::WorkerUpserted { worker } => format!(
+            "{}:{}",
+            worker.runtime_id.as_deref().unwrap_or_default(),
+            worker.worker_id
+        ),
+        SubscriptionEventPayload::WorkerRemoved {
+            worker_id,
+            runtime_id,
+        } => format!(
+            "{}:{}",
+            runtime_id.as_deref().unwrap_or_default(),
+            worker_id
+        ),
+        SubscriptionEventPayload::WorkerProtocol { worker_id, .. } => worker_id.to_string(),
         SubscriptionEventPayload::WorkdirUpserted { workdir } => {
             workdir.working_directory_id.to_string()
         }

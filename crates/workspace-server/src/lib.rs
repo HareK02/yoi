@@ -23,6 +23,7 @@ pub mod runtime_subscription;
 pub mod server;
 pub mod skills;
 pub mod store;
+mod workspace_subscription;
 
 pub use authority::{
     MemoryAuthority, MemoryDocument, MemoryStagingEntry, MemoryStagingResolution,

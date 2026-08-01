@@ -2177,6 +2177,7 @@ impl RuntimeState {
                 subject_revision,
                 payload: SubscriptionEventPayload::WorkerRemoved {
                     worker_id: worker_id.clone(),
+                    runtime_id: None,
                 },
             },
         );

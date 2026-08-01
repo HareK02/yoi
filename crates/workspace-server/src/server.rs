@@ -868,6 +868,10 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             get(scoped_list_workers).post(scoped_create_workspace_worker),
         )
         .route(
+            "/api/w/{workspace_id}/protocol/ws",
+            get(scoped_workspace_protocol_ws),
+        )
+        .route(
             "/api/workers/launch-options",
             get(get_worker_launch_options),
         )
@@ -3777,6 +3781,38 @@ async fn scoped_list_runtimes(
 ) -> ApiResult<Json<RuntimeListResponse<RuntimeSummary>>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     list_runtimes(State(api)).await
+}
+
+async fn scoped_workspace_protocol_ws(
+    State(api): State<WorkspaceApi>,
+    AxumPath(workspace_id): AxumPath<String>,
+    headers: HeaderMap,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> std::result::Result<Response, Response> {
+    validate_workspace_scope(&api, &workspace_id).map_err(|error| error.into_response())?;
+    let actor = resolve_actor(&api, &headers)
+        .await
+        .map_err(|error| error.into_response())?
+        .ok_or_else(|| StatusCode::UNAUTHORIZED.into_response())?;
+    let workspace = api
+        .store
+        .get_workspace(&workspace_id)
+        .await
+        .map_err(|error| ApiError::from(error).into_response())?
+        .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
+    if workspace
+        .owner_account_id
+        .as_deref()
+        .is_some_and(|owner| owner != actor.account_id.as_str())
+    {
+        return Err(StatusCode::FORBIDDEN.into_response());
+    }
+    let broker = api.runtime_subscription_broker().clone();
+    Ok(ws
+        .on_upgrade(move |socket| {
+            crate::workspace_subscription::serve_workspace_subscription(broker, socket)
+        })
+        .into_response())
 }
 
 async fn scoped_list_workers(
@@ -8716,6 +8752,7 @@ mod tests {
     use std::{fs, sync::Arc};
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tower::ServiceExt;
     use worker_runtime::resource::BackendResourceClient;
     use worker_runtime::working_directory::WorkingDirectoryMaterializer;
@@ -8725,8 +8762,9 @@ mod tests {
         WorkerSpawnIntent,
     };
     use crate::store::{
-        MemoryDocumentRecord, MemoryStagingRecord, ObjectiveRecord, ObjectiveResourceRecord,
-        ObjectiveTicketLinkRecord, SqliteWorkspaceStore, WorkspaceRecord,
+        AccountRecord, MemoryDocumentRecord, MemoryStagingRecord, ObjectiveRecord,
+        ObjectiveResourceRecord, ObjectiveTicketLinkRecord, SqliteWorkspaceStore, UserRecord,
+        WorkspaceRecord,
     };
 
     const TEST_WORKSPACE_ID: &str = "0192f0e8-4d84-7d6e-a000-000000000001";
@@ -12621,6 +12659,105 @@ mod tests {
             format!("ws://{app_addr}/api/runtimes/{runtime_id}/workers/{worker_id}/protocol/ws"),
             dir,
         )
+    }
+
+    #[tokio::test]
+    async fn workspace_subscription_requires_browser_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = build_router(test_api(dir.path()).await);
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let error = tokio_tungstenite::connect_async(format!(
+            "ws://{address}/api/w/{TEST_WORKSPACE_ID}/protocol/ws"
+        ))
+        .await
+        .unwrap_err();
+        let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
+            panic!("expected HTTP authentication rejection");
+        };
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn workspace_subscription_returns_authenticated_workspace_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let account = AccountRecord {
+            account_id: "account-test".to_string(),
+            kind: "user".to_string(),
+            handle: "tester".to_string(),
+            display_name: "Tester".to_string(),
+            created_at: TEST_CREATED_AT.to_string(),
+            updated_at: TEST_CREATED_AT.to_string(),
+        };
+        let user = UserRecord {
+            user_id: "user-test".to_string(),
+            account_id: account.account_id.clone(),
+            handle: account.handle.clone(),
+            display_name: account.display_name.clone(),
+            created_at: TEST_CREATED_AT.to_string(),
+            updated_at: TEST_CREATED_AT.to_string(),
+        };
+        api.store.upsert_account(&account).unwrap();
+        api.store.upsert_user(&user).unwrap();
+        let session = issue_browser_session_response(&api, user).unwrap();
+        let cookie = session
+            .headers()
+            .get(SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = build_router(api);
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut request = format!("ws://{address}/api/w/{TEST_WORKSPACE_ID}/protocol/ws")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert(axum::http::header::COOKIE, cookie.parse().unwrap());
+        let (mut socket, _) = connect_async(request).await.unwrap();
+        let frame = protocol::subscription::SubscriptionFrame::new(
+            protocol::subscription::SubscriptionFramePayload::Request(
+                protocol::subscription::SubscriptionRequest::SubscribeEvents {
+                    request_id: protocol::subscription::SubscriptionRequestId::new("request-1")
+                        .unwrap(),
+                    selector: protocol::subscription::EventSubscriptionSelector::WorkspaceWorkers,
+                },
+            ),
+        );
+        socket
+            .send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
+            .await
+            .unwrap();
+        let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+            panic!("expected subscription response");
+        };
+        let response: protocol::subscription::SubscriptionFrame =
+            serde_json::from_str(text.as_str()).unwrap();
+        assert!(matches!(
+            response.payload,
+            protocol::subscription::SubscriptionFramePayload::Response(
+                protocol::subscription::SubscriptionResponse::Subscribed {
+                    selector: protocol::subscription::EventSubscriptionSelector::WorkspaceWorkers,
+                    snapshot: protocol::subscription::SubscriptionSnapshot::Workers { .. },
+                    ..
+                }
+            )
+        ));
+        server.abort();
     }
 
     #[tokio::test]

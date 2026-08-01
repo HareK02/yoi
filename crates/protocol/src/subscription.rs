@@ -643,6 +643,8 @@ pub enum SubscriptionEventPayload {
     },
     WorkerRemoved {
         worker_id: SubscriptionWorkerId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime_id: Option<String>,
     },
     WorkerProtocol {
         worker_id: SubscriptionWorkerId,
@@ -660,9 +662,17 @@ impl SubscriptionEventPayload {
     pub fn validate(&self) -> Result<(), SubscriptionValidationError> {
         match self {
             Self::WorkerUpserted { worker } => worker.validate(),
-            Self::WorkerRemoved { worker_id } | Self::WorkerProtocol { worker_id, .. } => {
-                worker_id.validate()
+            Self::WorkerRemoved {
+                worker_id,
+                runtime_id,
+            } => {
+                worker_id.validate()?;
+                if let Some(runtime_id) = runtime_id {
+                    validate_identifier("runtime_id", runtime_id, MAX_RESOURCE_ID_BYTES)?;
+                }
+                Ok(())
             }
+            Self::WorkerProtocol { worker_id, .. } => worker_id.validate(),
             Self::WorkdirUpserted { workdir } => workdir.validate(),
             Self::WorkdirRemoved {
                 working_directory_id,
@@ -688,7 +698,7 @@ impl SubscriptionEventPayload {
             ) if worker_ids.contains(&worker.worker_id) => Ok(()),
             (
                 EventSubscriptionSelector::WorkerLifecycle { worker_ids },
-                Self::WorkerRemoved { worker_id },
+                Self::WorkerRemoved { worker_id, .. },
             ) if worker_ids.contains(worker_id) => Ok(()),
             (
                 EventSubscriptionSelector::WorkerProtocol {
@@ -708,7 +718,7 @@ impl SubscriptionEventPayload {
             }),
             (
                 EventSubscriptionSelector::WorkerLifecycle { .. },
-                Self::WorkerRemoved { worker_id },
+                Self::WorkerRemoved { worker_id, .. },
             ) => Err(SubscriptionValidationError::UnselectedWorker {
                 worker_id: worker_id.to_string(),
             }),
@@ -721,7 +731,7 @@ fn validate_workers(workers: &[SubscriptionWorker]) -> Result<(), SubscriptionVa
     let mut seen = HashSet::with_capacity(workers.len());
     for worker in workers {
         worker.validate()?;
-        if !seen.insert(&worker.worker_id) {
+        if !seen.insert((worker.runtime_id.as_deref(), &worker.worker_id)) {
             return Err(SubscriptionValidationError::DuplicateWorkerId {
                 worker_id: worker.worker_id.to_string(),
             });
@@ -868,6 +878,7 @@ mod tests {
             subject_revision: 8,
             payload: SubscriptionEventPayload::WorkerRemoved {
                 worker_id: worker_id("worker-2"),
+                runtime_id: None,
             },
         };
         assert!(matches!(
@@ -878,6 +889,19 @@ mod tests {
             event.validate_for_selector(&EventSubscriptionSelector::WorkspaceWorkdirs),
             Err(SubscriptionValidationError::SelectorEventMismatch)
         ));
+    }
+
+    #[test]
+    fn workspace_snapshot_allows_equal_local_worker_ids_from_distinct_runtimes() {
+        let mut first = worker("1");
+        first.runtime_id = Some("runtime-a".to_string());
+        let mut second = worker("1");
+        second.runtime_id = Some("runtime-b".to_string());
+        SubscriptionSnapshot::Workers {
+            workers: vec![first, second],
+        }
+        .validate_for_selector(&EventSubscriptionSelector::WorkspaceWorkers)
+        .unwrap();
     }
 
     #[test]
