@@ -7,6 +7,13 @@ use crate::{
     InFlightBlock, InFlightSnapshot, InFlightToolCallState, InvokeKind, MemoryWorkerEvent, Method,
     Permission, RewindSummary, RewindTarget, RewindTargetId, RunResult, ScopeRule, Segment,
     TurnResult, WorkerEvent, WorkerStatus,
+    subscription::{
+        EventSubscriptionSelector, SubscriptionEvent, SubscriptionEventPayload, SubscriptionFrame,
+        SubscriptionFramePayload, SubscriptionId, SubscriptionRejectionCode, SubscriptionRequest,
+        SubscriptionRequestId, SubscriptionResponse, SubscriptionSnapshot,
+        SubscriptionTerminationCode, SubscriptionWorkdir, SubscriptionWorkdirId,
+        SubscriptionWorker, SubscriptionWorkerId, SubscriptionWorkerIds, SubscriptionWorkerState,
+    },
 };
 
 const GENERATED_RELATIVE_PATH: &str = "../../web/workspace/src/lib/generated/protocol.ts";
@@ -50,6 +57,24 @@ pub fn generated_protocol_types() -> String {
     push_decl::<MemoryWorkerEvent>(&cfg, &mut output);
     push_decl::<Segment>(&cfg, &mut output);
     push_decl::<WorkerEvent>(&cfg, &mut output);
+    push_decl::<SubscriptionRequestId>(&cfg, &mut output);
+    push_decl::<SubscriptionId>(&cfg, &mut output);
+    push_decl::<SubscriptionWorkerId>(&cfg, &mut output);
+    push_decl::<SubscriptionWorkdirId>(&cfg, &mut output);
+    push_decl::<SubscriptionWorkerIds>(&cfg, &mut output);
+    push_decl::<SubscriptionWorkerState>(&cfg, &mut output);
+    push_decl::<EventSubscriptionSelector>(&cfg, &mut output);
+    push_decl::<SubscriptionWorker>(&cfg, &mut output);
+    push_decl::<SubscriptionWorkdir>(&cfg, &mut output);
+    push_decl::<SubscriptionSnapshot>(&cfg, &mut output);
+    push_decl::<SubscriptionEventPayload>(&cfg, &mut output);
+    push_decl::<SubscriptionRejectionCode>(&cfg, &mut output);
+    push_decl::<SubscriptionTerminationCode>(&cfg, &mut output);
+    push_decl::<SubscriptionRequest>(&cfg, &mut output);
+    push_decl::<SubscriptionResponse>(&cfg, &mut output);
+    push_decl::<SubscriptionEvent>(&cfg, &mut output);
+    push_decl::<SubscriptionFramePayload>(&cfg, &mut output);
+    push_decl::<SubscriptionFrame>(&cfg, &mut output);
     push_decl::<Method>(&cfg, &mut output);
     push_decl::<Event>(&cfg, &mut output);
 

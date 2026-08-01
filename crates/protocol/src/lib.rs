@@ -1,5 +1,6 @@
 #[cfg(feature = "stream")]
 pub mod stream;
+pub mod subscription;
 #[cfg(feature = "typescript")]
 pub mod typescript;
 
