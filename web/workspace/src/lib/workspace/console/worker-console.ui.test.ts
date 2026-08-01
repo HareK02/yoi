@@ -125,9 +125,12 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
     workersNav.includes("href={`/w/${workspaceId}/workers`}") &&
       workersNav.includes("filter(canShowWorkerInSidebar)") &&
       workersNav.includes("worker.display_name || worker.label") &&
-      workersNav.includes("worker {worker.worker_id}") &&
+      workersNav.includes("worker-status-dot") &&
+      workersNav.includes("worker-status-spinner") &&
+      workersNav.includes("worker.repository_id ?? '—'") &&
+      workersNav.includes("worker.working_directory_id ?? '—'") &&
       !workersNav.includes('aria-disabled="true"'),
-    "Workers sidebar should link to the Worker list page and omit registry-only Workers",
+    "Workers sidebar should link to the Worker list page and show state indicators with repository/workdir metadata",
   );
   assert(
     !sidebar.includes("CompanionNavSection") &&

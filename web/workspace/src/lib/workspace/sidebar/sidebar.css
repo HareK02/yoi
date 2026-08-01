@@ -211,29 +211,81 @@
     color: var(--text-muted);
     font-size: 0.82rem;
   }
-  .worker-nav-item {
-    gap: 2px;
-  }
-  .worker-nav-item.disabled {
-    cursor: default;
-    opacity: 0.62;
-  }
-  .worker-nav-item.disabled .item-title {
-    color: var(--text-muted);
-  }
-  .worker-title-row {
+  .worker-nav-link {
     display: grid;
-    grid-template-columns: minmax(0, max-content) minmax(0, 1fr);
-    align-items: baseline;
-    gap: var(--space-2);
-    min-width: 0;
-  }
-  .worker-task-title {
-    overflow: hidden;
+    grid-template-columns: 0.75rem minmax(0, 1fr);
+    grid-template-rows: auto auto;
+    column-gap: var(--space-2);
+    row-gap: 0.1rem;
+    margin: 0.0625rem 0;
+    padding: var(--space-2);
+    border-radius: var(--radius-soft);
     color: var(--text-muted);
-    font-size: 0.82rem;
+    text-decoration: none;
+  }
+  .worker-nav-link:hover {
+    background: var(--interactive-hover);
+    color: var(--text-strong);
+  }
+  .worker-nav-link.active {
+    background: var(--interactive-selected);
+    color: var(--accent);
+  }
+  .worker-status-indicator {
+    grid-column: 1;
+    grid-row: 1;
+    display: grid;
+    width: 0.75rem;
+    min-height: 1.1rem;
+    place-items: center;
+  }
+  .worker-status-dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    background: var(--success);
+  }
+  .worker-status-spinner {
+    width: 0.625rem;
+    height: 0.625rem;
+    border: 0.125rem solid color-mix(in oklch, var(--accent) 25%, transparent);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: worker-status-spin 0.8s linear infinite;
+  }
+  .worker-nav-label {
+    grid-column: 2;
+    grid-row: 1;
+    min-width: 0;
+    overflow: hidden;
+    color: inherit;
+    font-size: 0.78rem;
+    font-weight: 600;
+    line-height: 1.1rem;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .worker-nav-meta {
+    grid-column: 2;
+    grid-row: 2;
+    min-width: 0;
+    overflow: hidden;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+    line-height: 1rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  @keyframes worker-status-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .worker-status-spinner {
+      animation: none;
+    }
   }
 
   @media (max-width: 760px) {

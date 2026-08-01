@@ -1,8 +1,10 @@
 <script lang="ts">
   import { workerConsoleHref } from '$lib/workspace/console/model';
-  import { workspaceWorkersStore } from './worker-subscription';
+  import {
+    workspaceWorkersStore,
+    type SidebarWorker,
+  } from './worker-subscription';
   import { canShowWorkerInSidebar } from './workers';
-  import type { Worker } from './types';
 
   const MAX_VISIBLE_WORKERS = 6;
 
@@ -14,14 +16,16 @@
   let { currentPath = '/', workspaceId }: Props = $props();
   let loading = $state(true);
   let error = $state<string | null>(null);
-  let workers = $state<Worker[]>([]);
+  let workers = $state<SidebarWorker[]>([]);
 
   $effect(() => {
     const subscription = workspaceWorkersStore(workspaceId);
     return subscription.subscribe((state) => {
       loading = state.loading;
       error = state.error;
-      workers = state.workers.filter(canShowWorkerInSidebar).slice(0, MAX_VISIBLE_WORKERS);
+      workers = state.workers
+        .filter(canShowWorkerInSidebar)
+        .slice(0, MAX_VISIBLE_WORKERS);
     });
   });
 </script>
@@ -59,15 +63,23 @@
       {#each workers as worker (`${worker.runtime_id}:${worker.worker_id}`)}
         {@const href = workerConsoleHref(worker, workspaceId)}
         <li>
-          <a href={href} class="nav-item worker-nav-item" class:active={currentPath === href} aria-current={currentPath === href ? 'page' : undefined}>
-            <span class="worker-title-row">
-              <span class="item-title">{worker.display_name || worker.label}</span>
-              <span class="worker-task-title">-</span>
+          <a
+            href={href}
+            class="worker-nav-link"
+            class:active={currentPath === href}
+            aria-current={currentPath === href ? 'page' : undefined}
+          >
+            <span class="worker-status-indicator">
+              {#if worker.state === 'idle'}
+                <span class="worker-status-dot" aria-label="Idle"></span>
+              {:else if worker.state === 'running'}
+                <span class="worker-status-spinner" aria-label="Running"></span>
+              {/if}
             </span>
-            <span class="item-meta">
-              worker {worker.worker_id} · {worker.profile ? `${worker.profile} · ` : ''}{worker.state} · 🖥 {worker.host_id}
-              {worker.working_directory?.current_ref ? ` · wd:${worker.working_directory.repository_id}@${worker.working_directory.current_ref.slice(0, 8)}` : ''}
-            </span>
+            <span class="worker-nav-label">{worker.display_name || worker.label}</span>
+            <small class="worker-nav-meta">
+              {worker.repository_id ?? '—'}・{worker.working_directory_id ?? '—'}
+            </small>
           </a>
         </li>
       {/each}

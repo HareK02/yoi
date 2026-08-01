@@ -561,6 +561,8 @@ pub struct SubscriptionWorker {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_directory_id: Option<SubscriptionWorkdirId>,
 }
 
@@ -569,6 +571,9 @@ impl SubscriptionWorker {
         self.worker_id.validate()?;
         if let Some(runtime_id) = &self.runtime_id {
             validate_identifier("runtime_id", runtime_id, MAX_RESOURCE_ID_BYTES)?;
+        }
+        if let Some(repository_id) = &self.repository_id {
+            validate_identifier("repository_id", repository_id, MAX_RESOURCE_ID_BYTES)?;
         }
         if let Some(working_directory_id) = &self.working_directory_id {
             working_directory_id.validate()?;
@@ -794,6 +799,7 @@ mod tests {
             workspace_id: Some("workspace-1".to_string()),
             display_name: Some(format!("Worker {value}")),
             profile: Some("builtin:coder".to_string()),
+            repository_id: None,
             working_directory_id: None,
         }
     }

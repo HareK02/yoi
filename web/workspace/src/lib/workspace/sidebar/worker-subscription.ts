@@ -5,12 +5,18 @@ import {
   applyWorkspaceWorkersFrame,
   createWorkspaceWorkersProjection,
 } from './worker-subscription-model';
+import { compareWorkersForSidebar } from './workers';
 import type { Worker } from './types';
+
+export type SidebarWorker = Worker & {
+  repository_id: string | null;
+  working_directory_id: string | null;
+};
 
 export type WorkspaceWorkersState = {
   loading: boolean;
   error: string | null;
-  workers: Worker[];
+  workers: SidebarWorker[];
 };
 
 const stores = new Map<string, Readable<WorkspaceWorkersState>>();
@@ -29,10 +35,7 @@ export function workspaceWorkersStore(workspaceId: string): Readable<WorkspaceWo
       const publish = (loading = false, error: string | null = null) => {
         const workers = [...projection.workers.values()]
           .map(projectWorker)
-          .sort((left, right) =>
-            left.runtime_id.localeCompare(right.runtime_id) ||
-            left.worker_id.localeCompare(right.worker_id)
-          );
+          .sort(compareWorkersForSidebar);
         set({ loading, error, workers });
       };
       const subscription = workspaceMultiplexer(workspaceId).subscribe(
@@ -68,7 +71,7 @@ export function workspaceWorkersStore(workspaceId: string): Readable<WorkspaceWo
   return store;
 }
 
-function projectWorker(worker: SubscriptionWorker): Worker {
+function projectWorker(worker: SubscriptionWorker): SidebarWorker {
   if (!worker.runtime_id) throw new Error('Workspace Worker projection is missing runtime_id');
   const displayName = worker.display_name ?? `Worker ${worker.worker_id}`;
   return {
@@ -91,6 +94,8 @@ function projectWorker(worker: SubscriptionWorker): Worker {
       can_stop: worker.state !== 'stopped' && worker.state !== 'cancelled',
       can_spawn_followup: false,
     },
+    repository_id: worker.repository_id ?? null,
+    working_directory_id: worker.working_directory_id ?? null,
     working_directory: null,
     diagnostics: [],
   };

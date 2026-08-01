@@ -1952,6 +1952,10 @@ impl RuntimeState {
     ) -> Result<SubscriptionWorker, RuntimeError> {
         let worker_id = SubscriptionWorkerId::new(worker.worker_id.to_string())
             .map_err(subscription_validation_error)?;
+        let repository_id = worker
+            .working_directory
+            .as_ref()
+            .map(|working_directory| working_directory.summary.repository_id.clone());
         let working_directory_id = worker
             .working_directory
             .as_ref()
@@ -1975,6 +1979,7 @@ impl RuntimeState {
             workspace_id: worker.workspace_id.clone(),
             display_name: worker.request.display_name.clone(),
             profile,
+            repository_id,
             working_directory_id,
         })
     }
