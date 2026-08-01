@@ -90,6 +90,7 @@ use crate::repositories::{
     RepositoryRegistryReader, RepositorySummary,
 };
 use crate::resource_broker::BackendResourceBroker;
+use crate::runtime_subscription::RuntimeSubscriptionBroker;
 use crate::skills;
 use crate::store::{
     AccountRecord, ApiTokenRecord, AuthChallengeRecord, BrowserSessionRecord, ControlPlaneStore,
@@ -248,6 +249,7 @@ pub struct WorkspaceApi {
     runtime: Arc<RuntimeRegistry>,
     companion: Arc<CompanionConsole>,
     observation_proxy: BackendObservationProxy,
+    runtime_subscription_broker: RuntimeSubscriptionBroker,
     resource_broker: BackendResourceBroker,
     credential_operation_lock: Arc<std::sync::Mutex<()>>,
 }
@@ -317,19 +319,21 @@ impl WorkspaceApi {
                 crate::Error::Store(format!("invalid embedded Worker backend: {err}"))
             })?,
         );
+        let runtime_subscription_broker =
+            RuntimeSubscriptionBroker::new(config.workspace_id.clone());
         for remote_config in config.remote_runtime_sources.iter().cloned() {
-            runtime.register(
-                RemoteWorkerRuntime::new(
-                    remote_config,
-                    config.workspace_id.clone(),
-                    config
-                        .backend_base_url
-                        .clone()
-                        .unwrap_or_else(|| "http://127.0.0.1:8787".to_string()),
-                )
-                .map(|host| host.with_resource_broker(resource_broker.clone()))
-                .map_err(|err| err.into_error())?,
-            );
+            let remote_runtime = RemoteWorkerRuntime::new(
+                remote_config.clone(),
+                config.workspace_id.clone(),
+                config
+                    .backend_base_url
+                    .clone()
+                    .unwrap_or_else(|| "http://127.0.0.1:8787".to_string()),
+            )
+            .map(|host| host.with_resource_broker(resource_broker.clone()))
+            .map_err(|err| err.into_error())?;
+            runtime.register(remote_runtime);
+            runtime_subscription_broker.register_remote_runtime(remote_config);
         }
         let runtime = Arc::new(runtime);
         let companion = Arc::new(CompanionConsole::disabled());
@@ -344,6 +348,7 @@ impl WorkspaceApi {
             runtime,
             companion,
             observation_proxy,
+            runtime_subscription_broker,
             resource_broker,
             credential_operation_lock: Arc::new(std::sync::Mutex::new(())),
         })
@@ -351,6 +356,10 @@ impl WorkspaceApi {
 
     pub fn workspace_id(&self) -> &str {
         self.config.workspace_id.as_str()
+    }
+
+    pub fn runtime_subscription_broker(&self) -> &RuntimeSubscriptionBroker {
+        &self.runtime_subscription_broker
     }
 
     fn mint_worker_workspace_credential(

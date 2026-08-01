@@ -19,6 +19,7 @@ pub mod records;
 pub use records::ticket_api_typescript;
 pub mod repositories;
 pub mod resource_broker;
+pub mod runtime_subscription;
 pub mod server;
 pub mod skills;
 pub mod store;
