@@ -5150,8 +5150,9 @@ async fn post_passkey_registration_complete(
             )
         })?;
     let credential_id = passkey_credential_id(&passkey)?;
-    api.store
-        .upsert_passkey_credential(&PasskeyCredentialRecord {
+    let registered_at = crate::auth::now_rfc3339();
+    api.store.upsert_passkey_and_claim_legacy_workspace_owner(
+        &PasskeyCredentialRecord {
             credential_id,
             user_id: user.user_id.clone(),
             public_key_cose: serde_json::to_string(&passkey).map_err(|error| {
@@ -5159,9 +5160,13 @@ async fn post_passkey_registration_complete(
             })?,
             transports_json: None,
             sign_count: 0,
-            created_at: crate::auth::now_rfc3339(),
+            created_at: registered_at.clone(),
             last_used_at: None,
-        })?;
+        },
+        api.workspace_id(),
+        &user.account_id,
+        &registered_at,
+    )?;
     issue_browser_session_response(&api, user)
 }
 
