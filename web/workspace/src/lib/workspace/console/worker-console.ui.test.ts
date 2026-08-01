@@ -731,12 +731,4 @@ Deno.test("Workspace Worker list and Console share the multiplexed connection", 
       multiplexer.includes("frame: 'worker_protocol'"),
     "Sidebar and Console should share one Workspace multiplexer and route Worker methods through a subscription lane",
   );
-  assert(
-    multiplexer.includes("loadWhoami") &&
-      multiplexer.includes("actor === null") &&
-      multiplexer.includes("AUTH_RECHECK_DELAY_MS") &&
-      multiplexer.includes("Register or sign in on the Account page") &&
-      consolePage.includes("workspace_subscription_auth_required"),
-    "Workspace multiplexer should replace a tight unauthenticated WebSocket loop with an actionable auth status and bounded recheck",
-  );
 });

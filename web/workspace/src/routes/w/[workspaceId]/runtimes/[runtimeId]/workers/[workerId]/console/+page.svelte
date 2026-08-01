@@ -564,29 +564,11 @@
                         ];
                     }
                 },
-                onStatus: (status, message) => {
+                onStatus: (status) => {
                     if (token !== reloadToken) return;
-                    const authenticationRequired = message?.startsWith("Authentication required") ?? false;
-                    protocolState = authenticationRequired
-                        ? "error"
-                        : status === "open"
-                          ? "connecting"
-                          : status;
-                    if (authenticationRequired && message) {
-                        streamDiagnostics = [
-                            ...streamDiagnostics.filter(
-                                (diagnostic) =>
-                                    diagnostic.code !== "workspace_subscription_auth_required",
-                            ),
-                            {
-                                code: "workspace_subscription_auth_required",
-                                severity: "error",
-                                message,
-                            },
-                        ];
-                    }
+                    protocolState = status === "open" ? "connecting" : status;
                     if (status === "closed") {
-                        rejectPendingCompletion(new Error(message ?? "Worker protocol WebSocket closed."));
+                        rejectPendingCompletion(new Error("Worker protocol WebSocket closed."));
                     }
                 },
             },

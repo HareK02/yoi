@@ -6,7 +6,6 @@ import type {
   SubscriptionId,
 } from '$lib/generated/protocol';
 import { workspaceApiPath } from '$lib/workspace/api/http';
-import { loadWhoami } from '$lib/workspace/auth/api';
 
 type Listener = {
   onFrame(frame: SubscriptionFrame): void;
@@ -27,9 +26,6 @@ export type WorkspaceMultiplexerSubscription = {
 };
 
 const multiplexers = new Map<string, WorkspaceMultiplexer>();
-const RECONNECT_DELAY_MS = 500;
-const AUTH_RECHECK_DELAY_MS = 5_000;
-const AUTH_REQUIRED_MESSAGE = 'Authentication required. Register or sign in on the Account page.';
 
 export function workspaceMultiplexer(workspaceId: string): WorkspaceMultiplexer {
   let multiplexer = multiplexers.get(workspaceId);
@@ -93,45 +89,20 @@ export class WorkspaceMultiplexer {
     });
     socket.addEventListener('message', (event) => this.#receive(String(event.data)));
     socket.addEventListener('error', () => socket.close());
-    socket.addEventListener('close', () => void this.#handleSocketClose(socket));
-  }
-
-  async #handleSocketClose(socket: WebSocket): Promise<void> {
-    if (this.#socket !== socket) return;
-    this.#socket = null;
-    this.#requests.clear();
-    this.#runtimeSubscriptions.clear();
-    for (const subscription of this.#subscriptions.values()) {
-      subscription.requestId = null;
-      subscription.subscriptionId = null;
-    }
-    if (this.#closed || this.#subscriptions.size === 0) return;
-
-    let authenticationRequired = false;
-    try {
-      authenticationRequired = (await loadWhoami()).actor === null;
-    } catch {
-      // A failed auth probe is treated as a transient network/backend failure.
-    }
-    if (this.#closed || this.#subscriptions.size === 0 || this.#socket) return;
-
-    const message = authenticationRequired
-      ? AUTH_REQUIRED_MESSAGE
-      : 'Workspace subscription disconnected';
-    for (const subscription of this.#subscriptions.values()) {
-      subscription.listener.onStatus?.('closed', message);
-    }
-    this.#scheduleReconnect(
-      authenticationRequired ? AUTH_RECHECK_DELAY_MS : RECONNECT_DELAY_MS,
-    );
-  }
-
-  #scheduleReconnect(delayMs: number): void {
-    if (this.#reconnectTimer) clearTimeout(this.#reconnectTimer);
-    this.#reconnectTimer = setTimeout(() => {
-      this.#reconnectTimer = null;
-      this.#ensureConnected();
-    }, delayMs);
+    socket.addEventListener('close', () => {
+      if (this.#socket !== socket) return;
+      this.#socket = null;
+      this.#requests.clear();
+      this.#runtimeSubscriptions.clear();
+      for (const subscription of this.#subscriptions.values()) {
+        subscription.requestId = null;
+        subscription.subscriptionId = null;
+        subscription.listener.onStatus?.('closed', 'Workspace subscription disconnected');
+      }
+      if (!this.#closed && this.#subscriptions.size > 0) {
+        this.#reconnectTimer = setTimeout(() => this.#ensureConnected(), 500);
+      }
+    });
   }
 
   #sendSubscribe(subscription: ActiveSubscription): void {
