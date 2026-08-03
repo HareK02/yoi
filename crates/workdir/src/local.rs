@@ -9,7 +9,9 @@
 //! state, such as read-before-edit tracking, remains owned by the tool layer.
 
 use std::collections::HashMap;
-use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+#[cfg(test)]
+use std::io::Write as _;
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -17,8 +19,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use globset::Glob;
-use ignore::WalkBuilder;
 use manifest::{Scope, SharedScope};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
@@ -27,11 +27,13 @@ use tokio::task::JoinHandle;
 
 use crate::{
     CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest, CommandStatus, EditRequest,
-    EditResult, EntryKind, GlobRequest, GlobResult, GrepRequest, GrepResult, ListEntry,
-    ListRequest, ListResult, ReadRequest, ReadResult, StatRequest, StatResult, Workdir,
-    WorkdirError, WorkdirPath, WorkdirSession, WorkdirSessionCapabilities,
-    WorkdirSessionCapability, WriteOutcome, WriteRequest, WriteResult,
+    EditResult, GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest, ListResult,
+    ReadRequest, ReadResult, StatRequest, StatResult, Workdir, WorkdirError, WorkdirPath,
+    WorkdirSession, WorkdirSessionCapabilities, WorkdirSessionCapability, WriteRequest,
+    WriteResult,
 };
+#[cfg(test)]
+use crate::{EntryKind, WriteOutcome};
 
 #[derive(Debug)]
 enum LocalCommand {
@@ -40,6 +42,19 @@ enum LocalCommand {
         completion: Arc<Notify>,
     },
     Completed(CommandOutput),
+}
+
+#[derive(Debug)]
+struct ScopeAccess(Arc<Scope>);
+
+impl fs_operation::FsAccessPolicy for ScopeAccess {
+    fn is_readable(&self, path: &Path) -> bool {
+        self.0.is_readable(path)
+    }
+
+    fn is_writable(&self, path: &Path) -> bool {
+        self.0.is_writable(path)
+    }
 }
 
 #[derive(Debug)]
@@ -191,6 +206,7 @@ impl LocalWorkdirSession {
     ///
     /// Follows symlinks. Rejects directories, relative paths, paths not
     /// readable by the scope, and missing files.
+    #[cfg(test)]
     pub(crate) fn read_bytes(&self, path: &Path) -> Result<Vec<u8>, WorkdirError> {
         if !path.is_absolute() {
             return Err(WorkdirError::RelativePath(path.to_path_buf()));
@@ -241,6 +257,7 @@ impl LocalWorkdirSession {
     ///   target file transitions atomically between states.
     ///
     /// This method does **not** consult tool-specific read history.
+    #[cfg(test)]
     pub(crate) fn write(&self, path: &Path, content: &[u8]) -> Result<WriteOutcome, WorkdirError> {
         if !path.is_absolute() {
             return Err(WorkdirError::RelativePath(path.to_path_buf()));
@@ -342,13 +359,6 @@ impl LocalWorkdirSession {
             self.inner.root.join(path.as_str())
         }
     }
-
-    fn logical_path(&self, path: &Path) -> Result<WorkdirPath, WorkdirError> {
-        let relative = path
-            .strip_prefix(&self.inner.root)
-            .map_err(|_| WorkdirError::InvalidPath("path escaped Workdir root".into()))?;
-        WorkdirPath::new(relative.to_string_lossy())
-    }
 }
 
 #[async_trait]
@@ -363,244 +373,67 @@ impl WorkdirSession for LocalWorkdirSession {
 
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {
         self.ensure_capability(WorkdirSessionCapability::Read)?;
-        let path = self.resolve(&request.path);
-        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
-            let error = match error.kind() {
-                std::io::ErrorKind::NotFound => WorkdirError::NotFound(path.clone()),
-                _ => WorkdirError::io(&path, error),
-            };
-            sanitize_error(error, &request.path)
-        })?;
-        let kind = if metadata.file_type().is_symlink() {
-            EntryKind::Symlink
-        } else if metadata.is_file() {
-            EntryKind::File
-        } else if metadata.is_dir() {
-            EntryKind::Directory
-        } else {
-            EntryKind::Other
-        };
-        Ok(StatResult {
-            path: request.path,
-            kind,
-            size: metadata.len(),
-        })
+        let logical = request.path.clone();
+        let access = ScopeAccess(self.inner.scope.snapshot());
+        fs_operation::run_stat(&self.inner.root, request, &access)
+            .map_err(WorkdirError::from)
+            .map_err(|error| sanitize_error(error, &logical))
     }
 
     async fn read(&self, request: ReadRequest) -> Result<ReadResult, WorkdirError> {
         self.ensure_capability(WorkdirSessionCapability::Read)?;
-        let path = self.resolve(&request.path);
-        let bytes = LocalWorkdirSession::read_bytes(self, &path)
-            .map_err(|error| sanitize_error(error, &request.path))?;
-        let content_hash = Sha256::digest(&bytes).into();
-        let lines = bytes
-            .split_inclusive(|byte| *byte == b'\n')
-            .collect::<Vec<_>>();
-        let total_lines = lines.len();
-        if request.offset > total_lines && request.offset != 0 {
-            return Err(WorkdirError::InvalidArgument(format!(
-                "offset {} exceeds file length {total_lines}",
-                request.offset
-            )));
-        }
-        let end = request
-            .offset
-            .saturating_add(request.limit)
-            .min(total_lines);
-        let mut selected = lines[request.offset.min(total_lines)..end]
-            .iter()
-            .flat_map(|line| line.iter().copied())
-            .collect::<Vec<_>>();
-        let byte_truncated = selected.len() > request.max_bytes;
-        if byte_truncated {
-            let mut byte_end = request.max_bytes;
-            if let Ok(text) = std::str::from_utf8(&selected) {
-                while byte_end > 0 && !text.is_char_boundary(byte_end) {
-                    byte_end -= 1;
-                }
-            }
-            selected.truncate(byte_end);
-        }
-        Ok(ReadResult {
-            path: request.path,
-            bytes: selected,
-            start_line: request.offset,
-            total_lines,
-            content_hash,
-            truncated: end < total_lines || byte_truncated,
-        })
+        let logical = request.path.clone();
+        let access = ScopeAccess(self.inner.scope.snapshot());
+        fs_operation::run_read(&self.inner.root, request, &access)
+            .map_err(WorkdirError::from)
+            .map_err(|error| sanitize_error(error, &logical))
     }
 
     async fn write(&self, request: WriteRequest) -> Result<WriteResult, WorkdirError> {
         self.ensure_capability(WorkdirSessionCapability::Write)?;
-        let path = self.resolve(&request.path);
-        if path.exists() {
-            let current = LocalWorkdirSession::read_bytes(self, &path)
-                .map_err(|error| sanitize_error(error, &request.path))?;
-            let current_hash: [u8; 32] = Sha256::digest(&current).into();
-            if request.expected_hash != Some(current_hash) {
-                return Err(WorkdirError::Conflict(request.path.to_string()));
-            }
-        } else if request.expected_hash.is_some() {
-            return Err(WorkdirError::Conflict(request.path.to_string()));
-        }
-        LocalWorkdirSession::write(self, &path, &request.content)
-            .map_err(|error| sanitize_error(error, &request.path))
+        let logical = request.path.clone();
+        let access = ScopeAccess(self.inner.scope.snapshot());
+        fs_operation::run_write(&self.inner.root, request, &access)
+            .map_err(WorkdirError::from)
+            .map_err(|error| sanitize_error(error, &logical))
     }
 
     async fn edit(&self, request: EditRequest) -> Result<EditResult, WorkdirError> {
         self.ensure_capability(WorkdirSessionCapability::Edit)?;
-        let path = self.resolve(&request.path);
-        let bytes = LocalWorkdirSession::read_bytes(self, &path)
-            .map_err(|error| sanitize_error(error, &request.path))?;
-        let current_hash: [u8; 32] = Sha256::digest(&bytes).into();
-        if current_hash != request.expected_hash {
-            return Err(WorkdirError::Conflict(request.path.to_string()));
-        }
-        let text = String::from_utf8(bytes).map_err(|_| {
-            WorkdirError::InvalidArgument(format!("file is not UTF-8: {}", request.path))
-        })?;
-        let occurrences = text.matches(&request.old_string).count();
-        if occurrences == 0 {
-            return Err(WorkdirError::InvalidArgument("old_string not found".into()));
-        }
-        if !request.replace_all && occurrences != 1 {
-            return Err(WorkdirError::InvalidArgument(format!(
-                "old_string occurs {occurrences} times; set replace_all or provide more context"
-            )));
-        }
-        let replacements = if request.replace_all { occurrences } else { 1 };
-        let edited = if request.replace_all {
-            text.replace(&request.old_string, &request.new_string)
-        } else {
-            text.replacen(&request.old_string, &request.new_string, 1)
-        };
-        let outcome = LocalWorkdirSession::write(self, &path, edited.as_bytes())
-            .map_err(|error| sanitize_error(error, &request.path))?;
-        let content_hash = Sha256::digest(edited.as_bytes()).into();
-        Ok(EditResult {
-            replacements,
-            bytes_written: outcome.bytes_written,
-            content_hash,
-        })
+        let logical = request.path.clone();
+        let access = ScopeAccess(self.inner.scope.snapshot());
+        fs_operation::run_edit(&self.inner.root, request, &access)
+            .map_err(WorkdirError::from)
+            .map_err(|error| sanitize_error(error, &logical))
     }
 
     async fn list(&self, request: ListRequest) -> Result<ListResult, WorkdirError> {
         self.ensure_capability(WorkdirSessionCapability::Read)?;
-        let base = self.resolve(&request.path);
-        let scope = self.inner.scope.snapshot();
-        if !scope.is_readable(&base) {
-            return Err(WorkdirError::OutOfScope(PathBuf::from(
-                request.path.as_str(),
-            )));
-        }
-        let mut entries = Vec::new();
-        for entry in std::fs::read_dir(&base)
-            .map_err(|error| sanitize_error(WorkdirError::io(&base, error), &request.path))?
-        {
-            let entry = entry
-                .map_err(|error| sanitize_error(WorkdirError::io(&base, error), &request.path))?;
-            let path = entry.path();
-            if !scope.is_readable(&path) {
-                continue;
-            }
-            let link_metadata = std::fs::symlink_metadata(&path)
-                .map_err(|error| sanitize_error(WorkdirError::io(&path, error), &request.path))?;
-            let is_symlink = link_metadata.file_type().is_symlink();
-            let metadata = if is_symlink {
-                link_metadata
-            } else {
-                entry.metadata().map_err(|error| {
-                    sanitize_error(WorkdirError::io(&path, error), &request.path)
-                })?
-            };
-            let kind = if is_symlink {
-                EntryKind::Symlink
-            } else if metadata.is_file() {
-                EntryKind::File
-            } else if metadata.is_dir() {
-                EntryKind::Directory
-            } else {
-                EntryKind::Other
-            };
-            entries.push(ListEntry {
-                path: self.logical_path(&path)?,
-                kind,
-                size: metadata.len(),
-            });
-        }
-        entries.sort_by(|left, right| {
-            let left_dir = left.kind == EntryKind::Directory;
-            let right_dir = right.kind == EntryKind::Directory;
-            right_dir
-                .cmp(&left_dir)
-                .then_with(|| left.path.as_str().cmp(right.path.as_str()))
-        });
-        let total_entries = entries.len();
-        let total_bytes = entries.iter().map(|entry| entry.size).sum();
-        let truncated = total_entries > request.limit;
-        entries.truncate(request.limit);
-        Ok(ListResult {
-            entries,
-            total_entries,
-            total_bytes,
-            truncated,
-        })
+        let logical = request.path.clone();
+        let access = ScopeAccess(self.inner.scope.snapshot());
+        fs_operation::run_list(&self.inner.root, request, &access)
+            .map_err(WorkdirError::from)
+            .map_err(|error| sanitize_error(error, &logical))
     }
 
     async fn glob(&self, request: GlobRequest) -> Result<GlobResult, WorkdirError> {
         self.ensure_capability(WorkdirSessionCapability::Glob)?;
+        let logical = request.path.clone();
         let base = self.resolve(&request.path);
-        if let Some(info) = direct_symlink(&base)
-            && info.target_exists
-            && info.resolved_path.is_dir()
-        {
-            return Err(WorkdirError::SymlinkDirectoryNotTraversed {
-                tool: "Glob",
-                path: PathBuf::from(request.path.as_str()),
-                target: PathBuf::from("<provider-internal target>"),
-            });
-        }
-        let matcher = Glob::new(&request.pattern)
-            .map_err(|error| WorkdirError::InvalidGlob(error.to_string()))?
-            .compile_matcher();
-        let scope = self.inner.scope.snapshot();
-        if !scope.is_readable(&base) {
-            return Err(WorkdirError::OutOfScope(PathBuf::from(
-                request.path.as_str(),
-            )));
-        }
-        let mut matches = Vec::new();
-        for entry in WalkBuilder::new(&base).hidden(false).build().flatten() {
-            let path = entry.path();
-            if !path.is_file() || !scope.is_readable(path) {
-                continue;
-            }
-            let relative = path.strip_prefix(&base).unwrap_or(path);
-            if matcher.is_match(relative) {
-                matches.push(self.logical_path(path)?);
-            }
-        }
-        matches.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        let truncated = matches.len() > request.limit;
-        matches.truncate(request.limit);
-        Ok(GlobResult {
-            paths: matches,
-            truncated,
-        })
+        let access = ScopeAccess(self.inner.scope.snapshot());
+        fs_operation::run_glob(&self.inner.root, &base, request, &access)
+            .map_err(WorkdirError::from)
+            .map_err(|error| sanitize_error(error, &logical))
     }
 
     async fn grep(&self, request: GrepRequest) -> Result<GrepResult, WorkdirError> {
         self.ensure_capability(WorkdirSessionCapability::Grep)?;
         let base = self.resolve(&request.path);
         let logical = request.path.clone();
-        crate::search::run_grep(
-            &self.inner.root,
-            base,
-            request,
-            &self.inner.scope.snapshot(),
-        )
-        .map_err(|error| sanitize_error(error, &logical))
+        let access = ScopeAccess(self.inner.scope.snapshot());
+        fs_operation::run_grep(&self.inner.root, base, request, &access)
+            .map_err(WorkdirError::from)
+            .map_err(|error| sanitize_error(error, &logical))
     }
 
     async fn start_command(&self, request: CommandRequest) -> Result<CommandHandle, WorkdirError> {
@@ -948,6 +781,7 @@ pub fn direct_symlink(path: &Path) -> Option<SymlinkInfo> {
     }
 }
 
+#[cfg(test)]
 fn symlink_out_of_scope_or_plain(
     path: &Path,
     symlink: Option<&SymlinkInfo>,
@@ -971,6 +805,7 @@ fn symlink_out_of_scope_or_plain(
     WorkdirError::OutOfScope(path.to_path_buf())
 }
 
+#[cfg(test)]
 fn broken_symlink_error(path: &Path, info: &SymlinkInfo) -> WorkdirError {
     WorkdirError::BrokenSymlink {
         path: path.to_path_buf(),

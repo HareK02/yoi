@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+fs-operation.workspace = true
 html5ever = "0.26"
 llm-engine = { workspace = true }
 manifest = { workspace = true }

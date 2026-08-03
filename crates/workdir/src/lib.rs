@@ -8,7 +8,6 @@
 pub mod http;
 mod local;
 mod operation;
-mod search;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,6 +15,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+pub use fs_operation::{
+    ContentHash, EditRequest, EditResult, EntryKind, FsPath as WorkdirPath, GlobRequest,
+    GlobResult, GrepOutputMode, GrepRequest, GrepResult, ListEntry, ListRequest, ListResult,
+    ReadRequest, ReadResult, StatRequest, StatResult, WriteRequest, WriteResult,
+};
 pub use local::{LocalWorkdirSession, SymlinkInfo, direct_symlink, first_symlink};
 pub use operation::*;
 
@@ -245,6 +249,45 @@ impl WorkdirError {
         Self::Io {
             path: path.to_path_buf(),
             source,
+        }
+    }
+}
+
+impl From<fs_operation::FsError> for WorkdirError {
+    fn from(error: fs_operation::FsError) -> Self {
+        match error {
+            fs_operation::FsError::InvalidPath(message) => Self::InvalidPath(message),
+            fs_operation::FsError::RelativePath(path) => Self::RelativePath(path),
+            fs_operation::FsError::OutOfScope(path) => Self::OutOfScope(path),
+            fs_operation::FsError::NotFound(path) => Self::NotFound(path),
+            fs_operation::FsError::BrokenSymlink { path, link, target } => {
+                Self::BrokenSymlink { path, link, target }
+            }
+            fs_operation::FsError::SymlinkOutOfScope {
+                path,
+                target,
+                required_permission,
+            } => Self::SymlinkOutOfScope {
+                path,
+                target,
+                required_permission,
+            },
+            fs_operation::FsError::SymlinkDirectoryNotTraversed { tool, path, target } => {
+                Self::SymlinkDirectoryNotTraversed { tool, path, target }
+            }
+            fs_operation::FsError::ReadOnly(path) => Self::ReadOnly(path),
+            fs_operation::FsError::IsDirectory(path) => Self::IsDirectory(path),
+            fs_operation::FsError::NotDirectory(path) => {
+                Self::InvalidArgument(format!("path is not a directory: {}", path.display()))
+            }
+            fs_operation::FsError::SymlinkTargetIsDirectory { path, target } => {
+                Self::SymlinkTargetIsDirectory { path, target }
+            }
+            fs_operation::FsError::Conflict(message) => Self::Conflict(message),
+            fs_operation::FsError::InvalidGlob(message) => Self::InvalidGlob(message),
+            fs_operation::FsError::InvalidRegex(message) => Self::InvalidRegex(message),
+            fs_operation::FsError::InvalidArgument(message) => Self::InvalidArgument(message),
+            fs_operation::FsError::Io { path, source } => Self::Io { path, source },
         }
     }
 }

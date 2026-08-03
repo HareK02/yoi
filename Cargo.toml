@@ -17,6 +17,7 @@ members = [
     "crates/session-analytics",
     "crates/lint-common",
     "crates/tools",
+    "crates/fs-operation",
     "crates/workdir",
     "crates/tui",
     "crates/memory",
@@ -42,6 +43,7 @@ default-members = [
     "crates/session-analytics",
     "crates/lint-common",
     "crates/tools",
+    "crates/fs-operation",
     "crates/workdir",
     "crates/tui",
     "crates/memory",
@@ -75,6 +77,7 @@ session-analytics = { path = "crates/session-analytics" }
 session-store = { path = "crates/session-store" }
 secrets = { path = "crates/secrets" }
 tools = { path = "crates/tools" }
+fs-operation = { path = "crates/fs-operation" }
 workdir = { path = "crates/workdir" }
 tui = { path = "crates/tui" }
 yoi-workspace-server = { path = "crates/workspace-server" }

@@ -1286,6 +1286,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs-operation"
+version = "0.1.0"
+dependencies = [
+ "globset",
+ "grep-matcher",
+ "grep-regex",
+ "grep-searcher",
+ "ignore",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "fs4"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4494,6 +4510,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "filetime",
+ "fs-operation",
  "html5ever",
  "llm-engine",
  "manifest",
@@ -5924,11 +5941,7 @@ name = "workdir"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "globset",
- "grep-matcher",
- "grep-regex",
- "grep-searcher",
- "ignore",
+ "fs-operation",
  "manifest",
  "reqwest",
  "serde",

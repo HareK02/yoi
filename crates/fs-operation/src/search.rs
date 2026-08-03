@@ -1,14 +1,14 @@
 use std::path::{Path, PathBuf};
 
+use crate::FsAccessPolicy;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::sinks::UTF8 as UTF8Sink;
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use ignore::types::TypesBuilder;
-use manifest::Scope;
 
-use crate::{GrepOutputMode, GrepRequest, GrepResult, WorkdirError, direct_symlink};
+use crate::{FsError, GrepOutputMode, GrepRequest, GrepResult, direct_symlink};
 
 struct ContentLine {
     path: PathBuf,
@@ -107,12 +107,12 @@ struct GrepParams {
     offset: Option<usize>,
 }
 
-pub(crate) fn run_grep(
+pub fn run_grep(
     root: &Path,
     base: PathBuf,
     request: GrepRequest,
-    scope: &Scope,
-) -> Result<GrepResult, WorkdirError> {
+    access: &dyn FsAccessPolicy,
+) -> Result<GrepResult, FsError> {
     let p = GrepParams {
         pattern: request.pattern,
         path: Some(base.clone()),
@@ -133,7 +133,7 @@ pub(crate) fn run_grep(
         .multi_line(p.multiline)
         .dot_matches_new_line(p.multiline)
         .build(&p.pattern)
-        .map_err(|e| WorkdirError::InvalidRegex(e.to_string()))?;
+        .map_err(|e| FsError::InvalidRegex(e.to_string()))?;
 
     let (before, after) = match (p.before, p.after, p.context) {
         (_, _, Some(c)) => (c, c),
@@ -150,32 +150,32 @@ pub(crate) fn run_grep(
 
     let base = p.path.unwrap_or(base);
     if !base.is_absolute() {
-        return Err(WorkdirError::RelativePath(base));
+        return Err(FsError::RelativePath(base));
     }
     let symlink = direct_symlink(&base);
-    if !scope.is_readable(&base) {
+    if !access.is_readable(&base) {
         return Err(if let Some(info) = symlink.as_ref() {
             let link_parent_readable = info
                 .link_path
                 .parent()
-                .map(|parent| scope.is_readable(parent))
+                .map(|parent| access.is_readable(parent))
                 .unwrap_or(false);
             if info.target_exists && link_parent_readable {
-                WorkdirError::SymlinkOutOfScope {
+                FsError::SymlinkOutOfScope {
                     path: base.clone(),
                     target: info.resolved_path.clone(),
                     required_permission: "read",
                 }
             } else {
-                WorkdirError::OutOfScope(base.clone())
+                FsError::OutOfScope(base.clone())
             }
         } else {
-            WorkdirError::OutOfScope(base.clone())
+            FsError::OutOfScope(base.clone())
         });
     }
     if let Some(info) = symlink.as_ref() {
         if !info.target_exists {
-            return Err(WorkdirError::BrokenSymlink {
+            return Err(FsError::BrokenSymlink {
                 path: base.clone(),
                 link: info.link_path.clone(),
                 target: info.target_path.clone(),
@@ -183,17 +183,17 @@ pub(crate) fn run_grep(
         }
     }
     let base_meta = std::fs::metadata(&base).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => WorkdirError::NotFound(base.clone()),
-        _ => WorkdirError::io(&base, e),
+        std::io::ErrorKind::NotFound => FsError::NotFound(base.clone()),
+        _ => FsError::io(&base, e),
     })?;
     if !base_meta.is_dir() {
-        return Err(WorkdirError::InvalidArgument(format!(
+        return Err(FsError::InvalidArgument(format!(
             "grep search path is not a directory: {}",
             base.display()
         )));
     }
     if let Some(info) = symlink.as_ref() {
-        return Err(WorkdirError::SymlinkDirectoryNotTraversed {
+        return Err(FsError::SymlinkDirectoryNotTraversed {
             tool: "Grep",
             path: base.clone(),
             target: info.resolved_path.clone(),
@@ -215,16 +215,15 @@ pub(crate) fn run_grep(
         tb.select(t);
         let types = tb
             .build()
-            .map_err(|e| WorkdirError::InvalidArgument(format!("invalid type {t}: {e}")))?;
+            .map_err(|e| FsError::InvalidArgument(format!("invalid type {t}: {e}")))?;
         wb.types(types);
     }
     if let Some(g) = p.glob.as_deref() {
         let mut ob = OverrideBuilder::new(&base);
-        ob.add(g)
-            .map_err(|e| WorkdirError::InvalidGlob(e.to_string()))?;
+        ob.add(g).map_err(|e| FsError::InvalidGlob(e.to_string()))?;
         let ov = ob
             .build()
-            .map_err(|e| WorkdirError::InvalidGlob(e.to_string()))?;
+            .map_err(|e| FsError::InvalidGlob(e.to_string()))?;
         wb.overrides(ov);
     }
 
@@ -251,7 +250,7 @@ pub(crate) fn run_grep(
             continue;
         }
         let path = entry.path();
-        if !scope.is_readable(path) {
+        if !access.is_readable(path) {
             continue;
         }
 
@@ -295,7 +294,7 @@ pub(crate) fn run_grep(
                 };
                 searcher
                     .search_path(&matcher, path, &mut sink)
-                    .map_err(|e| WorkdirError::io(path, e))?;
+                    .map_err(|e| FsError::io(path, e))?;
                 // If we hit head_limit during this file, stop walking.
                 if matches_seen >= offset.saturating_add(head_limit) && matches_seen > before_count
                 {
@@ -313,7 +312,7 @@ fn scan_any_match(
     searcher: &mut Searcher,
     matcher: &grep_regex::RegexMatcher,
     path: &Path,
-) -> Result<bool, WorkdirError> {
+) -> Result<bool, FsError> {
     let mut hit = false;
     let sink = UTF8Sink(|_, _| {
         hit = true;
@@ -321,7 +320,7 @@ fn scan_any_match(
     });
     searcher
         .search_path(matcher, path, sink)
-        .map_err(|e| WorkdirError::io(path, e))?;
+        .map_err(|e| FsError::io(path, e))?;
     Ok(hit)
 }
 
@@ -329,7 +328,7 @@ fn scan_count(
     searcher: &mut Searcher,
     matcher: &grep_regex::RegexMatcher,
     path: &Path,
-) -> Result<usize, WorkdirError> {
+) -> Result<usize, FsError> {
     let mut count = 0usize;
     let sink = UTF8Sink(|_, _| {
         count += 1;
@@ -337,7 +336,7 @@ fn scan_count(
     });
     searcher
         .search_path(matcher, path, sink)
-        .map_err(|e| WorkdirError::io(path, e))?;
+        .map_err(|e| FsError::io(path, e))?;
     Ok(count)
 }
 

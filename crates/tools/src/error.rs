@@ -11,6 +11,9 @@ use llm_engine::tool::ToolError;
 #[derive(Debug, thiserror::Error)]
 pub enum ToolsError {
     #[error(transparent)]
+    FileSystem(#[from] fs_operation::FsError),
+
+    #[error(transparent)]
     WorkdirSession(#[from] workdir::WorkdirError),
 
     #[error("file has not been read in this session; read it first: {}", .0.display())]
@@ -40,7 +43,8 @@ impl From<ToolsError> for ToolError {
                 | workdir::WorkdirError::Io { .. }
                 | workdir::WorkdirError::Unavailable(_),
             ) => ToolError::ExecutionFailed(err.to_string()),
-            ToolsError::WorkdirSession(_)
+            ToolsError::FileSystem(_)
+            | ToolsError::WorkdirSession(_)
             | ToolsError::NotRead(_)
             | ToolsError::ExternallyModified(_)
             | ToolsError::StringNotFound { .. }
