@@ -88,23 +88,25 @@ impl WorkerHandle {
         (event, entry_rx)
     }
 
-    pub fn completion_entries(
+    pub async fn completion_entries(
         &self,
         kind: protocol::CompletionKind,
         prefix: &str,
     ) -> Vec<protocol::CompletionEntry> {
         match kind {
-            protocol::CompletionKind::File => self
-                .shared_state
-                .fs_view()
-                .map(|view| view.list_file_completions(prefix))
-                .unwrap_or_default()
-                .into_iter()
-                .map(|c| protocol::CompletionEntry {
-                    value: c.path,
-                    is_dir: c.is_dir,
-                })
-                .collect(),
+            protocol::CompletionKind::File => {
+                let Some(view) = self.shared_state.fs_view() else {
+                    return Vec::new();
+                };
+                view.list_file_completions(prefix)
+                    .await
+                    .into_iter()
+                    .map(|candidate| protocol::CompletionEntry {
+                        value: candidate.path,
+                        is_dir: candidate.is_dir,
+                    })
+                    .collect()
+            }
         }
     }
 
@@ -574,7 +576,7 @@ fn wire_event_bridges_on_engine<C, St>(
 
 /// Register the builtin file-manipulation tools, optional memory tools,
 /// and the Worker-orchestration tools (SpawnWorker + comm) on the Worker's
-/// Engine. Returns the `ScopedFs` clone used to attach a `WorkerFsView` to
+/// Engine. Returns the Workdir handle used to attach a `WorkerFsView` to
 /// the shared state.
 async fn register_worker_tools<C, St>(
     worker: &mut Worker<C, St>,
@@ -582,7 +584,7 @@ async fn register_worker_tools<C, St>(
     spawner_socket: PathBuf,
     runtime_base: PathBuf,
     spawned_registry: Arc<SpawnedWorkerRegistry>,
-) -> std::io::Result<Option<tools::ScopedFs>>
+) -> std::io::Result<Option<workdir::WorkdirHandle>>
 where
     C: LlmClient + Clone + 'static,
     St: Store + WorkerMetadataStore + Clone + 'static,
@@ -590,6 +592,7 @@ where
     // Worker-immutable snapshots taken before the mutable worker borrow
     // below so the worker borrow doesn't conflict with reads on `worker`.
     let scope_handle = worker.scope().clone();
+    let worker_workdir = worker.workdir().cloned();
     let local_filesystem = worker.local_working_directory().cloned();
     let local_workspace_root = local_filesystem.as_ref().map(|local| local.root.clone());
     let task_feature = worker.task_feature();
@@ -603,21 +606,19 @@ where
     let worker_metadata_store = worker.store().clone();
     let self_parent_socket = worker.callback_socket().cloned();
 
-    // The Worker's SharedScope is the single source of truth for every
-    // ScopedFs when local filesystem authority exists. No-workdir Workers
-    // deliberately skip constructing/registering filesystem and Bash tools.
-    let (fs_for_view, tracker) = if let Some(local) = local_filesystem.as_ref() {
-        let fs = tools::ScopedFs::with_shared_scope(scope_handle.clone(), local.cwd.clone());
+    // Resolve the existing Worker–Workdir binding into the domain provider.
+    // Tools only consume the provider handle; they do not own its root, cwd,
+    // scope, or lifecycle. No-workdir Workers expose no local tools.
+    let (workdir_for_view, tracker) = if let Some(workdir) = worker_workdir {
         let tracker = tools::Tracker::new();
-        let fs_for_view = fs.clone();
         worker
             .engine_mut()
             .register_tools(tools::core_builtin_tools(
-                fs,
+                workdir.clone(),
                 tracker.clone(),
                 bash_output_dir,
             ));
-        (Some(fs_for_view), Some(tracker))
+        (Some(workdir), Some(tracker))
     } else {
         (None, None)
     };
@@ -788,7 +789,7 @@ where
     if let Some(tracker) = tracker {
         worker.attach_tracker(tracker);
     }
-    Ok(fs_for_view)
+    Ok(workdir_for_view)
 }
 
 /// Idle/Paused event loop. Each iteration either fires a staged
@@ -1185,6 +1186,12 @@ async fn controller_loop<C, St>(
                 }
             }
         }
+    }
+
+    if let Some(workdir) = worker.workdir()
+        && let Err(error) = workdir.shutdown().await
+    {
+        tracing::warn!(%error, "Workdir provider shutdown failed");
     }
 
     // Background memory jobs own extract/consolidate workers after a

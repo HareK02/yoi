@@ -6,11 +6,6 @@ license.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
-globset = "0.4.18"
-grep-matcher = "0.1.8"
-grep-regex = "0.1.14"
-grep-searcher = "0.1.16"
-ignore = "0.4.25"
 html5ever = "0.26"
 llm-engine = { workspace = true }
 manifest = { workspace = true }
@@ -26,6 +21,7 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["process", "rt", "sync", "time"] }
 tracing = { workspace = true }
+workdir = { workspace = true }
 
 [dev-dependencies]
 filetime = "0.2.27"

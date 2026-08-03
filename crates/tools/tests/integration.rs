@@ -11,7 +11,8 @@ use llm_engine::tool::{Tool, ToolDefinition, ToolMeta};
 use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
 use serde_json::json;
 use tempfile::TempDir;
-use tools::{ScopedFs, Tracker, core_builtin_tools};
+use tools::{Tracker, core_builtin_tools};
+use workdir::{LocalWorkdir, WorkdirHandle};
 
 fn scope_with_spill(workspace: &Path, spill: &Path) -> Scope {
     let base = Scope::writable(workspace).unwrap();
@@ -54,7 +55,7 @@ fn setup() -> (TempDir, TempDir, Registry) {
     let dir = TempDir::new().unwrap();
     let spill = TempDir::new().unwrap();
     let scope = scope_with_spill(dir.path(), spill.path());
-    let fs = ScopedFs::new(scope, dir.path().to_path_buf());
+    let fs: WorkdirHandle = Arc::new(LocalWorkdir::new(scope, dir.path().to_path_buf()));
     let tracker = Tracker::new();
     let reg = Registry::new(core_builtin_tools(fs, tracker, spill.path().to_path_buf()));
     (dir, spill, reg)
@@ -103,7 +104,7 @@ async fn read_then_edit_then_read_roundtrip() {
     let (dir, _spill, reg) = setup();
     let file = dir.path().join("a.txt");
     std::fs::write(&file, "hello world\n").unwrap();
-    let p = file.to_str().unwrap();
+    let p = "a.txt";
 
     let read = reg.get("Read");
     let edit = reg.get("Edit");
@@ -140,7 +141,7 @@ async fn write_then_grep_finds_content() {
     call(
         &write,
         json!({
-            "file_path": file.to_str().unwrap(),
+            "file_path": file.file_name().unwrap().to_str().unwrap(),
             "content": "alpha\nNEEDLE\nomega\n",
         }),
     )
@@ -169,7 +170,7 @@ async fn glob_finds_written_files() {
         call(
             &write,
             json!({
-                "file_path": dir.path().join(name).to_str().unwrap(),
+                "file_path": name,
                 "content": "x",
             }),
         )
@@ -184,7 +185,7 @@ async fn glob_finds_written_files() {
 }
 
 #[tokio::test]
-async fn out_of_scope_write_is_rejected() {
+async fn absolute_path_is_rejected() {
     let (_dir, _spill, reg) = setup();
     let outside = TempDir::new().unwrap();
     let write = reg.get("Write");
@@ -197,9 +198,9 @@ async fn out_of_scope_write_is_rejected() {
         }),
     )
     .await;
-    // ToolsError::OutOfScope → ToolError::InvalidArgument
+    // Absolute paths are rejected at the logical Workdir boundary.
     let msg = format!("{err}");
-    assert!(msg.contains("outside allowed scope"), "unexpected: {msg}");
+    assert!(msg.contains("invalid Workdir path"), "unexpected: {msg}");
 }
 
 #[tokio::test]
@@ -212,7 +213,7 @@ async fn write_to_existing_without_read_fails() {
     let err = call_err(
         &write,
         json!({
-            "file_path": file.to_str().unwrap(),
+            "file_path": file.file_name().unwrap().to_str().unwrap(),
             "content": "new",
         }),
     )
@@ -222,8 +223,8 @@ async fn write_to_existing_without_read_fails() {
 }
 
 #[tokio::test]
-async fn shared_scoped_fs_across_tools() {
-    // The key invariant: all builtin tools share the same ScopedFs instance,
+async fn shared_workdir_across_tools() {
+    // The key invariant: all builtin tools share the same Workdir instance,
     // so read-history set by Read is visible to Edit and Write.
     let (dir, _spill, reg) = setup();
     let file = dir.path().join("shared.txt");
@@ -233,12 +234,16 @@ async fn shared_scoped_fs_across_tools() {
     let write = reg.get("Write");
 
     // Read via Read tool
-    call(&read, json!({ "file_path": file.to_str().unwrap() })).await;
-    // Write via Write tool — must succeed because the shared ScopedFs has the read
+    call(
+        &read,
+        json!({ "file_path": file.file_name().unwrap().to_str().unwrap() }),
+    )
+    .await;
+    // Write via Write tool — must succeed because the shared Workdir has the read
     call(
         &write,
         json!({
-            "file_path": file.to_str().unwrap(),
+            "file_path": file.file_name().unwrap().to_str().unwrap(),
             "content": "two\n",
         }),
     )
@@ -257,7 +262,7 @@ async fn edit_requires_read_across_tools() {
     let err = call_err(
         &edit,
         json!({
-            "file_path": file.to_str().unwrap(),
+            "file_path": file.file_name().unwrap().to_str().unwrap(),
             "old_string": "foo",
             "new_string": "bar",
         }),
@@ -296,7 +301,7 @@ async fn tracker_recent_files_tracks_read_write_edit() {
     let dir = TempDir::new().unwrap();
     let spill = TempDir::new().unwrap();
     let scope = scope_with_spill(dir.path(), spill.path());
-    let fs = ScopedFs::new(scope, dir.path().to_path_buf());
+    let fs: WorkdirHandle = Arc::new(LocalWorkdir::new(scope, dir.path().to_path_buf()));
     let tracker = Tracker::new();
     let reg = Registry::new(core_builtin_tools(
         fs,
@@ -309,22 +314,18 @@ async fn tracker_recent_files_tracks_read_write_edit() {
     std::fs::write(&a, "one\n").unwrap();
 
     // Read `a` — should appear in recency.
-    call(
-        &reg.get("Read"),
-        json!({ "file_path": a.to_str().unwrap() }),
-    )
-    .await;
+    call(&reg.get("Read"), json!({ "file_path": "a.txt" })).await;
     // Write `b` (new file) — should appear ahead of `a`.
     call(
         &reg.get("Write"),
-        json!({ "file_path": b.to_str().unwrap(), "content": "hello\n" }),
+        json!({ "file_path": "b.txt", "content": "hello\n" }),
     )
     .await;
     // Edit `a` — should bump it back to the front.
     call(
         &reg.get("Edit"),
         json!({
-            "file_path": a.to_str().unwrap(),
+            "file_path": "a.txt",
             "old_string": "one",
             "new_string": "two",
         }),
@@ -344,8 +345,8 @@ async fn tracker_recent_files_tracks_read_write_edit() {
 }
 
 #[tokio::test]
-async fn bash_inherits_scoped_fs_pwd() {
-    // The Bash tool starts at the ScopedFs's pwd. Without any `cd`, its
+async fn bash_inherits_workdir_cwd() {
+    // The Bash tool starts at the Workdir's pwd. Without any `cd`, its
     // `pwd` should canonicalize to the workspace root we set up.
     let (dir, _spill, reg) = setup();
     let bash = reg.get("Bash");
@@ -357,40 +358,14 @@ async fn bash_inherits_scoped_fs_pwd() {
 }
 
 #[tokio::test]
-async fn bash_spilled_file_is_readable_via_read_tool() {
-    // Long Bash output spills to a path that the controller has added to
-    // the readable scope. The agent should be able to Read that path
-    // exactly like any in-scope file.
+async fn bash_provider_output_does_not_expose_internal_paths() {
     let (_dir, spill, reg) = setup();
     let bash = reg.get("Bash");
-    let out = call(
-        &bash,
-        json!({ "command": "for i in $(seq 1 200); do echo line $i; done" }),
-    )
-    .await;
+    let out = call(&bash, json!({ "command": "printf 'x%.0s' {1..20480}" })).await;
     let body = out.content.unwrap();
-    let spill_str = spill.path().to_str().unwrap();
-
-    // Extract the spilled path from the marker line.
-    let marker = body.lines().next().unwrap();
-    let prefix_pos = marker
-        .find(spill_str)
-        .expect("marker should reference the spill dir");
-    let path_end_rel = marker[prefix_pos..]
-        .find(".log")
-        .expect("marker should end the path with .log");
-    let spilled = &marker[prefix_pos..prefix_pos + path_end_rel + 4];
-
-    // Read the file via the Read tool — must succeed (in scope).
-    let read_out = call(&reg.get("Read"), json!({ "file_path": spilled })).await;
-    let read_body = read_out.content.expect("Read returned content");
-    // The full 200 lines should be in the saved file even though Bash
-    // returned only the tail of 80.
-    assert!(
-        read_body.contains("line 1\n"),
-        "missing line 1: {read_body}"
-    );
-    assert!(read_body.contains("line 200"), "missing line 200");
+    assert!(body.contains("bounded Workdir command output"));
+    assert!(!body.contains(spill.path().to_str().unwrap()));
+    assert_eq!(std::fs::read_dir(spill.path()).unwrap().count(), 0);
 }
 
 // Sanity: unused Path import guard

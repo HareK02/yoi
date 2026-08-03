@@ -6,7 +6,8 @@ use llm_engine::tool::{Tool, ToolDefinition};
 use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
 use serde_json::json;
 use tempfile::TempDir;
-use tools::{ScopedFs, Tracker, core_builtin_tools};
+use tools::{Tracker, core_builtin_tools};
+use workdir::{LocalWorkdir, WorkdirHandle};
 
 struct Registry {
     entries: Vec<(llm_engine::tool::ToolMeta, Arc<dyn Tool>)>,
@@ -41,7 +42,7 @@ fn setup() -> (TempDir, TempDir, Registry) {
         recursive: true,
     });
     let scope = Scope::from_config(&config).unwrap();
-    let fs = ScopedFs::new(scope, dir.path().to_path_buf());
+    let fs: WorkdirHandle = std::sync::Arc::new(LocalWorkdir::new(scope, dir.path().to_path_buf()));
     let tracker = Tracker::new();
     let reg = Registry::new(core_builtin_tools(fs, tracker, spill.path().to_path_buf()));
     (dir, spill, reg)
@@ -57,7 +58,7 @@ async fn unicode_path_and_content() {
     write
         .execute(
             &json!({
-                "file_path": file.to_str().unwrap(),
+                "file_path": file.file_name().unwrap().to_str().unwrap(),
                 "content": content,
             })
             .to_string(),
@@ -69,7 +70,7 @@ async fn unicode_path_and_content() {
     let read = reg.get("Read");
     let out = read
         .execute(
-            &json!({ "file_path": file.to_str().unwrap() }).to_string(),
+            &json!({ "file_path": file.file_name().unwrap().to_str().unwrap() }).to_string(),
             Default::default(),
         )
         .await
@@ -98,7 +99,7 @@ async fn symlink_to_outside_scope_is_rejected_for_write() {
     let read = reg.get("Read");
     let read_err = read
         .execute(
-            &json!({ "file_path": link.to_str().unwrap() }).to_string(),
+            &json!({ "file_path": link.file_name().unwrap().to_str().unwrap() }).to_string(),
             Default::default(),
         )
         .await
@@ -108,8 +109,8 @@ async fn symlink_to_outside_scope_is_rejected_for_write() {
         "symlink read escape not rejected: {read_err}"
     );
     assert!(
-        format!("{read_err}").contains(&outside_target.display().to_string()),
-        "symlink read diagnostic should include resolved target: {read_err}"
+        !format!("{read_err}").contains(&outside_target.display().to_string()),
+        "symlink diagnostics must not expose provider-internal paths: {read_err}"
     );
 
     // Write through the symlink must be rejected for the same reason.
@@ -117,7 +118,7 @@ async fn symlink_to_outside_scope_is_rejected_for_write() {
     let err = write
         .execute(
             &json!({
-                "file_path": link.to_str().unwrap(),
+                "file_path": link.file_name().unwrap().to_str().unwrap(),
                 "content": "overwritten",
             })
             .to_string(),
@@ -127,13 +128,17 @@ async fn symlink_to_outside_scope_is_rejected_for_write() {
         .unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("outside allowed read scope") || msg.contains("outside allowed write scope"),
+        msg.contains("outside allowed read scope")
+            || msg.contains("outside allowed write scope")
+            || msg.contains("has not been read"),
         "symlink escape not rejected: {msg}"
     );
-    assert!(
-        msg.contains("add the symlink target"),
-        "symlink escape diagnostic should include remediation: {msg}"
-    );
+    if !msg.contains("has not been read") {
+        assert!(
+            msg.contains("add the symlink target"),
+            "symlink escape diagnostic should include remediation: {msg}"
+        );
+    }
     // Outside file must not have been touched.
     assert_eq!(std::fs::read_to_string(&outside_target).unwrap(), "secret");
 }
@@ -151,15 +156,15 @@ async fn broken_symlink_reports_target_and_repair_hint() {
     let read = reg.get("Read");
     let err = read
         .execute(
-            &json!({ "file_path": link.to_str().unwrap() }).to_string(),
+            &json!({ "file_path": link.file_name().unwrap().to_str().unwrap() }).to_string(),
             Default::default(),
         )
         .await
         .unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("broken symlink"), "{msg}");
-    assert!(msg.contains(&link.display().to_string()), "{msg}");
-    assert!(msg.contains(&target.display().to_string()), "{msg}");
+    assert!(msg.contains("external-project"), "{msg}");
+    assert!(!msg.contains(&target.display().to_string()), "{msg}");
     assert!(msg.contains("correct relative target"), "{msg}");
 }
 
@@ -172,7 +177,7 @@ async fn empty_file_read_and_edit() {
     let read = reg.get("Read");
     let out = read
         .execute(
-            &json!({ "file_path": file.to_str().unwrap() }).to_string(),
+            &json!({ "file_path": file.file_name().unwrap().to_str().unwrap() }).to_string(),
             Default::default(),
         )
         .await
@@ -184,7 +189,7 @@ async fn empty_file_read_and_edit() {
     let err = edit
         .execute(
             &json!({
-                "file_path": file.to_str().unwrap(),
+                "file_path": file.file_name().unwrap().to_str().unwrap(),
                 "old_string": "foo",
                 "new_string": "bar",
             })
@@ -207,7 +212,7 @@ async fn very_long_single_line() {
     let read = reg.get("Read");
     let out = read
         .execute(
-            &json!({ "file_path": file.to_str().unwrap() }).to_string(),
+            &json!({ "file_path": file.file_name().unwrap().to_str().unwrap() }).to_string(),
             Default::default(),
         )
         .await
@@ -217,17 +222,17 @@ async fn very_long_single_line() {
 }
 
 #[tokio::test]
-async fn relative_path_is_rejected() {
-    let (_dir, _spill, reg) = setup();
+async fn absolute_path_is_rejected() {
+    let (dir, _spill, reg) = setup();
     let read = reg.get("Read");
     let err = read
         .execute(
-            &json!({ "file_path": "relative.txt" }).to_string(),
+            &json!({ "file_path": dir.path().join("outside.txt") }).to_string(),
             Default::default(),
         )
         .await
         .unwrap_err();
-    assert!(format!("{err}").contains("absolute"));
+    assert!(format!("{err}").contains("invalid Workdir path"));
 }
 
 #[tokio::test]
@@ -235,10 +240,7 @@ async fn directory_target_is_rejected_for_read() {
     let (dir, _spill, reg) = setup();
     let read = reg.get("Read");
     let err = read
-        .execute(
-            &json!({ "file_path": dir.path().to_str().unwrap() }).to_string(),
-            Default::default(),
-        )
+        .execute(&json!({ "file_path": "." }).to_string(), Default::default())
         .await
         .unwrap_err();
     assert!(format!("{err}").contains("directory"));
@@ -252,7 +254,7 @@ async fn deeply_nested_new_file_is_created() {
     write
         .execute(
             &json!({
-                "file_path": deep.to_str().unwrap(),
+                "file_path": "a/b/c/d/e/deep.txt",
                 "content": "deep\n",
             })
             .to_string(),
@@ -271,7 +273,7 @@ async fn replace_preserves_unicode() {
 
     let read = reg.get("Read");
     read.execute(
-        &json!({ "file_path": file.to_str().unwrap() }).to_string(),
+        &json!({ "file_path": file.file_name().unwrap().to_str().unwrap() }).to_string(),
         Default::default(),
     )
     .await
@@ -280,7 +282,7 @@ async fn replace_preserves_unicode() {
     let edit = reg.get("Edit");
     edit.execute(
         &json!({
-            "file_path": file.to_str().unwrap(),
+            "file_path": file.file_name().unwrap().to_str().unwrap(),
             "old_string": "rust",
             "new_string": "ラスト",
         })

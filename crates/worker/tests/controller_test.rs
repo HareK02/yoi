@@ -11,6 +11,7 @@ use llm_engine::llm_client::{ClientError, LlmClient, Request};
 use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use session_store::{CombinedStore, FsWorkerStore};
 use session_store::{FsStore, LogEntry};
+use workdir::{CommandRequest, LocalWorkdir, WorkdirCapabilities, WorkdirError, WorkdirHandle};
 
 use worker::{
     Event, Method, Worker, WorkerController, WorkerFilesystemAuthority, WorkerHandle,
@@ -211,6 +212,42 @@ async fn spawn_controller(worker: Worker<MockClient, TestStore>) -> WorkerHandle
         .await
         .unwrap();
     handle
+}
+
+#[tokio::test]
+async fn shutdown_closes_bound_workdir_commands() {
+    let (mut worker, pwd) = make_worker_with_pwd(MockClient::new(simple_text_events())).await;
+    let workdir: WorkdirHandle = Arc::new(LocalWorkdir::materialized_bound(
+        Some("controller-test-workdir".to_owned()),
+        pwd.clone(),
+        pwd,
+        worker.scope().clone(),
+        WorkdirCapabilities::ALL,
+    ));
+    let command = workdir
+        .start_command(CommandRequest {
+            command: "sleep 30".to_owned(),
+            timeout_secs: 60,
+            output_limit: 1024,
+        })
+        .await
+        .unwrap();
+    worker.bind_workdir(Some(Arc::clone(&workdir)));
+
+    let runtime_base = tempfile::tempdir().unwrap();
+    let (handle, shutdown_rx) = WorkerController::spawn(worker, runtime_base.path())
+        .await
+        .unwrap();
+    handle.send(Method::Shutdown).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), shutdown_rx)
+        .await
+        .expect("controller should shut down")
+        .expect("controller shutdown signal should remain open");
+
+    assert!(matches!(
+        workdir.command_status(command).await,
+        Err(WorkdirError::UnknownCommand(_))
+    ));
 }
 
 async fn wait_for_status(handle: &WorkerHandle, status: WorkerStatus) {

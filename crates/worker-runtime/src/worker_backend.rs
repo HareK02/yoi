@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -37,6 +37,7 @@ use session_store::{CombinedStore, FsWorkerStore};
 use tokio::runtime::Runtime;
 #[cfg(feature = "ws-server")]
 use tokio::sync::broadcast;
+use workdir::{LocalWorkdir, WorkdirCapabilities, WorkdirHandle};
 
 #[cfg(feature = "ws-server")]
 use worker::ipc::protocol_session::{live_log_entry_event, subscribe_worker_protocol_session};
@@ -353,6 +354,21 @@ async fn fetch_profile_source_archive_http(
     )
 }
 
+fn runtime_local_workdir(
+    binding_id: &str,
+    root: &Path,
+    cwd: &Path,
+    scope: manifest::SharedScope,
+) -> WorkdirHandle {
+    Arc::new(LocalWorkdir::materialized_bound(
+        Some(binding_id.to_owned()),
+        root.to_path_buf(),
+        cwd.to_path_buf(),
+        scope,
+        WorkdirCapabilities::ALL,
+    ))
+}
+
 #[async_trait]
 impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
     async fn spawn_controller(
@@ -419,7 +435,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         })?;
         let store = CombinedStore::new(session_store, worker_metadata_store);
 
-        let worker = Worker::from_manifest_with_context(
+        let mut worker = Worker::from_manifest_with_context(
             manifest,
             store,
             loader,
@@ -428,6 +444,16 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         )
         .await
         .map_err(|err| format!("failed to create Worker from profile: {err}"))?;
+        if let Some(binding) = request.working_directory.as_ref() {
+            worker.bind_workdir(Some(runtime_local_workdir(
+                &binding.working_directory.id,
+                binding.root(),
+                binding.cwd(),
+                worker.scope().clone(),
+            )));
+        } else {
+            worker.bind_workdir(None);
+        }
 
         let runtime_base = self.runtime_base_dir()?;
         let (handle, _shutdown_rx) = WorkerController::spawn_runtime_managed(worker, &runtime_base)
@@ -472,7 +498,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         })?;
         let store = CombinedStore::new(session_store, worker_metadata_store);
 
-        let worker = match Worker::restore_from_worker_metadata_with_context(
+        let mut worker = match Worker::restore_from_worker_metadata_with_context(
             &worker_name,
             manifest.clone(),
             store,
@@ -513,6 +539,16 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             }
             Err(err) => return Err(format!("failed to restore Worker from metadata: {err}")),
         };
+        if let Some(binding) = request.working_directory.as_ref() {
+            worker.bind_workdir(Some(runtime_local_workdir(
+                &binding.working_directory.id,
+                binding.root(),
+                binding.cwd(),
+                worker.scope().clone(),
+            )));
+        } else {
+            worker.bind_workdir(None);
+        }
 
         let runtime_base = self.runtime_base_dir()?;
         let (handle, _shutdown_rx) = WorkerController::spawn_runtime_managed(worker, &runtime_base)
@@ -1227,7 +1263,9 @@ where
         };
         workers
             .get(handle.worker_ref())
-            .map(|execution| execution.handle.completion_entries(kind, prefix))
+            .map(|execution| {
+                futures::executor::block_on(execution.handle.completion_entries(kind, prefix))
+            })
             .unwrap_or_default()
     }
 }
@@ -1597,6 +1635,27 @@ mod tests {
             ProfileRuntimeWorkerFactory::runtime_worker_name(&request),
             "00000001"
         );
+    }
+
+    #[test]
+    fn runtime_rebind_preserves_working_directory_id_on_a_fresh_provider() {
+        let root = tempfile::tempdir().unwrap();
+        let spawned = runtime_local_workdir(
+            "working-directory-42",
+            root.path(),
+            root.path(),
+            manifest::SharedScope::new(Scope::writable(root.path()).unwrap()),
+        );
+        let restored = runtime_local_workdir(
+            "working-directory-42",
+            root.path(),
+            root.path(),
+            manifest::SharedScope::new(Scope::writable(root.path()).unwrap()),
+        );
+
+        assert_eq!(spawned.binding_id(), Some("working-directory-42"));
+        assert_eq!(restored.binding_id(), Some("working-directory-42"));
+        assert!(!Arc::ptr_eq(&spawned, &restored));
     }
 
     #[tokio::test]

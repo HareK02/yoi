@@ -1,26 +1,27 @@
 //! `Read` tool — read a text file with offset/limit, return line-numbered output.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::Deserialize;
 
-use crate::scoped_fs::ScopedFs;
+use crate::error::ToolsError;
 use crate::tracker::Tracker;
+use workdir::{ReadRequest, WorkdirHandle, WorkdirPath};
 
 const DESCRIPTION: &str = "Read a text file from the local filesystem. \
 Supports offset/limit for large files. Returns line-numbered output (1-based). \
 Directories cannot be read. The file must be read before Write or Edit can \
-modify it. Paths must be absolute.";
+modify it. Paths are relative to the bound Workdir.";
 
 const DEFAULT_LIMIT: usize = 2000;
+const PROVIDER_BYTE_LIMIT: usize = 256 * 1024;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ReadParams {
-    /// Absolute path to the file.
-    pub file_path: PathBuf,
+    /// Logical path relative to the bound Workdir root.
+    pub file_path: String,
     /// 0-based line offset from the start. Defaults to 0.
     #[serde(default)]
     pub offset: Option<usize>,
@@ -30,7 +31,7 @@ pub(crate) struct ReadParams {
 }
 
 pub(crate) struct ReadTool {
-    fs: ScopedFs,
+    workdir: WorkdirHandle,
     tracker: Tracker,
 }
 
@@ -46,20 +47,28 @@ impl Tool for ReadTool {
         let offset = params.offset.unwrap_or(0);
         let limit = params.limit.unwrap_or(DEFAULT_LIMIT).max(1);
 
-        tracing::debug!(
-            path = %params.file_path.display(),
-            offset,
-            limit,
-            "Read"
+        let path = WorkdirPath::new(&params.file_path).map_err(ToolsError::from)?;
+        tracing::debug!(path = %path, offset, limit, "Read");
+
+        let result = self
+            .workdir
+            .read(ReadRequest {
+                path: path.clone(),
+                offset,
+                limit,
+                max_bytes: PROVIDER_BYTE_LIMIT,
+            })
+            .await
+            .map_err(ToolsError::from)?;
+        self.tracker.record_workdir_hash(&path, result.content_hash);
+
+        let text = String::from_utf8_lossy(&result.bytes).into_owned();
+        let rendered = render_provider_read(
+            &text,
+            result.start_line,
+            result.total_lines,
+            result.truncated,
         );
-
-        let bytes = self.fs.read_bytes(&params.file_path)?;
-        // Record the raw bytes under the read-history so subsequent Edit /
-        // Write can detect external modification.
-        self.tracker.record(&params.file_path, &bytes);
-
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        let rendered = render_numbered(&text, offset, limit);
 
         let summary = if rendered.truncated {
             format!(
@@ -68,14 +77,10 @@ impl Tool for ReadTool {
                 offset + 1,
                 offset + rendered.line_count,
                 rendered.total_lines,
-                params.file_path.display()
+                path
             )
         } else {
-            format!(
-                "Read {} line(s) from {}",
-                rendered.line_count,
-                params.file_path.display()
-            )
+            format!("Read {} line(s) from {}", rendered.line_count, path)
         };
 
         Ok(ToolOutput {
@@ -92,8 +97,29 @@ struct Rendered {
     truncated: bool,
 }
 
+fn render_provider_read(
+    text: &str,
+    start_line: usize,
+    total_lines: usize,
+    truncated: bool,
+) -> Rendered {
+    use std::fmt::Write as _;
+    let lines = text.lines().collect::<Vec<_>>();
+    let mut body = String::with_capacity(text.len().saturating_add(lines.len() * 8));
+    for (index, line) in lines.iter().enumerate() {
+        let _ = writeln!(&mut body, "{:>6}\t{}", start_line + index + 1, line);
+    }
+    Rendered {
+        body,
+        line_count: lines.len(),
+        total_lines,
+        truncated: start_line > 0 || truncated,
+    }
+}
+
 /// Format a slice of lines from `text` with `cat -n` style 1-based line
 /// numbers. Pure function — no I/O, no history touching.
+#[cfg(test)]
 fn render_numbered(text: &str, offset: usize, limit: usize) -> Rendered {
     let all_lines: Vec<&str> = text.lines().collect();
     let total_lines = all_lines.len();
@@ -118,7 +144,7 @@ fn render_numbered(text: &str, offset: usize, limit: usize) -> Rendered {
 }
 
 /// Factory for the `Read` tool.
-pub fn read_tool(fs: ScopedFs, tracker: Tracker) -> ToolDefinition {
+pub fn read_tool(workdir: WorkdirHandle, tracker: Tracker) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(ReadParams);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
@@ -126,7 +152,7 @@ pub fn read_tool(fs: ScopedFs, tracker: Tracker) -> ToolDefinition {
             .description(DESCRIPTION)
             .input_schema(schema_value);
         let tool: Arc<dyn Tool> = Arc::new(ReadTool {
-            fs: fs.clone(),
+            workdir: workdir.clone(),
             tracker: tracker.clone(),
         });
         (meta, tool)
@@ -138,14 +164,15 @@ mod tests {
     use super::*;
     use manifest::Scope;
     use tempfile::TempDir;
+    use workdir::LocalWorkdir;
 
-    fn setup() -> (TempDir, ScopedFs, Tracker) {
+    fn setup() -> (TempDir, WorkdirHandle, Tracker) {
         let dir = TempDir::new().unwrap();
-        let fs = ScopedFs::new(
+        let workdir: WorkdirHandle = Arc::new(LocalWorkdir::new(
             Scope::writable(dir.path()).unwrap(),
             dir.path().to_path_buf(),
-        );
-        (dir, fs, Tracker::new())
+        ));
+        (dir, workdir, Tracker::new())
     }
 
     #[tokio::test]
@@ -158,7 +185,7 @@ mod tests {
         let (meta, tool) = def();
         assert_eq!(meta.name, "Read");
 
-        let input = serde_json::json!({ "file_path": file.to_str().unwrap() });
+        let input = serde_json::json!({ "file_path": file.file_name().unwrap().to_str().unwrap() });
         let out = tool
             .execute(&input.to_string(), Default::default())
             .await
@@ -169,7 +196,11 @@ mod tests {
         assert!(body.contains("     3\tgamma"));
 
         // History recorded
-        assert!(tracker.has(&file));
+        assert!(
+            tracker
+                .expected_workdir_hash(&WorkdirPath::new("a.txt").unwrap())
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -181,7 +212,7 @@ mod tests {
         let def = read_tool(fs, tracker);
         let (_, tool) = def();
         let input = serde_json::json!({
-            "file_path": file.to_str().unwrap(),
+            "file_path": file.file_name().unwrap().to_str().unwrap(),
             "offset": 1,
             "limit": 2,
         });
@@ -201,7 +232,7 @@ mod tests {
         let def = read_tool(fs, tracker);
         let (_, tool) = def();
         let input = serde_json::json!({
-            "file_path": dir.path().join("nope.txt").to_str().unwrap()
+            "file_path": "nope.txt"
         });
         let err = tool
             .execute(&input.to_string(), Default::default())

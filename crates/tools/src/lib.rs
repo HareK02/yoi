@@ -1,25 +1,14 @@
 //! Built-in tools for the Yoi LLM agent.
 //!
-//! Implements Read / Write / Edit / Glob / Grep / Bash on top of the
-//! `llm-engine` `Tool` infrastructure. Filesystem access is mediated by
-//! two orthogonal concerns:
+//! Read / Write / Edit / Glob / Grep / Bash operate through a host-owned
+//! [`workdir::Workdir`] handle. This crate owns tool schemas, rendering, and
+//! read-before-edit tracking; it does not own Workdir identity or lifecycle.
 //!
-//! - [`ScopedFs`] — Worker-process lifetime, expresses the write-block
-//!   boundary for the current scope. Derived from the manifest; not
-//!   persisted across Worker restart.
-//! - [`Tracker`] — Worker-process lifetime, enforces the "read before edit"
-//!   policy via content hashes and tracks the recency of touched files.
-//!   Recreated fresh on each Worker start (including resume).
-//!
-//! The Worker layer owns both instances and passes them to
-//! [`core_builtin_tools`] when registering tools on a `Engine`.
-//!
-//! `Bash` is the lone exception — its child processes bypass `ScopedFs`
-//! entirely. Safety for arbitrary command execution is delegated to the
-//! Permission layer (deny/allow rules on the command string).
+//! Bash is intentionally not sandboxed. The Workdir supplies its initial cwd
+//! and command capability, while the Runtime process and OS user remain the
+//! trusted execution boundary.
 
 pub mod error;
-pub mod scoped_fs;
 pub mod tracker;
 
 mod bash;
@@ -36,36 +25,40 @@ pub use error::ToolsError;
 pub use glob::glob_tool;
 pub use grep::grep_tool;
 pub use read::read_tool;
-pub use scoped_fs::ScopedFs;
 pub use tracker::Tracker;
 pub use web::{web_fetch_tool, web_search_tool};
 pub use write::write_tool;
 
-/// Register core builtin tools that do not require Worker-local task state,
-/// wiring them to a shared `ScopedFs` (Worker-process lifetime) and `Tracker`
-/// (Worker-process lifetime).
-///
-/// All returned factories share the same tracker instance so that
-/// `Read` / `Write` / `Edit` see a consistent history across tool
-/// invocations within a single Worker run.
-///
-/// `bash_output_dir` is where the Bash tool spills long outputs. The
-/// caller is responsible for adding that path to the readable scope
-/// (see [`manifest::Scope::with_extra_read`]) so the agent can `Read`
-/// the saved files.
+/// Build the local filesystem/command tool surface implemented by a Workdir.
+/// Profile/manifest policy may narrow this set further in the Engine.
 pub fn core_builtin_tools(
-    fs: ScopedFs,
+    workdir: workdir::WorkdirHandle,
     tracker: Tracker,
     bash_output_dir: std::path::PathBuf,
 ) -> Vec<llm_engine::tool::ToolDefinition> {
-    vec![
-        read_tool(fs.clone(), tracker.clone()),
-        write_tool(fs.clone(), tracker.clone()),
-        edit_tool(fs.clone(), tracker),
-        glob_tool(fs.clone()),
-        grep_tool(fs.clone()),
-        bash_tool(fs, bash_output_dir),
-    ]
+    use workdir::WorkdirCapability;
+
+    let capabilities = workdir.capabilities();
+    let mut tools = Vec::with_capacity(6);
+    if capabilities.supports(WorkdirCapability::Read) {
+        tools.push(read_tool(workdir.clone(), tracker.clone()));
+    }
+    if capabilities.supports(WorkdirCapability::Write) {
+        tools.push(write_tool(workdir.clone(), tracker.clone()));
+    }
+    if capabilities.supports(WorkdirCapability::Edit) {
+        tools.push(edit_tool(workdir.clone(), tracker));
+    }
+    if capabilities.supports(WorkdirCapability::Glob) {
+        tools.push(glob_tool(workdir.clone()));
+    }
+    if capabilities.supports(WorkdirCapability::Grep) {
+        tools.push(grep_tool(workdir.clone()));
+    }
+    if capabilities.supports(WorkdirCapability::Command) {
+        tools.push(bash_tool(workdir, bash_output_dir));
+    }
+    tools
 }
 
 pub fn web_builtin_tools(
@@ -75,4 +68,30 @@ pub fn web_builtin_tools(
         web_search_tool(web::WebTools::new(web_config.clone())),
         web_fetch_tool(web::WebTools::new(web_config)),
     ]
+}
+
+#[cfg(test)]
+mod workdir_tool_tests {
+    use super::*;
+    use manifest::{Scope, SharedScope};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use workdir::{LocalWorkdir, WorkdirCapabilities, WorkdirHandle};
+
+    #[test]
+    fn read_only_workdir_exposes_only_observation_tools() {
+        let dir = TempDir::new().unwrap();
+        let workdir: WorkdirHandle = Arc::new(LocalWorkdir::materialized(
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+            SharedScope::new(Scope::writable(dir.path()).unwrap()),
+            WorkdirCapabilities::READ_ONLY,
+        ));
+        let names = core_builtin_tools(workdir, Tracker::new(), dir.path().join("output"))
+            .into_iter()
+            .map(|definition| definition().0.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["Read", "Glob", "Grep"]);
+    }
 }

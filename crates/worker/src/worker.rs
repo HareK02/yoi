@@ -76,6 +76,7 @@ use protocol::{
 use tokio::net::UnixStream;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
+use workdir::{LocalWorkdir, WorkdirCapabilities, WorkdirHandle};
 
 const RESTORE_RECONCILIATION_REACHABILITY_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -741,13 +742,15 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// Explicit local filesystem authority, or `None` for Workers with no
     /// local cwd and no filesystem/Bash tool surface.
     filesystem_authority: WorkerFilesystemAuthority,
+    /// Live Workdir provider derived once from the Worker–Workdir binding.
+    /// Local tools, file views, and compaction workers clone this handle.
+    workdir: Option<WorkdirHandle>,
     /// Path-free workspace identity/client context injected by Runtime/host.
     /// This never grants local filesystem authority.
     workspace_context: WorkerWorkspaceContext,
     /// Shared, atomically-swappable view of the Worker's resolved scope.
-    /// Cloned out to `ScopedFs` instances (builtin tools, fs_view,
-    /// compact worker) so scope updates propagate to every consumer
-    /// at the next permission check.
+    /// Cloned into local Workdir providers used by builtin tools, fs_view,
+    /// and compaction so updates propagate at the next permission check.
     scope: SharedScope,
     /// Filesystem authority this Worker may pass to spawned children. Direct tools
     /// continue to use `scope`; SpawnWorker validates requested child scope here.
@@ -923,6 +926,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
             worker_metadata_writer: None,
             segment_state: self.segment_state.clone(),
             filesystem_authority: self.filesystem_authority.clone(),
+            workdir: self.workdir.clone(),
             workspace_context: self.workspace_context.clone(),
             scope: self.scope.clone(),
             delegation_scope: self.delegation_scope.clone(),
@@ -1110,6 +1114,8 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         let prompts = PromptCatalog::builtins_only()?;
         let delegation_scope =
             DelegationScope::from_config(&manifest.delegation_scope).map_err(WorkerError::Scope)?;
+        let scope = SharedScope::new(scope);
+        let workdir = workdir_from_authority(&filesystem_authority, &scope);
         let mut worker = Self {
             manifest,
             engine: Some(worker),
@@ -1117,8 +1123,9 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             worker_metadata_writer: None,
             segment_state: SegmentState::new(session_id, segment_id, 0),
             filesystem_authority,
+            workdir,
             workspace_context,
-            scope: SharedScope::new(scope),
+            scope,
             delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
@@ -1229,6 +1236,17 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// Local working directory when this Worker has local filesystem authority.
     pub fn local_working_directory(&self) -> Option<&LocalWorkingDirectory> {
         self.filesystem_authority.as_local()
+    }
+
+    pub fn workdir(&self) -> Option<&WorkdirHandle> {
+        self.workdir.as_ref()
+    }
+
+    /// Replace the constructor fallback with the provider binding resolved by
+    /// the owning Runtime. Runtime calls this before the Worker controller is
+    /// spawned, so tools only ever observe the Runtime-bound handle.
+    pub fn bind_workdir(&mut self, workdir: Option<WorkdirHandle>) {
+        self.workdir = workdir;
     }
 
     /// Path-free workspace identity, if Runtime/host associated this Worker
@@ -2063,7 +2081,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         // Resolve `@<path>` file refs to system messages stashed for the
         // WorkerInterceptor to attach right after the user message. Resolution
         // failures are non-fatal alerts.
-        let attachments = self.resolve_file_refs(&input);
+        let attachments = self.resolve_file_refs(&input).await;
         let flattened = self.flatten_segments(&input);
         if !attachments.is_empty() {
             *self
@@ -2094,8 +2112,8 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// directory) surface as `AlertLevel::Warn` Alerts and are skipped — the
     /// unresolved placeholder stays in the flattened user message so the LLM
     /// still sees the intent.
-    fn resolve_file_refs(&self, segments: &[Segment]) -> Vec<SystemItem> {
-        let Some(local) = self.local_working_directory() else {
+    async fn resolve_file_refs(&self, segments: &[Segment]) -> Vec<SystemItem> {
+        let Some(workdir) = self.workdir.clone() else {
             for seg in segments {
                 if let Segment::FileRef { path } = seg {
                     self.alert(
@@ -2107,16 +2125,16 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             }
             return Vec::new();
         };
-        let view = crate::fs_view::WorkerFsView::new(tools::ScopedFs::with_shared_scope(
-            self.scope.clone(),
-            local.cwd.clone(),
-        ));
+        let view = crate::fs_view::WorkerFsView::new(workdir);
         let mut out = Vec::new();
         for seg in segments {
             let Segment::FileRef { path } = seg else {
                 continue;
             };
-            match view.resolve_file_ref(path, self.manifest.engine.file_upload.max_bytes) {
+            match view
+                .resolve_file_ref(path, self.manifest.engine.file_upload.max_bytes)
+                .await
+            {
                 Ok(item) => {
                     // `resolve_file_ref` returns an `Item::system_message`
                     // whose text already carries the `[File: <path>]` or
@@ -2872,13 +2890,10 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             auto_read_budget,
         )));
 
-        // Build an independent compact worker. When the main Worker has local
-        // filesystem authority, compact-time reads go through the same scope
-        // and cwd policy. No-workdir Workers deliberately omit compact-time
-        // filesystem tools as well.
-        let scoped_fs = self
-            .local_working_directory()
-            .map(|local| tools::ScopedFs::with_shared_scope(self.scope.clone(), local.cwd.clone()));
+        // Build an independent compact worker. It clones the main Worker's
+        // provider handle, so compact-time reads use the same Workdir instance.
+        // No-workdir Workers deliberately omit compact-time filesystem tools.
+        let workdir = self.workdir.clone();
         let summary_tracker = tools::Tracker::new();
         let summary_client: Box<dyn LlmClient> = self.build_compactor_client()?;
         let summary_system_prompt = self
@@ -2916,9 +2931,9 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         // Tools: read_file (shared scope, fresh tracker), bounded session
         // history exploration, and compact-specific tools that populate `ctx`.
         let compact_target_items = Arc::new(items_to_summarise.clone());
-        if let Some(scoped_fs) = scoped_fs.clone() {
-            summary_worker.register_tool(tools::read_tool(scoped_fs.clone(), summary_tracker));
-            summary_worker.register_tool(mark_read_required_tool(scoped_fs, ctx.clone()));
+        if let Some(workdir) = workdir.clone() {
+            summary_worker.register_tool(tools::read_tool(workdir.clone(), summary_tracker));
+            summary_worker.register_tool(mark_read_required_tool(workdir, ctx.clone()));
         }
         summary_worker.register_tool(search_session_log_tool(compact_target_items.clone()));
         summary_worker.register_tool(read_session_items_tool(compact_target_items));
@@ -2998,12 +3013,13 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         // logged and skipped inside `render_auto_read` rather than
         // aborting compaction — a missing / moved file should not fail
         // the whole compact.
-        let auto_read_messages = scoped_fs
-            .clone()
-            .map(|scoped_fs| {
-                WorkerFsView::new(scoped_fs).render_auto_read(&final_ctx.read_required)
-            })
-            .unwrap_or_default();
+        let auto_read_messages = if let Some(workdir) = workdir {
+            WorkerFsView::new(workdir)
+                .render_auto_read(&final_ctx.read_required)
+                .await
+        } else {
+            Vec::new()
+        };
 
         // Reference list as a single system message; omitted when empty.
         let reference_message = (!final_ctx.references.is_empty()).then(|| {
@@ -3940,6 +3956,8 @@ where
         apply_worker_manifest(&mut worker, &manifest.engine);
         worker.set_cache_key(Some(segment_id.to_string()));
         let worker_metadata_writer = Some(worker_metadata_writer_for_store(&store));
+        let scope = SharedScope::new(common.scope);
+        let workdir = workdir_from_authority(&common.filesystem_authority, &scope);
 
         let mut worker = Self {
             manifest,
@@ -3948,8 +3966,9 @@ where
             worker_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, 0),
             filesystem_authority: common.filesystem_authority,
+            workdir,
             workspace_context: common.workspace_context,
-            scope: SharedScope::new(common.scope),
+            scope,
             delegation_scope: common.delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
@@ -4046,6 +4065,8 @@ where
         apply_worker_manifest(&mut worker, &manifest.engine);
         worker.set_cache_key(Some(segment_id.to_string()));
         let worker_metadata_writer = Some(worker_metadata_writer_for_store(&store));
+        let scope = SharedScope::new(common.scope);
+        let workdir = workdir_from_authority(&common.filesystem_authority, &scope);
 
         let mut worker = Self {
             manifest,
@@ -4054,8 +4075,9 @@ where
             worker_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, 0),
             filesystem_authority: common.filesystem_authority,
+            workdir,
             workspace_context: common.workspace_context,
-            scope: SharedScope::new(common.scope),
+            scope,
             delegation_scope: common.delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
@@ -4335,6 +4357,8 @@ where
         let extract_pointer = memory::extract::fold_pointer(&state.extensions);
         let task_feature = TaskFeature::from_history(&state.history);
         let worker_metadata_writer = Some(worker_metadata_writer_for_store(&store));
+        let scope = SharedScope::new(common.scope);
+        let workdir = workdir_from_authority(&common.filesystem_authority, &scope);
 
         let mut worker = Self {
             manifest,
@@ -4343,8 +4367,9 @@ where
             worker_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, state.entries_count),
             filesystem_authority: common.filesystem_authority,
+            workdir,
             workspace_context: common.workspace_context,
-            scope: SharedScope::new(common.scope),
+            scope,
             delegation_scope: common.delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
@@ -5006,6 +5031,20 @@ pub enum WorkerError {
         #[source]
         source: serde_json::Error,
     },
+}
+
+fn workdir_from_authority(
+    authority: &WorkerFilesystemAuthority,
+    scope: &SharedScope,
+) -> Option<WorkdirHandle> {
+    authority.as_local().map(|local| {
+        Arc::new(LocalWorkdir::materialized(
+            local.root.clone(),
+            local.cwd.clone(),
+            scope.clone(),
+            WorkdirCapabilities::ALL,
+        )) as WorkdirHandle
+    })
 }
 
 /// Bundle of resources that every high-level Worker constructor needs:

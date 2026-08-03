@@ -7,24 +7,25 @@ use async_trait::async_trait;
 use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::Deserialize;
 
-use crate::scoped_fs::ScopedFs;
+use crate::error::ToolsError;
 use crate::tracker::Tracker;
+use workdir::{StatRequest, WorkdirError, WorkdirHandle, WorkdirPath, WriteRequest};
 
 const DESCRIPTION: &str = "Create a new file or overwrite an existing one with \
 the given content. Missing parent directories within scope are created \
 automatically. Existing files must have been read first (via the Read tool) \
-in this session. Paths must be absolute.";
+in this session. Paths are relative to the bound Workdir.";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct WriteParams {
-    /// Absolute path to the file.
-    pub file_path: PathBuf,
+    /// Logical path relative to the bound Workdir root.
+    pub file_path: String,
     /// Full content to write. Overwrites any existing content.
     pub content: String,
 }
 
 pub(crate) struct WriteTool {
-    fs: ScopedFs,
+    workdir: WorkdirHandle,
     tracker: Tracker,
 }
 
@@ -38,30 +39,29 @@ impl Tool for WriteTool {
         let params: WriteParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid Write input: {e}")))?;
 
-        tracing::debug!(
-            path = %params.file_path.display(),
-            bytes = params.content.len(),
-            "Write"
-        );
+        let path = WorkdirPath::new(&params.file_path).map_err(ToolsError::from)?;
+        tracing::debug!(path = %path, bytes = params.content.len(), "Write");
 
-        let _mutation_permit = self.tracker.acquire_mutation(&params.file_path, &ctx).await;
-
-        // Policy check: if the target already exists, it must have been
-        // observed by the Read tool (via the tracker) and its current
-        // contents must match the recorded hash.
-        if params.file_path.exists() {
-            let current = self.fs.read_bytes(&params.file_path)?;
-            self.tracker.verify(&params.file_path, &current)?;
-        }
+        let mutation_key = PathBuf::from(path.as_str());
+        let _mutation_permit = self.tracker.acquire_mutation(&mutation_key, &ctx).await;
+        let expected_hash = match self.workdir.stat(StatRequest { path: path.clone() }).await {
+            Ok(_) => Some(self.tracker.expected_workdir_hash(&path)?),
+            Err(WorkdirError::NotFound(_)) => None,
+            Err(error) => return Err(ToolsError::from(error).into()),
+        };
 
         let outcome = self
-            .fs
-            .write(&params.file_path, params.content.as_bytes())?;
+            .workdir
+            .write(WriteRequest {
+                path: path.clone(),
+                content: params.content.as_bytes().to_vec(),
+                expected_hash,
+            })
+            .await
+            .map_err(ToolsError::from)?;
 
-        // Refresh the history entry to reflect the newly-written content,
-        // so a subsequent Edit / Write can proceed without a re-read.
         self.tracker
-            .record(&params.file_path, params.content.as_bytes());
+            .record_workdir_content(&path, params.content.as_bytes());
 
         let summary = format!(
             "{} {} ({} bytes)",
@@ -70,7 +70,7 @@ impl Tool for WriteTool {
             } else {
                 "Overwrote"
             },
-            params.file_path.display(),
+            path,
             outcome.bytes_written
         );
         Ok(ToolOutput {
@@ -81,7 +81,7 @@ impl Tool for WriteTool {
 }
 
 /// Factory for the `Write` tool.
-pub fn write_tool(fs: ScopedFs, tracker: Tracker) -> ToolDefinition {
+pub fn write_tool(workdir: WorkdirHandle, tracker: Tracker) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(WriteParams);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
@@ -89,7 +89,7 @@ pub fn write_tool(fs: ScopedFs, tracker: Tracker) -> ToolDefinition {
             .description(DESCRIPTION)
             .input_schema(schema_value);
         let tool: Arc<dyn Tool> = Arc::new(WriteTool {
-            fs: fs.clone(),
+            workdir: workdir.clone(),
             tracker: tracker.clone(),
         });
         (meta, tool)
@@ -102,14 +102,15 @@ mod tests {
     use crate::read::read_tool;
     use manifest::Scope;
     use tempfile::TempDir;
+    use workdir::LocalWorkdir;
 
-    fn setup() -> (TempDir, ScopedFs, Tracker) {
+    fn setup() -> (TempDir, WorkdirHandle, Tracker) {
         let dir = TempDir::new().unwrap();
-        let fs = ScopedFs::new(
+        let workdir: WorkdirHandle = Arc::new(LocalWorkdir::new(
             Scope::writable(dir.path()).unwrap(),
             dir.path().to_path_buf(),
-        );
-        (dir, fs, Tracker::new())
+        ));
+        (dir, workdir, Tracker::new())
     }
 
     #[tokio::test]
@@ -121,7 +122,7 @@ mod tests {
 
         let file = dir.path().join("new.txt");
         let input = serde_json::json!({
-            "file_path": file.to_str().unwrap(),
+            "file_path": file.file_name().unwrap().to_str().unwrap(),
             "content": "hello\n",
         });
         let out = tool
@@ -141,7 +142,7 @@ mod tests {
         let def = write_tool(fs, tracker);
         let (_, tool) = def();
         let input = serde_json::json!({
-            "file_path": file.to_str().unwrap(),
+            "file_path": file.file_name().unwrap().to_str().unwrap(),
             "content": "new",
         });
         let err = tool
@@ -159,7 +160,8 @@ mod tests {
 
         let read_def = read_tool(fs.clone(), tracker.clone());
         let (_, reader) = read_def();
-        let read_in = serde_json::json!({ "file_path": file.to_str().unwrap() });
+        let read_in =
+            serde_json::json!({ "file_path": file.file_name().unwrap().to_str().unwrap() });
         reader
             .execute(&read_in.to_string(), Default::default())
             .await
@@ -168,7 +170,7 @@ mod tests {
         let write_def = write_tool(fs, tracker);
         let (_, writer) = write_def();
         let write_in = serde_json::json!({
-            "file_path": file.to_str().unwrap(),
+            "file_path": file.file_name().unwrap().to_str().unwrap(),
             "content": "new\n",
         });
         let out = writer
@@ -190,7 +192,8 @@ mod tests {
         let (_, reader) = read_def();
         reader
             .execute(
-                &serde_json::json!({ "file_path": file.to_str().unwrap() }).to_string(),
+                &serde_json::json!({ "file_path": file.file_name().unwrap().to_str().unwrap() })
+                    .to_string(),
                 Default::default(),
             )
             .await
@@ -204,7 +207,7 @@ mod tests {
         let err = writer
             .execute(
                 &serde_json::json!({
-                    "file_path": file.to_str().unwrap(),
+                    "file_path": file.file_name().unwrap().to_str().unwrap(),
                     "content": "new",
                 })
                 .to_string(),
@@ -248,11 +251,11 @@ mod tests {
         let (_, editor) = edit_def();
 
         let write_in = serde_json::json!({
-            "file_path": file.to_str().unwrap(),
+            "file_path": file.file_name().unwrap().to_str().unwrap(),
             "content": "hello",
         });
         let edit_in = serde_json::json!({
-            "file_path": file.to_str().unwrap(),
+            "file_path": file.file_name().unwrap().to_str().unwrap(),
             "old_string": "hello",
             "new_string": "goodbye",
         });
@@ -282,7 +285,8 @@ mod tests {
         let (_, reader) = read_def();
         reader
             .execute(
-                &serde_json::json!({ "file_path": file.to_str().unwrap() }).to_string(),
+                &serde_json::json!({ "file_path": file.file_name().unwrap().to_str().unwrap() })
+                    .to_string(),
                 ToolExecutionContext::new("read", "pre", 0),
             )
             .await
@@ -291,12 +295,12 @@ mod tests {
         let edit_def = edit_tool(fs, tracker);
         let (_, editor) = edit_def();
         let bad_edit = serde_json::json!({
-            "file_path": file.to_str().unwrap(),
+            "file_path": file.file_name().unwrap().to_str().unwrap(),
             "old_string": "missing",
             "new_string": "beta",
         });
         let good_edit = serde_json::json!({
-            "file_path": file.to_str().unwrap(),
+            "file_path": file.file_name().unwrap().to_str().unwrap(),
             "old_string": "alpha",
             "new_string": "beta",
         });

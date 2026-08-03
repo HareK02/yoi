@@ -8,18 +8,18 @@ use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::Deserialize;
 
 use crate::error::ToolsError;
-use crate::scoped_fs::ScopedFs;
 use crate::tracker::Tracker;
+use workdir::{EditRequest, WorkdirHandle, WorkdirPath};
 
 const DESCRIPTION: &str = "Replace a substring in an existing file. By default \
 `old_string` must be unique in the file; set `replace_all: true` to replace \
 every occurrence. The file must have been read first (via the Read tool) in \
-this session. Paths must be absolute.";
+this session. Paths are relative to the bound Workdir.";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct EditParams {
-    /// Absolute path to the file.
-    pub file_path: PathBuf,
+    /// Logical path relative to the bound Workdir root.
+    pub file_path: String,
     /// String to replace. Must be unique in the file unless `replace_all` is true.
     pub old_string: String,
     /// Replacement string. Must differ from `old_string`.
@@ -30,7 +30,7 @@ pub(crate) struct EditParams {
 }
 
 pub(crate) struct EditTool {
-    fs: ScopedFs,
+    workdir: WorkdirHandle,
     tracker: Tracker,
 }
 
@@ -44,11 +44,8 @@ impl Tool for EditTool {
         let params: EditParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid Edit input: {e}")))?;
 
-        tracing::debug!(
-            path = %params.file_path.display(),
-            replace_all = params.replace_all,
-            "Edit"
-        );
+        let path = WorkdirPath::new(&params.file_path).map_err(ToolsError::from)?;
+        tracing::debug!(path = %path, replace_all = params.replace_all, "Edit");
 
         if params.old_string.is_empty() {
             return Err(ToolError::InvalidArgument(
@@ -61,51 +58,29 @@ impl Tool for EditTool {
             ));
         }
 
-        let _mutation_permit = self.tracker.acquire_mutation(&params.file_path, &ctx).await;
-
-        // Load current content and verify it matches the recorded hash.
-        let current_bytes = self.fs.read_bytes(&params.file_path)?;
-        self.tracker.verify(&params.file_path, &current_bytes)?;
-
-        let current_text = std::str::from_utf8(&current_bytes).map_err(|_| {
-            ToolsError::InvalidArgument(format!(
-                "file is not valid UTF-8: {}",
-                params.file_path.display()
-            ))
-        })?;
-
-        let count = current_text.matches(&params.old_string).count();
-        if count == 0 {
-            return Err(ToolsError::StringNotFound {
-                path: params.file_path.clone(),
-            }
-            .into());
-        }
-        if !params.replace_all && count > 1 {
-            return Err(ToolsError::NotUnique {
-                path: params.file_path.clone(),
-                count,
-            }
-            .into());
-        }
-
-        let new_text = if params.replace_all {
-            current_text.replace(&params.old_string, &params.new_string)
-        } else {
-            current_text.replacen(&params.old_string, &params.new_string, 1)
-        };
-        let occurrences = if params.replace_all { count } else { 1 };
-
-        self.fs.write(&params.file_path, new_text.as_bytes())?;
-        self.tracker.record(&params.file_path, new_text.as_bytes());
+        let mutation_key = PathBuf::from(path.as_str());
+        let _mutation_permit = self.tracker.acquire_mutation(&mutation_key, &ctx).await;
+        let expected_hash = self.tracker.expected_workdir_hash(&path)?;
+        let result = self
+            .workdir
+            .edit(EditRequest {
+                path: path.clone(),
+                old_string: params.old_string.clone(),
+                new_string: params.new_string.clone(),
+                replace_all: params.replace_all,
+                expected_hash,
+            })
+            .await
+            .map_err(ToolsError::from)?;
+        self.tracker.record_workdir_hash(&path, result.content_hash);
 
         let summary = format!(
             "Edited {} ({} replacement{})",
-            params.file_path.display(),
-            occurrences,
-            if occurrences == 1 { "" } else { "s" }
+            path,
+            result.replacements,
+            if result.replacements == 1 { "" } else { "s" }
         );
-        let preview = make_preview(&new_text, &params.new_string);
+        let preview = make_preview(&params.new_string, &params.new_string);
 
         Ok(ToolOutput {
             summary,
@@ -140,7 +115,7 @@ fn make_preview(text: &str, needle: &str) -> String {
 }
 
 /// Factory for the `Edit` tool.
-pub fn edit_tool(fs: ScopedFs, tracker: Tracker) -> ToolDefinition {
+pub fn edit_tool(workdir: WorkdirHandle, tracker: Tracker) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(EditParams);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
@@ -148,7 +123,7 @@ pub fn edit_tool(fs: ScopedFs, tracker: Tracker) -> ToolDefinition {
             .description(DESCRIPTION)
             .input_schema(schema_value);
         let tool: Arc<dyn Tool> = Arc::new(EditTool {
-            fs: fs.clone(),
+            workdir: workdir.clone(),
             tracker: tracker.clone(),
         });
         (meta, tool)
@@ -162,19 +137,19 @@ mod tests {
     use manifest::Scope;
     use tempfile::TempDir;
 
-    fn setup() -> (TempDir, ScopedFs, Tracker) {
+    fn setup() -> (TempDir, WorkdirHandle, Tracker) {
         let dir = TempDir::new().unwrap();
-        let fs = ScopedFs::new(
+        let fs: WorkdirHandle = Arc::new(workdir::LocalWorkdir::new(
             Scope::writable(dir.path()).unwrap(),
             dir.path().to_path_buf(),
-        );
+        ));
         (dir, fs, Tracker::new())
     }
 
-    async fn read_first(fs: &ScopedFs, tracker: &Tracker, file: &std::path::Path) {
+    async fn read_first(fs: &WorkdirHandle, tracker: &Tracker, file: &std::path::Path) {
         let def = read_tool(fs.clone(), tracker.clone());
         let (_, reader) = def();
-        let inp = serde_json::json!({ "file_path": file.to_str().unwrap() });
+        let inp = serde_json::json!({ "file_path": file.file_name().unwrap().to_str().unwrap() });
         reader
             .execute(&inp.to_string(), Default::default())
             .await
@@ -193,7 +168,7 @@ mod tests {
         assert_eq!(meta.name, "Edit");
 
         let inp = serde_json::json!({
-            "file_path": file.to_str().unwrap(),
+            "file_path": file.file_name().unwrap().to_str().unwrap(),
             "old_string": "foo bar",
             "new_string": "foo baz",
         });
@@ -219,7 +194,7 @@ mod tests {
         let def = edit_tool(fs, tracker);
         let (_, tool) = def();
         let inp = serde_json::json!({
-            "file_path": file.to_str().unwrap(),
+            "file_path": file.file_name().unwrap().to_str().unwrap(),
             "old_string": "x",
             "new_string": "y",
             "replace_all": true,
@@ -242,7 +217,7 @@ mod tests {
         let def = edit_tool(fs, tracker);
         let (_, tool) = def();
         let inp = serde_json::json!({
-            "file_path": file.to_str().unwrap(),
+            "file_path": file.file_name().unwrap().to_str().unwrap(),
             "old_string": "a",
             "new_string": "b",
         });
@@ -263,7 +238,7 @@ mod tests {
         let def = edit_tool(fs, tracker);
         let (_, tool) = def();
         let inp = serde_json::json!({
-            "file_path": file.to_str().unwrap(),
+            "file_path": file.file_name().unwrap().to_str().unwrap(),
             "old_string": "world",
             "new_string": "x",
         });
@@ -283,7 +258,7 @@ mod tests {
         let def = edit_tool(fs, tracker);
         let (_, tool) = def();
         let inp = serde_json::json!({
-            "file_path": file.to_str().unwrap(),
+            "file_path": file.file_name().unwrap().to_str().unwrap(),
             "old_string": "foo",
             "new_string": "bar",
         });
@@ -307,7 +282,7 @@ mod tests {
         let def = edit_tool(fs, tracker);
         let (_, tool) = def();
         let inp = serde_json::json!({
-            "file_path": file.to_str().unwrap(),
+            "file_path": file.file_name().unwrap().to_str().unwrap(),
             "old_string": "foo",
             "new_string": "bar",
         });

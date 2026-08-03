@@ -17,6 +17,7 @@ members = [
     "crates/session-analytics",
     "crates/lint-common",
     "crates/tools",
+    "crates/workdir",
     "crates/tui",
     "crates/memory",
     "crates/ticket",
@@ -41,6 +42,7 @@ default-members = [
     "crates/session-analytics",
     "crates/lint-common",
     "crates/tools",
+    "crates/workdir",
     "crates/tui",
     "crates/memory",
     "crates/ticket",
@@ -73,6 +75,7 @@ session-analytics = { path = "crates/session-analytics" }
 session-store = { path = "crates/session-store" }
 secrets = { path = "crates/secrets" }
 tools = { path = "crates/tools" }
+workdir = { path = "crates/workdir" }
 tui = { path = "crates/tui" }
 yoi-workspace-server = { path = "crates/workspace-server" }
 

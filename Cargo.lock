@@ -4494,12 +4494,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "filetime",
- "globset",
- "grep-matcher",
- "grep-regex",
- "grep-searcher",
  "html5ever",
- "ignore",
  "llm-engine",
  "manifest",
  "markup5ever_rcdom",
@@ -4514,6 +4509,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "workdir",
 ]
 
 [[package]]
@@ -5924,6 +5920,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "workdir"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "globset",
+ "grep-matcher",
+ "grep-regex",
+ "grep-searcher",
+ "ignore",
+ "manifest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "worker"
 version = "0.1.0"
 dependencies = [
@@ -5964,6 +5979,7 @@ dependencies = [
  "uuid",
  "wasmtime",
  "wat",
+ "workdir",
  "yoi-plugin-pdk",
 ]
 
@@ -5992,6 +6008,7 @@ dependencies = [
  "tokio-tungstenite 0.29.0",
  "toml",
  "tower",
+ "workdir",
  "worker",
 ]
 

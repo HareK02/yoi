@@ -26,10 +26,14 @@ use llm_engine::Item;
 use llm_engine::interceptor::{Interceptor, PreRequestAction, PreToolAction, ToolCallInfo};
 use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput, ToolResult};
 use serde::Deserialize;
-use tools::ScopedFs;
+#[cfg(test)]
+use workdir::LocalWorkdir;
+use workdir::{ReadRequest, WorkdirHandle, WorkdirPath};
 
 use crate::compact::usage_tracker::UsageTracker;
-use crate::fs_view::{ReadRequirement, slice_lines};
+use crate::fs_view::ReadRequirement;
+#[cfg(test)]
+use crate::fs_view::slice_lines;
 use crate::session_reference::{
     ReadDetail, ReadOptions, ReadSelector, SearchOptions, SessionReferenceView, ToolPart,
 };
@@ -323,7 +327,7 @@ fn truncate_to_token_budget(text: &mut String, max_tokens: u64) -> bool {
 }
 
 struct MarkReadRequiredTool {
-    fs: ScopedFs,
+    workdir: WorkdirHandle,
     ctx: Arc<Mutex<CompactWorkerContext>>,
 }
 
@@ -338,14 +342,22 @@ impl Tool for MarkReadRequiredTool {
             ToolError::InvalidArgument(format!("invalid mark_read_required input: {e}"))
         })?;
 
-        // Read the file through the shared ScopedFs so scope and I/O
-        // errors surface the same way the regular `read_file` tool does.
-        let bytes = self
-            .fs
-            .read_bytes(&params.file_path)
+        // Read through the shared Workdir so scope and I/O errors surface the
+        // same way the regular `read_file` tool does.
+        let path = WorkdirPath::new(params.file_path.to_string_lossy())
+            .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
+        let result = self
+            .workdir
+            .read(ReadRequest {
+                path,
+                offset: params.offset.unwrap_or(0),
+                limit: params.limit.unwrap_or(usize::MAX),
+                max_bytes: 4 * 1024 * 1024,
+            })
+            .await
             .map_err(|e| ToolError::ExecutionFailed(format!("read failed: {e}")))?;
-        let text = String::from_utf8_lossy(&bytes);
-        let slice = slice_lines(&text, params.offset.unwrap_or(0), params.limit);
+        let text = String::from_utf8_lossy(&result.bytes);
+        let slice = text.as_ref();
         let estimated_tokens = estimate_tokens(slice.len());
 
         let mut guard = self.ctx.lock().expect("compact worker context poisoned");
@@ -442,7 +454,7 @@ impl Tool for WriteSummaryTool {
 }
 
 pub(crate) fn mark_read_required_tool(
-    fs: ScopedFs,
+    workdir: WorkdirHandle,
     ctx: Arc<Mutex<CompactWorkerContext>>,
 ) -> ToolDefinition {
     Arc::new(move || {
@@ -452,7 +464,7 @@ pub(crate) fn mark_read_required_tool(
             .description(MARK_DESCRIPTION)
             .input_schema(schema_value);
         let tool: Arc<dyn Tool> = Arc::new(MarkReadRequiredTool {
-            fs: fs.clone(),
+            workdir: workdir.clone(),
             ctx: ctx.clone(),
         });
         (meta, tool)
@@ -623,9 +635,9 @@ mod tests {
     use super::*;
     use manifest::Scope;
 
-    fn make_fs(tmp: &std::path::Path) -> ScopedFs {
+    fn make_fs(tmp: &std::path::Path) -> WorkdirHandle {
         let scope = Scope::writable(tmp.to_path_buf()).unwrap();
-        ScopedFs::new(scope, tmp.to_path_buf())
+        Arc::new(LocalWorkdir::new(scope, tmp.to_path_buf()))
     }
 
     fn make_usage(input: u64) -> llm_engine::timeline::event::UsageEvent {
@@ -720,10 +732,11 @@ mod tests {
 
         let ctx = Arc::new(Mutex::new(CompactWorkerContext::with_budget(1_000)));
         let tool: Arc<dyn Tool> = Arc::new(MarkReadRequiredTool {
-            fs: make_fs(tmp.path()),
+            workdir: make_fs(tmp.path()),
             ctx: ctx.clone(),
         });
-        let input = serde_json::json!({ "file_path": path.to_str().unwrap() }).to_string();
+        let input = serde_json::json!({ "file_path": path.file_name().unwrap().to_str().unwrap() })
+            .to_string();
         let out = tool.execute(&input, Default::default()).await.unwrap();
 
         assert!(out.summary.starts_with("Marked"));
@@ -741,10 +754,11 @@ mod tests {
 
         let ctx = Arc::new(Mutex::new(CompactWorkerContext::with_budget(100)));
         let tool: Arc<dyn Tool> = Arc::new(MarkReadRequiredTool {
-            fs: make_fs(tmp.path()),
+            workdir: make_fs(tmp.path()),
             ctx: ctx.clone(),
         });
-        let input = serde_json::json!({ "file_path": path.to_str().unwrap() }).to_string();
+        let input = serde_json::json!({ "file_path": path.file_name().unwrap().to_str().unwrap() })
+            .to_string();
         let res = tool.execute(&input, Default::default()).await;
 
         assert!(matches!(res, Err(ToolError::ExecutionFailed(_))));

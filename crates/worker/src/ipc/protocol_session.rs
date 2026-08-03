@@ -65,7 +65,7 @@ pub async fn dispatch_worker_protocol_method(
 ) -> Option<Event> {
     match method {
         Method::ListCompletions { kind, prefix } => {
-            let entries = handle.completion_entries(kind, &prefix);
+            let entries = handle.completion_entries(kind, &prefix).await;
             Some(Event::Completions { kind, entries })
         }
         method => {

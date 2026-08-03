@@ -21,20 +21,25 @@
 //! A `Tracker` is **Worker-process scoped**: the Worker layer creates a fresh
 //! instance at the start of each Worker run (including resume) and discards
 //! it when the process exits — it is not persisted, so a resumed
-//! conversation starts with an empty read/edit history. The `ScopedFs`
-//! write boundary is likewise Worker-process scoped (derived from the
+//! conversation starts with an empty read/edit history. The local Workdir
+//! scope boundary is likewise Worker-process scoped (derived from the
 //! manifest). The two are orthogonal and the Worker wires them together
 //! when registering builtin tools.
 //!
 //! ```no_run
 //! # use std::path::PathBuf;
+//! # use std::sync::Arc;
 //! # use manifest::Scope;
-//! # use tools::{ScopedFs, Tracker, core_builtin_tools};
+//! # use tools::{Tracker, core_builtin_tools};
+//! # use workdir::{LocalWorkdir, WorkdirHandle};
 //! let scope = Scope::writable("/workspace").unwrap();
-//! let fs = ScopedFs::new(scope, PathBuf::from("/workspace")); // worker lifetime
-//! let tracker = Tracker::new();    // session lifetime
+//! let workdir: WorkdirHandle = Arc::new(LocalWorkdir::new(
+//!     scope,
+//!     PathBuf::from("/workspace"),
+//! ));
+//! let tracker = Tracker::new(); // session lifetime
 //! let bash_outputs = PathBuf::from("/run/yoi/bash-output");
-//! let defs = core_builtin_tools(fs, tracker, bash_outputs);
+//! let defs = core_builtin_tools(workdir, tracker, bash_outputs);
 //! ```
 
 use std::collections::{HashMap, VecDeque};
@@ -180,6 +185,35 @@ impl Tracker {
         if inner.recency.len() > RECENCY_CAPACITY {
             inner.recency.pop_back();
         }
+    }
+
+    pub fn record_workdir_content(&self, path: &workdir::WorkdirPath, bytes: &[u8]) {
+        self.record_workdir_hash(path, hash_bytes(bytes));
+    }
+
+    pub fn record_workdir_hash(&self, path: &workdir::WorkdirPath, hash: workdir::ContentHash) {
+        let key = PathBuf::from(path.as_str());
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.hashes.insert(key.clone(), hash);
+        inner.recency.retain(|candidate| candidate != &key);
+        inner.recency.push_front(key);
+        if inner.recency.len() > RECENCY_CAPACITY {
+            inner.recency.pop_back();
+        }
+    }
+
+    pub fn expected_workdir_hash(
+        &self,
+        path: &workdir::WorkdirPath,
+    ) -> Result<workdir::ContentHash, ToolsError> {
+        let key = PathBuf::from(path.as_str());
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .hashes
+            .get(&key)
+            .copied()
+            .ok_or_else(|| ToolsError::NotRead(key))
     }
 
     /// Verify that `path` was previously recorded and its current bytes
