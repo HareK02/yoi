@@ -178,8 +178,6 @@ pub struct WorkspaceApiRef {
     pub base_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub access_token: Option<String>,
 }
 
 impl std::fmt::Debug for WorkspaceApiRef {
@@ -189,10 +187,6 @@ impl std::fmt::Debug for WorkspaceApiRef {
             .field("workspace_id", &self.workspace_id)
             .field("base_url", &self.base_url)
             .field("runtime_id", &self.runtime_id)
-            .field(
-                "access_token",
-                &self.access_token.as_ref().map(|_| "[redacted]"),
-            )
             .finish()
     }
 }

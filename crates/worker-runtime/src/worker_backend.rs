@@ -261,17 +261,22 @@ enum RuntimeWorkspaceBackendRef {
     Http {
         workspace_id: String,
         base_url: String,
-        access_token: Option<String>,
+        runtime_id: String,
     },
 }
 
 impl RuntimeWorkspaceBackendRef {
     fn from_worker_request(request: &CreateWorkerRequest) -> Self {
-        if let Some(api) = request.workspace_api.as_ref() {
+        if let Some(api) = request.workspace_api.as_ref()
+            && let Some(runtime_id) = api
+                .runtime_id
+                .as_ref()
+                .filter(|runtime_id| !runtime_id.trim().is_empty())
+        {
             return Self::Http {
                 workspace_id: api.workspace_id.clone(),
                 base_url: api.base_url.clone(),
-                access_token: api.access_token.clone(),
+                runtime_id: runtime_id.clone(),
             };
         }
         Self::None
@@ -283,17 +288,15 @@ impl RuntimeWorkspaceBackendRef {
             Self::Http {
                 workspace_id,
                 base_url,
-                access_token,
+                runtime_id,
             } => WorkerWorkspaceContext::with_client(
                 WorkspaceId::new(workspace_id.clone()).ok(),
-                Arc::new(
-                    RuntimeWorkspaceHttpClient::new(
-                        workspace_id.clone(),
-                        base_url.clone(),
-                        worker_ref.worker_id.to_string(),
-                    )
-                    .with_access_token(access_token.clone()),
-                ),
+                Arc::new(RuntimeWorkspaceHttpClient::new(
+                    workspace_id.clone(),
+                    base_url.clone(),
+                    runtime_id.clone(),
+                    worker_ref.worker_id.to_string(),
+                )),
             ),
         }
     }
@@ -1160,34 +1163,6 @@ where
         result
     }
 
-    fn replace_workspace_access_token(
-        &self,
-        handle: &WorkerExecutionHandle,
-        access_token: String,
-    ) -> WorkerExecutionResult {
-        let (worker, _busy) = match self.get_execution(handle) {
-            Ok(execution) => execution,
-            Err(mut result) => {
-                result.operation = WorkerExecutionOperation::ReplaceWorkspaceAccessToken;
-                return result;
-            }
-        };
-        worker
-            .replace_workspace_access_token(access_token)
-            .map(|_| {
-                WorkerExecutionResult::accepted(
-                    WorkerExecutionOperation::ReplaceWorkspaceAccessToken,
-                    WorkerExecutionRunState::Idle,
-                )
-            })
-            .unwrap_or_else(|error| {
-                WorkerExecutionResult::errored(
-                    WorkerExecutionOperation::ReplaceWorkspaceAccessToken,
-                    error.to_string(),
-                )
-            })
-    }
-
     fn stop_worker(&self, handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
         if handle.backend_id() != self.backend_id() {
             return WorkerExecutionResult::rejected(
@@ -1775,8 +1750,7 @@ mod tests {
         request.workspace_api = Some(crate::catalog::WorkspaceApiRef {
             workspace_id: "ws-test".to_string(),
             base_url: "http://127.0.0.1:3999".to_string(),
-            runtime_id: None,
-            access_token: None,
+            runtime_id: Some("runtime-test".to_string()),
         });
         let detail = runtime.create_worker(request).unwrap();
 

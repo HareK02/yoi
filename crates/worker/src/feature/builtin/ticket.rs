@@ -1372,6 +1372,7 @@ provider = "github"
             crate::worker::RuntimeWorkspaceHttpClient::new(
                 "workspace-a",
                 "not-a-url",
+                "test-runtime",
                 "test-worker",
             ),
         ));
@@ -1407,6 +1408,7 @@ provider = "github"
         let client = Arc::new(crate::worker::RuntimeWorkspaceHttpClient::new(
             "workspace-a",
             format!("http://{address}"),
+            "test-runtime",
             "worker-a",
         ));
         let backend = WorkspaceHttpTicketBackend::new(client);
@@ -1448,7 +1450,12 @@ provider = "github"
         });
 
         let backend = WorkspaceHttpTicketBackend::new(Arc::new(
-            crate::worker::RuntimeWorkspaceHttpClient::new("workspace-a", base_url, "test-worker"),
+            crate::worker::RuntimeWorkspaceHttpClient::new(
+                "workspace-a",
+                base_url,
+                "test-runtime",
+                "test-worker",
+            ),
         ));
         let created = backend.create(NewTicket::new("HTTP ticket")).unwrap();
 

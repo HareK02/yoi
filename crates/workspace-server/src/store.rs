@@ -117,6 +117,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "reconcile Workdir revision and crash safe Worker lifecycle reservations",
         apply: strengthen_ticket_assignment_lifecycle_reservations,
     },
+    Migration {
+        version: 21,
+        name: "remove per-Worker Workspace credentials",
+        apply: remove_worker_workspace_credentials,
+    },
 ];
 
 struct Migration {
@@ -289,18 +294,6 @@ pub struct TicketWorkerAssignmentEventRecord {
 pub struct TicketWorkerAssignmentUpdate {
     pub current: TicketWorkerAssignmentRecord,
     pub previous: Option<TicketWorkerAssignmentRecord>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorkerWorkspaceCredentialRecord {
-    pub credential_id: String,
-    pub token: String,
-    pub workspace_id: String,
-    pub runtime_id: String,
-    pub worker_id: Option<String>,
-    pub created_at: String,
-    pub expires_at: String,
-    pub revoked_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -632,39 +625,6 @@ pub trait ControlPlaneStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<TicketWorkerAssignmentEventRecord>>;
 
-    fn upsert_worker_workspace_credential(
-        &self,
-        record: &WorkerWorkspaceCredentialRecord,
-    ) -> Result<()>;
-    fn authenticate_worker_workspace_credential(
-        &self,
-        token: &str,
-        workspace_id: &str,
-        worker_id: &str,
-    ) -> Result<Option<WorkerWorkspaceCredentialRecord>>;
-    fn refresh_worker_workspace_credential(
-        &self,
-        token: &str,
-        workspace_id: &str,
-        worker_id: &str,
-        new_token: &str,
-        new_expires_at: &str,
-    ) -> Result<Option<WorkerWorkspaceCredentialRecord>>;
-    fn revoke_worker_workspace_credentials_except(
-        &self,
-        workspace_id: &str,
-        runtime_id: &str,
-        worker_id: &str,
-        active_credential_id: &str,
-        revoked_at: &str,
-    ) -> Result<()>;
-    fn revoke_worker_workspace_credentials(
-        &self,
-        workspace_id: &str,
-        runtime_id: &str,
-        worker_id: &str,
-        revoked_at: &str,
-    ) -> Result<()>;
     fn enqueue_ticket_notification(
         &self,
         notification_id: &str,
@@ -2223,171 +2183,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
-    fn upsert_worker_workspace_credential(
-        &self,
-        record: &WorkerWorkspaceCredentialRecord,
-    ) -> Result<()> {
-        self.with_conn(|conn| {
-            conn.execute(
-                r#"INSERT INTO worker_workspace_credentials (
-                    credential_id, token, workspace_id, runtime_id, worker_id, created_at,
-                    expires_at, revoked_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                ON CONFLICT(credential_id) DO UPDATE SET
-                    token = excluded.token,
-                    workspace_id = excluded.workspace_id,
-                    runtime_id = excluded.runtime_id,
-                    worker_id = excluded.worker_id,
-                    created_at = excluded.created_at,
-                    expires_at = excluded.expires_at,
-                    revoked_at = excluded.revoked_at"#,
-                params![
-                    record.credential_id,
-                    record.token,
-                    record.workspace_id,
-                    record.runtime_id,
-                    record.worker_id,
-                    record.created_at,
-                    record.expires_at,
-                    record.revoked_at,
-                ],
-            )?;
-            Ok(())
-        })
-    }
-
-    fn authenticate_worker_workspace_credential(
-        &self,
-        token: &str,
-        workspace_id: &str,
-        worker_id: &str,
-    ) -> Result<Option<WorkerWorkspaceCredentialRecord>> {
-        self.with_conn(|conn| {
-            let tx = conn.unchecked_transaction()?;
-            let record = tx
-                .query_row(
-                    r#"SELECT credential_id, token, workspace_id, runtime_id, worker_id, created_at,
-                              expires_at, revoked_at
-                       FROM worker_workspace_credentials
-                       WHERE token = ?1 AND workspace_id = ?2
-                         AND revoked_at IS NULL AND datetime(expires_at) > datetime('now')"#,
-                    params![token, workspace_id],
-                    |row| {
-                        Ok(WorkerWorkspaceCredentialRecord {
-                            credential_id: row.get(0)?,
-                            token: row.get(1)?,
-                            workspace_id: row.get(2)?,
-                            runtime_id: row.get(3)?,
-                            worker_id: row.get(4)?,
-                            created_at: row.get(5)?,
-                            expires_at: row.get(6)?,
-                            revoked_at: row.get(7)?,
-                        })
-                    },
-                )
-                .optional()?;
-            let Some(mut record) = record else {
-                tx.commit()?;
-                return Ok(None);
-            };
-            if record.worker_id.as_deref().is_some_and(|bound| bound != worker_id) {
-                tx.commit()?;
-                return Ok(None);
-            }
-            if record.worker_id.is_none() {
-                tx.execute(
-                    "UPDATE worker_workspace_credentials SET worker_id = ?1 WHERE credential_id = ?2 AND worker_id IS NULL",
-                    params![worker_id, record.credential_id],
-                )?;
-                record.worker_id = Some(worker_id.to_string());
-            }
-            tx.commit()?;
-            Ok(Some(record))
-        })
-    }
-
-    fn refresh_worker_workspace_credential(
-        &self,
-        token: &str,
-        workspace_id: &str,
-        worker_id: &str,
-        new_token: &str,
-        new_expires_at: &str,
-    ) -> Result<Option<WorkerWorkspaceCredentialRecord>> {
-        self.with_conn(|conn| {
-            let tx = conn.unchecked_transaction()?;
-            let record = tx
-                .query_row(
-                    r#"SELECT credential_id, runtime_id, created_at FROM worker_workspace_credentials
-                       WHERE token = ?1 AND workspace_id = ?2 AND worker_id = ?3 AND revoked_at IS NULL"#,
-                    params![token, workspace_id, worker_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
-                )
-                .optional()?;
-            let Some((credential_id, runtime_id, created_at)) = record else {
-                tx.commit()?;
-                return Ok(None);
-            };
-            tx.execute(
-                "UPDATE worker_workspace_credentials SET token = ?1, expires_at = ?2 WHERE credential_id = ?3",
-                params![new_token, new_expires_at, credential_id],
-            )?;
-            tx.commit()?;
-            Ok(Some(WorkerWorkspaceCredentialRecord {
-                credential_id,
-                token: new_token.to_string(),
-                workspace_id: workspace_id.to_string(),
-                runtime_id,
-                worker_id: Some(worker_id.to_string()),
-                created_at,
-                expires_at: new_expires_at.to_string(),
-                revoked_at: None,
-            }))
-        })
-    }
-
-    fn revoke_worker_workspace_credentials_except(
-        &self,
-        workspace_id: &str,
-        runtime_id: &str,
-        worker_id: &str,
-        active_credential_id: &str,
-        revoked_at: &str,
-    ) -> Result<()> {
-        self.with_conn(|conn| {
-            conn.execute(
-                r#"UPDATE worker_workspace_credentials SET revoked_at = ?5
-                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
-                     AND credential_id <> ?4 AND revoked_at IS NULL"#,
-                params![
-                    workspace_id,
-                    runtime_id,
-                    worker_id,
-                    active_credential_id,
-                    revoked_at
-                ],
-            )?;
-            Ok(())
-        })
-    }
-
-    fn revoke_worker_workspace_credentials(
-        &self,
-        workspace_id: &str,
-        runtime_id: &str,
-        worker_id: &str,
-        revoked_at: &str,
-    ) -> Result<()> {
-        self.with_conn(|conn| {
-            conn.execute(
-                r#"UPDATE worker_workspace_credentials SET revoked_at = ?4
-                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3 AND revoked_at IS NULL"#,
-                params![workspace_id, runtime_id, worker_id, revoked_at],
-            )?;
-            Ok(())
-        })
-    }
-
     fn enqueue_ticket_notification(
         &self,
         notification_id: &str,
@@ -3543,6 +3338,11 @@ fn strengthen_ticket_assignment_lifecycle_reservations(conn: &Connection) -> Res
     Ok(())
 }
 
+fn remove_worker_workspace_credentials(conn: &Connection) -> Result<()> {
+    conn.execute_batch("DROP TABLE IF EXISTS worker_workspace_credentials;")?;
+    Ok(())
+}
+
 fn create_objective_event_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -4225,8 +4025,12 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 20);
-
+        assert_eq!(store.schema_version().await.unwrap(), 21);
+        assert!(
+            !store
+                .with_conn(|conn| table_exists(conn, "worker_workspace_credentials"))
+                .unwrap()
+        );
         let record = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -4238,7 +4042,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 20);
+        assert_eq!(reopened.schema_version().await.unwrap(), 21);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -4485,7 +4289,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
     }
 
     #[tokio::test]
-    async fn worker_credential_binds_once_and_notification_outbox_is_durable() {
+    async fn notification_outbox_is_durable() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("server.db");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
@@ -4500,81 +4304,6 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
             })
             .await
             .unwrap();
-        store
-            .upsert_worker_workspace_credential(&WorkerWorkspaceCredentialRecord {
-                credential_id: "credential-1".to_string(),
-                token: "secret-token".to_string(),
-                workspace_id: "workspace-a".to_string(),
-                runtime_id: "runtime-1".to_string(),
-                worker_id: None,
-                created_at: "2026-07-31T00:00:01Z".to_string(),
-                expires_at: "2099-01-01T00:00:00Z".to_string(),
-                revoked_at: None,
-            })
-            .unwrap();
-        let bound = store
-            .authenticate_worker_workspace_credential("secret-token", "workspace-a", "worker-1")
-            .unwrap()
-            .unwrap();
-        assert_eq!(bound.worker_id.as_deref(), Some("worker-1"));
-        let refreshed = store
-            .refresh_worker_workspace_credential(
-                "secret-token",
-                "workspace-a",
-                "worker-1",
-                "refreshed-token",
-                "2099-02-01T00:00:00Z",
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(refreshed.token, "refreshed-token");
-        assert!(store
-            .authenticate_worker_workspace_credential(
-                "secret-token",
-                "workspace-a",
-                "worker-1",
-            )
-            .unwrap()
-            .is_none());
-        assert!(
-            store
-                .authenticate_worker_workspace_credential(
-                    "refreshed-token",
-                    "workspace-a",
-                    "worker-1",
-                )
-                .unwrap()
-                .is_some()
-        );
-        store
-            .revoke_worker_workspace_credentials(
-                "workspace-a",
-                "runtime-1",
-                "worker-1",
-                "2026-08-01T00:00:00Z",
-            )
-            .unwrap();
-        assert!(
-            store
-                .authenticate_worker_workspace_credential(
-                    "refreshed-token",
-                    "workspace-a",
-                    "worker-1",
-                )
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            store
-                .authenticate_worker_workspace_credential(
-                    "secret-token",
-                    "workspace-a",
-                    "worker-2",
-                )
-                .unwrap()
-                .is_none()
-        );
-
         store
             .enqueue_ticket_notification(
                 "notification-1",
@@ -4850,7 +4579,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 20);
+        assert_eq!(store.schema_version().await.unwrap(), 21);
 
         store
             .with_conn(|conn| {
@@ -5036,7 +4765,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 20);
+        assert_eq!(store.schema_version().await.unwrap(), 21);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -5074,7 +4803,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 20);
+        assert_eq!(store.schema_version().await.unwrap(), 21);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -5252,7 +4981,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 20);
+        assert_eq!(store.schema_version().await.unwrap(), 21);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),

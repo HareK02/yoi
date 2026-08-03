@@ -720,8 +720,7 @@ impl Runtime {
         Ok(())
     }
 
-    /// Replace the Workspace API binding persisted for a Worker and update the
-    /// live execution when one is connected.
+    /// Replace the Workspace API identity binding persisted for a Worker.
     pub fn replace_worker_workspace_api_scoped(
         &self,
         scope: &RuntimeWorkspaceScope,
@@ -743,17 +742,7 @@ impl Runtime {
         worker_ref: &WorkerRef,
         workspace_api: WorkspaceApiRef,
     ) -> Result<WorkerDetail, RuntimeError> {
-        let access_token = workspace_api
-            .access_token
-            .as_ref()
-            .filter(|token| !token.trim().is_empty())
-            .cloned()
-            .ok_or_else(|| {
-                RuntimeError::InvalidRequest(
-                    "Workspace API replacement requires an access token".to_string(),
-                )
-            })?;
-        let (previous_workspace_api, live_execution) = {
+        let previous_workspace_api = {
             let state = self.lock()?;
             let worker = state.worker(worker_ref)?;
             if let Some(existing) = worker.request.workspace_api.as_ref()
@@ -769,14 +758,7 @@ impl Runtime {
                         .to_string(),
                 ));
             }
-            let live_execution = match (
-                state.execution_backend.clone(),
-                worker.execution_handle.clone(),
-            ) {
-                (Some(backend), Some(handle)) => Some((backend, handle)),
-                _ => None,
-            };
-            (worker.request.workspace_api.clone(), live_execution)
+            worker.request.workspace_api.clone()
         };
 
         {
@@ -785,22 +767,6 @@ impl Runtime {
             if let Err(error) = state.persist_runtime_snapshot() {
                 state.worker_mut(worker_ref)?.request.workspace_api = previous_workspace_api;
                 return Err(error);
-            }
-        }
-
-        if let Some((backend, handle)) = live_execution {
-            let result = backend.replace_workspace_access_token(&handle, access_token);
-            if !result.is_accepted() {
-                let mut state = self.lock()?;
-                state.worker_mut(worker_ref)?.request.workspace_api = previous_workspace_api;
-                state.persist_runtime_snapshot()?;
-                return Err(RuntimeError::WorkerExecutionRejected {
-                    worker_id: worker_ref.worker_id.clone(),
-                    operation: result.operation,
-                    outcome: result.outcome,
-                    message: result.message_or_default(),
-                    result,
-                });
             }
         }
 
@@ -1163,8 +1129,7 @@ impl Runtime {
             WorkerExecutionOperation::Spawn
             | WorkerExecutionOperation::Restore
             | WorkerExecutionOperation::Input
-            | WorkerExecutionOperation::ProtocolMethod
-            | WorkerExecutionOperation::ReplaceWorkspaceAccessToken => return Ok(()),
+            | WorkerExecutionOperation::ProtocolMethod => return Ok(()),
         };
         if result.is_accepted() {
             return Ok(());
@@ -2475,7 +2440,6 @@ mod tests {
             workspace_id: workspace_id.to_string(),
             base_url: format!("https://workspace.example/{workspace_id}"),
             runtime_id: None,
-            access_token: None,
         });
         request
     }
@@ -2518,7 +2482,6 @@ mod tests {
         restore_result: Mutex<Option<WorkerExecutionSpawnResult>>,
         restore_count: Mutex<u64>,
         contexts: Mutex<BTreeMap<WorkerId, WorkerExecutionContext>>,
-        workspace_access_tokens: Mutex<BTreeMap<WorkerId, String>>,
         #[cfg(feature = "ws-server")]
         snapshots: Mutex<BTreeMap<WorkerId, protocol::Event>>,
     }
@@ -2605,21 +2568,6 @@ mod tests {
                         WorkerExecutionRunState::Idle,
                     )
                 })
-        }
-
-        fn replace_workspace_access_token(
-            &self,
-            handle: &WorkerExecutionHandle,
-            access_token: String,
-        ) -> WorkerExecutionResult {
-            self.workspace_access_tokens
-                .lock()
-                .unwrap()
-                .insert(handle.worker_ref().worker_id.clone(), access_token);
-            WorkerExecutionResult::accepted(
-                WorkerExecutionOperation::ReplaceWorkspaceAccessToken,
-                WorkerExecutionRunState::Idle,
-            )
         }
 
         fn stop_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
@@ -2899,8 +2847,8 @@ mod tests {
     }
 
     #[test]
-    fn workspace_api_replacement_updates_live_execution_and_persisted_request() {
-        let (runtime, backend) = runtime_and_backend();
+    fn workspace_api_replacement_updates_persisted_request() {
+        let (runtime, _backend) = runtime_and_backend();
         let scope = scope("workspace-a", "server-a");
         let worker = runtime
             .create_worker_scoped(
@@ -2912,21 +2860,12 @@ mod tests {
             workspace_id: "workspace-a".to_string(),
             base_url: "https://workspace.example/workspace-a/".to_string(),
             runtime_id: Some("runtime-a".to_string()),
-            access_token: Some("replacement-token".to_string()),
         };
 
         runtime
             .replace_worker_workspace_api_scoped(&scope, &worker.worker_ref, replacement.clone())
             .unwrap();
 
-        assert_eq!(
-            backend
-                .workspace_access_tokens
-                .lock()
-                .unwrap()
-                .get(&worker.worker_ref.worker_id),
-            Some(&"replacement-token".to_string())
-        );
         let state = runtime.lock().unwrap();
         assert_eq!(
             state

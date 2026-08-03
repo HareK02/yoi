@@ -1466,7 +1466,6 @@ mod tests {
             workspace_id: workspace_id.to_string(),
             base_url: format!("https://workspace.example/{workspace_id}"),
             runtime_id: None,
-            access_token: None,
         });
         request
     }
@@ -1796,17 +1795,6 @@ mod tests {
             )
         }
 
-        fn replace_workspace_access_token(
-            &self,
-            _handle: &WorkerExecutionHandle,
-            _access_token: String,
-        ) -> WorkerExecutionResult {
-            WorkerExecutionResult::accepted(
-                WorkerExecutionOperation::ReplaceWorkspaceAccessToken,
-                WorkerExecutionRunState::Idle,
-            )
-        }
-
         fn stop_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
             WorkerExecutionResult::accepted(
                 WorkerExecutionOperation::Stop,
@@ -1908,7 +1896,6 @@ mod tests {
                     workspace_id: "local".to_string(),
                     base_url: "http://127.0.0.1:8787".to_string(),
                     runtime_id: None,
-                    access_token: Some("workspace-access-token".to_string()),
                 },
             },
         )

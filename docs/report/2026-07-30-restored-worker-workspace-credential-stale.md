@@ -16,13 +16,8 @@ The Server control-plane DB contained a current active `worker_workspace_credent
 - A Worker cannot report or ticket the restore regression through the intended typed authority.
 - The failure is easy to misattribute to the Browser multiplexer; in this incident Browser authentication/bootstrap was a separate issue.
 
-## Suggested investigation
+## Resolution
 
-Trace the credential lifecycle across Backend restart and Runtime Worker restore:
+The per-Worker bearer credential was removed rather than adding restore-time secret rotation and reinjection. Worker Workspace requests now carry the Runtime/Worker identity binding established by Runtime, and Server verifies that identity against the current Runtime catalog before applying Ticket role/assignment gates.
 
-1. whether Backend rotates or recreates the credential record;
-2. whether restored Worker execution receives the current plaintext credential rather than retaining an old environment/config bundle;
-3. whether credential binding should remain stable across Backend restart or be explicitly refreshed before marking the Worker restored;
-4. whether restore health should include a bounded Workspace API authentication probe.
-
-Do not treat a current DB credential row alone as proof that the restored Worker possesses it.
+The removal also deletes token mint/rotate/revoke/refresh behavior, live Worker token replacement, and the control-plane credential table. Runtime/Server trust remains the security boundary; Worker role checks remain the accidental-misuse gate.

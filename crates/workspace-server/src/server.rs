@@ -65,8 +65,7 @@ use crate::hosts::{
     WorkerInputKind, WorkerInputRequest, WorkerInputResult, WorkerLifecycleRequest,
     WorkerLifecycleResult, WorkerOperationState, WorkerRestoreResult,
     WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult,
-    WorkerSpawnWorkingDirectoryRequest, WorkerSummary, WorkerWorkspaceApiResult,
-    WorkerWorkspaceSummary,
+    WorkerSpawnWorkingDirectoryRequest, WorkerSummary, WorkerWorkspaceSummary,
 };
 use crate::identity::WorkspaceIdentity;
 use crate::memory_backend::execute_memory_backend_operation_with_authority;
@@ -96,7 +95,7 @@ use crate::store::{
     AccountRecord, ApiTokenRecord, AuthChallengeRecord, BrowserSessionRecord, ControlPlaneStore,
     DeviceLoginFlowRecord, PasskeyCredentialRecord, RepositoryRecord, TicketWorkerAssignmentRecord,
     UserRecord, WorkdirRegistryRecord, WorkerRegistryRecord, WorkerWorkdirLinkRecord,
-    WorkerWorkspaceCredentialRecord, WorkspaceRecord,
+    WorkspaceRecord,
 };
 use crate::{Error, Result};
 use worker_runtime::catalog::{
@@ -251,7 +250,6 @@ pub struct WorkspaceApi {
     observation_proxy: BackendObservationProxy,
     runtime_subscription_broker: RuntimeSubscriptionBroker,
     resource_broker: BackendResourceBroker,
-    credential_operation_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl WorkspaceApi {
@@ -351,7 +349,6 @@ impl WorkspaceApi {
             observation_proxy,
             runtime_subscription_broker,
             resource_broker,
-            credential_operation_lock: Arc::new(std::sync::Mutex::new(())),
         })
     }
 
@@ -363,49 +360,18 @@ impl WorkspaceApi {
         &self.runtime_subscription_broker
     }
 
-    fn mint_worker_workspace_credential(
-        &self,
-        runtime_id: &str,
-        worker_id: Option<&str>,
-    ) -> ApiResult<(WorkerWorkspaceCredentialRecord, WorkspaceApiRef)> {
-        let now = Utc::now();
-        let token = mint_secret("wac");
-        let credential = WorkerWorkspaceCredentialRecord {
-            credential_id: new_id("wac"),
-            token: token.clone(),
+    fn workspace_api_ref(&self, runtime_id: &str) -> WorkspaceApiRef {
+        WorkspaceApiRef {
             workspace_id: self.config.workspace_id.clone(),
-            runtime_id: runtime_id.to_string(),
-            worker_id: worker_id.map(ToOwned::to_owned),
-            created_at: now.to_rfc3339_opts(SecondsFormat::Secs, true),
-            expires_at: (now + chrono::Duration::hours(1))
-                .to_rfc3339_opts(SecondsFormat::Secs, true),
-            revoked_at: None,
-        };
-        self.store.upsert_worker_workspace_credential(&credential)?;
-        Ok((
-            credential,
-            WorkspaceApiRef {
-                workspace_id: self.config.workspace_id.clone(),
-                base_url: self
-                    .config
-                    .backend_base_url
-                    .clone()
-                    .unwrap_or_else(|| "http://127.0.0.1:8787".to_string())
-                    .trim_end_matches('/')
-                    .to_string(),
-                runtime_id: Some(runtime_id.to_string()),
-                access_token: Some(token),
-            },
-        ))
-    }
-
-    fn revoke_credential_record(
-        &self,
-        credential: &mut WorkerWorkspaceCredentialRecord,
-    ) -> ApiResult<()> {
-        credential.revoked_at = Some(Utc::now().to_rfc3339());
-        self.store.upsert_worker_workspace_credential(credential)?;
-        Ok(())
+            base_url: self
+                .config
+                .backend_base_url
+                .clone()
+                .unwrap_or_else(|| "http://127.0.0.1:8787".to_string())
+                .trim_end_matches('/')
+                .to_string(),
+            runtime_id: Some(runtime_id.to_string()),
+        }
     }
 
     fn spawn_workspace_worker(
@@ -413,18 +379,13 @@ impl WorkspaceApi {
         runtime_id: &str,
         mut request: WorkerSpawnRequest,
     ) -> ApiResult<WorkerSpawnResult> {
-        let (mut credential, workspace_api) =
-            self.mint_worker_workspace_credential(runtime_id, None)?;
+        let workspace_api = self.workspace_api_ref(runtime_id);
         request.resolved_workspace_api = Some(workspace_api.clone());
-        let result = match self.runtime.spawn_worker(runtime_id, request) {
-            Ok(result) => result,
-            Err(error) => {
-                self.revoke_credential_record(&mut credential)?;
-                return Err(error.into_error().into());
-            }
-        };
+        let result = self
+            .runtime
+            .spawn_worker(runtime_id, request)
+            .map_err(|error| error.into_error())?;
         let Some(worker) = result.worker.as_ref() else {
-            self.revoke_credential_record(&mut credential)?;
             return Ok(result);
         };
         let replacement = match self.runtime.replace_worker_workspace_api(
@@ -435,13 +396,11 @@ impl WorkspaceApi {
             Ok(replacement) => replacement,
             Err(error) => {
                 let _ = self.runtime.delete_worker(runtime_id, &worker.worker_id);
-                self.revoke_credential_record(&mut credential)?;
                 return Err(error.into_error().into());
             }
         };
         if replacement.state != WorkerOperationState::Accepted {
             let _ = self.runtime.delete_worker(runtime_id, &worker.worker_id);
-            self.revoke_credential_record(&mut credential)?;
             return Err(Error::RuntimeOperationFailed {
                 runtime_id: runtime_id.to_string(),
                 code: "worker_workspace_api_replace_failed".to_string(),
@@ -455,50 +414,6 @@ impl WorkspaceApi {
             }
             .into());
         }
-        credential.worker_id = Some(worker.worker_id.clone());
-        self.store.upsert_worker_workspace_credential(&credential)?;
-        self.store.revoke_worker_workspace_credentials_except(
-            &self.config.workspace_id,
-            runtime_id,
-            &worker.worker_id,
-            &credential.credential_id,
-            &Utc::now().to_rfc3339(),
-        )?;
-        Ok(result)
-    }
-
-    fn rotate_worker_workspace_credential(
-        &self,
-        runtime_id: &str,
-        worker_id: &str,
-    ) -> ApiResult<WorkerWorkspaceApiResult> {
-        let _credential_guard = self.credential_operation_lock.lock().map_err(|_| {
-            Error::Config("Workspace credential operation lock poisoned".to_string())
-        })?;
-        let (mut credential, workspace_api) =
-            self.mint_worker_workspace_credential(runtime_id, Some(worker_id))?;
-        let result =
-            match self
-                .runtime
-                .replace_worker_workspace_api(runtime_id, worker_id, workspace_api)
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    self.revoke_credential_record(&mut credential)?;
-                    return Err(error.into_error().into());
-                }
-            };
-        if result.state != WorkerOperationState::Accepted {
-            self.revoke_credential_record(&mut credential)?;
-            return Ok(result);
-        }
-        self.store.revoke_worker_workspace_credentials_except(
-            &self.config.workspace_id,
-            runtime_id,
-            worker_id,
-            &credential.credential_id,
-            &Utc::now().to_rfc3339(),
-        )?;
         Ok(result)
     }
 
@@ -507,12 +422,15 @@ impl WorkspaceApi {
         runtime_id: &str,
         worker_id: &str,
     ) -> ApiResult<WorkerRestoreResult> {
-        let rotation = self.rotate_worker_workspace_credential(runtime_id, worker_id)?;
-        if rotation.state != WorkerOperationState::Accepted {
+        let binding = self
+            .runtime
+            .replace_worker_workspace_api(runtime_id, worker_id, self.workspace_api_ref(runtime_id))
+            .map_err(|error| error.into_error())?;
+        if binding.state != WorkerOperationState::Accepted {
             return Ok(WorkerRestoreResult {
-                state: rotation.state,
-                worker: rotation.worker,
-                diagnostics: rotation.diagnostics,
+                state: binding.state,
+                worker: binding.worker,
+                diagnostics: binding.diagnostics,
             });
         }
         Ok(self
@@ -655,10 +573,6 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/tickets",
             get(scoped_list_tickets).post(scoped_create_ticket_record),
-        )
-        .route(
-            "/api/w/{workspace_id}/worker-credentials/refresh",
-            post(scoped_refresh_worker_workspace_credential),
         )
         .route(
             "/api/w/{workspace_id}/memory",
@@ -2256,63 +2170,6 @@ async fn scoped_close_ticket(
     browser_ticket_detail(&api, &path.id)
 }
 
-#[derive(Debug, Serialize)]
-struct WorkerWorkspaceCredentialRefreshResponse {
-    access_token: String,
-    expires_at: String,
-}
-
-async fn scoped_refresh_worker_workspace_credential(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedWorkspacePath>,
-    headers: HeaderMap,
-) -> ApiResult<Json<WorkerWorkspaceCredentialRefreshResponse>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    let _credential_guard = api
-        .credential_operation_lock
-        .lock()
-        .map_err(|_| Error::Config("Workspace credential operation lock poisoned".to_string()))?;
-    let token = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            Error::WorkerWorkspaceAuthentication("missing expired credential".to_string())
-        })?;
-    let worker_id = headers
-        .get("x-yoi-worker-id")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            Error::WorkerWorkspaceAuthentication("missing Runtime-bound Worker id".to_string())
-        })?;
-    let new_token = mint_secret("wac");
-    let expires_at =
-        (Utc::now() + chrono::Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
-    let credential = api
-        .store
-        .refresh_worker_workspace_credential(
-            token,
-            &path.workspace_id,
-            worker_id,
-            &new_token,
-            &expires_at,
-        )?
-        .ok_or_else(|| {
-            Error::WorkerWorkspaceAuthentication("credential cannot be refreshed".to_string())
-        })?;
-    api.runtime
-        .worker(&credential.runtime_id, worker_id)
-        .map_err(|_| {
-            Error::WorkerWorkspaceAuthentication("credential Worker no longer exists".to_string())
-        })?;
-    Ok(Json(WorkerWorkspaceCredentialRefreshResponse {
-        access_token: new_token,
-        expires_at,
-    }))
-}
-
 async fn execute_worker_ticket_rest_operation(
     api: &WorkspaceApi,
     workspace_id: &str,
@@ -2320,12 +2177,6 @@ async fn execute_worker_ticket_rest_operation(
     mut operation: TicketBackendOperation,
 ) -> ApiResult<TicketBackendOperationResult> {
     validate_workspace_scope(api, workspace_id)?;
-    if headers.get(axum::http::header::AUTHORIZATION).is_none() {
-        return Err(Error::WorkerWorkspaceAuthentication(
-            "missing Runtime Workspace credential".to_string(),
-        )
-        .into());
-    }
     let config = ticket::config::TicketConfig::load_workspace(&api.config.workspace_root)
         .map_err(|error| Error::Config(format!("load Ticket workspace settings: {error}")))?;
     let mut backend = SqliteTicketBackend::new(
@@ -3119,39 +2970,26 @@ fn build_ticket_notification_hook(
 
 fn authenticate_worker_mutation_source(
     api: &WorkspaceApi,
-    workspace_id: &str,
+    _workspace_id: &str,
     headers: &HeaderMap,
 ) -> Result<WorkerMutationSource> {
-    let token = headers
-        .get(axum::http::header::AUTHORIZATION)
+    let runtime_id = headers
+        .get("x-yoi-runtime-id")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            Error::WorkerWorkspaceAuthentication("missing Runtime Workspace credential".to_string())
-        })?;
+        .ok_or_else(|| Error::WorkerSourceIdentity("missing Runtime id".to_string()))?;
     let worker_id = headers
         .get("x-yoi-worker-id")
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
-            Error::WorkerWorkspaceAuthentication("missing Runtime-bound Worker id".to_string())
+            Error::WorkerSourceIdentity("missing Runtime-bound Worker id".to_string())
         })?;
-    let credential = api
-        .store
-        .authenticate_worker_workspace_credential(token, workspace_id, worker_id)?
-        .ok_or_else(|| {
-            Error::WorkerWorkspaceAuthentication("invalid Runtime Workspace credential".to_string())
-        })?;
-    api.runtime
-        .worker(&credential.runtime_id, worker_id)
-        .map_err(|_| {
-            Error::WorkerWorkspaceAuthentication(
-                "credential does not identify a current Runtime Worker".to_string(),
-            )
-        })?;
+    api.runtime.worker(runtime_id, worker_id).map_err(|_| {
+        Error::WorkerSourceIdentity("Runtime-bound Worker identity does not exist".to_string())
+    })?;
     Ok(WorkerMutationSource {
-        runtime_id: credential.runtime_id,
+        runtime_id: runtime_id.to_string(),
         worker_id: worker_id.to_string(),
     })
 }
@@ -4530,15 +4368,7 @@ fn cleanup_runtime_worker_for_execution(
         .runtime
         .delete_worker(runtime_id, candidate.runtime_worker_id.as_str())
     {
-        Ok(result) if result.deleted && result.state == WorkerOperationState::Accepted => {
-            api.store.revoke_worker_workspace_credentials(
-                &api.config.workspace_id,
-                runtime_id,
-                candidate.runtime_worker_id.as_str(),
-                &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-            )?;
-            Ok(())
-        }
+        Ok(result) if result.deleted && result.state == WorkerOperationState::Accepted => Ok(()),
         Ok(result) => Err(ApiError::with_diagnostics(
             Error::RuntimeOperationFailed {
                 runtime_id: runtime_id.to_string(),
@@ -8745,7 +8575,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.error {
             Error::TicketAssignmentConflict(_) => StatusCode::CONFLICT,
-            Error::WorkerWorkspaceAuthentication(_) => StatusCode::UNAUTHORIZED,
+            Error::WorkerSourceIdentity(_) => StatusCode::BAD_REQUEST,
             Error::InvalidRuntimeIdentifier { .. } => StatusCode::BAD_REQUEST,
             Error::Ticket(ticket::TicketError::NotFound(_)) => StatusCode::NOT_FOUND,
             Error::Ticket(
@@ -8880,7 +8710,6 @@ mod tests {
             workspace_id: TEST_WORKSPACE_ID.to_string(),
             base_url: "http://127.0.0.1:8787".to_string(),
             runtime_id: Some(runtime_id.to_string()),
-            access_token: Some("workspace-access-token".to_string()),
         }
     }
 
@@ -9535,17 +9364,6 @@ mod tests {
             }
         }
 
-        fn replace_workspace_access_token(
-            &self,
-            _handle: &worker_runtime::execution::WorkerExecutionHandle,
-            _access_token: String,
-        ) -> worker_runtime::execution::WorkerExecutionResult {
-            worker_runtime::execution::WorkerExecutionResult::accepted(
-                worker_runtime::execution::WorkerExecutionOperation::ReplaceWorkspaceAccessToken,
-                worker_runtime::execution::WorkerExecutionRunState::Idle,
-            )
-        }
-
         fn dispatch_input(
             &self,
             handle: &worker_runtime::execution::WorkerExecutionHandle,
@@ -9912,22 +9730,10 @@ mod tests {
                 false,
             )
             .unwrap();
-        api.store
-            .upsert_worker_workspace_credential(&WorkerWorkspaceCredentialRecord {
-                credential_id: "source-credential".to_string(),
-                token: "source-secret".to_string(),
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
-                worker_id: Some(source_worker.worker_id.clone()),
-                created_at: TEST_CREATED_AT.to_string(),
-                expires_at: "2099-01-01T00:00:00Z".to_string(),
-                revoked_at: None,
-            })
-            .unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(
-            axum::http::header::AUTHORIZATION,
-            axum::http::HeaderValue::from_static("Bearer source-secret"),
+            "x-yoi-runtime-id",
+            axum::http::HeaderValue::from_static(EMBEDDED_WORKER_RUNTIME_ID),
         );
         headers.insert(
             "x-yoi-worker-id",
@@ -9942,7 +9748,7 @@ mod tests {
                         ticket_ref.id
                     ))
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer source-secret")
+                    .header("x-yoi-runtime-id", EMBEDDED_WORKER_RUNTIME_ID)
                     .header("x-yoi-worker-id", &source_worker.worker_id)
                     .body(Body::from(
                         serde_json::to_vec(&NewTicketEvent::new(
@@ -9995,7 +9801,7 @@ mod tests {
                         "/api/w/{TEST_WORKSPACE_ID}/tickets/{}/record",
                         ticket_ref.id
                     ))
-                    .header("authorization", "Bearer source-secret")
+                    .header("x-yoi-runtime-id", EMBEDDED_WORKER_RUNTIME_ID)
                     .header("x-yoi-worker-id", &source_worker.worker_id)
                     .body(Body::empty())
                     .unwrap(),
@@ -10099,7 +9905,7 @@ mod tests {
             Some("coder")
         );
 
-        let unauthorized = execute_worker_ticket_test_operation(
+        let invalid_source = execute_worker_ticket_test_operation(
             State(api.clone()),
             AxumPath(ScopedWorkspacePath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
@@ -10113,7 +9919,7 @@ mod tests {
         .await
         .unwrap_err()
         .into_response();
-        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(invalid_source.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -10183,26 +9989,14 @@ mod tests {
                 },
             )
             .unwrap();
-        api.store
-            .upsert_worker_workspace_credential(&WorkerWorkspaceCredentialRecord {
-                credential_id: "orchestrator-source-credential".to_string(),
-                token: "orchestrator-source-secret".to_string(),
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
-                worker_id: Some(source.worker_id.clone()),
-                created_at: TEST_CREATED_AT.to_string(),
-                expires_at: "2099-01-01T00:00:00Z".to_string(),
-                revoked_at: None,
-            })
-            .unwrap();
         let backend = browser_ticket_backend(&api).unwrap();
         let mut input = ticket::NewTicket::new("Queued notification");
         input.workflow_state = Some(TicketWorkflowState::Queued);
         let ticket_ref = backend.create(input).unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(
-            axum::http::header::AUTHORIZATION,
-            axum::http::HeaderValue::from_static("Bearer orchestrator-source-secret"),
+            "x-yoi-runtime-id",
+            axum::http::HeaderValue::from_static(EMBEDDED_WORKER_RUNTIME_ID),
         );
         headers.insert(
             "x-yoi-worker-id",
@@ -10231,66 +10025,6 @@ mod tests {
                 )
                 .unwrap(),
             1
-        );
-    }
-
-    #[tokio::test]
-    async fn workspace_credential_rotation_revokes_prior_bound_credential() {
-        let dir = tempfile::tempdir().unwrap();
-        let api = test_api(dir.path()).await;
-        let result = api
-            .spawn_workspace_worker(
-                EMBEDDED_WORKER_RUNTIME_ID,
-                WorkerSpawnRequest {
-                    requested_worker_name: Some("credential-boundary".to_string()),
-                    intent: WorkerSpawnIntent::WorkspaceCoding,
-                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                        expected_segments: 0,
-                    },
-                    profile: ProfileSelector::Builtin("builtin:coder".to_string()),
-                    ticket_assignment: None,
-                    initial_input: None,
-                    working_directory_request: None,
-                    resolved_working_directory_request: None,
-                    resolved_working_directory: None,
-                    resolved_config_bundle: None,
-                    resolved_workspace_api: Some(test_worker_workspace_api(
-                        "embedded-worker-runtime",
-                    )),
-                },
-            )
-            .unwrap();
-        let worker = result.worker.unwrap();
-        let old_token = "legacy-worker-token";
-        api.store
-            .upsert_worker_workspace_credential(&WorkerWorkspaceCredentialRecord {
-                credential_id: new_id("wac"),
-                token: old_token.to_string(),
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
-                worker_id: Some(worker.worker_id.clone()),
-                created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-                expires_at: (Utc::now() + chrono::Duration::hours(1))
-                    .to_rfc3339_opts(SecondsFormat::Secs, true),
-                revoked_at: None,
-            })
-            .unwrap();
-
-        let rotation = api
-            .rotate_worker_workspace_credential(EMBEDDED_WORKER_RUNTIME_ID, &worker.worker_id)
-            .unwrap();
-
-        assert_eq!(rotation.state, WorkerOperationState::Accepted);
-        assert!(
-            api.store
-                .authenticate_worker_workspace_credential(
-                    old_token,
-                    TEST_WORKSPACE_ID,
-                    &worker.worker_id,
-                )
-                .unwrap()
-                .is_none(),
-            "repair must revoke the prior bound credential"
         );
     }
 
@@ -11500,7 +11234,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_rest_search_requires_worker_credential_and_rpc_route_is_removed() {
+    async fn ticket_rest_search_requires_worker_source_identity_and_rpc_route_is_removed() {
         let dir = tempfile::tempdir().unwrap();
         let api = test_api(dir.path()).await;
         let app = build_router(api);
@@ -11518,7 +11252,24 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/api/w/{TEST_WORKSPACE_ID}/tickets/search?state=active"
+                    ))
+                    .header("x-yoi-runtime-id", "embedded-worker-runtime")
+                    .header("x-yoi-worker-id", "missing-worker")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let response = app
             .oneshot(

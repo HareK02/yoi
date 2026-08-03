@@ -662,6 +662,7 @@ mod tests {
             Arc::new(crate::worker::RuntimeWorkspaceHttpClient::new(
                 "test-workspace",
                 format!("http://{addr}"),
+                "test-runtime",
                 "test-worker",
             )),
             rx,

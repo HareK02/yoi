@@ -193,11 +193,15 @@ mod tests {
             let mut request_line = String::new();
             reader.read_line(&mut request_line).unwrap();
             assert!(request_line.starts_with("GET /api/w/ws-1/skills HTTP/1.1"));
+            let mut runtime_header = None;
             let mut worker_header = None;
             let mut authorization = None;
             loop {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
+                if let Some(value) = line.strip_prefix("x-yoi-runtime-id: ") {
+                    runtime_header = Some(value.trim().to_string());
+                }
                 if let Some(value) = line.strip_prefix("x-yoi-worker-id: ") {
                     worker_header = Some(value.trim().to_string());
                 }
@@ -208,8 +212,9 @@ mod tests {
                     break;
                 }
             }
+            assert_eq!(runtime_header.as_deref(), Some("runtime-test"));
             assert_eq!(worker_header.as_deref(), Some("test-worker"));
-            assert_eq!(authorization.as_deref(), Some("Bearer test-credential"));
+            assert_eq!(authorization, None);
             let body = serde_json::json!({
                 "authority": "workspace-backend-skills-v0",
                 "entries": [{
@@ -234,9 +239,9 @@ mod tests {
         let client = crate::worker::RuntimeWorkspaceHttpClient::new(
             "ws-1",
             format!("http://{addr}"),
+            "runtime-test",
             "test-worker",
-        )
-        .with_access_token(Some("test-credential".to_string()));
+        );
         let catalog = (&client as &dyn WorkspaceClient).list_skills().unwrap();
         assert_eq!(catalog.entries[0].name, "triage-errors");
         assert_eq!(catalog.entries[0].provenance.id, "workspace:triage-errors");

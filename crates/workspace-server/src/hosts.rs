@@ -427,25 +427,13 @@ pub struct ConfigBundleListResult {
 fn required_worker_workspace_api(
     request: &WorkerSpawnRequest,
 ) -> Result<WorkspaceApiRef, RuntimeDiagnostic> {
-    let workspace_api = request.resolved_workspace_api.clone().ok_or_else(|| {
+    request.resolved_workspace_api.clone().ok_or_else(|| {
         diagnostic(
-            "worker_workspace_credential_missing",
+            "worker_workspace_api_missing",
             DiagnosticSeverity::Error,
-            "Workspace-bound Worker spawn requires a resolved Workspace API credential",
+            "Workspace-bound Worker spawn requires a resolved Workspace API binding",
         )
-    })?;
-    if workspace_api
-        .access_token
-        .as_deref()
-        .is_none_or(|token| token.trim().is_empty())
-    {
-        return Err(diagnostic(
-            "worker_workspace_credential_missing",
-            DiagnosticSeverity::Error,
-            "Workspace-bound Worker spawn requires a non-empty Workspace API access token",
-        ));
-    }
-    Ok(workspace_api)
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3808,7 +3796,6 @@ mod tests {
             workspace_id: "workspace-test".to_string(),
             base_url: "http://127.0.0.1:8787".to_string(),
             runtime_id: Some("runtime-test".to_string()),
-            access_token: Some("workspace-access-token".to_string()),
         }
     }
 
@@ -4339,7 +4326,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_runtime_rejects_tokenless_workspace_spawn() {
+    fn embedded_runtime_rejects_missing_workspace_api_binding() {
         let runtime = EmbeddedWorkerRuntime::new_memory_with_execution_backend(
             "local:test",
             Arc::new(AcceptingExecutionBackend::default()),
@@ -4355,7 +4342,7 @@ mod tests {
             spawned
                 .diagnostics
                 .iter()
-                .any(|diagnostic| { diagnostic.code == "worker_workspace_credential_missing" })
+                .any(|diagnostic| { diagnostic.code == "worker_workspace_api_missing" })
         );
     }
 

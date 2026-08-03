@@ -216,13 +216,6 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
     fn is_available(&self) -> bool;
     fn execute(&self, request: WorkspaceRequest)
     -> Result<WorkspaceResponse, WorkspaceClientError>;
-
-    /// Replace the Runtime-issued Workspace access token for this live client.
-    fn replace_access_token(&self, _access_token: String) -> Result<(), WorkspaceClientError> {
-        Err(WorkspaceClientError::Unavailable(
-            "Workspace client does not support access token replacement".to_string(),
-        ))
-    }
 }
 
 /// HTTP forwarding client created by Runtime for one concrete Worker execution.
@@ -233,8 +226,8 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
 pub struct RuntimeWorkspaceHttpClient {
     workspace_id: String,
     base_url: String,
+    runtime_id: String,
     worker_id: String,
-    access_token: Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for RuntimeWorkspaceHttpClient {
@@ -243,15 +236,8 @@ impl std::fmt::Debug for RuntimeWorkspaceHttpClient {
             .debug_struct("RuntimeWorkspaceHttpClient")
             .field("workspace_id", &self.workspace_id)
             .field("base_url", &self.base_url)
+            .field("runtime_id", &self.runtime_id)
             .field("worker_id", &self.worker_id)
-            .field(
-                "access_token",
-                &self
-                    .access_token
-                    .lock()
-                    .ok()
-                    .and_then(|token| token.as_ref().map(|_| "[redacted]")),
-            )
             .finish()
     }
 }
@@ -260,19 +246,15 @@ impl RuntimeWorkspaceHttpClient {
     pub fn new(
         workspace_id: impl Into<String>,
         base_url: impl Into<String>,
+        runtime_id: impl Into<String>,
         worker_id: impl Into<String>,
     ) -> Self {
         Self {
             workspace_id: workspace_id.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
+            runtime_id: runtime_id.into(),
             worker_id: worker_id.into(),
-            access_token: Mutex::new(None),
         }
-    }
-
-    pub fn with_access_token(self, access_token: Option<String>) -> Self {
-        *self.access_token.lock().expect("new credential mutex") = access_token;
-        self
     }
 }
 
@@ -294,105 +276,26 @@ impl WorkspaceClient for RuntimeWorkspaceHttpClient {
         request: WorkspaceRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         let base_url = self.base_url.clone();
+        let runtime_id = self.runtime_id.clone();
         let worker_id = self.worker_id.clone();
-        let access_token = self
-            .access_token
-            .lock()
-            .map_err(|_| {
-                WorkspaceClientError::Request("workspace credential lock poisoned".to_string())
-            })?
-            .clone();
-        let request_copy = request.clone();
-        let result = if tokio::runtime::Handle::try_current().is_ok() {
+        if tokio::runtime::Handle::try_current().is_ok() {
             std::thread::spawn(move || {
-                execute_runtime_workspace_http_with_refresh(
-                    &base_url,
-                    &worker_id,
-                    access_token,
-                    request_copy,
-                )
+                execute_runtime_workspace_http(&base_url, &runtime_id, &worker_id, request)
             })
             .join()
             .map_err(|_| {
                 WorkspaceClientError::Request("workspace request thread panicked".to_string())
             })?
         } else {
-            execute_runtime_workspace_http_with_refresh(
-                &base_url,
-                &worker_id,
-                access_token,
-                request,
-            )
-        }?;
-        if let Some(new_token) = result.1 {
-            *self.access_token.lock().map_err(|_| {
-                WorkspaceClientError::Request("workspace credential lock poisoned".to_string())
-            })? = Some(new_token);
+            execute_runtime_workspace_http(&base_url, &runtime_id, &worker_id, request)
         }
-        Ok(result.0)
     }
-
-    fn replace_access_token(&self, access_token: String) -> Result<(), WorkspaceClientError> {
-        *self.access_token.lock().map_err(|_| {
-            WorkspaceClientError::Request("workspace credential lock poisoned".to_string())
-        })? = Some(access_token);
-        Ok(())
-    }
-}
-
-fn execute_runtime_workspace_http_with_refresh(
-    base_url: &str,
-    worker_id: &str,
-    access_token: Option<String>,
-    request: WorkspaceRequest,
-) -> Result<(WorkspaceResponse, Option<String>), WorkspaceClientError> {
-    let response = execute_runtime_workspace_http(
-        base_url,
-        worker_id,
-        access_token.as_deref(),
-        request.clone(),
-    )?;
-    if response.status != 401 {
-        return Ok((response, None));
-    }
-    let Some(expired_token) = access_token else {
-        return Ok((response, None));
-    };
-    let workspace_id = request
-        .path
-        .strip_prefix("/api/w/")
-        .and_then(|path| path.split('/').next())
-        .ok_or_else(|| WorkspaceClientError::InvalidPath(request.path.clone()))?;
-    let refresh_url = format!("{base_url}/api/w/{workspace_id}/worker-credentials/refresh");
-    let refresh = reqwest::blocking::Client::new()
-        .post(refresh_url)
-        .bearer_auth(expired_token)
-        .header("x-yoi-worker-id", worker_id)
-        .send()
-        .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
-    if !refresh.status().is_success() {
-        return Ok((response, None));
-    }
-    let body: serde_json::Value = refresh
-        .json()
-        .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
-    let new_token = body
-        .get("access_token")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            WorkspaceClientError::Request(
-                "Workspace credential refresh response omitted access_token".to_string(),
-            )
-        })?
-        .to_string();
-    let retried = execute_runtime_workspace_http(base_url, worker_id, Some(&new_token), request)?;
-    Ok((retried, Some(new_token)))
 }
 
 fn execute_runtime_workspace_http(
     base_url: &str,
+    runtime_id: &str,
     worker_id: &str,
-    access_token: Option<&str>,
     request: WorkspaceRequest,
 ) -> Result<WorkspaceResponse, WorkspaceClientError> {
     if !request.path.starts_with('/') || request.path.starts_with("//") {
@@ -409,10 +312,8 @@ fn execute_runtime_workspace_http(
     let client = reqwest::blocking::Client::new();
     let mut request_builder = client
         .request(method, url)
+        .header("x-yoi-runtime-id", runtime_id)
         .header("x-yoi-worker-id", worker_id);
-    if let Some(access_token) = access_token {
-        request_builder = request_builder.bearer_auth(access_token);
-    }
     if let Some(body) = request.body {
         request_builder = request_builder
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -6132,6 +6033,7 @@ mod build_summary_prompt_tests {
             Arc::new(RuntimeWorkspaceHttpClient::new(
                 "test-memory",
                 format!("http://{addr}"),
+                "test-runtime",
                 "test-worker",
             )),
         )
@@ -6268,6 +6170,7 @@ mod build_summary_prompt_tests {
                     Arc::new(RuntimeWorkspaceHttpClient::new(
                         "ws-skill",
                         format!("http://{addr}"),
+                        "test-runtime",
                         "test-worker",
                     )),
                 ),
@@ -6311,86 +6214,55 @@ mod build_summary_prompt_tests {
     }
 
     #[test]
-    fn runtime_workspace_client_refreshes_expired_credential_and_retries() {
+    fn runtime_workspace_client_sends_runtime_worker_identity_without_bearer() {
         use std::io::{BufRead, BufReader, Write};
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            for step in 0..3 {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut first_line = String::new();
-                reader.read_line(&mut first_line).unwrap();
-                let mut authorization = String::new();
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    if let Some(value) = line.strip_prefix("authorization: ") {
-                        authorization = value.trim().to_string();
-                    }
-                    if line == "\r\n" || line.is_empty() {
-                        break;
-                    }
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut first_line = String::new();
+            reader.read_line(&mut first_line).unwrap();
+            assert!(first_line.contains("/api/w/workspace-a/tickets/search"));
+            let mut runtime_id = String::new();
+            let mut worker_id = String::new();
+            let mut authorization = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if let Some(value) = line.strip_prefix("x-yoi-runtime-id: ") {
+                    runtime_id = value.trim().to_string();
                 }
-                match step {
-                    0 => {
-                        assert_eq!(authorization, "Bearer expired-token");
-                        stream
-                            .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
-                            .unwrap();
-                    }
-                    1 => {
-                        assert!(first_line.contains("/worker-credentials/refresh"));
-                        assert_eq!(authorization, "Bearer expired-token");
-                        let body =
-                            r#"{"access_token":"fresh-token","expires_at":"2099-01-01T00:00:00Z"}"#;
-                        write!(
-                            stream,
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                            body.len(),
-                            body
-                        )
-                        .unwrap();
-                    }
-                    _ => {
-                        assert_eq!(authorization, "Bearer fresh-token");
-                        stream
-                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
-                            .unwrap();
-                    }
+                if let Some(value) = line.strip_prefix("x-yoi-worker-id: ") {
+                    worker_id = value.trim().to_string();
+                }
+                if let Some(value) = line.strip_prefix("authorization: ") {
+                    authorization = value.trim().to_string();
+                }
+                if line == "\r\n" || line.is_empty() {
+                    break;
                 }
             }
+            assert_eq!(runtime_id, "runtime-a");
+            assert_eq!(worker_id, "worker-a");
+            assert!(authorization.is_empty());
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .unwrap();
         });
         let client = RuntimeWorkspaceHttpClient::new(
-            "workspace-refresh",
+            "workspace-a",
             format!("http://{address}"),
-            "worker-refresh",
-        )
-        .with_access_token(Some("expired-token".to_string()));
+            "runtime-a",
+            "worker-a",
+        );
         let response = client
-            .execute(WorkspaceRequest::get(
-                "/api/w/workspace-refresh/tickets/search",
-            ))
+            .execute(WorkspaceRequest::get("/api/w/workspace-a/tickets/search"))
             .unwrap();
         assert_eq!(response.status, 200);
         server.join().unwrap();
-    }
-
-    #[test]
-    fn runtime_workspace_client_can_install_missing_access_token() {
-        let client =
-            RuntimeWorkspaceHttpClient::new("workspace-a", "https://workspace.example", "worker-a");
-
-        client
-            .replace_access_token("replacement-token".to_string())
-            .unwrap();
-
-        assert_eq!(
-            client.access_token.lock().unwrap().as_deref(),
-            Some("replacement-token")
-        );
     }
 
     fn minimal_manifest() -> WorkerManifest {

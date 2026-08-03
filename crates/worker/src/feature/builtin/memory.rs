@@ -348,6 +348,7 @@ mod tests {
         Arc::new(crate::worker::RuntimeWorkspaceHttpClient::new(
             "workspace",
             "http://backend",
+            "test-runtime",
             "test-worker",
         ))
     }
