@@ -845,6 +845,31 @@ where
         materializer.working_directory_status(working_directory_id)
     }
 
+    fn open_workdir_session(
+        &self,
+        working_directory_id: &str,
+    ) -> Result<WorkdirSessionHandle, WorkingDirectoryDiagnostic> {
+        let Some(materializer) = self.working_directory_materializer.as_ref() else {
+            return Err(WorkingDirectoryDiagnostic::rejected(
+                "working_directory_materializer_unavailable",
+                "Workdir session requested, but no materializer is configured for this runtime backend",
+            ));
+        };
+        let binding = materializer.bind_working_directory(working_directory_id, None)?;
+        let scope = manifest::Scope::writable(binding.root()).map_err(|error| {
+            WorkingDirectoryDiagnostic::rejected(
+                "workdir_session_scope_invalid",
+                format!("failed to create Workdir session scope: {error}"),
+            )
+        })?;
+        Ok(runtime_local_workdir_session(
+            working_directory_id,
+            binding.root(),
+            binding.cwd(),
+            manifest::SharedScope::new(scope),
+        ))
+    }
+
     fn cleanup_working_directory(
         &self,
         working_directory_id: &str,

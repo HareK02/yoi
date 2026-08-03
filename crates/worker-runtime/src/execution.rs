@@ -10,6 +10,7 @@ use protocol::Method;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
+use workdir::WorkdirSessionHandle;
 
 /// Current execution-side run state for a Worker.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,6 +294,18 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         ))
     }
 
+    fn open_workdir_session(
+        &self,
+        working_directory_id: &str,
+    ) -> Result<WorkdirSessionHandle, WorkingDirectoryDiagnostic> {
+        Err(WorkingDirectoryDiagnostic::rejected(
+            "workdir_session_unsupported",
+            format!(
+                "working directory `{working_directory_id}` does not expose operation sessions"
+            ),
+        ))
+    }
+
     fn cleanup_working_directory(
         &self,
         working_directory_id: &str,
@@ -401,6 +414,13 @@ impl WorkerExecutionBackendRef {
         working_directory_id: &str,
     ) -> Result<WorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
         self.backend.working_directory(working_directory_id)
+    }
+
+    pub(crate) fn open_workdir_session(
+        &self,
+        working_directory_id: &str,
+    ) -> Result<WorkdirSessionHandle, WorkingDirectoryDiagnostic> {
+        self.backend.open_workdir_session(working_directory_id)
     }
 
     pub(crate) fn cleanup_working_directory(

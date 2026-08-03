@@ -7,7 +7,7 @@
 //! credentials, registration, and policy.
 
 use crate::auth::{
-    RuntimeAuthContext, RuntimeAuthError, RuntimeHttpAuthConfig, unix_now_seconds,
+    RuntimeAuthContext, RuntimeAuthError, RuntimeHttpAuthConfig, new_token_id, unix_now_seconds,
     verify_capability_token,
 };
 use crate::catalog::{
@@ -32,7 +32,7 @@ use axum::extract::{Extension, Path, Query, State};
 use axum::http::{Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 #[cfg(feature = "ws-server")]
 use futures::{SinkExt, StreamExt};
@@ -45,14 +45,21 @@ use protocol::subscription::{
     SubscriptionTerminationCode,
 };
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "ws-server")]
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 #[cfg(feature = "fs-store")]
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
+use workdir::{
+    CommandOutput, CommandStatus, WorkdirSessionHandle,
+    http::{
+        OpenWorkdirSessionRequest, OpenWorkdirSessionResponse, WorkdirSessionId,
+        WorkdirSessionOperation, WorkdirSessionOperationResult, WorkdirTransportError,
+        WorkdirTransportErrorCode,
+    },
+};
 
 const DEFAULT_RUNTIME_HTTP_PORT: u16 = 38800;
 
@@ -172,6 +179,7 @@ fn runtime_http_router_with_optional_auth(
         runtime,
         local_token: local_token.map(Arc::<str>::from),
         auth: auth.map(Arc::new),
+        workdir_sessions: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let router = Router::new()
@@ -187,6 +195,18 @@ fn runtime_http_router_with_optional_auth(
         .route(
             "/v1/working-directories",
             get(list_working_directories).post(create_working_directory),
+        )
+        .route(
+            "/v1/working-directories/{working_directory_id}/sessions",
+            post(open_workdir_session),
+        )
+        .route(
+            "/v1/workdir-sessions/{session_id}/operations",
+            post(run_workdir_session_operation),
+        )
+        .route(
+            "/v1/workdir-sessions/{session_id}",
+            delete(close_workdir_session),
         )
         .route(
             "/v1/working-directories/{working_directory_id}",
@@ -228,6 +248,12 @@ struct RuntimeHttpState {
     runtime: Runtime,
     local_token: Option<Arc<str>>,
     auth: Option<Arc<RuntimeHttpAuthConfig>>,
+    workdir_sessions: Arc<Mutex<HashMap<String, RuntimeHttpWorkdirSession>>>,
+}
+
+struct RuntimeHttpWorkdirSession {
+    owner: RuntimeWorkspaceScope,
+    session: WorkdirSessionHandle,
 }
 
 /// `GET /v1/runtime` response.
@@ -470,6 +496,164 @@ async fn get_working_directory(
     Ok(Json(RuntimeHttpWorkingDirectoryResponse {
         working_directory,
     }))
+}
+
+async fn open_workdir_session(
+    State(state): State<RuntimeHttpState>,
+    Path(working_directory_id): Path<String>,
+    auth: Option<Extension<RuntimeAuthContext>>,
+    body: Result<Json<OpenWorkdirSessionRequest>, JsonRejection>,
+) -> Result<Json<OpenWorkdirSessionResponse>, RuntimeHttpWorkdirError> {
+    let Json(request) = body.map_err(|_| RuntimeHttpWorkdirError::invalid_request())?;
+    let owner = required_workdir_owner(auth)?;
+    let owner_worker_ref = request
+        .owner_worker_id
+        .as_deref()
+        .map(|worker_id| {
+            WorkerId::parse(worker_id)
+                .map(WorkerRef::new)
+                .ok_or_else(RuntimeHttpWorkdirError::invalid_request)
+        })
+        .transpose()?;
+    let session = state
+        .runtime
+        .open_workdir_session_scoped(&owner, &working_directory_id, owner_worker_ref.as_ref())
+        .map_err(RuntimeHttpWorkdirError::runtime)?;
+    let session_id =
+        WorkdirSessionId::new(new_token_id().map_err(|_| RuntimeHttpWorkdirError::internal())?)
+            .map_err(|_| RuntimeHttpWorkdirError::internal())?;
+    let response = OpenWorkdirSessionResponse {
+        session_id: session_id.clone(),
+        workdir_id: session.workdir().id().clone(),
+        capabilities: session.capabilities(),
+    };
+    state
+        .workdir_sessions
+        .lock()
+        .map_err(|_| RuntimeHttpWorkdirError::internal())?
+        .insert(
+            session_id.as_str().to_string(),
+            RuntimeHttpWorkdirSession { owner, session },
+        );
+    Ok(Json(response))
+}
+
+async fn run_workdir_session_operation(
+    State(state): State<RuntimeHttpState>,
+    Path(session_id): Path<String>,
+    auth: Option<Extension<RuntimeAuthContext>>,
+    body: Result<Json<WorkdirSessionOperation>, JsonRejection>,
+) -> Result<Json<WorkdirSessionOperationResult>, RuntimeHttpWorkdirError> {
+    let Json(operation) = body.map_err(|_| RuntimeHttpWorkdirError::invalid_request())?;
+    let owner = required_workdir_owner(auth)?;
+    let session = {
+        let sessions = state
+            .workdir_sessions
+            .lock()
+            .map_err(|_| RuntimeHttpWorkdirError::internal())?;
+        let record = sessions
+            .get(&session_id)
+            .filter(|record| record.owner == owner)
+            .ok_or_else(RuntimeHttpWorkdirError::not_found)?;
+        record.session.clone()
+    };
+
+    let result = match operation {
+        WorkdirSessionOperation::Stat(request) => {
+            WorkdirSessionOperationResult::Stat(session.stat(request).await?)
+        }
+        WorkdirSessionOperation::Read(request) => {
+            WorkdirSessionOperationResult::Read(session.read(request).await?)
+        }
+        WorkdirSessionOperation::Write(request) => {
+            WorkdirSessionOperationResult::Write(session.write(request).await?)
+        }
+        WorkdirSessionOperation::Edit(request) => {
+            WorkdirSessionOperationResult::Edit(session.edit(request).await?)
+        }
+        WorkdirSessionOperation::List(request) => {
+            WorkdirSessionOperationResult::List(session.list(request).await?)
+        }
+        WorkdirSessionOperation::Glob(request) => {
+            WorkdirSessionOperationResult::Glob(session.glob(request).await?)
+        }
+        WorkdirSessionOperation::Grep(request) => {
+            WorkdirSessionOperationResult::Grep(session.grep(request).await?)
+        }
+        WorkdirSessionOperation::CommandStart(request) => {
+            WorkdirSessionOperationResult::CommandStart(session.start_command(request).await?)
+        }
+        WorkdirSessionOperation::CommandStatus(handle) => {
+            WorkdirSessionOperationResult::CommandStatus(session.command_status(handle).await?)
+        }
+        WorkdirSessionOperation::CommandOutput(request) if request.wait => {
+            let cursor = request.cursor;
+            let output = match tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                session.command_output(request),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => CommandOutput {
+                    exit_code: None,
+                    timed_out: false,
+                    status: CommandStatus::Running,
+                    content: String::new(),
+                    next_cursor: Some(cursor),
+                    truncated: false,
+                },
+            };
+            WorkdirSessionOperationResult::CommandOutput(output)
+        }
+        WorkdirSessionOperation::CommandOutput(request) => {
+            WorkdirSessionOperationResult::CommandOutput(session.command_output(request).await?)
+        }
+        WorkdirSessionOperation::CommandCancel(handle) => {
+            session.cancel_command(handle).await?;
+            WorkdirSessionOperationResult::CommandCancel
+        }
+    };
+    Ok(Json(result))
+}
+
+async fn close_workdir_session(
+    State(state): State<RuntimeHttpState>,
+    Path(session_id): Path<String>,
+    auth: Option<Extension<RuntimeAuthContext>>,
+) -> Result<StatusCode, RuntimeHttpWorkdirError> {
+    let owner = required_workdir_owner(auth)?;
+    let session = {
+        let mut sessions = state
+            .workdir_sessions
+            .lock()
+            .map_err(|_| RuntimeHttpWorkdirError::internal())?;
+        if sessions
+            .get(&session_id)
+            .is_some_and(|record| record.owner == owner)
+        {
+            sessions.remove(&session_id).map(|record| record.session)
+        } else {
+            None
+        }
+    };
+    if let Some(session) = session {
+        session.close().await?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn required_workdir_owner(
+    auth: Option<Extension<RuntimeAuthContext>>,
+) -> Result<RuntimeWorkspaceScope, RuntimeHttpWorkdirError> {
+    let Extension(auth) = auth.ok_or_else(RuntimeHttpWorkdirError::forbidden)?;
+    if auth.workspace_id.trim().is_empty() || auth.server_id.trim().is_empty() {
+        return Err(RuntimeHttpWorkdirError::forbidden());
+    }
+    Ok(RuntimeWorkspaceScope::new(
+        auth.workspace_id,
+        auth.server_id,
+    ))
 }
 
 async fn cleanup_working_directory(
@@ -1263,6 +1447,11 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     if path == "/v1/workers" && *method == Method::POST {
         return Some("workers:create");
     }
+    if path.starts_with("/v1/workdir-sessions")
+        || (path.starts_with("/v1/working-directories/") && path.ends_with("/sessions"))
+    {
+        return Some("workdirs:operate");
+    }
     if path.starts_with("/v1/config-bundles") || path.starts_with("/v1/working-directories") {
         return Some("workers:create");
     }
@@ -1291,6 +1480,101 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
         return Some("workers:read");
     }
     None
+}
+
+#[derive(Debug)]
+struct RuntimeHttpWorkdirError {
+    status: StatusCode,
+    payload: WorkdirTransportError,
+}
+
+impl RuntimeHttpWorkdirError {
+    fn new(
+        status: StatusCode,
+        code: WorkdirTransportErrorCode,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            status,
+            payload: WorkdirTransportError {
+                code,
+                message: message.into(),
+            },
+        }
+    }
+
+    fn invalid_request() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            WorkdirTransportErrorCode::InvalidRequest,
+            "Workdir operation request is invalid",
+        )
+    }
+
+    fn forbidden() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            WorkdirTransportErrorCode::Unavailable,
+            "Workdir session is unavailable",
+        )
+    }
+
+    fn not_found() -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            WorkdirTransportErrorCode::NotFound,
+            "Workdir session was not found",
+        )
+    }
+
+    fn internal() -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            WorkdirTransportErrorCode::Internal,
+            "Workdir operation failed",
+        )
+    }
+
+    fn runtime(error: RuntimeError) -> Self {
+        match error {
+            RuntimeError::WorkingDirectory(diagnostic)
+                if diagnostic.code == "working_directory_not_found" =>
+            {
+                Self::not_found()
+            }
+            RuntimeError::WorkspaceOwnerMismatch { .. } => Self::not_found(),
+            RuntimeError::InvalidRequest(_) => Self::invalid_request(),
+            _ => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                WorkdirTransportErrorCode::Unavailable,
+                "Workdir session is unavailable",
+            ),
+        }
+    }
+}
+
+impl From<workdir::WorkdirError> for RuntimeHttpWorkdirError {
+    fn from(error: workdir::WorkdirError) -> Self {
+        let payload = WorkdirTransportError::from_workdir_error(&error);
+        let status = match payload.code {
+            WorkdirTransportErrorCode::NotFound | WorkdirTransportErrorCode::UnknownCommand => {
+                StatusCode::NOT_FOUND
+            }
+            WorkdirTransportErrorCode::Conflict => StatusCode::CONFLICT,
+            WorkdirTransportErrorCode::Unsupported | WorkdirTransportErrorCode::InvalidRequest => {
+                StatusCode::BAD_REQUEST
+            }
+            WorkdirTransportErrorCode::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            WorkdirTransportErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        Self { status, payload }
+    }
+}
+
+impl IntoResponse for RuntimeHttpWorkdirError {
+    fn into_response(self) -> Response {
+        (self.status, Json(self.payload)).into_response()
+    }
 }
 
 #[derive(Debug)]
@@ -1434,7 +1718,11 @@ mod tests {
     use crate::management::RuntimeOptions;
     use axum::body::to_bytes;
     use axum::http::Method;
+    use manifest::{Scope, SharedScope};
     use tower::ServiceExt;
+    use workdir::{
+        LocalWorkdirSession, StatRequest, Workdir, WorkdirPath, WorkdirSessionCapabilities,
+    };
 
     fn test_bundle(profile: ProfileSelector) -> ConfigBundle {
         ConfigBundle {
@@ -1525,6 +1813,7 @@ mod tests {
                 "workers:stop",
                 "workers:protocol",
                 "workers:delete",
+                "workdirs:operate",
             ],
         )
     }
@@ -1719,6 +2008,27 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
+    #[tokio::test]
+    async fn capability_token_without_workdir_permission_is_forbidden() {
+        let runtime =
+            Runtime::with_execution_backend(RuntimeOptions::default(), Arc::new(AcceptingBackend))
+                .unwrap();
+        let (auth, signer) = auth_config_and_signer();
+        let token = token_for_workspace_with_permissions(&signer, "workspace-a", ["workers:read"]);
+        let app = runtime_http_router_with_auth(runtime, None, auth);
+
+        let response = app
+            .oneshot(bearer_request(
+                Method::POST,
+                "/v1/working-directories/wd-1/sessions",
+                &token,
+                serde_json::to_vec(&OpenWorkdirSessionRequest::default()).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
     fn task_request(_objective: &str) -> CreateWorkerRequest {
         let profile = ProfileSelector::Builtin("builtin:coder".to_string());
         let bundle = test_bundle(profile.clone());
@@ -1753,6 +2063,115 @@ mod tests {
             working_directory: None,
             workspace_api: None,
         }
+    }
+
+    #[test]
+    fn workdir_routes_require_dedicated_operation_permission() {
+        assert_eq!(
+            required_runtime_permission(&Method::POST, "/v1/working-directories/wd-1/sessions"),
+            Some("workdirs:operate")
+        );
+        assert_eq!(
+            required_runtime_permission(&Method::POST, "/v1/workdir-sessions/session-1/operations"),
+            Some("workdirs:operate")
+        );
+        assert_eq!(
+            required_runtime_permission(&Method::DELETE, "/v1/workdir-sessions/session-1"),
+            Some("workdirs:operate")
+        );
+    }
+
+    #[tokio::test]
+    async fn workdir_session_operations_enforce_owner_and_close_terminally() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("hello.txt"), "hello").expect("write fixture");
+        let scope = SharedScope::new(Scope::writable(temp.path()).expect("scope"));
+        let session: WorkdirSessionHandle = Arc::new(LocalWorkdirSession::materialized_bound(
+            Workdir::new("wd-1"),
+            temp.path().to_path_buf(),
+            temp.path().to_path_buf(),
+            scope,
+            WorkdirSessionCapabilities::ALL,
+        ));
+        let owner = RuntimeWorkspaceScope::new("workspace-a", "server-a");
+        let state = RuntimeHttpState {
+            runtime: Runtime::with_execution_backend(
+                RuntimeOptions::default(),
+                Arc::new(AcceptingBackend),
+            )
+            .expect("runtime"),
+            local_token: Some(Arc::from("token")),
+            auth: None,
+            workdir_sessions: Arc::new(Mutex::new(HashMap::from([(
+                "session-1".to_string(),
+                RuntimeHttpWorkdirSession {
+                    owner: owner.clone(),
+                    session: session.clone(),
+                },
+            )]))),
+        };
+        let auth = RuntimeAuthContext {
+            server_id: "server-a".to_string(),
+            workspace_id: "workspace-a".to_string(),
+            permissions: vec!["workdirs:operate".to_string()],
+            token_id: "token-a".to_string(),
+            expires_at: u64::MAX,
+        };
+        let operation = WorkdirSessionOperation::Stat(StatRequest {
+            path: WorkdirPath::new("hello.txt").expect("logical path"),
+        });
+
+        let Json(result) = run_workdir_session_operation(
+            State(state.clone()),
+            Path("session-1".to_string()),
+            Some(Extension(auth.clone())),
+            Ok(Json(operation.clone())),
+        )
+        .await
+        .expect("owned operation");
+        assert!(matches!(result, WorkdirSessionOperationResult::Stat(_)));
+
+        let wrong_owner = RuntimeAuthContext {
+            workspace_id: "workspace-b".to_string(),
+            ..auth.clone()
+        };
+        let error = run_workdir_session_operation(
+            State(state.clone()),
+            Path("session-1".to_string()),
+            Some(Extension(wrong_owner)),
+            Ok(Json(operation)),
+        )
+        .await
+        .expect_err("cross-workspace session access must fail");
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+
+        assert_eq!(
+            close_workdir_session(
+                State(state.clone()),
+                Path("session-1".to_string()),
+                Some(Extension(auth)),
+            )
+            .await
+            .expect("close"),
+            StatusCode::NO_CONTENT
+        );
+        let closed_error = session
+            .stat(StatRequest {
+                path: WorkdirPath::new("hello.txt").expect("logical path"),
+            })
+            .await
+            .expect_err("close must be terminal");
+        assert!(matches!(
+            closed_error,
+            workdir::WorkdirError::Unavailable(_)
+        ));
+        assert!(
+            state
+                .workdir_sessions
+                .lock()
+                .expect("session registry")
+                .is_empty()
+        );
     }
 
     struct AcceptingBackend;

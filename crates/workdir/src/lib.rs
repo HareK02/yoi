@@ -5,6 +5,7 @@
 //! bound to one Worker. Tools consume sessions; they do not own Workdir
 //! materialization or cleanup.
 
+pub mod http;
 mod local;
 mod operation;
 mod search;

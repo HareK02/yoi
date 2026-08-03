@@ -5930,6 +5930,7 @@ dependencies = [
  "grep-searcher",
  "ignore",
  "manifest",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -6130,6 +6131,7 @@ dependencies = [
  "url",
  "uuid",
  "webauthn-rs",
+ "workdir",
  "worker",
  "worker-runtime",
 ]

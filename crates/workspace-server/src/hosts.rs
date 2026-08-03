@@ -1,17 +1,23 @@
 use crate::Error;
 use crate::resource_broker::BackendResourceBroker;
 use chrono::Utc;
-use reqwest::StatusCode;
 use reqwest::blocking::{Client as BlockingHttpClient, RequestBuilder};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+use reqwest::{Client as AsyncHttpClient, StatusCode, Url};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
+    future::Future,
     path::PathBuf,
+    pin::Pin,
     sync::{Arc, RwLock},
     time::Duration,
+};
+use workdir::{
+    Workdir, WorkdirError,
+    http::{OpenWorkdirSessionRequest, RemoteWorkdirSession, WorkdirHttpAuthorization},
 };
 use worker_runtime::auth::{CapabilityTokenSigner, capability_claims};
 use worker_runtime::catalog::{
@@ -688,6 +694,20 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
                 ),
             )],
         }
+    }
+
+    fn open_workdir_session<'a>(
+        &'a self,
+        _working_directory_id: &'a str,
+        _owner_worker_id: Option<&'a str>,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<workdir::WorkdirSessionHandle, WorkdirError>> + Send + 'a>,
+    > {
+        Box::pin(async {
+            Err(WorkdirError::Unavailable(
+                "Runtime does not expose Workdir operation sessions".to_string(),
+            ))
+        })
     }
 
     fn cleanup_working_directory(
@@ -2250,6 +2270,52 @@ impl RemoteRuntimeConfig {
 }
 
 #[derive(Clone)]
+struct RemoteWorkdirAuthorization {
+    runtime_id: String,
+    workspace_id: String,
+    auth: Option<RemoteRuntimeAuthConfig>,
+    fallback_bearer_token: Option<String>,
+}
+
+impl std::fmt::Debug for RemoteWorkdirAuthorization {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteWorkdirAuthorization")
+            .field("runtime_id", &self.runtime_id)
+            .field("workspace_id", &self.workspace_id)
+            .field("auth", &self.auth.as_ref().map(|_| "capability_token"))
+            .field(
+                "fallback_bearer_token",
+                &self.fallback_bearer_token.as_ref().map(|_| "configured"),
+            )
+            .finish()
+    }
+}
+
+impl WorkdirHttpAuthorization for RemoteWorkdirAuthorization {
+    fn bearer_token(&self) -> Result<String, WorkdirError> {
+        if let Some(auth) = self.auth.as_ref() {
+            let claims = capability_claims(
+                &auth.server_id,
+                &self.runtime_id,
+                &self.workspace_id,
+                all_remote_runtime_permissions(),
+                300,
+            )
+            .map_err(|error| WorkdirError::Unavailable(error.to_string()))?;
+            return CapabilityTokenSigner::new(&auth.server_id, &auth.server_private_key)
+                .sign(&claims)
+                .map_err(|error| WorkdirError::Unavailable(error.to_string()));
+        }
+        self.fallback_bearer_token.clone().ok_or_else(|| {
+            WorkdirError::Unavailable(
+                "remote Runtime does not have bearer authorization configured".to_string(),
+            )
+        })
+    }
+}
+
+#[derive(Clone)]
 pub struct RemoteWorkerRuntime {
     runtime_id: String,
     display_name: String,
@@ -2263,6 +2329,7 @@ pub struct RemoteWorkerRuntime {
     host_id: String,
     resource_broker: BackendResourceBroker,
     http: BlockingHttpClient,
+    async_http: AsyncHttpClient,
 }
 
 fn all_remote_runtime_permissions() -> Vec<String> {
@@ -2274,6 +2341,7 @@ fn all_remote_runtime_permissions() -> Vec<String> {
         "workers:input",
         "workers:stop",
         "workers:protocol",
+        "workdirs:operate",
     ]
     .into_iter()
     .map(str::to_string)
@@ -2296,6 +2364,17 @@ impl RemoteWorkerRuntime {
                     code: "remote_runtime_client_build_failed".to_string(),
                     message: err.to_string(),
                 })?;
+        // Workdir command-output waits are bounded to 20 seconds by Runtime;
+        // leave transport margin while retaining a finite client timeout.
+        let workdir_timeout = timeout.max(Duration::from_secs(30));
+        let async_http = AsyncHttpClient::builder()
+            .timeout(workdir_timeout)
+            .build()
+            .map_err(|err| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: config.runtime_id.clone(),
+                code: "remote_runtime_async_client_build_failed".to_string(),
+                message: err.to_string(),
+            })?;
         Ok(Self {
             host_id: host_id_for_remote_runtime(&config.runtime_id),
             runtime_id: config.runtime_id,
@@ -2309,12 +2388,40 @@ impl RemoteWorkerRuntime {
             cached_status: config.cached_status,
             resource_broker: BackendResourceBroker::default(),
             http,
+            async_http,
         })
     }
 
     pub fn with_resource_broker(mut self, resource_broker: BackendResourceBroker) -> Self {
         self.resource_broker = resource_broker;
         self
+    }
+
+    pub async fn open_workdir_session(
+        &self,
+        working_directory_id: &str,
+        owner_worker_id: Option<&str>,
+    ) -> Result<RemoteWorkdirSession, WorkdirError> {
+        let base_url = Url::parse(&self.base_url)
+            .map_err(|error| WorkdirError::InvalidArgument(error.to_string()))?;
+        let workdir_id = Workdir::new(working_directory_id).id().clone();
+        let authorization: Arc<dyn WorkdirHttpAuthorization> =
+            Arc::new(RemoteWorkdirAuthorization {
+                runtime_id: self.runtime_id.clone(),
+                workspace_id: self.workspace_id.clone(),
+                auth: self.auth.clone(),
+                fallback_bearer_token: self.bearer_token.clone(),
+            });
+        RemoteWorkdirSession::open_with_authorization(
+            self.async_http.clone(),
+            base_url,
+            authorization,
+            workdir_id,
+            OpenWorkdirSessionRequest {
+                owner_worker_id: owner_worker_id.map(str::to_string),
+            },
+        )
+        .await
     }
 
     fn endpoint(&self, path: &str) -> String {
@@ -2737,6 +2844,24 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 diagnostics: vec![diagnostic],
             },
         }
+    }
+
+    fn open_workdir_session<'a>(
+        &'a self,
+        working_directory_id: &'a str,
+        owner_worker_id: Option<&'a str>,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<workdir::WorkdirSessionHandle, WorkdirError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let session = RemoteWorkerRuntime::open_workdir_session(
+                self,
+                working_directory_id,
+                owner_worker_id,
+            )
+            .await?;
+            Ok(Arc::new(session) as workdir::WorkdirSessionHandle)
+        })
     }
 
     fn cleanup_working_directory(
@@ -4864,6 +4989,79 @@ mod tests {
             "{check_payload}"
         );
         assert!(!check_payload.contains(".yoi/sessions"), "{check_payload}");
+        server.join().expect("mock remote server finished");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_workdir_session_uses_authenticated_http_operations_and_closes() {
+        use workdir::{EntryKind, StatRequest, StatResult, WorkdirPath};
+
+        let opened = workdir::http::OpenWorkdirSessionResponse {
+            session_id: workdir::http::WorkdirSessionId::new("session-1").unwrap(),
+            workdir_id: Workdir::new("wd-1").id().clone(),
+            capabilities: workdir::WorkdirSessionCapabilities::ALL,
+        };
+        let stat = workdir::http::WorkdirSessionOperationResult::Stat(StatResult {
+            path: WorkdirPath::new("hello.txt").unwrap(),
+            kind: EntryKind::File,
+            size: 5,
+        });
+        let (base_url, server) = serve_mock_http(vec![
+            mock_response(
+                "POST",
+                "/v1/working-directories/wd-1/sessions",
+                true,
+                200,
+                serde_json::to_string(&opened).unwrap(),
+            ),
+            mock_response(
+                "POST",
+                "/v1/workdir-sessions/session-1/operations",
+                true,
+                200,
+                serde_json::to_string(&stat).unwrap(),
+            ),
+            mock_response(
+                "DELETE",
+                "/v1/workdir-sessions/session-1",
+                true,
+                204,
+                String::new(),
+            ),
+        ]);
+        let runtime = RemoteWorkerRuntime::new(
+            RemoteRuntimeConfig::new(
+                "runtime-a",
+                "Runtime A",
+                base_url,
+                Some("secret-token".to_string()),
+            ),
+            "workspace-a".to_string(),
+            "http://backend.invalid".to_string(),
+        )
+        .unwrap();
+
+        let runtime: Arc<dyn WorkspaceWorkerRuntime> = Arc::new(runtime);
+        let session = runtime
+            .open_workdir_session("wd-1", Some("1"))
+            .await
+            .expect("open remote Workdir session");
+        let result = session
+            .stat(StatRequest {
+                path: WorkdirPath::new("hello.txt").unwrap(),
+            })
+            .await
+            .expect("remote stat");
+        assert_eq!(result.size, 5);
+        session.close().await.expect("close remote session");
+        session.close().await.expect("idempotent close");
+        let error = session
+            .stat(StatRequest {
+                path: WorkdirPath::new("hello.txt").unwrap(),
+            })
+            .await
+            .expect_err("closed session must reject local operation without another request");
+        assert!(matches!(error, WorkdirError::Unavailable(_)));
         server.join().expect("mock remote server finished");
     }
 
