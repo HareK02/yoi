@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use workdir::{CommandHandle, CommandOutputRequest, CommandRequest, WorkdirHandle};
+use workdir::{CommandHandle, CommandOutputRequest, CommandRequest, WorkdirSessionHandle};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_TIMEOUT_SECS: u64 = 600;
@@ -19,18 +19,18 @@ struct BashParams {
 }
 
 pub(crate) struct BashTool {
-    workdir: WorkdirHandle,
+    session: WorkdirSessionHandle,
 }
 
 struct CommandGuard {
-    workdir: WorkdirHandle,
+    session: WorkdirSessionHandle,
     handle: Option<CommandHandle>,
 }
 
 impl Drop for CommandGuard {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
-            let workdir = self.workdir.clone();
+            let workdir = self.session.clone();
             tokio::spawn(async move {
                 let _ = workdir.cancel_command(handle).await;
             });
@@ -53,7 +53,7 @@ impl Tool for BashTool {
             .clamp(1, MAX_TIMEOUT_SECS);
         let cmd_summary = truncate_for_summary(&params.command);
         let handle = self
-            .workdir
+            .session
             .start_command(CommandRequest {
                 command: params.command,
                 timeout_secs,
@@ -62,11 +62,11 @@ impl Tool for BashTool {
             .await
             .map_err(crate::ToolsError::from)?;
         let mut guard = CommandGuard {
-            workdir: self.workdir.clone(),
+            session: self.session.clone(),
             handle: Some(handle.clone()),
         };
         let output = self
-            .workdir
+            .session
             .command_output(CommandOutputRequest {
                 handle,
                 cursor: 0,
@@ -90,7 +90,7 @@ impl Tool for BashTool {
             None
         } else if output.truncated {
             Some(format!(
-                "[showing bounded Workdir command output; additional output was truncated]\n{}",
+                "[showing bounded WorkdirSession command output; additional output was truncated]\n{}",
                 output.content
             ))
         } else {
@@ -110,14 +110,14 @@ fn truncate_for_summary(command: &str) -> String {
     summary
 }
 
-pub fn bash_tool(workdir: WorkdirHandle, _output_dir: PathBuf) -> ToolDefinition {
+pub fn bash_tool(session: WorkdirSessionHandle, _output_dir: PathBuf) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(BashParams);
         let meta = ToolMeta::new("Bash")
-            .description("Execute a shell command in the bound Workdir. Process start, bounded output, timeout and cancellation are owned by the Workdir provider. This is not a sandbox.")
+            .description("Execute a shell command in the bound Workdir. Process start, bounded output, timeout and cancellation are owned by the WorkdirSession provider. This is not a sandbox.")
             .input_schema(serde_json::to_value(schema).expect("Bash schema serialization"));
         let tool: Arc<dyn Tool> = Arc::new(BashTool {
-            workdir: workdir.clone(),
+            session: session.clone(),
         });
         (meta, tool)
     })

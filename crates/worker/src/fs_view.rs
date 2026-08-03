@@ -1,6 +1,6 @@
 //! Worker 視点のファイルシステム操作。
 //!
-//! `Workdir` の上に「Worker が読み取りたい / 列挙したい」操作を集約する軽い wrapper。
+//! `WorkdirSession` の上に「Worker が読み取りたい / 列挙したい」操作を集約する軽い wrapper。
 //!
 //! - `ReadRequirement` と `render_auto_read` — compact worker が `mark_read_required`
 //!   で nominate したファイルを再読し、`[Auto-read file: ...]` system message に
@@ -16,8 +16,10 @@ use llm_engine::Item;
 use tools::ToolsError;
 use tracing::warn;
 #[cfg(test)]
-use workdir::LocalWorkdir;
-use workdir::{EntryKind, ListRequest, ReadRequest, StatRequest, WorkdirHandle, WorkdirPath};
+use workdir::LocalWorkdirSession;
+use workdir::{
+    EntryKind, ListRequest, ReadRequest, StatRequest, WorkdirPath, WorkdirSessionHandle,
+};
 
 /// 補完候補1件の最大数。`list_file_completions` がこの値を超えたら打ち切り。
 const COMPLETION_LIMIT: usize = 100;
@@ -38,10 +40,10 @@ pub struct ReadRequirement {
     pub limit: Option<usize>,
 }
 
-/// Worker から見えるファイルシステム操作の入口。Clone は cheap（`Workdir` 内 `Arc`）。
+/// Worker から見えるファイルシステム操作の入口。Clone は cheap（`WorkdirSession` 内 `Arc`）。
 #[derive(Debug, Clone)]
 pub struct WorkerFsView {
-    workdir: WorkdirHandle,
+    session: WorkdirSessionHandle,
 }
 
 /// `list_file_completions` が返す候補1件。
@@ -54,10 +56,10 @@ pub struct FileCandidate {
 }
 
 /// `resolve_file_ref` の失敗理由。Worker 側で Alert に振り分けるために
-/// Workdir / 内部判定の両方を区別できるよう保持する。
+/// WorkdirSession / 内部判定の両方を区別できるよう保持する。
 #[derive(Debug)]
 pub enum ResolveError {
-    /// Path resolution / scope check failed via `Workdir`.
+    /// Path resolution / scope check failed via `WorkdirSession`.
     Fs(ToolsError),
     /// File contents are not valid UTF-8 (binary / non-text).
     Binary { path: PathBuf },
@@ -77,11 +79,11 @@ impl std::fmt::Display for ResolveError {
 impl std::error::Error for ResolveError {}
 
 impl WorkerFsView {
-    pub fn new(workdir: WorkdirHandle) -> Self {
-        Self { workdir }
+    pub fn new(session: WorkdirSessionHandle) -> Self {
+        Self { session }
     }
-    pub fn workdir(&self) -> &WorkdirHandle {
-        &self.workdir
+    pub fn session(&self) -> &WorkdirSessionHandle {
+        &self.session
     }
 
     pub async fn render_auto_read(&self, requirements: &[ReadRequirement]) -> Vec<Item> {
@@ -95,7 +97,7 @@ impl WorkerFsView {
                 }
             };
             match self
-                .workdir
+                .session
                 .read(ReadRequest {
                     path: path.clone(),
                     offset: req.offset.unwrap_or(0),
@@ -128,7 +130,7 @@ impl WorkerFsView {
             .map_err(ToolsError::from)
             .map_err(ResolveError::Fs)?;
         let stat = self
-            .workdir
+            .session
             .stat(StatRequest {
                 path: logical.clone(),
             })
@@ -137,7 +139,7 @@ impl WorkerFsView {
             .map_err(ResolveError::Fs)?;
         if stat.kind == EntryKind::Directory {
             let result = self
-                .workdir
+                .session
                 .list(ListRequest {
                     path: logical.clone(),
                     limit: DIR_FILE_REF_ENTRY_LIMIT,
@@ -175,7 +177,7 @@ impl WorkerFsView {
             return Ok(Item::system_message(text));
         }
         let result = self
-            .workdir
+            .session
             .read(ReadRequest {
                 path: logical.clone(),
                 offset: 0,
@@ -216,7 +218,7 @@ impl WorkerFsView {
             return Vec::new();
         };
         let Ok(result) = self
-            .workdir
+            .session
             .list(ListRequest {
                 path: parent,
                 limit: COMPLETION_LIMIT,
@@ -285,8 +287,8 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    fn fs_for(dir: &TempDir) -> WorkdirHandle {
-        Arc::new(LocalWorkdir::new(
+    fn fs_for(dir: &TempDir) -> WorkdirSessionHandle {
+        Arc::new(LocalWorkdirSession::new(
             Scope::writable(dir.path()).unwrap(),
             dir.path().to_path_buf(),
         ))
@@ -417,7 +419,8 @@ mod tests {
             }],
         };
         let scope = Scope::from_config(&cfg).unwrap();
-        let fs: WorkdirHandle = Arc::new(LocalWorkdir::new(scope, dir.path().to_path_buf()));
+        let fs: WorkdirSessionHandle =
+            Arc::new(LocalWorkdirSession::new(scope, dir.path().to_path_buf()));
         let view = WorkerFsView::new(fs);
 
         let item = view.resolve_file_ref("docs", 4096).await.unwrap();
@@ -493,7 +496,7 @@ mod tests {
         std::fs::create_dir(&inner).unwrap();
         std::fs::write(outer.path().join("secret.txt"), "nope").unwrap();
         let scope = Scope::writable(&inner).unwrap();
-        let fs: WorkdirHandle = Arc::new(LocalWorkdir::new(scope, inner.clone()));
+        let fs: WorkdirSessionHandle = Arc::new(LocalWorkdirSession::new(scope, inner.clone()));
         let view = WorkerFsView::new(fs);
 
         // Absolute path outside of scope.
@@ -579,7 +582,8 @@ mod tests {
             }],
         };
         let scope = Scope::from_config(&cfg).unwrap();
-        let fs: WorkdirHandle = Arc::new(LocalWorkdir::new(scope, dir.path().to_path_buf()));
+        let fs: WorkdirSessionHandle =
+            Arc::new(LocalWorkdirSession::new(scope, dir.path().to_path_buf()));
         let view = WorkerFsView::new(fs);
 
         let cands = view.list_file_completions("").await;

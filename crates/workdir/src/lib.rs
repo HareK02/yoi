@@ -1,8 +1,9 @@
-//! Workdir authority and local materialization provider.
+//! Persistent Workdir identity and Worker-bound operation sessions.
 //!
-//! A Workdir is the host-owned execution context bound to one Worker. Tools
-//! consume this interface; they do not own Workdir identity, paths, scope, or
-//! lifecycle.
+//! A [`Workdir`] identifies a materialized repository execution context across
+//! Worker lifetimes. A [`WorkdirSession`] is the live operation attachment
+//! bound to one Worker. Tools consume sessions; they do not own Workdir
+//! materialization or cleanup.
 
 mod local;
 mod operation;
@@ -14,12 +15,47 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-pub use local::{LocalWorkdir, SymlinkInfo, direct_symlink, first_symlink};
+pub use local::{LocalWorkdirSession, SymlinkInfo, direct_symlink, first_symlink};
 pub use operation::*;
+
+/// Persistent, opaque identity of one materialized Workdir.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Workdir {
+    id: WorkdirId,
+}
+
+impl Workdir {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: WorkdirId(id.into()),
+        }
+    }
+
+    pub fn id(&self) -> &WorkdirId {
+        &self.id
+    }
+}
+
+/// Opaque Workdir identifier assigned by the materialization authority.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WorkdirId(String);
+
+impl WorkdirId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for WorkdirId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkdirCapability {
+pub enum WorkdirSessionCapability {
     Read,
     Write,
     Edit,
@@ -29,11 +65,11 @@ pub enum WorkdirCapability {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkdirCapabilities {
+pub struct WorkdirSessionCapabilities {
     bits: u8,
 }
 
-impl WorkdirCapabilities {
+impl WorkdirSessionCapabilities {
     const READ: u8 = 1 << 0;
     const WRITE: u8 = 1 << 1;
     const EDIT: u8 = 1 << 2;
@@ -43,20 +79,22 @@ impl WorkdirCapabilities {
 
     pub const EMPTY: Self = Self { bits: 0 };
 
-    pub fn from_capabilities(capabilities: impl IntoIterator<Item = WorkdirCapability>) -> Self {
+    pub fn from_capabilities(
+        capabilities: impl IntoIterator<Item = WorkdirSessionCapability>,
+    ) -> Self {
         capabilities
             .into_iter()
             .fold(Self::EMPTY, |set, capability| set.with(capability))
     }
 
-    pub const fn with(mut self, capability: WorkdirCapability) -> Self {
+    pub const fn with(mut self, capability: WorkdirSessionCapability) -> Self {
         self.bits |= match capability {
-            WorkdirCapability::Read => Self::READ,
-            WorkdirCapability::Write => Self::WRITE,
-            WorkdirCapability::Edit => Self::EDIT,
-            WorkdirCapability::Glob => Self::GLOB,
-            WorkdirCapability::Grep => Self::GREP,
-            WorkdirCapability::Command => Self::COMMAND,
+            WorkdirSessionCapability::Read => Self::READ,
+            WorkdirSessionCapability::Write => Self::WRITE,
+            WorkdirSessionCapability::Edit => Self::EDIT,
+            WorkdirSessionCapability::Glob => Self::GLOB,
+            WorkdirSessionCapability::Grep => Self::GREP,
+            WorkdirSessionCapability::Command => Self::COMMAND,
         };
         self
     }
@@ -69,14 +107,14 @@ impl WorkdirCapabilities {
         bits: Self::READ | Self::GLOB | Self::GREP,
     };
 
-    pub const fn supports(self, capability: WorkdirCapability) -> bool {
+    pub const fn supports(self, capability: WorkdirSessionCapability) -> bool {
         let bit = match capability {
-            WorkdirCapability::Read => Self::READ,
-            WorkdirCapability::Write => Self::WRITE,
-            WorkdirCapability::Edit => Self::EDIT,
-            WorkdirCapability::Glob => Self::GLOB,
-            WorkdirCapability::Grep => Self::GREP,
-            WorkdirCapability::Command => Self::COMMAND,
+            WorkdirSessionCapability::Read => Self::READ,
+            WorkdirSessionCapability::Write => Self::WRITE,
+            WorkdirSessionCapability::Edit => Self::EDIT,
+            WorkdirSessionCapability::Glob => Self::GLOB,
+            WorkdirSessionCapability::Grep => Self::GREP,
+            WorkdirSessionCapability::Command => Self::COMMAND,
         };
         self.bits & bit != 0
     }
@@ -84,15 +122,16 @@ impl WorkdirCapabilities {
 
 pub type WriteOutcome = WriteResult;
 
-/// Network-capable operations available on one bound Workdir.
+/// Live, Worker-bound operations for one persistent [`Workdir`].
 ///
 /// Implementations execute filesystem search and command work on the host
-/// that owns the materialization. Requests and results never contain the raw
-/// materialized root.
+/// that owns the materialization. Structured requests and results never
+/// contain the raw materialized root. Closing a session is terminal and does
+/// not delete the persistent Workdir or its materialization.
 #[async_trait]
-pub trait Workdir: std::fmt::Debug + Send + Sync {
-    fn binding_id(&self) -> Option<&str>;
-    fn capabilities(&self) -> WorkdirCapabilities;
+pub trait WorkdirSession: std::fmt::Debug + Send + Sync {
+    fn workdir(&self) -> &Workdir;
+    fn capabilities(&self) -> WorkdirSessionCapabilities;
 
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError>;
     async fn read(&self, request: ReadRequest) -> Result<ReadResult, WorkdirError>;
@@ -108,26 +147,27 @@ pub trait Workdir: std::fmt::Debug + Send + Sync {
         request: CommandOutputRequest,
     ) -> Result<CommandOutput, WorkdirError>;
     async fn cancel_command(&self, handle: CommandHandle) -> Result<(), WorkdirError>;
-    async fn shutdown(&self) -> Result<(), WorkdirError>;
+    /// Terminal, idempotent release of this Worker-bound operation session.
+    async fn close(&self) -> Result<(), WorkdirError>;
 }
 
-pub type WorkdirHandle = Arc<dyn Workdir>;
+pub type WorkdirSessionHandle = Arc<dyn WorkdirSession>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkdirError {
-    #[error("Workdir does not support {0:?}")]
-    Unsupported(WorkdirCapability),
+    #[error("Workdir session does not support {0:?}")]
+    Unsupported(WorkdirSessionCapability),
 
     #[error("invalid Workdir path: {0}")]
     InvalidPath(String),
 
-    #[error("Workdir provider is unavailable: {0}")]
+    #[error("Workdir session is unavailable: {0}")]
     Unavailable(String),
 
     #[error("Workdir content was modified externally before the operation could be applied: {0}")]
     Conflict(String),
 
-    #[error("unknown Workdir command: {0}")]
+    #[error("unknown Workdir session command: {0}")]
     UnknownCommand(String),
 
     #[error("path must be absolute: {}", .0.display())]

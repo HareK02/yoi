@@ -12,7 +12,7 @@ use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
 use serde_json::json;
 use tempfile::TempDir;
 use tools::{Tracker, core_builtin_tools};
-use workdir::{LocalWorkdir, WorkdirHandle};
+use workdir::{LocalWorkdirSession, WorkdirSessionHandle};
 
 fn scope_with_spill(workspace: &Path, spill: &Path) -> Scope {
     let base = Scope::writable(workspace).unwrap();
@@ -55,7 +55,8 @@ fn setup() -> (TempDir, TempDir, Registry) {
     let dir = TempDir::new().unwrap();
     let spill = TempDir::new().unwrap();
     let scope = scope_with_spill(dir.path(), spill.path());
-    let fs: WorkdirHandle = Arc::new(LocalWorkdir::new(scope, dir.path().to_path_buf()));
+    let fs: WorkdirSessionHandle =
+        Arc::new(LocalWorkdirSession::new(scope, dir.path().to_path_buf()));
     let tracker = Tracker::new();
     let reg = Registry::new(core_builtin_tools(fs, tracker, spill.path().to_path_buf()));
     (dir, spill, reg)
@@ -198,7 +199,7 @@ async fn absolute_path_is_rejected() {
         }),
     )
     .await;
-    // Absolute paths are rejected at the logical Workdir boundary.
+    // Absolute paths are rejected at the logical WorkdirSession boundary.
     let msg = format!("{err}");
     assert!(msg.contains("invalid Workdir path"), "unexpected: {msg}");
 }
@@ -224,7 +225,7 @@ async fn write_to_existing_without_read_fails() {
 
 #[tokio::test]
 async fn shared_workdir_across_tools() {
-    // The key invariant: all builtin tools share the same Workdir instance,
+    // The key invariant: all builtin tools share the same WorkdirSession instance,
     // so read-history set by Read is visible to Edit and Write.
     let (dir, _spill, reg) = setup();
     let file = dir.path().join("shared.txt");
@@ -239,7 +240,7 @@ async fn shared_workdir_across_tools() {
         json!({ "file_path": file.file_name().unwrap().to_str().unwrap() }),
     )
     .await;
-    // Write via Write tool — must succeed because the shared Workdir has the read
+    // Write via Write tool — must succeed because the shared WorkdirSession has the read
     call(
         &write,
         json!({
@@ -301,7 +302,8 @@ async fn tracker_recent_files_tracks_read_write_edit() {
     let dir = TempDir::new().unwrap();
     let spill = TempDir::new().unwrap();
     let scope = scope_with_spill(dir.path(), spill.path());
-    let fs: WorkdirHandle = Arc::new(LocalWorkdir::new(scope, dir.path().to_path_buf()));
+    let fs: WorkdirSessionHandle =
+        Arc::new(LocalWorkdirSession::new(scope, dir.path().to_path_buf()));
     let tracker = Tracker::new();
     let reg = Registry::new(core_builtin_tools(
         fs,
@@ -346,7 +348,7 @@ async fn tracker_recent_files_tracks_read_write_edit() {
 
 #[tokio::test]
 async fn bash_inherits_workdir_cwd() {
-    // The Bash tool starts at the Workdir's pwd. Without any `cd`, its
+    // The Bash tool starts at the WorkdirSession's pwd. Without any `cd`, its
     // `pwd` should canonicalize to the workspace root we set up.
     let (dir, _spill, reg) = setup();
     let bash = reg.get("Bash");
@@ -363,7 +365,7 @@ async fn bash_provider_output_does_not_expose_internal_paths() {
     let bash = reg.get("Bash");
     let out = call(&bash, json!({ "command": "printf 'x%.0s' {1..20480}" })).await;
     let body = out.content.unwrap();
-    assert!(body.contains("bounded Workdir command output"));
+    assert!(body.contains("bounded WorkdirSession command output"));
     assert!(!body.contains(spill.path().to_str().unwrap()));
     assert_eq!(std::fs::read_dir(spill.path()).unwrap().count(), 0);
 }

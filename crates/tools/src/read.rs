@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use crate::error::ToolsError;
 use crate::tracker::Tracker;
-use workdir::{ReadRequest, WorkdirHandle, WorkdirPath};
+use workdir::{ReadRequest, WorkdirPath, WorkdirSessionHandle};
 
 const DESCRIPTION: &str = "Read a text file from the local filesystem. \
 Supports offset/limit for large files. Returns line-numbered output (1-based). \
@@ -31,7 +31,7 @@ pub(crate) struct ReadParams {
 }
 
 pub(crate) struct ReadTool {
-    workdir: WorkdirHandle,
+    session: WorkdirSessionHandle,
     tracker: Tracker,
 }
 
@@ -51,7 +51,7 @@ impl Tool for ReadTool {
         tracing::debug!(path = %path, offset, limit, "Read");
 
         let result = self
-            .workdir
+            .session
             .read(ReadRequest {
                 path: path.clone(),
                 offset,
@@ -144,7 +144,7 @@ fn render_numbered(text: &str, offset: usize, limit: usize) -> Rendered {
 }
 
 /// Factory for the `Read` tool.
-pub fn read_tool(workdir: WorkdirHandle, tracker: Tracker) -> ToolDefinition {
+pub fn read_tool(session: WorkdirSessionHandle, tracker: Tracker) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(ReadParams);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
@@ -152,7 +152,7 @@ pub fn read_tool(workdir: WorkdirHandle, tracker: Tracker) -> ToolDefinition {
             .description(DESCRIPTION)
             .input_schema(schema_value);
         let tool: Arc<dyn Tool> = Arc::new(ReadTool {
-            workdir: workdir.clone(),
+            session: session.clone(),
             tracker: tracker.clone(),
         });
         (meta, tool)
@@ -164,15 +164,15 @@ mod tests {
     use super::*;
     use manifest::Scope;
     use tempfile::TempDir;
-    use workdir::LocalWorkdir;
+    use workdir::LocalWorkdirSession;
 
-    fn setup() -> (TempDir, WorkdirHandle, Tracker) {
+    fn setup() -> (TempDir, WorkdirSessionHandle, Tracker) {
         let dir = TempDir::new().unwrap();
-        let workdir: WorkdirHandle = Arc::new(LocalWorkdir::new(
+        let session: WorkdirSessionHandle = Arc::new(LocalWorkdirSession::new(
             Scope::writable(dir.path()).unwrap(),
             dir.path().to_path_buf(),
         ));
-        (dir, workdir, Tracker::new())
+        (dir, session, Tracker::new())
     }
 
     #[tokio::test]

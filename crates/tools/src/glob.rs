@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use workdir::{GlobRequest, WorkdirHandle, WorkdirPath};
+use workdir::{GlobRequest, WorkdirPath, WorkdirSessionHandle};
 
 use crate::ToolsError;
 
@@ -20,7 +20,7 @@ struct GlobParams {
 }
 
 struct GlobTool {
-    workdir: WorkdirHandle,
+    session: WorkdirSessionHandle,
 }
 
 #[async_trait]
@@ -39,7 +39,7 @@ impl Tool for GlobTool {
         let pattern = params.pattern;
         tracing::debug!(%pattern, %path, "Glob");
         let result = self
-            .workdir
+            .session
             .glob(GlobRequest {
                 pattern: pattern.clone(),
                 path,
@@ -73,14 +73,14 @@ impl Tool for GlobTool {
     }
 }
 
-pub fn glob_tool(workdir: WorkdirHandle) -> ToolDefinition {
+pub fn glob_tool(session: WorkdirSessionHandle) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(GlobParams);
         let meta = ToolMeta::new("Glob")
             .description("Find files matching a glob pattern inside the bound Workdir. Results are sorted and capped at 1000 entries. Paths are Workdir-relative.")
             .input_schema(serde_json::to_value(schema).expect("Glob schema serialization"));
         let tool: Arc<dyn Tool> = Arc::new(GlobTool {
-            workdir: workdir.clone(),
+            session: session.clone(),
         });
         (meta, tool)
     })

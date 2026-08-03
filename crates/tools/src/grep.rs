@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use workdir::{GrepOutputMode, GrepRequest, WorkdirHandle, WorkdirPath};
+use workdir::{GrepOutputMode, GrepRequest, WorkdirPath, WorkdirSessionHandle};
 
 use crate::ToolsError;
 
@@ -48,7 +48,7 @@ struct GrepParams {
 }
 
 struct GrepTool {
-    workdir: WorkdirHandle,
+    session: WorkdirSessionHandle,
 }
 
 #[async_trait]
@@ -75,7 +75,7 @@ impl Tool for GrepTool {
             .unwrap_or((params.before.unwrap_or(0), params.after.unwrap_or(0)));
         let head_limit = params.head_limit.unwrap_or(DEFAULT_HEAD_LIMIT);
         let result = self
-            .workdir
+            .session
             .grep(GrepRequest {
                 pattern: params.pattern,
                 path,
@@ -124,14 +124,14 @@ impl Tool for GrepTool {
     }
 }
 
-pub fn grep_tool(workdir: WorkdirHandle) -> ToolDefinition {
+pub fn grep_tool(session: WorkdirSessionHandle) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(GrepParams);
         let meta = ToolMeta::new("Grep")
-            .description("Search Workdir file contents with a regex. Glob/Grep traversal executes inside the Workdir provider. Results are bounded and Workdir-relative.")
+            .description("Search Workdir file contents with a regex. Glob/Grep traversal executes inside the WorkdirSession provider. Results are bounded and Workdir-relative.")
             .input_schema(serde_json::to_value(schema).expect("Grep schema serialization"));
         let tool: Arc<dyn Tool> = Arc::new(GrepTool {
-            workdir: workdir.clone(),
+            session: session.clone(),
         });
         (meta, tool)
     })

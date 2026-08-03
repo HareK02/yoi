@@ -23,7 +23,7 @@ pub struct WorkerSharedState {
     pub greeting: protocol::Greeting,
     pub status: RwLock<WorkerStatus>,
     /// Worker-from-the-inside view of the filesystem. Set once in
-    /// `WorkerController::start` after the local Workdir provider is
+    /// `WorkerController::start` after the local WorkdirSession provider is
     /// materialised, and read from the IPC server layer to answer
     /// `ListCompletions` queries without going through the controller. It is
     /// unset only in unit tests that construct `WorkerSharedState` directly.

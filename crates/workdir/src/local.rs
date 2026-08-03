@@ -1,11 +1,11 @@
 //! Scope-aware filesystem primitive.
 //!
-//! `LocalWorkdir` is the write/read gate layered on top of a [`manifest::Scope`]
+//! `LocalWorkdirSession` is the write/read gate layered on top of a [`manifest::Scope`]
 //! and a Worker's working directory. The scope decides which paths are
 //! readable and writable; the cwd is carried alongside for convenience
 //! (Glob/Grep default their search base to it).
 //!
-//! `LocalWorkdir` is cheap to clone (`Arc` inside). Tool-specific session
+//! `LocalWorkdirSession` is cheap to clone (`Arc` inside). Tool-specific session
 //! state, such as read-before-edit tracking, remains owned by the tool layer.
 
 use std::collections::HashMap;
@@ -13,7 +13,7 @@ use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -29,8 +29,8 @@ use crate::{
     CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest, CommandStatus, EditRequest,
     EditResult, EntryKind, GlobRequest, GlobResult, GrepRequest, GrepResult, ListEntry,
     ListRequest, ListResult, ReadRequest, ReadResult, StatRequest, StatResult, Workdir,
-    WorkdirCapabilities, WorkdirCapability, WorkdirError, WorkdirPath, WriteOutcome, WriteRequest,
-    WriteResult,
+    WorkdirError, WorkdirPath, WorkdirSession, WorkdirSessionCapabilities,
+    WorkdirSessionCapability, WriteOutcome, WriteRequest, WriteResult,
 };
 
 #[derive(Debug)]
@@ -43,17 +43,19 @@ enum LocalCommand {
 }
 
 #[derive(Debug)]
-struct LocalWorkdirInner {
-    binding_id: Option<String>,
+struct LocalWorkdirSessionInner {
+    workdir: Workdir,
     root: PathBuf,
     scope: SharedScope,
     cwd: PathBuf,
-    capabilities: WorkdirCapabilities,
+    capabilities: WorkdirSessionCapabilities,
+    closed: AtomicBool,
+    close_lock: Mutex<()>,
     next_command_id: AtomicU64,
     commands: Mutex<HashMap<String, LocalCommand>>,
 }
 
-impl Drop for LocalWorkdirInner {
+impl Drop for LocalWorkdirSessionInner {
     fn drop(&mut self) {
         if let Ok(mut commands) = self.commands.try_lock() {
             for (_, command) in commands.drain() {
@@ -68,13 +70,13 @@ impl Drop for LocalWorkdirInner {
 /// Scope-aware filesystem handle. Clone-cheap (`Arc` inside).
 ///
 /// The wrapped [`SharedScope`] is shared with every clone of this
-/// `LocalWorkdir` and with whoever else holds the same `SharedScope`
+/// `LocalWorkdirSession` and with whoever else holds the same `SharedScope`
 /// handle (typically the owning Worker). Mutations to that `SharedScope`
 /// propagate atomically; the next permission check inside any
-/// `LocalWorkdir` reads the new view.
+/// `LocalWorkdirSession` reads the new view.
 #[derive(Debug, Clone)]
-pub struct LocalWorkdir {
-    inner: Arc<LocalWorkdirInner>,
+pub struct LocalWorkdirSession {
+    inner: Arc<LocalWorkdirSessionInner>,
 }
 
 /// First symlink encountered while resolving a path.
@@ -94,48 +96,63 @@ pub struct SymlinkInfo {
     pub target_exists: bool,
 }
 
-impl LocalWorkdir {
-    /// Create a new [`LocalWorkdir`] wrapping `scope` and `cwd` in a fresh
-    /// [`SharedScope`]. Use [`LocalWorkdir::with_shared_scope`] when you
-    /// need the resulting `LocalWorkdir` to share scope state with another
+fn local_workdir_identity(root: &Path) -> Workdir {
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    let digest = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Workdir::new(format!("local-{digest}"))
+}
+
+impl LocalWorkdirSession {
+    /// Create a new [`LocalWorkdirSession`] wrapping `scope` and `cwd` in a fresh
+    /// [`SharedScope`]. Use [`LocalWorkdirSession::with_shared_scope`] when you
+    /// need the resulting `LocalWorkdirSession` to share scope state with another
     /// holder of the `SharedScope` (typically the Worker).
     pub fn new(scope: Scope, cwd: PathBuf) -> Self {
         Self::materialized(
             cwd.clone(),
             cwd,
             SharedScope::new(scope),
-            WorkdirCapabilities::ALL,
+            WorkdirSessionCapabilities::ALL,
         )
     }
 
     pub fn with_shared_scope(scope: SharedScope, cwd: PathBuf) -> Self {
-        Self::materialized(cwd.clone(), cwd, scope, WorkdirCapabilities::ALL)
+        Self::materialized(cwd.clone(), cwd, scope, WorkdirSessionCapabilities::ALL)
     }
 
-    /// Construct the local provider for an existing Worker–Workdir binding.
+    /// Construct a standalone local session with a deterministic identity
+    /// derived from the canonical materialization root.
     pub fn materialized(
         root: PathBuf,
         cwd: PathBuf,
         scope: SharedScope,
-        capabilities: WorkdirCapabilities,
+        capabilities: WorkdirSessionCapabilities,
     ) -> Self {
-        Self::materialized_bound(None, root, cwd, scope, capabilities)
+        let workdir = local_workdir_identity(&root);
+        Self::materialized_bound(workdir, root, cwd, scope, capabilities)
     }
 
+    /// Open a local session for an authority-assigned persistent Workdir.
     pub fn materialized_bound(
-        binding_id: Option<String>,
+        workdir: Workdir,
         root: PathBuf,
         cwd: PathBuf,
         scope: SharedScope,
-        capabilities: WorkdirCapabilities,
+        capabilities: WorkdirSessionCapabilities,
     ) -> Self {
         Self {
-            inner: Arc::new(LocalWorkdirInner {
-                binding_id,
+            inner: Arc::new(LocalWorkdirSessionInner {
+                workdir,
                 root,
                 scope,
                 cwd,
                 capabilities,
+                closed: AtomicBool::new(false),
+                close_lock: Mutex::new(()),
                 next_command_id: AtomicU64::new(1),
                 commands: Mutex::new(HashMap::new()),
             }),
@@ -153,7 +170,7 @@ impl LocalWorkdir {
         self.inner.scope.snapshot()
     }
 
-    /// Shared scope handle backing this `LocalWorkdir`. Cloning it lets a
+    /// Shared scope handle backing this `LocalWorkdirSession`. Cloning it lets a
     /// caller (usually the Worker) hold the same view and push updates
     /// that are immediately reflected in subsequent permission checks.
     pub fn shared_scope(&self) -> &SharedScope {
@@ -298,7 +315,19 @@ impl LocalWorkdir {
         })
     }
 
-    fn ensure_capability(&self, capability: WorkdirCapability) -> Result<(), WorkdirError> {
+    fn ensure_open(&self) -> Result<(), WorkdirError> {
+        if self.inner.closed.load(Ordering::Acquire) {
+            Err(WorkdirError::Unavailable(format!(
+                "Workdir session for {} is closed",
+                self.inner.workdir.id()
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn ensure_capability(&self, capability: WorkdirSessionCapability) -> Result<(), WorkdirError> {
+        self.ensure_open()?;
         if self.inner.capabilities.supports(capability) {
             Ok(())
         } else {
@@ -323,17 +352,17 @@ impl LocalWorkdir {
 }
 
 #[async_trait]
-impl Workdir for LocalWorkdir {
-    fn binding_id(&self) -> Option<&str> {
-        self.inner.binding_id.as_deref()
+impl WorkdirSession for LocalWorkdirSession {
+    fn workdir(&self) -> &Workdir {
+        &self.inner.workdir
     }
 
-    fn capabilities(&self) -> WorkdirCapabilities {
+    fn capabilities(&self) -> WorkdirSessionCapabilities {
         self.inner.capabilities
     }
 
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {
-        self.ensure_capability(WorkdirCapability::Read)?;
+        self.ensure_capability(WorkdirSessionCapability::Read)?;
         let path = self.resolve(&request.path);
         let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
             let error = match error.kind() {
@@ -359,9 +388,9 @@ impl Workdir for LocalWorkdir {
     }
 
     async fn read(&self, request: ReadRequest) -> Result<ReadResult, WorkdirError> {
-        self.ensure_capability(WorkdirCapability::Read)?;
+        self.ensure_capability(WorkdirSessionCapability::Read)?;
         let path = self.resolve(&request.path);
-        let bytes = LocalWorkdir::read_bytes(self, &path)
+        let bytes = LocalWorkdirSession::read_bytes(self, &path)
             .map_err(|error| sanitize_error(error, &request.path))?;
         let content_hash = Sha256::digest(&bytes).into();
         let lines = bytes
@@ -403,10 +432,10 @@ impl Workdir for LocalWorkdir {
     }
 
     async fn write(&self, request: WriteRequest) -> Result<WriteResult, WorkdirError> {
-        self.ensure_capability(WorkdirCapability::Write)?;
+        self.ensure_capability(WorkdirSessionCapability::Write)?;
         let path = self.resolve(&request.path);
         if path.exists() {
-            let current = LocalWorkdir::read_bytes(self, &path)
+            let current = LocalWorkdirSession::read_bytes(self, &path)
                 .map_err(|error| sanitize_error(error, &request.path))?;
             let current_hash: [u8; 32] = Sha256::digest(&current).into();
             if request.expected_hash != Some(current_hash) {
@@ -415,14 +444,14 @@ impl Workdir for LocalWorkdir {
         } else if request.expected_hash.is_some() {
             return Err(WorkdirError::Conflict(request.path.to_string()));
         }
-        LocalWorkdir::write(self, &path, &request.content)
+        LocalWorkdirSession::write(self, &path, &request.content)
             .map_err(|error| sanitize_error(error, &request.path))
     }
 
     async fn edit(&self, request: EditRequest) -> Result<EditResult, WorkdirError> {
-        self.ensure_capability(WorkdirCapability::Edit)?;
+        self.ensure_capability(WorkdirSessionCapability::Edit)?;
         let path = self.resolve(&request.path);
-        let bytes = LocalWorkdir::read_bytes(self, &path)
+        let bytes = LocalWorkdirSession::read_bytes(self, &path)
             .map_err(|error| sanitize_error(error, &request.path))?;
         let current_hash: [u8; 32] = Sha256::digest(&bytes).into();
         if current_hash != request.expected_hash {
@@ -446,7 +475,7 @@ impl Workdir for LocalWorkdir {
         } else {
             text.replacen(&request.old_string, &request.new_string, 1)
         };
-        let outcome = LocalWorkdir::write(self, &path, edited.as_bytes())
+        let outcome = LocalWorkdirSession::write(self, &path, edited.as_bytes())
             .map_err(|error| sanitize_error(error, &request.path))?;
         let content_hash = Sha256::digest(edited.as_bytes()).into();
         Ok(EditResult {
@@ -457,7 +486,7 @@ impl Workdir for LocalWorkdir {
     }
 
     async fn list(&self, request: ListRequest) -> Result<ListResult, WorkdirError> {
-        self.ensure_capability(WorkdirCapability::Read)?;
+        self.ensure_capability(WorkdirSessionCapability::Read)?;
         let base = self.resolve(&request.path);
         let scope = self.inner.scope.snapshot();
         if !scope.is_readable(&base) {
@@ -520,7 +549,7 @@ impl Workdir for LocalWorkdir {
     }
 
     async fn glob(&self, request: GlobRequest) -> Result<GlobResult, WorkdirError> {
-        self.ensure_capability(WorkdirCapability::Glob)?;
+        self.ensure_capability(WorkdirSessionCapability::Glob)?;
         let base = self.resolve(&request.path);
         if let Some(info) = direct_symlink(&base)
             && info.target_exists
@@ -562,7 +591,7 @@ impl Workdir for LocalWorkdir {
     }
 
     async fn grep(&self, request: GrepRequest) -> Result<GrepResult, WorkdirError> {
-        self.ensure_capability(WorkdirCapability::Grep)?;
+        self.ensure_capability(WorkdirSessionCapability::Grep)?;
         let base = self.resolve(&request.path);
         let logical = request.path.clone();
         crate::search::run_grep(
@@ -575,7 +604,7 @@ impl Workdir for LocalWorkdir {
     }
 
     async fn start_command(&self, request: CommandRequest) -> Result<CommandHandle, WorkdirError> {
-        self.ensure_capability(WorkdirCapability::Command)?;
+        self.ensure_capability(WorkdirSessionCapability::Command)?;
         let id = self.inner.next_command_id.fetch_add(1, Ordering::Relaxed);
         let handle = CommandHandle(format!("command-{id}"));
         let cwd = self.inner.cwd.clone();
@@ -586,16 +615,18 @@ impl Workdir for LocalWorkdir {
             task_completion.notify_one();
             output
         });
-        self.inner
-            .commands
-            .lock()
-            .await
-            .insert(handle.0.clone(), LocalCommand::Running { task, completion });
+        let mut commands = self.inner.commands.lock().await;
+        if let Err(error) = self.ensure_open() {
+            task.abort();
+            completion.notify_one();
+            return Err(error);
+        }
+        commands.insert(handle.0.clone(), LocalCommand::Running { task, completion });
         Ok(handle)
     }
 
     async fn command_status(&self, handle: CommandHandle) -> Result<CommandStatus, WorkdirError> {
-        self.ensure_capability(WorkdirCapability::Command)?;
+        self.ensure_capability(WorkdirSessionCapability::Command)?;
         let commands = self.inner.commands.lock().await;
         let command = commands
             .get(&handle.0)
@@ -611,8 +642,9 @@ impl Workdir for LocalWorkdir {
         &self,
         request: CommandOutputRequest,
     ) -> Result<CommandOutput, WorkdirError> {
-        self.ensure_capability(WorkdirCapability::Command)?;
+        self.ensure_capability(WorkdirSessionCapability::Command)?;
         let command = loop {
+            self.ensure_open()?;
             let mut commands = self.inner.commands.lock().await;
             let Some(command) = commands.get(&request.handle.0) else {
                 return Err(WorkdirError::UnknownCommand(request.handle.0.clone()));
@@ -651,17 +683,16 @@ impl Workdir for LocalWorkdir {
         };
         let page = command_output_page(&output, request.cursor, request.limit);
         if page.next_cursor.is_some() {
-            self.inner
-                .commands
-                .lock()
-                .await
-                .insert(request.handle.0, LocalCommand::Completed(output));
+            let mut commands = self.inner.commands.lock().await;
+            if !self.inner.closed.load(Ordering::Acquire) {
+                commands.insert(request.handle.0, LocalCommand::Completed(output));
+            }
         }
         Ok(page)
     }
 
     async fn cancel_command(&self, handle: CommandHandle) -> Result<(), WorkdirError> {
-        self.ensure_capability(WorkdirCapability::Command)?;
+        self.ensure_capability(WorkdirSessionCapability::Command)?;
         let command = self
             .inner
             .commands
@@ -676,7 +707,11 @@ impl Workdir for LocalWorkdir {
         Ok(())
     }
 
-    async fn shutdown(&self) -> Result<(), WorkdirError> {
+    async fn close(&self) -> Result<(), WorkdirError> {
+        let _close_guard = self.inner.close_lock.lock().await;
+        if self.inner.closed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
         let mut commands = self.inner.commands.lock().await;
         for (_, command) in commands.drain() {
             if let LocalCommand::Running { task, completion } = command {
@@ -955,8 +990,8 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    fn make_fs(dir: &TempDir) -> LocalWorkdir {
-        LocalWorkdir::new(
+    fn make_fs(dir: &TempDir) -> LocalWorkdirSession {
+        LocalWorkdirSession::new(
             Scope::writable(dir.path()).unwrap(),
             dir.path().to_path_buf(),
         )
@@ -968,7 +1003,7 @@ mod tests {
         let workdir = make_fs(&dir);
         let path = WorkdirPath::new("notes/item.txt").unwrap();
 
-        let written = Workdir::write(
+        let written = WorkdirSession::write(
             &workdir,
             WriteRequest {
                 path: path.clone(),
@@ -980,7 +1015,7 @@ mod tests {
         .unwrap();
         assert!(written.created);
 
-        let read = Workdir::read(
+        let read = WorkdirSession::read(
             &workdir,
             ReadRequest {
                 path: path.clone(),
@@ -994,7 +1029,7 @@ mod tests {
         assert_eq!(read.bytes, b"alpha\nbeta\n");
         assert!(!read.truncated);
 
-        let bounded = Workdir::read(
+        let bounded = WorkdirSession::read(
             &workdir,
             ReadRequest {
                 path: path.clone(),
@@ -1009,7 +1044,7 @@ mod tests {
         assert!(bounded.truncated);
         assert_eq!(bounded.content_hash, read.content_hash);
 
-        let edited = Workdir::edit(
+        let edited = WorkdirSession::edit(
             &workdir,
             EditRequest {
                 path: path.clone(),
@@ -1023,13 +1058,13 @@ mod tests {
         .unwrap();
         assert_eq!(edited.replacements, 1);
 
-        let stat = Workdir::stat(&workdir, StatRequest { path: path.clone() })
+        let stat = WorkdirSession::stat(&workdir, StatRequest { path: path.clone() })
             .await
             .unwrap();
         assert_eq!(stat.path, path);
         assert_eq!(stat.kind, EntryKind::File);
 
-        let listed = Workdir::list(
+        let listed = WorkdirSession::list(
             &workdir,
             ListRequest {
                 path: WorkdirPath::new("notes").unwrap(),
@@ -1041,7 +1076,7 @@ mod tests {
         assert_eq!(listed.total_entries, 1);
         assert_eq!(listed.entries[0].path.as_str(), "notes/item.txt");
 
-        let error = Workdir::edit(
+        let error = WorkdirSession::edit(
             &workdir,
             EditRequest {
                 path: path.clone(),
@@ -1056,7 +1091,7 @@ mod tests {
         assert!(matches!(error, WorkdirError::Conflict(_)));
 
         std::fs::remove_file(dir.path().join("notes/item.txt")).unwrap();
-        let error = Workdir::write(
+        let error = WorkdirSession::write(
             &workdir,
             WriteRequest {
                 path,
@@ -1070,18 +1105,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_is_terminal_for_one_session_without_deleting_workdir_identity() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("item.txt"), "persisted").unwrap();
+        let workdir = Workdir::new("working-directory-42");
+        let scope = SharedScope::new(Scope::writable(dir.path()).unwrap());
+        let session = LocalWorkdirSession::materialized_bound(
+            workdir.clone(),
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+            scope.clone(),
+            WorkdirSessionCapabilities::ALL,
+        );
+        assert_eq!(session.workdir(), &workdir);
+
+        let command = WorkdirSession::start_command(
+            &session,
+            CommandRequest {
+                command: "sleep 30".to_owned(),
+                timeout_secs: 60,
+                output_limit: 1024,
+            },
+        )
+        .await
+        .unwrap();
+        let waiting_session = session.clone();
+        let waiting_command = command.clone();
+        let waiter = tokio::spawn(async move {
+            WorkdirSession::command_output(
+                &waiting_session,
+                CommandOutputRequest {
+                    handle: waiting_command,
+                    cursor: 0,
+                    limit: 1024,
+                    wait: true,
+                },
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        WorkdirSession::close(&session).await.unwrap();
+        WorkdirSession::close(&session).await.unwrap();
+        let waiter_error = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("close should wake command output waiters")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(waiter_error, WorkdirError::Unavailable(_)));
+
+        assert!(matches!(
+            WorkdirSession::command_status(&session, command).await,
+            Err(WorkdirError::Unavailable(_))
+        ));
+        assert!(matches!(
+            WorkdirSession::read(
+                &session,
+                ReadRequest {
+                    path: WorkdirPath::new("item.txt").unwrap(),
+                    offset: 0,
+                    limit: 10,
+                    max_bytes: 1024,
+                },
+            )
+            .await,
+            Err(WorkdirError::Unavailable(_))
+        ));
+
+        let restored = LocalWorkdirSession::materialized_bound(
+            workdir.clone(),
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+            scope,
+            WorkdirSessionCapabilities::ALL,
+        );
+        assert_eq!(restored.workdir(), &workdir);
+        let read = WorkdirSession::read(
+            &restored,
+            ReadRequest {
+                path: WorkdirPath::new("item.txt").unwrap(),
+                offset: 0,
+                limit: 10,
+                max_bytes: 1024,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(read.bytes, b"persisted");
+    }
+
+    #[tokio::test]
     async fn capability_boundary_rejects_direct_unsupported_operation() {
         let dir = TempDir::new().unwrap();
-        let workdir = LocalWorkdir::materialized(
+        let workdir = LocalWorkdirSession::materialized(
             dir.path().to_path_buf(),
             dir.path().to_path_buf(),
             SharedScope::new(Scope::writable(dir.path()).unwrap()),
-            WorkdirCapabilities::READ_ONLY,
+            WorkdirSessionCapabilities::READ_ONLY,
         );
 
         assert_eq!(workdir.root(), dir.path());
         assert_eq!(workdir.cwd(), dir.path());
-        let error = Workdir::write(
+        let error = WorkdirSession::write(
             &workdir,
             WriteRequest {
                 path: WorkdirPath::new("blocked.txt").unwrap(),
@@ -1093,7 +1217,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             error,
-            WorkdirError::Unsupported(WorkdirCapability::Write)
+            WorkdirError::Unsupported(WorkdirSessionCapability::Write)
         ));
         assert!(!dir.path().join("blocked.txt").exists());
     }
@@ -1331,7 +1455,7 @@ mod tests {
             }],
         };
         let scope = Scope::from_config(&cfg).unwrap();
-        let scoped = LocalWorkdir::new(scope, dir.path().to_path_buf());
+        let scoped = LocalWorkdirSession::new(scope, dir.path().to_path_buf());
         let err = scoped.write(&sub.join("locked.txt"), b"x").unwrap_err();
         assert!(
             matches!(err, WorkdirError::ReadOnly(_)),
@@ -1365,7 +1489,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Dynamic scope: SharedScope mutations propagate into LocalWorkdir decisions
+    // Dynamic scope: SharedScope mutations propagate into LocalWorkdirSession decisions
     // -------------------------------------------------------------------------
 
     #[test]
@@ -1378,7 +1502,7 @@ mod tests {
         fs::write(&extra_file, b"hi").unwrap();
 
         let shared = SharedScope::new(Scope::writable(dir.path()).unwrap());
-        let fs = LocalWorkdir::with_shared_scope(shared.clone(), dir.path().to_path_buf());
+        let fs = LocalWorkdirSession::with_shared_scope(shared.clone(), dir.path().to_path_buf());
 
         // Before: extra is out of scope.
         let err = fs.read_bytes(&extra_file).unwrap_err();
@@ -1415,7 +1539,7 @@ mod tests {
         let target = sub.join("a.txt");
 
         let shared = SharedScope::new(Scope::writable(dir.path()).unwrap());
-        let fs = LocalWorkdir::with_shared_scope(shared.clone(), dir.path().to_path_buf());
+        let fs = LocalWorkdirSession::with_shared_scope(shared.clone(), dir.path().to_path_buf());
 
         // Write succeeds initially.
         fs.write(&target, b"first").unwrap();
@@ -1449,7 +1573,7 @@ mod tests {
         let target = dir.path().join("a.txt");
 
         let shared = SharedScope::new(Scope::writable(dir.path()).unwrap());
-        let fs1 = LocalWorkdir::with_shared_scope(shared.clone(), dir.path().to_path_buf());
+        let fs1 = LocalWorkdirSession::with_shared_scope(shared.clone(), dir.path().to_path_buf());
         let fs2 = fs1.clone();
 
         // fs1 writes; both clones see the file.
@@ -1488,7 +1612,7 @@ mod tests {
         )
         .unwrap();
         let workdir = make_fs(&dir);
-        let glob = Workdir::glob(
+        let glob = WorkdirSession::glob(
             &workdir,
             GlobRequest {
                 pattern: "**/*.rs".into(),
@@ -1499,7 +1623,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(glob.paths, [WorkdirPath::new("src/main.rs").unwrap()]);
-        let grep = Workdir::grep(
+        let grep = WorkdirSession::grep(
             &workdir,
             GrepRequest {
                 pattern: "NEEDLE".into(),
@@ -1520,7 +1644,7 @@ mod tests {
         assert_eq!(grep.match_count, 1);
         assert!(grep.output.contains("src/main.rs"));
         assert!(!grep.output.contains(dir.path().to_string_lossy().as_ref()));
-        let handle = Workdir::start_command(
+        let handle = WorkdirSession::start_command(
             &workdir,
             CommandRequest {
                 command: "pwd && printf provider-command".into(),
@@ -1530,7 +1654,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let output = Workdir::command_output(
+        let output = WorkdirSession::command_output(
             &workdir,
             CommandOutputRequest {
                 handle,
@@ -1554,7 +1678,7 @@ mod tests {
     async fn completed_command_output_can_be_read_in_bounded_unicode_pages() {
         let dir = TempDir::new().unwrap();
         let workdir = make_fs(&dir);
-        let handle = Workdir::start_command(
+        let handle = WorkdirSession::start_command(
             &workdir,
             CommandRequest {
                 command: "printf 'aéz'".into(),
@@ -1564,7 +1688,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let first = Workdir::command_output(
+        let first = WorkdirSession::command_output(
             &workdir,
             CommandOutputRequest {
                 handle: handle.clone(),
@@ -1578,7 +1702,7 @@ mod tests {
         assert_eq!(first.content, "aé");
         assert_eq!(first.next_cursor, Some(2));
 
-        let second = Workdir::command_output(
+        let second = WorkdirSession::command_output(
             &workdir,
             CommandOutputRequest {
                 handle: handle.clone(),
@@ -1592,7 +1716,7 @@ mod tests {
         assert_eq!(second.content, "z");
         assert_eq!(second.next_cursor, None);
         assert!(matches!(
-            Workdir::command_status(&workdir, handle).await,
+            WorkdirSession::command_status(&workdir, handle).await,
             Err(WorkdirError::UnknownCommand(_))
         ));
     }
@@ -1601,7 +1725,7 @@ mod tests {
     async fn provider_cancels_active_command() {
         let dir = TempDir::new().unwrap();
         let workdir = make_fs(&dir);
-        let handle = Workdir::start_command(
+        let handle = WorkdirSession::start_command(
             &workdir,
             CommandRequest {
                 command: "sleep 30".into(),
@@ -1612,7 +1736,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            Workdir::command_status(&workdir, handle.clone())
+            WorkdirSession::command_status(&workdir, handle.clone())
                 .await
                 .unwrap(),
             CommandStatus::Running
@@ -1620,7 +1744,7 @@ mod tests {
         let waiting_workdir = workdir.clone();
         let waiting_handle = handle.clone();
         let waiter = tokio::spawn(async move {
-            Workdir::command_output(
+            WorkdirSession::command_output(
                 &waiting_workdir,
                 CommandOutputRequest {
                     handle: waiting_handle,
@@ -1632,7 +1756,7 @@ mod tests {
             .await
         });
         tokio::task::yield_now().await;
-        Workdir::cancel_command(&workdir, handle.clone())
+        WorkdirSession::cancel_command(&workdir, handle.clone())
             .await
             .unwrap();
         let waiter_error = tokio::time::timeout(Duration::from_secs(1), waiter)
@@ -1642,7 +1766,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(waiter_error, WorkdirError::UnknownCommand(_)));
         assert!(matches!(
-            Workdir::command_status(&workdir, handle).await,
+            WorkdirSession::command_status(&workdir, handle).await,
             Err(WorkdirError::UnknownCommand(_))
         ));
     }

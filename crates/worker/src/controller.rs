@@ -222,6 +222,26 @@ impl WorkerController {
     }
 
     async fn spawn_inner<C, St>(
+        worker: Worker<C, St>,
+        runtime_base: &Path,
+        runtime_managed: bool,
+    ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
+    where
+        C: LlmClient + Clone + 'static,
+        St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+    {
+        let session = worker.workdir_session().cloned();
+        let result = Self::spawn_initialized(worker, runtime_base, runtime_managed).await;
+        if result.is_err()
+            && let Some(session) = session
+            && let Err(error) = session.close().await
+        {
+            tracing::warn!(%error, "Workdir session close after controller startup failure failed");
+        }
+        result
+    }
+
+    async fn spawn_initialized<C, St>(
         mut worker: Worker<C, St>,
         runtime_base: &Path,
         runtime_managed: bool,
@@ -562,7 +582,7 @@ fn wire_event_bridges_on_engine<C, St>(
 
 /// Register the builtin file-manipulation tools, optional memory tools,
 /// and the Worker-orchestration tools (SpawnWorker + comm) on the Worker's
-/// Engine. Returns the Workdir handle used to attach a `WorkerFsView` to
+/// Engine. Returns the WorkdirSession handle used to attach a `WorkerFsView` to
 /// the shared state.
 async fn register_worker_tools<C, St>(
     worker: &mut Worker<C, St>,
@@ -570,7 +590,7 @@ async fn register_worker_tools<C, St>(
     spawner_socket: PathBuf,
     runtime_base: PathBuf,
     spawned_registry: Arc<SpawnedWorkerRegistry>,
-) -> std::io::Result<Option<workdir::WorkdirHandle>>
+) -> std::io::Result<Option<workdir::WorkdirSessionHandle>>
 where
     C: LlmClient + Clone + 'static,
     St: Store + WorkerMetadataStore + Clone + 'static,
@@ -578,7 +598,7 @@ where
     // Worker-immutable snapshots taken before the mutable worker borrow
     // below so the worker borrow doesn't conflict with reads on `worker`.
     let scope_handle = worker.scope().clone();
-    let worker_workdir = worker.workdir().cloned();
+    let worker_workdir = worker.workdir_session().cloned();
     let local_filesystem = worker.local_working_directory().cloned();
     let local_workspace_root = local_filesystem.as_ref().map(|local| local.root.clone());
     let task_feature = worker.task_feature();
@@ -1174,16 +1194,16 @@ async fn controller_loop<C, St>(
         }
     }
 
-    if let Some(workdir) = worker.workdir()
-        && let Err(error) = workdir.shutdown().await
-    {
-        tracing::warn!(%error, "Workdir provider shutdown failed");
-    }
-
     // Background memory jobs own extract/consolidate workers after a
-    // turn completes. Join them before the controller task exits so
-    // staging writes and consolidation cleanups are not abandoned.
+    // turn completes. Join them before closing the Workdir session so no
+    // Worker-owned task can outlive its operation attachment.
     worker.wait_for_memory_jobs().await;
+
+    if let Some(session) = worker.workdir_session()
+        && let Err(error) = session.close().await
+    {
+        tracing::warn!(%error, "Workdir session close failed");
+    }
 
     // Report upward that this Worker is stopping before the controller
     // task exits. Awaited (not fire-and-forget): after `shutdown_tx.send`

@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use crate::error::ToolsError;
 use crate::tracker::Tracker;
-use workdir::{EditRequest, WorkdirHandle, WorkdirPath};
+use workdir::{EditRequest, WorkdirPath, WorkdirSessionHandle};
 
 const DESCRIPTION: &str = "Replace a substring in an existing file. By default \
 `old_string` must be unique in the file; set `replace_all: true` to replace \
@@ -30,7 +30,7 @@ pub(crate) struct EditParams {
 }
 
 pub(crate) struct EditTool {
-    workdir: WorkdirHandle,
+    session: WorkdirSessionHandle,
     tracker: Tracker,
 }
 
@@ -62,7 +62,7 @@ impl Tool for EditTool {
         let _mutation_permit = self.tracker.acquire_mutation(&mutation_key, &ctx).await;
         let expected_hash = self.tracker.expected_workdir_hash(&path)?;
         let result = self
-            .workdir
+            .session
             .edit(EditRequest {
                 path: path.clone(),
                 old_string: params.old_string.clone(),
@@ -115,7 +115,7 @@ fn make_preview(text: &str, needle: &str) -> String {
 }
 
 /// Factory for the `Edit` tool.
-pub fn edit_tool(workdir: WorkdirHandle, tracker: Tracker) -> ToolDefinition {
+pub fn edit_tool(session: WorkdirSessionHandle, tracker: Tracker) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(EditParams);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
@@ -123,7 +123,7 @@ pub fn edit_tool(workdir: WorkdirHandle, tracker: Tracker) -> ToolDefinition {
             .description(DESCRIPTION)
             .input_schema(schema_value);
         let tool: Arc<dyn Tool> = Arc::new(EditTool {
-            workdir: workdir.clone(),
+            session: session.clone(),
             tracker: tracker.clone(),
         });
         (meta, tool)
@@ -137,16 +137,16 @@ mod tests {
     use manifest::Scope;
     use tempfile::TempDir;
 
-    fn setup() -> (TempDir, WorkdirHandle, Tracker) {
+    fn setup() -> (TempDir, WorkdirSessionHandle, Tracker) {
         let dir = TempDir::new().unwrap();
-        let fs: WorkdirHandle = Arc::new(workdir::LocalWorkdir::new(
+        let fs: WorkdirSessionHandle = Arc::new(workdir::LocalWorkdirSession::new(
             Scope::writable(dir.path()).unwrap(),
             dir.path().to_path_buf(),
         ));
         (dir, fs, Tracker::new())
     }
 
-    async fn read_first(fs: &WorkdirHandle, tracker: &Tracker, file: &std::path::Path) {
+    async fn read_first(fs: &WorkdirSessionHandle, tracker: &Tracker, file: &std::path::Path) {
         let def = read_tool(fs.clone(), tracker.clone());
         let (_, reader) = def();
         let inp = serde_json::json!({ "file_path": file.file_name().unwrap().to_str().unwrap() });

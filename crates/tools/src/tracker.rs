@@ -21,7 +21,7 @@
 //! A `Tracker` is **Worker-process scoped**: the Worker layer creates a fresh
 //! instance at the start of each Worker run (including resume) and discards
 //! it when the process exits — it is not persisted, so a resumed
-//! conversation starts with an empty read/edit history. The local Workdir
+//! conversation starts with an empty read/edit history. The local WorkdirSession
 //! scope boundary is likewise Worker-process scoped (derived from the
 //! manifest). The two are orthogonal and the Worker wires them together
 //! when registering builtin tools.
@@ -31,15 +31,15 @@
 //! # use std::sync::Arc;
 //! # use manifest::Scope;
 //! # use tools::{Tracker, core_builtin_tools};
-//! # use workdir::{LocalWorkdir, WorkdirHandle};
+//! # use workdir::{LocalWorkdirSession, WorkdirSessionHandle};
 //! let scope = Scope::writable("/workspace").unwrap();
-//! let workdir: WorkdirHandle = Arc::new(LocalWorkdir::new(
+//! let session: WorkdirSessionHandle = Arc::new(LocalWorkdirSession::new(
 //!     scope,
 //!     PathBuf::from("/workspace"),
 //! ));
 //! let tracker = Tracker::new(); // session lifetime
 //! let bash_outputs = PathBuf::from("/run/yoi/bash-output");
-//! let defs = core_builtin_tools(workdir, tracker, bash_outputs);
+//! let defs = core_builtin_tools(session, tracker, bash_outputs);
 //! ```
 
 use std::collections::{HashMap, VecDeque};

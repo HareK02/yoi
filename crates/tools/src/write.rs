@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use crate::error::ToolsError;
 use crate::tracker::Tracker;
-use workdir::{StatRequest, WorkdirError, WorkdirHandle, WorkdirPath, WriteRequest};
+use workdir::{StatRequest, WorkdirError, WorkdirPath, WorkdirSessionHandle, WriteRequest};
 
 const DESCRIPTION: &str = "Create a new file or overwrite an existing one with \
 the given content. Missing parent directories within scope are created \
@@ -25,7 +25,7 @@ pub(crate) struct WriteParams {
 }
 
 pub(crate) struct WriteTool {
-    workdir: WorkdirHandle,
+    session: WorkdirSessionHandle,
     tracker: Tracker,
 }
 
@@ -44,14 +44,14 @@ impl Tool for WriteTool {
 
         let mutation_key = PathBuf::from(path.as_str());
         let _mutation_permit = self.tracker.acquire_mutation(&mutation_key, &ctx).await;
-        let expected_hash = match self.workdir.stat(StatRequest { path: path.clone() }).await {
+        let expected_hash = match self.session.stat(StatRequest { path: path.clone() }).await {
             Ok(_) => Some(self.tracker.expected_workdir_hash(&path)?),
             Err(WorkdirError::NotFound(_)) => None,
             Err(error) => return Err(ToolsError::from(error).into()),
         };
 
         let outcome = self
-            .workdir
+            .session
             .write(WriteRequest {
                 path: path.clone(),
                 content: params.content.as_bytes().to_vec(),
@@ -81,7 +81,7 @@ impl Tool for WriteTool {
 }
 
 /// Factory for the `Write` tool.
-pub fn write_tool(workdir: WorkdirHandle, tracker: Tracker) -> ToolDefinition {
+pub fn write_tool(session: WorkdirSessionHandle, tracker: Tracker) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(WriteParams);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
@@ -89,7 +89,7 @@ pub fn write_tool(workdir: WorkdirHandle, tracker: Tracker) -> ToolDefinition {
             .description(DESCRIPTION)
             .input_schema(schema_value);
         let tool: Arc<dyn Tool> = Arc::new(WriteTool {
-            workdir: workdir.clone(),
+            session: session.clone(),
             tracker: tracker.clone(),
         });
         (meta, tool)
@@ -102,15 +102,15 @@ mod tests {
     use crate::read::read_tool;
     use manifest::Scope;
     use tempfile::TempDir;
-    use workdir::LocalWorkdir;
+    use workdir::LocalWorkdirSession;
 
-    fn setup() -> (TempDir, WorkdirHandle, Tracker) {
+    fn setup() -> (TempDir, WorkdirSessionHandle, Tracker) {
         let dir = TempDir::new().unwrap();
-        let workdir: WorkdirHandle = Arc::new(LocalWorkdir::new(
+        let session: WorkdirSessionHandle = Arc::new(LocalWorkdirSession::new(
             Scope::writable(dir.path()).unwrap(),
             dir.path().to_path_buf(),
         ));
-        (dir, workdir, Tracker::new())
+        (dir, session, Tracker::new())
     }
 
     #[tokio::test]

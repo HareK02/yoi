@@ -37,7 +37,7 @@ use session_store::{CombinedStore, FsWorkerStore};
 use tokio::runtime::Runtime;
 #[cfg(feature = "ws-server")]
 use tokio::sync::broadcast;
-use workdir::{LocalWorkdir, WorkdirCapabilities, WorkdirHandle};
+use workdir::{LocalWorkdirSession, Workdir, WorkdirSessionCapabilities, WorkdirSessionHandle};
 
 #[cfg(feature = "ws-server")]
 use worker::ipc::protocol_session::{live_log_entry_event, subscribe_worker_protocol_session};
@@ -357,18 +357,18 @@ async fn fetch_profile_source_archive_http(
     )
 }
 
-fn runtime_local_workdir(
-    binding_id: &str,
+fn runtime_local_workdir_session(
+    workdir_id: &str,
     root: &Path,
     cwd: &Path,
     scope: manifest::SharedScope,
-) -> WorkdirHandle {
-    Arc::new(LocalWorkdir::materialized_bound(
-        Some(binding_id.to_owned()),
+) -> WorkdirSessionHandle {
+    Arc::new(LocalWorkdirSession::materialized_bound(
+        Workdir::new(workdir_id),
         root.to_path_buf(),
         cwd.to_path_buf(),
         scope,
-        WorkdirCapabilities::ALL,
+        WorkdirSessionCapabilities::ALL,
     ))
 }
 
@@ -448,14 +448,14 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         .await
         .map_err(|err| format!("failed to create Worker from profile: {err}"))?;
         if let Some(binding) = request.working_directory.as_ref() {
-            worker.bind_workdir(Some(runtime_local_workdir(
+            worker.bind_workdir_session(Some(runtime_local_workdir_session(
                 &binding.working_directory.id,
                 binding.root(),
                 binding.cwd(),
                 worker.scope().clone(),
             )));
         } else {
-            worker.bind_workdir(None);
+            worker.bind_workdir_session(None);
         }
 
         let runtime_base = self.runtime_base_dir()?;
@@ -543,14 +543,14 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             Err(err) => return Err(format!("failed to restore Worker from metadata: {err}")),
         };
         if let Some(binding) = request.working_directory.as_ref() {
-            worker.bind_workdir(Some(runtime_local_workdir(
+            worker.bind_workdir_session(Some(runtime_local_workdir_session(
                 &binding.working_directory.id,
                 binding.root(),
                 binding.cwd(),
                 worker.scope().clone(),
             )));
         } else {
-            worker.bind_workdir(None);
+            worker.bind_workdir_session(None);
         }
 
         let runtime_base = self.runtime_base_dir()?;
@@ -1613,23 +1613,23 @@ mod tests {
     }
 
     #[test]
-    fn runtime_rebind_preserves_working_directory_id_on_a_fresh_provider() {
+    fn restore_opens_a_fresh_session_for_the_same_workdir_identity() {
         let root = tempfile::tempdir().unwrap();
-        let spawned = runtime_local_workdir(
+        let spawned = runtime_local_workdir_session(
             "working-directory-42",
             root.path(),
             root.path(),
             manifest::SharedScope::new(Scope::writable(root.path()).unwrap()),
         );
-        let restored = runtime_local_workdir(
+        let restored = runtime_local_workdir_session(
             "working-directory-42",
             root.path(),
             root.path(),
             manifest::SharedScope::new(Scope::writable(root.path()).unwrap()),
         );
 
-        assert_eq!(spawned.binding_id(), Some("working-directory-42"));
-        assert_eq!(restored.binding_id(), Some("working-directory-42"));
+        assert_eq!(spawned.workdir().id().as_str(), "working-directory-42");
+        assert_eq!(restored.workdir().id().as_str(), "working-directory-42");
         assert!(!Arc::ptr_eq(&spawned, &restored));
     }
 

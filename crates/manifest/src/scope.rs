@@ -422,12 +422,12 @@ impl Scope {
 /// Shared, atomically-swappable view of a [`Scope`].
 ///
 /// Built around [`ArcSwap`] so the hot path (permission checks inside a local
-/// Workdir provider) reads the current scope lock-free. Mutators are
+/// WorkdirSession provider) reads the current scope lock-free. Mutators are
 /// serialised by an internal `Mutex` so concurrent `update` calls do
 /// not lose each other's contributions.
 ///
 /// All clones share the same underlying state — a `SharedScope` cloned
-/// out to multiple consumers (Worker, local Workdir providers, future
+/// out to multiple consumers (Worker, local WorkdirSession providers, future
 /// grant/revoke callers) sees every update.
 #[derive(Debug, Clone)]
 pub struct SharedScope {

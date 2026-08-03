@@ -1,6 +1,6 @@
 //! Error types for builtin tools.
 //!
-//! `ToolsError` keeps tool-specific policy failures separate from Workdir
+//! `ToolsError` keeps tool-specific policy failures separate from WorkdirSession
 //! operation failures. Filesystem, search, and command errors originate in
 //! `workdir` and remain transparent here.
 
@@ -11,7 +11,7 @@ use llm_engine::tool::ToolError;
 #[derive(Debug, thiserror::Error)]
 pub enum ToolsError {
     #[error(transparent)]
-    Workdir(#[from] workdir::WorkdirError),
+    WorkdirSession(#[from] workdir::WorkdirError),
 
     #[error("file has not been read in this session; read it first: {}", .0.display())]
     NotRead(PathBuf),
@@ -35,12 +35,12 @@ pub enum ToolsError {
 impl From<ToolsError> for ToolError {
     fn from(err: ToolsError) -> Self {
         match &err {
-            ToolsError::Workdir(
+            ToolsError::WorkdirSession(
                 workdir::WorkdirError::NotFound(_)
                 | workdir::WorkdirError::Io { .. }
                 | workdir::WorkdirError::Unavailable(_),
             ) => ToolError::ExecutionFailed(err.to_string()),
-            ToolsError::Workdir(_)
+            ToolsError::WorkdirSession(_)
             | ToolsError::NotRead(_)
             | ToolsError::ExternallyModified(_)
             | ToolsError::StringNotFound { .. }

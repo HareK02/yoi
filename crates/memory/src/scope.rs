@@ -3,8 +3,8 @@
 //!
 //! Worker is expected to call [`deny_write_rules`] when memory is enabled
 //! and append the result to the manifest's `scope.deny` list before
-//! constructing the [`Scope`] passed to the local Workdir provider. The
-//! memory tools themselves bypass generic Workdir filesystem operations and
+//! constructing the [`Scope`] passed to the local WorkdirSession provider. The
+//! memory tools themselves bypass generic WorkdirSession filesystem operations and
 //! write directly under the workspace root, so this deny does not affect them.
 
 use std::path::Path;

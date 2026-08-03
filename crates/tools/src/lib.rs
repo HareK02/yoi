@@ -1,10 +1,11 @@
 //! Built-in tools for the Yoi LLM agent.
 //!
 //! Read / Write / Edit / Glob / Grep / Bash operate through a host-owned
-//! [`workdir::Workdir`] handle. This crate owns tool schemas, rendering, and
-//! read-before-edit tracking; it does not own Workdir identity or lifecycle.
+//! [`workdir::WorkdirSession`] handle. This crate owns tool schemas, rendering, and
+//! read-before-edit tracking; it does not own Workdir identity/materialization or
+//! WorkdirSession lifecycle.
 //!
-//! Bash is intentionally not sandboxed. The Workdir supplies its initial cwd
+//! Bash is intentionally not sandboxed. The WorkdirSession supplies its initial cwd
 //! and command capability, while the Runtime process and OS user remain the
 //! trusted execution boundary.
 
@@ -29,34 +30,34 @@ pub use tracker::Tracker;
 pub use web::{web_fetch_tool, web_search_tool};
 pub use write::write_tool;
 
-/// Build the local filesystem/command tool surface implemented by a Workdir.
+/// Build the local filesystem/command tool surface implemented by a WorkdirSession.
 /// Profile/manifest policy may narrow this set further in the Engine.
 pub fn core_builtin_tools(
-    workdir: workdir::WorkdirHandle,
+    session: workdir::WorkdirSessionHandle,
     tracker: Tracker,
     bash_output_dir: std::path::PathBuf,
 ) -> Vec<llm_engine::tool::ToolDefinition> {
-    use workdir::WorkdirCapability;
+    use workdir::WorkdirSessionCapability;
 
-    let capabilities = workdir.capabilities();
+    let capabilities = session.capabilities();
     let mut tools = Vec::with_capacity(6);
-    if capabilities.supports(WorkdirCapability::Read) {
-        tools.push(read_tool(workdir.clone(), tracker.clone()));
+    if capabilities.supports(WorkdirSessionCapability::Read) {
+        tools.push(read_tool(session.clone(), tracker.clone()));
     }
-    if capabilities.supports(WorkdirCapability::Write) {
-        tools.push(write_tool(workdir.clone(), tracker.clone()));
+    if capabilities.supports(WorkdirSessionCapability::Write) {
+        tools.push(write_tool(session.clone(), tracker.clone()));
     }
-    if capabilities.supports(WorkdirCapability::Edit) {
-        tools.push(edit_tool(workdir.clone(), tracker));
+    if capabilities.supports(WorkdirSessionCapability::Edit) {
+        tools.push(edit_tool(session.clone(), tracker));
     }
-    if capabilities.supports(WorkdirCapability::Glob) {
-        tools.push(glob_tool(workdir.clone()));
+    if capabilities.supports(WorkdirSessionCapability::Glob) {
+        tools.push(glob_tool(session.clone()));
     }
-    if capabilities.supports(WorkdirCapability::Grep) {
-        tools.push(grep_tool(workdir.clone()));
+    if capabilities.supports(WorkdirSessionCapability::Grep) {
+        tools.push(grep_tool(session.clone()));
     }
-    if capabilities.supports(WorkdirCapability::Command) {
-        tools.push(bash_tool(workdir, bash_output_dir));
+    if capabilities.supports(WorkdirSessionCapability::Command) {
+        tools.push(bash_tool(session, bash_output_dir));
     }
     tools
 }
@@ -76,18 +77,18 @@ mod workdir_tool_tests {
     use manifest::{Scope, SharedScope};
     use std::sync::Arc;
     use tempfile::TempDir;
-    use workdir::{LocalWorkdir, WorkdirCapabilities, WorkdirHandle};
+    use workdir::{LocalWorkdirSession, WorkdirSessionCapabilities, WorkdirSessionHandle};
 
     #[test]
     fn read_only_workdir_exposes_only_observation_tools() {
         let dir = TempDir::new().unwrap();
-        let workdir: WorkdirHandle = Arc::new(LocalWorkdir::materialized(
+        let session: WorkdirSessionHandle = Arc::new(LocalWorkdirSession::materialized(
             dir.path().to_path_buf(),
             dir.path().to_path_buf(),
             SharedScope::new(Scope::writable(dir.path()).unwrap()),
-            WorkdirCapabilities::READ_ONLY,
+            WorkdirSessionCapabilities::READ_ONLY,
         ));
-        let names = core_builtin_tools(workdir, Tracker::new(), dir.path().join("output"))
+        let names = core_builtin_tools(session, Tracker::new(), dir.path().join("output"))
             .into_iter()
             .map(|definition| definition().0.name)
             .collect::<Vec<_>>();

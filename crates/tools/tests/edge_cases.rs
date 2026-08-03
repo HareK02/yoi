@@ -7,7 +7,7 @@ use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
 use serde_json::json;
 use tempfile::TempDir;
 use tools::{Tracker, core_builtin_tools};
-use workdir::{LocalWorkdir, WorkdirHandle};
+use workdir::{LocalWorkdirSession, WorkdirSessionHandle};
 
 struct Registry {
     entries: Vec<(llm_engine::tool::ToolMeta, Arc<dyn Tool>)>,
@@ -42,7 +42,8 @@ fn setup() -> (TempDir, TempDir, Registry) {
         recursive: true,
     });
     let scope = Scope::from_config(&config).unwrap();
-    let fs: WorkdirHandle = std::sync::Arc::new(LocalWorkdir::new(scope, dir.path().to_path_buf()));
+    let fs: WorkdirSessionHandle =
+        std::sync::Arc::new(LocalWorkdirSession::new(scope, dir.path().to_path_buf()));
     let tracker = Tracker::new();
     let reg = Registry::new(core_builtin_tools(fs, tracker, spill.path().to_path_buf()));
     (dir, spill, reg)

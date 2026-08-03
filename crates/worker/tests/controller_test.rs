@@ -11,7 +11,10 @@ use llm_engine::llm_client::{ClientError, LlmClient, Request};
 use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use session_store::{CombinedStore, FsWorkerStore};
 use session_store::{FsStore, LogEntry};
-use workdir::{CommandRequest, LocalWorkdir, WorkdirCapabilities, WorkdirError, WorkdirHandle};
+use workdir::{
+    CommandRequest, LocalWorkdirSession, Workdir, WorkdirError, WorkdirSessionCapabilities,
+    WorkdirSessionHandle,
+};
 
 use worker::{
     Event, Method, Worker, WorkerController, WorkerFilesystemAuthority, WorkerHandle,
@@ -215,16 +218,16 @@ async fn spawn_controller(worker: Worker<MockClient, TestStore>) -> WorkerHandle
 }
 
 #[tokio::test]
-async fn shutdown_closes_bound_workdir_commands() {
+async fn shutdown_closes_bound_workdir_session() {
     let (mut worker, pwd) = make_worker_with_pwd(MockClient::new(simple_text_events())).await;
-    let workdir: WorkdirHandle = Arc::new(LocalWorkdir::materialized_bound(
-        Some("controller-test-workdir".to_owned()),
+    let session: WorkdirSessionHandle = Arc::new(LocalWorkdirSession::materialized_bound(
+        Workdir::new("controller-test-workdir"),
         pwd.clone(),
         pwd,
         worker.scope().clone(),
-        WorkdirCapabilities::ALL,
+        WorkdirSessionCapabilities::ALL,
     ));
-    let command = workdir
+    let command = session
         .start_command(CommandRequest {
             command: "sleep 30".to_owned(),
             timeout_secs: 60,
@@ -232,7 +235,7 @@ async fn shutdown_closes_bound_workdir_commands() {
         })
         .await
         .unwrap();
-    worker.bind_workdir(Some(Arc::clone(&workdir)));
+    worker.bind_workdir_session(Some(Arc::clone(&session)));
 
     let runtime_base = tempfile::tempdir().unwrap();
     let (handle, shutdown_rx) = WorkerController::spawn(worker, runtime_base.path())
@@ -245,8 +248,40 @@ async fn shutdown_closes_bound_workdir_commands() {
         .expect("controller shutdown signal should remain open");
 
     assert!(matches!(
-        workdir.command_status(command).await,
-        Err(WorkdirError::UnknownCommand(_))
+        session.command_status(command).await,
+        Err(WorkdirError::Unavailable(_))
+    ));
+}
+
+#[tokio::test]
+async fn controller_startup_failure_closes_bound_workdir_session() {
+    let (mut worker, pwd) = make_worker_with_pwd(MockClient::new(simple_text_events())).await;
+    let session: WorkdirSessionHandle = Arc::new(LocalWorkdirSession::materialized_bound(
+        Workdir::new("controller-startup-failure-workdir"),
+        pwd.clone(),
+        pwd,
+        worker.scope().clone(),
+        WorkdirSessionCapabilities::ALL,
+    ));
+    worker.bind_workdir_session(Some(Arc::clone(&session)));
+    let runtime_base = tempfile::tempdir().unwrap();
+    let invalid_runtime_base = runtime_base.path().join("not-a-directory");
+    std::fs::write(&invalid_runtime_base, "file").unwrap();
+
+    assert!(
+        WorkerController::spawn(worker, &invalid_runtime_base)
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        session
+            .start_command(CommandRequest {
+                command: "printf unreachable".to_owned(),
+                timeout_secs: 5,
+                output_limit: 1024,
+            })
+            .await,
+        Err(WorkdirError::Unavailable(_))
     ));
 }
 

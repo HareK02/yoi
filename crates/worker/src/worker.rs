@@ -76,7 +76,7 @@ use protocol::{
 use tokio::net::UnixStream;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
-use workdir::{LocalWorkdir, WorkdirCapabilities, WorkdirHandle};
+use workdir::{LocalWorkdirSession, WorkdirSessionCapabilities, WorkdirSessionHandle};
 
 const RESTORE_RECONCILIATION_REACHABILITY_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -643,14 +643,14 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// Explicit local filesystem authority, or `None` for Workers with no
     /// local cwd and no filesystem/Bash tool surface.
     filesystem_authority: WorkerFilesystemAuthority,
-    /// Live Workdir provider derived once from the Worker–Workdir binding.
+    /// Live WorkdirSession provider derived once from the Worker–Workdir binding.
     /// Local tools, file views, and compaction workers clone this handle.
-    workdir: Option<WorkdirHandle>,
+    workdir_session: Option<WorkdirSessionHandle>,
     /// Path-free workspace identity/client context injected by Runtime/host.
     /// This never grants local filesystem authority.
     workspace_context: WorkerWorkspaceContext,
     /// Shared, atomically-swappable view of the Worker's resolved scope.
-    /// Cloned into local Workdir providers used by builtin tools, fs_view,
+    /// Cloned into local WorkdirSession providers used by builtin tools, fs_view,
     /// and compaction so updates propagate at the next permission check.
     scope: SharedScope,
     /// Filesystem authority this Worker may pass to spawned children. Direct tools
@@ -827,7 +827,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
             worker_metadata_writer: None,
             segment_state: self.segment_state.clone(),
             filesystem_authority: self.filesystem_authority.clone(),
-            workdir: self.workdir.clone(),
+            workdir_session: self.workdir_session.clone(),
             workspace_context: self.workspace_context.clone(),
             scope: self.scope.clone(),
             delegation_scope: self.delegation_scope.clone(),
@@ -1016,7 +1016,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         let delegation_scope =
             DelegationScope::from_config(&manifest.delegation_scope).map_err(WorkerError::Scope)?;
         let scope = SharedScope::new(scope);
-        let workdir = workdir_from_authority(&filesystem_authority, &scope);
+        let workdir_session = workdir_session_from_authority(&filesystem_authority, &scope);
         let mut worker = Self {
             manifest,
             engine: Some(worker),
@@ -1024,7 +1024,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             worker_metadata_writer: None,
             segment_state: SegmentState::new(session_id, segment_id, 0),
             filesystem_authority,
-            workdir,
+            workdir_session,
             workspace_context,
             scope,
             delegation_scope,
@@ -1139,15 +1139,15 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         self.filesystem_authority.as_local()
     }
 
-    pub fn workdir(&self) -> Option<&WorkdirHandle> {
-        self.workdir.as_ref()
+    pub fn workdir_session(&self) -> Option<&WorkdirSessionHandle> {
+        self.workdir_session.as_ref()
     }
 
     /// Replace the constructor fallback with the provider binding resolved by
     /// the owning Runtime. Runtime calls this before the Worker controller is
     /// spawned, so tools only ever observe the Runtime-bound handle.
-    pub fn bind_workdir(&mut self, workdir: Option<WorkdirHandle>) {
-        self.workdir = workdir;
+    pub fn bind_workdir_session(&mut self, workdir_session: Option<WorkdirSessionHandle>) {
+        self.workdir_session = workdir_session;
     }
 
     /// Path-free workspace identity, if Runtime/host associated this Worker
@@ -2014,7 +2014,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// unresolved placeholder stays in the flattened user message so the LLM
     /// still sees the intent.
     async fn resolve_file_refs(&self, segments: &[Segment]) -> Vec<SystemItem> {
-        let Some(workdir) = self.workdir.clone() else {
+        let Some(workdir) = self.workdir_session.clone() else {
             for seg in segments {
                 if let Segment::FileRef { path } = seg {
                     self.alert(
@@ -2792,9 +2792,9 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         )));
 
         // Build an independent compact worker. It clones the main Worker's
-        // provider handle, so compact-time reads use the same Workdir instance.
+        // provider handle, so compact-time reads use the same WorkdirSession instance.
         // No-workdir Workers deliberately omit compact-time filesystem tools.
-        let workdir = self.workdir.clone();
+        let workdir = self.workdir_session.clone();
         let summary_tracker = tools::Tracker::new();
         let summary_client: Box<dyn LlmClient> = self.build_compactor_client()?;
         let summary_system_prompt = self
@@ -3858,7 +3858,7 @@ where
         worker.set_cache_key(Some(segment_id.to_string()));
         let worker_metadata_writer = Some(worker_metadata_writer_for_store(&store));
         let scope = SharedScope::new(common.scope);
-        let workdir = workdir_from_authority(&common.filesystem_authority, &scope);
+        let workdir_session = workdir_session_from_authority(&common.filesystem_authority, &scope);
 
         let mut worker = Self {
             manifest,
@@ -3867,7 +3867,7 @@ where
             worker_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, 0),
             filesystem_authority: common.filesystem_authority,
-            workdir,
+            workdir_session,
             workspace_context: common.workspace_context,
             scope,
             delegation_scope: common.delegation_scope,
@@ -3967,7 +3967,7 @@ where
         worker.set_cache_key(Some(segment_id.to_string()));
         let worker_metadata_writer = Some(worker_metadata_writer_for_store(&store));
         let scope = SharedScope::new(common.scope);
-        let workdir = workdir_from_authority(&common.filesystem_authority, &scope);
+        let workdir_session = workdir_session_from_authority(&common.filesystem_authority, &scope);
 
         let mut worker = Self {
             manifest,
@@ -3976,7 +3976,7 @@ where
             worker_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, 0),
             filesystem_authority: common.filesystem_authority,
-            workdir,
+            workdir_session,
             workspace_context: common.workspace_context,
             scope,
             delegation_scope: common.delegation_scope,
@@ -4259,7 +4259,7 @@ where
         let task_feature = TaskFeature::from_history(&state.history);
         let worker_metadata_writer = Some(worker_metadata_writer_for_store(&store));
         let scope = SharedScope::new(common.scope);
-        let workdir = workdir_from_authority(&common.filesystem_authority, &scope);
+        let workdir_session = workdir_session_from_authority(&common.filesystem_authority, &scope);
 
         let mut worker = Self {
             manifest,
@@ -4268,7 +4268,7 @@ where
             worker_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, state.entries_count),
             filesystem_authority: common.filesystem_authority,
-            workdir,
+            workdir_session,
             workspace_context: common.workspace_context,
             scope,
             delegation_scope: common.delegation_scope,
@@ -4934,17 +4934,17 @@ pub enum WorkerError {
     },
 }
 
-fn workdir_from_authority(
+fn workdir_session_from_authority(
     authority: &WorkerFilesystemAuthority,
     scope: &SharedScope,
-) -> Option<WorkdirHandle> {
+) -> Option<WorkdirSessionHandle> {
     authority.as_local().map(|local| {
-        Arc::new(LocalWorkdir::materialized(
+        Arc::new(LocalWorkdirSession::materialized(
             local.root.clone(),
             local.cwd.clone(),
             scope.clone(),
-            WorkdirCapabilities::ALL,
-        )) as WorkdirHandle
+            WorkdirSessionCapabilities::ALL,
+        )) as WorkdirSessionHandle
     })
 }
 

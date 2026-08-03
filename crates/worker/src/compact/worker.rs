@@ -27,8 +27,8 @@ use llm_engine::interceptor::{Interceptor, PreRequestAction, PreToolAction, Tool
 use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput, ToolResult};
 use serde::Deserialize;
 #[cfg(test)]
-use workdir::LocalWorkdir;
-use workdir::{ReadRequest, WorkdirHandle, WorkdirPath};
+use workdir::LocalWorkdirSession;
+use workdir::{ReadRequest, WorkdirPath, WorkdirSessionHandle};
 
 use crate::compact::usage_tracker::UsageTracker;
 use crate::fs_view::ReadRequirement;
@@ -327,7 +327,7 @@ fn truncate_to_token_budget(text: &mut String, max_tokens: u64) -> bool {
 }
 
 struct MarkReadRequiredTool {
-    workdir: WorkdirHandle,
+    session: WorkdirSessionHandle,
     ctx: Arc<Mutex<CompactWorkerContext>>,
 }
 
@@ -342,12 +342,12 @@ impl Tool for MarkReadRequiredTool {
             ToolError::InvalidArgument(format!("invalid mark_read_required input: {e}"))
         })?;
 
-        // Read through the shared Workdir so scope and I/O errors surface the
+        // Read through the shared WorkdirSession so scope and I/O errors surface the
         // same way the regular `read_file` tool does.
         let path = WorkdirPath::new(params.file_path.to_string_lossy())
             .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
         let result = self
-            .workdir
+            .session
             .read(ReadRequest {
                 path,
                 offset: params.offset.unwrap_or(0),
@@ -454,7 +454,7 @@ impl Tool for WriteSummaryTool {
 }
 
 pub(crate) fn mark_read_required_tool(
-    workdir: WorkdirHandle,
+    session: WorkdirSessionHandle,
     ctx: Arc<Mutex<CompactWorkerContext>>,
 ) -> ToolDefinition {
     Arc::new(move || {
@@ -464,7 +464,7 @@ pub(crate) fn mark_read_required_tool(
             .description(MARK_DESCRIPTION)
             .input_schema(schema_value);
         let tool: Arc<dyn Tool> = Arc::new(MarkReadRequiredTool {
-            workdir: workdir.clone(),
+            session: session.clone(),
             ctx: ctx.clone(),
         });
         (meta, tool)
@@ -635,9 +635,9 @@ mod tests {
     use super::*;
     use manifest::Scope;
 
-    fn make_fs(tmp: &std::path::Path) -> WorkdirHandle {
+    fn make_fs(tmp: &std::path::Path) -> WorkdirSessionHandle {
         let scope = Scope::writable(tmp.to_path_buf()).unwrap();
-        Arc::new(LocalWorkdir::new(scope, tmp.to_path_buf()))
+        Arc::new(LocalWorkdirSession::new(scope, tmp.to_path_buf()))
     }
 
     fn make_usage(input: u64) -> llm_engine::timeline::event::UsageEvent {
@@ -732,7 +732,7 @@ mod tests {
 
         let ctx = Arc::new(Mutex::new(CompactWorkerContext::with_budget(1_000)));
         let tool: Arc<dyn Tool> = Arc::new(MarkReadRequiredTool {
-            workdir: make_fs(tmp.path()),
+            session: make_fs(tmp.path()),
             ctx: ctx.clone(),
         });
         let input = serde_json::json!({ "file_path": path.file_name().unwrap().to_str().unwrap() })
@@ -754,7 +754,7 @@ mod tests {
 
         let ctx = Arc::new(Mutex::new(CompactWorkerContext::with_budget(100)));
         let tool: Arc<dyn Tool> = Arc::new(MarkReadRequiredTool {
-            workdir: make_fs(tmp.path()),
+            session: make_fs(tmp.path()),
             ctx: ctx.clone(),
         });
         let input = serde_json::json!({ "file_path": path.file_name().unwrap().to_str().unwrap() })
