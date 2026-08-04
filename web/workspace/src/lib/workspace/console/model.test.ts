@@ -718,7 +718,7 @@ Deno.test("projectConsole preserves in-progress assistant protocol stream", () =
   );
 });
 
-Deno.test("projectConsole keeps protocol lifecycle events out of the console surface", () => {
+Deno.test("projectConsole hides lifecycle events and renders system items", () => {
   const projection = projectConsole([
     {
       eventId: "30",
@@ -743,12 +743,24 @@ Deno.test("projectConsole keeps protocol lifecycle events out of the console sur
       eventId: "34",
       event: {
         event: "system_item",
-        data: { item: { kind: "note", content: "internal" } },
+        data: {
+          item: {
+            kind: "notification",
+            message: "Ticket queued",
+            body: "Reread Ticket 00001KZ6TSGG5 before acting.",
+          },
+        },
       } satisfies Event,
     },
   ]);
 
-  assertEquals(projection.lines, []);
+  assertEquals(projection.lines.length, 1);
+  assertEquals(projection.lines[0].kind, "system");
+  assertEquals(projection.lines[0].title, "System · notification");
+  assertEquals(
+    projection.lines[0].body,
+    "Reread Ticket 00001KZ6TSGG5 before acting.",
+  );
   assertEquals(projection.status, "running");
 });
 
@@ -857,6 +869,42 @@ Deno.test("projectConsole renders snapshot entries and in-flight output", () => 
       "in_flight:partial:true",
     ],
   );
+});
+
+Deno.test("projectConsole restores system items from snapshot entries", () => {
+  const projection = projectConsole([{
+    eventId: "system-snapshot",
+    event: {
+      event: "snapshot",
+      data: {
+        entries: [{
+          kind: "system_item",
+          ts: 1,
+          item: {
+            kind: "notification",
+            message: "Worker completed",
+            body: "Child Worker coder-1 completed.",
+          },
+        }],
+        greeting: {
+          worker_name: "Worker",
+          cwd: "/repo",
+          provider: "provider",
+          model: "model",
+          scope_summary: "bounded",
+          tools: [],
+          context_window: 100,
+          context_tokens: 20,
+        },
+        status: "idle",
+      },
+    } satisfies Event,
+  }]);
+
+  assertEquals(projection.lines.length, 1);
+  assertEquals(projection.lines[0].kind, "system");
+  assertEquals(projection.lines[0].title, "System · notification");
+  assertEquals(projection.lines[0].body, "Child Worker coder-1 completed.");
 });
 
 Deno.test("projectConsole reseeds visible rows from segment rotation", () => {

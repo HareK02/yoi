@@ -208,7 +208,7 @@ export function applyProtocolEvent(
       );
       break;
     case "system_item":
-      // System items are protocol/internal context, not console output.
+      next.lines.push(systemItemLine(envelope.eventId, event.data.item));
       break;
     case "text_delta":
       appendStreaming(
@@ -395,6 +395,17 @@ function line(
     streaming,
     error,
   };
+}
+
+function systemItemLine(eventId: string, item: unknown): ConsoleLine {
+  if (!isRecord(item)) {
+    return line(eventId, "system", "System item", jsonPreview(item));
+  }
+  const itemKind = stringField(item, "kind") ?? "item";
+  const title = `System · ${itemKind.replaceAll("_", " ")}`;
+  const body = stringField(item, "body") ?? stringField(item, "message") ??
+    stringField(item, "content") ?? jsonPreview(item);
+  return line(eventId, "system", title, body);
 }
 
 function upsertStatusLine(
@@ -1139,6 +1150,9 @@ function applyLogEntry(
           segmentsToText(arrayField(entry, "segments") as Segment[]),
         ),
       );
+      break;
+    case "system_item":
+      projection.lines.push(systemItemLine(eventId, entry["item"]));
       break;
     case "assistant_item":
     case "tool_result":
