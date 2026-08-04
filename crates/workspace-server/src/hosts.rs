@@ -16,7 +16,7 @@ use std::{
     time::Duration,
 };
 use workdir::{
-    Workdir, WorkdirError,
+    Workdir, WorkdirError, WorkdirSessionHandle,
     http::{OpenWorkdirSessionRequest, RemoteWorkdirSession, WorkdirHttpAuthorization},
 };
 use worker_runtime::RuntimeWorkspaceScope;
@@ -1175,6 +1175,26 @@ impl RuntimeRegistry {
         validate_backend_identifier("working_directory_id", working_directory_id)?;
         let runtime = self.runtime(runtime_id)?;
         Ok(runtime.working_directory(working_directory_id))
+    }
+
+    pub async fn open_workdir_session(
+        &self,
+        runtime_id: &str,
+        working_directory_id: &str,
+        owner_worker_id: &str,
+    ) -> Result<WorkdirSessionHandle, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        validate_backend_identifier("working_directory_id", working_directory_id)?;
+        validate_backend_identifier("owner_worker_id", owner_worker_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        runtime
+            .open_workdir_session(working_directory_id, Some(owner_worker_id))
+            .await
+            .map_err(|error| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: runtime_id.to_string(),
+                code: "workdir_session_open_failed".to_string(),
+                message: error.to_string(),
+            })
     }
 
     pub fn cleanup_working_directory(

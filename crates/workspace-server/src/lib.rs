@@ -91,6 +91,8 @@ pub enum Error {
     WorkspaceIdMismatch,
     #[error("Ticket assignment conflict: {0}")]
     TicketAssignmentConflict(String),
+    #[error("Workdir attachment conflict: {0}")]
+    WorkdirAttachmentConflict(String),
     #[error("Worker source identity is invalid: {0}")]
     WorkerSourceIdentity(String),
     #[error("workspace identity error: {0}")]

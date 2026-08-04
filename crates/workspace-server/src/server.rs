@@ -39,6 +39,8 @@ use webauthn_rs::prelude::{
     PublicKeyCredential, RegisterPublicKeyCredential, RequestChallengeResponse, Webauthn,
     WebauthnBuilder,
 };
+use workdir::WorkdirSessionHandle;
+use workdir::http::{WorkdirSessionOperation, WorkdirSessionOperationResult};
 use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest};
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
 
@@ -257,6 +259,8 @@ pub struct WorkspaceApi {
     observation_proxy: BackendObservationProxy,
     runtime_subscription_broker: RuntimeSubscriptionBroker,
     resource_broker: BackendResourceBroker,
+    workdir_sessions: Arc<Mutex<HashMap<(String, u64), WorkdirSessionHandle>>>,
+    workdir_session_locks: Arc<Mutex<HashMap<(String, u64), Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl WorkspaceApi {
@@ -358,6 +362,8 @@ impl WorkspaceApi {
             observation_proxy,
             runtime_subscription_broker,
             resource_broker,
+            workdir_sessions: Arc::new(Mutex::new(HashMap::new())),
+            workdir_session_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -390,11 +396,45 @@ impl WorkspaceApi {
     ) -> ApiResult<WorkerSpawnResult> {
         let workspace_api = self.workspace_api_ref(runtime_id);
         request.resolved_workspace_api = Some(workspace_api.clone());
-        let result = self
-            .runtime
-            .spawn_worker(runtime_id, request)
-            .map_err(|error| error.into_error())?;
+        let attachment_reservation =
+            request
+                .resolved_working_directory
+                .as_ref()
+                .map(|working_directory| {
+                    (
+                        working_directory.working_directory_id.clone(),
+                        Uuid::new_v4().to_string(),
+                    )
+                });
+        if let Some((workdir_id, reservation_id)) = attachment_reservation.as_ref() {
+            self.store.reserve_worker_workdir_attachment(
+                &self.config.workspace_id,
+                workdir_id,
+                reservation_id,
+                &now_registry_timestamp(),
+            )?;
+        }
+        let result = match self.runtime.spawn_worker(runtime_id, request) {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some((workdir_id, reservation_id)) = attachment_reservation.as_ref() {
+                    let _ = self.store.release_worker_workdir_attachment_reservation(
+                        &self.config.workspace_id,
+                        workdir_id,
+                        reservation_id,
+                    );
+                }
+                return Err(error.into_error().into());
+            }
+        };
         let Some(worker) = result.worker.as_ref() else {
+            if let Some((workdir_id, reservation_id)) = attachment_reservation.as_ref() {
+                self.store.release_worker_workdir_attachment_reservation(
+                    &self.config.workspace_id,
+                    workdir_id,
+                    reservation_id,
+                )?;
+            }
             return Ok(result);
         };
         let replacement = match self.runtime.replace_worker_workspace_api(
@@ -405,11 +445,25 @@ impl WorkspaceApi {
             Ok(replacement) => replacement,
             Err(error) => {
                 let _ = self.runtime.delete_worker(runtime_id, &worker.worker_id);
+                if let Some((workdir_id, reservation_id)) = attachment_reservation.as_ref() {
+                    let _ = self.store.release_worker_workdir_attachment_reservation(
+                        &self.config.workspace_id,
+                        workdir_id,
+                        reservation_id,
+                    );
+                }
                 return Err(error.into_error().into());
             }
         };
         if replacement.state != WorkerOperationState::Accepted {
             let _ = self.runtime.delete_worker(runtime_id, &worker.worker_id);
+            if let Some((workdir_id, reservation_id)) = attachment_reservation.as_ref() {
+                let _ = self.store.release_worker_workdir_attachment_reservation(
+                    &self.config.workspace_id,
+                    workdir_id,
+                    reservation_id,
+                );
+            }
             return Err(Error::RuntimeOperationFailed {
                 runtime_id: runtime_id.to_string(),
                 code: "worker_workspace_api_replace_failed".to_string(),
@@ -422,6 +476,41 @@ impl WorkspaceApi {
                     }),
             }
             .into());
+        }
+        if let Some((workdir_id, reservation_id)) = attachment_reservation.as_ref() {
+            let runtime_worker_id = match parse_runtime_worker_id_for_registry(&worker.worker_id) {
+                Ok(worker_id) => worker_id,
+                Err(error) => {
+                    let _ = self.runtime.delete_worker(runtime_id, &worker.worker_id);
+                    let _ = self.store.release_worker_workdir_attachment_reservation(
+                        &self.config.workspace_id,
+                        workdir_id,
+                        reservation_id,
+                    );
+                    return Err(error);
+                }
+            };
+            let attachment = WorkerWorkdirLinkRecord {
+                workspace_id: self.config.workspace_id.clone(),
+                runtime_id: runtime_id.to_string(),
+                runtime_worker_id,
+                workdir_id: workdir_id.clone(),
+                role: "attachment".to_string(),
+                linked_at: now_registry_timestamp(),
+                unlinked_at: None,
+            };
+            if let Err(error) = self
+                .store
+                .finalize_reserved_worker_workdir_attachment(&attachment, reservation_id)
+            {
+                let _ = self.runtime.delete_worker(runtime_id, &worker.worker_id);
+                let _ = self.store.release_worker_workdir_attachment_reservation(
+                    &self.config.workspace_id,
+                    workdir_id,
+                    reservation_id,
+                );
+                return Err(error.into());
+            }
         }
         Ok(result)
     }
@@ -771,6 +860,15 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/working-directories/{working_directory_id}",
             get(scoped_runtime_working_directory_detail).delete(scoped_cleanup_runtime_working_directory),
+        )
+        .route(
+            "/api/w/{workspace_id}/workers/self/workdir-attachment",
+            post(scoped_attach_current_worker_workdir)
+                .delete(scoped_detach_current_worker_workdir),
+        )
+        .route(
+            "/api/w/{workspace_id}/workers/self/workdir-session/operations",
+            post(scoped_execute_current_worker_workdir_operation),
         )
         .route(
             "/api/w/{workspace_id}/working-directories",
@@ -1471,6 +1569,19 @@ struct TranscriptQuery {
 #[derive(Debug, Deserialize)]
 struct ScopedWorkspacePath {
     workspace_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttachCurrentWorkerWorkdirRequest {
+    workdir_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct CurrentWorkerWorkdirAttachmentResponse {
+    workspace_id: String,
+    workdir_id: String,
+    attached: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2977,6 +3088,331 @@ fn authenticate_worker_mutation_source(
     })
 }
 
+fn current_worker_identity(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    headers: &HeaderMap,
+) -> Result<(String, u64)> {
+    let source = authenticate_worker_mutation_source(api, workspace_id, headers)?;
+    let worker_id = source.worker_id.parse::<u64>().map_err(|_| {
+        Error::WorkerSourceIdentity(format!(
+            "Runtime-bound Worker id must be numeric, got `{}`",
+            source.worker_id
+        ))
+    })?;
+    Ok((source.runtime_id, worker_id))
+}
+
+fn current_worker_active_attachment(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+    worker_id: u64,
+) -> ApiResult<WorkerWorkdirLinkRecord> {
+    if let Some(link) = api
+        .store
+        .list_worker_workdir_links(&api.config.workspace_id, runtime_id, worker_id)?
+        .into_iter()
+        .next()
+    {
+        return Ok(link);
+    }
+
+    if api.store.worker_workdir_link_history_exists(
+        &api.config.workspace_id,
+        runtime_id,
+        worker_id,
+    )? {
+        return Err(Error::WorkdirAttachmentConflict(format!(
+            "Worker {runtime_id}:{worker_id} has no active Workdir attachment"
+        ))
+        .into());
+    }
+
+    // A Runtime can start the Worker immediately after reserving its local binding, before the
+    // outer spawn handler has projected that binding into the Backend registry. Import the same
+    // binding transactionally on the first identity-bound operation so initial input cannot race
+    // attachment authority.
+    let worker = api
+        .runtime
+        .worker(runtime_id, &worker_id.to_string())
+        .map_err(|error| error.into_error())?;
+    if worker.working_directory.is_some() {
+        sync_worker_observation(api, &worker)?;
+        if let Some(link) = api
+            .store
+            .list_worker_workdir_links(&api.config.workspace_id, runtime_id, worker_id)?
+            .into_iter()
+            .next()
+        {
+            return Ok(link);
+        }
+    }
+    Err(Error::WorkdirAttachmentConflict(format!(
+        "Worker {runtime_id}:{worker_id} has no active Workdir attachment"
+    ))
+    .into())
+}
+
+fn current_worker_session_lock(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+    worker_id: u64,
+) -> Arc<tokio::sync::Mutex<()>> {
+    api.workdir_session_locks
+        .lock()
+        .expect("Workdir session lock registry poisoned")
+        .entry((runtime_id.to_string(), worker_id))
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+async fn open_current_worker_workdir_session_locked(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+    worker_id: u64,
+    link: &WorkerWorkdirLinkRecord,
+) -> Result<WorkdirSessionHandle> {
+    if let Some(session) = api
+        .workdir_sessions
+        .lock()
+        .expect("Workdir session registry lock poisoned")
+        .get(&(runtime_id.to_string(), worker_id))
+        .cloned()
+    {
+        return Ok(session);
+    }
+    let workdir = api
+        .store
+        .list_workdir_registry(&api.config.workspace_id, 10_000)?
+        .into_iter()
+        .find(|workdir| workdir.workdir_id == link.workdir_id)
+        .ok_or_else(|| Error::RuntimeOperationFailed {
+            runtime_id: runtime_id.to_string(),
+            code: "working_directory_not_found".to_string(),
+            message: format!(
+                "attached Workdir {} is not registered in this Workspace",
+                link.workdir_id
+            ),
+        })?;
+    let owner_worker_id = format!("{runtime_id}-{worker_id}");
+    let session = api
+        .runtime
+        .open_workdir_session(&workdir.runtime_id, &workdir.workdir_id, &owner_worker_id)
+        .await
+        .map_err(|error| error.into_error())?;
+    let key = (runtime_id.to_string(), worker_id);
+    let (selected, unused) = {
+        let mut sessions = api
+            .workdir_sessions
+            .lock()
+            .expect("Workdir session registry lock poisoned");
+        match sessions.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                (entry.get().clone(), Some(session))
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(session.clone());
+                (session, None)
+            }
+        }
+    };
+    if let Some(unused) = unused {
+        unused
+            .close()
+            .await
+            .map_err(|error| Error::RuntimeOperationFailed {
+                runtime_id: runtime_id.to_string(),
+                code: "duplicate_workdir_session_close_failed".to_string(),
+                message: error.to_string(),
+            })?;
+    }
+    Ok(selected)
+}
+
+async fn close_current_worker_session_locked(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+    worker_id: u64,
+) -> Result<()> {
+    let key = (runtime_id.to_string(), worker_id);
+    let session = api
+        .workdir_sessions
+        .lock()
+        .expect("Workdir session registry lock poisoned")
+        .get(&key)
+        .cloned();
+    if let Some(session) = session {
+        session
+            .close()
+            .await
+            .map_err(|error| Error::RuntimeOperationFailed {
+                runtime_id: runtime_id.to_string(),
+                code: "workdir_session_close_failed".to_string(),
+                message: error.to_string(),
+            })?;
+        api.workdir_sessions
+            .lock()
+            .expect("Workdir session registry lock poisoned")
+            .remove(&key);
+    }
+    Ok(())
+}
+
+async fn scoped_attach_current_worker_workdir(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    headers: HeaderMap,
+    Json(request): Json<AttachCurrentWorkerWorkdirRequest>,
+) -> ApiResult<Json<CurrentWorkerWorkdirAttachmentResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let (runtime_id, worker_id) = current_worker_identity(&api, &path.workspace_id, &headers)?;
+    let workdir_id = request.workdir_id.trim();
+    if workdir_id.is_empty() || workdir_id.chars().any(char::is_control) {
+        return Err(Error::InvalidRecordId(request.workdir_id).into());
+    }
+    if !api
+        .store
+        .list_workdir_registry(&api.config.workspace_id, 10_000)?
+        .iter()
+        .any(|workdir| workdir.workdir_id == workdir_id)
+    {
+        return Err(Error::RuntimeOperationFailed {
+            runtime_id: runtime_id.clone(),
+            code: "working_directory_not_found".to_string(),
+            message: format!("unknown Workdir `{workdir_id}`"),
+        }
+        .into());
+    }
+    let session_lock = current_worker_session_lock(&api, &runtime_id, worker_id);
+    let _session_guard = session_lock.lock().await;
+    let link = api.store.attach_worker_workdir(&WorkerWorkdirLinkRecord {
+        workspace_id: api.config.workspace_id.clone(),
+        runtime_id: runtime_id.clone(),
+        runtime_worker_id: worker_id,
+        workdir_id: workdir_id.to_string(),
+        role: "attachment".to_string(),
+        linked_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        unlinked_at: None,
+    })?;
+    if let Err(error) =
+        open_current_worker_workdir_session_locked(&api, &runtime_id, worker_id, &link).await
+    {
+        let _ = api.store.detach_worker_workdir(
+            &api.config.workspace_id,
+            &runtime_id,
+            worker_id,
+            Some(workdir_id),
+            &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        );
+        return Err(error.into());
+    }
+    Ok(Json(CurrentWorkerWorkdirAttachmentResponse {
+        workspace_id: api.config.workspace_id.clone(),
+        workdir_id: workdir_id.to_string(),
+        attached: true,
+    }))
+}
+
+async fn scoped_detach_current_worker_workdir(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    headers: HeaderMap,
+) -> ApiResult<Json<CurrentWorkerWorkdirAttachmentResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let (runtime_id, worker_id) = current_worker_identity(&api, &path.workspace_id, &headers)?;
+    let session_lock = current_worker_session_lock(&api, &runtime_id, worker_id);
+    let _session_guard = session_lock.lock().await;
+    let link = current_worker_active_attachment(&api, &runtime_id, worker_id)?;
+    close_current_worker_session_locked(&api, &runtime_id, worker_id).await?;
+    api.store.detach_worker_workdir(
+        &api.config.workspace_id,
+        &runtime_id,
+        worker_id,
+        Some(&link.workdir_id),
+        &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+    )?;
+    Ok(Json(CurrentWorkerWorkdirAttachmentResponse {
+        workspace_id: api.config.workspace_id.clone(),
+        workdir_id: link.workdir_id,
+        attached: false,
+    }))
+}
+
+async fn scoped_execute_current_worker_workdir_operation(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    headers: HeaderMap,
+    Json(operation): Json<WorkdirSessionOperation>,
+) -> ApiResult<Json<WorkdirSessionOperationResult>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let (runtime_id, worker_id) = current_worker_identity(&api, &path.workspace_id, &headers)?;
+    let session_lock = current_worker_session_lock(&api, &runtime_id, worker_id);
+    let _session_guard = session_lock.lock().await;
+    let link = current_worker_active_attachment(&api, &runtime_id, worker_id)?;
+    let session =
+        open_current_worker_workdir_session_locked(&api, &runtime_id, worker_id, &link).await?;
+    let result = execute_workdir_session_operation(&session, operation)
+        .await
+        .map_err(|error| Error::RuntimeOperationFailed {
+            runtime_id,
+            code: "workdir_session_operation_failed".to_string(),
+            message: error.to_string(),
+        })?;
+    Ok(Json(result))
+}
+
+async fn execute_workdir_session_operation(
+    session: &WorkdirSessionHandle,
+    operation: WorkdirSessionOperation,
+) -> std::result::Result<WorkdirSessionOperationResult, workdir::WorkdirError> {
+    match operation {
+        WorkdirSessionOperation::Stat(request) => session
+            .stat(request)
+            .await
+            .map(WorkdirSessionOperationResult::Stat),
+        WorkdirSessionOperation::Read(request) => session
+            .read(request)
+            .await
+            .map(WorkdirSessionOperationResult::Read),
+        WorkdirSessionOperation::Write(request) => session
+            .write(request)
+            .await
+            .map(WorkdirSessionOperationResult::Write),
+        WorkdirSessionOperation::Edit(request) => session
+            .edit(request)
+            .await
+            .map(WorkdirSessionOperationResult::Edit),
+        WorkdirSessionOperation::List(request) => session
+            .list(request)
+            .await
+            .map(WorkdirSessionOperationResult::List),
+        WorkdirSessionOperation::Glob(request) => session
+            .glob(request)
+            .await
+            .map(WorkdirSessionOperationResult::Glob),
+        WorkdirSessionOperation::Grep(request) => session
+            .grep(request)
+            .await
+            .map(WorkdirSessionOperationResult::Grep),
+        WorkdirSessionOperation::CommandStart(request) => session
+            .start_command(request)
+            .await
+            .map(WorkdirSessionOperationResult::CommandStart),
+        WorkdirSessionOperation::CommandStatus(handle) => session
+            .command_status(handle)
+            .await
+            .map(WorkdirSessionOperationResult::CommandStatus),
+        WorkdirSessionOperation::CommandOutput(request) => session
+            .command_output(request)
+            .await
+            .map(WorkdirSessionOperationResult::CommandOutput),
+        WorkdirSessionOperation::CommandCancel(handle) => session
+            .cancel_command(handle)
+            .await
+            .map(|()| WorkdirSessionOperationResult::CommandCancel),
+    }
+}
+
 async fn run_orchestrator_turn_end_hook(api: WorkspaceApi) {
     let Ok(mut subscription) = api.runtime_subscription_broker.subscribe(
         EMBEDDED_WORKER_RUNTIME_ID,
@@ -4331,7 +4767,7 @@ fn cleanup_plan_digest(
     Ok(format!("sha256:{digest}"))
 }
 
-fn execute_runtime_cleanup(
+async fn execute_runtime_cleanup(
     api: &WorkspaceApi,
     runtime_id: &str,
     request: ExecuteRuntimeCleanupRequest,
@@ -4375,12 +4811,20 @@ fn execute_runtime_cleanup(
             ));
         }
         let runtime_worker_id = parse_runtime_worker_id_for_registry(&candidate.runtime_worker_id)?;
+        let session_lock = current_worker_session_lock(api, runtime_id, runtime_worker_id);
+        let _session_guard = session_lock.lock().await;
+        close_current_worker_session_locked(api, runtime_id, runtime_worker_id).await?;
         cleanup_runtime_worker_for_execution(api, runtime_id, candidate)?;
         api.store.delete_worker_registry(
             &api.config.workspace_id,
             candidate.runtime_id.as_str(),
             runtime_worker_id,
         )?;
+        drop(_session_guard);
+        api.workdir_session_locks
+            .lock()
+            .expect("Workdir session lock registry poisoned")
+            .remove(&(runtime_id.to_string(), runtime_worker_id));
         results.push(RuntimeCleanupExecutionResult {
             target_id: candidate.target_id.clone(),
             action: candidate.action.clone(),
@@ -4813,7 +5257,7 @@ async fn scoped_execute_runtime_cleanup(
     Json(request): Json<ExecuteRuntimeCleanupRequest>,
 ) -> ApiResult<Json<RuntimeCleanupExecutionResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let response = execute_runtime_cleanup(&api, path.runtime_id.as_str(), request)?;
+    let response = execute_runtime_cleanup(&api, path.runtime_id.as_str(), request).await?;
     Ok(Json(response))
 }
 
@@ -6200,7 +6644,12 @@ fn record_browser_worker_spawn(
         let workdir_record =
             workdir_record_from_summary(api, worker.runtime_id.as_str(), working_directory);
         api.store.upsert_workdir_registry(&workdir_record)?;
-        link_worker_to_workdir(api, &worker_record, &working_directory.working_directory_id)?;
+        link_worker_to_workdir(
+            api,
+            &worker_record,
+            &working_directory.working_directory_id,
+            None,
+        )?;
     }
     if let Some(workdir_id) = selected_working_directory_id.as_deref() {
         if api
@@ -6228,7 +6677,7 @@ fn record_browser_worker_spawn(
             .get_workdir_registry(&api.config.workspace_id, workdir_id)?
             .is_some()
         {
-            link_worker_to_workdir(api, &worker_record, workdir_id)?;
+            link_worker_to_workdir(api, &worker_record, workdir_id, None)?;
         }
     }
     let runtime_id = worker.runtime_id.clone();
@@ -6533,7 +6982,7 @@ async fn create_runtime_worker(
                     .get_workdir_registry(&api.config.workspace_id, workdir_id)?
                     .is_some()
                 {
-                    link_worker_to_workdir(&api, &record, workdir_id)?;
+                    link_worker_to_workdir(&api, &record, workdir_id, None)?;
                 }
             }
         }
@@ -6614,6 +7063,9 @@ async fn stop_runtime_worker(
         .stop_worker(&runtime_id, &worker_id, request)
         .map_err(|err| err.into_error())?;
     let runtime_worker_id = parse_runtime_worker_id_for_registry(&worker_id)?;
+    let session_lock = current_worker_session_lock(&api, &runtime_id, runtime_worker_id);
+    let _session_guard = session_lock.lock().await;
+    close_current_worker_session_locked(&api, &runtime_id, runtime_worker_id).await?;
     if let Some(record) =
         api.store
             .get_worker_registry(&api.config.workspace_id, &runtime_id, runtime_worker_id)?
@@ -8033,7 +8485,7 @@ fn sync_worker_observation(
         let workdir_record =
             workdir_record_from_summary(api, worker.runtime_id.as_str(), working_directory);
         api.store.upsert_workdir_registry(&workdir_record)?;
-        link_worker_to_workdir(api, &record, &working_directory.working_directory_id)?;
+        link_worker_to_workdir(api, &record, &working_directory.working_directory_id, None)?;
     }
     Ok(record)
 }
@@ -8326,18 +8778,24 @@ fn link_worker_to_workdir(
     api: &WorkspaceApi,
     worker_record: &WorkerRegistryRecord,
     workdir_id: &str,
+    reservation_id: Option<&str>,
 ) -> ApiResult<()> {
     let timestamp = now_registry_timestamp();
-    api.store
-        .upsert_worker_workdir_link(&WorkerWorkdirLinkRecord {
-            workspace_id: api.config.workspace_id.clone(),
-            runtime_id: worker_record.runtime_id.clone(),
-            runtime_worker_id: worker_record.runtime_worker_id.clone(),
-            workdir_id: workdir_id.to_string(),
-            role: "primary_cwd".to_string(),
-            linked_at: timestamp,
-            unlinked_at: None,
-        })?;
+    let record = WorkerWorkdirLinkRecord {
+        workspace_id: api.config.workspace_id.clone(),
+        runtime_id: worker_record.runtime_id.clone(),
+        runtime_worker_id: worker_record.runtime_worker_id,
+        workdir_id: workdir_id.to_string(),
+        role: "attachment".to_string(),
+        linked_at: timestamp,
+        unlinked_at: None,
+    };
+    if let Some(reservation_id) = reservation_id {
+        api.store
+            .finalize_reserved_worker_workdir_attachment(&record, reservation_id)?;
+    } else {
+        api.store.attach_worker_workdir(&record)?;
+    }
     Ok(())
 }
 
@@ -8740,7 +9198,9 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.error {
-            Error::TicketAssignmentConflict(_) => StatusCode::CONFLICT,
+            Error::TicketAssignmentConflict(_) | Error::WorkdirAttachmentConflict(_) => {
+                StatusCode::CONFLICT
+            }
             Error::WorkerSourceIdentity(_) => StatusCode::BAD_REQUEST,
             Error::InvalidRuntimeIdentifier { .. } | Error::ReservedWorkerName(_) => {
                 StatusCode::BAD_REQUEST
@@ -8931,7 +9391,7 @@ mod tests {
             runtime_id: worker.runtime_id.clone(),
             runtime_worker_id: worker.runtime_worker_id.clone(),
             workdir_id: workdir.workdir_id.clone(),
-            role: "primary_cwd".to_string(),
+            role: "attachment".to_string(),
             linked_at: "4".to_string(),
             unlinked_at: None,
         };
@@ -9085,12 +9545,12 @@ mod tests {
             })
             .unwrap();
         api.store
-            .upsert_worker_workdir_link(&WorkerWorkdirLinkRecord {
+            .attach_worker_workdir(&WorkerWorkdirLinkRecord {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 runtime_worker_id: 7,
                 workdir_id: "managed".to_string(),
-                role: "primary_cwd".to_string(),
+                role: "attachment".to_string(),
                 linked_at: "3".to_string(),
                 unlinked_at: None,
             })
@@ -10741,12 +11201,12 @@ mod tests {
     fn seed_cleanup_link(api: &WorkspaceApi, runtime_worker_id: &str, workdir_id: &str) {
         let runtime_worker_id = runtime_worker_id.parse::<u64>().unwrap();
         api.store
-            .upsert_worker_workdir_link(&WorkerWorkdirLinkRecord {
+            .attach_worker_workdir(&WorkerWorkdirLinkRecord {
                 workspace_id: api.config.workspace_id.clone(),
                 runtime_id: "runtime-test".to_string(),
                 runtime_worker_id,
                 workdir_id: workdir_id.to_string(),
-                role: "primary".to_string(),
+                role: "attachment".to_string(),
                 linked_at: now_registry_timestamp(),
                 unlinked_at: None,
             })
@@ -10764,6 +11224,54 @@ mod tests {
             registered_workdir_runtime_id(&api, "remote-workdir").unwrap(),
             "runtime-test"
         );
+    }
+
+    #[tokio::test]
+    async fn current_worker_workdir_routes_require_a_live_runtime_worker_identity() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let response = build_router(api)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/w/{TEST_WORKSPACE_ID}/workers/self/workdir-attachment"
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"workdir_id": "wd"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn backend_workdir_session_proxy_executes_typed_operations() {
+        use manifest::Scope;
+        use workdir::LocalWorkdirSession;
+
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("visible.txt"), "attached").unwrap();
+        let session: WorkdirSessionHandle = Arc::new(LocalWorkdirSession::new(
+            Scope::writable(root.path()).unwrap(),
+            root.path().to_path_buf(),
+        ));
+        let result = execute_workdir_session_operation(
+            &session,
+            WorkdirSessionOperation::List(workdir::ListRequest {
+                path: workdir::WorkdirPath::root(),
+                limit: 10,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            WorkdirSessionOperationResult::List(ref result)
+                if result.entries.iter().any(|entry| entry.path.as_str().ends_with("visible.txt"))
+        ));
     }
 
     #[tokio::test]
@@ -10884,7 +11392,11 @@ mod tests {
             workdir_target_ids: Vec::new(),
             confirm_dirty_discard_target_ids: Vec::new(),
         };
-        assert!(execute_runtime_cleanup(&api, "runtime-test", stale).is_err());
+        assert!(
+            execute_runtime_cleanup(&api, "runtime-test", stale)
+                .await
+                .is_err()
+        );
         let pinned = ExecuteRuntimeCleanupRequest {
             expected_plan_revision: plan.revision,
             expected_plan_digest: plan.digest,
@@ -10892,7 +11404,11 @@ mod tests {
             workdir_target_ids: Vec::new(),
             confirm_dirty_discard_target_ids: Vec::new(),
         };
-        assert!(execute_runtime_cleanup(&api, "runtime-test", pinned).is_err());
+        assert!(
+            execute_runtime_cleanup(&api, "runtime-test", pinned)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -10925,7 +11441,11 @@ mod tests {
             workdir_target_ids: vec![dirty_target],
             confirm_dirty_discard_target_ids: Vec::new(),
         };
-        assert!(execute_runtime_cleanup(&api, "runtime-test", missing_confirmation).is_err());
+        assert!(
+            execute_runtime_cleanup(&api, "runtime-test", missing_confirmation)
+                .await
+                .is_err()
+        );
         let delete_removed = ExecuteRuntimeCleanupRequest {
             expected_plan_revision: plan.revision,
             expected_plan_digest: plan.digest,
@@ -10934,6 +11454,7 @@ mod tests {
             confirm_dirty_discard_target_ids: Vec::new(),
         };
         let response = execute_runtime_cleanup(&api, "runtime-test", delete_removed)
+            .await
             .unwrap_or_else(|err| panic!("cleanup execution: {}", err.error));
         assert_eq!(response.results[0].status, "deleted");
         assert!(

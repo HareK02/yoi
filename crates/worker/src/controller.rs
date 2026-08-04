@@ -599,6 +599,18 @@ where
     // Worker-immutable snapshots taken before the mutable worker borrow
     // below so the worker borrow doesn't conflict with reads on `worker`.
     let scope_handle = worker.scope().clone();
+    let feature_config = worker.manifest().feature.clone();
+    if feature_config.manage_workdir.enabled {
+        if let Some(existing) = worker.workdir_session().cloned() {
+            existing.close().await.map_err(std::io::Error::other)?;
+        }
+        let workspace_client = worker.workspace_client_handle();
+        worker.bind_workdir_session(Some(
+            crate::feature::builtin::manage_workdir::WorkspaceAttachedWorkdirSession::handle(
+                workspace_client,
+            ),
+        ));
+    }
     let worker_workdir = worker.workdir_session().cloned();
     let local_filesystem = worker.local_working_directory().cloned();
     let local_workspace_root = local_filesystem.as_ref().map(|local| local.root.clone());
@@ -606,7 +618,6 @@ where
     let memory_config = worker.manifest().memory.clone();
     let web_config = worker.manifest().web.clone();
     let mcp_config = worker.manifest().mcp.clone();
-    let feature_config = worker.manifest().feature.clone();
     let spawner_name = worker.manifest().worker.name.clone();
     let spawner_manifest = worker.manifest().clone();
     let prompts = worker.prompts().clone();

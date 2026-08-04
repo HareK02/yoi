@@ -127,6 +127,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "drop Ticket notification outbox",
         apply: drop_ticket_notification_tables,
     },
+    Migration {
+        version: 23,
+        name: "enforce exclusive Worker Workdir attachments and spawn reservations",
+        apply: enforce_exclusive_worker_workdir_attachments,
+    },
 ];
 
 struct Migration {
@@ -618,7 +623,42 @@ pub trait ControlPlaneStore: Send + Sync {
     ) -> Result<Vec<WorkdirRegistryRecord>>;
     fn delete_workdir_registry(&self, workspace_id: &str, workdir_id: &str) -> Result<bool>;
 
-    fn upsert_worker_workdir_link(&self, record: &WorkerWorkdirLinkRecord) -> Result<()>;
+    fn reserve_worker_workdir_attachment(
+        &self,
+        workspace_id: &str,
+        workdir_id: &str,
+        reservation_id: &str,
+        reserved_at: &str,
+    ) -> Result<()>;
+    fn release_worker_workdir_attachment_reservation(
+        &self,
+        workspace_id: &str,
+        workdir_id: &str,
+        reservation_id: &str,
+    ) -> Result<()>;
+    fn finalize_reserved_worker_workdir_attachment(
+        &self,
+        record: &WorkerWorkdirLinkRecord,
+        reservation_id: &str,
+    ) -> Result<WorkerWorkdirLinkRecord>;
+    fn attach_worker_workdir(
+        &self,
+        record: &WorkerWorkdirLinkRecord,
+    ) -> Result<WorkerWorkdirLinkRecord>;
+    fn detach_worker_workdir(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        runtime_worker_id: u64,
+        expected_workdir_id: Option<&str>,
+        unlinked_at: &str,
+    ) -> Result<Option<WorkerWorkdirLinkRecord>>;
+    fn worker_workdir_link_history_exists(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        runtime_worker_id: u64,
+    ) -> Result<bool>;
     fn list_worker_workdir_links(
         &self,
         workspace_id: &str,
@@ -1680,10 +1720,18 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         runtime_worker_id: u64,
     ) -> Result<bool> {
         self.with_conn(|conn| {
-            let changed = conn.execute(
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                r#"UPDATE worker_workdir_links
+                   SET unlinked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3 AND unlinked_at IS NULL"#,
+                params![workspace_id, runtime_id, runtime_worker_id],
+            )?;
+            let changed = tx.execute(
                 "DELETE FROM worker_registry WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3",
                 params![workspace_id, runtime_id, runtime_worker_id],
             )?;
+            tx.commit()?;
             Ok(changed > 0)
         })
     }
@@ -2173,23 +2221,147 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
 
     fn delete_workdir_registry(&self, workspace_id: &str, workdir_id: &str) -> Result<bool> {
         self.with_conn(|conn| {
-            let changed = conn.execute(
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let blocked: bool = tx.query_row(
+                r#"SELECT EXISTS(
+                    SELECT 1 FROM worker_workdir_links
+                    WHERE workspace_id = ?1 AND workdir_id = ?2 AND unlinked_at IS NULL
+                    UNION ALL
+                    SELECT 1 FROM worker_workdir_attachment_reservations
+                    WHERE workspace_id = ?1 AND workdir_id = ?2
+                )"#,
+                params![workspace_id, workdir_id],
+                |row| row.get(0),
+            )?;
+            if blocked {
+                return Err(Error::WorkdirAttachmentConflict(format!(
+                    "Workdir {workdir_id} has an active or pending Worker attachment"
+                )));
+            }
+            let changed = tx.execute(
                 "DELETE FROM workdir_registry WHERE workspace_id = ?1 AND workdir_id = ?2",
                 params![workspace_id, workdir_id],
             )?;
+            tx.commit()?;
             Ok(changed > 0)
         })
     }
 
-    fn upsert_worker_workdir_link(&self, record: &WorkerWorkdirLinkRecord) -> Result<()> {
+    fn reserve_worker_workdir_attachment(
+        &self,
+        workspace_id: &str,
+        workdir_id: &str,
+        reservation_id: &str,
+        reserved_at: &str,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let registered: bool = tx.query_row(
+                r#"SELECT EXISTS(
+                    SELECT 1 FROM workdir_registry
+                    WHERE workspace_id = ?1 AND workdir_id = ?2
+                )"#,
+                params![workspace_id, workdir_id],
+                |row| row.get(0),
+            )?;
+            if !registered {
+                return Err(Error::WorkdirAttachmentConflict(format!(
+                    "Workdir {workdir_id} is not registered in Workspace {workspace_id}"
+                )));
+            }
+            let occupied: bool = tx.query_row(
+                r#"SELECT EXISTS(
+                    SELECT 1 FROM worker_workdir_links
+                    WHERE workspace_id = ?1 AND workdir_id = ?2 AND unlinked_at IS NULL
+                )"#,
+                params![workspace_id, workdir_id],
+                |row| row.get(0),
+            )?;
+            if occupied {
+                return Err(Error::WorkdirAttachmentConflict(format!(
+                    "Workdir {workdir_id} already has an active attachment"
+                )));
+            }
+            tx.execute(
+                r#"INSERT INTO worker_workdir_attachment_reservations (
+                    workspace_id, workdir_id, reservation_id, reserved_at
+                ) VALUES (?1, ?2, ?3, ?4)"#,
+                params![workspace_id, workdir_id, reservation_id, reserved_at],
+            )
+            .map_err(|error| {
+                if matches!(error, rusqlite::Error::SqliteFailure(ref code, _) if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY || code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE)
+                {
+                    Error::WorkdirAttachmentConflict(format!(
+                        "Workdir {workdir_id} already has a pending attachment reservation"
+                    ))
+                } else {
+                    error.into()
+                }
+            })?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    fn release_worker_workdir_attachment_reservation(
+        &self,
+        workspace_id: &str,
+        workdir_id: &str,
+        reservation_id: &str,
+    ) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute(
+                r#"DELETE FROM worker_workdir_attachment_reservations
+                   WHERE workspace_id = ?1 AND workdir_id = ?2 AND reservation_id = ?3"#,
+                params![workspace_id, workdir_id, reservation_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn finalize_reserved_worker_workdir_attachment(
+        &self,
+        record: &WorkerWorkdirLinkRecord,
+        reservation_id: &str,
+    ) -> Result<WorkerWorkdirLinkRecord> {
+        if record.role != "attachment" || record.unlinked_at.is_some() {
+            return Err(Error::WorkdirAttachmentConflict(
+                "reserved attachment finalization requires an active canonical attachment"
+                    .to_string(),
+            ));
+        }
+        self.with_conn(|conn| {
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let owns_reservation: bool = tx.query_row(
+                r#"SELECT EXISTS(
+                    SELECT 1 FROM worker_workdir_attachment_reservations
+                    WHERE workspace_id = ?1 AND workdir_id = ?2 AND reservation_id = ?3
+                )"#,
+                params![record.workspace_id, record.workdir_id, reservation_id],
+                |row| row.get(0),
+            )?;
+            if !owns_reservation {
+                return Err(Error::WorkdirAttachmentConflict(format!(
+                    "Workdir {} attachment reservation is missing or owned by another spawn",
+                    record.workdir_id
+                )));
+            }
+            tx.execute(
                 r#"INSERT INTO worker_workdir_links (
                     workspace_id, runtime_id, runtime_worker_id, workdir_id, role, linked_at, unlinked_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
                 ON CONFLICT(workspace_id, runtime_id, runtime_worker_id, workdir_id, role) DO UPDATE SET
                     linked_at = excluded.linked_at,
-                    unlinked_at = excluded.unlinked_at"#,
+                    unlinked_at = NULL"#,
                 params![
                     record.workspace_id,
                     record.runtime_id,
@@ -2197,10 +2369,213 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     record.workdir_id,
                     record.role,
                     record.linked_at,
-                    record.unlinked_at,
                 ],
+            )
+            .map_err(|error| {
+                if matches!(error, rusqlite::Error::SqliteFailure(ref code, _) if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE)
+                {
+                    Error::WorkdirAttachmentConflict(
+                        "Worker or Workdir acquired another active attachment".to_string(),
+                    )
+                } else {
+                    error.into()
+                }
+            })?;
+            tx.execute(
+                r#"DELETE FROM worker_workdir_attachment_reservations
+                   WHERE workspace_id = ?1 AND workdir_id = ?2 AND reservation_id = ?3"#,
+                params![record.workspace_id, record.workdir_id, reservation_id],
             )?;
-            Ok(())
+            tx.commit()?;
+            Ok(record.clone())
+        })
+    }
+
+    fn attach_worker_workdir(
+        &self,
+        record: &WorkerWorkdirLinkRecord,
+    ) -> Result<WorkerWorkdirLinkRecord> {
+        if record.role != "attachment" {
+            return Err(Error::WorkdirAttachmentConflict(format!(
+                "unsupported Workdir attachment role `{}`",
+                record.role
+            )));
+        }
+        if record.unlinked_at.is_some() {
+            return Err(Error::WorkdirAttachmentConflict(
+                "a new attachment cannot already be unlinked".to_string(),
+            ));
+        }
+        self.with_conn(|conn| {
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let registered: bool = tx.query_row(
+                r#"SELECT EXISTS(
+                    SELECT 1 FROM workdir_registry
+                    WHERE workspace_id = ?1 AND workdir_id = ?2
+                )"#,
+                params![record.workspace_id, record.workdir_id],
+                |row| row.get(0),
+            )?;
+            if !registered {
+                return Err(Error::WorkdirAttachmentConflict(format!(
+                    "Workdir {} is not registered in Workspace {}",
+                    record.workdir_id, record.workspace_id
+                )));
+            }
+            let reserved: bool = tx.query_row(
+                r#"SELECT EXISTS(
+                    SELECT 1 FROM worker_workdir_attachment_reservations
+                    WHERE workspace_id = ?1 AND workdir_id = ?2
+                )"#,
+                params![record.workspace_id, record.workdir_id],
+                |row| row.get(0),
+            )?;
+            if reserved {
+                return Err(Error::WorkdirAttachmentConflict(format!(
+                    "Workdir {} has a pending attachment reservation",
+                    record.workdir_id
+                )));
+            }
+            let active_for_worker = tx
+                .query_row(
+                    r#"SELECT workspace_id, runtime_id, runtime_worker_id, workdir_id, role, linked_at, unlinked_at
+                       FROM worker_workdir_links
+                       WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3 AND unlinked_at IS NULL"#,
+                    params![
+                        record.workspace_id,
+                        record.runtime_id,
+                        record.runtime_worker_id,
+                    ],
+                    read_worker_workdir_link_record,
+                )
+                .optional()?;
+            if let Some(active) = active_for_worker {
+                if active.workdir_id == record.workdir_id {
+                    tx.commit()?;
+                    return Ok(active);
+                }
+                return Err(Error::WorkdirAttachmentConflict(format!(
+                    "Worker {}:{} is already attached to Workdir {}",
+                    record.runtime_id, record.runtime_worker_id, active.workdir_id
+                )));
+            }
+            let active_for_workdir = tx
+                .query_row(
+                    r#"SELECT workspace_id, runtime_id, runtime_worker_id, workdir_id, role, linked_at, unlinked_at
+                       FROM worker_workdir_links
+                       WHERE workspace_id = ?1 AND workdir_id = ?2 AND unlinked_at IS NULL"#,
+                    params![record.workspace_id, record.workdir_id],
+                    read_worker_workdir_link_record,
+                )
+                .optional()?;
+            if let Some(active) = active_for_workdir {
+                return Err(Error::WorkdirAttachmentConflict(format!(
+                    "Workdir {} is already attached to Worker {}:{}",
+                    record.workdir_id, active.runtime_id, active.runtime_worker_id
+                )));
+            }
+            let write = tx.execute(
+                r#"INSERT INTO worker_workdir_links (
+                    workspace_id, runtime_id, runtime_worker_id, workdir_id, role, linked_at, unlinked_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
+                ON CONFLICT(workspace_id, runtime_id, runtime_worker_id, workdir_id, role) DO UPDATE SET
+                    linked_at = excluded.linked_at,
+                    unlinked_at = NULL"#,
+                params![
+                    record.workspace_id,
+                    record.runtime_id,
+                    record.runtime_worker_id,
+                    record.workdir_id,
+                    record.role,
+                    record.linked_at,
+                ],
+            );
+            if let Err(error) = write {
+                if matches!(error, rusqlite::Error::SqliteFailure(ref code, _) if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE)
+                {
+                    return Err(Error::WorkdirAttachmentConflict(
+                        "Worker or Workdir acquired another active attachment".to_string(),
+                    ));
+                }
+                return Err(error.into());
+            }
+            tx.commit()?;
+            Ok(record.clone())
+        })
+    }
+
+    fn detach_worker_workdir(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        runtime_worker_id: u64,
+        expected_workdir_id: Option<&str>,
+        unlinked_at: &str,
+    ) -> Result<Option<WorkerWorkdirLinkRecord>> {
+        self.with_conn(|conn| {
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let active = tx
+                .query_row(
+                    r#"SELECT workspace_id, runtime_id, runtime_worker_id, workdir_id, role, linked_at, unlinked_at
+                       FROM worker_workdir_links
+                       WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3 AND unlinked_at IS NULL"#,
+                    params![workspace_id, runtime_id, runtime_worker_id],
+                    read_worker_workdir_link_record,
+                )
+                .optional()?;
+            let Some(active) = active else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            if let Some(expected_workdir_id) = expected_workdir_id {
+                if active.workdir_id != expected_workdir_id {
+                    return Err(Error::WorkdirAttachmentConflict(format!(
+                        "Worker {runtime_id}:{runtime_worker_id} is attached to Workdir {}, not {expected_workdir_id}",
+                        active.workdir_id
+                    )));
+                }
+            }
+            let changed = tx.execute(
+                r#"UPDATE worker_workdir_links
+                   SET unlinked_at = ?4
+                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3 AND unlinked_at IS NULL"#,
+                params![workspace_id, runtime_id, runtime_worker_id, unlinked_at],
+            )?;
+            if changed != 1 {
+                return Err(Error::WorkdirAttachmentConflict(format!(
+                    "Worker {runtime_id}:{runtime_worker_id} attachment changed during detach"
+                )));
+            }
+            tx.commit()?;
+            Ok(Some(WorkerWorkdirLinkRecord {
+                unlinked_at: Some(unlinked_at.to_string()),
+                ..active
+            }))
+        })
+    }
+
+    fn worker_workdir_link_history_exists(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        runtime_worker_id: u64,
+    ) -> Result<bool> {
+        self.with_conn(|conn| {
+            let exists = conn.query_row(
+                r#"SELECT EXISTS(
+                    SELECT 1 FROM worker_workdir_links
+                    WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3
+                )"#,
+                params![workspace_id, runtime_id, runtime_worker_id],
+                |row| row.get(0),
+            )?;
+            Ok(exists)
         })
     }
 
@@ -3037,6 +3412,29 @@ DROP TABLE IF EXISTS ticket_notification_outbox;
     Ok(())
 }
 
+fn enforce_exclusive_worker_workdir_attachments(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+CREATE TABLE IF NOT EXISTS worker_workdir_attachment_reservations (
+    workspace_id TEXT NOT NULL,
+    workdir_id TEXT NOT NULL,
+    reservation_id TEXT NOT NULL,
+    reserved_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, workdir_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_worker_workdir_attachment_reservation_id
+    ON worker_workdir_attachment_reservations(workspace_id, reservation_id);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_worker_workdir_links_active_worker
+    ON worker_workdir_links(workspace_id, runtime_id, runtime_worker_id)
+    WHERE unlinked_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_worker_workdir_links_active_workdir
+    ON worker_workdir_links(workspace_id, workdir_id)
+    WHERE unlinked_at IS NULL;
+"#,
+    )?;
+    Ok(())
+}
+
 fn create_objective_event_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -3722,7 +4120,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 22);
+        assert_eq!(store.schema_version().await.unwrap(), 23);
         assert!(
             !store
                 .with_conn(|conn| table_exists(conn, "worker_workspace_credentials"))
@@ -3739,7 +4137,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 22);
+        assert_eq!(reopened.schema_version().await.unwrap(), 23);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -4190,7 +4588,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 22);
+        assert_eq!(store.schema_version().await.unwrap(), 23);
 
         store
             .with_conn(|conn| {
@@ -4379,7 +4777,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 22);
+        assert_eq!(store.schema_version().await.unwrap(), 23);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -4417,7 +4815,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 22);
+        assert_eq!(store.schema_version().await.unwrap(), 23);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -4560,13 +4958,39 @@ CREATE TABLE ticket_assignment_operations (
         let link = WorkerWorkdirLinkRecord {
             workspace_id: "local-dev".to_string(),
             runtime_id: worker.runtime_id.clone(),
-            runtime_worker_id: worker.runtime_worker_id.clone(),
+            runtime_worker_id: worker.runtime_worker_id,
             workdir_id: workdir.workdir_id.clone(),
-            role: "primary_cwd".to_string(),
+            role: "attachment".to_string(),
             linked_at: "4".to_string(),
             unlinked_at: None,
         };
-        store.upsert_worker_workdir_link(&link).unwrap();
+        store
+            .reserve_worker_workdir_attachment("local-dev", &workdir.workdir_id, "spawn-1", "4")
+            .unwrap();
+        assert!(matches!(
+            store.reserve_worker_workdir_attachment(
+                "local-dev",
+                &workdir.workdir_id,
+                "spawn-2",
+                "4"
+            ),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
+        assert!(matches!(
+            store.delete_workdir_registry("local-dev", &workdir.workdir_id),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
+        assert!(matches!(
+            store.attach_worker_workdir(&link),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
+        assert_eq!(
+            store
+                .finalize_reserved_worker_workdir_attachment(&link, "spawn-1")
+                .unwrap(),
+            link
+        );
+        assert_eq!(store.attach_worker_workdir(&link).unwrap(), link);
 
         assert_eq!(
             store
@@ -4588,14 +5012,60 @@ CREATE TABLE ticket_assignment_operations (
             store
                 .list_worker_workdir_links("local-dev", "embedded", 1)
                 .unwrap(),
-            vec![link]
+            vec![link.clone()]
+        );
+
+        let worker_conflict = WorkerWorkdirLinkRecord {
+            workdir_id: unmanaged_workdir.workdir_id.clone(),
+            linked_at: "5".to_string(),
+            ..link.clone()
+        };
+        assert!(matches!(
+            store.attach_worker_workdir(&worker_conflict),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
+
+        let second_worker = WorkerRegistryRecord {
+            runtime_worker_id: 2,
+            display_name: "Browser 2".to_string(),
+            created_at: "5".to_string(),
+            updated_at: "5".to_string(),
+            ..worker.clone()
+        };
+        store.upsert_worker_registry(&second_worker).unwrap();
+        let workdir_conflict = WorkerWorkdirLinkRecord {
+            runtime_worker_id: second_worker.runtime_worker_id,
+            linked_at: "5".to_string(),
+            ..link.clone()
+        };
+        assert!(matches!(
+            store.attach_worker_workdir(&workdir_conflict),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
+        assert!(matches!(
+            store.detach_worker_workdir("local-dev", "embedded", 1, Some("wrong-workdir"), "6"),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
+        let detached = store
+            .detach_worker_workdir("local-dev", "embedded", 1, Some(&workdir.workdir_id), "6")
+            .unwrap()
+            .unwrap();
+        assert_eq!(detached.unlinked_at.as_deref(), Some("6"));
+        assert!(
+            store
+                .worker_workdir_link_history_exists("local-dev", "embedded", 1)
+                .unwrap()
+        );
+        assert_eq!(
+            store.attach_worker_workdir(&workdir_conflict).unwrap(),
+            workdir_conflict
         );
     }
 
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 22);
+        assert_eq!(store.schema_version().await.unwrap(), 23);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),

@@ -13,6 +13,13 @@ use llm_engine::tool::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use workdir::http::{WorkdirSessionOperation, WorkdirSessionOperationResult};
+use workdir::{
+    CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest, CommandStatus, EditRequest,
+    EditResult, GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest, ListResult,
+    ReadRequest, ReadResult, StatRequest, StatResult, Workdir, WorkdirError, WorkdirSession,
+    WorkdirSessionCapabilities, WorkdirSessionHandle, WriteRequest, WriteResult,
+};
 
 use crate::feature::{
     FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureModule, ToolContribution,
@@ -27,10 +34,14 @@ const FEATURE_DESCRIPTION: &str =
 
 const LIST_TOOL: &str = "WorkdirList";
 const CREATE_TOOL: &str = "WorkdirCreate";
+const ATTACH_TOOL: &str = "WorkdirAttach";
+const DETACH_TOOL: &str = "WorkdirDetach";
 const DELETE_TOOL: &str = "WorkdirDelete";
 
 const LIST_DESCRIPTION: &str = "List persistent Workdirs in the current Workspace through Backend Workspace API authority. The result contains safe summaries and diagnostics, never host paths or Runtime connection details.";
-const CREATE_DESCRIPTION: &str = "Materialize a persistent Workdir on a selected Runtime from a Workspace repository and optional selector. Repository resolution and materialization remain Backend/Runtime authority.";
+const CREATE_DESCRIPTION: &str = "Materialize a persistent Workdir on a selected Runtime from a Workspace repository and optional selector. This does not change this Worker's attachment; use WorkdirAttach explicitly after creation.";
+const ATTACH_DESCRIPTION: &str = "Attach this Worker to one existing Workdir. The Backend enforces one active Workdir per Worker and one active Worker per Workdir, then opens an ephemeral operation session.";
+const DETACH_DESCRIPTION: &str = "Detach this Worker from its active Workdir and release Workdir occupancy. Any ephemeral operation session is closed.";
 const DELETE_DESCRIPTION: &str = "Delete one persistent Workdir by id through Backend Workspace API authority. Occupied, blocked, or dirty Workdirs requiring confirmation are rejected.";
 
 #[derive(Clone, Debug)]
@@ -54,6 +65,8 @@ impl FeatureModule for ManageWorkdirFeature {
             .with_description(FEATURE_DESCRIPTION)
             .with_tool(ToolDeclaration::new(LIST_TOOL, LIST_DESCRIPTION))
             .with_tool(ToolDeclaration::new(CREATE_TOOL, CREATE_DESCRIPTION))
+            .with_tool(ToolDeclaration::new(ATTACH_TOOL, ATTACH_DESCRIPTION))
+            .with_tool(ToolDeclaration::new(DETACH_TOOL, DETACH_DESCRIPTION))
             .with_tool(ToolDeclaration::new(DELETE_TOOL, DELETE_DESCRIPTION))
     }
 
@@ -81,6 +94,26 @@ impl FeatureModule for ManageWorkdirFeature {
                 ),
             ),
             (
+                ATTACH_TOOL,
+                workdir_tool(
+                    ATTACH_TOOL,
+                    ATTACH_DESCRIPTION,
+                    attach_schema(),
+                    backend.clone(),
+                    WorkdirOperation::Attach,
+                ),
+            ),
+            (
+                DETACH_TOOL,
+                workdir_tool(
+                    DETACH_TOOL,
+                    DETACH_DESCRIPTION,
+                    detach_schema(),
+                    backend.clone(),
+                    WorkdirOperation::Detach,
+                ),
+            ),
+            (
                 DELETE_TOOL,
                 workdir_tool(
                     DELETE_TOOL,
@@ -102,6 +135,164 @@ impl FeatureModule for ManageWorkdirFeature {
 #[derive(Clone, Debug)]
 struct WorkspaceHttpWorkdirBackend {
     client: Arc<dyn WorkspaceClient>,
+}
+
+/// Worker-local Workdir handle whose operation authority remains in the Workspace Backend.
+///
+/// The Backend resolves the caller from the identity-bound [`WorkspaceClient`] and routes each
+/// operation to that Worker's active attachment. Runtime endpoints, credentials, and ephemeral
+/// session ids remain outside model-visible tool contracts.
+#[derive(Debug)]
+pub struct WorkspaceAttachedWorkdirSession {
+    client: Arc<dyn WorkspaceClient>,
+    workdir: Workdir,
+}
+
+impl WorkspaceAttachedWorkdirSession {
+    pub fn handle(client: Arc<dyn WorkspaceClient>) -> WorkdirSessionHandle {
+        Arc::new(Self {
+            client,
+            workdir: Workdir::new("workspace-attachment"),
+        })
+    }
+
+    fn operate(
+        &self,
+        operation: WorkdirSessionOperation,
+    ) -> Result<WorkdirSessionOperationResult, WorkdirError> {
+        let workspace_id = self.client.workspace_id().ok_or_else(|| {
+            WorkdirError::Unavailable("Workspace identity is unavailable".to_string())
+        })?;
+        let request = WorkspaceRequest::json(
+            WorkspaceRequestMethod::Post,
+            format!(
+                "/api/w/{}/workers/self/workdir-session/operations",
+                encode_path_segment(workspace_id)
+            ),
+            serde_json::to_string(&operation).map_err(|error| {
+                WorkdirError::Unavailable(format!(
+                    "failed to encode Workspace Workdir operation: {error}"
+                ))
+            })?,
+        );
+        let response = self
+            .client
+            .execute(request)
+            .map_err(|error| WorkdirError::Unavailable(error.to_string()))?;
+        if !response.is_success() {
+            return Err(WorkdirError::Unavailable(format!(
+                "Workspace Workdir API returned HTTP {}: {}",
+                response.status,
+                bounded_error_body(&response.body)
+            )));
+        }
+        serde_json::from_str(&response.body).map_err(|error| {
+            WorkdirError::Unavailable(format!(
+                "failed to decode Workspace Workdir operation result: {error}"
+            ))
+        })
+    }
+
+    fn mismatch(expected: &str) -> WorkdirError {
+        WorkdirError::Unavailable(format!(
+            "Workspace Backend returned a mismatched Workdir operation result; expected {expected}"
+        ))
+    }
+}
+
+#[async_trait]
+impl WorkdirSession for WorkspaceAttachedWorkdirSession {
+    fn workdir(&self) -> &Workdir {
+        &self.workdir
+    }
+
+    fn capabilities(&self) -> WorkdirSessionCapabilities {
+        WorkdirSessionCapabilities::ALL
+    }
+
+    async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {
+        match self.operate(WorkdirSessionOperation::Stat(request))? {
+            WorkdirSessionOperationResult::Stat(result) => Ok(result),
+            _ => Err(Self::mismatch("stat")),
+        }
+    }
+
+    async fn read(&self, request: ReadRequest) -> Result<ReadResult, WorkdirError> {
+        match self.operate(WorkdirSessionOperation::Read(request))? {
+            WorkdirSessionOperationResult::Read(result) => Ok(result),
+            _ => Err(Self::mismatch("read")),
+        }
+    }
+
+    async fn write(&self, request: WriteRequest) -> Result<WriteResult, WorkdirError> {
+        match self.operate(WorkdirSessionOperation::Write(request))? {
+            WorkdirSessionOperationResult::Write(result) => Ok(result),
+            _ => Err(Self::mismatch("write")),
+        }
+    }
+
+    async fn edit(&self, request: EditRequest) -> Result<EditResult, WorkdirError> {
+        match self.operate(WorkdirSessionOperation::Edit(request))? {
+            WorkdirSessionOperationResult::Edit(result) => Ok(result),
+            _ => Err(Self::mismatch("edit")),
+        }
+    }
+
+    async fn list(&self, request: ListRequest) -> Result<ListResult, WorkdirError> {
+        match self.operate(WorkdirSessionOperation::List(request))? {
+            WorkdirSessionOperationResult::List(result) => Ok(result),
+            _ => Err(Self::mismatch("list")),
+        }
+    }
+
+    async fn glob(&self, request: GlobRequest) -> Result<GlobResult, WorkdirError> {
+        match self.operate(WorkdirSessionOperation::Glob(request))? {
+            WorkdirSessionOperationResult::Glob(result) => Ok(result),
+            _ => Err(Self::mismatch("glob")),
+        }
+    }
+
+    async fn grep(&self, request: GrepRequest) -> Result<GrepResult, WorkdirError> {
+        match self.operate(WorkdirSessionOperation::Grep(request))? {
+            WorkdirSessionOperationResult::Grep(result) => Ok(result),
+            _ => Err(Self::mismatch("grep")),
+        }
+    }
+
+    async fn start_command(&self, request: CommandRequest) -> Result<CommandHandle, WorkdirError> {
+        match self.operate(WorkdirSessionOperation::CommandStart(request))? {
+            WorkdirSessionOperationResult::CommandStart(result) => Ok(result),
+            _ => Err(Self::mismatch("command_start")),
+        }
+    }
+
+    async fn command_status(&self, handle: CommandHandle) -> Result<CommandStatus, WorkdirError> {
+        match self.operate(WorkdirSessionOperation::CommandStatus(handle))? {
+            WorkdirSessionOperationResult::CommandStatus(result) => Ok(result),
+            _ => Err(Self::mismatch("command_status")),
+        }
+    }
+
+    async fn command_output(
+        &self,
+        request: CommandOutputRequest,
+    ) -> Result<CommandOutput, WorkdirError> {
+        match self.operate(WorkdirSessionOperation::CommandOutput(request))? {
+            WorkdirSessionOperationResult::CommandOutput(result) => Ok(result),
+            _ => Err(Self::mismatch("command_output")),
+        }
+    }
+
+    async fn cancel_command(&self, handle: CommandHandle) -> Result<(), WorkdirError> {
+        match self.operate(WorkdirSessionOperation::CommandCancel(handle))? {
+            WorkdirSessionOperationResult::CommandCancel => Ok(()),
+            _ => Err(Self::mismatch("command_cancel")),
+        }
+    }
+
+    async fn close(&self) -> Result<(), WorkdirError> {
+        Ok(())
+    }
 }
 
 impl WorkspaceHttpWorkdirBackend {
@@ -154,6 +345,37 @@ impl WorkspaceHttpWorkdirBackend {
         )
     }
 
+    fn attach(&self, input: WorkdirAttachInput) -> Result<ToolOutput, ToolError> {
+        let workdir_id = validate_identity(&input.workdir_id, ATTACH_TOOL, "workdir_id")?;
+        let response = self.attach_response(workdir_id)?;
+        workdir_output(format!("Attached to Workdir {workdir_id}"), &response)
+    }
+
+    fn attach_response(&self, workdir_id: &str) -> Result<WorkdirAttachmentResponse, ToolError> {
+        let workspace_id = encode_path_segment(self.workspace_id()?);
+        self.execute_json::<WorkdirAttachmentResponse>(WorkspaceRequest::json(
+            WorkspaceRequestMethod::Post,
+            format!("/api/w/{workspace_id}/workers/self/workdir-attachment"),
+            serde_json::to_string(&WorkdirAttachRequest {
+                workdir_id: workdir_id.to_string(),
+            })
+            .map_err(decode_error)?,
+        ))
+    }
+
+    fn detach(&self) -> Result<ToolOutput, ToolError> {
+        let workspace_id = encode_path_segment(self.workspace_id()?);
+        let response = self.execute_json::<WorkdirAttachmentResponse>(WorkspaceRequest {
+            method: WorkspaceRequestMethod::Delete,
+            path: format!("/api/w/{workspace_id}/workers/self/workdir-attachment"),
+            body: None,
+        })?;
+        workdir_output(
+            format!("Detached from Workdir {}", response.workdir_id),
+            &response,
+        )
+    }
+
     fn delete(&self, input: WorkdirDeleteInput) -> Result<ToolOutput, ToolError> {
         let workdir_id = validate_identity(
             &input.working_directory_id,
@@ -185,6 +407,8 @@ impl WorkspaceHttpWorkdirBackend {
 enum WorkdirOperation {
     List,
     Create,
+    Attach,
+    Detach,
     Delete,
 }
 
@@ -229,6 +453,13 @@ impl Tool for WorkspaceHttpWorkdirTool {
             WorkdirOperation::Create => self
                 .backend
                 .create(parse_input::<WorkdirCreateInput>(input_json)?),
+            WorkdirOperation::Attach => self
+                .backend
+                .attach(parse_input::<WorkdirAttachInput>(input_json)?),
+            WorkdirOperation::Detach => {
+                let _input = parse_input::<WorkdirDetachInput>(input_json)?;
+                self.backend.detach()
+            }
             WorkdirOperation::Delete => self
                 .backend
                 .delete(parse_input::<WorkdirDeleteInput>(input_json)?),
@@ -337,6 +568,21 @@ fn create_schema() -> serde_json::Value {
     })
 }
 
+fn attach_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["workdir_id"],
+        "properties": {
+            "workdir_id": {"type": "string", "minLength": 1}
+        }
+    })
+}
+
+fn detach_schema() -> serde_json::Value {
+    list_schema()
+}
+
 fn delete_schema() -> serde_json::Value {
     json!({
         "type": "object",
@@ -367,6 +613,28 @@ struct WorkdirCreateRequest {
     repository_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     selector: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkdirAttachInput {
+    workdir_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkdirDetachInput {}
+
+#[derive(Debug, Serialize)]
+struct WorkdirAttachRequest {
+    workdir_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkdirAttachmentResponse {
+    workspace_id: String,
+    workdir_id: String,
+    attached: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -407,8 +675,12 @@ struct WorkdirSummary {
     status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cleanliness: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    primary_worker_id: Option<u64>,
+    #[serde(
+        default,
+        alias = "primary_worker_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    attached_worker_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     occupied_by: Option<WorkdirOccupancy>,
 }
@@ -525,7 +797,16 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(descriptor.id.as_str(), "builtin:manage-workdir");
-        assert_eq!(names, [LIST_TOOL, CREATE_TOOL, DELETE_TOOL]);
+        assert_eq!(
+            names,
+            [
+                LIST_TOOL,
+                CREATE_TOOL,
+                ATTACH_TOOL,
+                DETACH_TOOL,
+                DELETE_TOOL
+            ]
+        );
     }
 
     #[test]
@@ -544,9 +825,24 @@ mod tests {
         assert!(report.reports[0].installed);
         assert_eq!(
             report.installed_tool_names(),
-            [LIST_TOOL, CREATE_TOOL, DELETE_TOOL]
+            [
+                LIST_TOOL,
+                CREATE_TOOL,
+                ATTACH_TOOL,
+                DETACH_TOOL,
+                DELETE_TOOL
+            ]
         );
-        assert_eq!(names, [LIST_TOOL, CREATE_TOOL, DELETE_TOOL]);
+        assert_eq!(
+            names,
+            [
+                LIST_TOOL,
+                CREATE_TOOL,
+                ATTACH_TOOL,
+                DETACH_TOOL,
+                DELETE_TOOL
+            ]
+        );
     }
 
     #[test]
@@ -587,11 +883,13 @@ mod tests {
         assert_eq!(create["required"], json!(["runtime_id", "repository_id"]));
         assert!(create["properties"].get("path").is_none());
         assert!(create["properties"].get("session_id").is_none());
+        assert_eq!(attach_schema()["required"], json!(["workdir_id"]));
+        assert!(attach_schema()["properties"].get("session_id").is_none());
         assert_eq!(delete_schema()["required"], json!(["working_directory_id"]));
     }
 
     #[test]
-    fn list_create_and_delete_use_scoped_workspace_authority_paths() {
+    fn list_create_explicit_attach_detach_and_delete_use_scoped_workspace_authority_paths() {
         let client = Arc::new(RecordingWorkspaceClient::new(vec![
             response(json!({
                 "workspace_id": "workspace/test",
@@ -602,6 +900,16 @@ mod tests {
                 "workspace_id": "workspace/test",
                 "item": workdir_json("wd-created"),
                 "diagnostics": []
+            })),
+            response(json!({
+                "workspace_id": "workspace/test",
+                "workdir_id": "wd-created",
+                "attached": true
+            })),
+            response(json!({
+                "workspace_id": "workspace/test",
+                "workdir_id": "wd-created",
+                "attached": false
             })),
             response(json!({
                 "workspace_id": "workspace/test",
@@ -617,13 +925,25 @@ mod tests {
         let backend = WorkspaceHttpWorkdirBackend::new(client.clone());
 
         backend.list().unwrap();
-        backend
+        let created = backend
             .create(WorkdirCreateInput {
                 runtime_id: "runtime/one".to_string(),
                 repository_id: "main".to_string(),
                 selector: Some("refs/heads/topic".to_string()),
             })
             .unwrap();
+        assert_eq!(created.summary, "Created Workdir wd-created");
+        let created: serde_json::Value =
+            serde_json::from_str(created.content.as_deref().unwrap()).unwrap();
+        assert_eq!(created["item"]["working_directory_id"], "wd-created");
+        assert!(created.get("attachment").is_none());
+        assert_eq!(client.requests().len(), 2);
+        backend
+            .attach(WorkdirAttachInput {
+                workdir_id: "wd-created".to_string(),
+            })
+            .unwrap();
+        backend.detach().unwrap();
         backend
             .delete(WorkdirDeleteInput {
                 working_directory_id: "wd-created".to_string(),
@@ -647,9 +967,46 @@ mod tests {
         assert_eq!(body["selector"], "refs/heads/topic");
         assert_eq!(
             requests[2].path,
+            "/api/w/workspace%2Ftest/workers/self/workdir-attachment"
+        );
+        assert_eq!(requests[2].method, WorkspaceRequestMethod::Post);
+        assert_eq!(
+            requests[3].path,
+            "/api/w/workspace%2Ftest/workers/self/workdir-attachment"
+        );
+        assert_eq!(requests[3].method, WorkspaceRequestMethod::Delete);
+        assert_eq!(
+            requests[4].path,
             "/api/w/workspace%2Ftest/working-directories/wd-created"
         );
-        assert_eq!(requests[2].method, WorkspaceRequestMethod::Delete);
+        assert_eq!(requests[4].method, WorkspaceRequestMethod::Delete);
+    }
+
+    #[tokio::test]
+    async fn attached_session_proxies_operations_without_runtime_or_session_arguments() {
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![response(json!({
+            "operation": "stat",
+            "result": {"path": "visible.txt", "kind": "file", "size": 8}
+        }))]));
+        let session = WorkspaceAttachedWorkdirSession::handle(client.clone());
+        let result = session
+            .stat(StatRequest {
+                path: workdir::WorkdirPath::new("visible.txt").unwrap(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.size, 8);
+        let requests = client.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].path,
+            "/api/w/workspace%2Ftest/workers/self/workdir-session/operations"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["operation"], "stat");
+        assert!(body.get("runtime_id").is_none());
+        assert!(body.get("session_id").is_none());
     }
 
     #[test]
