@@ -5,6 +5,7 @@
 //! an external plugin-loading surface.
 
 pub mod manage_workdir;
+pub mod manage_worker;
 pub mod memory;
 pub mod objective;
 pub mod session_explore;

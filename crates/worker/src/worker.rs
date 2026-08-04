@@ -654,7 +654,7 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// and compaction so updates propagate at the next permission check.
     scope: SharedScope,
     /// Filesystem authority this Worker may pass to spawned children. Direct tools
-    /// continue to use `scope`; SpawnWorker validates requested child scope here.
+    /// continue to use `scope`; SubWorkerSpawn validates requested child scope here.
     delegation_scope: DelegationScope,
     hook_builder: HookRegistryBuilder,
     interceptor_installed: bool,
@@ -3794,7 +3794,7 @@ where
     /// The Worker's working directory is captured once here from the
     /// process's `std::env::current_dir()` — callers that want a
     /// different cwd must `cd` before constructing the Worker (e.g. the
-    /// `SpawnWorker` tool sets `Command::current_dir` on the child). The
+    /// `SubWorkerSpawn` tool sets `Command::current_dir` on the child). The
     /// captured cwd is canonicalised and validated against
     /// `manifest.scope`.
     ///

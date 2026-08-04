@@ -125,7 +125,7 @@ pub enum WorkerEvent {
     /// Child has stopped (controller loop is exiting).
     ShutDown { worker_name: String },
 
-    /// Child sub-delegated scope to a grandchild Worker via `SpawnWorker`.
+    /// Child SubWorker sub-delegated scope to a grandchild SubWorker via `SubWorkerSpawn`.
     ///
     /// Control-plane only: receivers apply registry side effects and
     /// propagate upward, but do not expose this as an agent notification.

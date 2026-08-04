@@ -25,7 +25,8 @@ feature = {
     task = { enabled = true; };
     memory = { enabled = true; };
     web = { enabled = true; };
-    workers = { enabled = true; };
+    sub_worker = { enabled = true; };
+    worker = { enabled = false; };
     objective = { enabled = true; };
     ticket = { enabled = true; authoring = true; thread = true; };
 };

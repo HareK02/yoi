@@ -331,7 +331,7 @@ impl Scope {
 
     /// Build a new [`Scope`] equal to `self` with `extra_deny` appended
     /// to the deny set. Used by dynamic-scope shrink paths
-    /// (e.g. SpawnWorker-style delegation that strips Write from the
+    /// (e.g. SubWorkerSpawn-style delegation that strips Write from the
     /// spawner without touching its allow rules).
     pub fn with_added_deny_rules(
         &self,

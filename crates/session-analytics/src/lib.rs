@@ -1598,8 +1598,22 @@ fn tool_kind(name: &str) -> &'static str {
         "Read" | "Write" | "Edit" | "Glob" | "Grep" => "filesystem",
         "Bash" => "shell",
         "WebFetch" | "WebSearch" => "web",
-        "SpawnWorker" | "SendToWorker" | "SendToPeerWorker" | "ReadWorkerOutput"
-        | "ListWorkers" | "StopWorker" | "RestoreWorker" => "worker",
+        "SubWorkerSpawn"
+        | "SubWorkerSend"
+        | "SubWorkerReadOutput"
+        | "SubWorkerList"
+        | "SubWorkerStop"
+        | "WorkerList"
+        | "WorkerSpawn"
+        | "WorkerStop"
+        | "WorkerRestore"
+        | "SpawnWorker"
+        | "SendToWorker"
+        | "SendToPeerWorker"
+        | "ReadWorkerOutput"
+        | "ListWorkers"
+        | "StopWorker"
+        | "RestoreWorker" => "worker",
         // Legacy session logs used the pre-rename peer tool name; keep analytics classification only.
         /* legacy session-log tool name only */
         LEGACY_SEND_TO_PEER_POD_TOOL => "worker",

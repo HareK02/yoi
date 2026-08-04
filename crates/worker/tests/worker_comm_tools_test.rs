@@ -1,5 +1,5 @@
-//! Integration tests for the worker-comm tools (`SendToWorker`,
-//! `ReadWorkerOutput`, `StopWorker`).
+//! Integration tests for the worker-comm tools (`SubWorkerSend`,
+//! `SubWorkerReadOutput`, `SubWorkerStop`).
 //!
 //! The real child Worker binary is not started. Instead each test stands
 //! up a mock `UnixListener` that speaks the socket protocol directly:
@@ -25,7 +25,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use worker::runtime::dir::{RuntimeDir, SpawnedWorkerRecord};
 use worker::runtime::worker_allocation::{self, LockFileGuard};
-use worker::spawn::comm_tools::{read_worker_output_tool, send_to_worker_tool, stop_worker_tool};
+use worker::spawn::comm_tools::{
+    sub_worker_read_output_tool, sub_worker_send_tool, sub_worker_stop_tool,
+};
 use worker::spawn::registry::SpawnedWorkerRegistry;
 
 /// Serialises env-mutating tests. The test harness runs tasks across
@@ -148,7 +150,7 @@ fn accept_one_method(listener: UnixListener) -> JoinHandle<Option<Method>> {
 }
 
 /// Accept one connection, send the protocol's connect-time snapshot,
-/// read one `Method`, then write `response` back. Used by `SendToWorker`
+/// read one `Method`, then write `response` back. Used by `SubWorkerSend`
 /// tests to mock the real controller's `TurnStart` acknowledgement (or
 /// its `AlreadyRunning` rejection).
 fn accept_method_and_respond(
@@ -171,7 +173,7 @@ fn accept_method_and_respond(
 
 /// Pretend to be a spawned Worker whose connect-time snapshot carries a
 /// fixed set of assistant items. Sends `Event::Snapshot` immediately on
-/// every accept — the real Worker does the same, so `ReadWorkerOutput`'s
+/// every accept — the real Worker does the same, so `SubWorkerReadOutput`'s
 /// `fetch_history` just consumes the first non-Alert event.
 fn serve_history(listener: UnixListener, items: Vec<Item>) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -249,7 +251,7 @@ fn assistant(text: &str) -> Item {
 }
 
 // ---------------------------------------------------------------------------
-// SendToWorker
+// SubWorkerSend
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -257,11 +259,11 @@ async fn send_to_worker_delivers_run_method() {
     let (tmp, registry, _rd) = setup_registry().await;
     let (socket, listener) = bind_mock_socket(tmp.path(), "child").await;
     // Mock the controller's accept path: after reading the method,
-    // ack with `TurnStart` so `SendToWorker`'s confirmation loop succeeds.
+    // ack with `TurnStart` so `SubWorkerSend`'s confirmation loop succeeds.
     let received = accept_method_and_respond(listener, Event::TurnStart { turn: 1 });
     register_child(&registry, "child", &socket, tmp.path()).await;
 
-    let def = send_to_worker_tool(registry);
+    let def = sub_worker_send_tool(registry);
     let (_meta, tool) = def();
     let input = json!({ "name": "child", "message": "hello there" }).to_string();
     let output: ToolOutput = tool.execute(&input, Default::default()).await.unwrap();
@@ -284,7 +286,7 @@ async fn send_to_worker_delivers_run_method() {
 #[tokio::test]
 async fn send_to_worker_errors_on_unknown_worker() {
     let (_tmp, registry, _rd) = setup_registry().await;
-    let def = send_to_worker_tool(registry);
+    let def = sub_worker_send_tool(registry);
     let (_meta, tool) = def();
     let input = json!({ "name": "nope", "message": "hi" }).to_string();
     let err = tool.execute(&input, Default::default()).await.unwrap_err();
@@ -306,7 +308,7 @@ async fn send_to_worker_errors_when_worker_already_running() {
     );
     register_child(&registry, "child", &socket, tmp.path()).await;
 
-    let def = send_to_worker_tool(registry);
+    let def = sub_worker_send_tool(registry);
     let (_meta, tool) = def();
     let input = json!({ "name": "child", "message": "hi" }).to_string();
     let err = tool.execute(&input, Default::default()).await.unwrap_err();
@@ -323,7 +325,7 @@ async fn send_to_worker_errors_when_worker_already_running() {
 }
 
 // ---------------------------------------------------------------------------
-// ReadWorkerOutput
+// SubWorkerReadOutput
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -339,7 +341,7 @@ async fn read_worker_output_returns_new_assistant_text_then_empty_on_second_call
     ];
     let _server = serve_history(listener, items);
 
-    let def = read_worker_output_tool(registry);
+    let def = sub_worker_read_output_tool(registry);
     let (_meta, tool) = def();
     let input = json!({ "name": "child" }).to_string();
 
@@ -370,7 +372,7 @@ async fn read_worker_output_reports_stopped_on_dead_socket() {
     let dead_socket = tmp.path().join("dead.sock");
     register_child(&registry, "child", &dead_socket, tmp.path()).await;
 
-    let def = read_worker_output_tool(registry);
+    let def = sub_worker_read_output_tool(registry);
     let (_meta, tool) = def();
     let input = json!({ "name": "child" }).to_string();
     let output: ToolOutput = tool.execute(&input, Default::default()).await.unwrap();
@@ -378,7 +380,7 @@ async fn read_worker_output_reports_stopped_on_dead_socket() {
 }
 
 // ---------------------------------------------------------------------------
-// StopWorker
+// SubWorkerStop
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -408,7 +410,7 @@ async fn stop_worker_sends_shutdown_and_releases_scope() {
 
     // Seed workers.json with a restored top-level `spawner` allocation whose
     // scope_deny contains the delegated child path plus the live child
-    // allocation — mimics a parent resumed after SpawnWorker.
+    // allocation — mimics a parent resumed after SubWorkerSpawn.
     {
         let mut g = LockFileGuard::open(&lock_path).unwrap();
         let rule = ScopeRule {
@@ -451,7 +453,7 @@ async fn stop_worker_sends_shutdown_and_releases_scope() {
     let received = accept_one_method(listener);
     register_child(&registry, "child", &socket, tmp.path()).await;
 
-    let def = stop_worker_tool(registry.clone());
+    let def = sub_worker_stop_tool(registry.clone());
     let (_meta, tool) = def();
     let input = json!({ "name": "child" }).to_string();
     let output: ToolOutput = tool.execute(&input, Default::default()).await.unwrap();
@@ -492,11 +494,11 @@ async fn stop_worker_succeeds_even_when_child_unreachable() {
     }
 
     // No live listener — socket never bound. Registered record points
-    // at a dead path. StopWorker should still clean up local bookkeeping.
+    // at a dead path. SubWorkerStop should still clean up local bookkeeping.
     let dead_socket = tmp.path().join("dead.sock");
     register_child(&registry, "child", &dead_socket, tmp.path()).await;
 
-    let def = stop_worker_tool(registry.clone());
+    let def = sub_worker_stop_tool(registry.clone());
     let (_meta, tool) = def();
     let input = json!({ "name": "child" }).to_string();
     let output: ToolOutput = tool.execute(&input, Default::default()).await.unwrap();
@@ -550,7 +552,7 @@ async fn restored_registry_uses_worker_state_without_runtime_file() {
     .await
     .unwrap();
 
-    let def = send_to_worker_tool(restored.clone());
+    let def = sub_worker_send_tool(restored.clone());
     let (_meta, tool) = def();
     let input = json!({ "name": "child", "message": "after restart" }).to_string();
     tool.execute(&input, Default::default()).await.unwrap();
@@ -562,7 +564,7 @@ async fn restored_registry_uses_worker_state_without_runtime_file() {
         other => panic!("expected Run, got {other:?}"),
     }
 
-    let def = stop_worker_tool(restored.clone());
+    let def = sub_worker_stop_tool(restored.clone());
     let (_meta, tool) = def();
     tool.execute(&json!({ "name": "child" }).to_string(), Default::default())
         .await

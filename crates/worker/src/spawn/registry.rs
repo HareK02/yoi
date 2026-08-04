@@ -1,12 +1,12 @@
 //! Shared registry of Workers spawned by this Worker.
 //!
-//! `SpawnWorker` writes here; the worker-comm tools (`SendToWorker`,
-//! `ReadWorkerOutput`, `StopWorker`) read and mutate the same instance. Discovery
+//! `SubWorkerSpawn` writes here; the worker-comm tools (`SubWorkerSend`,
+//! `SubWorkerReadOutput`, `SubWorkerStop`) read and mutate the same instance. Discovery
 //! tools consult this registry together with durable Worker state. Runtime
 //! write-through still materialises `spawned_workers.json`, but durable state lives
 //! in the spawner's Worker metadata.
 //!
-//! `ReadWorkerOutput` additionally owns a per-spawned-worker cursor here so
+//! `SubWorkerReadOutput` additionally owns a per-spawned-worker cursor here so
 //! two consecutive reads yield only new assistant text. The cursor is
 //! an item-index into the child's history; push-only history makes
 //! index stable across reads.

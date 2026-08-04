@@ -253,7 +253,7 @@ Unless explicitly authorized otherwise, final merge, cleanup, design-boundary de
 
 Before closing, verify concrete evidence:
 
-- child Worker output via `ReadWorkerOutput`;
+- SubWorker output via `SubWorkerReadOutput`;
 - worktree state and diff;
 - validation command output;
 - review result;

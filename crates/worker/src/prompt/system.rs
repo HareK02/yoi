@@ -206,12 +206,12 @@ struct ToolCapabilities {
     memory_query: bool,
     memory_read_document: bool,
     memory_update_document: bool,
-    worker_spawn: bool,
-    worker_send: bool,
-    worker_read_output: bool,
-    worker_stop: bool,
-    worker_list: bool,
-    worker_restore: bool,
+    sub_worker_spawn: bool,
+    sub_worker_send: bool,
+    sub_worker_read_output: bool,
+    sub_worker_stop: bool,
+    sub_worker_list: bool,
+    sub_worker_restore: bool,
 }
 
 impl ToolCapabilities {
@@ -222,12 +222,11 @@ impl ToolCapabilities {
                 "MemoryQuery" => capabilities.memory_query = true,
                 "MemoryReadDocument" => capabilities.memory_read_document = true,
                 "MemoryUpdateDocument" => capabilities.memory_update_document = true,
-                "SpawnWorker" => capabilities.worker_spawn = true,
-                "SendToWorker" => capabilities.worker_send = true,
-                "ReadWorkerOutput" => capabilities.worker_read_output = true,
-                "StopWorker" => capabilities.worker_stop = true,
-                "ListWorkers" => capabilities.worker_list = true,
-                "RestoreWorker" => capabilities.worker_restore = true,
+                "SubWorkerSpawn" => capabilities.sub_worker_spawn = true,
+                "SubWorkerSend" => capabilities.sub_worker_send = true,
+                "SubWorkerReadOutput" => capabilities.sub_worker_read_output = true,
+                "SubWorkerStop" => capabilities.sub_worker_stop = true,
+                "SubWorkerList" => capabilities.sub_worker_list = true,
                 _ => {}
             }
         }
@@ -246,13 +245,13 @@ impl ToolCapabilities {
         self.memory_update_document
     }
 
-    fn worker_management(self) -> bool {
-        self.worker_spawn
-            || self.worker_send
-            || self.worker_read_output
-            || self.worker_stop
-            || self.worker_list
-            || self.worker_restore
+    fn sub_worker_management(self) -> bool {
+        self.sub_worker_spawn
+            || self.sub_worker_send
+            || self.sub_worker_read_output
+            || self.sub_worker_stop
+            || self.sub_worker_list
+            || self.sub_worker_restore
     }
 
     fn to_minijinja_value(self) -> Value {
@@ -269,7 +268,10 @@ impl ToolCapabilities {
             Value::from(self.memory_update_document),
         );
         map.insert("memory_mutation", Value::from(self.memory_mutation()));
-        map.insert("worker_management", Value::from(self.worker_management()));
+        map.insert(
+            "sub_worker_management",
+            Value::from(self.sub_worker_management()),
+        );
         Value::from(map)
     }
 }
@@ -419,7 +421,7 @@ mod tests {
         .unwrap()
     }
 
-    fn worker_orchestration_instruction() -> FeatureInstructionDeclaration {
+    fn sub_worker_orchestration_instruction() -> FeatureInstructionDeclaration {
         FeatureInstructionDeclaration::new(
             crate::feature::FeatureInstructionId::builtin("worker.orchestration"),
             "$yoi/common/worker-orchestration",
@@ -595,13 +597,13 @@ mod tests {
         let tmpl = SystemPromptTemplate::parse("$yoi/default", loader).unwrap();
         let dir = TempDir::new().unwrap();
         let scope = build_scope(dir.path());
-        let instructions = [worker_orchestration_instruction()];
+        let instructions = [sub_worker_orchestration_instruction()];
         let mut ctx = ctx(dir.path(), &scope, vec!["Read".into()], None);
         ctx.feature_instructions = &instructions;
         let rendered = tmpl.render(&ctx).unwrap();
 
-        assert!(rendered.contains("## Worker orchestration"));
-        assert!(rendered.contains("spawned Worker notifications are background signals"));
+        assert!(rendered.contains("## SubWorker orchestration"));
+        assert!(rendered.contains("SubWorker notifications are background signals"));
         assert!(rendered.contains("does not need to keep a turn open"));
         assert!(rendered.contains("Do not use `sleep` or polling loops"));
         assert!(rendered.contains("worktree state, diff, and test results"));
@@ -610,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_orchestration_guidance_is_omitted_without_worker_management_tools() {
+    fn worker_orchestration_guidance_is_omitted_without_sub_worker_management_tools() {
         let loader = PromptLoader::builtins_only();
         let tmpl = SystemPromptTemplate::parse("$yoi/default", loader).unwrap();
         let dir = TempDir::new().unwrap();

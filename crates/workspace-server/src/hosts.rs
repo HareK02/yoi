@@ -3930,7 +3930,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_orchestrator_profile_enables_manage_workdir() {
+    fn embedded_orchestrator_profile_enables_workdir_and_worker_authority() {
         let root = tempfile::tempdir().unwrap();
         let broker = BackendResourceBroker::default();
         let runtime_id = "runtime-test";
@@ -3962,7 +3962,8 @@ mod tests {
             .unwrap();
 
         assert!(manifest.feature.manage_workdir.enabled);
-        assert!(!manifest.feature.workers.enabled);
+        assert!(!manifest.feature.sub_worker.enabled);
+        assert!(manifest.feature.worker.enabled);
     }
 
     #[test]

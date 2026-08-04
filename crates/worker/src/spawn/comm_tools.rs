@@ -1,6 +1,6 @@
 //! Worker-to-Worker communication tools.
 //!
-//! Three tools in one module: `SendToWorker`, `ReadWorkerOutput`, `StopWorker`,
+//! Three tools in one module: `SubWorkerSend`, `SubWorkerReadOutput`, `SubWorkerStop`,
 //! all built on the same `SpawnedWorkerRegistry` handed in by
 //! the controller. Each operation is request-response: connect to the
 //! target's Unix socket, perform one method exchange, disconnect.
@@ -18,7 +18,7 @@ use llm_engine::llm_client::types::{ContentPart, Item, Role};
 use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use protocol::stream::{JsonLineReader, JsonLineWriter};
 use protocol::{ErrorCode, Event, InvokeKind, Method};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use session_store::LogEntry;
 use tokio::net::UnixStream;
 
@@ -35,40 +35,96 @@ const SOCKET_OP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct NameInput {
-    /// Name of a previously spawned Worker.
+    /// Name of a previously spawned SubWorker.
     name: String,
 }
-
-// ---------------------------------------------------------------------------
-// SendToWorker
-// ---------------------------------------------------------------------------
-
-const SEND_TO_POD_DESCRIPTION: &str = "Send a text message to a previously spawned Worker. The spawned Worker \
-processes it as a user turn. Fails if the Worker is already executing a \
-turn — retry after it finishes. Does not wait for the turn to complete; \
-use `ReadWorkerOutput` to fetch results afterwards.";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct SendToWorkerInput {
-    /// Target Worker name.
+#[serde(deny_unknown_fields)]
+struct SubWorkerListInput {}
+
+#[derive(Debug, Serialize)]
+struct SubWorkerListItem {
     name: String,
-    /// Text delivered to the Worker as the next user message.
-    message: String,
 }
 
-struct SendToWorkerTool {
+struct SubWorkerListTool {
     registry: Arc<SpawnedWorkerRegistry>,
 }
 
 #[async_trait]
-impl Tool for SendToWorkerTool {
+impl Tool for SubWorkerListTool {
     async fn execute(
         &self,
         input_json: &str,
         _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
-        let input: SendToWorkerInput = serde_json::from_str(input_json)
-            .map_err(|e| ToolError::InvalidArgument(format!("invalid SendToWorker input: {e}")))?;
+        let _input: SubWorkerListInput = serde_json::from_str(input_json).map_err(|error| {
+            ToolError::InvalidArgument(format!("invalid SubWorkerList input: {error}"))
+        })?;
+        let items = self
+            .registry
+            .list()
+            .await
+            .into_iter()
+            .map(|record| SubWorkerListItem {
+                name: record.worker_name,
+            })
+            .collect::<Vec<_>>();
+        let count = items.len();
+        let content = serde_json::to_string_pretty(&serde_json::json!({ "sub_workers": items }))
+            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+        Ok(ToolOutput {
+            summary: format!("listed {count} child SubWorker(s)"),
+            content: Some(content),
+        })
+    }
+}
+
+pub fn sub_worker_list_tool(registry: Arc<SpawnedWorkerRegistry>) -> ToolDefinition {
+    Arc::new(move || {
+        let schema = schemars::schema_for!(SubWorkerListInput);
+        let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
+        let meta = ToolMeta::new("SubWorkerList")
+            .description("List child SubWorkers owned by this Worker. Peer Workers and general Runtime Workers are excluded.")
+            .input_schema(schema_value);
+        let tool: Arc<dyn Tool> = Arc::new(SubWorkerListTool {
+            registry: registry.clone(),
+        });
+        (meta, tool)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// SubWorkerSend
+// ---------------------------------------------------------------------------
+
+const SEND_TO_POD_DESCRIPTION: &str = "Send a text message to a previously spawned SubWorker. The SubWorker \
+processes it as a user turn. Fails if the SubWorker is already executing a \
+turn — retry after it finishes. Does not wait for the turn to complete; \
+use `SubWorkerReadOutput` to fetch results afterwards.";
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SubWorkerSendInput {
+    /// Target SubWorker name.
+    name: String,
+    /// Text delivered to the SubWorker as the next user message.
+    message: String,
+}
+
+struct SubWorkerSendTool {
+    registry: Arc<SpawnedWorkerRegistry>,
+}
+
+#[async_trait]
+impl Tool for SubWorkerSendTool {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_engine::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let input: SubWorkerSendInput = serde_json::from_str(input_json)
+            .map_err(|e| ToolError::InvalidArgument(format!("invalid SubWorkerSend input: {e}")))?;
         let record = self
             .registry
             .get(&input.name)
@@ -98,14 +154,14 @@ impl Tool for SendToWorkerTool {
     }
 }
 
-pub fn send_to_worker_tool(registry: Arc<SpawnedWorkerRegistry>) -> ToolDefinition {
+pub fn sub_worker_send_tool(registry: Arc<SpawnedWorkerRegistry>) -> ToolDefinition {
     Arc::new(move || {
-        let schema = schemars::schema_for!(SendToWorkerInput);
+        let schema = schemars::schema_for!(SubWorkerSendInput);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
-        let meta = ToolMeta::new("SendToWorker")
+        let meta = ToolMeta::new("SubWorkerSend")
             .description(SEND_TO_POD_DESCRIPTION)
             .input_schema(schema_value);
-        let tool: Arc<dyn Tool> = Arc::new(SendToWorkerTool {
+        let tool: Arc<dyn Tool> = Arc::new(SubWorkerSendTool {
             registry: registry.clone(),
         });
         (meta, tool)
@@ -113,27 +169,27 @@ pub fn send_to_worker_tool(registry: Arc<SpawnedWorkerRegistry>) -> ToolDefiniti
 }
 
 // ---------------------------------------------------------------------------
-// ReadWorkerOutput
+// SubWorkerReadOutput
 // ---------------------------------------------------------------------------
 
-const READ_POD_OUTPUT_DESCRIPTION: &str = "Fetch new assistant text from a spawned Worker since the last read. \
-Uses an internal cursor per-Worker so consecutive calls return only \
-newly-produced output. Returns the Worker's current status and the new \
-text, or reports `stopped` if the Worker can no longer be reached.";
+const READ_POD_OUTPUT_DESCRIPTION: &str = "Fetch new assistant text from a SubWorker since the last read. \
+Uses an internal cursor per-SubWorker so consecutive calls return only \
+newly-produced output. Returns the SubWorker's current status and the new \
+text, or reports `stopped` if the SubWorker can no longer be reached.";
 
-struct ReadWorkerOutputTool {
+struct SubWorkerReadOutputTool {
     registry: Arc<SpawnedWorkerRegistry>,
 }
 
 #[async_trait]
-impl Tool for ReadWorkerOutputTool {
+impl Tool for SubWorkerReadOutputTool {
     async fn execute(
         &self,
         input_json: &str,
         _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let input: NameInput = serde_json::from_str(input_json).map_err(|e| {
-            ToolError::InvalidArgument(format!("invalid ReadWorkerOutput input: {e}"))
+            ToolError::InvalidArgument(format!("invalid SubWorkerReadOutput input: {e}"))
         })?;
         let record = self
             .registry
@@ -178,14 +234,14 @@ impl Tool for ReadWorkerOutputTool {
     }
 }
 
-pub fn read_worker_output_tool(registry: Arc<SpawnedWorkerRegistry>) -> ToolDefinition {
+pub fn sub_worker_read_output_tool(registry: Arc<SpawnedWorkerRegistry>) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(NameInput);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
-        let meta = ToolMeta::new("ReadWorkerOutput")
+        let meta = ToolMeta::new("SubWorkerReadOutput")
             .description(READ_POD_OUTPUT_DESCRIPTION)
             .input_schema(schema_value);
-        let tool: Arc<dyn Tool> = Arc::new(ReadWorkerOutputTool {
+        let tool: Arc<dyn Tool> = Arc::new(SubWorkerReadOutputTool {
             registry: registry.clone(),
         });
         (meta, tool)
@@ -193,26 +249,26 @@ pub fn read_worker_output_tool(registry: Arc<SpawnedWorkerRegistry>) -> ToolDefi
 }
 
 // ---------------------------------------------------------------------------
-// StopWorker
+// SubWorkerStop
 // ---------------------------------------------------------------------------
 
-const STOP_POD_DESCRIPTION: &str = "Terminate a spawned Worker and reclaim the delegated scope. The Worker \
+const STOP_POD_DESCRIPTION: &str = "Terminate a spawned SubWorker and reclaim the delegated scope. The SubWorker \
 receives `Shutdown`; its scope entry is released in the machine-wide \
-registry so the spawner can spawn a new Worker over the same paths.";
+registry so the parent Worker can spawn a new SubWorker over the same paths.";
 
-struct StopWorkerTool {
+struct SubWorkerStopTool {
     registry: Arc<SpawnedWorkerRegistry>,
 }
 
 #[async_trait]
-impl Tool for StopWorkerTool {
+impl Tool for SubWorkerStopTool {
     async fn execute(
         &self,
         input_json: &str,
         _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let input: NameInput = serde_json::from_str(input_json)
-            .map_err(|e| ToolError::InvalidArgument(format!("invalid StopWorker input: {e}")))?;
+            .map_err(|e| ToolError::InvalidArgument(format!("invalid SubWorkerStop input: {e}")))?;
         let record = self
             .registry
             .get(&input.name)
@@ -244,14 +300,14 @@ impl Tool for StopWorkerTool {
     }
 }
 
-pub fn stop_worker_tool(registry: Arc<SpawnedWorkerRegistry>) -> ToolDefinition {
+pub fn sub_worker_stop_tool(registry: Arc<SpawnedWorkerRegistry>) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(NameInput);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
-        let meta = ToolMeta::new("StopWorker")
+        let meta = ToolMeta::new("SubWorkerStop")
             .description(STOP_POD_DESCRIPTION)
             .input_schema(schema_value);
-        let tool: Arc<dyn Tool> = Arc::new(StopWorkerTool {
+        let tool: Arc<dyn Tool> = Arc::new(SubWorkerStopTool {
             registry: registry.clone(),
         });
         (meta, tool)
@@ -335,13 +391,13 @@ where
     }
 }
 
-/// Failure modes distinguished by `SendToWorker`.
+/// Failure modes distinguished by `SubWorkerSend`.
 #[derive(Debug)]
 pub(crate) enum SendRunError {
-    /// Target Worker responded with `Error { AlreadyRunning }` — the
+    /// Target SubWorker responded with `Error { AlreadyRunning }` — the
     /// caller can retry once the current turn ends.
     AlreadyRunning,
-    /// Target Worker explicitly rejected the run after delivery reached the
+    /// Target SubWorker explicitly rejected the run after delivery reached the
     /// controller.
     Rejected { code: ErrorCode, message: String },
     /// Transport, protocol, timeout, or unexpected EOF before acceptance

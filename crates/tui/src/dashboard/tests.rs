@@ -823,7 +823,7 @@ fn ticket_queue_notification_message_carries_routing_contract() {
     assert!(message.contains("Read the Ticket"));
     assert!(message.contains("inspect current Orchestrator workspace state"));
     assert!(message.contains("transition state queued -> inprogress"));
-    assert!(message.contains("before any worktree/SpawnWorker implementation side effects"));
+    assert!(message.contains("before any worktree/WorkerSpawn implementation side effects"));
     assert!(message.contains("After inprogress acceptance"));
     assert!(message.contains("implementation worktree"));
     assert!(message.contains("tracked `.yoi` project records visible"));

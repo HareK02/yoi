@@ -1,4 +1,4 @@
-//! Integration tests for the `SpawnWorker` tool.
+//! Integration tests for the `SubWorkerSpawn` tool.
 //!
 //! These tests exercise the tool's worker-allocation delegation, subprocess
 //! launch, socket handoff, and `spawned_workers.json` write through an injected
@@ -24,7 +24,7 @@ use tokio::net::UnixListener;
 use worker::runtime::dir::{RuntimeDir, SpawnedWorkerRecord};
 use worker::runtime::worker_allocation::{self, LockFileGuard};
 use worker::spawn::registry::SpawnedWorkerRegistry;
-use worker::spawn::tool::spawn_worker_tool_with_runtime_command;
+use worker::spawn::tool::sub_worker_spawn_tool_with_runtime_command;
 
 /// Serialises tests that mutate `YOI_RUNTIME_DIR` across the
 /// thread-pooled test harness.
@@ -203,7 +203,7 @@ fn which_sh() -> String {
 }
 
 /// Tests don't exercise the model — they intercept the spawned
-/// child via a mock socket — but `spawn_worker_tool` needs a value to
+/// child via a mock socket — but `sub_worker_spawn_tool` needs a value to
 /// embed in the overlay TOML. Any well-formed `ModelManifest` works.
 fn dummy_model() -> ModelManifest {
     ModelManifest {
@@ -289,7 +289,7 @@ async fn spawn_worker_launches_runtime_in_workspace_and_process_cwd() {
     let received = accept_one_method(listener);
 
     let registry = SpawnedWorkerRegistry::new(spawner_rd);
-    let def = spawn_worker_tool_with_runtime_command(
+    let def = sub_worker_spawn_tool_with_runtime_command(
         "root".into(),
         spawner_socket,
         runtime_base,
@@ -349,7 +349,7 @@ async fn spawn_worker_omitted_cwd_preserves_spawner_cwd() {
     let received = accept_one_method(listener);
 
     let registry = SpawnedWorkerRegistry::new(spawner_rd);
-    let def = spawn_worker_tool_with_runtime_command(
+    let def = sub_worker_spawn_tool_with_runtime_command(
         "root".into(),
         spawner_socket,
         runtime_base,
@@ -400,7 +400,7 @@ async fn spawn_worker_delegates_scope_and_sends_run() {
 
     let registry = SpawnedWorkerRegistry::new(spawner_rd.clone());
     let spawner_scope = shared_scope_for(allow_root.path());
-    let def = spawn_worker_tool_with_runtime_command(
+    let def = sub_worker_spawn_tool_with_runtime_command(
         "root".into(),
         spawner_socket.clone(),
         runtime_base.clone(),
@@ -493,7 +493,7 @@ async fn spawn_worker_requires_explicit_delegation_even_with_direct_scope() {
     assert!(direct.is_writable(&allow_root.path().join("direct.txt")));
 
     let registry = SpawnedWorkerRegistry::new(spawner_rd.clone());
-    let def = spawn_worker_tool_with_runtime_command(
+    let def = sub_worker_spawn_tool_with_runtime_command(
         "root".into(),
         spawner_socket,
         runtime_base,
@@ -560,7 +560,7 @@ async fn spawn_worker_rejects_child_non_recursive_scope_under_parent_non_recursi
     let manifest = dummy_manifest_with_scopes(direct_scope, delegation_scope);
 
     let registry = SpawnedWorkerRegistry::new(spawner_rd.clone());
-    let def = spawn_worker_tool_with_runtime_command(
+    let def = sub_worker_spawn_tool_with_runtime_command(
         "root".into(),
         spawner_socket,
         runtime_base,
@@ -612,7 +612,7 @@ async fn spawn_worker_rejects_scope_outside_spawner() {
 
     let registry = SpawnedWorkerRegistry::new(spawner_rd);
     let spawner_scope = shared_scope_for(allow_root.path());
-    let def = spawn_worker_tool_with_runtime_command(
+    let def = sub_worker_spawn_tool_with_runtime_command(
         "root".into(),
         spawner_socket,
         runtime_base,
@@ -686,7 +686,7 @@ async fn spawn_worker_rolls_back_reservation_when_socket_never_appears() {
 
     let registry = SpawnedWorkerRegistry::new(spawner_rd);
     let spawner_scope = shared_scope_for(allow_root.path());
-    let def = spawn_worker_tool_with_runtime_command(
+    let def = sub_worker_spawn_tool_with_runtime_command(
         "root".into(),
         spawner_socket,
         runtime_base,

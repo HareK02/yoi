@@ -1,8 +1,8 @@
-//! `SpawnWorker` tool — launch a new Worker process as a child of this one.
+//! `SubWorkerSpawn` tool — launch a new SubWorker process as a child of this one.
 //!
 //! Wires worker-allocation delegation, child manifest-config construction, subprocess
 //! launch, and socket handoff into a single `Tool` implementation. When
-//! the LLM calls `SpawnWorker`, a fresh Worker runtime command is exec'd in its own
+//! the LLM calls `SubWorkerSpawn`, a fresh SubWorker runtime command is exec'd in its own
 //! process group, the worker-allocation is updated atomically, and the child's
 //! first turn is kicked off by handing its socket a `Method::Run`.
 
@@ -34,13 +34,13 @@ use crate::spawn::comm_tools::{SendRunError, send_run_and_confirm};
 use crate::spawn::registry::SpawnedWorkerRegistry;
 use protocol::WorkerEvent;
 
-/// How long we will wait for the spawned Worker's socket to become
+/// How long we will wait for the spawned SubWorker's socket to become
 /// connectable before treating the spawn as failed.
 const SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct SpawnWorkerInput {
-    /// Identifier for the spawned Worker. Must be unique machine-wide.
+struct SubWorkerSpawnInput {
+    /// Identifier for the spawned SubWorker. Must be unique machine-wide.
     name: String,
     /// Profile selector for child role configuration. Omit or use `default`
     /// for the effective child default profile, use `inherit` to derive
@@ -53,13 +53,13 @@ struct SpawnWorkerInput {
     #[serde(default)]
     instruction: Option<String>,
     /// Child process/tool working directory. This is not the runtime workspace
-    /// root and grants no filesystem authority. When omitted, the spawned Worker
+    /// root and grants no filesystem authority. When omitted, the spawned SubWorker
     /// starts in the spawner's current working directory.
     #[serde(default)]
     cwd: Option<PathBuf>,
-    /// First message sent to the spawned Worker via `Method::Run`.
+    /// First message sent to the spawned SubWorker via `Method::Run`.
     task: String,
-    /// Allow rules delegated to the spawned Worker. Must be a subset of the
+    /// Allow rules delegated to the spawned SubWorker. Must be a subset of the
     /// spawner's explicit delegation authority; direct tool scope alone is not
     /// sufficient. Omit `recursive` for normal workspace/worktree delegation; it defaults to true.
     scope: Vec<ScopeRuleInput>,
@@ -189,7 +189,7 @@ fn parse_spawn_profile_selector(raw: Option<&str>) -> Result<SpawnProfileSelecto
         || raw.ends_with(".nix")
     {
         return Err(format!(
-            "SpawnWorker.profile accepts `default`, `inherit`, or registry selectors only; path-like selector `{raw}` is not allowed"
+            "SubWorkerSpawn.profile accepts `default`, `inherit`, or registry selectors only; path-like selector `{raw}` is not allowed"
         ));
     }
     if let Some((prefix, name)) = raw.split_once(':') {
@@ -199,12 +199,14 @@ fn parse_spawn_profile_selector(raw: Option<&str>) -> Result<SpawnProfileSelecto
             "project" => ProfileRegistrySource::Project,
             _ => {
                 return Err(format!(
-                    "unsupported SpawnWorker.profile selector prefix `{prefix}`; use builtin:, user:, project:, default, or inherit"
+                    "unsupported SubWorkerSpawn.profile selector prefix `{prefix}`; use builtin:, user:, project:, default, or inherit"
                 ));
             }
         };
         if name.is_empty() {
-            return Err("SpawnWorker.profile registry selector has an empty profile name".into());
+            return Err(
+                "SubWorkerSpawn.profile registry selector has an empty profile name".into(),
+            );
         }
         return Ok(SpawnProfileSelector::Registry(
             ProfileSelector::source_named(source, name),
@@ -213,30 +215,30 @@ fn parse_spawn_profile_selector(raw: Option<&str>) -> Result<SpawnProfileSelecto
     Ok(SpawnProfileSelector::Registry(ProfileSelector::named(raw)))
 }
 
-/// Runtime dependencies the `SpawnWorker` tool needs in order to launch a
-/// child Worker and record the handoff locally. Constructed by the Worker
+/// Runtime dependencies the `SubWorkerSpawn` tool needs in order to launch a
+/// child SubWorker and record the handoff locally. Constructed by the Worker
 /// controller once per Worker lifetime.
-pub struct SpawnWorkerTool {
-    /// Spawner's own worker name — becomes the spawned Worker's
+pub struct SubWorkerSpawnTool {
+    /// Spawner's own worker name — becomes the spawned SubWorker's
     /// `delegated_from` in the worker-allocation.
     spawner_name: String,
     /// Path to the spawner's Unix socket. Handed to the child via
     /// `--callback` so its `WorkerEvent` callbacks have somewhere to land.
     callback_socket: PathBuf,
     /// Root of the `$XDG_RUNTIME_DIR/yoi/` tree, used to predict
-    /// the spawned Worker's socket path before the child has bound it.
+    /// the spawned SubWorker's socket path before the child has bound it.
     runtime_base: PathBuf,
     /// Inherited runtime workspace root for Profile/project/Ticket/workflow/
-    /// memory context. SpawnWorker `cwd` must not affect this value.
+    /// memory context. SubWorkerSpawn `cwd` must not affect this value.
     workspace_root: PathBuf,
-    /// Directory the spawned Worker's tools should use when the LLM did not
+    /// Directory the spawned SubWorker's tools should use when the LLM did not
     /// override it. Defaults to the spawner's cwd.
     spawner_cwd: PathBuf,
     /// Optional typed runtime command injected by tests. Production resolves
     /// the runtime command from `std::env::current_exe()` at launch time.
     runtime_command: Option<WorkerRuntimeCommand>,
     /// Shared registry of spawned children, also used by the
-    /// worker-comm tools (`SendToWorker` / `ReadWorkerOutput` / `StopWorker`) and by
+    /// worker-comm tools (`SubWorkerSend` / `SubWorkerReadOutput` / `SubWorkerStop`) and by
     /// Worker discovery. Writes the list to runtime and durable Worker state on
     /// each add.
     registry: Arc<SpawnedWorkerRegistry>,
@@ -266,7 +268,7 @@ pub struct SpawnWorkerTool {
     delegation_scope: DelegationScope,
 }
 
-impl SpawnWorkerTool {
+impl SubWorkerSpawnTool {
     fn new(
         spawner_name: String,
         callback_socket: PathBuf,
@@ -299,14 +301,15 @@ impl SpawnWorkerTool {
 }
 
 #[async_trait]
-impl Tool for SpawnWorkerTool {
+impl Tool for SubWorkerSpawnTool {
     async fn execute(
         &self,
         input_json: &str,
         _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
-        let input: SpawnWorkerInput = serde_json::from_str(input_json)
-            .map_err(|e| ToolError::InvalidArgument(format!("invalid SpawnWorker input: {e}")))?;
+        let input: SubWorkerSpawnInput = serde_json::from_str(input_json).map_err(|e| {
+            ToolError::InvalidArgument(format!("invalid SubWorkerSpawn input: {e}"))
+        })?;
 
         // `delegate_scope` catches this too (as `DuplicateWorkerName`), but
         // the dedicated message is kinder to the LLM — which gets the
@@ -438,7 +441,7 @@ impl Tool for SpawnWorkerTool {
     }
 }
 
-impl SpawnWorkerTool {
+impl SubWorkerSpawnTool {
     async fn exec_child(
         &self,
         worker_name: &str,
@@ -508,7 +511,7 @@ impl SpawnWorkerTool {
     fn validate_delegation_scope(&self, scope_allow: &[ScopeRule]) -> Result<(), ToolError> {
         if self.delegation_scope.is_empty() && !scope_allow.is_empty() {
             return Err(ToolError::InvalidArgument(
-                "SpawnWorker requires delegation authority, but this Worker has no delegation scope grant; direct filesystem scope only authorizes this Worker's own tools".into(),
+                "SubWorkerSpawn requires delegation authority, but this Worker has no delegation scope grant; direct filesystem scope only authorizes this Worker's own tools".into(),
             ));
         }
         for rule in scope_allow {
@@ -566,29 +569,32 @@ fn validate_spawn_cwd(
     };
     if !cwd.is_absolute() {
         return Err(ToolError::InvalidArgument(format!(
-            "SpawnWorker.cwd must be absolute: {}",
+            "SubWorkerSpawn.cwd must be absolute: {}",
             cwd.display()
         )));
     }
     let metadata = std::fs::metadata(cwd).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
-            ToolError::InvalidArgument(format!("SpawnWorker.cwd does not exist: {}", cwd.display()))
+            ToolError::InvalidArgument(format!(
+                "SubWorkerSpawn.cwd does not exist: {}",
+                cwd.display()
+            ))
         } else {
             ToolError::InvalidArgument(format!(
-                "SpawnWorker.cwd is not usable: {}: {e}",
+                "SubWorkerSpawn.cwd is not usable: {}: {e}",
                 cwd.display()
             ))
         }
     })?;
     if !metadata.is_dir() {
         return Err(ToolError::InvalidArgument(format!(
-            "SpawnWorker.cwd must be a directory: {}",
+            "SubWorkerSpawn.cwd must be a directory: {}",
             cwd.display()
         )));
     }
     let canonical = std::fs::canonicalize(cwd).map_err(|e| {
         ToolError::InvalidArgument(format!(
-            "SpawnWorker.cwd is not usable: {}: {e}",
+            "SubWorkerSpawn.cwd is not usable: {}: {e}",
             cwd.display()
         ))
     })?;
@@ -598,12 +604,12 @@ fn validate_spawn_cwd(
     })
     .map_err(|e| {
         ToolError::InvalidArgument(format!(
-            "requested child scope cannot validate SpawnWorker.cwd: {e}"
+            "requested child scope cannot validate SubWorkerSpawn.cwd: {e}"
         ))
     })?;
     if !child_scope.is_readable(&canonical) {
         return Err(ToolError::InvalidArgument(format!(
-            "SpawnWorker.cwd {} is outside the child's delegated readable scope; cwd grants no authority, so add an explicit read or write scope rule covering it",
+            "SubWorkerSpawn.cwd {} is outside the child's delegated readable scope; cwd grants no authority, so add an explicit read or write scope rule covering it",
             cwd.display()
         )));
     }
@@ -617,7 +623,7 @@ fn validate_spawn_cwd(
 ///
 /// The child's tool working directory is carried separately through
 /// the child runtime entrypoint; it is not part of the manifest.
-impl SpawnWorkerTool {
+impl SubWorkerSpawnTool {
     fn build_spawn_config_json(
         &self,
         name: &str,
@@ -651,7 +657,7 @@ fn build_spawn_config_json_for_profile(
         SpawnProfileSelector::Default | SpawnProfileSelector::Registry(_) => {
             let registry = available_profiles.registry.as_ref().ok_or_else(|| {
                 format!(
-                    "profile discovery failed for SpawnWorker: {}{}",
+                    "profile discovery failed for SubWorkerSpawn: {}{}",
                     available_profiles.diagnostic().if_empty("unknown error"),
                     available_profiles.error_suffix()
                 )
@@ -728,7 +734,7 @@ impl IfEmpty for str {
 
 fn profile_error_with_available(error: ProfileError, available: &AvailableProfiles) -> String {
     format!(
-        "invalid SpawnWorker.profile: {error}{}",
+        "invalid SubWorkerSpawn.profile: {error}{}",
         available.error_suffix()
     )
 }
@@ -878,8 +884,8 @@ fn worker_allocation_err_to_tool(e: ScopeLockError) -> ToolError {
     }
 }
 
-/// Factory for the `SpawnWorker` tool.
-pub fn spawn_worker_tool(
+/// Factory for the `SubWorkerSpawn` tool.
+pub fn sub_worker_spawn_tool(
     spawner_name: String,
     callback_socket: PathBuf,
     runtime_base: PathBuf,
@@ -891,7 +897,7 @@ pub fn spawn_worker_tool(
     spawner_scope: SharedScope,
     prompts: Arc<PromptCatalog>,
 ) -> ToolDefinition {
-    spawn_worker_tool_impl(
+    sub_worker_spawn_tool_impl(
         spawner_name,
         callback_socket,
         runtime_base,
@@ -907,7 +913,7 @@ pub fn spawn_worker_tool(
 }
 
 #[doc(hidden)]
-pub fn spawn_worker_tool_with_runtime_command(
+pub fn sub_worker_spawn_tool_with_runtime_command(
     spawner_name: String,
     callback_socket: PathBuf,
     runtime_base: PathBuf,
@@ -920,7 +926,7 @@ pub fn spawn_worker_tool_with_runtime_command(
     prompts: Arc<PromptCatalog>,
     runtime_command: WorkerRuntimeCommand,
 ) -> ToolDefinition {
-    spawn_worker_tool_impl(
+    sub_worker_spawn_tool_impl(
         spawner_name,
         callback_socket,
         runtime_base,
@@ -935,7 +941,7 @@ pub fn spawn_worker_tool_with_runtime_command(
     )
 }
 
-fn spawn_worker_tool_impl(
+fn sub_worker_spawn_tool_impl(
     spawner_name: String,
     callback_socket: PathBuf,
     runtime_base: PathBuf,
@@ -949,25 +955,25 @@ fn spawn_worker_tool_impl(
     runtime_command: Option<WorkerRuntimeCommand>,
 ) -> ToolDefinition {
     Arc::new(move || {
-        let schema = schemars::schema_for!(SpawnWorkerInput);
+        let schema = schemars::schema_for!(SubWorkerSpawnInput);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
         let available_profiles = AvailableProfiles::discover(&workspace_root);
         let description = prompts
-            .spawn_worker_tool_description(
+            .sub_worker_spawn_tool_description(
                 &available_profiles.compact_list(),
                 &available_profiles.default_label(),
                 available_profiles.diagnostic(),
             )
             .unwrap_or_else(|e| {
                 format!(
-                    "Spawn a new Worker process to work on a delegated task. Profile description rendering failed: {e}. Available profiles:\n{}",
+                    "Spawn a new SubWorker process to split context for a delegated task. Profile description rendering failed: {e}. Available profiles:\n{}",
                     available_profiles.compact_list()
                 )
             });
-        let meta = ToolMeta::new("SpawnWorker")
+        let meta = ToolMeta::new("SubWorkerSpawn")
             .description(description)
             .input_schema(schema_value);
-        let tool: Arc<dyn Tool> = Arc::new(SpawnWorkerTool::new(
+        let tool: Arc<dyn Tool> = Arc::new(SubWorkerSpawnTool::new(
             spawner_name.clone(),
             callback_socket.clone(),
             runtime_base.clone(),
@@ -1002,7 +1008,7 @@ mod tests {
 
     #[test]
     fn spawn_worker_input_schema_includes_optional_cwd() {
-        let schema = serde_json::to_value(schemars::schema_for!(SpawnWorkerInput)).unwrap();
+        let schema = serde_json::to_value(schemars::schema_for!(SubWorkerSpawnInput)).unwrap();
         let properties = schema
             .get("properties")
             .and_then(serde_json::Value::as_object)

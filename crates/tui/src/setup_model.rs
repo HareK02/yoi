@@ -233,7 +233,7 @@ enabled = true
 [feature.web]
 enabled = true
 
-[feature.workers]
+[feature.sub_worker]
 enabled = false
 
 [feature.ticket]

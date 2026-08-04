@@ -342,7 +342,7 @@ async fn feature_flags_default_to_core_tool_surface_only() {
     assert_eq!(names, vec!["Bash", "Edit", "Glob", "Grep", "Read", "Write"]);
     assert!(!names.iter().any(|name| name == "TaskCreate"));
     assert!(!names.iter().any(|name| name == "WebSearch"));
-    assert!(!names.iter().any(|name| name == "SpawnWorker"));
+    assert!(!names.iter().any(|name| name == "SubWorkerSpawn"));
 }
 
 #[tokio::test]
@@ -386,7 +386,7 @@ permission = "write"
     assert!(names.iter().any(|name| name == "TaskUpdate"));
     assert!(names.iter().any(|name| name == "WebSearch"));
     assert!(names.iter().any(|name| name == "WebFetch"));
-    assert!(!names.iter().any(|name| name == "SpawnWorker"));
+    assert!(!names.iter().any(|name| name == "SubWorkerSpawn"));
     assert!(!names.iter().any(|name| name == "MemoryRead"));
 }
 
@@ -394,34 +394,34 @@ permission = "write"
 async fn project_role_tool_surfaces_keep_task_disabled_and_workers_role_scoped() {
     struct Case {
         role: &'static str,
-        workers_enabled: bool,
+        sub_worker_enabled: bool,
     }
 
     let cases = [
         Case {
             role: "orchestrator",
-            workers_enabled: true,
+            sub_worker_enabled: true,
         },
         Case {
             role: "coder",
-            workers_enabled: false,
+            sub_worker_enabled: false,
         },
         Case {
             role: "intake",
-            workers_enabled: false,
+            sub_worker_enabled: false,
         },
         Case {
             role: "reviewer",
-            workers_enabled: false,
+            sub_worker_enabled: false,
         },
         Case {
             role: "companion",
-            workers_enabled: false,
+            sub_worker_enabled: false,
         },
     ];
 
     for case in cases {
-        let delegation = if case.workers_enabled {
+        let delegation = if case.sub_worker_enabled {
             r#"
 [[delegation_scope.allow]]
 target = "/tmp"
@@ -446,8 +446,8 @@ max_tokens = 100
 [feature.task]
 enabled = false
 
-[feature.workers]
-enabled = {workers_enabled}
+[feature.sub_worker]
+enabled = {sub_worker_enabled}
 
 [[scope.allow]]
 target = "./"
@@ -455,7 +455,7 @@ permission = "write"
 {delegation}
 "#,
             role = case.role,
-            workers_enabled = case.workers_enabled,
+            sub_worker_enabled = case.sub_worker_enabled,
             delegation = delegation,
         );
         let client = MockClient::new(simple_text_events());
@@ -474,16 +474,16 @@ permission = "write"
             case.role
         );
         assert_eq!(
-            names.iter().any(|name| name == "SpawnWorker"),
-            case.workers_enabled,
-            "{} role Worker tool exposure mismatch: {names:?}",
+            names.iter().any(|name| name == "SubWorkerSpawn"),
+            case.sub_worker_enabled,
+            "{} role SubWorker tool exposure mismatch: {names:?}",
             case.role
         );
     }
 }
 
 #[tokio::test]
-async fn workers_feature_requires_delegation_scope() {
+async fn sub_worker_feature_requires_delegation_scope() {
     let manifest = r#"
 [worker]
 name = "worker-management-feature-test"
@@ -496,7 +496,7 @@ model_id = "test-model"
 [engine]
 max_tokens = 100
 
-[feature.workers]
+[feature.sub_worker]
 enabled = true
 
 [[scope.allow]]
@@ -510,7 +510,7 @@ permission = "write"
     assert!(result.is_err());
     let message = result.err().unwrap().to_string();
     assert!(
-        message.contains("[feature.workers].enabled = true requires non-empty"),
+        message.contains("[feature.sub_worker].enabled = true requires non-empty"),
         "unexpected error: {message}"
     );
 }

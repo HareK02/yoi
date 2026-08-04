@@ -7,7 +7,8 @@ import "./base.dcdl" // {
         task = { enabled = false; };
         memory = { enabled = true; staging = true; };
         web = { enabled = false; };
-        workers = { enabled = false; };
+        sub_worker = { enabled = false; };
+        worker = { enabled = false; };
         objective = { enabled = false; };
         ticket = { enabled = false; thread = false; };
     };

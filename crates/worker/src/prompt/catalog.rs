@@ -88,9 +88,9 @@ pub enum WorkerPrompt {
     WorkerOrchestrationGuidanceSection,
     /// Weak Companion Notify payload for explicit Orchestrator Ticket events.
     TicketEventCompanionNotice,
-    /// LLM-facing description for the SpawnWorker tool, including discovered
+    /// LLM-facing description for the SubWorkerSpawn tool, including discovered
     /// profile selectors.
-    SpawnWorkerToolDescription,
+    SubWorkerSpawnToolDescription,
 }
 
 impl WorkerPrompt {
@@ -107,7 +107,7 @@ impl WorkerPrompt {
             Self::ResidentMemorySummarySection => "resident_memory_summary_section",
             Self::WorkerOrchestrationGuidanceSection => "worker_orchestration_guidance_section",
             Self::TicketEventCompanionNotice => "ticket_event_companion_notice",
-            Self::SpawnWorkerToolDescription => "spawn_worker_tool_description",
+            Self::SubWorkerSpawnToolDescription => "sub_worker_spawn_tool_description",
         }
     }
 
@@ -126,7 +126,7 @@ impl WorkerPrompt {
         WorkerPrompt::ResidentMemorySummarySection,
         WorkerPrompt::WorkerOrchestrationGuidanceSection,
         WorkerPrompt::TicketEventCompanionNotice,
-        WorkerPrompt::SpawnWorkerToolDescription,
+        WorkerPrompt::SubWorkerSpawnToolDescription,
     ];
 
     pub const KEYS: &'static [&'static str] = &[
@@ -141,7 +141,7 @@ impl WorkerPrompt {
         "resident_memory_summary_section",
         "worker_orchestration_guidance_section",
         "ticket_event_companion_notice",
-        "spawn_worker_tool_description",
+        "sub_worker_spawn_tool_description",
     ];
 }
 
@@ -384,8 +384,8 @@ impl PromptCatalog {
         )
     }
 
-    /// Render `WorkerPrompt::SpawnWorkerToolDescription`.
-    pub fn spawn_worker_tool_description(
+    /// Render `WorkerPrompt::SubWorkerSpawnToolDescription`.
+    pub fn sub_worker_spawn_tool_description(
         &self,
         available_profiles: &str,
         default_profile: &str,
@@ -396,7 +396,7 @@ impl PromptCatalog {
         m.insert("available_profiles", Value::from(available_profiles));
         m.insert("default_profile", Value::from(default_profile));
         m.insert("profile_diagnostic", Value::from(profile_diagnostic));
-        self.render(WorkerPrompt::SpawnWorkerToolDescription, Value::from(m))
+        self.render(WorkerPrompt::SubWorkerSpawnToolDescription, Value::from(m))
     }
 }
 
@@ -722,8 +722,8 @@ compact_system = "PREFIX\n{% include \"$yoi/internal/compact_system\" %}"
     fn worker_orchestration_guidance_section_renders_resource_body() {
         let cat = PromptCatalog::builtins_only().unwrap();
         let rendered = cat.worker_orchestration_guidance_section().unwrap();
-        assert!(rendered.contains("## Worker orchestration"));
-        assert!(rendered.contains("spawned Worker notifications are background signals"));
+        assert!(rendered.contains("## SubWorker orchestration"));
+        assert!(rendered.contains("SubWorker notifications are background signals"));
         assert!(rendered.contains("does not need to keep a turn open"));
         assert!(rendered.contains("Do not use `sleep` or polling loops"));
         assert!(rendered.contains("worktree state, diff, and test results"));
@@ -732,10 +732,10 @@ compact_system = "PREFIX\n{% include \"$yoi/internal/compact_system\" %}"
     }
 
     #[test]
-    fn spawn_worker_tool_description_renders_profile_block() {
+    fn sub_worker_spawn_tool_description_renders_profile_block() {
         let cat = PromptCatalog::builtins_only().unwrap();
         let rendered = cat
-            .spawn_worker_tool_description(
+            .sub_worker_spawn_tool_description(
                 "- `project:coder` — Coder\n- `project:reviewer` — Reviewer",
                 "project:coder",
                 "",

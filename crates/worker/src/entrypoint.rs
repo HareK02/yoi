@@ -56,7 +56,7 @@ struct Cli {
 
     /// Claim a scope allocation pre-registered by a spawning Worker, rather
     /// than installing a new top-level allocation. Used only when this
-    /// process is launched by `SpawnWorker`; end users should never pass it.
+    /// process is launched by `SubWorkerSpawn`; end users should never pass it.
     #[arg(long)]
     adopt: bool,
 

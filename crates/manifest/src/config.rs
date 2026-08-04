@@ -83,7 +83,9 @@ pub struct FeatureConfigPartial {
     #[serde(default)]
     pub web: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
-    pub workers: Option<FeatureFlagConfigPartial>,
+    pub sub_worker: Option<FeatureFlagConfigPartial>,
+    #[serde(default)]
+    pub worker: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
     pub objective: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
@@ -100,7 +102,12 @@ impl FeatureConfigPartial {
             task: merge_option(self.task, other.task, FeatureFlagConfigPartial::merge),
             memory: merge_option(self.memory, other.memory, MemoryFeatureConfigPartial::merge),
             web: merge_option(self.web, other.web, FeatureFlagConfigPartial::merge),
-            workers: merge_option(self.workers, other.workers, FeatureFlagConfigPartial::merge),
+            sub_worker: merge_option(
+                self.sub_worker,
+                other.sub_worker,
+                FeatureFlagConfigPartial::merge,
+            ),
+            worker: merge_option(self.worker, other.worker, FeatureFlagConfigPartial::merge),
             objective: merge_option(
                 self.objective,
                 other.objective,
@@ -179,8 +186,12 @@ impl From<FeatureConfigPartial> for FeatureConfig {
                 .map(MemoryFeatureConfig::from)
                 .unwrap_or_default(),
             web: value.web.map(FeatureFlagConfig::from).unwrap_or_default(),
-            workers: value
-                .workers
+            sub_worker: value
+                .sub_worker
+                .map(FeatureFlagConfig::from)
+                .unwrap_or_default(),
+            worker: value
+                .worker
                 .map(FeatureFlagConfig::from)
                 .unwrap_or_default(),
             objective: value
@@ -267,7 +278,8 @@ impl From<FeatureConfig> for FeatureConfigPartial {
             task: Some(value.task.into()),
             memory: Some(value.memory.into()),
             web: Some(value.web.into()),
-            workers: Some(value.workers.into()),
+            sub_worker: Some(value.sub_worker.into()),
+            worker: Some(value.worker.into()),
             objective: Some(value.objective.into()),
             manage_workdir: Some(value.manage_workdir.into()),
             ticket: Some(value.ticket.into()),
@@ -417,6 +429,15 @@ pub(crate) fn reject_removed_manifest_fields(s: &str) -> Result<(), toml::de::Er
             "unknown field in manifest: memory.extract_worker_max_input_tokens (removed)",
         ));
     }
+    if value
+        .get("feature")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|table| table.contains_key("workers"))
+    {
+        return Err(toml::de::Error::custom(
+            "unknown field in manifest: feature.workers (removed; use feature.sub_worker)",
+        ));
+    }
     Ok(())
 }
 
@@ -424,8 +445,8 @@ impl WorkerManifestConfig {
     /// Parse a partial manifest from a TOML string. Unknown top-level or
     /// nested fields emit a `tracing::warn!` and are ignored; use
     /// `tracing_subscriber` with `WARN` enabled to surface them to the
-    /// operator. Removed fields that must not be silently ignored (currently
-    /// `compaction.prune_protected_turns`) are rejected before deserialization.
+    /// operator. Removed fields with an explicit replacement (including
+    /// `feature.workers`) are rejected before deserialization.
     pub fn from_toml(s: &str) -> Result<Self, toml::de::Error> {
         reject_removed_manifest_fields(s)?;
         let de = toml::Deserializer::parse(s)?;
@@ -1814,7 +1835,7 @@ worker_max_turns = 7
         assert!(!manifest.feature.task.enabled);
         assert!(!manifest.feature.memory.enabled);
         assert!(!manifest.feature.web.enabled);
-        assert!(!manifest.feature.workers.enabled);
+        assert!(!manifest.feature.sub_worker.enabled);
         assert!(!manifest.feature.objective.enabled);
         assert!(!manifest.feature.manage_workdir.enabled);
         assert!(!manifest.feature.ticket.enabled);
@@ -1949,7 +1970,7 @@ enabled = true
         assert!(manifest.feature.ticket.orchestration_control);
         assert!(manifest.feature.objective.enabled);
         assert!(manifest.feature.web.enabled);
-        assert!(!manifest.feature.workers.enabled);
+        assert!(!manifest.feature.sub_worker.enabled);
     }
 
     #[test]

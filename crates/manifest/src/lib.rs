@@ -111,7 +111,9 @@ pub struct FeatureConfig {
     #[serde(default)]
     pub web: FeatureFlagConfig,
     #[serde(default)]
-    pub workers: FeatureFlagConfig,
+    pub sub_worker: FeatureFlagConfig,
+    #[serde(default)]
+    pub worker: FeatureFlagConfig,
     #[serde(default)]
     pub objective: FeatureFlagConfig,
     #[serde(default)]
@@ -128,7 +130,8 @@ impl Default for FeatureConfig {
             task: FeatureFlagConfig::disabled(),
             memory: MemoryFeatureConfig::disabled(),
             web: FeatureFlagConfig::disabled(),
-            workers: FeatureFlagConfig::disabled(),
+            sub_worker: FeatureFlagConfig::disabled(),
+            worker: FeatureFlagConfig::disabled(),
             objective: FeatureFlagConfig::disabled(),
             manage_workdir: FeatureFlagConfig::disabled(),
             ticket: TicketFeatureConfig::default(),
@@ -405,7 +408,7 @@ pub struct MemoryConfig {
     /// system-prompt section. `None` ⇒ enabled.
     #[serde(default)]
     pub inject_summary: Option<bool>,
-    /// Language used by memory extraction / consolidation workers for durable
+    /// Language used by memory extraction / consolidation sub_worker for durable
     /// memory text. Free-form so workspaces can use names like
     /// `English`, `Japanese`, or locale tags. `None` ⇒
     /// [`defaults::MEMORY_LANGUAGE`].

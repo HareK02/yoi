@@ -8,9 +8,7 @@ use session_store::WorkerMetadataStore;
 use session_store::{LogEntry, Store};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use crate::discovery::{
-    WorkerDiscovery, list_workers_tool, restore_worker_tool, send_to_peer_worker_tool,
-};
+use crate::discovery::WorkerDiscovery;
 use crate::feature::FeatureRegistryBuilder;
 use crate::in_flight::{InFlightEvents, snapshot_from_guard};
 use crate::ipc::alerter::Alerter;
@@ -23,9 +21,11 @@ use crate::shutdown_after_idle::{
     ShutdownAfterIdleRequest, TicketIntakeReadyShutdownHook, is_ticket_intake_role,
     take_shutdown_request_after_status,
 };
-use crate::spawn::comm_tools::{read_worker_output_tool, send_to_worker_tool, stop_worker_tool};
+use crate::spawn::comm_tools::{
+    sub_worker_list_tool, sub_worker_read_output_tool, sub_worker_send_tool, sub_worker_stop_tool,
+};
 use crate::spawn::registry::SpawnedWorkerRegistry;
-use crate::spawn::tool::spawn_worker_tool;
+use crate::spawn::tool::sub_worker_spawn_tool;
 use crate::worker::{SystemItemCommitter, Worker, WorkerError, WorkerRunResult};
 use protocol::{
     AlertLevel, AlertSource, ErrorCode, Event, Method, RewindTargetId, RunResult, Segment,
@@ -582,7 +582,7 @@ fn wire_event_bridges_on_engine<C, St>(
 }
 
 /// Register the builtin file-manipulation tools, optional memory tools,
-/// and the Worker-orchestration tools (SpawnWorker + comm) on the Worker's
+/// and the Worker-orchestration tools (SubWorkerSpawn + comm) on the Worker's
 /// Engine. Returns the WorkdirSession handle used to attach a `WorkerFsView` to
 /// the shared state.
 async fn register_worker_tools<C, St>(
@@ -610,7 +610,6 @@ where
     let spawner_name = worker.manifest().worker.name.clone();
     let spawner_manifest = worker.manifest().clone();
     let prompts = worker.prompts().clone();
-    let worker_metadata_store = worker.store().clone();
     let self_parent_socket = worker.callback_socket().cloned();
 
     // Resolve the existing Worker–Workdir binding into the domain provider.
@@ -684,6 +683,21 @@ where
             crate::feature::builtin::manage_workdir::manage_workdir_feature(workspace_client),
         );
     }
+    if feature_config.worker.enabled {
+        let workspace_client = worker.workspace_client_handle();
+        let has_workspace_identity = workspace_client.workspace_id().is_some_and(|workspace_id| {
+            !workspace_id.is_empty() && !workspace_id.chars().any(char::is_control)
+        });
+        if !workspace_client.is_available() || !has_workspace_identity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Worker tools require Backend Workspace API authority",
+            ));
+        }
+        feature_registry.add_module(
+            crate::feature::builtin::manage_worker::manage_worker_feature(workspace_client),
+        );
+    }
     for module in crate::feature::plugin::plugin_tool_features_if_enabled(
         feature_config.plugins.enabled,
         &worker.manifest().plugins,
@@ -698,7 +712,7 @@ where
         }
     }
 
-    if feature_config.workers.enabled {
+    if feature_config.sub_worker.enabled {
         worker.register_worker_orchestration_instruction();
     }
 
@@ -756,16 +770,16 @@ where
             }
         }
 
-        // Worker-orchestration tools (SpawnWorker + the four comm tools) share
+        // Worker-orchestration tools (SubWorkerSpawn + the four comm tools) share
         // the Worker-scoped `SpawnedWorkerRegistry` (also consumed by the main
         // loop's `WorkerEvent` handler). Expose them only behind the explicit
         // profile feature and require delegation authority up front so enabling
         // the surface cannot imply broad child scope by accident.
-        if feature_config.workers.enabled {
+        if feature_config.sub_worker.enabled {
             if spawner_manifest.delegation_scope.allow.is_empty() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "[feature.workers].enabled = true requires non-empty [[delegation_scope.allow]]",
+                    "[feature.sub_worker].enabled = true requires non-empty [[delegation_scope.allow]]",
                 ));
             }
             let spawner_cwd = local_filesystem
@@ -783,7 +797,7 @@ where
                     "worker spawn tools require local Worker filesystem authority",
                 )
             })?;
-            engine.register_tool(spawn_worker_tool(
+            engine.register_tool(sub_worker_spawn_tool(
                 spawner_name.clone(),
                 spawner_socket,
                 runtime_base.clone(),
@@ -795,19 +809,10 @@ where
                 scope_handle,
                 prompts,
             ));
-            engine.register_tool(send_to_worker_tool(spawned_registry.clone()));
-            engine.register_tool(read_worker_output_tool(spawned_registry.clone()));
-            engine.register_tool(stop_worker_tool(spawned_registry.clone()));
-            let discovery = WorkerDiscovery::new(
-                worker_metadata_store,
-                spawner_name,
-                runtime_base,
-                Some(spawner_cwd),
-                spawned_registry,
-            );
-            engine.register_tool(list_workers_tool(discovery.clone()));
-            engine.register_tool(restore_worker_tool(discovery.clone()));
-            engine.register_tool(send_to_peer_worker_tool(discovery));
+            engine.register_tool(sub_worker_list_tool(spawned_registry.clone()));
+            engine.register_tool(sub_worker_send_tool(spawned_registry.clone()));
+            engine.register_tool(sub_worker_read_output_tool(spawned_registry.clone()));
+            engine.register_tool(sub_worker_stop_tool(spawned_registry));
         }
     }
     let _feature_install_report = worker.install_features(feature_registry);

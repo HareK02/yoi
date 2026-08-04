@@ -436,7 +436,7 @@ impl ProfileResolver {
         }
     }
     /// Resolve a registry/default selector against an already-discovered
-    /// registry. Callers such as SpawnWorker use this to bind discovery to the
+    /// registry. Callers such as SubWorkerSpawn use this to bind discovery to the
     /// Worker's cwd instead of the process current directory.
     pub fn resolve_from_registry(
         &self,
@@ -936,7 +936,7 @@ fn builtin_profile_artifact(label: &str) -> Option<serde_json::Value> {
             value["feature"]["task"] = serde_json::json!({ "enabled": false });
             value["feature"]["memory"] = serde_json::json!({ "enabled": true, "staging": true });
             value["feature"]["web"] = serde_json::json!({ "enabled": false });
-            value["feature"]["workers"] = serde_json::json!({ "enabled": false });
+            value["feature"]["sub_worker"] = serde_json::json!({ "enabled": false });
             value["feature"]["objective"] = serde_json::json!({ "enabled": false });
             value["feature"]["ticket"] = serde_json::json!({ "enabled": false, "thread": false });
             Some(value)
@@ -962,7 +962,8 @@ fn builtin_base_profile_artifact() -> serde_json::Value {
             "task": { "enabled": true },
             "memory": { "enabled": true },
             "web": { "enabled": true },
-            "workers": { "enabled": true },
+            "sub_worker": { "enabled": true },
+            "worker": { "enabled": false },
             "objective": { "enabled": true },
             "ticket": { "enabled": true, "authoring": true, "thread": true }
         },
@@ -990,14 +991,15 @@ fn apply_role_profile(
     task: bool,
     memory: bool,
     web: bool,
-    workers: bool,
+    sub_worker: bool,
 ) {
     value["slug"] = serde_json::Value::String(slug.to_string());
     value["description"] = serde_json::Value::String(description.to_string());
     value["feature"]["task"] = serde_json::json!({ "enabled": task });
     value["feature"]["memory"] = serde_json::json!({ "enabled": memory });
     value["feature"]["web"] = serde_json::json!({ "enabled": web });
-    value["feature"]["workers"] = serde_json::json!({ "enabled": workers });
+    value["feature"]["sub_worker"] = serde_json::json!({ "enabled": sub_worker });
+    value["feature"]["worker"] = serde_json::json!({ "enabled": slug == "orchestrator" });
     value["feature"]["manage_workdir"] = serde_json::json!({ "enabled": slug == "orchestrator" });
     let ticket = match slug {
         "companion" => serde_json::json!({ "enabled": true, "authoring": true, "thread": true }),
@@ -1456,7 +1458,8 @@ mod tests {
 
         let companion = resolve("companion");
         assert!(companion.feature.task.enabled);
-        assert!(companion.feature.workers.enabled);
+        assert!(companion.feature.sub_worker.enabled);
+        assert!(!companion.feature.worker.enabled);
         assert!(companion.scope.allow.is_empty());
         assert!(companion.scope.deny.is_empty());
         assert!(companion.delegation_scope.allow.is_empty());
@@ -1487,7 +1490,8 @@ mod tests {
 
         let intake = resolve("intake");
         assert!(intake.feature.task.enabled);
-        assert!(!intake.feature.workers.enabled);
+        assert!(!intake.feature.sub_worker.enabled);
+        assert!(!intake.feature.worker.enabled);
         assert!(intake.feature.ticket.enabled);
         assert!(intake.feature.ticket.enabled);
         assert!(intake.feature.ticket.authoring);
@@ -1504,7 +1508,8 @@ mod tests {
 
         let orchestrator = resolve("orchestrator");
         assert!(orchestrator.feature.task.enabled);
-        assert!(!orchestrator.feature.workers.enabled);
+        assert!(!orchestrator.feature.sub_worker.enabled);
+        assert!(orchestrator.feature.worker.enabled);
         assert!(orchestrator.feature.ticket.enabled);
         assert!(orchestrator.feature.ticket.enabled);
         assert!(!orchestrator.feature.ticket.authoring);
@@ -1524,7 +1529,8 @@ mod tests {
 
         let coder = resolve("coder");
         assert!(coder.feature.task.enabled);
-        assert!(!coder.feature.workers.enabled);
+        assert!(!coder.feature.sub_worker.enabled);
+        assert!(!coder.feature.worker.enabled);
         assert!(coder.scope.allow.is_empty());
         assert!(coder.delegation_scope.allow.is_empty());
         assert_eq!(coder.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
@@ -1540,7 +1546,8 @@ mod tests {
         assert!(!coder.feature.ticket.orchestration_control);
         let reviewer = resolve("reviewer");
         assert!(reviewer.feature.task.enabled);
-        assert!(!reviewer.feature.workers.enabled);
+        assert!(!reviewer.feature.sub_worker.enabled);
+        assert!(!reviewer.feature.worker.enabled);
         assert!(reviewer.feature.ticket.enabled);
         assert!(reviewer.feature.ticket.enabled);
         assert!(!reviewer.feature.ticket.authoring);
@@ -1692,7 +1699,7 @@ enabled = false
 [feature.web]
 enabled = true
 
-[feature.workers]
+[feature.sub_worker]
 enabled = true
 
 [feature.ticket]
@@ -1716,7 +1723,7 @@ orchestration_control = false
         assert!(resolved.manifest.feature.task.enabled);
         assert!(!resolved.manifest.feature.memory.enabled);
         assert!(resolved.manifest.feature.web.enabled);
-        assert!(resolved.manifest.feature.workers.enabled);
+        assert!(resolved.manifest.feature.sub_worker.enabled);
         assert!(resolved.manifest.feature.ticket.enabled);
         assert!(!resolved.manifest.feature.ticket.authoring);
         assert!(!resolved.manifest.feature.ticket.thread);

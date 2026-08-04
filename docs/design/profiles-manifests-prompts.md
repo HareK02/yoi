@@ -65,9 +65,9 @@ name = "MCP_UPSTREAM_TOKEN"
 
 Local stdio MCP servers are ordinary local executables running with the user's OS permissions. Yoi's feature flags, Plugin permissions, and MCP config validation are not an operating-system sandbox and cannot prevent filesystem/network/process side effects once a later lifecycle implementation chooses to spawn a configured server.
 
-## Spawned Workers
+## SubWorkers
 
-`SpawnWorker.profile` is optional and resolves through defaults when omitted. The only concrete capability delegation in the tool call is `SpawnWorker.scope`, and it must be a subset of the parent's effective scope.
+`SubWorkerSpawn.profile` is optional and resolves through defaults when omitted. The only concrete capability delegation in the tool call is `SubWorkerSpawn.scope`, and it must be a subset of the parent Worker's effective scope.
 
 `inherit` derives reusable settings from the parent's resolved Manifest while replacing child identity and delegated scope. It should not blindly reuse the parent's original Profile source or runtime state.
 
