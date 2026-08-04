@@ -129,8 +129,13 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 23,
-        name: "enforce exclusive Worker Workdir attachments and spawn reservations",
+        name: "enforce exclusive active Worker Workdir attachments",
         apply: enforce_exclusive_worker_workdir_attachments,
+    },
+    Migration {
+        version: 24,
+        name: "create Worker Workdir attachment reservations",
+        apply: create_worker_workdir_attachment_reservations,
     },
 ];
 
@@ -3415,6 +3420,20 @@ DROP TABLE IF EXISTS ticket_notification_outbox;
 fn enforce_exclusive_worker_workdir_attachments(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
+CREATE UNIQUE INDEX IF NOT EXISTS ux_worker_workdir_links_active_worker
+    ON worker_workdir_links(workspace_id, runtime_id, runtime_worker_id)
+    WHERE unlinked_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_worker_workdir_links_active_workdir
+    ON worker_workdir_links(workspace_id, workdir_id)
+    WHERE unlinked_at IS NULL;
+"#,
+    )?;
+    Ok(())
+}
+
+fn create_worker_workdir_attachment_reservations(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
 CREATE TABLE IF NOT EXISTS worker_workdir_attachment_reservations (
     workspace_id TEXT NOT NULL,
     workdir_id TEXT NOT NULL,
@@ -3424,12 +3443,6 @@ CREATE TABLE IF NOT EXISTS worker_workdir_attachment_reservations (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_worker_workdir_attachment_reservation_id
     ON worker_workdir_attachment_reservations(workspace_id, reservation_id);
-CREATE UNIQUE INDEX IF NOT EXISTS ux_worker_workdir_links_active_worker
-    ON worker_workdir_links(workspace_id, runtime_id, runtime_worker_id)
-    WHERE unlinked_at IS NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS ux_worker_workdir_links_active_workdir
-    ON worker_workdir_links(workspace_id, workdir_id)
-    WHERE unlinked_at IS NULL;
 "#,
     )?;
     Ok(())
@@ -4114,13 +4127,39 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         }
     }
 
+    #[test]
+    fn schema_v24_adds_attachment_reservations_to_already_applied_v23() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_sqlite(&conn).unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 23)
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            (migration.apply)(&tx).unwrap();
+            tx.execute(
+                "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+                params![migration.version, migration.name],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(current_schema_version(&conn).unwrap(), 23);
+        assert!(!table_exists(&conn, "worker_workdir_attachment_reservations").unwrap());
+
+        apply_migrations(&conn).unwrap();
+
+        assert_eq!(current_schema_version(&conn).unwrap(), 24);
+        assert!(table_exists(&conn, "worker_workdir_attachment_reservations").unwrap());
+    }
+
     #[tokio::test]
     async fn migrates_sqlite_and_preserves_workspace_record() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 23);
+        assert_eq!(store.schema_version().await.unwrap(), 24);
         assert!(
             !store
                 .with_conn(|conn| table_exists(conn, "worker_workspace_credentials"))
@@ -4137,7 +4176,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 23);
+        assert_eq!(reopened.schema_version().await.unwrap(), 24);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -4588,7 +4627,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 23);
+        assert_eq!(store.schema_version().await.unwrap(), 24);
 
         store
             .with_conn(|conn| {
@@ -4777,7 +4816,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 23);
+        assert_eq!(store.schema_version().await.unwrap(), 24);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -4815,7 +4854,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 23);
+        assert_eq!(store.schema_version().await.unwrap(), 24);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -5065,7 +5104,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 23);
+        assert_eq!(store.schema_version().await.unwrap(), 24);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),

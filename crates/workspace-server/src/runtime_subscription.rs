@@ -418,6 +418,8 @@ async fn run_embedded_connection(
             update = update_receiver.recv() => {
                 let Some((selector, subject_revision, payload)) = update else { return; };
                 if let Some(entry) = entries.get_mut(&selector) {
+                    entry.snapshot_revision = entry.snapshot_revision.saturating_add(1);
+                    apply_event_to_cached_snapshot(&mut entry.snapshot, &payload);
                     broadcast(&mut entry.downstreams, BrokerSubscriptionEvent::Event { connection_generation: generation, subject_revision, payload });
                 }
             }
@@ -428,6 +430,31 @@ async fn run_embedded_connection(
             desired_selectors: entries.len(),
             upstream_subscriptions: entries.len(),
         };
+    }
+}
+
+fn apply_event_to_cached_snapshot(
+    snapshot: &mut SubscriptionSnapshot,
+    payload: &SubscriptionEventPayload,
+) {
+    let SubscriptionSnapshot::Workers { workers } = snapshot else {
+        return;
+    };
+    match payload {
+        SubscriptionEventPayload::WorkerUpserted { worker } => {
+            if let Some(existing) = workers
+                .iter_mut()
+                .find(|existing| existing.worker_id == worker.worker_id)
+            {
+                *existing = worker.clone();
+            } else {
+                workers.push(worker.clone());
+            }
+        }
+        SubscriptionEventPayload::WorkerRemoved { worker_id, .. } => {
+            workers.retain(|worker| worker.worker_id != *worker_id);
+        }
+        _ => {}
     }
 }
 
@@ -736,6 +763,10 @@ async fn handle_frame(
                     return Ok(());
                 }
                 *revision = subject_revision;
+            }
+            if let Some((snapshot_revision, snapshot)) = entry.snapshot.as_mut() {
+                *snapshot_revision = snapshot_revision.saturating_add(1);
+                apply_event_to_cached_snapshot(snapshot, &payload);
             }
             broadcast(
                 &mut entry.downstreams,

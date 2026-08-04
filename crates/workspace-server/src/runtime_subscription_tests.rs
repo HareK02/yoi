@@ -36,6 +36,13 @@ impl WorkerExecutionBackend for TestExecutionBackend {
             WorkerExecutionRunState::Busy,
         )
     }
+
+    fn stop_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
+        WorkerExecutionResult::accepted(
+            WorkerExecutionOperation::Stop,
+            WorkerExecutionRunState::Stopped,
+        )
+    }
 }
 
 const TOKEN: &str = "runtime-subscription-test-token";
@@ -156,7 +163,7 @@ async fn equal_downstream_selectors_share_one_upstream_subscription() {
         .unwrap(),
     };
     let mut first = broker.subscribe("runtime-test", selector.clone()).unwrap();
-    let mut second = broker.subscribe("runtime-test", selector).unwrap();
+    let mut second = broker.subscribe("runtime-test", selector.clone()).unwrap();
     assert!(matches!(
         next_snapshot(&mut first).await,
         BrokerSubscriptionEvent::Snapshot { .. }
@@ -188,6 +195,16 @@ async fn equal_downstream_selectors_share_one_upstream_subscription() {
             } if worker.state == SubscriptionWorkerState::Running
         ));
     }
+    let mut late = broker.subscribe("runtime-test", selector.clone()).unwrap();
+    let BrokerSubscriptionEvent::Snapshot { snapshot, .. } = next_snapshot(&mut late).await else {
+        panic!("expected cached snapshot for late subscriber");
+    };
+    assert!(matches!(
+        snapshot,
+        SubscriptionSnapshot::Workers { workers }
+            if workers.iter().any(|worker| worker.state == SubscriptionWorkerState::Running)
+    ));
+    drop(late);
 
     drop(first);
     tokio::task::yield_now().await;
@@ -312,5 +329,53 @@ async fn embedded_runtime_uses_in_process_subscription_source() {
     assert!(matches!(next_event(&mut subscription).await,
         BrokerSubscriptionEvent::Event { payload: SubscriptionEventPayload::WorkerUpserted { worker }, .. }
         if worker.runtime_id.as_deref() == Some("embedded-worker-runtime") && worker.state == SubscriptionWorkerState::Running));
+    let mut late = broker
+        .subscribe(
+            "embedded-worker-runtime",
+            EventSubscriptionSelector::RuntimeWorkers,
+        )
+        .unwrap();
+    let BrokerSubscriptionEvent::Snapshot { snapshot, .. } = next_snapshot(&mut late).await else {
+        panic!("expected cached embedded snapshot for late subscriber");
+    };
+    assert!(matches!(
+        snapshot,
+        SubscriptionSnapshot::Workers { workers }
+            if workers.iter().any(|worker| worker.state == SubscriptionWorkerState::Running)
+    ));
+
+    runtime
+        .stop_worker(&worker.worker_ref, Some("done".to_string()))
+        .unwrap();
+    assert!(matches!(
+        next_event(&mut subscription).await,
+        BrokerSubscriptionEvent::Event {
+            payload: SubscriptionEventPayload::WorkerUpserted { .. },
+            ..
+        }
+    ));
+    runtime.delete_worker(&worker.worker_ref).unwrap();
+    assert!(matches!(
+        next_event(&mut subscription).await,
+        BrokerSubscriptionEvent::Event {
+            payload: SubscriptionEventPayload::WorkerRemoved { .. },
+            ..
+        }
+    ));
+    let mut after_remove = broker
+        .subscribe(
+            "embedded-worker-runtime",
+            EventSubscriptionSelector::RuntimeWorkers,
+        )
+        .unwrap();
+    let BrokerSubscriptionEvent::Snapshot { snapshot, .. } = next_snapshot(&mut after_remove).await
+    else {
+        panic!("expected cached embedded snapshot after remove");
+    };
+    assert!(matches!(
+        snapshot,
+        SubscriptionSnapshot::Workers { workers }
+            if workers.iter().all(|candidate| candidate.worker_id.as_str() != worker.worker_ref.worker_id.to_string())
+    ));
     server.abort();
 }
