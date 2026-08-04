@@ -899,7 +899,7 @@ fn builtin_profile_artifact(label: &str) -> Option<serde_json::Value> {
                 true,
                 true,
                 true,
-                true,
+                false,
             );
             Some(value)
         }
@@ -1504,7 +1504,7 @@ mod tests {
 
         let orchestrator = resolve("orchestrator");
         assert!(orchestrator.feature.task.enabled);
-        assert!(orchestrator.feature.workers.enabled);
+        assert!(!orchestrator.feature.workers.enabled);
         assert!(orchestrator.feature.ticket.enabled);
         assert!(orchestrator.feature.ticket.enabled);
         assert!(!orchestrator.feature.ticket.authoring);

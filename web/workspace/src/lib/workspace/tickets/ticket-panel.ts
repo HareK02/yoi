@@ -12,6 +12,23 @@ export const TICKET_STATES = [
 export type TicketState = (typeof TICKET_STATES)[number];
 export type TicketWorkerRole = "coder" | "reviewer";
 
+export type WorkspaceOrchestratorStatus = {
+  workspace_id: string;
+  online: boolean;
+  disposition: string;
+  worker?: {
+    runtime_id: string;
+    worker_id: string;
+    state: string;
+    display_name: string;
+  } | null;
+  diagnostics: Array<{
+    code: string;
+    severity: string;
+    message: string;
+  }>;
+};
+
 const LANE_DEFINITIONS = [
   {
     id: "ready-planning",

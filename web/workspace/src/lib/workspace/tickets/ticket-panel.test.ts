@@ -10,7 +10,14 @@ import type {
 
 declare const Deno: {
   test(name: string, fn: () => Promise<void> | void): void;
+  readTextFile(path: string): Promise<string>;
 };
+
+function assertIncludes(actual: string, expected: string): void {
+  if (!actual.includes(expected)) {
+    throw new Error(`expected source to include ${JSON.stringify(expected)}`);
+  }
+}
 
 function assertEquals<T>(actual: T, expected: T): void {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -96,4 +103,21 @@ Deno.test("ticket worker launch uses the common Worker route and bounded Ticket 
     url.searchParams.get("initialInput"),
     "Work on Ticket 00001KYRRDVH9 as its reviewer.",
   );
+});
+
+Deno.test("ticket panel starts the Orchestrator explicitly and gates orchestration actions", async () => {
+  const panelSource = await Deno.readTextFile(
+    "src/routes/w/[workspaceId]/tickets/+page.svelte",
+  );
+  const detailSource = await Deno.readTextFile(
+    "src/routes/w/[workspaceId]/tickets/[ticketId]/+page.svelte",
+  );
+
+  assertIncludes(panelSource, 'workspaceApiPath(data.workspaceId, "/orchestrator")');
+  assertIncludes(panelSource, '{ method: "POST" }');
+  assertIncludes(panelSource, "Start Orchestrator");
+  assertIncludes(panelSource, "orchestrator.data?.online");
+  assertIncludes(detailSource, "{#if orchestratorOnline}");
+  assertIncludes(detailSource, "!orchestratorOnline");
+  assertIncludes(detailSource, "Orchestrator offline");
 });

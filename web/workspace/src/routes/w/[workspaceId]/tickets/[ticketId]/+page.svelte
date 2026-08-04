@@ -9,6 +9,7 @@
     relationLabel,
     TICKET_STATES,
     ticketWorkerLaunchHref,
+    type WorkspaceOrchestratorStatus,
   } from "$lib/workspace/tickets/ticket-panel";
   import type { ApiResult } from "$lib/workspace/api/http";
   import type {
@@ -22,6 +23,7 @@
       ticketId: string;
       ticket: ApiResult<TicketDetail>;
       repositories: ApiResult<RepositoryListResponse>;
+      orchestrator: ApiResult<WorkspaceOrchestratorStatus>;
     };
   }>();
 
@@ -29,6 +31,7 @@
   const loadedTicket = initialData.ticket.data;
   if (!loadedTicket) throw new Error(initialData.ticket.error ?? "ticket load failed");
   const loadedRepositories = initialData.repositories.data;
+  const orchestratorOnline = initialData.orchestrator.data?.online ?? false;
 
   let ticket = $state<TicketDetail>(loadedTicket);
   let editing = $state(false);
@@ -270,11 +273,19 @@
         <p class="ticket-assignment-line">
           Assigned to <strong>{ticket.assignee ?? "Unassigned"}</strong>
         </p>
-        <p>The common launch flow carries a short canonical Ticket message and the target below.</p>
-        <div class="ticket-role-actions">
-          <a class="workspace-primary-button" href={ticketWorkerLaunchHref(data.workspaceId, ticket, "coder")}>Coder</a>
-          <a class="workspace-secondary-button" href={ticketWorkerLaunchHref(data.workspaceId, ticket, "reviewer")}>Reviewer</a>
-        </div>
+        {#if orchestratorOnline}
+          <p>The Orchestrator is online. Start a role-specific Worker with the Ticket target below.</p>
+          <div class="ticket-role-actions">
+            <a class="workspace-primary-button" href={ticketWorkerLaunchHref(data.workspaceId, ticket, "coder")}>Coder</a>
+            <a class="workspace-secondary-button" href={ticketWorkerLaunchHref(data.workspaceId, ticket, "reviewer")}>Reviewer</a>
+          </div>
+        {:else}
+          <p class="workspace-callout">Start the Workspace Orchestrator from the Ticket panel before launching Ticket Workers.</p>
+          <div class="ticket-role-actions">
+            <button class="workspace-primary-button" type="button" disabled>Coder</button>
+            <button class="workspace-secondary-button" type="button" disabled>Reviewer</button>
+          </div>
+        {/if}
       </section>
 
       <section class="ticket-control-card">
@@ -309,8 +320,8 @@
           </button>
         </form>
         {#if ticket.state === "ready"}
-          <button class="workspace-primary-button ticket-queue-button" type="button" disabled={busy === "queue"} onclick={() => mutate("queue", "/queue", {})}>
-            {busy === "queue" ? "Queueing…" : "Queue ticket"}
+          <button class="workspace-primary-button ticket-queue-button" type="button" disabled={busy === "queue" || !orchestratorOnline} onclick={() => mutate("queue", "/queue", {})}>
+            {busy === "queue" ? "Queueing…" : orchestratorOnline ? "Queue ticket" : "Orchestrator offline"}
           </button>
         {/if}
       </section>

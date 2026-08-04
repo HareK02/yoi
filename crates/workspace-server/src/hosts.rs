@@ -19,6 +19,7 @@ use workdir::{
     Workdir, WorkdirError,
     http::{OpenWorkdirSessionRequest, RemoteWorkdirSession, WorkdirHttpAuthorization},
 };
+use worker_runtime::RuntimeWorkspaceScope;
 use worker_runtime::auth::{CapabilityTokenSigner, capability_claims};
 use worker_runtime::catalog::{
     ConfigBundleRef, CreateWorkerRequest, ProfileSelector, ProfileSourceArchiveHttpRef,
@@ -1830,6 +1831,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 };
             }
         };
+        let workspace_id = workspace_api.workspace_id.clone();
         let create_request = CreateWorkerRequest {
             idempotency_key,
             idempotency_fingerprint,
@@ -1842,7 +1844,11 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             working_directory: request.resolved_working_directory.clone(),
             workspace_api: Some(workspace_api),
         };
-        match self.runtime.create_worker(create_request) {
+        let workspace_scope = RuntimeWorkspaceScope::new(workspace_id, "embedded-backend");
+        match self
+            .runtime
+            .create_worker_scoped(&workspace_scope, create_request)
+        {
             Ok(detail) => WorkerSpawnResult {
                 state: WorkerOperationState::Accepted,
                 worker: Some(self.map_worker_detail(detail)),
@@ -3433,16 +3439,15 @@ fn worker_display_metadata(
             tags,
         };
     }
-    if profile_label == Some(WORKSPACE_ORCHESTRATOR_PROFILE) {
+    if profile_label == Some(WORKSPACE_ORCHESTRATOR_PROFILE)
+        && requested_display_name == Some(WORKSPACE_ORCHESTRATOR_SINGLETON_KEY)
+    {
         let mut tags = vec!["orchestrator".to_string(), "singleton".to_string()];
         if internal {
             tags.insert(0, "internal".to_string());
         }
         return WorkerDisplayMetadata {
-            display_name: requested_display_name
-                .filter(|value| !value.trim().is_empty())
-                .map(safe_display_hint)
-                .unwrap_or_else(|| "Workspace Orchestrator".to_string()),
+            display_name: "Workspace Orchestrator".to_string(),
             singleton_key: Some(WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string()),
             tags,
         };
@@ -3957,6 +3962,7 @@ mod tests {
             .unwrap();
 
         assert!(manifest.feature.manage_workdir.enabled);
+        assert!(!manifest.feature.workers.enabled);
     }
 
     #[test]

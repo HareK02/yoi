@@ -1,4 +1,5 @@
 import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
+import type { WorkspaceOrchestratorStatus } from "$lib/workspace/tickets/ticket-panel";
 import type {
   RepositoryListResponse,
   TicketDetail,
@@ -6,7 +7,7 @@ import type {
 import type { PageLoad } from "./$types";
 
 export const load = (async ({ fetch, params }) => {
-  const [ticket, repositories] = await Promise.all([
+  const [ticket, repositories, orchestrator] = await Promise.all([
     loadJson<TicketDetail>(
       fetch,
       workspaceApiPath(
@@ -18,6 +19,10 @@ export const load = (async ({ fetch, params }) => {
       fetch,
       workspaceApiPath(params.workspaceId, "/repositories"),
     ),
+    loadJson<WorkspaceOrchestratorStatus>(
+      fetch,
+      workspaceApiPath(params.workspaceId, "/orchestrator"),
+    ),
   ]);
 
   return {
@@ -25,5 +30,6 @@ export const load = (async ({ fetch, params }) => {
     ticketId: params.ticketId,
     ticket,
     repositories,
+    orchestrator,
   };
 }) satisfies PageLoad;

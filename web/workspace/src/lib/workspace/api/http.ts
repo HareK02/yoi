@@ -108,9 +108,10 @@ export async function loadWorkspaceSkillDetail(
 export async function loadJson<T>(
   fetchFn: typeof fetch,
   path: string,
+  init?: RequestInit,
 ): Promise<ApiResult<T>> {
   try {
-    const response = await fetchFn(path);
+    const response = await fetchFn(path, init);
     if (!response.ok) {
       const text = await response.text();
       return {

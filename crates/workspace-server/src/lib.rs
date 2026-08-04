@@ -72,6 +72,8 @@ pub enum Error {
     },
     #[error("invalid runtime {kind} `{value}`")]
     InvalidRuntimeIdentifier { kind: String, value: String },
+    #[error("worker name is reserved for a dedicated Workspace service: {0}")]
+    ReservedWorkerName(String),
     #[error("runtime `{runtime_id}` operation failed ({code}): {message}")]
     RuntimeOperationFailed {
         runtime_id: String,

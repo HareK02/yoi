@@ -247,6 +247,7 @@ pub struct WorkspaceApi {
     authority: SqliteWorkspaceAuthority,
     runtime: Arc<RuntimeRegistry>,
     companion: Arc<CompanionConsole>,
+    orchestrator_spawn_lock: Arc<std::sync::Mutex<()>>,
     observation_proxy: BackendObservationProxy,
     runtime_subscription_broker: RuntimeSubscriptionBroker,
     resource_broker: BackendResourceBroker,
@@ -346,6 +347,7 @@ impl WorkspaceApi {
             store,
             runtime,
             companion,
+            orchestrator_spawn_lock: Arc::new(std::sync::Mutex::new(())),
             observation_proxy,
             runtime_subscription_broker,
             resource_broker,
@@ -776,6 +778,11 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/workers",
             get(list_workers).post(create_workspace_worker),
+        )
+        .route(
+            "/api/w/{workspace_id}/orchestrator",
+            get(scoped_workspace_orchestrator_status)
+                .post(scoped_start_workspace_orchestrator),
         )
         .route(
             "/api/w/{workspace_id}/workers",
@@ -1333,6 +1340,16 @@ pub struct BrowserWorkerWorkingDirectorySelection {
     pub working_directory_id: String,
     #[serde(default)]
     pub relative_cwd: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BrowserWorkspaceOrchestratorResponse {
+    pub workspace_id: String,
+    pub online: bool,
+    pub disposition: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker: Option<WorkerSummary>,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3640,6 +3657,109 @@ async fn scoped_list_workers(
 ) -> ApiResult<Json<RuntimeListResponse<WorkerSummary>>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     list_workers(State(api)).await
+}
+
+async fn scoped_workspace_orchestrator_status(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+) -> ApiResult<Json<BrowserWorkspaceOrchestratorResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    Ok(Json(workspace_orchestrator_response(&api, "observed")))
+}
+
+async fn scoped_start_workspace_orchestrator(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+) -> ApiResult<Json<BrowserWorkspaceOrchestratorResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let _guard = api.orchestrator_spawn_lock.lock().map_err(|_| {
+        ApiError::with_diagnostics(
+            Error::RuntimeOperationFailed {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                code: "workspace_orchestrator_spawn_lock_poisoned".to_string(),
+                message: "Workspace Orchestrator launch lock is unavailable".to_string(),
+            },
+            Vec::new(),
+        )
+    })?;
+
+    if let Some(existing) = find_workspace_orchestrator(&api) {
+        if workspace_orchestrator_is_online(&existing) {
+            return Ok(Json(workspace_orchestrator_response(&api, "existing")));
+        }
+        let restored = api
+            .runtime
+            .restore_worker(&existing.runtime_id, &existing.worker_id)
+            .map_err(|error| error.into_error())?;
+        if restored.state != WorkerOperationState::Accepted {
+            return Err(ApiError::with_diagnostics(
+                Error::RuntimeOperationFailed {
+                    runtime_id: existing.runtime_id,
+                    code: "workspace_orchestrator_restore_rejected".to_string(),
+                    message: "Runtime rejected Workspace Orchestrator restore".to_string(),
+                },
+                restored.diagnostics,
+            ));
+        }
+        return Ok(Json(workspace_orchestrator_response(&api, "restored")));
+    }
+
+    let result = api.spawn_workspace_worker(
+        EMBEDDED_WORKER_RUNTIME_ID,
+        WorkerSpawnRequest {
+            requested_worker_name: Some(
+                crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string(),
+            ),
+            intent: WorkerSpawnIntent::WorkspaceOrchestrator,
+            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                expected_segments: 0,
+            },
+            profile: ProfileSelector::Builtin("builtin:orchestrator".to_string()),
+            ticket_assignment: None,
+            initial_input: None,
+            working_directory_request: None,
+            resolved_working_directory_request: None,
+            resolved_working_directory: None,
+            resolved_config_bundle: None,
+            resolved_workspace_api: None,
+        },
+    )?;
+    if result.state != WorkerOperationState::Accepted || result.worker.is_none() {
+        return Err(ApiError::with_diagnostics(
+            Error::RuntimeOperationFailed {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                code: "workspace_orchestrator_spawn_rejected".to_string(),
+                message: "Embedded Runtime rejected Workspace Orchestrator launch".to_string(),
+            },
+            result.diagnostics,
+        ));
+    }
+    Ok(Json(workspace_orchestrator_response(&api, "created")))
+}
+
+fn workspace_orchestrator_response(
+    api: &WorkspaceApi,
+    disposition: &str,
+) -> BrowserWorkspaceOrchestratorResponse {
+    let worker = find_workspace_orchestrator(api);
+    let online = worker
+        .as_ref()
+        .is_some_and(workspace_orchestrator_is_online);
+    let diagnostics = worker
+        .as_ref()
+        .map(|worker| worker.diagnostics.clone())
+        .unwrap_or_default();
+    BrowserWorkspaceOrchestratorResponse {
+        workspace_id: api.config.workspace_id.clone(),
+        online,
+        disposition: disposition.to_string(),
+        worker,
+        diagnostics,
+    }
+}
+
+fn workspace_orchestrator_is_online(worker: &WorkerSummary) -> bool {
+    matches!(worker.state.as_str(), "idle" | "running" | "paused")
 }
 
 async fn scoped_create_workspace_worker(
@@ -5965,6 +6085,9 @@ async fn create_workspace_worker(
             "display_name must contain at least one non-control character",
         )
     })?;
+    if display_name == crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY {
+        return Err(Error::ReservedWorkerName(display_name).into());
+    }
     let initial_text = request.initial_text.trim().to_string();
     let initial_input = if initial_text.is_empty() {
         None
@@ -8589,7 +8712,9 @@ impl IntoResponse for ApiError {
         let status = match &self.error {
             Error::TicketAssignmentConflict(_) => StatusCode::CONFLICT,
             Error::WorkerSourceIdentity(_) => StatusCode::BAD_REQUEST,
-            Error::InvalidRuntimeIdentifier { .. } => StatusCode::BAD_REQUEST,
+            Error::InvalidRuntimeIdentifier { .. } | Error::ReservedWorkerName(_) => {
+                StatusCode::BAD_REQUEST
+            }
             Error::Ticket(ticket::TicketError::NotFound(_)) => StatusCode::NOT_FOUND,
             Error::Ticket(
                 ticket::TicketError::Ambiguous { .. }
@@ -8804,6 +8929,77 @@ mod tests {
         let serialized = serde_json::to_string(&projected).unwrap();
         assert!(!serialized.contains("/tmp/"));
         assert!(!serialized.contains("materialized_path"));
+    }
+
+    #[tokio::test]
+    async fn explicit_orchestrator_launch_marks_only_the_dedicated_worker() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let workspace_id = api.config.workspace_id.clone();
+
+        let Json(generic) = create_workspace_worker(
+            State(api.clone()),
+            Json(BrowserCreateWorkerRequest {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                display_name: "Generic Orchestrator Profile Worker".to_string(),
+                profile: Some("builtin:orchestrator".to_string()),
+                initial_text: String::new(),
+                working_directory: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(generic.worker.singleton_key, None);
+        assert!(find_workspace_orchestrator(&api).is_none());
+        let reserved = create_workspace_worker(
+            State(api.clone()),
+            Json(BrowserCreateWorkerRequest {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                display_name: crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string(),
+                profile: Some("builtin:orchestrator".to_string()),
+                initial_text: String::new(),
+                working_directory: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(reserved.error, Error::ReservedWorkerName(_)));
+
+        let Json(started) = scoped_start_workspace_orchestrator(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: workspace_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(started.disposition, "created");
+        let dedicated = started.worker.expect("dedicated Orchestrator Worker");
+        assert_eq!(
+            dedicated.singleton_key.as_deref(),
+            Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY)
+        );
+        assert_ne!(dedicated.worker_id, generic.worker_id);
+
+        let Json(existing) = scoped_start_workspace_orchestrator(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: workspace_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(existing.disposition, "existing");
+        assert_eq!(existing.worker.unwrap().worker_id, dedicated.worker_id);
+
+        let Json(status) = scoped_workspace_orchestrator_status(
+            State(api),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status.worker.unwrap().worker_id, dedicated.worker_id);
     }
 
     #[tokio::test]
