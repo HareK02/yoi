@@ -122,6 +122,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "remove per-Worker Workspace credentials",
         apply: remove_worker_workspace_credentials,
     },
+    Migration {
+        version: 22,
+        name: "drop Ticket notification outbox",
+        apply: drop_ticket_notification_tables,
+    },
 ];
 
 struct Migration {
@@ -294,31 +299,6 @@ pub struct TicketWorkerAssignmentEventRecord {
 pub struct TicketWorkerAssignmentUpdate {
     pub current: TicketWorkerAssignmentRecord,
     pub previous: Option<TicketWorkerAssignmentRecord>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TicketNotificationRecipient {
-    pub runtime_id: String,
-    pub worker_id: String,
-    pub recipient_kind: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TicketNotificationDeliveryRecord {
-    pub notification_id: String,
-    pub workspace_id: String,
-    pub ticket_id: String,
-    pub event_sequence: i64,
-    pub event_kind: String,
-    pub source_operation_kind: String,
-    pub source_actor_role: String,
-    pub source_assignment_id: Option<String>,
-    pub source_runtime_id: String,
-    pub source_worker_id: String,
-    pub recipient_runtime_id: String,
-    pub recipient_worker_id: String,
-    pub recipient_kind: String,
-    pub attempts: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -624,70 +604,6 @@ pub trait ControlPlaneStore: Send + Sync {
         ticket_id: &str,
         limit: usize,
     ) -> Result<Vec<TicketWorkerAssignmentEventRecord>>;
-
-    fn enqueue_ticket_notification(
-        &self,
-        notification_id: &str,
-        workspace_id: &str,
-        ticket_id: &str,
-        event_sequence: i64,
-        source_runtime_id: &str,
-        source_worker_id: &str,
-        previous_state: &str,
-        current_state: &str,
-        created_at: &str,
-        recipients: &[TicketNotificationRecipient],
-    ) -> Result<()>;
-    fn list_pending_ticket_notification_deliveries(
-        &self,
-        workspace_id: &str,
-        limit: usize,
-    ) -> Result<Vec<TicketNotificationDeliveryRecord>>;
-    fn count_ticket_notification_deliveries_for_recipient(
-        &self,
-        workspace_id: &str,
-        ticket_id: &str,
-        runtime_id: &str,
-        worker_id: &str,
-    ) -> Result<usize>;
-    fn mark_ticket_notification_delivered(
-        &self,
-        notification_id: &str,
-        recipient_runtime_id: &str,
-        recipient_worker_id: &str,
-        delivered_at: &str,
-    ) -> Result<()>;
-    fn mark_ticket_notification_failed(
-        &self,
-        notification_id: &str,
-        recipient_runtime_id: &str,
-        recipient_worker_id: &str,
-        error: &str,
-    ) -> Result<()>;
-    fn reroute_ticket_notification_delivery(
-        &self,
-        notification_id: &str,
-        old_runtime_id: &str,
-        old_worker_id: &str,
-        new_runtime_id: &str,
-        new_worker_id: &str,
-    ) -> Result<()>;
-    fn upsert_ticket_notification_cursor(
-        &self,
-        workspace_id: &str,
-        ticket_id: &str,
-        runtime_id: &str,
-        worker_id: &str,
-        event_index: i64,
-        updated_at: &str,
-    ) -> Result<()>;
-    fn get_ticket_notification_cursor(
-        &self,
-        workspace_id: &str,
-        ticket_id: &str,
-        runtime_id: &str,
-        worker_id: &str,
-    ) -> Result<Option<i64>>;
 
     fn upsert_workdir_registry(&self, record: &WorkdirRegistryRecord) -> Result<()>;
     fn get_workdir_registry(
@@ -2183,239 +2099,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
-    fn enqueue_ticket_notification(
-        &self,
-        notification_id: &str,
-        workspace_id: &str,
-        ticket_id: &str,
-        event_sequence: i64,
-        source_runtime_id: &str,
-        source_worker_id: &str,
-        previous_state: &str,
-        current_state: &str,
-        created_at: &str,
-        recipients: &[TicketNotificationRecipient],
-    ) -> Result<()> {
-        self.with_conn(|conn| {
-            let tx = conn.unchecked_transaction()?;
-            tx.execute(
-                r#"INSERT INTO ticket_notification_outbox (
-                    notification_id, workspace_id, ticket_id, event_sequence,
-                    source_runtime_id, source_worker_id, previous_state, current_state, created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
-                params![
-                    notification_id,
-                    workspace_id,
-                    ticket_id,
-                    event_sequence,
-                    source_runtime_id,
-                    source_worker_id,
-                    previous_state,
-                    current_state,
-                    created_at,
-                ],
-            )?;
-            for recipient in recipients {
-                tx.execute(
-                    r#"INSERT OR IGNORE INTO ticket_notification_deliveries (
-                        notification_id, recipient_runtime_id, recipient_worker_id,
-                        recipient_kind, attempts
-                    ) VALUES (?1, ?2, ?3, ?4, 0)"#,
-                    params![
-                        notification_id,
-                        recipient.runtime_id,
-                        recipient.worker_id,
-                        recipient.recipient_kind,
-                    ],
-                )?;
-            }
-            tx.commit()?;
-            Ok(())
-        })
-    }
-
-    fn list_pending_ticket_notification_deliveries(
-        &self,
-        workspace_id: &str,
-        limit: usize,
-    ) -> Result<Vec<TicketNotificationDeliveryRecord>> {
-        self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                r#"SELECT o.notification_id, o.workspace_id, o.ticket_id, o.event_sequence,
-                          o.event_kind, o.source_operation_kind, o.source_actor_role,
-                          o.source_assignment_id, o.source_runtime_id, o.source_worker_id,
-                          d.recipient_runtime_id, d.recipient_worker_id, d.recipient_kind, d.attempts
-                   FROM ticket_notification_deliveries AS d
-                   JOIN ticket_notification_outbox AS o ON o.notification_id = d.notification_id
-                   WHERE o.workspace_id = ?1 AND d.delivered_at IS NULL
-                   ORDER BY o.created_at ASC, o.notification_id ASC
-                   LIMIT ?2"#,
-            )?;
-            let rows = stmt.query_map(params![workspace_id, limit as i64], |row| {
-                Ok(TicketNotificationDeliveryRecord {
-                    notification_id: row.get(0)?,
-                    workspace_id: row.get(1)?,
-                    ticket_id: row.get(2)?,
-                    event_sequence: row.get(3)?,
-                    event_kind: row.get(4)?,
-                    source_operation_kind: row.get(5)?,
-                    source_actor_role: row.get(6)?,
-                    source_assignment_id: row.get(7)?,
-                    source_runtime_id: row.get(8)?,
-                    source_worker_id: row.get(9)?,
-                    recipient_runtime_id: row.get(10)?,
-                    recipient_worker_id: row.get(11)?,
-                    recipient_kind: row.get(12)?,
-                    attempts: row.get(13)?,
-                })
-            })?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(Error::from)
-        })
-    }
-
-    fn count_ticket_notification_deliveries_for_recipient(
-        &self,
-        workspace_id: &str,
-        ticket_id: &str,
-        runtime_id: &str,
-        worker_id: &str,
-    ) -> Result<usize> {
-        self.with_conn(|conn| {
-            let count = conn.query_row(
-                r#"SELECT COUNT(*)
-                   FROM ticket_notification_deliveries AS d
-                   JOIN ticket_notification_outbox AS o ON o.notification_id = d.notification_id
-                   WHERE o.workspace_id = ?1 AND o.ticket_id = ?2
-                     AND d.recipient_runtime_id = ?3 AND d.recipient_worker_id = ?4"#,
-                params![workspace_id, ticket_id, runtime_id, worker_id],
-                |row| row.get::<_, i64>(0),
-            )?;
-            Ok(count as usize)
-        })
-    }
-
-    fn mark_ticket_notification_delivered(
-        &self,
-        notification_id: &str,
-        recipient_runtime_id: &str,
-        recipient_worker_id: &str,
-        delivered_at: &str,
-    ) -> Result<()> {
-        self.with_conn(|conn| {
-            conn.execute(
-                r#"UPDATE ticket_notification_deliveries
-                   SET delivered_at = ?4, last_error = NULL, attempts = attempts + 1
-                   WHERE notification_id = ?1 AND recipient_runtime_id = ?2 AND recipient_worker_id = ?3"#,
-                params![notification_id, recipient_runtime_id, recipient_worker_id, delivered_at],
-            )?;
-            Ok(())
-        })
-    }
-
-    fn mark_ticket_notification_failed(
-        &self,
-        notification_id: &str,
-        recipient_runtime_id: &str,
-        recipient_worker_id: &str,
-        error: &str,
-    ) -> Result<()> {
-        self.with_conn(|conn| {
-            conn.execute(
-                r#"UPDATE ticket_notification_deliveries
-                   SET last_error = ?4, attempts = attempts + 1
-                   WHERE notification_id = ?1 AND recipient_runtime_id = ?2 AND recipient_worker_id = ?3"#,
-                params![notification_id, recipient_runtime_id, recipient_worker_id, error],
-            )?;
-            Ok(())
-        })
-    }
-
-    fn reroute_ticket_notification_delivery(
-        &self,
-        notification_id: &str,
-        old_runtime_id: &str,
-        old_worker_id: &str,
-        new_runtime_id: &str,
-        new_worker_id: &str,
-    ) -> Result<()> {
-        self.with_conn(|conn| {
-            let tx = conn.unchecked_transaction()?;
-            let recipient_kind: Option<String> = tx
-                .query_row(
-                    r#"SELECT recipient_kind FROM ticket_notification_deliveries
-                       WHERE notification_id = ?1 AND recipient_runtime_id = ?2 AND recipient_worker_id = ?3"#,
-                    params![notification_id, old_runtime_id, old_worker_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(recipient_kind) = recipient_kind {
-                tx.execute(
-                    r#"INSERT OR IGNORE INTO ticket_notification_deliveries (
-                        notification_id, recipient_runtime_id, recipient_worker_id, recipient_kind, attempts
-                    ) VALUES (?1, ?2, ?3, ?4, 0)"#,
-                    params![notification_id, new_runtime_id, new_worker_id, recipient_kind],
-                )?;
-                tx.execute(
-                    r#"DELETE FROM ticket_notification_deliveries
-                       WHERE notification_id = ?1 AND recipient_runtime_id = ?2 AND recipient_worker_id = ?3"#,
-                    params![notification_id, old_runtime_id, old_worker_id],
-                )?;
-            }
-            tx.commit()?;
-            Ok(())
-        })
-    }
-
-    fn upsert_ticket_notification_cursor(
-        &self,
-        workspace_id: &str,
-        ticket_id: &str,
-        runtime_id: &str,
-        worker_id: &str,
-        event_index: i64,
-        updated_at: &str,
-    ) -> Result<()> {
-        self.with_conn(|conn| {
-            conn.execute(
-                r#"INSERT INTO ticket_notification_cursors (
-                    workspace_id, ticket_id, runtime_id, worker_id, last_event_index, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                ON CONFLICT(workspace_id, ticket_id, runtime_id, worker_id) DO UPDATE SET
-                    last_event_index = MAX(last_event_index, excluded.last_event_index),
-                    updated_at = excluded.updated_at"#,
-                params![
-                    workspace_id,
-                    ticket_id,
-                    runtime_id,
-                    worker_id,
-                    event_index,
-                    updated_at
-                ],
-            )?;
-            Ok(())
-        })
-    }
-
-    fn get_ticket_notification_cursor(
-        &self,
-        workspace_id: &str,
-        ticket_id: &str,
-        runtime_id: &str,
-        worker_id: &str,
-    ) -> Result<Option<i64>> {
-        self.with_conn(|conn| {
-            conn.query_row(
-                r#"SELECT last_event_index FROM ticket_notification_cursors
-                   WHERE workspace_id = ?1 AND ticket_id = ?2 AND runtime_id = ?3 AND worker_id = ?4"#,
-                params![workspace_id, ticket_id, runtime_id, worker_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(Error::from)
-        })
-    }
-
     fn upsert_workdir_registry(&self, record: &WorkdirRegistryRecord) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute(
@@ -3343,6 +3026,17 @@ fn remove_worker_workspace_credentials(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn drop_ticket_notification_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+DROP TABLE IF EXISTS ticket_notification_cursors;
+DROP TABLE IF EXISTS ticket_notification_deliveries;
+DROP TABLE IF EXISTS ticket_notification_outbox;
+"#,
+    )?;
+    Ok(())
+}
+
 fn create_objective_event_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -4014,6 +3708,9 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
             "ticket_targets",
             "ticket_target_paths",
             "ticket_worker_links",
+            "ticket_notification_outbox",
+            "ticket_notification_deliveries",
+            "ticket_notification_cursors",
         ] {
             assert!(!table_exists(&conn, table).unwrap(), "{table} still exists");
         }
@@ -4025,7 +3722,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 21);
+        assert_eq!(store.schema_version().await.unwrap(), 22);
         assert!(
             !store
                 .with_conn(|conn| table_exists(conn, "worker_workspace_credentials"))
@@ -4042,7 +3739,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 21);
+        assert_eq!(reopened.schema_version().await.unwrap(), 22);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -4288,95 +3985,6 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         );
     }
 
-    #[tokio::test]
-    async fn notification_outbox_is_durable() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("server.db");
-        let store = SqliteWorkspaceStore::open(&db).unwrap();
-        store
-            .upsert_workspace(&WorkspaceRecord {
-                workspace_id: "workspace-a".to_string(),
-                owner_account_id: None,
-                display_name: "Workspace A".to_string(),
-                state: "active".to_string(),
-                created_at: "2026-07-31T00:00:00Z".to_string(),
-                updated_at: "2026-07-31T00:00:00Z".to_string(),
-            })
-            .await
-            .unwrap();
-        store
-            .enqueue_ticket_notification(
-                "notification-1",
-                "workspace-a",
-                "ticket-1",
-                4,
-                "runtime-1",
-                "worker-1",
-                "queued",
-                "inprogress",
-                "2026-07-31T00:00:02Z",
-                &[TicketNotificationRecipient {
-                    runtime_id: "runtime-1".to_string(),
-                    worker_id: "worker-2".to_string(),
-                    recipient_kind: "assigned".to_string(),
-                }],
-            )
-            .unwrap();
-
-        drop(store);
-        let store = SqliteWorkspaceStore::open(&db).unwrap();
-        let pending = store
-            .list_pending_ticket_notification_deliveries("workspace-a", 10)
-            .unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].event_sequence, 4);
-        store
-            .reroute_ticket_notification_delivery(
-                "notification-1",
-                "runtime-1",
-                "worker-2",
-                "runtime-2",
-                "worker-3",
-            )
-            .unwrap();
-        assert_eq!(
-            store
-                .count_ticket_notification_deliveries_for_recipient(
-                    "workspace-a",
-                    "ticket-1",
-                    "runtime-1",
-                    "worker-2",
-                )
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            store
-                .count_ticket_notification_deliveries_for_recipient(
-                    "workspace-a",
-                    "ticket-1",
-                    "runtime-2",
-                    "worker-3",
-                )
-                .unwrap(),
-            1
-        );
-        store
-            .mark_ticket_notification_delivered(
-                "notification-1",
-                "runtime-2",
-                "worker-3",
-                "2026-07-31T00:00:03Z",
-            )
-            .unwrap();
-        assert!(
-            store
-                .list_pending_ticket_notification_deliveries("workspace-a", 10)
-                .unwrap()
-                .is_empty()
-        );
-    }
-
     #[test]
     fn fresh_schema_matches_workspace_db_v0_boundaries() {
         let conn = Connection::open_in_memory().unwrap();
@@ -4427,6 +4035,9 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
             "ticket_targets",
             "ticket_target_paths",
             "ticket_worker_links",
+            "ticket_notification_outbox",
+            "ticket_notification_deliveries",
+            "ticket_notification_cursors",
         ] {
             assert!(
                 !tables.contains(forbidden),
@@ -4579,7 +4190,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 21);
+        assert_eq!(store.schema_version().await.unwrap(), 22);
 
         store
             .with_conn(|conn| {
@@ -4616,6 +4227,9 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
                     "ticket_targets",
                     "ticket_target_paths",
                     "ticket_worker_links",
+                    "ticket_notification_outbox",
+                    "ticket_notification_deliveries",
+                    "ticket_notification_cursors",
                 ] {
                     assert!(
                         !tables.contains(forbidden),
@@ -4765,7 +4379,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 21);
+        assert_eq!(store.schema_version().await.unwrap(), 22);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -4803,7 +4417,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 21);
+        assert_eq!(store.schema_version().await.unwrap(), 22);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -4981,7 +4595,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 21);
+        assert_eq!(store.schema_version().await.unwrap(), 22);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),

@@ -2,7 +2,7 @@ import type { Segment } from "$lib/generated/protocol";
 
 export type WorkerConsoleInputKind =
   | "user"
-  | "system"
+  | "notify"
   | "compact"
   | "list_rewind_targets"
   | "register_peer";
@@ -53,9 +53,9 @@ const COMMANDS: Record<string, CommandSpec> = {
     description:
       "Register another existing Worker as a reciprocal metadata peer.",
   },
-  system: {
-    usage: ":system <message>",
-    description: "Send an agent-visible system notification to the Worker.",
+  notify: {
+    usage: ":notify <message>",
+    description: "Send an agent-visible notification to the Worker.",
   },
 };
 
@@ -125,12 +125,12 @@ function buildColonCommand(commandLine: string): ComposerCommandResult {
         request: { kind: "register_peer", content: argv[0] },
         notice: `peer metadata registration requested with \`${argv[0]}\``,
       };
-    case "system": {
+    case "notify": {
       const message = commandLine.trim().slice(name.length).trimStart();
       if (!message) {
-        return invalidUsage("system");
+        return invalidUsage("notify");
       }
-      return { ok: true, request: { kind: "system", content: message } };
+      return { ok: true, request: { kind: "notify", content: message } };
     }
     default:
       return {
@@ -158,7 +158,7 @@ function helpCommand(argv: string[]): ComposerCommandResult {
       notice: `command: ${name} — usage: ${spec.usage}. ${spec.description}`,
     };
   }
-  const list = ["help", "noop", "compact", "rewind", "peer", "system"]
+  const list = ["help", "noop", "compact", "rewind", "peer", "notify"]
     .map((command) => `${command} (${COMMANDS[command].usage})`)
     .join(", ");
   return {

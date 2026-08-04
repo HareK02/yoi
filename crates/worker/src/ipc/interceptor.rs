@@ -220,7 +220,9 @@ impl Interceptor for WorkerInterceptor {
                     // simply be skipped from the SystemItem batch.
                     warn!(error = %e, "failed to render notify_wrapper; using raw message");
                     let fallback = match &entry {
-                        super::notify_buffer::PendingNotify::Notify { message } => message.clone(),
+                        super::notify_buffer::PendingNotify::Notify { message, .. } => {
+                            message.clone()
+                        }
                         super::notify_buffer::PendingNotify::WorkerEvent { event } => {
                             session_store::render_worker_event(event)
                         }
@@ -1019,8 +1021,8 @@ mod tests {
     async fn pending_history_appends_drains_buffer_into_items() {
         let registry = Arc::new(HookRegistryBuilder::new().build());
         let buffer = NotifyBuffer::new();
-        buffer.push_notify("first".into());
-        buffer.push_notify("second".into());
+        buffer.push_notify("first".into(), false);
+        buffer.push_notify("second".into(), false);
 
         let interceptor = WorkerInterceptor::new(
             registry,
@@ -1057,7 +1059,7 @@ mod tests {
         // anything itself.
         let registry = Arc::new(HookRegistryBuilder::new().build());
         let buffer = NotifyBuffer::new();
-        buffer.push_notify("msg".into());
+        buffer.push_notify("msg".into(), false);
 
         let interceptor = WorkerInterceptor::new(
             registry,

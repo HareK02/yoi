@@ -496,7 +496,7 @@ pub struct WorkerLifecycleResult {
 #[serde(rename_all = "snake_case")]
 pub enum WorkerInputKind {
     User,
-    System,
+    Notify,
     Compact,
     ListRewindTargets,
     RegisterPeer,
@@ -2115,7 +2115,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         let input = EmbeddedWorkerInput {
             kind: match request.kind {
                 WorkerInputKind::User => EmbeddedWorkerInputKind::User,
-                WorkerInputKind::System => EmbeddedWorkerInputKind::System,
+                WorkerInputKind::Notify => EmbeddedWorkerInputKind::Notify,
                 WorkerInputKind::Compact => EmbeddedWorkerInputKind::Compact,
                 WorkerInputKind::ListRewindTargets => EmbeddedWorkerInputKind::ListRewindTargets,
                 WorkerInputKind::RegisterPeer => EmbeddedWorkerInputKind::RegisterPeer,
@@ -3086,7 +3086,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         let input = EmbeddedWorkerInput {
             kind: match request.kind {
                 WorkerInputKind::User => EmbeddedWorkerInputKind::User,
-                WorkerInputKind::System => EmbeddedWorkerInputKind::System,
+                WorkerInputKind::Notify => EmbeddedWorkerInputKind::Notify,
                 WorkerInputKind::Compact => EmbeddedWorkerInputKind::Compact,
                 WorkerInputKind::ListRewindTargets => EmbeddedWorkerInputKind::ListRewindTargets,
                 WorkerInputKind::RegisterPeer => EmbeddedWorkerInputKind::RegisterPeer,
@@ -4538,7 +4538,7 @@ mod tests {
         .expect("test backend should connect");
         let mut request = embedded_spawn_request();
         request.initial_input = Some(EmbeddedWorkerInput {
-            kind: EmbeddedWorkerInputKind::System,
+            kind: EmbeddedWorkerInputKind::Notify,
             content: "system/role instruction belongs in profile".to_string(),
             segments: None,
         });

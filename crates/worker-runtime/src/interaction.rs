@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum WorkerInputKind {
     User,
-    System,
+    Notify,
     Compact,
     ListRewindTargets,
     RegisterPeer,
@@ -38,12 +38,32 @@ impl WorkerInput {
         }
     }
 
-    pub fn system(content: impl Into<String>) -> Self {
+    pub fn notify(content: impl Into<String>) -> Self {
         Self {
-            kind: WorkerInputKind::System,
+            kind: WorkerInputKind::Notify,
             content: content.into(),
             segments: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkerInput;
+
+    #[test]
+    fn notify_is_an_operation_and_legacy_system_kind_is_rejected() {
+        assert_eq!(
+            serde_json::to_value(WorkerInput::notify("message")).unwrap(),
+            serde_json::json!({ "kind": "notify", "content": "message" })
+        );
+        assert!(
+            serde_json::from_value::<WorkerInput>(serde_json::json!({
+                "kind": "system",
+                "content": "message"
+            }))
+            .is_err()
+        );
     }
 }
 

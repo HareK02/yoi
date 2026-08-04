@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
@@ -17,7 +17,6 @@ use memory::backend::{
     MemoryConsolidationOutput,
 };
 use protocol::stream::{decode_method, encode_event};
-use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ticket::{
@@ -240,6 +239,12 @@ impl ServerConfig {
     }
 }
 
+const ORCHESTRATOR_ATTENTION_TICKET_LIMIT: usize = 20;
+const ORCHESTRATOR_ATTENTION_PROMPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../resources/prompts/internal/workspace_orchestrator_queue_attention.md"
+));
+
 #[derive(Clone)]
 pub struct WorkspaceApi {
     config: ServerConfig,
@@ -248,6 +253,7 @@ pub struct WorkspaceApi {
     runtime: Arc<RuntimeRegistry>,
     companion: Arc<CompanionConsole>,
     orchestrator_spawn_lock: Arc<std::sync::Mutex<()>>,
+    orchestrator_attention_fingerprint: Arc<Mutex<Option<String>>>,
     observation_proxy: BackendObservationProxy,
     runtime_subscription_broker: RuntimeSubscriptionBroker,
     resource_broker: BackendResourceBroker,
@@ -348,6 +354,7 @@ impl WorkspaceApi {
             runtime,
             companion,
             orchestrator_spawn_lock: Arc::new(std::sync::Mutex::new(())),
+            orchestrator_attention_fingerprint: Arc::new(Mutex::new(None)),
             observation_proxy,
             runtime_subscription_broker,
             resource_broker,
@@ -963,21 +970,9 @@ pub async fn serve(
     listener: TcpListener,
 ) -> Result<()> {
     let api = WorkspaceApi::new(config, store).await?;
-    let dispatcher_api = api.clone();
-    let dispatcher_workspace_id = dispatcher_api.config.workspace_id.clone();
-    let dispatcher = tokio::spawn(async move {
-        loop {
-            let api = dispatcher_api.clone();
-            let workspace_id = dispatcher_workspace_id.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                dispatch_pending_ticket_notifications(&api, &workspace_id)
-            })
-            .await;
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        }
-    });
+    let orchestrator_hook = tokio::spawn(run_orchestrator_turn_end_hook(api.clone()));
     let result = axum::serve(listener, build_router(api)).await;
-    dispatcher.abort();
+    orchestrator_hook.abort();
     result?;
     Ok(())
 }
@@ -2169,7 +2164,27 @@ async fn scoped_queue_ticket(
     browser_ticket_backend(&api)?
         .queue_ready(TicketIdOrSlug::Id(path.id.clone()), queued_by)
         .map_err(Error::from)?;
-    browser_ticket_detail(&api, &path.id)
+    let Json(ticket) = browser_ticket_detail(&api, &path.id)?;
+    notify_ticket_recipients(
+        &api,
+        &path.workspace_id,
+        &path.id,
+        ticket
+            .events
+            .last()
+            .map(|event| event.sequence as i64)
+            .unwrap_or_default(),
+        ticket
+            .events
+            .last()
+            .map(|event| event.kind.as_str())
+            .unwrap_or("state_changed"),
+        "queue_ready",
+        TicketWorkflowState::Ready.as_str(),
+        ticket.state.as_str(),
+        None,
+    );
+    Ok(Json(ticket))
 }
 
 async fn scoped_close_ticket(
@@ -2204,44 +2219,36 @@ async fn execute_worker_ticket_rest_operation(
     let operation_kind = ticket_mutation_operation_kind(&operation);
     let is_mutation = operation_kind != "read";
     let target = ticket_mutation_target(&operation).cloned();
-    let read_target = ticket_read_target(&operation).cloned();
     let source = authenticate_worker_mutation_source(api, workspace_id, &headers)?;
     let before = target.as_ref().and_then(|id| backend.show(id.clone()).ok());
+    let previous_state = before
+        .as_ref()
+        .map(|ticket| ticket.meta.workflow_state.as_str().to_string())
+        .unwrap_or_else(|| ticket_operation_initial_state(&operation));
     bind_worker_ticket_operation_source(&source, &mut operation);
     let source_context = worker_ticket_source_context(api, workspace_id, &source, before.as_ref());
-    backend = backend
-        .with_event_attributes(source_context.attributes(operation_kind))
-        .with_mutation_hook(build_ticket_notification_hook(
-            api,
-            source_context,
-            operation_kind,
-            before
-                .as_ref()
-                .map(|ticket| ticket.meta.workflow_state.as_str().to_string())
-                .unwrap_or_else(|| ticket_operation_initial_state(&operation)),
-        ));
+    backend = backend.with_event_attributes(source_context.attributes(operation_kind));
 
     let result = execute_ticket_backend_operation(&backend, operation).map_err(Error::from)?;
-    if let Some(read_target) = read_target.as_ref()
-        && let Ok(ticket) = backend.show(read_target.clone())
-        && let Some(event_index) = ticket.events.last().and_then(|event| {
-            event
-                .attributes
-                .get("event_sequence")
-                .and_then(|value| value.parse::<i64>().ok())
-        })
+    if is_mutation
+        && let Some(target) = target
+        && let Ok(ticket) = backend.show(target)
     {
-        api.store.upsert_ticket_notification_cursor(
+        let event = ticket.events.last();
+        notify_ticket_recipients(
+            api,
             workspace_id,
             &ticket.meta.id,
-            &source.runtime_id,
-            &source.worker_id,
-            event_index,
-            &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-        )?;
-    }
-    if is_mutation {
-        dispatch_pending_ticket_notifications(api, workspace_id);
+            event
+                .and_then(|event| event.attributes.get("event_sequence"))
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(ticket.events.len() as i64),
+            event.map(|event| event.kind.as_str()).unwrap_or("mutation"),
+            operation_kind,
+            &previous_state,
+            ticket.meta.workflow_state.as_str(),
+            Some((source.runtime_id, source.worker_id)),
+        );
     }
     Ok(result)
 }
@@ -2791,13 +2798,6 @@ fn bind_worker_ticket_operation_source(
     }
 }
 
-fn ticket_read_target(operation: &TicketBackendOperation) -> Option<&TicketIdOrSlug> {
-    match operation {
-        TicketBackendOperation::Show { id } => Some(id),
-        _ => None,
-    }
-}
-
 fn ticket_mutation_operation_kind(operation: &TicketBackendOperation) -> &'static str {
     match operation {
         TicketBackendOperation::Create { .. } => "create",
@@ -2830,12 +2830,10 @@ fn ticket_operation_initial_state(operation: &TicketBackendOperation) -> String 
 
 #[derive(Debug, Clone)]
 struct WorkerTicketSourceContext {
-    workspace_id: String,
     runtime_id: String,
     worker_id: String,
     actor_role: String,
     assignment_id: Option<String>,
-    orchestrator: Option<(String, String)>,
 }
 
 impl WorkerTicketSourceContext {
@@ -2887,7 +2885,6 @@ fn worker_ticket_source_context(
     });
     let actor_role = worker_source_actor_role(is_current_assignment, is_orchestrator);
     WorkerTicketSourceContext {
-        workspace_id: workspace_id.to_string(),
         runtime_id: source.runtime_id.clone(),
         worker_id: source.worker_id.clone(),
         actor_role: actor_role.to_string(),
@@ -2895,94 +2892,63 @@ fn worker_ticket_source_context(
             (assignment.runtime_id == source.runtime_id && assignment.worker_id == source.worker_id)
                 .then_some(assignment.assignment_id)
         }),
-        orchestrator: orchestrator.map(|worker| (worker.runtime_id, worker.worker_id)),
     }
 }
 
-fn build_ticket_notification_hook(
-    _api: &WorkspaceApi,
-    source: WorkerTicketSourceContext,
-    operation_kind: &'static str,
-    previous_state: String,
-) -> Arc<ticket::SqliteTicketMutationHook> {
-    let invoked = AtomicBool::new(false);
-    let notification_id = new_id("tnfy");
-    Arc::new(move |conn, event| {
-        if invoked.swap(true, Ordering::SeqCst) {
-            return Ok(());
-        }
-        let current_state: String = conn
-            .query_row(
-                "SELECT workflow_state FROM typed_tickets WHERE workspace_id = ?1 AND ticket_id = ?2",
-                rusqlite::params![source.workspace_id, event.ticket_id],
-                |row| row.get(0),
-            )
-            .map_err(|error| ticket::TicketError::Conflict(format!("read committed Ticket state for outbox: {error}")))?;
-        conn.execute(
-            r#"INSERT INTO ticket_notification_outbox (
-                notification_id, workspace_id, ticket_id, event_sequence,
-                source_runtime_id, source_worker_id, previous_state, current_state, created_at,
-                event_kind, source_operation_kind, source_actor_role, source_assignment_id
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
-            rusqlite::params![
-                notification_id,
-                source.workspace_id,
-                event.ticket_id,
-                event.event_index,
-                source.runtime_id,
-                source.worker_id,
-                previous_state,
-                current_state,
-                Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-                event.event_kind.as_str(),
-                operation_kind,
-                source.actor_role,
-                source.assignment_id,
-            ],
-        )
-        .map_err(|error| {
-            ticket::TicketError::Conflict(format!("insert Ticket notification outbox: {error}"))
-        })?;
+fn notify_ticket_recipients(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    ticket_id: &str,
+    event_sequence: i64,
+    event_kind: &str,
+    source_operation_kind: &str,
+    previous_state: &str,
+    current_state: &str,
+    source: Option<(String, String)>,
+) {
+    let mut recipients = Vec::new();
+    if let Some(assignment) = api
+        .store
+        .get_current_ticket_worker_assignment(workspace_id, ticket_id)
+        .ok()
+        .flatten()
+    {
+        recipients.push((assignment.runtime_id, assignment.worker_id));
+    }
+    if (matches!(previous_state, "queued" | "inprogress")
+        || matches!(current_state, "queued" | "inprogress"))
+        && let Some(orchestrator) = find_workspace_orchestrator(api)
+    {
+        recipients.push((orchestrator.runtime_id, orchestrator.worker_id));
+    }
+    recipients.sort();
+    recipients.dedup();
 
-        let assigned: Option<(String, String)> = conn
-            .query_row(
-                r#"SELECT runtime_id, worker_id FROM ticket_current_worker_assignments
-                   WHERE workspace_id = ?1 AND ticket_id = ?2"#,
-                rusqlite::params![source.workspace_id, event.ticket_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|error| {
-                ticket::TicketError::Conflict(format!(
-                    "resolve assigned notification recipient: {error}"
-                ))
-            })?;
-        let mut recipients = Vec::new();
-        if let Some((runtime_id, worker_id)) = assigned {
-            if runtime_id != source.runtime_id || worker_id != source.worker_id {
-                recipients.push((runtime_id, worker_id, "assigned"));
-            }
-        }
-        if (matches!(previous_state.as_str(), "queued" | "inprogress")
-            || matches!(current_state.as_str(), "queued" | "inprogress"))
-            && let Some((runtime_id, worker_id)) = &source.orchestrator
-            && (*runtime_id != source.runtime_id || *worker_id != source.worker_id)
+    let source_fields = source
+        .as_ref()
+        .map(|(runtime_id, worker_id)| {
+            format!(" source_runtime_id={runtime_id} source_worker_id={worker_id}")
+        })
+        .unwrap_or_default();
+    for (runtime_id, worker_id) in recipients {
+        if source
+            .as_ref()
+            .is_some_and(|source| source.0 == runtime_id && source.1 == worker_id)
         {
-            recipients.push((runtime_id.clone(), worker_id.clone(), "orchestrator"));
+            continue;
         }
-        recipients.sort();
-        recipients.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1);
-        for (runtime_id, worker_id, recipient_kind) in recipients {
-            conn.execute(
-                r#"INSERT OR IGNORE INTO ticket_notification_deliveries (
-                    notification_id, recipient_runtime_id, recipient_worker_id, recipient_kind, attempts
-                ) VALUES (?1, ?2, ?3, ?4, 0)"#,
-                rusqlite::params![notification_id, runtime_id, worker_id, recipient_kind],
-            )
-            .map_err(|error| ticket::TicketError::Conflict(format!("insert Ticket notification delivery: {error}")))?;
-        }
-        Ok(())
-    })
+        let _ = api.runtime.send_input(
+            &runtime_id,
+            &worker_id,
+            WorkerInputRequest {
+                kind: WorkerInputKind::Notify,
+                content: format!(
+                    "Ticket notification: workspace_id={workspace_id} ticket_id={ticket_id} event_sequence={event_sequence} event_kind={event_kind} source_operation_kind={source_operation_kind}.{source_fields} Reread the Ticket before acting.",
+                ),
+                segments: None,
+            },
+        );
+    }
 }
 
 fn authenticate_worker_mutation_source(
@@ -3011,107 +2977,184 @@ fn authenticate_worker_mutation_source(
     })
 }
 
-fn dispatch_pending_ticket_notifications(api: &WorkspaceApi, workspace_id: &str) {
-    let Ok(deliveries) = api
-        .store
-        .list_pending_ticket_notification_deliveries(workspace_id, 100)
-    else {
+async fn run_orchestrator_turn_end_hook(api: WorkspaceApi) {
+    let Ok(mut subscription) = api.runtime_subscription_broker.subscribe(
+        EMBEDDED_WORKER_RUNTIME_ID,
+        protocol::subscription::EventSubscriptionSelector::RuntimeWorkers,
+    ) else {
         return;
     };
-    for delivery in deliveries {
-        let Some((current_runtime_id, current_worker_id)) =
-            current_ticket_notification_recipient(api, &delivery)
-        else {
-            continue;
-        };
-        if current_runtime_id == delivery.source_runtime_id
-            && current_worker_id == delivery.source_worker_id
-        {
-            let _ = api.store.mark_ticket_notification_delivered(
-                &delivery.notification_id,
-                &delivery.recipient_runtime_id,
-                &delivery.recipient_worker_id,
-                &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-            );
-            continue;
-        }
-        if current_runtime_id != delivery.recipient_runtime_id
-            || current_worker_id != delivery.recipient_worker_id
-        {
-            let _ = api.store.reroute_ticket_notification_delivery(
-                &delivery.notification_id,
-                &delivery.recipient_runtime_id,
-                &delivery.recipient_worker_id,
-                &current_runtime_id,
-                &current_worker_id,
-            );
-            continue;
-        }
-        if api
-            .store
-            .get_ticket_notification_cursor(
-                &delivery.workspace_id,
-                &delivery.ticket_id,
-                &current_runtime_id,
-                &current_worker_id,
-            )
-            .ok()
-            .flatten()
-            .is_some_and(|cursor| cursor >= delivery.event_sequence)
-        {
-            let _ = api.store.mark_ticket_notification_delivered(
-                &delivery.notification_id,
-                &delivery.recipient_runtime_id,
-                &delivery.recipient_worker_id,
-                &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-            );
-            continue;
-        }
-        let result = api.runtime.send_input(
-            &delivery.recipient_runtime_id,
-            &delivery.recipient_worker_id,
-            WorkerInputRequest {
-                kind: WorkerInputKind::System,
-                content: format!(
-                    "Ticket notification: workspace_id={} ticket_id={} event_sequence={} event_kind={} source_operation_kind={} source_runtime_id={} source_worker_id={}. Reread the Ticket before acting.",
-                    delivery.workspace_id,
-                    delivery.ticket_id,
-                    delivery.event_sequence,
-                    delivery.event_kind,
-                    delivery.source_operation_kind,
-                    delivery.source_runtime_id,
-                    delivery.source_worker_id
-                ),
-                segments: None,
-            },
-        );
-        match result {
-            Ok(result) if result.state == WorkerOperationState::Accepted => {
-                let _ = api.store.mark_ticket_notification_delivered(
-                    &delivery.notification_id,
-                    &delivery.recipient_runtime_id,
-                    &delivery.recipient_worker_id,
-                    &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-                );
+    let mut worker_states = HashMap::new();
+    while let Some(update) = subscription.recv().await {
+        match update {
+            crate::runtime_subscription::BrokerSubscriptionEvent::Snapshot { snapshot, .. } => {
+                if let protocol::subscription::SubscriptionSnapshot::Workers { workers } = snapshot
+                {
+                    worker_states.clear();
+                    for worker in workers {
+                        let worker_id = worker.worker_id.to_string();
+                        maybe_dispatch_orchestrator_turn_end(&api, &worker_id, None, worker.state);
+                        worker_states.insert(worker_id, worker.state);
+                    }
+                }
             }
-            Ok(result) => {
-                let _ = api.store.mark_ticket_notification_failed(
-                    &delivery.notification_id,
-                    &delivery.recipient_runtime_id,
-                    &delivery.recipient_worker_id,
-                    &format!("Runtime rejected notification: {:?}", result.diagnostics),
-                );
+            crate::runtime_subscription::BrokerSubscriptionEvent::Event { payload, .. } => {
+                match payload {
+                    protocol::subscription::SubscriptionEventPayload::WorkerUpserted { worker } => {
+                        let worker_id = worker.worker_id.to_string();
+                        let previous = worker_states.insert(worker_id.clone(), worker.state);
+                        maybe_dispatch_orchestrator_turn_end(
+                            &api,
+                            &worker_id,
+                            previous,
+                            worker.state,
+                        );
+                    }
+                    protocol::subscription::SubscriptionEventPayload::WorkerRemoved {
+                        worker_id,
+                        ..
+                    } => {
+                        worker_states.remove(worker_id.as_str());
+                    }
+                    _ => {}
+                }
             }
-            Err(error) => {
-                let _ = api.store.mark_ticket_notification_failed(
-                    &delivery.notification_id,
-                    &delivery.recipient_runtime_id,
-                    &delivery.recipient_worker_id,
-                    &error.into_error().to_string(),
-                );
+            crate::runtime_subscription::BrokerSubscriptionEvent::Disconnected { .. } => {
+                worker_states.clear();
             }
+            crate::runtime_subscription::BrokerSubscriptionEvent::Rejected { .. }
+            | crate::runtime_subscription::BrokerSubscriptionEvent::Closed { .. } => return,
         }
     }
+}
+
+fn maybe_dispatch_orchestrator_turn_end(
+    api: &WorkspaceApi,
+    worker_id: &str,
+    previous: Option<protocol::subscription::SubscriptionWorkerState>,
+    current: protocol::subscription::SubscriptionWorkerState,
+) {
+    use protocol::subscription::SubscriptionWorkerState;
+
+    if current != SubscriptionWorkerState::Idle
+        || !matches!(
+            previous,
+            None | Some(SubscriptionWorkerState::Running)
+                | Some(SubscriptionWorkerState::Stopped)
+                | Some(SubscriptionWorkerState::Paused)
+        )
+    {
+        return;
+    }
+    let Some(orchestrator) = find_workspace_orchestrator(api) else {
+        return;
+    };
+    if orchestrator.runtime_id == EMBEDDED_WORKER_RUNTIME_ID && orchestrator.worker_id == worker_id
+    {
+        dispatch_orchestrator_queue_attention(api);
+    }
+}
+
+fn dispatch_orchestrator_queue_attention(api: &WorkspaceApi) {
+    let Some(orchestrator) = find_workspace_orchestrator(api) else {
+        return;
+    };
+    let Ok(backend) = browser_ticket_backend(api) else {
+        return;
+    };
+    let Ok(mut queued) = backend.list(ticket::TicketListQuery::states([
+        ticket::TicketListState::Queued,
+    ])) else {
+        return;
+    };
+    queued.sort_by(|left, right| left.id.cmp(&right.id));
+    if queued.is_empty() {
+        *api.orchestrator_attention_fingerprint
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        return;
+    }
+    let Ok(inprogress) = backend.list(ticket::TicketListQuery::states([
+        ticket::TicketListState::InProgress,
+    ])) else {
+        return;
+    };
+    if !inprogress.is_empty() {
+        return;
+    }
+
+    let fingerprint = queued
+        .iter()
+        .map(|ticket| ticket.id.as_str())
+        .collect::<Vec<_>>()
+        .join("|");
+    if api
+        .orchestrator_attention_fingerprint
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_deref()
+        == Some(fingerprint.as_str())
+    {
+        return;
+    }
+
+    let shown = queued
+        .iter()
+        .take(ORCHESTRATOR_ATTENTION_TICKET_LIMIT)
+        .map(|ticket| {
+            format!(
+                "- {} — {}",
+                bounded_orchestrator_attention_text(&ticket.id, 80),
+                bounded_orchestrator_attention_text(&ticket.title, 240)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let omitted = queued
+        .len()
+        .saturating_sub(ORCHESTRATOR_ATTENTION_TICKET_LIMIT);
+    let omitted_line = if omitted == 0 {
+        String::new()
+    } else {
+        format!("Additional queued Tickets omitted from this notice: {omitted}\n")
+    };
+    let content = ORCHESTRATOR_ATTENTION_PROMPT
+        .replace("{{omitted_line}}", &omitted_line)
+        .replace("{{workspace_id}}", &api.config.workspace_id)
+        .replace("{{ticket_lines}}", &shown);
+    let accepted = api
+        .runtime
+        .send_input(
+            &orchestrator.runtime_id,
+            &orchestrator.worker_id,
+            WorkerInputRequest {
+                kind: WorkerInputKind::Notify,
+                content,
+                segments: None,
+            },
+        )
+        .is_ok_and(|result| result.state == WorkerOperationState::Accepted);
+    if accepted {
+        *api.orchestrator_attention_fingerprint
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(fingerprint);
+    }
+}
+
+fn bounded_orchestrator_attention_text(input: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    for (index, character) in input.chars().enumerate() {
+        if index == max_chars {
+            output.push('…');
+            break;
+        }
+        output.push(if character.is_control() {
+            ' '
+        } else {
+            character
+        });
+    }
+    output
 }
 
 fn find_workspace_orchestrator(api: &WorkspaceApi) -> Option<WorkerSummary> {
@@ -3138,24 +3181,6 @@ fn find_workspace_orchestrator(api: &WorkspaceApi) -> Option<WorkerSummary> {
         }
     }
     None
-}
-
-fn current_ticket_notification_recipient(
-    api: &WorkspaceApi,
-    delivery: &crate::store::TicketNotificationDeliveryRecord,
-) -> Option<(String, String)> {
-    match delivery.recipient_kind.as_str() {
-        "assigned" => api
-            .store
-            .get_current_ticket_worker_assignment(&delivery.workspace_id, &delivery.ticket_id)
-            .ok()
-            .flatten()
-            .map(|assignment| (assignment.runtime_id, assignment.worker_id)),
-        "orchestrator" => {
-            find_workspace_orchestrator(api).map(|worker| (worker.runtime_id, worker.worker_id))
-        }
-        _ => None,
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3701,6 +3726,10 @@ async fn scoped_start_workspace_orchestrator(
                 restored.diagnostics,
             ));
         }
+        *api.orchestrator_attention_fingerprint
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        dispatch_orchestrator_queue_attention(&api);
         return Ok(Json(workspace_orchestrator_response(&api, "restored")));
     }
 
@@ -3734,6 +3763,10 @@ async fn scoped_start_workspace_orchestrator(
             result.diagnostics,
         ));
     }
+    *api.orchestrator_attention_fingerprint
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    dispatch_orchestrator_queue_attention(&api);
     Ok(Json(workspace_orchestrator_response(&api, "created")))
 }
 
@@ -4726,7 +4759,6 @@ async fn scoped_restore_runtime_worker(
                 .into());
             }
             assign_ticket_worker_from_lifecycle(&api, assignment, &runtime_id, &worker_id)?;
-            dispatch_pending_ticket_notifications(&api, &workspace_id);
             return Ok(Json(WorkerRestoreResponse {
                 workspace_id,
                 runtime_id,
@@ -4747,7 +4779,6 @@ async fn scoped_restore_runtime_worker(
     if let Some(assignment) = assignment_request.as_ref() {
         assign_ticket_worker_from_lifecycle(&api, assignment, &runtime_id, &worker_id)?;
     }
-    dispatch_pending_ticket_notifications(&api, &workspace_id);
     Ok(response)
 }
 
@@ -6420,7 +6451,6 @@ async fn create_runtime_worker(
     if let Some(assignment) = request.ticket_assignment.as_ref() {
         if let Some(worker) = existing_lifecycle_assignment_worker(&api, assignment, &runtime_id)? {
             assign_ticket_worker_from_lifecycle(&api, assignment, &runtime_id, &worker.worker_id)?;
-            dispatch_pending_ticket_notifications(&api, api.workspace_id());
             return Ok(Json(WorkerSpawnResult {
                 state: WorkerOperationState::Accepted,
                 worker: Some(worker),
@@ -9885,7 +9915,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_worker_ticket_mutation_routes_durable_assignment_notification() {
+    async fn authenticated_worker_ticket_mutation_notifies_current_assignment() {
         let dir = tempfile::tempdir().unwrap();
         let api = test_api(dir.path()).await;
         let spawn = |name: &str| WorkerSpawnRequest {
@@ -9996,47 +10026,6 @@ mod tests {
         );
         assert!(committed_event.attributes.contains_key("event_id"));
         assert!(committed_event.attributes.contains_key("event_sequence"));
-        let event_sequence = committed_event
-            .attributes
-            .get("event_sequence")
-            .unwrap()
-            .parse::<i64>()
-            .unwrap();
-        let response = build_router(api.clone())
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri(format!(
-                        "/api/w/{TEST_WORKSPACE_ID}/tickets/{}/record",
-                        ticket_ref.id
-                    ))
-                    .header("x-yoi-runtime-id", EMBEDDED_WORKER_RUNTIME_ID)
-                    .header("x-yoi-worker-id", &source_worker.worker_id)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            api.store
-                .get_ticket_notification_cursor(
-                    TEST_WORKSPACE_ID,
-                    &ticket_ref.id,
-                    EMBEDDED_WORKER_RUNTIME_ID,
-                    &source_worker.worker_id,
-                )
-                .unwrap(),
-            Some(event_sequence)
-        );
-        assert!(
-            api.store
-                .list_pending_ticket_notification_deliveries(TEST_WORKSPACE_ID, 10)
-                .unwrap()
-                .is_empty(),
-            "accepted Runtime system input must complete the outbox delivery"
-        );
-
         let Json(stale_report) = execute_worker_ticket_test_operation(
             State(api.clone()),
             AxumPath(ScopedWorkspacePath {
@@ -10132,7 +10121,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_ticket_mutation_targets_current_orchestrator() {
+    async fn queued_ticket_mutation_succeeds_without_orchestrator() {
         let dir = tempfile::tempdir().unwrap();
         let api = test_api(dir.path()).await;
         let source = api
@@ -10163,41 +10152,6 @@ mod tests {
             .unwrap()
             .worker
             .unwrap();
-        let orchestrator = api
-            .runtime
-            .spawn_worker(
-                EMBEDDED_WORKER_RUNTIME_ID,
-                WorkerSpawnRequest {
-                    requested_worker_name: Some("workspace-orchestrator".to_string()),
-                    intent: WorkerSpawnIntent::WorkspaceOrchestrator,
-                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                        expected_segments: 0,
-                    },
-                    profile: ProfileSelector::Builtin("builtin:orchestrator".to_string()),
-                    ticket_assignment: None,
-                    initial_input: None,
-                    working_directory_request: None,
-                    resolved_working_directory_request: None,
-                    resolved_working_directory: None,
-                    resolved_config_bundle: None,
-                    resolved_workspace_api: Some(test_worker_workspace_api(
-                        EMBEDDED_WORKER_RUNTIME_ID,
-                    )),
-                },
-            )
-            .unwrap()
-            .worker
-            .unwrap();
-        api.runtime
-            .stop_worker(
-                EMBEDDED_WORKER_RUNTIME_ID,
-                &orchestrator.worker_id,
-                WorkerLifecycleRequest {
-                    reason: Some("test pending delivery".to_string()),
-                    ticket_assignment: None,
-                },
-            )
-            .unwrap();
         let backend = browser_ticket_backend(&api).unwrap();
         let mut input = ticket::NewTicket::new("Queued notification");
         input.workflow_state = Some(TicketWorkflowState::Queued);
@@ -10224,16 +10178,82 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn orchestrator_running_to_idle_recovers_queued_ticket_without_notification_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let backend = browser_ticket_backend(&api).unwrap();
+        let ticket_ref = backend
+            .create(ticket::NewTicket::new("Recover queued work"))
+            .unwrap();
+        backend
+            .mark_intake_ready(
+                TicketIdOrSlug::Id(ticket_ref.id.clone()),
+                ticket::TicketIntakeSummary {
+                    author: Some("intake".to_string()),
+                    body: MarkdownText::new("Ready"),
+                    references: Vec::new(),
+                },
+                ticket::TicketStateChange {
+                    from: "planning".to_string(),
+                    to: "ready".to_string(),
+                    reason: "ready".to_string(),
+                    author: Some("intake".to_string()),
+                    body: MarkdownText::new("Ready"),
+                    references: Vec::new(),
+                },
+            )
+            .unwrap();
+        backend
+            .queue_ready(TicketIdOrSlug::Id(ticket_ref.id.clone()), "browser-user")
+            .unwrap();
+        *api.orchestrator_attention_fingerprint.lock().unwrap() = Some(ticket_ref.id.clone());
+
+        let Json(started) = scoped_start_workspace_orchestrator(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(started.online);
         assert_eq!(
-            api.store
-                .count_ticket_notification_deliveries_for_recipient(
-                    TEST_WORKSPACE_ID,
-                    &ticket_ref.id,
-                    EMBEDDED_WORKER_RUNTIME_ID,
-                    &orchestrator.worker_id,
-                )
-                .unwrap(),
-            1
+            api.orchestrator_attention_fingerprint
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some(ticket_ref.id.as_str())
+        );
+        *api.orchestrator_attention_fingerprint.lock().unwrap() = None;
+        let worker_id = started.worker.as_ref().unwrap().worker_id.clone();
+        maybe_dispatch_orchestrator_turn_end(
+            &api,
+            &worker_id,
+            Some(protocol::subscription::SubscriptionWorkerState::Idle),
+            protocol::subscription::SubscriptionWorkerState::Idle,
+        );
+        assert!(
+            api.orchestrator_attention_fingerprint
+                .lock()
+                .unwrap()
+                .is_none()
+        );
+        maybe_dispatch_orchestrator_turn_end(
+            &api,
+            &worker_id,
+            Some(protocol::subscription::SubscriptionWorkerState::Running),
+            protocol::subscription::SubscriptionWorkerState::Idle,
+        );
+
+        assert_eq!(
+            api.orchestrator_attention_fingerprint
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some(ticket_ref.id.as_str())
         );
     }
 
@@ -10551,7 +10571,6 @@ mod tests {
         .unwrap();
         assert_eq!(queued.state, "queued");
         assert_eq!(queued.queued_by.as_deref(), Some("browser-user"));
-
         let Json(reviewed) = scoped_review_ticket(
             State(api.clone()),
             AxumPath(path()),

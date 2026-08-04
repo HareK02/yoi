@@ -285,6 +285,7 @@ impl WorkerController {
             worker.push_notify(
                 "Restored Worker state contained unreachable delegated child Workers; their delegated write scopes were reclaimed before resume."
                     .to_string(),
+                false,
             );
         }
 
@@ -883,7 +884,7 @@ async fn controller_loop<C, St>(
             )
             .await;
             let parent_originated = run.is_parent_originated();
-            let (new_status, shutdown) = match run {
+            let (mut new_status, shutdown) = match run {
                 PendingRun::Run(input) => {
                     drive_turn(
                         worker.run(input),
@@ -930,6 +931,11 @@ async fn controller_loop<C, St>(
                     .await
                 }
             };
+            if !shutdown && new_status == WorkerStatus::Idle && notify_buffer.has_auto_run_pending()
+            {
+                pending = Some(PendingRun::RunForNotification(protocol::InvokeKind::Notify));
+                new_status = WorkerStatus::Running;
+            }
             finish_controller_run(
                 &mut worker,
                 &shared_state,
@@ -985,13 +991,13 @@ async fn controller_loop<C, St>(
                 // `LogEntry::SystemItem` entry — drained out of the
                 // notify buffer + broadcast through the sink. No
                 // separate echo here.
-                worker.push_notify(message);
-                // RUNNING / Paused: the buffer push is the entire
-                // operation; an in-flight turn (or the next
-                // Resume/Run) will drain it at its next
-                // pending_history_appends. IDLE: only `auto_run`
-                // notifications stage RunForNotification; weak progress
-                // notices stay queued until an explicit run/resume.
+                worker.push_notify(message, auto_run);
+                // RUNNING: the in-flight turn drains the buffer at its next
+                // pending_history_appends; if an auto-run notification remains
+                // at turn end, the Controller stages a follow-up notification
+                // turn. Paused notifications remain queued until Resume/Run.
+                // IDLE: `auto_run` notifications stage RunForNotification;
+                // weak progress notices stay queued until an explicit run.
                 if should_auto_run_notification(shared_state.get_status(), auto_run) {
                     pending = Some(PendingRun::RunForNotification(protocol::InvokeKind::Notify));
                 }
@@ -1385,11 +1391,11 @@ where
                                 .into(),
                         });
                     }
-                    Some(Method::Notify { message, .. }) => {
+                    Some(Method::Notify { message, auto_run }) => {
                         // Live echo arrives via `Event::SystemItem` once
                         // the in-flight turn's next `pending_history_appends`
                         // drains this entry through the interceptor.
-                        notify_buffer.push_notify(message);
+                        notify_buffer.push_notify(message, auto_run);
                     }
                     Some(Method::ListCompletions { .. }) => {}
                     Some(Method::ListWorkers | Method::RestoreWorker { .. } | Method::RegisterPeer { .. }) => {
@@ -1902,6 +1908,41 @@ mod tests {
         assert_eq!(status, WorkerStatus::Idle);
         assert!(!shutdown);
         assert_eq!(env.notify_buffer.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn running_auto_run_notify_remains_staged_for_followup_turn() {
+        let mut env = make_env().await;
+        env._method_tx
+            .send(Method::Notify {
+                message: "continue".into(),
+                auto_run: true,
+            })
+            .await
+            .expect("send notify");
+
+        let worker_future = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok::<_, WorkerError>(WorkerRunResult::Finished)
+        };
+        let (status, shutdown) = drive_turn(
+            worker_future,
+            &mut env.method_rx,
+            &env.event_tx,
+            &env.cancel_tx,
+            &env.shared_state,
+            &env.notify_buffer,
+            Some(&env.parent_socket_path),
+            "parent",
+            &env.spawned_registry,
+            false,
+        )
+        .await;
+
+        assert_eq!(status, WorkerStatus::Idle);
+        assert!(!shutdown);
+        assert_eq!(env.notify_buffer.len(), 1);
+        assert!(env.notify_buffer.has_auto_run_pending());
     }
 
     #[tokio::test]

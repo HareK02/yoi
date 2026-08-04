@@ -1,4 +1,7 @@
-import { parseSigilSegments } from "./composer-command.ts";
+import {
+  buildComposerRequest,
+  parseSigilSegments,
+} from "./composer-command.ts";
 
 declare const Deno: { test(name: string, fn: () => void): void };
 
@@ -20,4 +23,15 @@ Deno.test("parseSigilSegments leaves hash sigils as plain text", () => {
     kind: "text",
     content: "ask #memory",
   }]);
+});
+
+Deno.test("notify command exposes the operation instead of a System-role input", () => {
+  assertEquals(buildComposerRequest(":notify reread the Ticket"), {
+    ok: true,
+    request: { kind: "notify", content: "reread the Ticket" },
+  });
+  assertEquals(buildComposerRequest(":system reread the Ticket"), {
+    ok: false,
+    message: "Unknown command: system. Type :help for available commands.",
+  });
 });

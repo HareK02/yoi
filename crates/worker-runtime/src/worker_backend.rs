@@ -793,6 +793,14 @@ fn method_starts_turn(method: &Method) -> bool {
     )
 }
 
+fn accepted_notify_run_state(status: WorkerStatus, auto_run: bool) -> WorkerExecutionRunState {
+    match status {
+        WorkerStatus::Running => WorkerExecutionRunState::Busy,
+        WorkerStatus::Idle if auto_run => WorkerExecutionRunState::Busy,
+        WorkerStatus::Idle | WorkerStatus::Paused => WorkerExecutionRunState::Idle,
+    }
+}
+
 fn accepted_run_state_for_method(method: &Method) -> WorkerExecutionRunState {
     match method {
         Method::Run { .. }
@@ -1098,6 +1106,29 @@ where
             }
         };
 
+        if input.kind == WorkerInputKind::Notify {
+            let status = worker.shared_state.get_status();
+            let accepted_run_state = accepted_notify_run_state(status, true);
+            let claimed_here = status == WorkerStatus::Idle
+                && busy
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok();
+            let result = self.send_method(
+                WorkerExecutionOperation::Input,
+                worker,
+                Method::Notify {
+                    message: input.content,
+                    auto_run: true,
+                },
+                accepted_run_state,
+            );
+            if claimed_here && result.outcome != crate::execution::WorkerExecutionOutcome::Accepted
+            {
+                busy.store(false, Ordering::SeqCst);
+            }
+            return result;
+        }
+
         if worker.shared_state.get_status() != WorkerStatus::Idle
             || busy
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -1115,10 +1146,9 @@ where
                     .segments
                     .unwrap_or_else(|| vec![Segment::text(input.content.trim().to_string())]),
             },
-            WorkerInputKind::System => Method::Notify {
-                message: input.content,
-                auto_run: true,
-            },
+            WorkerInputKind::Notify => {
+                unreachable!("Notify input is dispatched before the turn-start busy guard")
+            }
             WorkerInputKind::Compact => Method::Compact,
             WorkerInputKind::ListRewindTargets => Method::ListRewindTargets,
             WorkerInputKind::RegisterPeer => Method::RegisterPeer {
@@ -1158,6 +1188,28 @@ where
                 return result;
             }
         };
+
+        if let Method::Notify { auto_run, .. } = &method {
+            let auto_run = *auto_run;
+            let status = worker.shared_state.get_status();
+            let accepted_run_state = accepted_notify_run_state(status, auto_run);
+            let claimed_here = status == WorkerStatus::Idle
+                && auto_run
+                && busy
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok();
+            let result = self.send_method(
+                WorkerExecutionOperation::ProtocolMethod,
+                worker,
+                method,
+                accepted_run_state,
+            );
+            if claimed_here && result.outcome != crate::execution::WorkerExecutionOutcome::Accepted
+            {
+                busy.store(false, Ordering::SeqCst);
+            }
+            return result;
+        }
 
         let starts_turn = method_starts_turn(&method);
         if starts_turn
@@ -1297,6 +1349,26 @@ mod tests {
     use llm_engine::llm_client::{ClientError, LlmClient, Request};
     use manifest::{Scope, WorkerManifest};
     use session_store::WorkerMetadataStore;
+
+    #[test]
+    fn notify_run_state_allows_running_worker_inbox_delivery() {
+        assert_eq!(
+            accepted_notify_run_state(WorkerStatus::Running, true),
+            WorkerExecutionRunState::Busy
+        );
+        assert_eq!(
+            accepted_notify_run_state(WorkerStatus::Idle, true),
+            WorkerExecutionRunState::Busy
+        );
+        assert_eq!(
+            accepted_notify_run_state(WorkerStatus::Idle, false),
+            WorkerExecutionRunState::Idle
+        );
+        assert_eq!(
+            accepted_notify_run_state(WorkerStatus::Paused, true),
+            WorkerExecutionRunState::Idle
+        );
+    }
 
     #[derive(Clone)]
     struct MockClient {

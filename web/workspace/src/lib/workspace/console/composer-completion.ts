@@ -26,7 +26,7 @@ export const COLON_COMMAND_COMPLETIONS: ComposerCompletionEntry[] = [
   { value: "rewind", description: "List rewind targets" },
   { value: "rollback", description: "Alias for rewind" },
   { value: "peer", description: "Register metadata peer" },
-  { value: "system", description: "Send system notification" },
+  { value: "notify", description: "Send Worker notification" },
 ];
 
 export function completionTokenAt(

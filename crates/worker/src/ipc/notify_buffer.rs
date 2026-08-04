@@ -41,7 +41,7 @@ const CAPACITY: usize = 128;
 /// is available.
 #[derive(Debug, Clone)]
 pub enum PendingNotify {
-    Notify { message: String },
+    Notify { message: String, auto_run: bool },
     WorkerEvent { event: WorkerEvent },
 }
 
@@ -61,8 +61,8 @@ impl NotifyBuffer {
     /// Push a notify entry onto the queue. If the queue is full, the
     /// oldest entry is dropped and a `tracing::warn` is emitted — the
     /// caller should never hit this in normal operation.
-    pub fn push_notify(&self, message: String) {
-        self.push_entry(PendingNotify::Notify { message });
+    pub fn push_notify(&self, message: String, auto_run: bool) {
+        self.push_entry(PendingNotify::Notify { message, auto_run });
     }
 
     /// Push a typed worker-event entry onto the queue.
@@ -89,6 +89,15 @@ impl NotifyBuffer {
         q.drain(..).collect()
     }
 
+    /// Whether an undrained `Method::Notify { auto_run: true }` remains.
+    pub fn has_auto_run_pending(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("notify buffer poisoned")
+            .iter()
+            .any(|entry| matches!(entry, PendingNotify::Notify { auto_run: true, .. }))
+    }
+
     /// Number of pending entries. Primarily for tests.
     pub fn len(&self) -> usize {
         self.inner.lock().expect("notify buffer poisoned").len()
@@ -107,7 +116,7 @@ pub(crate) fn build_system_item(
     prompts: &PromptCatalog,
 ) -> Result<SystemItem, CatalogError> {
     match entry {
-        PendingNotify::Notify { message } => {
+        PendingNotify::Notify { message, .. } => {
             let body = prompts.notify_wrapper(message)?;
             Ok(SystemItem::Notification {
                 message: message.clone(),
@@ -132,12 +141,15 @@ mod tests {
     #[test]
     fn push_then_drain_preserves_order() {
         let buf = NotifyBuffer::new();
-        buf.push_notify("one".into());
-        buf.push_notify("two".into());
+        buf.push_notify("one".into(), false);
+        assert!(!buf.has_auto_run_pending());
+        buf.push_notify("two".into(), true);
+        assert!(buf.has_auto_run_pending());
         let drained = buf.drain();
+        assert!(!buf.has_auto_run_pending());
         assert_eq!(drained.len(), 2);
         match &drained[0] {
-            PendingNotify::Notify { message } => assert_eq!(message, "one"),
+            PendingNotify::Notify { message, .. } => assert_eq!(message, "one"),
             other => panic!("unexpected: {other:?}"),
         }
         assert!(buf.is_empty());
@@ -147,12 +159,12 @@ mod tests {
     fn capacity_drops_oldest() {
         let buf = NotifyBuffer::new();
         for i in 0..(CAPACITY + 5) {
-            buf.push_notify(format!("msg{i}"));
+            buf.push_notify(format!("msg{i}"), false);
         }
         let drained = buf.drain();
         assert_eq!(drained.len(), CAPACITY);
         match &drained[0] {
-            PendingNotify::Notify { message } => assert_eq!(message, "msg5"),
+            PendingNotify::Notify { message, .. } => assert_eq!(message, "msg5"),
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -161,6 +173,7 @@ mod tests {
     fn build_system_item_for_notify_carries_wrapper_body() {
         let entry = PendingNotify::Notify {
             message: "hello".into(),
+            auto_run: false,
         };
         let catalog = PromptCatalog::builtins_only().unwrap();
         let item = build_system_item(&entry, &catalog).unwrap();

@@ -1597,8 +1597,8 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// `Item::system_message` just before the next LLM request, via
     /// `WorkerInterceptor::pending_history_appends`. See [`NotifyBuffer`]
     /// for overflow behaviour and the lane-of-record rationale.
-    pub fn push_notify(&self, message: String) {
-        self.pending_notifies.push_notify(message);
+    pub fn push_notify(&self, message: String, auto_run: bool) {
+        self.pending_notifies.push_notify(message, auto_run);
     }
 
     /// Push an agent-visible typed `WorkerEvent` entry onto the pending buffer.
@@ -4364,6 +4364,7 @@ where
         self.push_notify(
             "Restored Worker state contained missing or unreachable delegated child Workers; their delegated write scopes were reclaimed before resume."
                 .to_string(),
+            false,
         );
         Ok(())
     }

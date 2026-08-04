@@ -428,7 +428,7 @@
                         ],
                     },
                 };
-            case "system":
+            case "notify":
                 return {
                     method: "notify",
                     params: { message: request.content, auto_run: true },

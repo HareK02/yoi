@@ -2392,9 +2392,9 @@ fn input_protocol_event(input: &WorkerInput) -> protocol::Event {
                 }]
             }),
         },
-        WorkerInputKind::System => protocol::Event::SystemItem {
+        WorkerInputKind::Notify => protocol::Event::SystemItem {
             item: serde_json::json!({
-                "kind": "embedded_worker_system_input",
+                "kind": "embedded_worker_notification",
                 "content": input.content.clone(),
             }),
         },
@@ -3148,7 +3148,7 @@ mod tests {
     fn create_worker_rejects_system_initial_input_without_persisting_worker() {
         let runtime = runtime_with_backend();
         let mut request = task_request("system initial input");
-        request.initial_input = Some(WorkerInput::system("role/system belongs in config bundle"));
+        request.initial_input = Some(WorkerInput::notify("role/system belongs in config bundle"));
 
         let error = runtime.create_worker(request).unwrap_err();
         assert!(matches!(
@@ -3390,7 +3390,7 @@ mod tests {
             .send_input(&detail.worker_ref, WorkerInput::user("hello"))
             .unwrap();
         runtime
-            .send_input(&detail.worker_ref, WorkerInput::system("note"))
+            .send_input(&detail.worker_ref, WorkerInput::notify("note"))
             .unwrap();
 
         let observations = runtime
@@ -3550,7 +3550,7 @@ mod tests {
             .send_input(&worker.worker_ref, WorkerInput::user("first"))
             .unwrap();
         runtime
-            .send_input(&worker.worker_ref, WorkerInput::system("second"))
+            .send_input(&worker.worker_ref, WorkerInput::notify("second"))
             .unwrap();
         runtime
             .stop_worker(&worker.worker_ref, Some("finished".to_string()))
