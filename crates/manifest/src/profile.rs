@@ -998,6 +998,7 @@ fn apply_role_profile(
     value["feature"]["memory"] = serde_json::json!({ "enabled": memory });
     value["feature"]["web"] = serde_json::json!({ "enabled": web });
     value["feature"]["workers"] = serde_json::json!({ "enabled": workers });
+    value["feature"]["manage_workdir"] = serde_json::json!({ "enabled": slug == "orchestrator" });
     let ticket = match slug {
         "companion" => serde_json::json!({ "enabled": true, "authoring": true, "thread": true }),
         "intake" => {
@@ -1492,6 +1493,7 @@ mod tests {
         assert!(intake.feature.ticket.authoring);
         assert!(intake.feature.ticket.thread);
         assert!(intake.feature.objective.enabled);
+        assert!(!intake.feature.manage_workdir.enabled);
         assert!(intake.feature.ticket.intake);
         assert!(!intake.feature.ticket.orchestration_control);
         assert!(intake.scope.allow.is_empty());
@@ -1508,6 +1510,7 @@ mod tests {
         assert!(!orchestrator.feature.ticket.authoring);
         assert!(orchestrator.feature.ticket.thread);
         assert!(orchestrator.feature.objective.enabled);
+        assert!(orchestrator.feature.manage_workdir.enabled);
         assert!(!orchestrator.feature.ticket.intake);
         assert!(orchestrator.feature.ticket.orchestration_control);
         assert!(orchestrator.scope.allow.is_empty());
@@ -1532,6 +1535,7 @@ mod tests {
         assert!(!coder.feature.ticket.authoring);
         assert!(coder.feature.ticket.thread);
         assert!(coder.feature.objective.enabled);
+        assert!(!coder.feature.manage_workdir.enabled);
         assert!(!coder.feature.ticket.intake);
         assert!(!coder.feature.ticket.orchestration_control);
         let reviewer = resolve("reviewer");
@@ -1542,6 +1546,7 @@ mod tests {
         assert!(!reviewer.feature.ticket.authoring);
         assert!(reviewer.feature.ticket.thread);
         assert!(reviewer.feature.objective.enabled);
+        assert!(!reviewer.feature.manage_workdir.enabled);
         assert!(!reviewer.feature.ticket.intake);
         assert!(!reviewer.feature.ticket.orchestration_control);
         assert!(reviewer.scope.allow.is_empty());

@@ -3925,6 +3925,41 @@ mod tests {
     }
 
     #[test]
+    fn embedded_orchestrator_profile_enables_manage_workdir() {
+        let root = tempfile::tempdir().unwrap();
+        let broker = BackendResourceBroker::default();
+        let runtime_id = "runtime-test";
+        let selector = ProfileSelector::Builtin("builtin:orchestrator".to_string());
+        let bundle = builtin_profile_config_bundle(
+            &selector,
+            "workspace-test",
+            Some(runtime_id),
+            &broker,
+            ProfileSourceArchiveTransport::BackendResourceHandle,
+        )
+        .unwrap();
+        let handle = bundle.profile_source_archive_handle.as_ref().unwrap();
+        let response = broker
+            .fetch_profile_source_archive(worker_runtime::resource::BackendResourceFetchRequest {
+                handle: handle.clone(),
+                runtime_id: runtime_id.to_string(),
+                worker_id: None,
+                audit_correlation_id: handle.audit_correlation_id.clone(),
+            })
+            .unwrap();
+        let archive =
+            worker_runtime::resource::profile_source_archive_from_response(handle, response)
+                .unwrap()
+                .verify()
+                .unwrap();
+        let manifest = archive
+            .resolve_profile("builtin:orchestrator", root.path(), "embedded-orchestrator")
+            .unwrap();
+
+        assert!(manifest.feature.manage_workdir.enabled);
+    }
+
+    #[test]
     fn embedded_builtin_decodal_profiles_resolve_through_archive() {
         let root = tempfile::tempdir().unwrap();
         let broker = BackendResourceBroker::default();

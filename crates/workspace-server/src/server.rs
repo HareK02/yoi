@@ -3736,11 +3736,8 @@ async fn scoped_working_directory_detail(
     AxumPath(path): AxumPath<ScopedWorkingDirectoryPath>,
 ) -> ApiResult<Json<BrowserWorkingDirectoryDetailResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    working_directory_detail_for_runtime(
-        api,
-        EMBEDDED_WORKER_RUNTIME_ID,
-        &path.working_directory_id,
-    )
+    let runtime_id = registered_workdir_runtime_id(&api, &path.working_directory_id)?;
+    working_directory_detail_for_runtime(api, &runtime_id, &path.working_directory_id)
 }
 
 async fn scoped_cleanup_working_directory(
@@ -3748,11 +3745,27 @@ async fn scoped_cleanup_working_directory(
     AxumPath(path): AxumPath<ScopedWorkingDirectoryPath>,
 ) -> ApiResult<Json<BrowserWorkingDirectoryDetailResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    cleanup_working_directory_for_runtime(
-        api,
-        EMBEDDED_WORKER_RUNTIME_ID,
-        &path.working_directory_id,
-    )
+    let runtime_id = registered_workdir_runtime_id(&api, &path.working_directory_id)?;
+    cleanup_working_directory_for_runtime(api, &runtime_id, &path.working_directory_id)
+}
+
+fn registered_workdir_runtime_id(
+    api: &WorkspaceApi,
+    working_directory_id: &str,
+) -> ApiResult<String> {
+    api.store
+        .get_workdir_registry(&api.config.workspace_id, working_directory_id)?
+        .map(|record| record.runtime_id)
+        .ok_or_else(|| {
+            ApiError::with_diagnostics(
+                Error::RuntimeOperationFailed {
+                    runtime_id: "workspace-backend".to_string(),
+                    code: "working_directory_not_found".to_string(),
+                    message: format!("Unknown Workdir `{working_directory_id}`"),
+                },
+                Vec::new(),
+            )
+        })
 }
 
 fn create_working_directory_for_runtime(
@@ -10523,6 +10536,47 @@ mod tests {
                 unlinked_at: None,
             })
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_scoped_workdir_routes_resolve_runtime_owner_from_registry() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        seed_cleanup_workdir(&api, "remote-workdir", "present", "clean");
+
+        assert_eq!(
+            registered_workdir_runtime_id(&api, "remote-workdir").unwrap(),
+            "runtime-test"
+        );
+    }
+
+    #[tokio::test]
+    async fn simple_workdir_cleanup_rejects_dirty_and_blocked_candidates() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        seed_cleanup_workdir(&api, "dirty-workdir", "present", "dirty");
+        let dirty =
+            cleanup_working_directory_for_runtime(api.clone(), "runtime-test", "dirty-workdir")
+                .unwrap_err();
+        assert!(matches!(
+            dirty.error,
+            Error::RuntimeOperationFailed { ref code, .. }
+                if code == "workspace_cleanup_dirty_confirmation_required"
+        ));
+
+        let pinned = seed_cleanup_worker(&api, 17, "pinned");
+        seed_cleanup_workdir(&api, "blocked-workdir", "present", "clean");
+        seed_cleanup_link(&api, pinned.as_str(), "blocked-workdir");
+        let blocked =
+            cleanup_working_directory_for_runtime(api.clone(), "runtime-test", "blocked-workdir")
+                .unwrap_err();
+        assert!(matches!(
+            blocked.error,
+            Error::RuntimeOperationFailed { ref code, .. }
+                if code == "workspace_cleanup_workdir_blocked"
+        ));
     }
 
     #[tokio::test]

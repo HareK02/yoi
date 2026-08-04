@@ -115,6 +115,8 @@ pub struct FeatureConfig {
     #[serde(default)]
     pub objective: FeatureFlagConfig,
     #[serde(default)]
+    pub manage_workdir: FeatureFlagConfig,
+    #[serde(default)]
     pub ticket: TicketFeatureConfig,
     #[serde(default)]
     pub plugins: FeatureFlagConfig,
@@ -128,6 +130,7 @@ impl Default for FeatureConfig {
             web: FeatureFlagConfig::disabled(),
             workers: FeatureFlagConfig::disabled(),
             objective: FeatureFlagConfig::disabled(),
+            manage_workdir: FeatureFlagConfig::disabled(),
             ticket: TicketFeatureConfig::default(),
             plugins: FeatureFlagConfig::disabled(),
         }

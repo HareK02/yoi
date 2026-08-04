@@ -87,6 +87,8 @@ pub struct FeatureConfigPartial {
     #[serde(default)]
     pub objective: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
+    pub manage_workdir: Option<FeatureFlagConfigPartial>,
+    #[serde(default)]
     pub ticket: Option<TicketFeatureConfigPartial>,
     #[serde(default)]
     pub plugins: Option<FeatureFlagConfigPartial>,
@@ -102,6 +104,11 @@ impl FeatureConfigPartial {
             objective: merge_option(
                 self.objective,
                 other.objective,
+                FeatureFlagConfigPartial::merge,
+            ),
+            manage_workdir: merge_option(
+                self.manage_workdir,
+                other.manage_workdir,
                 FeatureFlagConfigPartial::merge,
             ),
             ticket: merge_option(self.ticket, other.ticket, TicketFeatureConfigPartial::merge),
@@ -178,6 +185,10 @@ impl From<FeatureConfigPartial> for FeatureConfig {
                 .unwrap_or_default(),
             objective: value
                 .objective
+                .map(FeatureFlagConfig::from)
+                .unwrap_or_default(),
+            manage_workdir: value
+                .manage_workdir
                 .map(FeatureFlagConfig::from)
                 .unwrap_or_default(),
             ticket: value
@@ -258,6 +269,7 @@ impl From<FeatureConfig> for FeatureConfigPartial {
             web: Some(value.web.into()),
             workers: Some(value.workers.into()),
             objective: Some(value.objective.into()),
+            manage_workdir: Some(value.manage_workdir.into()),
             ticket: Some(value.ticket.into()),
             plugins: Some(value.plugins.into()),
         }
@@ -1804,6 +1816,7 @@ worker_max_turns = 7
         assert!(!manifest.feature.web.enabled);
         assert!(!manifest.feature.workers.enabled);
         assert!(!manifest.feature.objective.enabled);
+        assert!(!manifest.feature.manage_workdir.enabled);
         assert!(!manifest.feature.ticket.enabled);
     }
 
@@ -1812,6 +1825,9 @@ worker_max_turns = 7
         let cfg = WorkerManifestConfig::from_toml(
             r#"
 [feature.task]
+enabled = true
+
+[feature.manage_workdir]
 enabled = true
 
 [feature.ticket]
@@ -1848,6 +1864,7 @@ orchestration_control = false
             .try_into()
             .unwrap();
         assert!(manifest.feature.task.enabled);
+        assert!(manifest.feature.manage_workdir.enabled);
         assert!(manifest.feature.ticket.enabled);
         assert!(!manifest.feature.ticket.authoring);
         assert!(!manifest.feature.ticket.thread);
@@ -1864,6 +1881,9 @@ orchestration_control = false
             r#"
 [feature.memory]
 enabled = true
+
+[feature.manage_workdir]
+enabled = false
 
 [feature.ticket]
 enabled = true
@@ -1882,6 +1902,9 @@ orchestration_control = true
 
 [feature.memory]
 staging = true
+
+[feature.manage_workdir]
+enabled = true
 
 [feature.objective]
 enabled = true
@@ -1918,6 +1941,7 @@ enabled = true
             .unwrap();
         assert!(manifest.feature.memory.enabled);
         assert!(manifest.feature.memory.staging);
+        assert!(manifest.feature.manage_workdir.enabled);
         assert!(manifest.feature.ticket.enabled);
         assert!(!manifest.feature.ticket.authoring);
         assert!(manifest.feature.ticket.thread);

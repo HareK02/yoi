@@ -8,6 +8,7 @@ import "./base.dcdl" // {
         memory = { enabled = true; };
         web = { enabled = true; };
         workers = { enabled = true; };
+        manage_workdir = { enabled = true; };
         ticket = { enabled = true; thread = true; orchestration_control = true; };
     };
 }

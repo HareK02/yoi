@@ -665,6 +665,24 @@ where
             ),
         );
     }
+    if feature_config.manage_workdir.enabled {
+        // Workdir lifecycle is Workspace control-plane authority. The Worker
+        // receives only the injected WorkspaceClient and never Runtime URLs,
+        // repository paths, materializer handles, or cleanup sessions.
+        let workspace_client = worker.workspace_client_handle();
+        let has_workspace_identity = workspace_client.workspace_id().is_some_and(|workspace_id| {
+            !workspace_id.is_empty() && !workspace_id.chars().any(char::is_control)
+        });
+        if !workspace_client.is_available() || !has_workspace_identity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "manage Workdir tools require Backend Workspace API authority",
+            ));
+        }
+        feature_registry.add_module(
+            crate::feature::builtin::manage_workdir::manage_workdir_feature(workspace_client),
+        );
+    }
     for module in crate::feature::plugin::plugin_tool_features_if_enabled(
         feature_config.plugins.enabled,
         &worker.manifest().plugins,

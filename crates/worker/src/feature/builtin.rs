@@ -4,6 +4,7 @@
 //! same descriptor-approved registry path used by feature modules. They are not
 //! an external plugin-loading surface.
 
+pub mod manage_workdir;
 pub mod memory;
 pub mod objective;
 pub mod session_explore;
