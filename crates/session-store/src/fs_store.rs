@@ -20,17 +20,23 @@ use crate::segment_log::LogEntry;
 use crate::store::{Store, StoreError};
 use crate::{SegmentId, SessionId};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 /// Filesystem-backed JSONL store.
 ///
 /// Each segment is stored as a single `.jsonl` file with one [`LogEntry`]
-/// per line. Writes use append mode for crash safety.
+/// per line. A trailing line is committed only once its newline has been
+/// written; readers ignore an unterminated tail and the next append removes it.
 #[derive(Clone)]
 pub struct FsStore {
     root: PathBuf,
+    /// Serialises append repair + write + rollback across clones. A failed
+    /// `write_all` may have extended the file, so rollback is safe only while
+    /// no sibling writer can append behind it.
+    append_lock: Arc<Mutex<()>>,
 }
 
 impl FsStore {
@@ -39,7 +45,10 @@ impl FsStore {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let root = root.into();
         fs::create_dir_all(&root)?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            append_lock: Arc::new(Mutex::new(())),
+        })
     }
 
     /// Return the filesystem root used by this store.
@@ -101,22 +110,62 @@ impl FsStore {
     }
 
     fn append_line(&self, path: &Path, line: &str) -> Result<(), StoreError> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| std::io::Error::other("session store append lock was poisoned"))?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let mut file = fs::OpenOptions::new()
             .create(true)
+            .read(true)
+            .write(true)
             .append(true)
             .open(path)?;
-        file.write_all(line.as_bytes())?;
-        file.write_all(b"\n")?;
-        // Append-mode write is the durability boundary; an explicit
-        // `sync_all` here would multiply latency by ~10× for no gain
-        // since the kernel already orders concurrent `O_APPEND` writes.
+        let committed_len = Self::truncate_uncommitted_tail(&mut file)?;
+        let mut record = Vec::with_capacity(line.len() + 1);
+        record.extend_from_slice(line.as_bytes());
+        record.push(b'\n');
+
+        if let Err(write_error) = file.write_all(&record) {
+            return match file.set_len(committed_len) {
+                Ok(()) => Err(write_error.into()),
+                Err(rollback_error) => Err(std::io::Error::new(
+                    rollback_error.kind(),
+                    format!(
+                        "session append failed ({write_error}) and partial-write rollback failed: {rollback_error}"
+                    ),
+                )
+                .into()),
+            };
+        }
         Ok(())
     }
 
-    fn parse_jsonl<T: serde::de::DeserializeOwned>(content: &str) -> Result<Vec<T>, StoreError> {
+    /// Return only newline-terminated records. A process interruption or
+    /// ENOSPC can leave the final UTF-8 code point / JSON object incomplete;
+    /// without a newline that record never crossed the commit boundary.
+    fn complete_jsonl_prefix(content: &[u8]) -> &[u8] {
+        if content.last() == Some(&b'\n') {
+            return content;
+        }
+        match content.iter().rposition(|byte| *byte == b'\n') {
+            Some(index) => &content[..=index],
+            None => &[],
+        }
+    }
+
+    fn parse_jsonl<T: serde::de::DeserializeOwned>(content: &[u8]) -> Result<Vec<T>, StoreError> {
+        let complete = Self::complete_jsonl_prefix(content);
+        let content = std::str::from_utf8(complete).map_err(|error| StoreError::Corrupt {
+            line: complete[..error.valid_up_to()]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count()
+                + 1,
+            message: error.to_string(),
+        })?;
         let mut entries = Vec::new();
         for (i, line) in content.lines().enumerate() {
             if line.trim().is_empty() {
@@ -129,6 +178,43 @@ impl FsStore {
             entries.push(entry);
         }
         Ok(entries)
+    }
+
+    /// Remove a prior unterminated record and return the committed file size.
+    /// Scans backwards in bounded chunks so repairing a large session does not
+    /// require loading it into memory.
+    fn truncate_uncommitted_tail(file: &mut fs::File) -> std::io::Result<u64> {
+        const SCAN_BYTES: usize = 8 * 1024;
+
+        let len = file.metadata()?.len();
+        if len == 0 {
+            return Ok(0);
+        }
+
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0_u8; 1];
+        file.read_exact(&mut last)?;
+        if last[0] == b'\n' {
+            return Ok(len);
+        }
+
+        let mut end = len;
+        let mut buffer = [0_u8; SCAN_BYTES];
+        while end > 0 {
+            let start = end.saturating_sub(SCAN_BYTES as u64);
+            let chunk_len = (end - start) as usize;
+            file.seek(SeekFrom::Start(start))?;
+            file.read_exact(&mut buffer[..chunk_len])?;
+            if let Some(index) = buffer[..chunk_len].iter().rposition(|byte| *byte == b'\n') {
+                let committed_len = start + index as u64 + 1;
+                file.set_len(committed_len)?;
+                return Ok(committed_len);
+            }
+            end = start;
+        }
+
+        file.set_len(0)?;
+        Ok(0)
     }
 }
 
@@ -152,7 +238,7 @@ impl Store for FsStore {
         if !path.exists() {
             return Err(StoreError::NotFound(segment_id));
         }
-        let content = fs::read_to_string(&path)?;
+        let content = fs::read(&path)?;
         Self::parse_jsonl(&content)
     }
 
@@ -251,8 +337,17 @@ impl Store for FsStore {
         if !path.exists() {
             return Err(StoreError::NotFound(segment_id));
         }
-        let content = fs::read_to_string(&path)?;
-        Ok(content.lines().filter(|l| !l.trim().is_empty()).count())
+        let content = fs::read(&path)?;
+        let complete = Self::complete_jsonl_prefix(&content);
+        let complete = std::str::from_utf8(complete).map_err(|error| StoreError::Corrupt {
+            line: complete[..error.valid_up_to()]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count()
+                + 1,
+            message: error.to_string(),
+        })?;
+        Ok(complete.lines().filter(|l| !l.trim().is_empty()).count())
     }
 
     fn append_trace(

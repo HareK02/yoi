@@ -112,13 +112,14 @@ impl WorkerInterceptor {
     /// `Item::system_message`s reach the worker via
     /// `ContinueWith` / `pending_history_appends`, so on-disk order
     /// matches worker-history order.
-    fn commit_system_items(&self, items: &[SystemItem]) {
+    fn commit_system_items(&self, items: &[SystemItem]) -> Result<(), session_store::StoreError> {
         let Some(writer) = self.log_writer.as_ref() else {
-            return;
+            return Ok(());
         };
         for item in items {
-            writer.commit_system_item(item.clone());
+            writer.commit_system_item(item.clone())?;
         }
+        Ok(())
     }
 
     fn current_turn_index(&self) -> usize {
@@ -194,15 +195,17 @@ impl Interceptor for WorkerInterceptor {
             // `Item::system_message`s, so on-disk order matches
             // worker-history order.
             let items: Vec<Item> = extras.iter().map(SystemItem::to_history_item).collect();
-            self.commit_system_items(&extras);
-            PromptAction::ContinueWith(items)
+            match self.commit_system_items(&extras) {
+                Ok(()) => PromptAction::ContinueWith(items),
+                Err(error) => PromptAction::Cancel(format!("session persistence failed: {error}")),
+            }
         }
     }
 
-    async fn pending_history_appends(&self) -> Vec<Item> {
+    async fn pending_history_appends(&self) -> Result<Vec<Item>, String> {
         let drained = self.pending_notifies.drain();
         if drained.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let mut system_items: Vec<SystemItem> = Vec::with_capacity(drained.len());
@@ -231,8 +234,9 @@ impl Interceptor for WorkerInterceptor {
                 }
             }
         }
-        self.commit_system_items(&system_items);
-        items
+        self.commit_system_items(&system_items)
+            .map_err(|error| format!("session persistence failed: {error}"))?;
+        Ok(items)
     }
 
     async fn pre_llm_request(&self, context: &mut Vec<Item>) -> PreRequestAction {
@@ -278,7 +282,9 @@ impl Interceptor for WorkerInterceptor {
         let current_tokens = self.estimated_tokens(effective_context.as_ref());
 
         if self.request_threshold_exceeded(current_tokens, effective_context.as_ref()) {
-            self.commit_system_items(&system_items);
+            if let Err(error) = self.commit_system_items(&system_items) {
+                return PreRequestAction::Cancel(format!("session persistence failed: {error}"));
+            }
             return if appended_items.is_empty() {
                 PreRequestAction::Yield
             } else {
@@ -292,8 +298,10 @@ impl Interceptor for WorkerInterceptor {
         if system_items.is_empty() {
             return PreRequestAction::Continue;
         }
-        self.commit_system_items(&system_items);
-        PreRequestAction::ContinueWith(appended_items)
+        match self.commit_system_items(&system_items) {
+            Ok(()) => PreRequestAction::ContinueWith(appended_items),
+            Err(error) => PreRequestAction::Cancel(format!("session persistence failed: {error}")),
+        }
     }
 
     async fn pre_tool_call(&self, info: &mut ToolCallInfo) -> PreToolAction {
@@ -451,13 +459,17 @@ mod tests {
     }
 
     impl SystemItemCommitter for RecordingSystemItemCommitter {
-        fn commit_log_entry(&self, entry: session_store::LogEntry) {
+        fn commit_log_entry(
+            &self,
+            entry: session_store::LogEntry,
+        ) -> Result<(), session_store::StoreError> {
             if let session_store::LogEntry::SystemItem { item, .. } = entry {
                 self.committed
                     .lock()
                     .expect("committed system-item list poisoned")
                     .push(item);
             }
+            Ok(())
         }
     }
 
@@ -1034,7 +1046,7 @@ mod tests {
             None,
         );
 
-        let items = interceptor.pending_history_appends().await;
+        let items = interceptor.pending_history_appends().await.unwrap();
         assert_eq!(items.len(), 2);
         let first = items[0].as_text().unwrap_or_default();
         let second = items[1].as_text().unwrap_or_default();
@@ -1048,7 +1060,7 @@ mod tests {
         );
 
         // Empty buffer → empty Vec (no synthesised items).
-        let again = interceptor.pending_history_appends().await;
+        let again = interceptor.pending_history_appends().await.unwrap();
         assert!(again.is_empty());
     }
 

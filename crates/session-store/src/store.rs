@@ -40,8 +40,8 @@ pub enum StoreError {
 pub trait Store: Send + Sync {
     /// Append a single log entry to the segment log.
     ///
-    /// One line per call. The kernel orders concurrent `O_APPEND` writes
-    /// for lines < `PIPE_BUF`, so user-space serialization is unnecessary.
+    /// One committed line per successful call. Implementations must not expose
+    /// a failed call's partial record as committed data on later reads.
     fn append(
         &self,
         session_id: SessionId,

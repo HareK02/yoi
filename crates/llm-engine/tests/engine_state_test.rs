@@ -44,12 +44,18 @@ fn test_mutable_history_manipulation() {
     assert!(engine.history().is_empty());
 
     // Add to history
-    engine.append_history(vec![Item::user_message("Hello")]);
-    engine.append_history(vec![Item::assistant_message("Hi there!")]);
+    engine
+        .append_history(vec![Item::user_message("Hello")])
+        .unwrap();
+    engine
+        .append_history(vec![Item::assistant_message("Hi there!")])
+        .unwrap();
     assert_eq!(engine.history().len(), 2);
 
     // Append to history via the callback-aware API.
-    engine.append_history(vec![Item::user_message("How are you?")]);
+    engine
+        .append_history(vec![Item::user_message("How are you?")])
+        .unwrap();
     assert_eq!(engine.history().len(), 3);
 
     // Clear history
@@ -86,15 +92,20 @@ fn test_mutable_append_history() {
         if let Some(text) = item.as_text() {
             observed_for_callback.lock().unwrap().push(text.to_string());
         }
+        Ok(())
     });
 
-    engine.append_history(vec![Item::user_message("First")]);
+    engine
+        .append_history(vec![Item::user_message("First")])
+        .unwrap();
 
-    engine.append_history(vec![
-        Item::assistant_message("Response 1"),
-        Item::user_message("Second"),
-        Item::assistant_message("Response 2"),
-    ]);
+    engine
+        .append_history(vec![
+            Item::assistant_message("Response 1"),
+            Item::user_message("Second"),
+            Item::assistant_message("Response 2"),
+        ])
+        .unwrap();
 
     assert_eq!(engine.history().len(), 4);
     assert_eq!(
@@ -157,6 +168,40 @@ fn test_mutable_can_register_tool() {
     engine.register_tool(tool.definition());
 }
 
+/// A durable-history failure on a tool call must stop the turn before the
+/// tool can produce an external side effect.
+#[tokio::test]
+async fn history_append_failure_stops_before_tool_execution() {
+    let client = MockLlmClient::new(vec![
+        Event::tool_use_start(0, "call_1", "count_tool"),
+        Event::tool_input_delta(0, r#"{}"#),
+        Event::tool_use_stop(0),
+        Event::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        }),
+    ]);
+    let tool = CountingTool::new("count_tool");
+    let mut engine = Engine::new(client);
+    engine.register_tool(tool.definition());
+    engine.on_history_append(|item| {
+        if item.is_tool_call() {
+            Err("simulated ENOSPC".to_string())
+        } else {
+            Ok(())
+        }
+    });
+
+    let mut engine = engine.lock();
+    let error = engine.run("use the tool").await.unwrap_err();
+
+    assert!(
+        matches!(error, EngineError::HistoryAppend(ref message) if message == "simulated ENOSPC")
+    );
+    assert_eq!(tool.call_count(), 0);
+    assert_eq!(engine.history().len(), 1);
+    assert_eq!(engine.history()[0].as_text(), Some("use the tool"));
+}
+
 // =============================================================================
 // State Transition Tests
 // =============================================================================
@@ -168,8 +213,12 @@ fn test_lock_transition() {
     let mut engine = Engine::new(client);
 
     engine.set_system_prompt("System");
-    engine.append_history(vec![Item::user_message("Hello")]);
-    engine.append_history(vec![Item::assistant_message("Hi")]);
+    engine
+        .append_history(vec![Item::user_message("Hello")])
+        .unwrap();
+    engine
+        .append_history(vec![Item::assistant_message("Hi")])
+        .unwrap();
 
     // Lock
     let locked_engine = engine.lock();
@@ -186,14 +235,18 @@ fn test_unlock_transition() {
     let client = MockLlmClient::new(vec![]);
     let mut engine = Engine::new(client);
 
-    engine.append_history(vec![Item::user_message("Hello")]);
+    engine
+        .append_history(vec![Item::user_message("Hello")])
+        .unwrap();
     let locked_engine = engine.lock();
 
     // Unlock
     let mut engine = locked_engine.unlock();
 
     // History operations are available again in Mutable state
-    engine.append_history(vec![Item::assistant_message("Hi")]);
+    engine
+        .append_history(vec![Item::assistant_message("Hi")])
+        .unwrap();
     engine.clear_history();
     assert!(engine.history().is_empty());
 }
@@ -316,8 +369,12 @@ async fn test_locked_prefix_len_tracking() {
     let mut engine = Engine::new(client);
 
     // Add items beforehand
-    engine.append_history(vec![Item::user_message("Pre-existing message 1")]);
-    engine.append_history(vec![Item::assistant_message("Pre-existing response 1")]);
+    engine
+        .append_history(vec![Item::user_message("Pre-existing message 1")])
+        .unwrap();
+    engine
+        .append_history(vec![Item::assistant_message("Pre-existing response 1")])
+        .unwrap();
 
     assert_eq!(engine.history().len(), 2);
 
@@ -387,10 +444,12 @@ async fn test_unlock_edit_relock() {
     ]]);
 
     let mut engine = Engine::new(client);
-    engine.append_history(vec![
-        Item::user_message("Hello"),
-        Item::assistant_message("Hi"),
-    ]);
+    engine
+        .append_history(vec![
+            Item::user_message("Hello"),
+            Item::assistant_message("Hi"),
+        ])
+        .unwrap();
 
     // Lock -> Unlock
     let locked = engine.lock();
@@ -400,7 +459,9 @@ async fn test_unlock_edit_relock() {
 
     // Edit history
     unlocked.clear_history();
-    unlocked.append_history(vec![Item::user_message("Fresh start")]);
+    unlocked
+        .append_history(vec![Item::user_message("Fresh start")])
+        .unwrap();
 
     // Re-lock
     let relocked = unlocked.lock();

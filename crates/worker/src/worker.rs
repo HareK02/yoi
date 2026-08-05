@@ -568,9 +568,8 @@ where
     St: Store + Clone,
 {
     /// Append `entry` to the log: disk write → counter bump → in-memory
-    /// mirror push → broadcast. The kernel orders concurrent `O_APPEND`
-    /// writes for `< PIPE_BUF` lines, so no user-space serialization is
-    /// needed across appenders.
+    /// mirror push → broadcast. The Store owns physical write ordering and
+    /// partial-write recovery; publication happens only after it returns Ok.
     pub fn append_entry(&self, entry: LogEntry) -> Result<(), StoreError> {
         let loc = self.state.location();
         self.store.append(loc.session_id, loc.segment_id, &entry)?;
@@ -602,13 +601,13 @@ where
 /// interceptor commit `SystemItem`s without being generic over the
 /// concrete `Store` type.
 pub trait SystemItemCommitter: Send + Sync {
-    fn commit_log_entry(&self, entry: LogEntry);
+    fn commit_log_entry(&self, entry: LogEntry) -> Result<(), StoreError>;
 
-    fn commit_system_item(&self, item: SystemItem) {
+    fn commit_system_item(&self, item: SystemItem) -> Result<(), StoreError> {
         self.commit_log_entry(LogEntry::SystemItem {
             ts: segment_log::now_millis(),
             item,
-        });
+        })
     }
 }
 
@@ -616,10 +615,8 @@ impl<St> SystemItemCommitter for LogWriterHandle<St>
 where
     St: Store + Clone + Send + Sync + 'static,
 {
-    fn commit_log_entry(&self, entry: LogEntry) {
-        if let Err(err) = self.append_entry(entry) {
-            warn!(error = %err, "session log entry commit failed; dropping");
-        }
+    fn commit_log_entry(&self, entry: LogEntry) -> Result<(), StoreError> {
+        self.append_entry(entry)
     }
 }
 
@@ -914,7 +911,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
         let writer = self.log_writer_handle();
         self.engine_mut().on_history_append(move |item| {
             if item.is_user_message() {
-                return;
+                return Ok(());
             }
             if matches!(
                 item,
@@ -923,12 +920,12 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
                     ..
                 }
             ) {
-                return;
+                return Ok(());
             }
             let entry = session_store::classify_history_item(item, segment_log::now_millis());
-            if let Err(err) = writer.append_entry(entry) {
-                warn!(error = %err, "history append commit failed; dropping");
-            }
+            writer
+                .append_entry(entry)
+                .map_err(|error| error.to_string())
         });
         if self.manifest.session.record_event_trace {
             let writer = self.log_writer_handle();
@@ -1206,7 +1203,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             },
         })?;
         self.engine_mut()
-            .append_history(std::iter::once(llm_engine::Item::system_message(body)));
+            .append_history(std::iter::once(llm_engine::Item::system_message(body)))?;
         Ok(activation)
     }
 
@@ -1251,9 +1248,8 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     }
 
     /// Append `entry` to the session log AND publish it through the
-    /// broadcast sink. No user-space serialization is needed across
-    /// concurrent appenders — the kernel orders `O_APPEND` writes for
-    /// lines smaller than `PIPE_BUF`.
+    /// broadcast sink. The Store is the commit boundary: a failed write is
+    /// never counted or published.
     pub(crate) fn commit_entry(&self, entry: LogEntry) -> Result<(), StoreError> {
         let loc = self.segment_state.location();
         self.store.append(loc.session_id, loc.segment_id, &entry)?;
@@ -2083,7 +2079,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             &tool_result_summary,
         );
         if !closures.is_empty() {
-            self.engine_mut().append_history(closures);
+            self.engine_mut().append_history(closures)?;
         }
         self.commit_entry(LogEntry::SystemItem {
             ts: segment_log::now_millis(),
@@ -2094,7 +2090,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         self.engine_mut()
             .append_history(std::iter::once(llm_engine::Item::system_message(
                 system_note,
-            )));
+            )))?;
         Ok(())
     }
 
@@ -2164,6 +2160,12 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             ),
             "run_for_notification expects a non-UserSend InvokeKind; got {kind:?}"
         );
+        // This is a fresh Invoke, not an explicit resume of the interrupted
+        // turn. Close any dangling tool calls before an auto-run notification
+        // can enter `Engine::resume` and execute them again after a crash.
+        if self.engine.as_ref().unwrap().last_run_interrupted() {
+            self.apply_interrupt_prep()?;
+        }
         self.prepare_for_run().await?;
 
         // IDLE → active marker for the buffered notification / worker-event
@@ -5912,6 +5914,57 @@ mod build_summary_prompt_tests {
 
         assert_eq!(tool_result_count, 1);
         assert_eq!(interrupt_system_count, 1);
+    }
+
+    #[tokio::test]
+    async fn notification_run_closes_interrupted_tool_call_before_engine_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = minimal_manifest();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let cwd = dir.path().join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let scope = Scope::writable(&cwd).unwrap();
+        let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
+        let mut worker = Worker::new(
+            manifest,
+            Engine::new(NoopClient),
+            store,
+            WorkerWorkspaceContext::local_filesystem(None),
+            authority,
+            scope,
+        )
+        .await
+        .unwrap();
+
+        worker.ensure_segment_head().unwrap();
+        worker.wire_history_persistence();
+        let dangling_call = Item::tool_call("call-1", "SideEffect", "{}");
+        worker
+            .commit_entry(LogEntry::AssistantItem {
+                ts: segment_log::now_millis(),
+                item: dangling_call.clone().into(),
+            })
+            .unwrap();
+        worker.engine_mut().set_history(vec![dangling_call]);
+        worker.engine_mut().set_last_run_interrupted(true);
+
+        worker
+            .run_for_notification(protocol::InvokeKind::Notify)
+            .await
+            .unwrap();
+
+        let history = worker.engine().history();
+        assert!(matches!(
+            history.get(1),
+            Some(Item::ToolResult { call_id, .. }) if call_id == "call-1"
+        ));
+        assert!(matches!(
+            history.get(2),
+            Some(Item::Message {
+                role: Role::System,
+                ..
+            })
+        ));
     }
 
     #[derive(Clone, Copy)]

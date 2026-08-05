@@ -69,7 +69,10 @@ pub enum LogEntry {
     /// Field name is `trigger` (not `kind`) because the LogEntry
     /// serde tag already occupies `"kind"`.
     ///
-    /// Marker only — replay does not mutate `RestoredState`.
+    /// Replay marks the run interrupted until a terminal `RunCompleted`,
+    /// `RunErrored`, or `PausedTurnAbandoned` entry proves how it ended. This
+    /// makes a process/disk failure between Invoke and its terminal record
+    /// restore conservatively instead of re-running a dangling tool call.
     Invoke { ts: u64, trigger: InvokeKind },
 
     /// User input accepted at submit time. Carries the original typed
@@ -236,9 +239,9 @@ pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
                 state.history = history.iter().cloned().map(Item::from).collect();
             }
             LogEntry::Invoke { .. } => {
-                // Marker only; no state mutation. The trailing
-                // UserInput / SystemItem / TurnEnd entries carry all
-                // replay-relevant data.
+                // A terminal run record below clears or refines this. If the
+                // log ends first, restore must treat the turn as interrupted.
+                state.last_run_interrupted = true;
             }
             LogEntry::UserInput { segments, .. } => {
                 let text = Segment::flatten_to_text(segments);
@@ -366,6 +369,35 @@ mod tests {
         assert_eq!(state.history.len(), 2);
         assert_eq!(state.turn_count, 1);
         assert!(!state.last_run_interrupted);
+    }
+
+    #[test]
+    fn replay_incomplete_invoke_is_interrupted() {
+        let state = collect_state(&[
+            LogEntry::SegmentStart {
+                ts: 1000,
+                session_id: uuid::Uuid::nil(),
+                system_prompt: None,
+                config: RequestConfig::default(),
+                history: vec![],
+                forked_from: None,
+                compacted_from: None,
+            },
+            LogEntry::Invoke {
+                ts: 2000,
+                trigger: InvokeKind::UserSend,
+            },
+            LogEntry::UserInput {
+                ts: 2001,
+                segments: vec![Segment::text("run a tool")],
+            },
+            LogEntry::AssistantItem {
+                ts: 3000,
+                item: Item::tool_call("call_1", "side_effect", "{}").into(),
+            },
+        ]);
+
+        assert!(state.last_run_interrupted);
     }
 
     #[test]
@@ -546,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_invoke_marker_does_not_mutate_state() {
+    fn replay_invoke_marker_only_mutates_interrupted_state() {
         let state = collect_state(&[
             LogEntry::SegmentStart {
                 ts: 0,
@@ -576,6 +608,7 @@ mod tests {
         ]);
         assert_eq!(state.history.len(), 1);
         assert_eq!(state.turn_count, 1);
+        assert!(state.last_run_interrupted);
     }
 
     #[test]

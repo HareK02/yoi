@@ -50,6 +50,9 @@ pub enum EngineError {
     /// Config warnings (unsupported options)
     #[error("Config warnings: {}", .0.iter().map(|w| w.to_string()).collect::<Vec<_>>().join(", "))]
     ConfigWarnings(Vec<ConfigWarning>),
+    /// A durable-history observer rejected an item before it entered history.
+    #[error("History append failed: {0}")]
+    HistoryAppend(String),
 }
 
 /// Tool registration error
@@ -222,10 +225,10 @@ pub struct Engine<C: LlmClient, S: EngineState = Mutable> {
     /// truncation have been applied — i.e. on the same data that
     /// enters history.
     tool_result_cbs: Vec<Box<dyn Fn(&ToolResult) + Send + Sync>>,
-    /// History-append callbacks. Invoked for non-streamed items when they
-    /// are appended to persistent engine history, so upper layers can
-    /// broadcast those items using history itself as the source of truth.
-    history_append_cbs: Vec<Box<dyn Fn(&Item) + Send + Sync>>,
+    /// History-append callbacks. Invoked before non-streamed items enter
+    /// engine history. An error rejects the item and aborts the turn, allowing
+    /// upper layers to make durable storage the commit gate.
+    history_append_cbs: Vec<Box<dyn Fn(&Item) -> Result<(), String> + Send + Sync>>,
     /// Request configuration (max_tokens, temperature, etc.)
     request_config: RequestConfig,
     /// Whether the previous run was interrupted
@@ -498,23 +501,31 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
         }
     }
 
-    /// Register a callback invoked for items appended directly to engine
-    /// history outside streaming timeline callbacks.
-    pub fn on_history_append(&mut self, callback: impl Fn(&Item) + Send + Sync + 'static) {
+    /// Register a fallible callback invoked before an item enters engine
+    /// history. Returning an error rejects that item and aborts the turn.
+    pub fn on_history_append(
+        &mut self,
+        callback: impl Fn(&Item) -> Result<(), String> + Send + Sync + 'static,
+    ) {
         self.history_append_cbs.push(Box::new(callback));
     }
 
-    fn emit_history_append(&self, item: &Item) {
+    fn emit_history_append(&self, item: &Item) -> Result<(), EngineError> {
         for cb in &self.history_append_cbs {
-            cb(item);
+            cb(item).map_err(EngineError::HistoryAppend)?;
         }
+        Ok(())
     }
 
-    fn append_history_items(&mut self, items: impl IntoIterator<Item = Item>) {
+    fn append_history_items(
+        &mut self,
+        items: impl IntoIterator<Item = Item>,
+    ) -> Result<(), EngineError> {
         for item in items {
-            self.emit_history_append(&item);
+            self.emit_history_append(&item)?;
             self.history.push(item);
         }
+        Ok(())
     }
 
     fn request_trace_payload(&self, request: &Request) -> Value {
@@ -1125,9 +1136,13 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
             // These are committed *before* the per-request clone so they
             // participate in the LLM request below and get persisted by
             // the caller that owns durable history.
-            let pending = self.interceptor.pending_history_appends().await;
+            let pending = self
+                .interceptor
+                .pending_history_appends()
+                .await
+                .map_err(EngineError::HistoryAppend)?;
             if !pending.is_empty() {
-                self.append_history_items(pending);
+                self.append_history_items(pending)?;
             }
 
             // Clone the history into a per-request context. Everything
@@ -1202,7 +1217,7 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                     return Err(EngineError::Aborted(reason));
                 }
                 PreRequestAction::YieldWith(items) => {
-                    self.append_history_items(items.clone());
+                    self.append_history_items(items.clone())?;
                     request_context.extend(items);
                     info!("Yielded by interceptor after pre-request history append");
                     for cb in &self.turn_end_cbs {
@@ -1220,7 +1235,7 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                     return Ok(EngineResult::Yielded);
                 }
                 PreRequestAction::ContinueWith(items) => {
-                    self.append_history_items(items.clone());
+                    self.append_history_items(items.clone())?;
                     request_context.extend(items);
                 }
                 PreRequestAction::Continue => {}
@@ -1280,7 +1295,7 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                 let assistant_items =
                     self.build_assistant_items(&reasoning_items, &text_blocks, &[]);
                 if !assistant_items.is_empty() {
-                    self.append_history_items(assistant_items);
+                    self.append_history_items(assistant_items)?;
                 }
                 self.emit_llm_continuation(
                     current_llm_call,
@@ -1307,7 +1322,7 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
             let tool_calls = self.tool_call_collector.take_collected();
             let assistant_items =
                 self.build_assistant_items(&reasoning_items, &text_blocks, &tool_calls);
-            self.append_history_items(assistant_items);
+            self.append_history_items(assistant_items)?;
 
             if tool_calls.is_empty() {
                 match self.interceptor.on_turn_end(&self.history).await {
@@ -1316,7 +1331,7 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                         return Ok(EngineResult::Finished);
                     }
                     TurnEndAction::ContinueWithMessages(additional) => {
-                        self.append_history_items(additional);
+                        self.append_history_items(additional)?;
                         continue;
                     }
                     TurnEndAction::Pause => {
@@ -1610,7 +1625,7 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                         result.is_error,
                     )
                 });
-                self.append_history_items(items);
+                self.append_history_items(items)?;
                 Ok(None)
             }
             Err(err) => {
@@ -1815,12 +1830,15 @@ impl<C: LlmClient> Engine<C, Mutable> {
         self.history = items;
     }
 
-    /// Append items to history and notify history-append observers for each
-    /// item before it lands. This is the only public Mutable-state API for
-    /// growing engine history; callers that need session-log persistence must
-    /// install [`on_history_append`](Self::on_history_append) before calling it.
-    pub fn append_history(&mut self, items: impl IntoIterator<Item = Item>) {
-        self.append_history_items(items);
+    /// Append items to history after every history-append observer accepts the
+    /// item. This is the only public Mutable-state API for growing engine
+    /// history; callers that need session-log persistence must install
+    /// [`on_history_append`](Self::on_history_append) before calling it.
+    pub fn append_history(
+        &mut self,
+        items: impl IntoIterator<Item = Item>,
+    ) -> Result<(), EngineError> {
+        self.append_history_items(items)
     }
 
     /// Truncate history without emitting append callbacks.
@@ -1969,9 +1987,9 @@ impl<C: LlmClient> Engine<C, Locked> {
             PromptAction::Continue => Vec::new(),
             PromptAction::ContinueWith(items) => items,
         };
-        self.append_history_items(std::iter::once(user_item));
+        self.append_history_items(std::iter::once(user_item))?;
         if !extras.is_empty() {
-            self.append_history_items(extras);
+            self.append_history_items(extras)?;
         }
         let result = self.run_turn_loop().await;
         self.finalize_interruption(result).await

@@ -158,8 +158,8 @@ pub trait Interceptor: Send + Sync {
     /// reproducible per-request transformations (pruning, content
     /// trimming, cache anchors) that depend only on the existing
     /// history.
-    async fn pending_history_appends(&self) -> Vec<Item> {
-        Vec::new()
+    async fn pending_history_appends(&self) -> Result<Vec<Item>, String> {
+        Ok(Vec::new())
     }
 
     /// Called before each LLM request. The context starts as a clone

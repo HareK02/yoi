@@ -3,6 +3,7 @@ use llm_engine::llm_client::types::{Item, RequestConfig};
 use session_store::{
     FsStore, LogEntry, Store, TraceEntry, collect_state, new_segment_id, new_session_id,
 };
+use std::io::Write;
 
 fn nil_session_start(ts: u64, session_id: uuid::Uuid) -> LogEntry {
     LogEntry::SegmentStart {
@@ -222,6 +223,71 @@ fn read_entry_count_matches_append_tally() {
     }
 
     assert_eq!(store.read_entry_count(sid, segid).unwrap(), entries.len());
+}
+
+#[test]
+fn unterminated_utf8_tail_is_ignored_and_replaced_on_append() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsStore::new(dir.path()).unwrap();
+    let sid = new_session_id();
+    let segid = new_segment_id();
+    let path = dir
+        .path()
+        .join(sid.to_string())
+        .join(format!("{segid}.jsonl"));
+
+    store
+        .append(sid, segid, &nil_session_start(1, sid))
+        .unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        // First byte of a three-byte UTF-8 code point, matching an ENOSPC
+        // partial write observed in a real session log.
+        .write_all(&[0xe3])
+        .unwrap();
+
+    assert_eq!(store.read_all(sid, segid).unwrap().len(), 1);
+    assert_eq!(store.read_entry_count(sid, segid).unwrap(), 1);
+
+    let next = LogEntry::UserInput {
+        ts: 2,
+        segments: vec![protocol::Segment::text("recovered")],
+    };
+    store.append(sid, segid, &next).unwrap();
+
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(std::str::from_utf8(&bytes).is_ok());
+    assert_eq!(store.read_all(sid, segid).unwrap().len(), 2);
+    assert_eq!(store.read_entry_count(sid, segid).unwrap(), 2);
+}
+
+#[test]
+fn newline_terminated_invalid_utf8_is_reported_as_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsStore::new(dir.path()).unwrap();
+    let sid = new_session_id();
+    let segid = new_segment_id();
+    let path = dir
+        .path()
+        .join(sid.to_string())
+        .join(format!("{segid}.jsonl"));
+
+    store
+        .append(sid, segid, &nil_session_start(1, sid))
+        .unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(&[0xe3, b'\n'])
+        .unwrap();
+
+    assert!(matches!(
+        store.read_all(sid, segid),
+        Err(session_store::StoreError::Corrupt { line: 2, .. })
+    ));
 }
 
 #[test]
