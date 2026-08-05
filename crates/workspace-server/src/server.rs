@@ -3166,6 +3166,14 @@ fn current_worker_session_lock(
         .clone()
 }
 
+fn runtime_local_owner_worker_id(
+    caller_runtime_id: &str,
+    target_runtime_id: &str,
+    caller_worker_id: u64,
+) -> Option<String> {
+    (caller_runtime_id == target_runtime_id).then(|| caller_worker_id.to_string())
+}
+
 async fn open_current_worker_workdir_session_locked(
     api: &WorkspaceApi,
     runtime_id: &str,
@@ -3194,10 +3202,14 @@ async fn open_current_worker_workdir_session_locked(
                 link.workdir_id
             ),
         })?;
-    let owner_worker_id = format!("{runtime_id}-{worker_id}");
+    let owner_worker_id = runtime_local_owner_worker_id(runtime_id, &workdir.runtime_id, worker_id);
     let session = api
         .runtime
-        .open_workdir_session(&workdir.runtime_id, &workdir.workdir_id, &owner_worker_id)
+        .open_workdir_session(
+            &workdir.runtime_id,
+            &workdir.workdir_id,
+            owner_worker_id.as_deref(),
+        )
         .await
         .map_err(|error| error.into_error())?;
     let key = (runtime_id.to_string(), worker_id);
@@ -11223,6 +11235,18 @@ mod tests {
         assert_eq!(
             registered_workdir_runtime_id(&api, "remote-workdir").unwrap(),
             "runtime-test"
+        );
+    }
+
+    #[test]
+    fn workdir_session_owner_is_only_sent_for_same_runtime_worker() {
+        assert_eq!(
+            runtime_local_owner_worker_id("embedded-worker-runtime", "arcadia", 5),
+            None
+        );
+        assert_eq!(
+            runtime_local_owner_worker_id("arcadia", "arcadia", 30).as_deref(),
+            Some("30")
         );
     }
 

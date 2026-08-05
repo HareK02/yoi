@@ -360,8 +360,11 @@ impl Runtime {
         self.annotate_working_directory_status(status)
     }
 
-    /// Open a fresh Workdir operation session after proving that the persisted
-    /// materialization is assigned to a Worker in the authorized workspace.
+    /// Open a fresh Workdir operation session in this Runtime's authorized Workspace.
+    ///
+    /// A same-Runtime owner Worker can be supplied as an additional persisted-binding check.
+    /// Cross-Runtime callers rely on the Runtime's Workspace capability scope and the existence
+    /// of the Runtime-owned materialization; Backend attachment remains occupancy authority.
     pub fn open_workdir_session_scoped(
         &self,
         scope: &RuntimeWorkspaceScope,
@@ -373,26 +376,24 @@ impl Runtime {
             state.ensure_running()?;
             state.ensure_workspace_owner(scope, false)?;
 
-            let owns_workdir = |worker: &WorkerRecord| {
-                worker.belongs_to_workspace(&scope.workspace_id)
-                    && worker.working_directory.as_ref().is_some_and(|status| {
-                        status.summary.working_directory_id == working_directory_id
-                    })
-            };
-            let authorized = match owner_worker_ref {
-                Some(worker_ref) => state
+            if let Some(worker_ref) = owner_worker_ref {
+                let owns_workdir = state
                     .workers
                     .get(&worker_ref.worker_id)
-                    .is_some_and(owns_workdir),
-                None => state.workers.values().any(owns_workdir),
-            };
-            if !authorized {
-                return Err(RuntimeError::WorkingDirectory(
-                    crate::working_directory::WorkingDirectoryDiagnostic::rejected(
-                        "working_directory_not_found",
-                        "working directory was not found in the authorized workspace",
-                    ),
-                ));
+                    .is_some_and(|worker| {
+                        worker.belongs_to_workspace(&scope.workspace_id)
+                            && worker.working_directory.as_ref().is_some_and(|status| {
+                                status.summary.working_directory_id == working_directory_id
+                            })
+                    });
+                if !owns_workdir {
+                    return Err(RuntimeError::WorkingDirectory(
+                        crate::working_directory::WorkingDirectoryDiagnostic::rejected(
+                            "working_directory_not_found",
+                            "working directory was not assigned to the authorized owner Worker",
+                        ),
+                    ));
+                }
             }
             state.execution_backend.clone().ok_or_else(|| {
                 RuntimeError::ExecutionBackendUnavailable {
@@ -400,6 +401,9 @@ impl Runtime {
                 }
             })?
         };
+        backend
+            .working_directory(working_directory_id)
+            .map_err(RuntimeError::WorkingDirectory)?;
         backend
             .open_workdir_session(working_directory_id)
             .map_err(RuntimeError::WorkingDirectory)

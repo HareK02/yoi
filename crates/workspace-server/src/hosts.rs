@@ -1181,14 +1181,16 @@ impl RuntimeRegistry {
         &self,
         runtime_id: &str,
         working_directory_id: &str,
-        owner_worker_id: &str,
+        owner_worker_id: Option<&str>,
     ) -> Result<WorkdirSessionHandle, RuntimeRegistryError> {
         validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("working_directory_id", working_directory_id)?;
-        validate_backend_identifier("owner_worker_id", owner_worker_id)?;
+        if let Some(owner_worker_id) = owner_worker_id {
+            validate_backend_identifier("owner_worker_id", owner_worker_id)?;
+        }
         let runtime = self.runtime(runtime_id)?;
         runtime
-            .open_workdir_session(working_directory_id, Some(owner_worker_id))
+            .open_workdir_session(working_directory_id, owner_worker_id)
             .await
             .map_err(|error| RuntimeRegistryError::RuntimeOperationFailed {
                 runtime_id: runtime_id.to_string(),
