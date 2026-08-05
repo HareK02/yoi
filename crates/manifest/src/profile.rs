@@ -999,7 +999,8 @@ fn apply_role_profile(
     value["feature"]["memory"] = serde_json::json!({ "enabled": memory });
     value["feature"]["web"] = serde_json::json!({ "enabled": web });
     value["feature"]["sub_worker"] = serde_json::json!({ "enabled": sub_worker });
-    value["feature"]["worker"] = serde_json::json!({ "enabled": slug == "orchestrator" });
+    value["feature"]["worker"] =
+        serde_json::json!({ "enabled": matches!(slug, "companion" | "orchestrator") });
     value["feature"]["manage_workdir"] = serde_json::json!({ "enabled": slug == "orchestrator" });
     let ticket = match slug {
         "companion" => serde_json::json!({ "enabled": true, "authoring": true, "thread": true }),
@@ -1459,7 +1460,7 @@ mod tests {
         let companion = resolve("companion");
         assert!(companion.feature.task.enabled);
         assert!(companion.feature.sub_worker.enabled);
-        assert!(!companion.feature.worker.enabled);
+        assert!(companion.feature.worker.enabled);
         assert!(companion.scope.allow.is_empty());
         assert!(companion.scope.deny.is_empty());
         assert!(companion.delegation_scope.allow.is_empty());

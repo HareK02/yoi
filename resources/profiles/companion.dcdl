@@ -8,7 +8,7 @@ import "./base.dcdl" // {
         memory = { enabled = true; };
         web = { enabled = true; };
         sub_worker = { enabled = true; };
-        worker = { enabled = false; };
+        worker = { enabled = true; };
         ticket = { enabled = true; authoring = true; thread = true; };
     };
 }

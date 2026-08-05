@@ -3989,6 +3989,23 @@ mod tests {
     }
 
     #[test]
+    fn embedded_companion_profile_enables_worker_management() {
+        let root = tempfile::tempdir().unwrap();
+        let selector = ProfileSelector::Builtin("builtin:companion".to_string());
+        let archive = builtin_profile_source_archive(&selector)
+            .unwrap()
+            .verify()
+            .unwrap();
+        let manifest = archive
+            .resolve_profile("builtin:companion", root.path(), "companion-test-worker")
+            .unwrap();
+
+        assert!(manifest.feature.worker.enabled);
+        assert!(manifest.feature.sub_worker.enabled);
+        assert!(!manifest.feature.manage_workdir.enabled);
+    }
+
+    #[test]
     fn embedded_builtin_decodal_profiles_resolve_through_archive() {
         let root = tempfile::tempdir().unwrap();
         let broker = BackendResourceBroker::default();
@@ -4033,7 +4050,10 @@ mod tests {
                 .resolve_profile(&selector_key, root.path(), "embedded-test-worker")
                 .unwrap();
             assert_eq!(manifest.worker.name, "embedded-test-worker");
-            assert_eq!(manifest.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
+            assert_eq!(
+                manifest.model.ref_.as_deref(),
+                Some("codex-oauth/gpt-5.6-sol")
+            );
             if selector_key == "builtin:memory-consolidation" {
                 assert!(manifest.feature.memory.enabled);
                 assert!(manifest.feature.memory.staging);
