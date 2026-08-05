@@ -6846,6 +6846,297 @@ async fn list_runtime_workers(
     }))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerSpawnFinalizeStage {
+    WorkerRegistry,
+    TicketAssignmentBind,
+    TicketAssignmentCurrent,
+    WorkdirRegistry,
+    WorkdirAttachment,
+}
+
+impl WorkerSpawnFinalizeStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkerRegistry => "worker_registry",
+            Self::TicketAssignmentBind => "ticket_assignment_bind",
+            Self::TicketAssignmentCurrent => "ticket_assignment_current",
+            Self::WorkdirRegistry => "workdir_registry",
+            Self::WorkdirAttachment => "workdir_attachment",
+        }
+    }
+}
+
+struct WorkerSpawnCompensationContext<'a> {
+    assignment: Option<&'a crate::hosts::WorkerTicketAssignmentRequest>,
+    prepared_workdir_id: Option<&'a str>,
+    cleanup_spawned_workdir: bool,
+}
+
+fn finalize_worker_spawn_stage<T>(
+    api: &WorkspaceApi,
+    worker: &WorkerSummary,
+    context: &WorkerSpawnCompensationContext<'_>,
+    stage: WorkerSpawnFinalizeStage,
+    result: ApiResult<T>,
+) -> ApiResult<T> {
+    let Err(source) = result else {
+        return result;
+    };
+    let source_message = sanitize_backend_error(&source.error.to_string());
+    let operation_id = context
+        .assignment
+        .map(|assignment| assignment.operation_id.as_str())
+        .unwrap_or("none");
+    let mut diagnostics = vec![RuntimeDiagnostic {
+        code: format!("worker_spawn_finalize_{}_failed", stage.as_str()),
+        severity: DiagnosticSeverity::Error,
+        message: format!(
+            "Worker spawn finalize failed at stage `{}` for Runtime Worker {}:{} (operation `{operation_id}`): {source_message}",
+            stage.as_str(),
+            worker.worker.runtime_id,
+            worker.worker.worker_id
+        ),
+    }];
+    diagnostics.extend(source.diagnostics);
+    let compensation_errors = compensate_failed_worker_spawn(api, worker, context);
+    let compensation_failed = !compensation_errors.is_empty();
+    diagnostics.extend(compensation_errors);
+    if !compensation_failed {
+        diagnostics.push(RuntimeDiagnostic {
+            code: "worker_spawn_compensated".to_string(),
+            severity: DiagnosticSeverity::Info,
+            message: format!(
+                "Removed Runtime Worker {}:{} and rolled back Backend spawn state",
+                worker.worker.runtime_id, worker.worker.worker_id
+            ),
+        });
+    }
+    let compensation = if compensation_failed {
+        "compensation left residual state; inspect diagnostics"
+    } else {
+        "compensation completed"
+    };
+    Err(ApiError::with_diagnostics(
+        Error::RuntimeOperationFailed {
+            runtime_id: worker.worker.runtime_id.clone(),
+            code: format!("worker_spawn_finalize_{}_failed", stage.as_str()),
+            message: format!(
+                "Worker spawn finalize failed at stage `{}` for Runtime Worker {}:{} (operation `{operation_id}`): {source_message}; {compensation}",
+                stage.as_str(),
+                worker.worker.runtime_id,
+                worker.worker.worker_id
+            ),
+        },
+        diagnostics,
+    ))
+}
+
+fn compensate_failed_worker_spawn(
+    api: &WorkspaceApi,
+    worker: &WorkerSummary,
+    context: &WorkerSpawnCompensationContext<'_>,
+) -> Vec<RuntimeDiagnostic> {
+    let mut diagnostics = Vec::new();
+    let lifecycle_request = WorkerLifecycleRequest {
+        reason: Some("Backend spawn finalize failed; compensating Runtime Worker".to_string()),
+        ticket_assignment: None,
+    };
+    let cancellation = api
+        .runtime
+        .cancel_worker(&worker.worker, lifecycle_request.clone());
+    let cancellation_accepted = cancellation
+        .as_ref()
+        .is_ok_and(|result| result.state == WorkerOperationState::Accepted);
+    let stop = (!cancellation_accepted)
+        .then(|| api.runtime.stop_worker(&worker.worker, lifecycle_request));
+    let stop_accepted = stop.as_ref().is_some_and(|result| {
+        result
+            .as_ref()
+            .is_ok_and(|result| result.state == WorkerOperationState::Accepted)
+    });
+    let termination_detail = (!cancellation_accepted && !stop_accepted).then(|| {
+        let cancellation = lifecycle_failure_detail("cancel", &cancellation);
+        let stop = stop
+            .as_ref()
+            .map(|result| lifecycle_failure_detail("stop", result))
+            .unwrap_or_else(|| "stop was not attempted".to_string());
+        format!("{cancellation}; {stop}")
+    });
+
+    let runtime_deleted = match api.runtime.delete_worker(&worker.worker) {
+        Ok(result) if result.state == WorkerOperationState::Accepted && result.deleted => true,
+        Ok(result) => {
+            let mut message = format!(
+                "Runtime did not delete Worker {}:{}: state={:?}, deleted={}",
+                worker.worker.runtime_id, worker.worker.worker_id, result.state, result.deleted
+            );
+            if let Some(detail) = termination_detail.as_deref() {
+                message.push_str(&format!("; cancellation: {detail}"));
+            }
+            if !result.diagnostics.is_empty() {
+                message.push_str(&format!(
+                    "; delete diagnostics: {}",
+                    runtime_diagnostics_message(&result.diagnostics)
+                ));
+            }
+            diagnostics.push(spawn_compensation_diagnostic(
+                "worker_spawn_compensation_runtime_delete_failed",
+                message,
+            ));
+            false
+        }
+        Err(RuntimeRegistryError::UnknownWorker { .. }) => true,
+        Err(error) => {
+            let mut message = format!(
+                "Failed to delete Runtime Worker {}:{}: {}",
+                worker.worker.runtime_id,
+                worker.worker.worker_id,
+                error.message()
+            );
+            if let Some(detail) = termination_detail.as_deref() {
+                message.push_str(&format!("; cancellation: {detail}"));
+            }
+            diagnostics.push(spawn_compensation_diagnostic(
+                "worker_spawn_compensation_runtime_delete_failed",
+                message,
+            ));
+            false
+        }
+    };
+    if !runtime_deleted {
+        return diagnostics;
+    }
+    diagnostics.extend(finalize_spawn_compensation_after_worker_delete(
+        api, worker, context,
+    ));
+    diagnostics
+}
+
+fn finalize_spawn_compensation_after_worker_delete(
+    api: &WorkspaceApi,
+    worker: &WorkerSummary,
+    context: &WorkerSpawnCompensationContext<'_>,
+) -> Vec<RuntimeDiagnostic> {
+    let mut diagnostics = Vec::new();
+    if let Some(assignment) = context.assignment {
+        if let Err(error) = api.store.rollback_ticket_assignment_operation(
+            &api.config.workspace_id,
+            &assignment.operation_id,
+        ) {
+            diagnostics.push(spawn_compensation_diagnostic(
+                "worker_spawn_compensation_assignment_rollback_failed",
+                format!(
+                    "Failed to roll back Ticket assignment operation `{}` for Worker {}:{}: {}",
+                    assignment.operation_id,
+                    worker.worker.runtime_id,
+                    worker.worker.worker_id,
+                    sanitize_backend_error(&error.to_string())
+                ),
+            ));
+        }
+    }
+    if let Err(error) = api
+        .store
+        .delete_worker_registry(&api.config.workspace_id, &worker.worker)
+    {
+        diagnostics.push(spawn_compensation_diagnostic(
+            "worker_spawn_compensation_registry_delete_failed",
+            format!(
+                "Failed to remove Backend Worker registry for {}:{}: {}",
+                worker.worker.runtime_id,
+                worker.worker.worker_id,
+                sanitize_backend_error(&error.to_string())
+            ),
+        ));
+    }
+
+    if context.cleanup_spawned_workdir {
+        if let Some(workdir_id) = context.prepared_workdir_id {
+            let runtime_cleanup_succeeded = match api
+                .runtime
+                .cleanup_working_directory(&worker.worker.runtime_id, workdir_id)
+            {
+                Ok(result) if result.state == WorkerOperationState::Accepted => true,
+                Ok(result) => {
+                    diagnostics.push(spawn_compensation_diagnostic(
+                        "worker_spawn_compensation_workdir_cleanup_failed",
+                        format!(
+                            "Runtime did not clean up spawn-created Workdir `{workdir_id}` for Worker {}:{}: state={:?}; {}",
+                            worker.worker.runtime_id,
+                            worker.worker.worker_id,
+                            result.state,
+                            runtime_diagnostics_message(&result.diagnostics)
+                        ),
+                    ));
+                    false
+                }
+                Err(error) => {
+                    diagnostics.push(spawn_compensation_diagnostic(
+                        "worker_spawn_compensation_workdir_cleanup_failed",
+                        format!(
+                            "Failed to clean up spawn-created Workdir `{workdir_id}` for Worker {}:{}: {}",
+                            worker.worker.runtime_id,
+                            worker.worker.worker_id,
+                            error.message()
+                        ),
+                    ));
+                    false
+                }
+            };
+            if runtime_cleanup_succeeded {
+                if let Err(error) = api
+                    .store
+                    .delete_workdir_registry(&api.config.workspace_id, workdir_id)
+                {
+                    diagnostics.push(spawn_compensation_diagnostic(
+                        "worker_spawn_compensation_workdir_registry_delete_failed",
+                        format!(
+                            "Failed to remove Backend Workdir registry `{workdir_id}` after Runtime cleanup: {}",
+                            sanitize_backend_error(&error.to_string())
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    diagnostics
+}
+
+fn lifecycle_failure_detail(
+    action: &str,
+    result: &std::result::Result<WorkerLifecycleResult, RuntimeRegistryError>,
+) -> String {
+    match result {
+        Ok(result) => format!(
+            "Runtime {action} returned state={:?}: {}",
+            result.state,
+            runtime_diagnostics_message(&result.diagnostics)
+        ),
+        Err(error) => format!("Runtime {action} failed: {}", error.message()),
+    }
+}
+
+fn spawn_compensation_diagnostic(code: &str, message: String) -> RuntimeDiagnostic {
+    RuntimeDiagnostic {
+        code: code.to_string(),
+        severity: DiagnosticSeverity::Error,
+        message,
+    }
+}
+
+fn runtime_diagnostics_message(diagnostics: &[RuntimeDiagnostic]) -> String {
+    if diagnostics.is_empty() {
+        "no Runtime diagnostics".to_string()
+    } else {
+        diagnostics
+            .iter()
+            .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
 async fn create_runtime_worker(
     State(api): State<WorkspaceApi>,
     AxumPath(runtime_id): AxumPath<String>,
@@ -6912,41 +7203,80 @@ async fn create_runtime_worker(
             &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
         )?;
     }
+    let cleanup_spawned_workdir = request.resolved_working_directory_request.is_some();
     let result = api.spawn_workspace_worker(&runtime_id, request)?;
     if let Some(worker) = result.worker.as_ref() {
+        let compensation = WorkerSpawnCompensationContext {
+            assignment: lifecycle_assignment.as_ref(),
+            prepared_workdir_id: prepared_workdir_id.as_deref(),
+            cleanup_spawned_workdir,
+        };
         let display_name = requested_worker_name
             .as_deref()
             .filter(|name| !name.trim().is_empty())
             .unwrap_or(worker.label.as_str())
             .to_string();
-        let record = record_worker_summary(
+        let record = finalize_worker_spawn_stage(
             &api,
             worker,
-            display_name.as_str(),
-            worker.profile.clone(),
-            WorkerRegistryDisplayNamePolicy::UseProvided,
+            &compensation,
+            WorkerSpawnFinalizeStage::WorkerRegistry,
+            record_worker_summary(
+                &api,
+                worker,
+                display_name.as_str(),
+                worker.profile.clone(),
+                WorkerRegistryDisplayNamePolicy::UseProvided,
+            ),
         )?;
         if let Some(assignment) = lifecycle_assignment.as_ref() {
-            api.store.bind_ticket_assignment_operation_worker(
-                &api.config.workspace_id,
-                &assignment.operation_id,
-                &worker.worker.worker_id,
-            )?;
-            assign_ticket_worker_from_lifecycle(
+            finalize_worker_spawn_stage(
                 &api,
-                assignment,
-                &runtime_id,
-                &worker.worker.worker_id,
+                worker,
+                &compensation,
+                WorkerSpawnFinalizeStage::TicketAssignmentBind,
+                api.store
+                    .bind_ticket_assignment_operation_worker(
+                        &api.config.workspace_id,
+                        &assignment.operation_id,
+                        &worker.worker.worker_id,
+                    )
+                    .map_err(ApiError::from),
+            )?;
+            finalize_worker_spawn_stage(
+                &api,
+                worker,
+                &compensation,
+                WorkerSpawnFinalizeStage::TicketAssignmentCurrent,
+                assign_ticket_worker_from_lifecycle(
+                    &api,
+                    assignment,
+                    &runtime_id,
+                    &worker.worker.worker_id,
+                )
+                .map_err(ApiError::from),
             )?;
         }
         if worker.working_directory.is_none() {
             if let Some(workdir_id) = prepared_workdir_id.as_deref() {
-                if api
-                    .store
-                    .get_workdir_registry(&api.config.workspace_id, workdir_id)?
-                    .is_some()
-                {
-                    link_worker_to_workdir(&api, &record, workdir_id, None)?;
+                let workdir_exists = finalize_worker_spawn_stage(
+                    &api,
+                    worker,
+                    &compensation,
+                    WorkerSpawnFinalizeStage::WorkdirRegistry,
+                    api.store
+                        .get_workdir_registry(&api.config.workspace_id, workdir_id)
+                        .map_err(ApiError::from),
+                )?
+                .is_some();
+                if workdir_exists {
+                    finalize_worker_spawn_stage(
+                        &api,
+                        worker,
+                        &compensation,
+                        WorkerSpawnFinalizeStage::WorkdirAttachment,
+                        link_worker_to_workdir(&api, &record, workdir_id, None),
+                    )?;
                 }
             }
         }
@@ -10009,6 +10339,26 @@ mod tests {
             }
         }
 
+        fn stop_worker(
+            &self,
+            _handle: &worker_runtime::execution::WorkerExecutionHandle,
+        ) -> worker_runtime::execution::WorkerExecutionResult {
+            worker_runtime::execution::WorkerExecutionResult::accepted(
+                worker_runtime::execution::WorkerExecutionOperation::Stop,
+                worker_runtime::execution::WorkerExecutionRunState::Stopped,
+            )
+        }
+
+        fn cancel_worker(
+            &self,
+            _handle: &worker_runtime::execution::WorkerExecutionHandle,
+        ) -> worker_runtime::execution::WorkerExecutionResult {
+            worker_runtime::execution::WorkerExecutionResult::accepted(
+                worker_runtime::execution::WorkerExecutionOperation::Cancel,
+                worker_runtime::execution::WorkerExecutionRunState::Stopped,
+            )
+        }
+
         fn dispatch_input(
             &self,
             handle: &worker_runtime::execution::WorkerExecutionHandle,
@@ -10895,6 +11245,135 @@ mod tests {
                 .and_then(|operation| operation.assignment_id)
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn worker_spawn_finalize_failure_reports_stage_and_compensation_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let ticket_id = browser_ticket_backend(&api)
+            .unwrap()
+            .create(ticket::NewTicket::new("Compensation test Ticket"))
+            .unwrap()
+            .id;
+        let assignment = crate::hosts::WorkerTicketAssignmentRequest {
+            ticket_id: ticket_id.clone(),
+            operation_id: "compensation-test-operation".to_string(),
+        };
+        let request = WorkerSpawnRequest {
+            intent: WorkerSpawnIntent::TicketRole {
+                ticket_id: ticket_id.clone(),
+                role: TicketWorkerRole::Coder,
+            },
+            requested_worker_name: Some("Compensation test Worker".to_string()),
+            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                expected_segments: 0,
+            },
+            profile: ProfileSelector::Builtin("builtin:coder".to_string()),
+            ticket_assignment: Some(assignment.clone()),
+            initial_input: None,
+            working_directory_request: None,
+            resolved_working_directory_request: None,
+            resolved_working_directory: None,
+            resolved_config_bundle: None,
+            resolved_workspace_api: None,
+        };
+        let Json(created) = scoped_create_runtime_worker(
+            State(api.clone()),
+            AxumPath(ScopedRuntimePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+            }),
+            Json(request),
+        )
+        .await
+        .unwrap();
+        let worker = created.worker.unwrap();
+        assert!(
+            api.store
+                .get_worker_registry(TEST_WORKSPACE_ID, &worker.worker)
+                .unwrap()
+                .is_some()
+        );
+
+        let context = WorkerSpawnCompensationContext {
+            assignment: Some(&assignment),
+            prepared_workdir_id: None,
+            cleanup_spawned_workdir: false,
+        };
+        let error = finalize_worker_spawn_stage::<()>(
+            &api,
+            &worker,
+            &context,
+            WorkerSpawnFinalizeStage::WorkdirAttachment,
+            Err(Error::RegistryInconsistency("injected finalize failure".to_string()).into()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.error,
+            Error::RuntimeOperationFailed { ref code, .. }
+                if code == "worker_spawn_finalize_workdir_attachment_failed"
+        ));
+        assert!(error.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "worker_spawn_finalize_workdir_attachment_failed"
+                && diagnostic.message.contains(&worker.worker.runtime_id)
+                && diagnostic.message.contains(&worker.worker.worker_id)
+        }));
+        assert!(
+            error
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "worker_spawn_compensated")
+        );
+        assert!(matches!(
+            api.runtime.worker(&worker.worker),
+            Err(RuntimeRegistryError::UnknownWorker { .. })
+        ));
+        assert!(
+            api.store
+                .get_worker_registry(TEST_WORKSPACE_ID, &worker.worker)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            api.store
+                .get_ticket_assignment_operation(TEST_WORKSPACE_ID, &assignment.operation_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            api.store
+                .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket_id)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut residual_worker = worker.clone();
+        residual_worker.worker.runtime_id = "missing-runtime".to_string();
+        let residual_context = WorkerSpawnCompensationContext {
+            assignment: None,
+            prepared_workdir_id: None,
+            cleanup_spawned_workdir: false,
+        };
+        let residual_error = finalize_worker_spawn_stage::<()>(
+            &api,
+            &residual_worker,
+            &residual_context,
+            WorkerSpawnFinalizeStage::WorkerRegistry,
+            Err(Error::RegistryInconsistency("injected registry failure".to_string()).into()),
+        )
+        .unwrap_err();
+        assert!(residual_error.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "worker_spawn_compensation_runtime_delete_failed"
+                && diagnostic.message.contains("missing-runtime")
+        }));
+        assert!(
+            !residual_error
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "worker_spawn_compensated")
+        );
+        assert!(residual_error.error.to_string().contains("residual state"));
     }
 
     #[tokio::test]

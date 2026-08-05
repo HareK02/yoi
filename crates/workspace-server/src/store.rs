@@ -578,6 +578,11 @@ pub trait ControlPlaneStore: Send + Sync {
         operation_id: &str,
         worker_id: &str,
     ) -> Result<()>;
+    fn rollback_ticket_assignment_operation(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+    ) -> Result<()>;
     fn get_current_ticket_worker_assignment(
         &self,
         workspace_id: &str,
@@ -1812,6 +1817,44 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             Err(Error::TicketAssignmentConflict(format!(
                 "assignment operation {operation_id} cannot bind Worker {worker_id}"
             )))
+        })
+    }
+
+    fn rollback_ticket_assignment_operation(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let operation = read_assignment_operation(&transaction, workspace_id, operation_id)?;
+            let Some(operation) = operation else {
+                transaction.commit()?;
+                return Ok(());
+            };
+            if operation.action != "assign" {
+                return Err(Error::TicketAssignmentConflict(format!(
+                    "Ticket operation `{operation_id}` is `{}`, expected `assign`",
+                    operation.action
+                )));
+            }
+
+            transaction.execute(
+                "DELETE FROM ticket_assignment_operations WHERE workspace_id = ?1 AND operation_id = ?2",
+                params![workspace_id, operation_id],
+            )?;
+            if let Some(assignment_id) = operation.assignment_id {
+                transaction.execute(
+                    "DELETE FROM ticket_worker_assignment_events WHERE workspace_id = ?1 AND ticket_id = ?2 AND assignment_id = ?3",
+                    params![workspace_id, operation.ticket_id, assignment_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM ticket_worker_assignments WHERE workspace_id = ?1 AND ticket_id = ?2 AND assignment_id = ?3",
+                    params![workspace_id, operation.ticket_id, assignment_id],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(())
         })
     }
 
@@ -4391,6 +4434,30 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
                 .unwrap(),
             None
         );
+        store
+            .rollback_ticket_assignment_operation("workspace-a", "reserved-operation")
+            .unwrap();
+        assert_eq!(
+            store
+                .get_ticket_assignment_operation("workspace-a", "reserved-operation")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .get_current_ticket_worker_assignment("workspace-a", "ticket-3")
+                .unwrap(),
+            None
+        );
+        assert!(
+            store
+                .list_ticket_worker_assignment_events("workspace-a", "ticket-3", 10)
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .rollback_ticket_assignment_operation("workspace-a", "reserved-operation")
+            .unwrap();
 
         let events = store
             .list_ticket_worker_assignment_events("workspace-a", "ticket-1", 10)
