@@ -43,7 +43,9 @@ use crate::hook::{
     PreToolCall,
 };
 use crate::in_flight::InFlightEvents;
-use crate::internal_worker::{InternalWorkerSpec, run_internal_worker};
+use crate::internal_worker::{
+    InternalWorkerAuthority, InternalWorkerIdentity, InternalWorkerSpec, run_internal_worker,
+};
 
 const COMPACTION_EXTENSION_DOMAIN: &str = "yoi.compaction";
 const COMPACTION_BLOCK_ID: &str = "compact";
@@ -3435,51 +3437,53 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         let session_explore_state =
             SessionExploreState::new(session_view, self.workspace_client_handle(), source);
         let input_text = render_extract_input(session_explore_state.view());
-        let mut internal_tools = Vec::new();
-        let mut internal_hook_builder = HookRegistryBuilder::new();
-        let feature_report = FeatureRegistryBuilder::new()
-            .with_module(SessionExploreFeature::new(session_explore_state.clone()))
-            .install_into_pending(&mut internal_tools, &mut internal_hook_builder);
-        let installed_tool_names = feature_report.installed_tool_names();
-        let expected_extract_tools = [
-            "search_evidence",
-            "read_evidence",
-            "stage_candidate",
-            "finish_extraction",
-        ];
-        if !expected_extract_tools.iter().all(|name| {
-            installed_tool_names
-                .iter()
-                .any(|installed| installed == name)
-        }) {
-            audit
-                .emit(
-                    self.workspace_client(),
-                    event_tx,
-                    memory::audit::WorkerLifecycleStatus::Failed,
-                    "session_explore_feature_install_failed",
-                    None,
-                    Some(extract_audit_base),
-                    None,
-                )
-                .await;
-            return Err(WorkerError::FeatureInstall(
-                "session-explore feature install failed".to_string(),
-            ));
-        }
+        let features = FeatureRegistryBuilder::new()
+            .with_module(SessionExploreFeature::new(session_explore_state.clone()));
+        let mut internal_manifest = self.manifest.clone();
+        internal_manifest.model = model.clone();
         let internal_result = run_internal_worker(InternalWorkerSpec {
-            slug: "memory-extract",
+            identity: InternalWorkerIdentity {
+                kind: "memory-extract",
+                run_id: audit.run_id,
+            },
+            manifest: internal_manifest,
+            client,
             system_prompt: extract_system_prompt,
             input: input_text,
-            client,
             cache_key: Some(self.segment_id().to_string()),
             max_turns: extract_worker_max_turns,
-            tools: internal_tools,
+            features,
+            required_tools: &[
+                "search_evidence",
+                "read_evidence",
+                "stage_candidate",
+                "finish_extraction",
+            ],
+            authority: InternalWorkerAuthority {
+                workspace: self.workspace_context.clone(),
+                filesystem: WorkerFilesystemAuthority::None,
+                scope: Scope::empty(),
+            },
         })
         .await;
         let usage = match internal_result {
-            Ok(result) => result.usage.as_ref().map(usage_audit_from_event),
+            Ok(result) => {
+                tracing::debug!(
+                    internal_worker_kind = result.identity.kind,
+                    internal_worker_run_id = %result.identity.run_id,
+                    history_entries = result.history_entries,
+                    lifecycle = ?result.lifecycle,
+                    "internal Worker execution completed"
+                );
+                result.usage.as_ref().map(usage_audit_from_event)
+            }
             Err(err) => {
+                tracing::debug!(
+                    internal_worker_kind = err.identity.kind,
+                    internal_worker_run_id = %err.identity.run_id,
+                    history_entries = err.history_entries,
+                    "internal Worker execution failed"
+                );
                 let usage = err.usage.as_ref().map(usage_audit_from_event);
                 audit
                     .emit(
@@ -3492,7 +3496,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                         None,
                     )
                     .await;
-                return Err(WorkerError::Engine(err.source));
+                return Err(err.source);
             }
         };
 
@@ -3625,8 +3629,8 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     }
 }
 
-fn lifecycle_status_for_worker_error(err: &EngineError) -> memory::audit::WorkerLifecycleStatus {
-    if matches!(err, EngineError::Cancelled) {
+fn lifecycle_status_for_worker_error(err: &WorkerError) -> memory::audit::WorkerLifecycleStatus {
+    if matches!(err, WorkerError::Engine(EngineError::Cancelled)) {
         memory::audit::WorkerLifecycleStatus::Cancelled
     } else {
         memory::audit::WorkerLifecycleStatus::Failed
