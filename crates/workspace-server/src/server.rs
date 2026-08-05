@@ -110,7 +110,7 @@ use worker_runtime::http_server::{
     RuntimeHttpConfigBundleAvailabilityResponse, RuntimeHttpConfigBundlesResponse,
     RuntimeHttpSummaryResponse, RuntimeHttpWorkerResponse, RuntimeHttpWorkersResponse,
 };
-use worker_runtime::identity::WorkerId;
+use worker_runtime::identity::RuntimeWorkerRef;
 use worker_runtime::interaction::{
     WorkerInput as EmbeddedWorkerInput, WorkerInputKind as EmbeddedWorkerInputKind,
 };
@@ -259,8 +259,8 @@ pub struct WorkspaceApi {
     observation_proxy: BackendObservationProxy,
     runtime_subscription_broker: RuntimeSubscriptionBroker,
     resource_broker: BackendResourceBroker,
-    workdir_sessions: Arc<Mutex<HashMap<(String, u64), WorkdirSessionHandle>>>,
-    workdir_session_locks: Arc<Mutex<HashMap<(String, u64), Arc<tokio::sync::Mutex<()>>>>>,
+    workdir_sessions: Arc<Mutex<HashMap<RuntimeWorkerRef, WorkdirSessionHandle>>>,
+    workdir_session_locks: Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl WorkspaceApi {
@@ -437,14 +437,14 @@ impl WorkspaceApi {
             }
             return Ok(result);
         };
-        let replacement = match self.runtime.replace_worker_workspace_api(
-            runtime_id,
-            &worker.worker_id,
-            workspace_api,
-        ) {
+        let worker_ref = worker.worker.clone();
+        let replacement = match self
+            .runtime
+            .replace_worker_workspace_api(&worker_ref, workspace_api)
+        {
             Ok(replacement) => replacement,
             Err(error) => {
-                let _ = self.runtime.delete_worker(runtime_id, &worker.worker_id);
+                let _ = self.runtime.delete_worker(&worker_ref);
                 if let Some((workdir_id, reservation_id)) = attachment_reservation.as_ref() {
                     let _ = self.store.release_worker_workdir_attachment_reservation(
                         &self.config.workspace_id,
@@ -456,7 +456,7 @@ impl WorkspaceApi {
             }
         };
         if replacement.state != WorkerOperationState::Accepted {
-            let _ = self.runtime.delete_worker(runtime_id, &worker.worker_id);
+            let _ = self.runtime.delete_worker(&worker_ref);
             if let Some((workdir_id, reservation_id)) = attachment_reservation.as_ref() {
                 let _ = self.store.release_worker_workdir_attachment_reservation(
                     &self.config.workspace_id,
@@ -478,22 +478,18 @@ impl WorkspaceApi {
             .into());
         }
         if let Some((workdir_id, reservation_id)) = attachment_reservation.as_ref() {
-            let runtime_worker_id = match parse_runtime_worker_id_for_registry(&worker.worker_id) {
-                Ok(worker_id) => worker_id,
-                Err(error) => {
-                    let _ = self.runtime.delete_worker(runtime_id, &worker.worker_id);
-                    let _ = self.store.release_worker_workdir_attachment_reservation(
-                        &self.config.workspace_id,
-                        workdir_id,
-                        reservation_id,
-                    );
-                    return Err(error);
-                }
-            };
+            if let Err(error) = parse_runtime_worker_id_for_registry(&worker.worker.worker_id) {
+                let _ = self.runtime.delete_worker(&worker_ref);
+                let _ = self.store.release_worker_workdir_attachment_reservation(
+                    &self.config.workspace_id,
+                    workdir_id,
+                    reservation_id,
+                );
+                return Err(error);
+            }
             let attachment = WorkerWorkdirLinkRecord {
                 workspace_id: self.config.workspace_id.clone(),
-                runtime_id: runtime_id.to_string(),
-                runtime_worker_id,
+                worker: worker_ref.clone(),
                 workdir_id: workdir_id.clone(),
                 role: "attachment".to_string(),
                 linked_at: now_registry_timestamp(),
@@ -503,7 +499,7 @@ impl WorkspaceApi {
                 .store
                 .finalize_reserved_worker_workdir_attachment(&attachment, reservation_id)
             {
-                let _ = self.runtime.delete_worker(runtime_id, &worker.worker_id);
+                let _ = self.runtime.delete_worker(&worker_ref);
                 let _ = self.store.release_worker_workdir_attachment_reservation(
                     &self.config.workspace_id,
                     workdir_id,
@@ -517,12 +513,11 @@ impl WorkspaceApi {
 
     fn restore_workspace_worker(
         &self,
-        runtime_id: &str,
-        worker_id: &str,
+        worker: &RuntimeWorkerRef,
     ) -> ApiResult<WorkerRestoreResult> {
         let binding = self
             .runtime
-            .replace_worker_workspace_api(runtime_id, worker_id, self.workspace_api_ref(runtime_id))
+            .replace_worker_workspace_api(worker, self.workspace_api_ref(&worker.runtime_id))
             .map_err(|error| error.into_error())?;
         if binding.state != WorkerOperationState::Accepted {
             return Ok(WorkerRestoreResult {
@@ -533,7 +528,7 @@ impl WorkspaceApi {
         }
         Ok(self
             .runtime
-            .restore_worker(runtime_id, worker_id)
+            .restore_worker(worker)
             .map_err(|error| error.into_error())?)
     }
 
@@ -1132,8 +1127,8 @@ enum RuntimeWorkersStatusFilter {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WorkerRestoreResponse {
     pub workspace_id: String,
-    pub runtime_id: String,
-    pub worker_id: String,
+    #[serde(flatten)]
+    pub worker_ref: RuntimeWorkerRef,
     pub result: WorkerRestoreResult,
 }
 
@@ -1300,8 +1295,8 @@ pub struct RuntimeCleanupExecutionResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerRetentionResponse {
     pub workspace_id: String,
-    pub runtime_id: String,
-    pub worker_id: String,
+    #[serde(flatten)]
+    pub worker_ref: RuntimeWorkerRef,
     pub pinned: bool,
     pub retention_state: String,
 }
@@ -1460,8 +1455,8 @@ pub struct BrowserCreateWorkerRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BrowserCreateWorkerResponse {
     pub workspace_id: String,
-    pub runtime_id: String,
-    pub worker_id: String,
+    #[serde(flatten)]
+    pub worker_ref: RuntimeWorkerRef,
     pub console_href: String,
     pub worker: WorkerSummary,
     pub diagnostics: Vec<RuntimeDiagnostic>,
@@ -1643,8 +1638,8 @@ struct ScopedConfigBundlePath {
 #[derive(Debug, Deserialize)]
 struct ScopedRuntimeWorkerPath {
     workspace_id: String,
-    runtime_id: String,
-    worker_id: String,
+    #[serde(flatten)]
+    worker: RuntimeWorkerRef,
 }
 
 fn validate_workspace_scope(api: &WorkspaceApi, workspace_id: &str) -> ApiResult<()> {
@@ -1864,8 +1859,8 @@ struct TicketWorkerAssignmentMutationResponse {
 #[serde(deny_unknown_fields)]
 struct SetTicketWorkerAssignmentRequest {
     operation_id: String,
-    runtime_id: String,
-    worker_id: String,
+    #[serde(flatten)]
+    worker: RuntimeWorkerRef,
     expected_assignment_id: Option<String>,
     assigned_by: Option<String>,
 }
@@ -1887,11 +1882,9 @@ async fn scoped_get_ticket_worker_assignment(
     let assignment = api
         .store
         .get_current_ticket_worker_assignment(&path.workspace_id, &ticket.id)?;
-    let worker = assignment.as_ref().and_then(|assignment| {
-        api.runtime
-            .worker(&assignment.runtime_id, &assignment.worker_id)
-            .ok()
-    });
+    let worker = assignment
+        .as_ref()
+        .and_then(|assignment| api.runtime.worker(&assignment.worker).ok());
     Ok(Json(TicketWorkerAssignmentResponse {
         workspace_id: path.workspace_id,
         ticket_id: ticket.id,
@@ -1925,8 +1918,8 @@ async fn set_ticket_worker_assignment(
     validate_workspace_scope(&api, &path.workspace_id)?;
     let ticket = api.authority.ticket(&path.id)?;
     let operation_id = require_ticket_assignment_value("operation_id", request.operation_id)?;
-    let runtime_id = require_ticket_assignment_value("runtime_id", request.runtime_id)?;
-    let worker_id = require_ticket_assignment_value("worker_id", request.worker_id)?;
+    let runtime_id = require_ticket_assignment_value("runtime_id", request.worker.runtime_id)?;
+    let worker_id = require_ticket_assignment_value("worker_id", request.worker.worker_id)?;
     let expected_assignment_id = request
         .expected_assignment_id
         .map(|value| require_ticket_assignment_value("expected_assignment_id", value))
@@ -1936,17 +1929,17 @@ async fn set_ticket_worker_assignment(
         .map(|value| require_ticket_assignment_value("assigned_by", value))
         .transpose()?
         .unwrap_or_else(|| "workspace-api".to_string());
+    let requested_worker = RuntimeWorkerRef::new(runtime_id, worker_id);
     let worker = api
         .runtime
-        .worker(&runtime_id, &worker_id)
+        .worker(&requested_worker)
         .map_err(|err| err.into_error())?;
     let assigned_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let record = TicketWorkerAssignmentRecord {
         workspace_id: path.workspace_id.clone(),
         ticket_id: ticket.id.clone(),
         assignment_id: new_id("tasg"),
-        runtime_id: worker.runtime_id,
-        worker_id: worker.worker_id,
+        worker: worker.worker.clone(),
         assigned_by,
         assigned_at,
     };
@@ -2017,8 +2010,7 @@ fn assign_ticket_worker_from_lifecycle(
         workspace_id: api.config.workspace_id.clone(),
         ticket_id: ticket.id,
         assignment_id: new_id("tasg"),
-        runtime_id: runtime_id.to_string(),
-        worker_id: worker_id.to_string(),
+        worker: RuntimeWorkerRef::new(runtime_id, worker_id),
         assigned_by: "worker-lifecycle".to_string(),
         assigned_at,
     };
@@ -2054,12 +2046,12 @@ fn existing_lifecycle_assignment_worker(
             assignment.operation_id
         )));
     }
-    let Some(worker_id) = operation.worker_id else {
+    let Some(worker_ref) = operation.worker else {
         return Ok(None);
     };
     let worker = api
         .runtime
-        .worker(runtime_id, &worker_id)
+        .worker(&worker_ref)
         .map_err(|error| error.into_error())?;
     if operation.assignment_id.is_none() && worker.state == "stopped" {
         return Ok(None);
@@ -2358,7 +2350,7 @@ async fn execute_worker_ticket_rest_operation(
             operation_kind,
             &previous_state,
             ticket.meta.workflow_state.as_str(),
-            Some((source.runtime_id, source.worker_id)),
+            Some(source),
         );
     }
     Ok(result)
@@ -2854,11 +2846,7 @@ async fn scoped_ticket_doctor(
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct WorkerMutationSource {
-    runtime_id: String,
-    worker_id: String,
-}
+type WorkerMutationSource = RuntimeWorkerRef;
 
 fn ticket_mutation_target(operation: &TicketBackendOperation) -> Option<&TicketIdOrSlug> {
     match operation {
@@ -2941,8 +2929,7 @@ fn ticket_operation_initial_state(operation: &TicketBackendOperation) -> String 
 
 #[derive(Debug, Clone)]
 struct WorkerTicketSourceContext {
-    runtime_id: String,
-    worker_id: String,
+    worker: RuntimeWorkerRef,
     actor_role: String,
     assignment_id: Option<String>,
 }
@@ -2950,8 +2937,14 @@ struct WorkerTicketSourceContext {
 impl WorkerTicketSourceContext {
     fn attributes(&self, operation_kind: &str) -> BTreeMap<String, String> {
         let mut attributes = BTreeMap::from([
-            ("source_runtime_id".to_string(), self.runtime_id.clone()),
-            ("source_worker_id".to_string(), self.worker_id.clone()),
+            (
+                "source_runtime_id".to_string(),
+                self.worker.runtime_id.clone(),
+            ),
+            (
+                "source_worker_id".to_string(),
+                self.worker.worker_id.clone(),
+            ),
             ("source_actor_role".to_string(), self.actor_role.clone()),
             (
                 "source_operation_kind".to_string(),
@@ -2988,20 +2981,18 @@ fn worker_ticket_source_context(
             .flatten()
     });
     let orchestrator = find_workspace_orchestrator(api);
-    let is_current_assignment = assignment.as_ref().is_some_and(|assignment| {
-        assignment.runtime_id == source.runtime_id && assignment.worker_id == source.worker_id
-    });
-    let is_orchestrator = orchestrator.as_ref().is_some_and(|worker| {
-        worker.runtime_id == source.runtime_id && worker.worker_id == source.worker_id
-    });
+    let is_current_assignment = assignment
+        .as_ref()
+        .is_some_and(|assignment| &assignment.worker == source);
+    let is_orchestrator = orchestrator
+        .as_ref()
+        .is_some_and(|worker| worker.worker == *source);
     let actor_role = worker_source_actor_role(is_current_assignment, is_orchestrator);
     WorkerTicketSourceContext {
-        runtime_id: source.runtime_id.clone(),
-        worker_id: source.worker_id.clone(),
+        worker: source.clone(),
         actor_role: actor_role.to_string(),
         assignment_id: assignment.and_then(|assignment| {
-            (assignment.runtime_id == source.runtime_id && assignment.worker_id == source.worker_id)
-                .then_some(assignment.assignment_id)
+            (assignment.worker == *source).then_some(assignment.assignment_id)
         }),
     }
 }
@@ -3015,7 +3006,7 @@ fn notify_ticket_recipients(
     source_operation_kind: &str,
     previous_state: &str,
     current_state: &str,
-    source: Option<(String, String)>,
+    source: Option<RuntimeWorkerRef>,
 ) {
     let mut recipients = Vec::new();
     if let Some(assignment) = api
@@ -3024,33 +3015,32 @@ fn notify_ticket_recipients(
         .ok()
         .flatten()
     {
-        recipients.push((assignment.runtime_id, assignment.worker_id));
+        recipients.push(assignment.worker.clone());
     }
     if (matches!(previous_state, "queued" | "inprogress")
         || matches!(current_state, "queued" | "inprogress"))
         && let Some(orchestrator) = find_workspace_orchestrator(api)
     {
-        recipients.push((orchestrator.runtime_id, orchestrator.worker_id));
+        recipients.push(orchestrator.worker.clone());
     }
     recipients.sort();
     recipients.dedup();
 
     let source_fields = source
         .as_ref()
-        .map(|(runtime_id, worker_id)| {
-            format!(" source_runtime_id={runtime_id} source_worker_id={worker_id}")
+        .map(|source| {
+            format!(
+                " source_runtime_id={} source_worker_id={}",
+                source.runtime_id, source.worker_id
+            )
         })
         .unwrap_or_default();
-    for (runtime_id, worker_id) in recipients {
-        if source
-            .as_ref()
-            .is_some_and(|source| source.0 == runtime_id && source.1 == worker_id)
-        {
+    for recipient in recipients {
+        if source.as_ref().is_some_and(|source| source == &recipient) {
             continue;
         }
         let _ = api.runtime.send_input(
-            &runtime_id,
-            &worker_id,
+            &recipient,
             WorkerInputRequest {
                 kind: WorkerInputKind::Notify,
                 content: format!(
@@ -3079,51 +3069,41 @@ fn authenticate_worker_mutation_source(
         .ok_or_else(|| {
             Error::WorkerSourceIdentity("missing Runtime-bound Worker id".to_string())
         })?;
-    api.runtime.worker(runtime_id, worker_id).map_err(|_| {
+    let worker = RuntimeWorkerRef::new(runtime_id, worker_id);
+    api.runtime.worker(&worker).map_err(|_| {
         Error::WorkerSourceIdentity("Runtime-bound Worker identity does not exist".to_string())
     })?;
-    Ok(WorkerMutationSource {
-        runtime_id: runtime_id.to_string(),
-        worker_id: worker_id.to_string(),
-    })
+    Ok(worker)
 }
 
 fn current_worker_identity(
     api: &WorkspaceApi,
     workspace_id: &str,
     headers: &HeaderMap,
-) -> Result<(String, u64)> {
-    let source = authenticate_worker_mutation_source(api, workspace_id, headers)?;
-    let worker_id = source.worker_id.parse::<u64>().map_err(|_| {
-        Error::WorkerSourceIdentity(format!(
-            "Runtime-bound Worker id must be numeric, got `{}`",
-            source.worker_id
-        ))
-    })?;
-    Ok((source.runtime_id, worker_id))
+) -> Result<RuntimeWorkerRef> {
+    authenticate_worker_mutation_source(api, workspace_id, headers)
 }
 
 fn current_worker_active_attachment(
     api: &WorkspaceApi,
-    runtime_id: &str,
-    worker_id: u64,
+    worker: &RuntimeWorkerRef,
 ) -> ApiResult<WorkerWorkdirLinkRecord> {
     if let Some(link) = api
         .store
-        .list_worker_workdir_links(&api.config.workspace_id, runtime_id, worker_id)?
+        .list_worker_workdir_links(&api.config.workspace_id, worker)?
         .into_iter()
         .next()
     {
         return Ok(link);
     }
 
-    if api.store.worker_workdir_link_history_exists(
-        &api.config.workspace_id,
-        runtime_id,
-        worker_id,
-    )? {
+    if api
+        .store
+        .worker_workdir_link_history_exists(&api.config.workspace_id, worker)?
+    {
         return Err(Error::WorkdirAttachmentConflict(format!(
-            "Worker {runtime_id}:{worker_id} has no active Workdir attachment"
+            "Worker {}:{} has no active Workdir attachment",
+            worker.runtime_id, worker.worker_id
         ))
         .into());
     }
@@ -3132,15 +3112,15 @@ fn current_worker_active_attachment(
     // outer spawn handler has projected that binding into the Backend registry. Import the same
     // binding transactionally on the first identity-bound operation so initial input cannot race
     // attachment authority.
-    let worker = api
+    let observed_worker = api
         .runtime
-        .worker(runtime_id, &worker_id.to_string())
+        .worker(worker)
         .map_err(|error| error.into_error())?;
-    if worker.working_directory.is_some() {
-        sync_worker_observation(api, &worker)?;
+    if observed_worker.working_directory.is_some() {
+        sync_worker_observation(api, &observed_worker)?;
         if let Some(link) = api
             .store
-            .list_worker_workdir_links(&api.config.workspace_id, runtime_id, worker_id)?
+            .list_worker_workdir_links(&api.config.workspace_id, worker)?
             .into_iter()
             .next()
         {
@@ -3148,43 +3128,41 @@ fn current_worker_active_attachment(
         }
     }
     Err(Error::WorkdirAttachmentConflict(format!(
-        "Worker {runtime_id}:{worker_id} has no active Workdir attachment"
+        "Worker {}:{} has no active Workdir attachment",
+        worker.runtime_id, worker.worker_id
     ))
     .into())
 }
 
 fn current_worker_session_lock(
     api: &WorkspaceApi,
-    runtime_id: &str,
-    worker_id: u64,
+    worker: &RuntimeWorkerRef,
 ) -> Arc<tokio::sync::Mutex<()>> {
     api.workdir_session_locks
         .lock()
         .expect("Workdir session lock registry poisoned")
-        .entry((runtime_id.to_string(), worker_id))
+        .entry(worker.clone())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
 }
 
-fn runtime_local_owner_worker_id(
-    caller_runtime_id: &str,
+fn runtime_local_owner_worker_id<'a>(
+    caller: &'a RuntimeWorkerRef,
     target_runtime_id: &str,
-    caller_worker_id: u64,
-) -> Option<String> {
-    (caller_runtime_id == target_runtime_id).then(|| caller_worker_id.to_string())
+) -> Option<&'a str> {
+    (caller.runtime_id == target_runtime_id).then_some(caller.worker_id.as_str())
 }
 
 async fn open_current_worker_workdir_session_locked(
     api: &WorkspaceApi,
-    runtime_id: &str,
-    worker_id: u64,
+    worker: &RuntimeWorkerRef,
     link: &WorkerWorkdirLinkRecord,
 ) -> Result<WorkdirSessionHandle> {
     if let Some(session) = api
         .workdir_sessions
         .lock()
         .expect("Workdir session registry lock poisoned")
-        .get(&(runtime_id.to_string(), worker_id))
+        .get(worker)
         .cloned()
     {
         return Ok(session);
@@ -3195,24 +3173,20 @@ async fn open_current_worker_workdir_session_locked(
         .into_iter()
         .find(|workdir| workdir.workdir_id == link.workdir_id)
         .ok_or_else(|| Error::RuntimeOperationFailed {
-            runtime_id: runtime_id.to_string(),
+            runtime_id: worker.runtime_id.clone(),
             code: "working_directory_not_found".to_string(),
             message: format!(
                 "attached Workdir {} is not registered in this Workspace",
                 link.workdir_id
             ),
         })?;
-    let owner_worker_id = runtime_local_owner_worker_id(runtime_id, &workdir.runtime_id, worker_id);
+    let owner_worker_id = runtime_local_owner_worker_id(worker, &workdir.runtime_id);
     let session = api
         .runtime
-        .open_workdir_session(
-            &workdir.runtime_id,
-            &workdir.workdir_id,
-            owner_worker_id.as_deref(),
-        )
+        .open_workdir_session(&workdir.runtime_id, &workdir.workdir_id, owner_worker_id)
         .await
         .map_err(|error| error.into_error())?;
-    let key = (runtime_id.to_string(), worker_id);
+    let key = worker.clone();
     let (selected, unused) = {
         let mut sessions = api
             .workdir_sessions
@@ -3233,7 +3207,7 @@ async fn open_current_worker_workdir_session_locked(
             .close()
             .await
             .map_err(|error| Error::RuntimeOperationFailed {
-                runtime_id: runtime_id.to_string(),
+                runtime_id: worker.runtime_id.clone(),
                 code: "duplicate_workdir_session_close_failed".to_string(),
                 message: error.to_string(),
             })?;
@@ -3243,10 +3217,9 @@ async fn open_current_worker_workdir_session_locked(
 
 async fn close_current_worker_session_locked(
     api: &WorkspaceApi,
-    runtime_id: &str,
-    worker_id: u64,
+    worker: &RuntimeWorkerRef,
 ) -> Result<()> {
-    let key = (runtime_id.to_string(), worker_id);
+    let key = worker.clone();
     let session = api
         .workdir_sessions
         .lock()
@@ -3258,7 +3231,7 @@ async fn close_current_worker_session_locked(
             .close()
             .await
             .map_err(|error| Error::RuntimeOperationFailed {
-                runtime_id: runtime_id.to_string(),
+                runtime_id: worker.runtime_id.clone(),
                 code: "workdir_session_close_failed".to_string(),
                 message: error.to_string(),
             })?;
@@ -3277,7 +3250,7 @@ async fn scoped_attach_current_worker_workdir(
     Json(request): Json<AttachCurrentWorkerWorkdirRequest>,
 ) -> ApiResult<Json<CurrentWorkerWorkdirAttachmentResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let (runtime_id, worker_id) = current_worker_identity(&api, &path.workspace_id, &headers)?;
+    let worker = current_worker_identity(&api, &path.workspace_id, &headers)?;
     let workdir_id = request.workdir_id.trim();
     if workdir_id.is_empty() || workdir_id.chars().any(char::is_control) {
         return Err(Error::InvalidRecordId(request.workdir_id).into());
@@ -3289,30 +3262,26 @@ async fn scoped_attach_current_worker_workdir(
         .any(|workdir| workdir.workdir_id == workdir_id)
     {
         return Err(Error::RuntimeOperationFailed {
-            runtime_id: runtime_id.clone(),
+            runtime_id: worker.runtime_id.clone(),
             code: "working_directory_not_found".to_string(),
             message: format!("unknown Workdir `{workdir_id}`"),
         }
         .into());
     }
-    let session_lock = current_worker_session_lock(&api, &runtime_id, worker_id);
+    let session_lock = current_worker_session_lock(&api, &worker);
     let _session_guard = session_lock.lock().await;
     let link = api.store.attach_worker_workdir(&WorkerWorkdirLinkRecord {
         workspace_id: api.config.workspace_id.clone(),
-        runtime_id: runtime_id.clone(),
-        runtime_worker_id: worker_id,
+        worker: worker.clone(),
         workdir_id: workdir_id.to_string(),
         role: "attachment".to_string(),
         linked_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         unlinked_at: None,
     })?;
-    if let Err(error) =
-        open_current_worker_workdir_session_locked(&api, &runtime_id, worker_id, &link).await
-    {
+    if let Err(error) = open_current_worker_workdir_session_locked(&api, &worker, &link).await {
         let _ = api.store.detach_worker_workdir(
             &api.config.workspace_id,
-            &runtime_id,
-            worker_id,
+            &worker,
             Some(workdir_id),
             &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         );
@@ -3331,15 +3300,14 @@ async fn scoped_detach_current_worker_workdir(
     headers: HeaderMap,
 ) -> ApiResult<Json<CurrentWorkerWorkdirAttachmentResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let (runtime_id, worker_id) = current_worker_identity(&api, &path.workspace_id, &headers)?;
-    let session_lock = current_worker_session_lock(&api, &runtime_id, worker_id);
+    let worker = current_worker_identity(&api, &path.workspace_id, &headers)?;
+    let session_lock = current_worker_session_lock(&api, &worker);
     let _session_guard = session_lock.lock().await;
-    let link = current_worker_active_attachment(&api, &runtime_id, worker_id)?;
-    close_current_worker_session_locked(&api, &runtime_id, worker_id).await?;
+    let link = current_worker_active_attachment(&api, &worker)?;
+    close_current_worker_session_locked(&api, &worker).await?;
     api.store.detach_worker_workdir(
         &api.config.workspace_id,
-        &runtime_id,
-        worker_id,
+        &worker,
         Some(&link.workdir_id),
         &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
     )?;
@@ -3357,16 +3325,15 @@ async fn scoped_execute_current_worker_workdir_operation(
     Json(operation): Json<WorkdirSessionOperation>,
 ) -> ApiResult<Json<WorkdirSessionOperationResult>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let (runtime_id, worker_id) = current_worker_identity(&api, &path.workspace_id, &headers)?;
-    let session_lock = current_worker_session_lock(&api, &runtime_id, worker_id);
+    let worker = current_worker_identity(&api, &path.workspace_id, &headers)?;
+    let session_lock = current_worker_session_lock(&api, &worker);
     let _session_guard = session_lock.lock().await;
-    let link = current_worker_active_attachment(&api, &runtime_id, worker_id)?;
-    let session =
-        open_current_worker_workdir_session_locked(&api, &runtime_id, worker_id, &link).await?;
+    let link = current_worker_active_attachment(&api, &worker)?;
+    let session = open_current_worker_workdir_session_locked(&api, &worker, &link).await?;
     let result = execute_workdir_session_operation(&session, operation)
         .await
         .map_err(|error| Error::RuntimeOperationFailed {
-            runtime_id,
+            runtime_id: worker.runtime_id.clone(),
             code: "workdir_session_operation_failed".to_string(),
             message: error.to_string(),
         })?;
@@ -3497,7 +3464,8 @@ fn maybe_dispatch_orchestrator_turn_end(
     let Some(orchestrator) = find_workspace_orchestrator(api) else {
         return;
     };
-    if orchestrator.runtime_id == EMBEDDED_WORKER_RUNTIME_ID && orchestrator.worker_id == worker_id
+    if orchestrator.worker.runtime_id == EMBEDDED_WORKER_RUNTIME_ID
+        && orchestrator.worker.worker_id == worker_id
     {
         dispatch_orchestrator_queue_attention(api);
     }
@@ -3573,8 +3541,7 @@ fn dispatch_orchestrator_queue_attention(api: &WorkspaceApi) {
     let accepted = api
         .runtime
         .send_input(
-            &orchestrator.runtime_id,
-            &orchestrator.worker_id,
+            &orchestrator.worker,
             WorkerInputRequest {
                 kind: WorkerInputKind::Notify,
                 content,
@@ -3792,7 +3759,7 @@ fn start_memory_staging_consolidation(
         status: "started".to_string(),
         summary: format!(
             "Started Memory consolidater '{}' for {candidate_count} staging candidate(s).",
-            worker.worker_id
+            worker.worker.worker_id
         ),
         candidate_count,
         total_bytes,
@@ -3818,13 +3785,13 @@ fn try_reuse_memory_consolidation_worker(
     if consolidaters.is_empty() {
         return Ok(None);
     }
-    consolidaters.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
+    consolidaters.sort_by(|a, b| a.worker.worker_id.cmp(&b.worker.worker_id));
     if let Some(worker) = consolidaters.iter().find(|worker| worker.state != "idle") {
         return Ok(Some(MemoryConsolidationOutput {
             status: "skipped_existing_not_idle".to_string(),
             summary: format!(
                 "Existing Memory consolidater '{}' is '{}', not confirmed idle.",
-                worker.worker_id, worker.state
+                worker.worker.worker_id, worker.state
             ),
             candidate_count,
             total_bytes,
@@ -3837,8 +3804,7 @@ fn try_reuse_memory_consolidation_worker(
     let input = api
         .runtime
         .send_input(
-            &worker.runtime_id,
-            &worker.worker_id,
+            &worker.worker,
             WorkerInputRequest {
                 kind: WorkerInputKind::User,
                 content: input_content.to_string(),
@@ -3851,7 +3817,7 @@ fn try_reuse_memory_consolidation_worker(
             status: "skipped_existing_input_rejected".to_string(),
             summary: format!(
                 "Existing idle Memory consolidater '{}' rejected the new consolidation input.",
-                worker.worker_id
+                worker.worker.worker_id
             ),
             candidate_count,
             total_bytes,
@@ -3861,7 +3827,7 @@ fn try_reuse_memory_consolidation_worker(
         status: "reused".to_string(),
         summary: format!(
             "Reused Memory consolidater '{}' for {candidate_count} staging candidate(s).",
-            worker.worker_id
+            worker.worker.worker_id
         ),
         candidate_count,
         total_bytes,
@@ -4162,12 +4128,12 @@ async fn scoped_start_workspace_orchestrator(
         }
         let restored = api
             .runtime
-            .restore_worker(&existing.runtime_id, &existing.worker_id)
+            .restore_worker(&existing.worker)
             .map_err(|error| error.into_error())?;
         if restored.state != WorkerOperationState::Accepted {
             return Err(ApiError::with_diagnostics(
                 Error::RuntimeOperationFailed {
-                    runtime_id: existing.runtime_id,
+                    runtime_id: existing.worker.runtime_id.clone(),
                     code: "workspace_orchestrator_restore_rejected".to_string(),
                     message: "Runtime rejected Workspace Orchestrator restore".to_string(),
                 },
@@ -4521,28 +4487,21 @@ async fn set_worker_retention(
     runtime_worker_id: String,
     pinned: bool,
 ) -> ApiResult<Json<WorkerRetentionResponse>> {
-    let runtime_worker_registry_id = parse_runtime_worker_id_for_registry(&runtime_worker_id)?;
+    parse_runtime_worker_id_for_registry(&runtime_worker_id)?;
+    let worker_ref = RuntimeWorkerRef::new(runtime_id.clone(), runtime_worker_id.clone());
     if api
         .store
-        .get_worker_registry(
-            &api.config.workspace_id,
-            runtime_id.as_str(),
-            runtime_worker_registry_id,
-        )?
+        .get_worker_registry(&api.config.workspace_id, &worker_ref)?
         .is_none()
     {
-        if let Ok(worker) = api
-            .runtime
-            .worker(runtime_id.as_str(), runtime_worker_id.as_str())
-        {
+        if let Ok(worker) = api.runtime.worker(&worker_ref) {
             let _ = sync_worker_observation(&api, &worker);
         }
     }
     let retention_state = if pinned { "pinned" } else { "normal" };
     let changed = api.store.update_worker_retention(
         &api.config.workspace_id,
-        runtime_id.as_str(),
-        runtime_worker_registry_id,
+        &worker_ref,
         retention_state,
         now_registry_timestamp().as_str(),
     )?;
@@ -4555,8 +4514,7 @@ async fn set_worker_retention(
     }
     Ok(Json(WorkerRetentionResponse {
         workspace_id: api.config.workspace_id,
-        runtime_id,
-        worker_id: runtime_worker_id,
+        worker_ref,
         pinned,
         retention_state: retention_state.to_string(),
     }))
@@ -4567,15 +4525,11 @@ fn build_runtime_cleanup_plan(
     runtime_id: &str,
 ) -> ApiResult<RuntimeCleanupPlanResponse> {
     let workers = workers_response(api.clone())?;
-    let live_running_worker_ids: HashSet<(String, u64)> = workers
+    let live_running_worker_ids: HashSet<RuntimeWorkerRef> = workers
         .items
         .iter()
         .filter(|worker| worker.state == "running")
-        .filter_map(|worker| {
-            parse_runtime_worker_id_for_registry(worker.worker_id.as_str())
-                .ok()
-                .map(|worker_id| (worker.runtime_id.clone(), worker_id))
-        })
+        .map(|worker| worker.worker.clone())
         .collect();
     let (workdir_summaries, mut diagnostics) =
         match runtime_working_directory_summaries(api, runtime_id) {
@@ -4600,12 +4554,7 @@ fn build_runtime_cleanup_plan(
         .list_worker_registry(&api.config.workspace_id, 500)?;
     let worker_by_id: HashMap<_, _> = worker_records
         .iter()
-        .map(|record| {
-            (
-                (record.runtime_id.clone(), record.runtime_worker_id.clone()),
-                record.clone(),
-            )
-        })
+        .map(|record| (record.worker.clone(), record.clone()))
         .collect();
     let observed_workdirs: HashMap<_, _> = workdir_summaries
         .into_iter()
@@ -4615,15 +4564,12 @@ fn build_runtime_cleanup_plan(
     let mut worker_candidates = Vec::new();
     for record in worker_records
         .iter()
-        .filter(|record| record.runtime_id == runtime_id)
+        .filter(|record| record.worker.runtime_id == runtime_id)
     {
-        let links = api.store.list_worker_workdir_links(
-            &api.config.workspace_id,
-            record.runtime_id.as_str(),
-            record.runtime_worker_id,
-        )?;
-        let is_running = live_running_worker_ids
-            .contains(&(record.runtime_id.clone(), record.runtime_worker_id.clone()));
+        let links = api
+            .store
+            .list_worker_workdir_links(&api.config.workspace_id, &record.worker)?;
+        let is_running = live_running_worker_ids.contains(&record.worker);
         let pinned = record.retention_state == "pinned";
         let blocking_reason = if pinned {
             Some("worker is pinned".to_string())
@@ -4635,13 +4581,13 @@ fn build_runtime_cleanup_plan(
         worker_candidates.push(CleanupWorkerCandidate {
             target_id: format!(
                 "worker:{}:{}",
-                encode_path_segment(record.runtime_id.as_str()),
-                encode_path_segment(&record.runtime_worker_id.to_string())
+                encode_path_segment(record.worker.runtime_id.as_str()),
+                encode_path_segment(&record.worker.worker_id)
             ),
             action: CleanupTargetKind::WorkerDelete,
-            worker_id: record.runtime_worker_id.to_string(),
-            runtime_worker_id: record.runtime_worker_id.to_string(),
-            runtime_id: record.runtime_id.clone(),
+            worker_id: record.worker.worker_id.clone(),
+            runtime_worker_id: record.worker.worker_id.clone(),
+            runtime_id: record.worker.runtime_id.clone(),
             reason: if blocking_reason.is_some() {
                 "Worker cannot be deleted until blocking conditions are cleared".to_string()
             } else {
@@ -4666,21 +4612,16 @@ fn build_runtime_cleanup_plan(
             .list_workdir_worker_links(&api.config.workspace_id, record.workdir_id.as_str())?;
         let linked_workers = links
             .iter()
-            .filter_map(|link| {
-                worker_by_id.get(&(link.runtime_id.clone(), link.runtime_worker_id.clone()))
-            })
+            .filter_map(|link| worker_by_id.get(&link.worker))
             .collect::<Vec<_>>();
         let linked_worker_ids = links
             .iter()
-            .map(|link| link.runtime_worker_id.to_string())
+            .map(|link| link.worker.worker_id.clone())
             .collect::<Vec<_>>();
         let linked_running_worker_ids = linked_workers
             .iter()
-            .filter(|worker| {
-                live_running_worker_ids
-                    .contains(&(worker.runtime_id.clone(), worker.runtime_worker_id.clone()))
-            })
-            .map(|worker| worker.runtime_worker_id.to_string())
+            .filter(|worker| live_running_worker_ids.contains(&worker.worker))
+            .map(|worker| worker.worker.worker_id.clone())
             .collect::<Vec<_>>();
         let pinned_linked = linked_workers
             .iter()
@@ -4822,21 +4763,22 @@ async fn execute_runtime_cleanup(
                 "pinned Worker/history cannot be deleted",
             ));
         }
-        let runtime_worker_id = parse_runtime_worker_id_for_registry(&candidate.runtime_worker_id)?;
-        let session_lock = current_worker_session_lock(api, runtime_id, runtime_worker_id);
+        parse_runtime_worker_id_for_registry(&candidate.runtime_worker_id)?;
+        let worker = RuntimeWorkerRef::new(
+            candidate.runtime_id.clone(),
+            candidate.runtime_worker_id.clone(),
+        );
+        let session_lock = current_worker_session_lock(api, &worker);
         let _session_guard = session_lock.lock().await;
-        close_current_worker_session_locked(api, runtime_id, runtime_worker_id).await?;
+        close_current_worker_session_locked(api, &worker).await?;
         cleanup_runtime_worker_for_execution(api, runtime_id, candidate)?;
-        api.store.delete_worker_registry(
-            &api.config.workspace_id,
-            candidate.runtime_id.as_str(),
-            runtime_worker_id,
-        )?;
+        api.store
+            .delete_worker_registry(&api.config.workspace_id, &worker)?;
         drop(_session_guard);
         api.workdir_session_locks
             .lock()
             .expect("Workdir session lock registry poisoned")
-            .remove(&(runtime_id.to_string(), runtime_worker_id));
+            .remove(&worker);
         results.push(RuntimeCleanupExecutionResult {
             target_id: candidate.target_id.clone(),
             action: candidate.action.clone(),
@@ -4963,9 +4905,9 @@ fn cleanup_runtime_worker_for_execution(
     runtime_id: &str,
     candidate: &CleanupWorkerCandidate,
 ) -> ApiResult<()> {
+    let worker = RuntimeWorkerRef::new(runtime_id, &candidate.runtime_worker_id);
     match api.runtime.stop_worker(
-        runtime_id,
-        candidate.runtime_worker_id.as_str(),
+        &worker,
         WorkerLifecycleRequest {
             reason: Some("cleanup worker before deletion".to_string()),
             ticket_assignment: None,
@@ -4986,10 +4928,7 @@ fn cleanup_runtime_worker_for_execution(
         Err(error) => return Err(error.into_error().into()),
     }
 
-    match api
-        .runtime
-        .delete_worker(runtime_id, candidate.runtime_worker_id.as_str())
-    {
+    match api.runtime.delete_worker(&worker) {
         Ok(result) if result.deleted && result.state == WorkerOperationState::Accepted => Ok(()),
         Ok(result) => Err(ApiError::with_diagnostics(
             Error::RuntimeOperationFailed {
@@ -5149,7 +5088,11 @@ async fn scoped_get_runtime_worker(
     AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
 ) -> ApiResult<Json<WorkerSummary>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    get_runtime_worker(State(api), AxumPath((path.runtime_id, path.worker_id))).await
+    get_runtime_worker(
+        State(api),
+        AxumPath((path.worker.runtime_id, path.worker.worker_id)),
+    )
+    .await
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -5165,8 +5108,8 @@ async fn scoped_restore_runtime_worker(
 ) -> ApiResult<Json<WorkerRestoreResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let workspace_id = path.workspace_id.clone();
-    let runtime_id = path.runtime_id.clone();
-    let worker_id = path.worker_id.clone();
+    let runtime_id = path.worker.runtime_id.clone();
+    let worker_id = path.worker.worker_id.clone();
     let assignment_request = match (
         query.ticket_id.clone(),
         query.assignment_operation_id.clone(),
@@ -5207,18 +5150,17 @@ async fn scoped_restore_runtime_worker(
             &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
         )?;
         if let Some(worker) = existing_lifecycle_assignment_worker(&api, assignment, &runtime_id)? {
-            if worker.worker_id != worker_id {
+            if worker.worker.worker_id != worker_id {
                 return Err(Error::TicketAssignmentConflict(format!(
                     "assignment operation {} belongs to worker {}, not {}",
-                    assignment.operation_id, worker.worker_id, worker_id
+                    assignment.operation_id, worker.worker.worker_id, worker_id
                 ))
                 .into());
             }
             assign_ticket_worker_from_lifecycle(&api, assignment, &runtime_id, &worker_id)?;
             return Ok(Json(WorkerRestoreResponse {
                 workspace_id,
-                runtime_id,
-                worker_id,
+                worker_ref: RuntimeWorkerRef::new(&runtime_id, &worker_id),
                 result: crate::hosts::WorkerRestoreResult {
                     state: WorkerOperationState::Accepted,
                     worker: Some(worker),
@@ -5243,7 +5185,7 @@ async fn scoped_pin_runtime_worker(
     AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
 ) -> ApiResult<Json<WorkerRetentionResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    set_worker_retention(api, path.runtime_id, path.worker_id, true).await
+    set_worker_retention(api, path.worker.runtime_id, path.worker.worker_id, true).await
 }
 
 async fn scoped_unpin_runtime_worker(
@@ -5251,7 +5193,7 @@ async fn scoped_unpin_runtime_worker(
     AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
 ) -> ApiResult<Json<WorkerRetentionResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    set_worker_retention(api, path.runtime_id, path.worker_id, false).await
+    set_worker_retention(api, path.worker.runtime_id, path.worker.worker_id, false).await
 }
 
 async fn scoped_runtime_cleanup_plan(
@@ -5281,7 +5223,7 @@ async fn scoped_send_runtime_worker_input(
     validate_workspace_scope(&api, &path.workspace_id)?;
     send_runtime_worker_input(
         State(api),
-        AxumPath((path.runtime_id, path.worker_id)),
+        AxumPath((path.worker.runtime_id, path.worker.worker_id)),
         Json(request),
     )
     .await
@@ -5295,7 +5237,7 @@ async fn scoped_runtime_worker_completions(
     validate_workspace_scope(&api, &path.workspace_id)?;
     runtime_worker_completions(
         State(api),
-        AxumPath((path.runtime_id, path.worker_id)),
+        AxumPath((path.worker.runtime_id, path.worker.worker_id)),
         Json(request),
     )
     .await
@@ -5309,7 +5251,7 @@ async fn scoped_stop_runtime_worker(
     validate_workspace_scope(&api, &path.workspace_id)?;
     stop_runtime_worker(
         State(api),
-        AxumPath((path.runtime_id, path.worker_id)),
+        AxumPath((path.worker.runtime_id, path.worker.worker_id)),
         Json(request),
     )
     .await
@@ -5323,7 +5265,7 @@ async fn scoped_cancel_runtime_worker(
     validate_workspace_scope(&api, &path.workspace_id)?;
     cancel_runtime_worker(
         State(api),
-        AxumPath((path.runtime_id, path.worker_id)),
+        AxumPath((path.worker.runtime_id, path.worker.worker_id)),
         Json(request),
     )
     .await
@@ -5337,9 +5279,13 @@ async fn scoped_worker_protocol_ws(
     if let Err(err) = validate_workspace_scope(&api, &path.workspace_id) {
         return err.into_response();
     }
-    worker_protocol_ws(State(api), AxumPath((path.runtime_id, path.worker_id)), ws)
-        .await
-        .into_response()
+    worker_protocol_ws(
+        State(api),
+        AxumPath((path.worker.runtime_id, path.worker.worker_id)),
+        ws,
+    )
+    .await
+    .into_response()
 }
 
 async fn scoped_list_host_workers(
@@ -6654,7 +6600,7 @@ fn record_browser_worker_spawn(
     )?;
     if let Some(working_directory) = worker.working_directory.as_ref() {
         let workdir_record =
-            workdir_record_from_summary(api, worker.runtime_id.as_str(), working_directory);
+            workdir_record_from_summary(api, worker.worker.runtime_id.as_str(), working_directory);
         api.store.upsert_workdir_registry(&workdir_record)?;
         link_worker_to_workdir(
             api,
@@ -6671,13 +6617,13 @@ fn record_browser_worker_spawn(
         {
             if let Ok(result) = api
                 .runtime
-                .working_directory(worker.runtime_id.as_str(), workdir_id)
+                .working_directory(worker.worker.runtime_id.as_str(), workdir_id)
                 .map_err(|err| err.into_error())
             {
                 if let Some(status) = result.working_directory {
                     let record = workdir_record_from_summary(
                         api,
-                        worker.runtime_id.as_str(),
+                        worker.worker.runtime_id.as_str(),
                         &status.summary,
                     );
                     api.store.upsert_workdir_registry(&record)?;
@@ -6692,8 +6638,8 @@ fn record_browser_worker_spawn(
             link_worker_to_workdir(api, &worker_record, workdir_id, None)?;
         }
     }
-    let runtime_id = worker.runtime_id.clone();
-    let worker_id = worker.worker_id.clone();
+    let runtime_id = worker.worker.runtime_id.clone();
+    let worker_id = worker.worker.worker_id.clone();
     let workspace_id = api.workspace_id().to_string();
     let console_href = format!(
         "/w/{}/runtimes/{}/workers/{}/console",
@@ -6703,8 +6649,7 @@ fn record_browser_worker_spawn(
     );
     Ok(BrowserCreateWorkerResponse {
         workspace_id,
-        runtime_id,
-        worker_id,
+        worker_ref: RuntimeWorkerRef::new(&runtime_id, &worker_id),
         console_href,
         worker,
         diagnostics: result.diagnostics,
@@ -6771,16 +6716,15 @@ async fn get_runtime_worker(
     State(api): State<WorkspaceApi>,
     AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
 ) -> ApiResult<Json<WorkerSummary>> {
+    let worker_ref = RuntimeWorkerRef::new(runtime_id, worker_id);
     let worker = api
         .runtime
-        .worker(&runtime_id, &worker_id)
+        .worker(&worker_ref)
         .map_err(|err| err.into_error())?;
     let record = sync_worker_observation(&api, &worker)?;
-    let links = api.store.list_worker_workdir_links(
-        &api.config.workspace_id,
-        record.runtime_id.as_str(),
-        record.runtime_worker_id,
-    )?;
+    let links = api
+        .store
+        .list_worker_workdir_links(&api.config.workspace_id, &record.worker)?;
     let workdirs = api
         .store
         .list_workdir_registry(&api.config.workspace_id, 500)?;
@@ -6796,14 +6740,13 @@ async fn restore_runtime_worker(
     State(api): State<WorkspaceApi>,
     AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
 ) -> ApiResult<Json<WorkerRestoreResponse>> {
-    let mut result = api.restore_workspace_worker(&runtime_id, &worker_id)?;
+    let worker = RuntimeWorkerRef::new(&runtime_id, &worker_id);
+    let mut result = api.restore_workspace_worker(&worker)?;
     if let Some(worker) = result.worker.as_ref() {
         let record = sync_worker_observation(&api, worker)?;
-        let links = api.store.list_worker_workdir_links(
-            &api.config.workspace_id,
-            record.runtime_id.as_str(),
-            record.runtime_worker_id,
-        )?;
+        let links = api
+            .store
+            .list_worker_workdir_links(&api.config.workspace_id, &record.worker)?;
         let workdirs = api
             .store
             .list_workdir_registry(&api.config.workspace_id, 500)?;
@@ -6816,8 +6759,7 @@ async fn restore_runtime_worker(
     }
     Ok(Json(WorkerRestoreResponse {
         workspace_id: api.workspace_id().to_string(),
-        runtime_id,
-        worker_id,
+        worker_ref: RuntimeWorkerRef::new(&runtime_id, &worker_id),
         result,
     }))
 }
@@ -6911,7 +6853,12 @@ async fn create_runtime_worker(
 ) -> ApiResult<Json<WorkerSpawnResult>> {
     if let Some(assignment) = request.ticket_assignment.as_ref() {
         if let Some(worker) = existing_lifecycle_assignment_worker(&api, assignment, &runtime_id)? {
-            assign_ticket_worker_from_lifecycle(&api, assignment, &runtime_id, &worker.worker_id)?;
+            assign_ticket_worker_from_lifecycle(
+                &api,
+                assignment,
+                &runtime_id,
+                &worker.worker.worker_id,
+            )?;
             return Ok(Json(WorkerSpawnResult {
                 state: WorkerOperationState::Accepted,
                 worker: Some(worker),
@@ -6983,9 +6930,14 @@ async fn create_runtime_worker(
             api.store.bind_ticket_assignment_operation_worker(
                 &api.config.workspace_id,
                 &assignment.operation_id,
-                &worker.worker_id,
+                &worker.worker.worker_id,
             )?;
-            assign_ticket_worker_from_lifecycle(&api, assignment, &runtime_id, &worker.worker_id)?;
+            assign_ticket_worker_from_lifecycle(
+                &api,
+                assignment,
+                &runtime_id,
+                &worker.worker.worker_id,
+            )?;
         }
         if worker.working_directory.is_none() {
             if let Some(workdir_id) = prepared_workdir_id.as_deref() {
@@ -7046,9 +6998,10 @@ async fn send_runtime_worker_input(
     AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
     Json(request): Json<WorkerInputRequest>,
 ) -> ApiResult<Json<WorkerInputResult>> {
+    let worker = RuntimeWorkerRef::new(&runtime_id, &worker_id);
     let result = api
         .runtime
-        .send_input(&runtime_id, &worker_id, request)
+        .send_input(&worker, request)
         .map_err(|err| err.into_error())?;
     Ok(Json(result))
 }
@@ -7058,9 +7011,10 @@ async fn runtime_worker_completions(
     AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
     Json(request): Json<WorkerCompletionsRequest>,
 ) -> ApiResult<Json<WorkerCompletionsResult>> {
+    let worker = RuntimeWorkerRef::new(&runtime_id, &worker_id);
     let result = api
         .runtime
-        .worker_completions(&runtime_id, &worker_id, request)
+        .worker_completions(&worker, request)
         .map_err(|err| err.into_error())?;
     Ok(Json(result))
 }
@@ -7070,19 +7024,20 @@ async fn stop_runtime_worker(
     AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
     Json(request): Json<WorkerLifecycleRequest>,
 ) -> ApiResult<Json<WorkerLifecycleResult>> {
+    let worker = RuntimeWorkerRef::new(&runtime_id, &worker_id);
     let result = api
         .runtime
-        .stop_worker(&runtime_id, &worker_id, request)
+        .stop_worker(&worker, request)
         .map_err(|err| err.into_error())?;
-    let runtime_worker_id = parse_runtime_worker_id_for_registry(&worker_id)?;
-    let session_lock = current_worker_session_lock(&api, &runtime_id, runtime_worker_id);
+    parse_runtime_worker_id_for_registry(&worker.worker_id)?;
+    let session_lock = current_worker_session_lock(&api, &worker);
     let _session_guard = session_lock.lock().await;
-    close_current_worker_session_locked(&api, &runtime_id, runtime_worker_id).await?;
-    if let Some(record) =
-        api.store
-            .get_worker_registry(&api.config.workspace_id, &runtime_id, runtime_worker_id)?
+    close_current_worker_session_locked(&api, &worker).await?;
+    if let Some(record) = api
+        .store
+        .get_worker_registry(&api.config.workspace_id, &worker)?
     {
-        sync_linked_workdir_after_worker_stop(&api, &runtime_id, &record)?;
+        sync_linked_workdir_after_worker_stop(&api, &worker.runtime_id, &record)?;
     }
     Ok(Json(result))
 }
@@ -7092,9 +7047,10 @@ async fn cancel_runtime_worker(
     AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
     Json(request): Json<WorkerLifecycleRequest>,
 ) -> ApiResult<Json<WorkerLifecycleResult>> {
+    let worker = RuntimeWorkerRef::new(&runtime_id, &worker_id);
     let result = api
         .runtime
-        .cancel_worker(&runtime_id, &worker_id, request)
+        .cancel_worker(&worker, request)
         .map_err(|err| err.into_error())?;
     Ok(Json(result))
 }
@@ -7104,10 +7060,11 @@ async fn worker_protocol_ws(
     AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    let source = match api.observation_proxy.source(&runtime_id, &worker_id) {
+    let worker = RuntimeWorkerRef::new(&runtime_id, &worker_id);
+    let source = match api.observation_proxy.source(&worker) {
         Ok(source) => source,
         Err(ObservationProxyError::WorkerNotFound(_)) => {
-            match api.runtime.observation_source(&runtime_id, &worker_id) {
+            match api.runtime.observation_source(&worker) {
                 Ok(source) => source,
                 Err(error) => return ApiError::from(error.into_error()).into_response(),
             }
@@ -7133,18 +7090,17 @@ pub(crate) struct WorkspaceWorkerProtocolConnection {
 
 pub(crate) async fn connect_workspace_worker_protocol(
     api: &WorkspaceApi,
-    runtime_id: &str,
-    worker_id: &str,
+    worker: &RuntimeWorkerRef,
 ) -> Result<WorkspaceWorkerProtocolConnection> {
-    let source = match api.observation_proxy.source(runtime_id, worker_id) {
+    let source = match api.observation_proxy.source(worker) {
         Ok(source) => source,
         Err(ObservationProxyError::WorkerNotFound(_)) => api
             .runtime
-            .observation_source(runtime_id, worker_id)
+            .observation_source(worker)
             .map_err(|error| error.into_error())?,
         Err(error) => {
             return Err(Error::RuntimeOperationFailed {
-                runtime_id: runtime_id.to_string(),
+                runtime_id: worker.runtime_id.clone(),
                 code: error.code().to_string(),
                 message: error.message().to_string(),
             });
@@ -7178,7 +7134,7 @@ async fn connect_remote_worker_protocol(
         connect_async(request)
             .await
             .map_err(|error| Error::RuntimeOperationFailed {
-                runtime_id: config.runtime_id.clone(),
+                runtime_id: config.worker.runtime_id.clone(),
                 code: "worker_protocol_connect_failed".to_string(),
                 message: error.to_string(),
             })?;
@@ -7217,7 +7173,7 @@ async fn connect_embedded_worker_protocol(
         RuntimeObservationClient::connect(&RuntimeObservationSource::Embedded(source.clone()))
             .await
             .map_err(|error| Error::RuntimeOperationFailed {
-                runtime_id: source.runtime_id.clone(),
+                runtime_id: source.worker.runtime_id.clone(),
                 code: error.code().to_string(),
                 message: error.message().to_string(),
             })?;
@@ -7495,14 +7451,7 @@ fn workers_response(api: WorkspaceApi) -> ApiResult<RuntimeListResponse<WorkerSu
     let mut observed = std::collections::BTreeMap::new();
     for worker in &runtime_workers.items {
         let _ = sync_worker_observation(&api, worker);
-        if let Ok(runtime_worker_id) =
-            parse_runtime_worker_id_for_registry(worker.worker_id.as_str())
-        {
-            observed.insert(
-                (worker.runtime_id.clone(), runtime_worker_id),
-                worker.clone(),
-            );
-        }
+        observed.insert(worker.worker.clone(), worker.clone());
     }
     let mut diagnostics = runtime_workers.diagnostics;
     let worker_records = api
@@ -7513,17 +7462,11 @@ fn workers_response(api: WorkspaceApi) -> ApiResult<RuntimeListResponse<WorkerSu
         .list_workdir_registry(&api.config.workspace_id, 500)?;
     let mut items = Vec::new();
     for record in worker_records {
-        if !observed.contains_key(&(record.runtime_id.clone(), record.runtime_worker_id)) {
-            match api.runtime.worker(
-                record.runtime_id.as_str(),
-                &record.runtime_worker_id.to_string(),
-            ) {
+        if !observed.contains_key(&record.worker) {
+            match api.runtime.worker(&record.worker) {
                 Ok(worker) => {
                     let _ = sync_worker_observation(&api, &worker);
-                    observed.insert(
-                        (worker.runtime_id.clone(), record.runtime_worker_id),
-                        worker,
-                    );
+                    observed.insert(record.worker.clone(), worker);
                 }
                 Err(RuntimeRegistryError::UnknownWorker { .. }) => {}
                 Err(error) => diagnostics.push(RuntimeDiagnostic {
@@ -7531,20 +7474,18 @@ fn workers_response(api: WorkspaceApi) -> ApiResult<RuntimeListResponse<WorkerSu
                     severity: DiagnosticSeverity::Info,
                     message: format!(
                         "Could not verify Worker {} on Runtime {}: {}",
-                        record.runtime_worker_id,
-                        record.runtime_id,
+                        record.worker.worker_id,
+                        record.worker.runtime_id,
                         sanitize_backend_error(&error.into_error().to_string())
                     ),
                 }),
             }
         }
-        let links = api.store.list_worker_workdir_links(
-            &api.config.workspace_id,
-            record.runtime_id.as_str(),
-            record.runtime_worker_id,
-        )?;
+        let links = api
+            .store
+            .list_worker_workdir_links(&api.config.workspace_id, &record.worker)?;
         items.push(merge_worker_registry_projection(
-            observed.get(&(record.runtime_id.clone(), record.runtime_worker_id)),
+            observed.get(&record.worker),
             &record,
             links,
             &workdir_records,
@@ -8368,12 +8309,11 @@ fn record_worker_summary(
     display_name_policy: WorkerRegistryDisplayNamePolicy,
 ) -> ApiResult<WorkerRegistryRecord> {
     let timestamp = now_registry_timestamp();
-    let runtime_worker_id = parse_runtime_worker_id_for_registry(worker.worker_id.as_str())?;
-    let existing = api.store.get_worker_registry(
-        &api.config.workspace_id,
-        worker.runtime_id.as_str(),
-        runtime_worker_id,
-    )?;
+    parse_runtime_worker_id_for_registry(worker.worker.worker_id.as_str())?;
+    let worker_ref = worker.worker.clone();
+    let existing = api
+        .store
+        .get_worker_registry(&api.config.workspace_id, &worker_ref)?;
     let display_name = match (display_name_policy, existing.as_ref()) {
         (WorkerRegistryDisplayNamePolicy::PreserveExisting, Some(record)) => {
             record.display_name.clone()
@@ -8382,8 +8322,7 @@ fn record_worker_summary(
     };
     let record = WorkerRegistryRecord {
         workspace_id: api.config.workspace_id.clone(),
-        runtime_id: worker.runtime_id.as_str().to_string(),
-        runtime_worker_id,
+        worker: worker_ref.clone(),
         display_name,
         profile,
         retention_state: existing
@@ -8392,8 +8331,8 @@ fn record_worker_summary(
             .unwrap_or_else(|| "normal".to_string()),
         transcript_ref: Some(format!(
             "runtime://{}/workers/{}/transcript",
-            worker.runtime_id.as_str(),
-            worker.worker_id.as_str()
+            worker.worker.runtime_id.as_str(),
+            worker.worker.worker_id.as_str()
         )),
         session_ref: None,
         summary_ref: None,
@@ -8404,18 +8343,13 @@ fn record_worker_summary(
     api.store.upsert_worker_registry(&record)?;
     Ok(api
         .store
-        .get_worker_registry(
-            &api.config.workspace_id,
-            worker.runtime_id.as_str(),
-            runtime_worker_id,
-        )?
+        .get_worker_registry(&api.config.workspace_id, &worker_ref)?
         .unwrap_or(record))
 }
 
 fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> WorkerSummary {
     WorkerSummary {
-        worker_id: record.runtime_worker_id.to_string(),
-        runtime_id: record.runtime_id.clone(),
+        worker: record.worker.clone(),
         host_id: "backend-registry".to_string(),
         display_name: record.display_name.clone(),
         label: record.display_name.clone(),
@@ -8468,11 +8402,8 @@ fn merge_worker_registry_projection(
             .find(|workdir| workdir.workdir_id == link.workdir_id)
             .map(|workdir| {
                 let mut workdir_summary = workdir_summary_from_record(workdir);
-                workdir_summary.primary_worker_id = Some(WorkerId::new(record.runtime_worker_id));
                 workdir_summary.occupied_by = Some(WorkingDirectoryOccupancy {
-                    runtime_id: record.runtime_id.clone(),
-                    runtime_worker_id: record.runtime_worker_id,
-                    worker_id: format!("{}:{}", record.runtime_id, record.runtime_worker_id),
+                    worker: record.worker.clone(),
                     display_name: record.display_name.clone(),
                     linked_at: link.linked_at.clone(),
                 });
@@ -8495,7 +8426,7 @@ fn sync_worker_observation(
     )?;
     if let Some(working_directory) = worker.working_directory.as_ref() {
         let workdir_record =
-            workdir_record_from_summary(api, worker.runtime_id.as_str(), working_directory);
+            workdir_record_from_summary(api, worker.worker.runtime_id.as_str(), working_directory);
         api.store.upsert_workdir_registry(&workdir_record)?;
         link_worker_to_workdir(api, &record, &working_directory.working_directory_id, None)?;
     }
@@ -8635,11 +8566,9 @@ fn sync_linked_workdir_after_worker_stop(
     runtime_id: &str,
     worker_record: &WorkerRegistryRecord,
 ) -> ApiResult<()> {
-    let links = api.store.list_worker_workdir_links(
-        &api.config.workspace_id,
-        worker_record.runtime_id.as_str(),
-        worker_record.runtime_worker_id,
-    )?;
+    let links = api
+        .store
+        .list_worker_workdir_links(&api.config.workspace_id, &worker_record.worker)?;
     for link in links {
         let result = api
             .runtime
@@ -8757,21 +8686,19 @@ fn apply_workdir_occupancy_projection(
         return Ok(());
     };
 
-    let worker = api.store.get_worker_registry(
-        &api.config.workspace_id,
-        &link.runtime_id,
-        link.runtime_worker_id,
-    )?;
-    let display_name = worker
-        .as_ref()
-        .map(|worker| worker.display_name.clone())
-        .unwrap_or_else(|| format!("{}:{}", link.runtime_id, link.runtime_worker_id));
-    summary.primary_worker_id = Some(WorkerId::new(link.runtime_worker_id));
+    let worker = api
+        .store
+        .get_worker_registry(&api.config.workspace_id, &link.worker)?
+        .ok_or_else(|| {
+            Error::RegistryInconsistency(format!(
+                "Workdir {} attachment references missing Worker {}:{}",
+                link.workdir_id, link.worker.runtime_id, link.worker.worker_id
+            ))
+        })?;
+    summary.primary_worker_id = None;
     summary.occupied_by = Some(WorkingDirectoryOccupancy {
-        runtime_id: link.runtime_id.clone(),
-        runtime_worker_id: link.runtime_worker_id,
-        worker_id: format!("{}:{}", link.runtime_id, link.runtime_worker_id),
-        display_name,
+        worker: link.worker.clone(),
+        display_name: worker.display_name,
         linked_at: link.linked_at.clone(),
     });
     Ok(())
@@ -8795,8 +8722,7 @@ fn link_worker_to_workdir(
     let timestamp = now_registry_timestamp();
     let record = WorkerWorkdirLinkRecord {
         workspace_id: api.config.workspace_id.clone(),
-        runtime_id: worker_record.runtime_id.clone(),
-        runtime_worker_id: worker_record.runtime_worker_id,
+        worker: worker_record.worker.clone(),
         workdir_id: workdir_id.to_string(),
         role: "attachment".to_string(),
         linked_at: timestamp,
@@ -9372,8 +9298,7 @@ mod tests {
     fn backend_worker_projection_preserves_missing_rows_links_and_redacts_paths() {
         let worker = WorkerRegistryRecord {
             workspace_id: "workspace-1".to_string(),
-            runtime_id: "embedded".to_string(),
-            runtime_worker_id: 1,
+            worker: RuntimeWorkerRef::new("embedded", "1"),
             display_name: "Missing Worker".to_string(),
             profile: Some("builtin:coder".to_string()),
             retention_state: "pinned".to_string(),
@@ -9400,8 +9325,7 @@ mod tests {
         };
         let link = WorkerWorkdirLinkRecord {
             workspace_id: "workspace-1".to_string(),
-            runtime_id: worker.runtime_id.clone(),
-            runtime_worker_id: worker.runtime_worker_id.clone(),
+            worker: worker.worker.clone(),
             workdir_id: workdir.workdir_id.clone(),
             role: "attachment".to_string(),
             linked_at: "4".to_string(),
@@ -9424,8 +9348,12 @@ mod tests {
         assert_eq!(working_directory.current_selector, None);
         assert_eq!(working_directory.current_ref.as_deref(), Some("fedcba"));
         let occupied_by = working_directory.occupied_by.as_ref().unwrap();
-        assert_eq!(occupied_by.runtime_id, "embedded");
-        assert_eq!(occupied_by.runtime_worker_id, 1);
+        assert_eq!(occupied_by.worker, RuntimeWorkerRef::new("embedded", "1"));
+        assert!(working_directory.primary_worker_id.is_none());
+        let occupancy = serde_json::to_value(occupied_by).unwrap();
+        assert_eq!(occupancy["runtime_id"], "embedded");
+        assert_eq!(occupancy["worker_id"], "1");
+        assert!(occupancy.get("runtime_worker_id").is_none());
         assert_eq!(occupied_by.display_name, "Missing Worker");
         assert_eq!(occupied_by.linked_at, "4");
         let serialized = serde_json::to_string(&projected).unwrap();
@@ -9482,7 +9410,7 @@ mod tests {
             dedicated.singleton_key.as_deref(),
             Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY)
         );
-        assert_ne!(dedicated.worker_id, generic.worker_id);
+        assert_ne!(dedicated.worker.worker_id, generic.worker_ref.worker_id);
 
         let Json(existing) = scoped_start_workspace_orchestrator(
             State(api.clone()),
@@ -9493,7 +9421,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(existing.disposition, "existing");
-        assert_eq!(existing.worker.unwrap().worker_id, dedicated.worker_id);
+        assert_eq!(
+            existing.worker.unwrap().worker.worker_id,
+            dedicated.worker.worker_id
+        );
 
         let Json(status) = scoped_workspace_orchestrator_status(
             State(api),
@@ -9501,7 +9432,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(status.worker.unwrap().worker_id, dedicated.worker_id);
+        assert_eq!(
+            status.worker.unwrap().worker.worker_id,
+            dedicated.worker.worker_id
+        );
     }
 
     #[tokio::test]
@@ -9543,8 +9477,7 @@ mod tests {
         api.store
             .upsert_worker_registry(&WorkerRegistryRecord {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
-                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
-                runtime_worker_id: 7,
+                worker: RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, "7"),
                 display_name: "Worker Seven".to_string(),
                 profile: Some("builtin:coder".to_string()),
                 retention_state: "normal".to_string(),
@@ -9559,8 +9492,7 @@ mod tests {
         api.store
             .attach_worker_workdir(&WorkerWorkdirLinkRecord {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
-                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
-                runtime_worker_id: 7,
+                worker: RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, "7"),
                 workdir_id: "managed".to_string(),
                 role: "attachment".to_string(),
                 linked_at: "3".to_string(),
@@ -9581,8 +9513,10 @@ mod tests {
             .find(|summary| summary.working_directory_id == "managed")
             .unwrap();
         let occupied_by = managed.occupied_by.as_ref().unwrap();
-        assert_eq!(occupied_by.runtime_id, EMBEDDED_WORKER_RUNTIME_ID);
-        assert_eq!(occupied_by.runtime_worker_id, 7);
+        assert_eq!(
+            occupied_by.worker,
+            RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, "7")
+        );
         assert_eq!(occupied_by.display_name, "Worker Seven");
         assert_eq!(occupied_by.linked_at, "3");
 
@@ -10235,10 +10169,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(existing.state, WorkerOperationState::Accepted);
-        let worker_id = existing.worker.unwrap().worker_id;
+        let worker_id = existing.worker.unwrap().worker.worker_id;
         let worker = api
             .runtime
-            .worker(EMBEDDED_WORKER_RUNTIME_ID, &worker_id)
+            .worker(&RuntimeWorkerRef::new(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                &worker_id,
+            ))
             .unwrap();
         assert_eq!(worker.state, "idle");
         assert_eq!(worker.display_name, "Memory Consolidation");
@@ -10272,7 +10209,7 @@ mod tests {
             .filter(|worker| is_memory_consolidation_worker(worker))
             .collect::<Vec<_>>();
         assert_eq!(consolidaters_after_second.len(), 1);
-        assert_eq!(consolidaters_after_second[0].worker_id, worker_id);
+        assert_eq!(consolidaters_after_second[0].worker.worker_id, worker_id);
     }
 
     fn init_clean_git_workspace(path: &std::path::Path) {
@@ -10330,8 +10267,7 @@ mod tests {
             workspace_id: TEST_WORKSPACE_ID.to_string(),
             ticket_id: ticket_id.clone(),
             assignment_id: "assignment-api-1".to_string(),
-            runtime_id: "embedded".to_string(),
-            worker_id: "42".to_string(),
+            worker: RuntimeWorkerRef::new("embedded", "42"),
             assigned_by: "test-user".to_string(),
             assigned_at: TEST_CREATED_AT.to_string(),
         };
@@ -10430,8 +10366,10 @@ mod tests {
                     workspace_id: TEST_WORKSPACE_ID.to_string(),
                     ticket_id: ticket_ref.id.clone(),
                     assignment_id: "notify-assignment".to_string(),
-                    runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
-                    worker_id: recipient_worker.worker_id.clone(),
+                    worker: RuntimeWorkerRef::new(
+                        EMBEDDED_WORKER_RUNTIME_ID,
+                        recipient_worker.worker.worker_id.clone(),
+                    ),
                     assigned_by: "test-user".to_string(),
                     assigned_at: TEST_CREATED_AT.to_string(),
                 },
@@ -10448,7 +10386,7 @@ mod tests {
         );
         headers.insert(
             "x-yoi-worker-id",
-            axum::http::HeaderValue::from_str(&source_worker.worker_id).unwrap(),
+            axum::http::HeaderValue::from_str(&source_worker.worker.worker_id).unwrap(),
         );
         let response = build_router(api.clone())
             .oneshot(
@@ -10460,7 +10398,7 @@ mod tests {
                     ))
                     .header("content-type", "application/json")
                     .header("x-yoi-runtime-id", EMBEDDED_WORKER_RUNTIME_ID)
-                    .header("x-yoi-worker-id", &source_worker.worker_id)
+                    .header("x-yoi-worker-id", &source_worker.worker.worker_id)
                     .body(Body::from(
                         serde_json::to_vec(&NewTicketEvent::new(
                             TicketEventKind::Comment,
@@ -10487,7 +10425,7 @@ mod tests {
                 .attributes
                 .get("source_worker_id")
                 .map(String::as_str),
-            Some(source_worker.worker_id.as_str())
+            Some(source_worker.worker.worker_id.as_str())
         );
         assert_eq!(
             committed_event
@@ -10531,8 +10469,10 @@ mod tests {
                     workspace_id: TEST_WORKSPACE_ID.to_string(),
                     ticket_id: ticket_ref.id.clone(),
                     assignment_id: "source-assignment".to_string(),
-                    runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
-                    worker_id: source_worker.worker_id.clone(),
+                    worker: RuntimeWorkerRef::new(
+                        EMBEDDED_WORKER_RUNTIME_ID,
+                        source_worker.worker.worker_id.clone(),
+                    ),
                     assigned_by: "test-user".to_string(),
                     assigned_at: TEST_CREATED_AT.to_string(),
                 },
@@ -10635,7 +10575,7 @@ mod tests {
         );
         headers.insert(
             "x-yoi-worker-id",
-            axum::http::HeaderValue::from_str(&source.worker_id).unwrap(),
+            axum::http::HeaderValue::from_str(&source.worker.worker_id).unwrap(),
         );
         let _ = execute_worker_ticket_test_operation(
             State(api.clone()),
@@ -10700,7 +10640,7 @@ mod tests {
             Some(ticket_ref.id.as_str())
         );
         *api.orchestrator_attention_fingerprint.lock().unwrap() = None;
-        let worker_id = started.worker.as_ref().unwrap().worker_id.clone();
+        let worker_id = started.worker.as_ref().unwrap().worker.worker_id.clone();
         maybe_dispatch_orchestrator_turn_end(
             &api,
             &worker_id,
@@ -10782,8 +10722,8 @@ mod tests {
             projected
                 .worker
                 .as_ref()
-                .map(|worker| worker.worker_id.as_str()),
-            Some(first_worker.worker_id.as_str())
+                .map(|worker| worker.worker.worker_id.as_str()),
+            Some(first_worker.worker.worker_id.as_str())
         );
         let Json(retried) = scoped_create_runtime_worker(
             State(api.clone()),
@@ -10795,7 +10735,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(retried.worker.unwrap().worker_id, first_worker.worker_id);
+        assert_eq!(
+            retried.worker.unwrap().worker.worker_id,
+            first_worker.worker.worker_id
+        );
         assert_eq!(
             api.store
                 .list_ticket_worker_assignment_events(TEST_WORKSPACE_ID, &first_ticket.id, 10,)
@@ -10822,8 +10765,7 @@ mod tests {
             .unwrap();
         api.runtime
             .stop_worker(
-                EMBEDDED_WORKER_RUNTIME_ID,
-                &first_worker.worker_id,
+                &first_worker.worker,
                 WorkerLifecycleRequest {
                     reason: Some("restore assignment test".to_string()),
                     ticket_assignment: None,
@@ -10837,8 +10779,10 @@ mod tests {
             State(api.clone()),
             AxumPath(ScopedRuntimeWorkerPath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
-                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
-                worker_id: first_worker.worker_id.clone(),
+                worker: RuntimeWorkerRef::new(
+                    EMBEDDED_WORKER_RUNTIME_ID,
+                    first_worker.worker.worker_id.clone(),
+                ),
             }),
             Query(RestoreTicketAssignmentQuery {
                 ticket_id: Some(second_ticket.id.clone()),
@@ -10851,8 +10795,10 @@ mod tests {
             State(api.clone()),
             AxumPath(ScopedRuntimeWorkerPath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
-                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
-                worker_id: first_worker.worker_id.clone(),
+                worker: RuntimeWorkerRef::new(
+                    EMBEDDED_WORKER_RUNTIME_ID,
+                    first_worker.worker.worker_id.clone(),
+                ),
             }),
             Query(RestoreTicketAssignmentQuery {
                 ticket_id: Some(second_ticket.id.clone()),
@@ -10861,14 +10807,20 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(retried_restore.worker_id, first_worker.worker_id);
+        assert_eq!(
+            retried_restore.worker_ref.worker_id,
+            first_worker.worker.worker_id
+        );
         assert_eq!(retried_restore.result.state, WorkerOperationState::Accepted);
         let restored_assignment = api
             .store
             .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &second_ticket.id)
             .unwrap()
             .unwrap();
-        assert_eq!(restored_assignment.worker_id, first_worker.worker_id);
+        assert_eq!(
+            restored_assignment.worker.worker_id,
+            first_worker.worker.worker_id
+        );
 
         api.store
             .clear_current_ticket_worker_assignment(
@@ -10914,7 +10866,7 @@ mod tests {
             api.store
                 .get_ticket_assignment_operation(TEST_WORKSPACE_ID, "pending-spawn-operation")
                 .unwrap()
-                .is_some_and(|operation| operation.worker_id.is_none())
+                .is_some_and(|operation| operation.worker.is_none())
         );
         let worker_count_before_retry = api.runtime.list_workers(100).items.len();
         let Json(reconciled) = scoped_create_runtime_worker(
@@ -10928,8 +10880,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            reconciled.worker.unwrap().worker_id,
-            spawned_before_backend_failure.worker_id
+            reconciled.worker.unwrap().worker.worker_id,
+            spawned_before_backend_failure.worker.worker_id
         );
         assert_eq!(
             api.runtime.list_workers(100).items.len(),
@@ -11174,8 +11126,7 @@ mod tests {
         api.store
             .upsert_worker_registry(&WorkerRegistryRecord {
                 workspace_id: api.config.workspace_id.clone(),
-                runtime_id: "runtime-test".to_string(),
-                runtime_worker_id,
+                worker: RuntimeWorkerRef::new("runtime-test", runtime_worker_id.to_string()),
                 display_name: runtime_worker_id.to_string(),
                 profile: None,
                 retention_state: retention_state.to_string(),
@@ -11215,8 +11166,7 @@ mod tests {
         api.store
             .attach_worker_workdir(&WorkerWorkdirLinkRecord {
                 workspace_id: api.config.workspace_id.clone(),
-                runtime_id: "runtime-test".to_string(),
-                runtime_worker_id,
+                worker: RuntimeWorkerRef::new("runtime-test", runtime_worker_id.to_string()),
                 workdir_id: workdir_id.to_string(),
                 role: "attachment".to_string(),
                 linked_at: now_registry_timestamp(),
@@ -11240,12 +11190,14 @@ mod tests {
 
     #[test]
     fn workdir_session_owner_is_only_sent_for_same_runtime_worker() {
+        let embedded_worker = RuntimeWorkerRef::new("embedded-worker-runtime", "5");
         assert_eq!(
-            runtime_local_owner_worker_id("embedded-worker-runtime", "arcadia", 5),
+            runtime_local_owner_worker_id(&embedded_worker, "arcadia"),
             None
         );
+        let arcadia_worker = RuntimeWorkerRef::new("arcadia", "30");
         assert_eq!(
-            runtime_local_owner_worker_id("arcadia", "arcadia", 30).as_deref(),
+            runtime_local_owner_worker_id(&arcadia_worker, "arcadia"),
             Some("30")
         );
     }
@@ -11593,8 +11545,7 @@ mod tests {
         let runtime_id = "runtime-test";
         let handle = broker.issue_profile_source_archive_handle(
             "workspace-test",
-            Some(runtime_id),
-            None,
+            crate::resource_broker::BackendResourceTarget::Runtime(runtime_id),
             archive,
         );
         let app = build_router(api);
@@ -12852,12 +12803,12 @@ mod tests {
             )
             .expect("spawn worker");
         assert_eq!(spawned.state, WorkerOperationState::Accepted);
-        let worker_id = spawned.worker.expect("created worker").worker_id;
+        let worker_id = spawned.worker.expect("created worker").worker.worker_id;
+        let worker_ref = RuntimeWorkerRef::new("embedded-worker-runtime", &worker_id);
         let sent = api
             .runtime
             .send_input(
-                "embedded-worker-runtime",
-                &worker_id,
+                &worker_ref,
                 WorkerInputRequest {
                     kind: WorkerInputKind::User,
                     content: "persist me".to_string(),
@@ -12869,10 +12820,7 @@ mod tests {
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            let detail = api
-                .runtime
-                .worker("embedded-worker-runtime", &worker_id)
-                .expect("worker detail");
+            let detail = api.runtime.worker(&worker_ref).expect("worker detail");
             if detail.state == "idle" {
                 break;
             }
@@ -12893,7 +12841,7 @@ mod tests {
         .expect("restored fs-backed api starts");
         let restored_worker = restored
             .runtime
-            .worker("embedded-worker-runtime", &worker_id)
+            .worker(&worker_ref)
             .expect("restored worker");
         assert_eq!(restored_worker.state, "stopped");
         assert!(!restored_worker.capabilities.can_stop);
@@ -12912,8 +12860,7 @@ mod tests {
         let rejected_input = restored
             .runtime
             .send_input(
-                "embedded-worker-runtime",
-                &worker_id,
+                &worker_ref,
                 WorkerInputRequest {
                     kind: WorkerInputKind::User,
                     content: "should not be routed to corrupted handle".to_string(),
@@ -13210,8 +13157,7 @@ mod tests {
     async fn proxies_worker_protocol_ws_as_raw_events() {
         let (runtime, worker_ref, endpoint) = spawn_runtime_worker().await;
         let source = RuntimeObservationSourceConfig {
-            runtime_id: "runtime-a".into(),
-            worker_id: "worker-a".into(),
+            worker: RuntimeWorkerRef::new("runtime-a", "worker-a"),
             endpoint,
             bearer_token: None,
         };
@@ -13257,8 +13203,7 @@ mod tests {
         let (_runtime, _worker_ref, endpoint) = spawn_runtime_worker().await;
         let endpoint = endpoint.replace("/protocol/ws", "/missing-worker/protocol/ws");
         let source = RuntimeObservationSourceConfig {
-            runtime_id: "runtime-a".into(),
-            worker_id: "worker-a".into(),
+            worker: RuntimeWorkerRef::new("runtime-a", "worker-a"),
             endpoint,
             bearer_token: None,
         };
@@ -13311,8 +13256,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteWorkspaceStore::in_memory().unwrap();
         let mut config = test_server_config(dir.path());
-        let runtime_id = source.runtime_id.clone();
-        let worker_id = source.worker_id.clone();
+        let runtime_id = source.worker.runtime_id.clone();
+        let worker_id = source.worker.worker_id.clone();
         config.runtime_event_sources.push(source);
         let api = WorkspaceApi::new_with_execution_backend(
             config,
@@ -13375,7 +13320,7 @@ mod tests {
             .spawn_workspace_worker(EMBEDDED_WORKER_RUNTIME_ID, spawn_request)
             .unwrap();
         assert_eq!(spawned.state, WorkerOperationState::Accepted);
-        let worker_id = spawned.worker.unwrap().worker_id;
+        let worker_id = spawned.worker.unwrap().worker.worker_id;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

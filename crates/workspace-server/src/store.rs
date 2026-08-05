@@ -6,6 +6,8 @@ use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use worker_runtime::identity::RuntimeWorkerRef;
+
 use crate::{Error, Result};
 
 const WORKSPACES_V0_COLUMNS: &[&str] = &[
@@ -268,8 +270,7 @@ pub struct DeviceLoginFlowRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerRegistryRecord {
     pub workspace_id: String,
-    pub runtime_id: String,
-    pub runtime_worker_id: u64,
+    pub worker: RuntimeWorkerRef,
     pub display_name: String,
     pub profile: Option<String>,
     /// Retention state is explicit so `pinned` can be represented before prune exists.
@@ -287,8 +288,7 @@ pub struct TicketWorkerAssignmentRecord {
     pub workspace_id: String,
     pub ticket_id: String,
     pub assignment_id: String,
-    pub runtime_id: String,
-    pub worker_id: String,
+    pub worker: RuntimeWorkerRef,
     pub assigned_by: String,
     pub assigned_at: String,
 }
@@ -330,8 +330,7 @@ pub struct WorkdirRegistryRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerWorkdirLinkRecord {
     pub workspace_id: String,
-    pub runtime_id: String,
-    pub runtime_worker_id: u64,
+    pub worker: RuntimeWorkerRef,
     pub workdir_id: String,
     pub role: String,
     pub linked_at: String,
@@ -541,8 +540,7 @@ pub trait ControlPlaneStore: Send + Sync {
     fn get_worker_registry(
         &self,
         workspace_id: &str,
-        runtime_id: &str,
-        runtime_worker_id: u64,
+        worker: &RuntimeWorkerRef,
     ) -> Result<Option<WorkerRegistryRecord>>;
     fn list_worker_registry(
         &self,
@@ -552,17 +550,12 @@ pub trait ControlPlaneStore: Send + Sync {
     fn update_worker_retention(
         &self,
         workspace_id: &str,
-        runtime_id: &str,
-        runtime_worker_id: u64,
+        worker: &RuntimeWorkerRef,
         retention_state: &str,
         updated_at: &str,
     ) -> Result<bool>;
-    fn delete_worker_registry(
-        &self,
-        workspace_id: &str,
-        runtime_id: &str,
-        runtime_worker_id: u64,
-    ) -> Result<bool>;
+    fn delete_worker_registry(&self, workspace_id: &str, worker: &RuntimeWorkerRef)
+    -> Result<bool>;
 
     fn get_ticket_assignment_operation(
         &self,
@@ -653,22 +646,19 @@ pub trait ControlPlaneStore: Send + Sync {
     fn detach_worker_workdir(
         &self,
         workspace_id: &str,
-        runtime_id: &str,
-        runtime_worker_id: u64,
+        worker: &RuntimeWorkerRef,
         expected_workdir_id: Option<&str>,
         unlinked_at: &str,
     ) -> Result<Option<WorkerWorkdirLinkRecord>>;
     fn worker_workdir_link_history_exists(
         &self,
         workspace_id: &str,
-        runtime_id: &str,
-        runtime_worker_id: u64,
+        worker: &RuntimeWorkerRef,
     ) -> Result<bool>;
     fn list_worker_workdir_links(
         &self,
         workspace_id: &str,
-        runtime_id: &str,
-        runtime_worker_id: u64,
+        worker: &RuntimeWorkerRef,
     ) -> Result<Vec<WorkerWorkdirLinkRecord>>;
     fn list_workdir_worker_links(
         &self,
@@ -1637,8 +1627,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     updated_at = excluded.updated_at"#,
                 params![
                     record.workspace_id,
-                    record.runtime_id,
-                    record.runtime_worker_id,
+                    record.worker.runtime_id,
+                    record.worker.worker_id,
                     record.display_name,
                     record.profile,
                     record.retention_state,
@@ -1657,8 +1647,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     fn get_worker_registry(
         &self,
         workspace_id: &str,
-        runtime_id: &str,
-        runtime_worker_id: u64,
+        worker: &RuntimeWorkerRef,
     ) -> Result<Option<WorkerRegistryRecord>> {
         self.with_conn(|conn| {
             conn.query_row(
@@ -1666,7 +1655,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     "WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3",
                 )
                 .as_str(),
-                params![workspace_id, runtime_id, runtime_worker_id],
+                params![workspace_id, worker.runtime_id, worker.worker_id],
                 read_worker_registry_record,
             )
             .optional()
@@ -1696,8 +1685,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     fn update_worker_retention(
         &self,
         workspace_id: &str,
-        runtime_id: &str,
-        runtime_worker_id: u64,
+        worker: &RuntimeWorkerRef,
         retention_state: &str,
         updated_at: &str,
     ) -> Result<bool> {
@@ -1708,8 +1696,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                    WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3"#,
                 params![
                     workspace_id,
-                    runtime_id,
-                    runtime_worker_id,
+                    worker.runtime_id,
+                    worker.worker_id,
                     retention_state,
                     updated_at
                 ],
@@ -1721,8 +1709,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     fn delete_worker_registry(
         &self,
         workspace_id: &str,
-        runtime_id: &str,
-        runtime_worker_id: u64,
+        worker: &RuntimeWorkerRef,
     ) -> Result<bool> {
         self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
@@ -1730,11 +1717,11 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 r#"UPDATE worker_workdir_links
                    SET unlinked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                    WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3 AND unlinked_at IS NULL"#,
-                params![workspace_id, runtime_id, runtime_worker_id],
+                params![workspace_id, worker.runtime_id, worker.worker_id],
             )?;
             let changed = tx.execute(
                 "DELETE FROM worker_registry WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3",
-                params![workspace_id, runtime_id, runtime_worker_id],
+                params![workspace_id, worker.runtime_id, worker.worker_id],
             )?;
             tx.commit()?;
             Ok(changed > 0)
@@ -1787,7 +1774,12 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             if existing.action == "assign"
                 && existing.ticket_id == ticket_id
                 && existing.runtime_id.as_deref() == Some(runtime_id)
-                && (worker_id.is_none() || existing.worker_id.as_deref() == worker_id)
+                && (worker_id.is_none()
+                    || existing
+                        .worker
+                        .as_ref()
+                        .map(|worker| worker.worker_id.as_str())
+                        == worker_id)
                 && existing.expected_assignment_id.is_none()
                 && existing.request_fingerprint.as_deref() == Some(request_fingerprint)
             {
@@ -1855,8 +1847,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             {
                 if existing.action != if allow_reassign { "reassign" } else { "assign" }
                     || existing.ticket_id != record.ticket_id
-                    || existing.runtime_id.as_deref() != Some(record.runtime_id.as_str())
-                    || existing.worker_id.as_deref() != Some(record.worker_id.as_str())
+                    || existing.worker.as_ref() != Some(&record.worker)
                     || existing.expected_assignment_id.as_deref() != expected_assignment_id
                 {
                     return Err(Error::TicketAssignmentConflict(format!(
@@ -1937,8 +1928,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     record.workspace_id,
                     record.ticket_id,
                     record.assignment_id,
-                    record.runtime_id,
-                    record.worker_id,
+                    record.worker.runtime_id,
+                    record.worker.worker_id,
                     record.assigned_by,
                     record.assigned_at,
                 ],
@@ -1952,8 +1943,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                         record.workspace_id,
                         record.ticket_id,
                         record.assignment_id,
-                        record.runtime_id,
-                        record.worker_id,
+                        record.worker.runtime_id,
+                        record.worker.worker_id,
                         record.assigned_at,
                     ],
                 )
@@ -1966,8 +1957,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                         record.workspace_id,
                         record.ticket_id,
                         record.assignment_id,
-                        record.runtime_id,
-                        record.worker_id,
+                        record.worker.runtime_id,
+                        record.worker.worker_id,
                         record.assigned_at,
                     ],
                 )
@@ -1976,7 +1967,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 return Err(map_assignment_constraint(
                     error,
                     &record.ticket_id,
-                    &record.worker_id,
+                    &record.worker.worker_id,
                 ));
             }
             tx.execute(
@@ -2024,8 +2015,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                         operation_id,
                         if allow_reassign { "reassign" } else { "assign" },
                         record.ticket_id,
-                        record.runtime_id,
-                        record.worker_id,
+                        record.worker.runtime_id,
+                        record.worker.worker_id,
                         record.assignment_id,
                         expected_assignment_id,
                         record.assigned_at,
@@ -2116,8 +2107,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     workspace_id,
                     operation_id,
                     ticket_id,
-                    previous.runtime_id,
-                    previous.worker_id,
+                    previous.worker.runtime_id,
+                    previous.worker.worker_id,
                     previous.assignment_id,
                     expected_assignment_id,
                     created_at,
@@ -2369,8 +2360,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     unlinked_at = NULL"#,
                 params![
                     record.workspace_id,
-                    record.runtime_id,
-                    record.runtime_worker_id,
+                    record.worker.runtime_id,
+                    record.worker.worker_id,
                     record.workdir_id,
                     record.role,
                     record.linked_at,
@@ -2451,8 +2442,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                        WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3 AND unlinked_at IS NULL"#,
                     params![
                         record.workspace_id,
-                        record.runtime_id,
-                        record.runtime_worker_id,
+                        record.worker.runtime_id,
+                        record.worker.worker_id,
                     ],
                     read_worker_workdir_link_record,
                 )
@@ -2464,7 +2455,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 }
                 return Err(Error::WorkdirAttachmentConflict(format!(
                     "Worker {}:{} is already attached to Workdir {}",
-                    record.runtime_id, record.runtime_worker_id, active.workdir_id
+                    record.worker.runtime_id, record.worker.worker_id, active.workdir_id
                 )));
             }
             let active_for_workdir = tx
@@ -2479,7 +2470,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             if let Some(active) = active_for_workdir {
                 return Err(Error::WorkdirAttachmentConflict(format!(
                     "Workdir {} is already attached to Worker {}:{}",
-                    record.workdir_id, active.runtime_id, active.runtime_worker_id
+                    record.workdir_id, active.worker.runtime_id, active.worker.worker_id
                 )));
             }
             let write = tx.execute(
@@ -2491,8 +2482,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     unlinked_at = NULL"#,
                 params![
                     record.workspace_id,
-                    record.runtime_id,
-                    record.runtime_worker_id,
+                    record.worker.runtime_id,
+                    record.worker.worker_id,
                     record.workdir_id,
                     record.role,
                     record.linked_at,
@@ -2515,8 +2506,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     fn detach_worker_workdir(
         &self,
         workspace_id: &str,
-        runtime_id: &str,
-        runtime_worker_id: u64,
+        worker: &RuntimeWorkerRef,
         expected_workdir_id: Option<&str>,
         unlinked_at: &str,
     ) -> Result<Option<WorkerWorkdirLinkRecord>> {
@@ -2530,7 +2520,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     r#"SELECT workspace_id, runtime_id, runtime_worker_id, workdir_id, role, linked_at, unlinked_at
                        FROM worker_workdir_links
                        WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3 AND unlinked_at IS NULL"#,
-                    params![workspace_id, runtime_id, runtime_worker_id],
+                    params![workspace_id, worker.runtime_id, worker.worker_id],
                     read_worker_workdir_link_record,
                 )
                 .optional()?;
@@ -2541,8 +2531,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             if let Some(expected_workdir_id) = expected_workdir_id {
                 if active.workdir_id != expected_workdir_id {
                     return Err(Error::WorkdirAttachmentConflict(format!(
-                        "Worker {runtime_id}:{runtime_worker_id} is attached to Workdir {}, not {expected_workdir_id}",
-                        active.workdir_id
+                        "Worker {}:{} is attached to Workdir {}, not {expected_workdir_id}",
+                        worker.runtime_id, worker.worker_id, active.workdir_id
                     )));
                 }
             }
@@ -2550,11 +2540,12 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 r#"UPDATE worker_workdir_links
                    SET unlinked_at = ?4
                    WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3 AND unlinked_at IS NULL"#,
-                params![workspace_id, runtime_id, runtime_worker_id, unlinked_at],
+                params![workspace_id, worker.runtime_id, worker.worker_id, unlinked_at],
             )?;
             if changed != 1 {
                 return Err(Error::WorkdirAttachmentConflict(format!(
-                    "Worker {runtime_id}:{runtime_worker_id} attachment changed during detach"
+                    "Worker {}:{} attachment changed during detach",
+                    worker.runtime_id, worker.worker_id
                 )));
             }
             tx.commit()?;
@@ -2568,8 +2559,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     fn worker_workdir_link_history_exists(
         &self,
         workspace_id: &str,
-        runtime_id: &str,
-        runtime_worker_id: u64,
+        worker: &RuntimeWorkerRef,
     ) -> Result<bool> {
         self.with_conn(|conn| {
             let exists = conn.query_row(
@@ -2577,7 +2567,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     SELECT 1 FROM worker_workdir_links
                     WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3
                 )"#,
-                params![workspace_id, runtime_id, runtime_worker_id],
+                params![workspace_id, worker.runtime_id, worker.worker_id],
                 |row| row.get(0),
             )?;
             Ok(exists)
@@ -2587,8 +2577,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     fn list_worker_workdir_links(
         &self,
         workspace_id: &str,
-        runtime_id: &str,
-        runtime_worker_id: u64,
+        worker: &RuntimeWorkerRef,
     ) -> Result<Vec<WorkerWorkdirLinkRecord>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
@@ -2598,7 +2587,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                    ORDER BY linked_at DESC"#,
             )?;
             let rows = stmt.query_map(
-                params![workspace_id, runtime_id, runtime_worker_id],
+                params![workspace_id, worker.runtime_id, worker.worker_id],
                 read_worker_workdir_link_record,
             )?;
             rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -2807,8 +2796,7 @@ fn read_worker_workdir_link_record(
 ) -> rusqlite::Result<WorkerWorkdirLinkRecord> {
     Ok(WorkerWorkdirLinkRecord {
         workspace_id: row.get(0)?,
-        runtime_id: row.get(1)?,
-        runtime_worker_id: row.get(2)?,
+        worker: RuntimeWorkerRef::new(row.get::<_, String>(1)?, row.get::<_, u64>(2)?.to_string()),
         workdir_id: row.get(3)?,
         role: row.get(4)?,
         linked_at: row.get(5)?,
@@ -2900,8 +2888,7 @@ fn worker_registry_select_sql(where_clause: &str) -> String {
 fn read_worker_registry_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerRegistryRecord> {
     Ok(WorkerRegistryRecord {
         workspace_id: row.get(0)?,
-        runtime_id: row.get(1)?,
-        runtime_worker_id: row.get(2)?,
+        worker: RuntimeWorkerRef::new(row.get::<_, String>(1)?, row.get::<_, u64>(2)?.to_string()),
         display_name: row.get(3)?,
         profile: row.get(4)?,
         retention_state: row.get(5)?,
@@ -2933,8 +2920,7 @@ fn read_ticket_worker_assignment_record(
         workspace_id: row.get(0)?,
         ticket_id: row.get(1)?,
         assignment_id: row.get(2)?,
-        runtime_id: row.get(3)?,
-        worker_id: row.get(4)?,
+        worker: RuntimeWorkerRef::new(row.get::<_, String>(3)?, row.get::<_, String>(4)?),
         assigned_by: row.get(5)?,
         assigned_at: row.get(6)?,
     })
@@ -2960,7 +2946,7 @@ pub struct TicketAssignmentOperationRecord {
     pub action: String,
     pub ticket_id: String,
     pub runtime_id: Option<String>,
-    pub worker_id: Option<String>,
+    pub worker: Option<RuntimeWorkerRef>,
     pub assignment_id: Option<String>,
     pub expected_assignment_id: Option<String>,
     pub request_fingerprint: Option<String>,
@@ -2978,11 +2964,15 @@ fn read_assignment_operation(
            WHERE workspace_id = ?1 AND operation_id = ?2"#,
         params![workspace_id, operation_id],
         |row| {
+            let runtime_id: Option<String> = row.get(2)?;
+            let worker_id: Option<String> = row.get(3)?;
             Ok(TicketAssignmentOperationRecord {
                 action: row.get(0)?,
                 ticket_id: row.get(1)?,
-                runtime_id: row.get(2)?,
-                worker_id: row.get(3)?,
+                runtime_id: runtime_id.clone(),
+                worker: runtime_id
+                    .zip(worker_id)
+                    .map(|(runtime_id, worker_id)| RuntimeWorkerRef::new(runtime_id, worker_id)),
                 assignment_id: row.get(4)?,
                 expected_assignment_id: row.get(5)?,
                 request_fingerprint: row.get(6)?,
@@ -4204,8 +4194,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
             workspace_id: "workspace-a".to_string(),
             ticket_id: "ticket-1".to_string(),
             assignment_id: "assignment-1".to_string(),
-            runtime_id: "runtime-1".to_string(),
-            worker_id: "worker-1".to_string(),
+            worker: RuntimeWorkerRef::new("runtime-1", "worker-1"),
             assigned_by: "user-1".to_string(),
             assigned_at: "2026-07-31T00:00:01Z".to_string(),
         };
@@ -4239,7 +4228,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
             .set_current_ticket_worker_assignment(
                 &TicketWorkerAssignmentRecord {
                     assignment_id: "implicit-reassign".to_string(),
-                    worker_id: "worker-other".to_string(),
+                    worker: RuntimeWorkerRef::new("runtime-1", "worker-other"),
                     ..first.clone()
                 },
                 None,
@@ -4272,8 +4261,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
 
         let second = TicketWorkerAssignmentRecord {
             assignment_id: "assignment-2".to_string(),
-            runtime_id: "runtime-2".to_string(),
-            worker_id: "worker-2".to_string(),
+            worker: RuntimeWorkerRef::new("runtime-2", "worker-2"),
             assigned_by: "user-2".to_string(),
             assigned_at: "2026-07-31T00:00:02Z".to_string(),
             ..first.clone()
@@ -4360,7 +4348,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
             .get_ticket_assignment_operation("workspace-a", "reserved-operation")
             .unwrap()
             .unwrap();
-        assert_eq!(pending.worker_id, None);
+        assert_eq!(pending.worker, None);
         assert_eq!(
             pending.request_fingerprint.as_deref(),
             Some("sha256:reserved")
@@ -4376,8 +4364,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
             workspace_id: "workspace-a".to_string(),
             ticket_id: "ticket-3".to_string(),
             assignment_id: "assignment-3".to_string(),
-            runtime_id: "runtime-3".to_string(),
-            worker_id: "worker-3".to_string(),
+            worker: RuntimeWorkerRef::new("runtime-3", "worker-3"),
             assigned_by: "runtime".to_string(),
             assigned_at: "2026-07-31T00:00:06Z".to_string(),
         };
@@ -4943,8 +4930,7 @@ CREATE TABLE ticket_assignment_operations (
 
         let worker = WorkerRegistryRecord {
             workspace_id: "local-dev".to_string(),
-            runtime_id: "embedded".to_string(),
-            runtime_worker_id: 1,
+            worker: RuntimeWorkerRef::new("embedded", "1"),
             display_name: "Browser 1".to_string(),
             profile: Some("builtin:companion".to_string()),
             retention_state: "pinned".to_string(),
@@ -4996,8 +4982,7 @@ CREATE TABLE ticket_assignment_operations (
 
         let link = WorkerWorkdirLinkRecord {
             workspace_id: "local-dev".to_string(),
-            runtime_id: worker.runtime_id.clone(),
-            runtime_worker_id: worker.runtime_worker_id,
+            worker: worker.worker.clone(),
             workdir_id: workdir.workdir_id.clone(),
             role: "attachment".to_string(),
             linked_at: "4".to_string(),
@@ -5033,7 +5018,7 @@ CREATE TABLE ticket_assignment_operations (
 
         assert_eq!(
             store
-                .get_worker_registry("local-dev", "embedded", 1)
+                .get_worker_registry("local-dev", &worker.worker)
                 .unwrap(),
             Some(expected_worker.clone())
         );
@@ -5049,7 +5034,7 @@ CREATE TABLE ticket_assignment_operations (
         );
         assert_eq!(
             store
-                .list_worker_workdir_links("local-dev", "embedded", 1)
+                .list_worker_workdir_links("local-dev", &worker.worker)
                 .unwrap(),
             vec![link.clone()]
         );
@@ -5065,7 +5050,7 @@ CREATE TABLE ticket_assignment_operations (
         ));
 
         let second_worker = WorkerRegistryRecord {
-            runtime_worker_id: 2,
+            worker: RuntimeWorkerRef::new("embedded", "2"),
             display_name: "Browser 2".to_string(),
             created_at: "5".to_string(),
             updated_at: "5".to_string(),
@@ -5073,7 +5058,7 @@ CREATE TABLE ticket_assignment_operations (
         };
         store.upsert_worker_registry(&second_worker).unwrap();
         let workdir_conflict = WorkerWorkdirLinkRecord {
-            runtime_worker_id: second_worker.runtime_worker_id,
+            worker: second_worker.worker.clone(),
             linked_at: "5".to_string(),
             ..link.clone()
         };
@@ -5082,17 +5067,17 @@ CREATE TABLE ticket_assignment_operations (
             Err(Error::WorkdirAttachmentConflict(_))
         ));
         assert!(matches!(
-            store.detach_worker_workdir("local-dev", "embedded", 1, Some("wrong-workdir"), "6"),
+            store.detach_worker_workdir("local-dev", &worker.worker, Some("wrong-workdir"), "6",),
             Err(Error::WorkdirAttachmentConflict(_))
         ));
         let detached = store
-            .detach_worker_workdir("local-dev", "embedded", 1, Some(&workdir.workdir_id), "6")
+            .detach_worker_workdir("local-dev", &worker.worker, Some(&workdir.workdir_id), "6")
             .unwrap()
             .unwrap();
         assert_eq!(detached.unlinked_at.as_deref(), Some("6"));
         assert!(
             store
-                .worker_workdir_link_history_exists("local-dev", "embedded", 1)
+                .worker_workdir_link_history_exists("local-dev", &worker.worker)
                 .unwrap()
         );
         assert_eq!(

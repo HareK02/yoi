@@ -8,6 +8,7 @@ use protocol::subscription::{
     SubscriptionResponse, SubscriptionSnapshot, SubscriptionTerminationCode, SubscriptionWorker,
 };
 use tokio::sync::mpsc;
+use worker_runtime::identity::RuntimeWorkerRef;
 
 use crate::runtime_subscription::{BrokerSubscriptionEvent, RuntimeSubscriptionBroker};
 use crate::server::{WorkspaceApi, connect_workspace_worker_protocol};
@@ -81,13 +82,8 @@ pub(crate) async fn serve_workspace_subscription(api: WorkspaceApi, socket: WebS
                                 worker_id,
                                 runtime_id: Some(runtime_id),
                             } => {
-                                match connect_workspace_worker_protocol(
-                                    &api,
-                                    &runtime_id,
-                                    worker_id.as_str(),
-                                )
-                                .await
-                                {
+                                let worker = RuntimeWorkerRef::new(&runtime_id, worker_id.as_str());
+                                match connect_workspace_worker_protocol(&api, &worker).await {
                                     Ok(connection) => {
                                         let methods = connection.methods.clone();
                                         let task = tokio::spawn(run_worker_protocol(
@@ -323,16 +319,15 @@ async fn run_workspace_workers(
         }
     }
 
-    let mut revisions = HashMap::<String, u64>::new();
-    let mut initial_workers = workers
-        .values_mut()
-        .flat_map(|runtime| runtime.values_mut())
-        .map(|worker| {
-            let key = worker_key(worker.runtime_id.as_deref(), worker.worker_id.as_str());
-            worker.subject_revision = next_revision(&mut revisions, &key);
-            worker.clone()
-        })
-        .collect::<Vec<_>>();
+    let mut revisions = HashMap::<RuntimeWorkerRef, u64>::new();
+    let mut initial_workers = Vec::new();
+    for (runtime_id, runtime) in &mut workers {
+        for worker in runtime.values_mut() {
+            let worker_ref = RuntimeWorkerRef::new(runtime_id, worker.worker_id.as_str());
+            worker.subject_revision = next_revision(&mut revisions, &worker_ref);
+            initial_workers.push(worker.clone());
+        }
+    }
     sort_workers(&mut initial_workers);
     if send_frame(
         &outbound,
@@ -359,8 +354,8 @@ async fn run_workspace_workers(
             BrokerSubscriptionEvent::Snapshot { snapshot, .. } => {
                 let removed = workers.remove(&runtime_id).unwrap_or_default();
                 for worker in removed.values() {
-                    let key = worker_key(Some(&runtime_id), worker.worker_id.as_str());
-                    let revision = next_revision(&mut revisions, &key);
+                    let worker_ref = RuntimeWorkerRef::new(&runtime_id, worker.worker_id.as_str());
+                    let revision = next_revision(&mut revisions, &worker_ref);
                     if send_event(
                         &outbound,
                         &subscription_id,
@@ -379,8 +374,9 @@ async fn run_workspace_workers(
                 install_snapshot(&mut workers, &runtime_id, snapshot);
                 if let Some(current) = workers.get_mut(&runtime_id) {
                     for worker in current.values_mut() {
-                        let key = worker_key(Some(&runtime_id), worker.worker_id.as_str());
-                        let revision = next_revision(&mut revisions, &key);
+                        let worker_ref =
+                            RuntimeWorkerRef::new(&runtime_id, worker.worker_id.as_str());
+                        let revision = next_revision(&mut revisions, &worker_ref);
                         worker.subject_revision = revision;
                         if send_event(
                             &outbound,
@@ -401,8 +397,8 @@ async fn run_workspace_workers(
             BrokerSubscriptionEvent::Event { payload, .. } => match payload {
                 SubscriptionEventPayload::WorkerUpserted { mut worker } => {
                     worker.runtime_id = Some(runtime_id.clone());
-                    let key = worker_key(Some(&runtime_id), worker.worker_id.as_str());
-                    let revision = next_revision(&mut revisions, &key);
+                    let worker_ref = RuntimeWorkerRef::new(&runtime_id, worker.worker_id.as_str());
+                    let revision = next_revision(&mut revisions, &worker_ref);
                     worker.subject_revision = revision;
                     workers
                         .entry(runtime_id)
@@ -425,8 +421,8 @@ async fn run_workspace_workers(
                         .entry(runtime_id.clone())
                         .or_default()
                         .remove(worker_id.as_str());
-                    let key = worker_key(Some(&runtime_id), worker_id.as_str());
-                    let revision = next_revision(&mut revisions, &key);
+                    let worker_ref = RuntimeWorkerRef::new(&runtime_id, worker_id.as_str());
+                    let revision = next_revision(&mut revisions, &worker_ref);
                     if send_event(
                         &outbound,
                         &subscription_id,
@@ -534,13 +530,10 @@ async fn send_frame(
         .map_err(|_| ())
 }
 
-fn next_revision(revisions: &mut HashMap<String, u64>, key: &str) -> u64 {
-    let revision = revisions.entry(key.to_string()).or_insert(0);
+fn next_revision(revisions: &mut HashMap<RuntimeWorkerRef, u64>, worker: &RuntimeWorkerRef) -> u64 {
+    let revision = revisions.entry(worker.clone()).or_insert(0);
     *revision = revision.saturating_add(1);
     *revision
-}
-fn worker_key(runtime_id: Option<&str>, worker_id: &str) -> String {
-    format!("{}:{worker_id}", runtime_id.unwrap_or_default())
 }
 fn sort_workers(workers: &mut [SubscriptionWorker]) {
     workers.sort_by(|left, right| {

@@ -1,5 +1,5 @@
 use crate::Error;
-use crate::resource_broker::BackendResourceBroker;
+use crate::resource_broker::{BackendResourceBroker, BackendResourceTarget};
 use chrono::Utc;
 use reqwest::blocking::{Client as BlockingHttpClient, RequestBuilder};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -45,7 +45,9 @@ use worker_runtime::http_server::{
     RuntimeHttpWorkerWorkspaceApiRequest, RuntimeHttpWorkersResponse,
     RuntimeHttpWorkingDirectoriesResponse, RuntimeHttpWorkingDirectoryResponse,
 };
-use worker_runtime::identity::{WorkerId as EmbeddedWorkerId, WorkerRef as EmbeddedWorkerRef};
+use worker_runtime::identity::{
+    RuntimeWorkerRef, WorkerId as EmbeddedWorkerId, WorkerRef as EmbeddedWorkerRef,
+};
 use worker_runtime::interaction::{
     WorkerInput as EmbeddedWorkerInput, WorkerInputKind as EmbeddedWorkerInputKind,
 };
@@ -235,8 +237,8 @@ pub struct WorkerCapabilitySummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerSummary {
-    pub runtime_id: String,
-    pub worker_id: String,
+    #[serde(flatten)]
+    pub worker: RuntimeWorkerRef,
     pub host_id: String,
     /// Human-readable display name. This is not identity and may be duplicated.
     pub display_name: String,
@@ -487,8 +489,8 @@ pub struct WorkerLifecycleRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerLifecycleResult {
     pub state: WorkerOperationState,
-    pub runtime_id: String,
-    pub worker_id: String,
+    #[serde(flatten)]
+    pub worker: RuntimeWorkerRef,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -505,8 +507,8 @@ pub enum WorkerInputKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerDeleteResult {
     pub state: WorkerOperationState,
-    pub runtime_id: String,
-    pub worker_id: String,
+    #[serde(flatten)]
+    pub worker: RuntimeWorkerRef,
     pub deleted: bool,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
@@ -529,8 +531,8 @@ pub struct WorkerCompletionsRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerCompletionsResult {
-    pub runtime_id: String,
-    pub worker_id: String,
+    #[serde(flatten)]
+    pub worker: RuntimeWorkerRef,
     pub kind: protocol::CompletionKind,
     pub prefix: String,
     pub entries: Vec<protocol::CompletionEntry>,
@@ -540,8 +542,8 @@ pub struct WorkerCompletionsResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerInputResult {
     pub state: WorkerOperationState,
-    pub runtime_id: String,
-    pub worker_id: String,
+    #[serde(flatten)]
+    pub worker: RuntimeWorkerRef,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -561,8 +563,7 @@ pub enum RuntimeRegistryError {
     UnknownRuntime(String),
     UnknownHost(String),
     UnknownWorker {
-        runtime_id: String,
-        worker_id: String,
+        worker: RuntimeWorkerRef,
     },
     RuntimeOperationFailed {
         runtime_id: String,
@@ -579,10 +580,10 @@ impl RuntimeRegistryError {
             }
             Self::UnknownRuntime(runtime_id) => format!("unknown runtime `{runtime_id}`"),
             Self::UnknownHost(host_id) => format!("unknown host `{host_id}`"),
-            Self::UnknownWorker {
-                runtime_id,
-                worker_id,
-            } => format!("unknown worker `{worker_id}` in runtime `{runtime_id}`"),
+            Self::UnknownWorker { worker } => format!(
+                "unknown worker `{}` in runtime `{}`",
+                worker.worker_id, worker.runtime_id
+            ),
             Self::RuntimeOperationFailed { message, .. } => message.clone(),
         }
     }
@@ -595,13 +596,7 @@ impl RuntimeRegistryError {
             },
             Self::UnknownRuntime(runtime_id) => Error::UnknownRuntime(runtime_id),
             Self::UnknownHost(host_id) => Error::UnknownHost(host_id),
-            Self::UnknownWorker {
-                runtime_id,
-                worker_id,
-            } => Error::UnknownWorker {
-                runtime_id,
-                worker_id,
-            },
+            Self::UnknownWorker { worker } => Error::UnknownWorker { worker },
             Self::RuntimeOperationFailed {
                 runtime_id,
                 code,
@@ -798,8 +793,7 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
     ) -> WorkerLifecycleResult {
         WorkerLifecycleResult {
             state: WorkerOperationState::Unsupported,
-            runtime_id: self.runtime_id().to_string(),
-            worker_id: worker_id.to_string(),
+            worker: RuntimeWorkerRef::new(self.runtime_id().to_string(), worker_id.to_string()),
             diagnostics: vec![diagnostic(
                 "worker_stop_pending",
                 DiagnosticSeverity::Info,
@@ -817,8 +811,7 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
     ) -> WorkerLifecycleResult {
         WorkerLifecycleResult {
             state: WorkerOperationState::Unsupported,
-            runtime_id: self.runtime_id().to_string(),
-            worker_id: worker_id.to_string(),
+            worker: RuntimeWorkerRef::new(self.runtime_id().to_string(), worker_id.to_string()),
             diagnostics: vec![diagnostic(
                 "worker_cancel_pending",
                 DiagnosticSeverity::Info,
@@ -832,8 +825,7 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
     fn delete_worker(&self, worker_id: &str) -> WorkerDeleteResult {
         WorkerDeleteResult {
             state: WorkerOperationState::Unsupported,
-            runtime_id: self.runtime_id().to_string(),
-            worker_id: worker_id.to_string(),
+            worker: RuntimeWorkerRef::new(self.runtime_id().to_string(), worker_id.to_string()),
             deleted: false,
             diagnostics: vec![diagnostic(
                 "worker_delete_unsupported",
@@ -853,8 +845,7 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
     fn send_input(&self, worker_id: &str, _request: WorkerInputRequest) -> WorkerInputResult {
         WorkerInputResult {
             state: WorkerOperationState::Unsupported,
-            runtime_id: self.runtime_id().to_string(),
-            worker_id: worker_id.to_string(),
+            worker: RuntimeWorkerRef::new(self.runtime_id().to_string(), worker_id.to_string()),
             diagnostics: vec![diagnostic(
                 "worker_input_pending",
                 DiagnosticSeverity::Info,
@@ -871,8 +862,7 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         request: WorkerCompletionsRequest,
     ) -> WorkerCompletionsResult {
         WorkerCompletionsResult {
-            runtime_id: self.runtime_id().to_string(),
-            worker_id: worker_id.to_string(),
+            worker: RuntimeWorkerRef::new(self.runtime_id().to_string(), worker_id.to_string()),
             kind: request.kind,
             prefix: request.prefix,
             entries: Vec::new(),
@@ -1099,11 +1089,9 @@ impl RuntimeRegistry {
         }
     }
 
-    pub fn worker(
-        &self,
-        runtime_id: &str,
-        worker_id: &str,
-    ) -> Result<WorkerSummary, RuntimeRegistryError> {
+    pub fn worker(&self, worker: &RuntimeWorkerRef) -> Result<WorkerSummary, RuntimeRegistryError> {
+        let runtime_id = worker.runtime_id.as_str();
+        let worker_id = worker.worker_id.as_str();
         validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("worker_id", worker_id)?;
         let runtime = self.runtime(runtime_id)?;
@@ -1116,9 +1104,10 @@ impl RuntimeRegistry {
 
     pub fn restore_worker(
         &self,
-        runtime_id: &str,
-        worker_id: &str,
+        worker: &RuntimeWorkerRef,
     ) -> Result<WorkerRestoreResult, RuntimeRegistryError> {
+        let runtime_id = worker.runtime_id.as_str();
+        let worker_id = worker.worker_id.as_str();
         validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("worker_id", worker_id)?;
         let runtime = self.runtime(runtime_id)?;
@@ -1127,10 +1116,11 @@ impl RuntimeRegistry {
 
     pub fn replace_worker_workspace_api(
         &self,
-        runtime_id: &str,
-        worker_id: &str,
+        worker: &RuntimeWorkerRef,
         workspace_api: WorkspaceApiRef,
     ) -> Result<WorkerWorkspaceApiResult, RuntimeRegistryError> {
+        let runtime_id = worker.runtime_id.as_str();
+        let worker_id = worker.worker_id.as_str();
         validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("worker_id", worker_id)?;
         let runtime = self.runtime(runtime_id)?;
@@ -1241,10 +1231,11 @@ impl RuntimeRegistry {
 
     pub fn send_protocol_method(
         &self,
-        runtime_id: &str,
-        worker_id: &str,
+        worker: &RuntimeWorkerRef,
         method: protocol::Method,
     ) -> Result<Vec<protocol::Event>, RuntimeRegistryError> {
+        let runtime_id = worker.runtime_id.as_str();
+        let worker_id = worker.worker_id.as_str();
         validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("worker_id", worker_id)?;
         let runtime = self.runtime(runtime_id)?;
@@ -1261,10 +1252,11 @@ impl RuntimeRegistry {
 
     pub fn send_input(
         &self,
-        runtime_id: &str,
-        worker_id: &str,
+        worker: &RuntimeWorkerRef,
         request: WorkerInputRequest,
     ) -> Result<WorkerInputResult, RuntimeRegistryError> {
+        let runtime_id = worker.runtime_id.as_str();
+        let worker_id = worker.worker_id.as_str();
         validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("worker_id", worker_id)?;
         let runtime = self.runtime(runtime_id)?;
@@ -1281,10 +1273,11 @@ impl RuntimeRegistry {
 
     pub fn worker_completions(
         &self,
-        runtime_id: &str,
-        worker_id: &str,
+        worker: &RuntimeWorkerRef,
         request: WorkerCompletionsRequest,
     ) -> Result<WorkerCompletionsResult, RuntimeRegistryError> {
+        let runtime_id = worker.runtime_id.as_str();
+        let worker_id = worker.worker_id.as_str();
         validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("worker_id", worker_id)?;
         let runtime = self.runtime(runtime_id)?;
@@ -1301,10 +1294,11 @@ impl RuntimeRegistry {
 
     pub fn stop_worker(
         &self,
-        runtime_id: &str,
-        worker_id: &str,
+        worker: &RuntimeWorkerRef,
         request: WorkerLifecycleRequest,
     ) -> Result<WorkerLifecycleResult, RuntimeRegistryError> {
+        let runtime_id = worker.runtime_id.as_str();
+        let worker_id = worker.worker_id.as_str();
         validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("worker_id", worker_id)?;
         let runtime = self.runtime(runtime_id)?;
@@ -1321,10 +1315,11 @@ impl RuntimeRegistry {
 
     pub fn cancel_worker(
         &self,
-        runtime_id: &str,
-        worker_id: &str,
+        worker: &RuntimeWorkerRef,
         request: WorkerLifecycleRequest,
     ) -> Result<WorkerLifecycleResult, RuntimeRegistryError> {
+        let runtime_id = worker.runtime_id.as_str();
+        let worker_id = worker.worker_id.as_str();
         validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("worker_id", worker_id)?;
         let runtime = self.runtime(runtime_id)?;
@@ -1341,9 +1336,10 @@ impl RuntimeRegistry {
 
     pub fn delete_worker(
         &self,
-        runtime_id: &str,
-        worker_id: &str,
+        worker: &RuntimeWorkerRef,
     ) -> Result<WorkerDeleteResult, RuntimeRegistryError> {
+        let runtime_id = worker.runtime_id.as_str();
+        let worker_id = worker.worker_id.as_str();
         validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("worker_id", worker_id)?;
         let runtime = self.runtime(runtime_id)?;
@@ -1360,17 +1356,17 @@ impl RuntimeRegistry {
 
     pub fn observation_source(
         &self,
-        runtime_id: &str,
-        worker_id: &str,
+        worker: &RuntimeWorkerRef,
     ) -> Result<crate::observation::RuntimeObservationSource, RuntimeRegistryError> {
+        let runtime_id = worker.runtime_id.as_str();
+        let worker_id = worker.worker_id.as_str();
         validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("worker_id", worker_id)?;
         let runtime = self.runtime(runtime_id)?;
         runtime
             .observation_source(worker_id)
             .ok_or_else(|| RuntimeRegistryError::UnknownWorker {
-                runtime_id: runtime_id.to_string(),
-                worker_id: worker_id.to_string(),
+                worker: worker.clone(),
             })
     }
 
@@ -1483,8 +1479,7 @@ impl EmbeddedWorkerRuntime {
             true,
         );
         WorkerSummary {
-            runtime_id: self.runtime_id.clone(),
-            worker_id,
+            worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
             label: display.display_name,
@@ -1522,8 +1517,7 @@ impl EmbeddedWorkerRuntime {
             true,
         );
         WorkerSummary {
-            runtime_id: self.runtime_id.clone(),
-            worker_id,
+            worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
             label: display.display_name,
@@ -1974,8 +1968,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         match self.runtime.stop_worker(&worker_ref, request.reason) {
             Ok(_) => WorkerLifecycleResult {
                 state: WorkerOperationState::Accepted,
-                runtime_id: self.runtime_id.clone(),
-                worker_id: worker_id.to_string(),
+                worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 diagnostics: Vec::new(),
             },
             Err(error) => embedded_lifecycle_rejected(
@@ -2018,8 +2011,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         match self.runtime.cancel_worker(&worker_ref, request.reason) {
             Ok(_) => WorkerLifecycleResult {
                 state: WorkerOperationState::Accepted,
-                runtime_id: self.runtime_id.clone(),
-                worker_id: worker_id.to_string(),
+                worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 diagnostics: Vec::new(),
             },
             Err(error) => embedded_lifecycle_rejected(
@@ -2034,8 +2026,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         let Some(worker_ref) = self.worker_ref(worker_id) else {
             return WorkerDeleteResult {
                 state: WorkerOperationState::Rejected,
-                runtime_id: self.runtime_id.clone(),
-                worker_id: worker_id.to_string(),
+                worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 deleted: false,
                 diagnostics: vec![diagnostic(
                     "embedded_worker_id_invalid",
@@ -2047,15 +2038,16 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         match self.runtime.delete_worker(&worker_ref) {
             Ok(result) => WorkerDeleteResult {
                 state: WorkerOperationState::Accepted,
-                runtime_id: self.runtime_id.clone(),
-                worker_id: result.worker_id.to_string(),
+                worker: RuntimeWorkerRef::new(
+                    self.runtime_id.clone(),
+                    result.worker_id.to_string(),
+                ),
                 deleted: result.deleted,
                 diagnostics: Vec::new(),
             },
             Err(error) => WorkerDeleteResult {
                 state: WorkerOperationState::Rejected,
-                runtime_id: self.runtime_id.clone(),
-                worker_id: worker_id.to_string(),
+                worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 deleted: false,
                 diagnostics: vec![embedded_runtime_diagnostic(&error)],
             },
@@ -2072,8 +2064,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         }
         Some(crate::observation::RuntimeObservationSource::embedded(
             crate::observation::EmbeddedRuntimeObservationSource {
-                runtime_id: self.runtime_id.clone(),
-                worker_id: worker_id.to_string(),
+                worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id),
                 runtime: self.runtime.clone(),
                 worker_ref,
             },
@@ -2096,8 +2087,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         }
         let Some(worker_ref) = self.worker_ref(worker_id) else {
             return Err(RuntimeRegistryError::UnknownWorker {
-                runtime_id: self.runtime_id.clone(),
-                worker_id: worker_id.to_string(),
+                worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id),
             });
         };
         self.runtime
@@ -2148,8 +2138,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         match self.runtime.send_input(&worker_ref, input) {
             Ok(_) => WorkerInputResult {
                 state: WorkerOperationState::Accepted,
-                runtime_id: self.runtime_id.clone(),
-                worker_id: worker_id.to_string(),
+                worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 diagnostics: Vec::new(),
             },
             Err(error) => embedded_input_rejected(
@@ -2167,8 +2156,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
     ) -> WorkerCompletionsResult {
         if !self.execution_enabled {
             return WorkerCompletionsResult {
-                runtime_id: self.runtime_id.clone(),
-                worker_id: worker_id.to_string(),
+                worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 kind: request.kind,
                 prefix: request.prefix,
                 entries: Vec::new(),
@@ -2183,8 +2171,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         }
         let Some(worker_ref) = self.worker_ref(worker_id) else {
             return WorkerCompletionsResult {
-                runtime_id: self.runtime_id.clone(),
-                worker_id: worker_id.to_string(),
+                worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 kind: request.kind,
                 prefix: request.prefix,
                 entries: Vec::new(),
@@ -2200,16 +2187,14 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             .worker_completions(&worker_ref, request.kind, &request.prefix)
         {
             Ok(entries) => WorkerCompletionsResult {
-                runtime_id: self.runtime_id.clone(),
-                worker_id: worker_id.to_string(),
+                worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 kind: request.kind,
                 prefix: request.prefix,
                 entries,
                 diagnostics: Vec::new(),
             },
             Err(error) => WorkerCompletionsResult {
-                runtime_id: self.runtime_id.clone(),
-                worker_id: worker_id.to_string(),
+                worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 kind: request.kind,
                 prefix: request.prefix,
                 entries: Vec::new(),
@@ -2572,8 +2557,7 @@ impl RemoteWorkerRuntime {
             false,
         );
         WorkerSummary {
-            runtime_id: self.runtime_id.clone(),
-            worker_id,
+            worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
             label: display.display_name,
@@ -2615,8 +2599,7 @@ impl RemoteWorkerRuntime {
             false,
         );
         WorkerSummary {
-            runtime_id: self.runtime_id.clone(),
-            worker_id,
+            worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
             label: display.display_name,
@@ -2655,8 +2638,7 @@ impl RemoteWorkerRuntime {
     ) -> WorkerLifecycleResult {
         WorkerLifecycleResult {
             state: WorkerOperationState::Accepted,
-            runtime_id: self.runtime_id.clone(),
-            worker_id: worker_id.to_string(),
+            worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
             diagnostics: vec![diagnostic(
                 "remote_runtime_lifecycle_accepted",
                 DiagnosticSeverity::Info,
@@ -3073,15 +3055,16 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         {
             Ok(response) => WorkerDeleteResult {
                 state: WorkerOperationState::Accepted,
-                runtime_id: self.runtime_id.clone(),
-                worker_id: response.worker.worker_id.to_string(),
+                worker: RuntimeWorkerRef::new(
+                    self.runtime_id.clone(),
+                    response.worker.worker_id.to_string(),
+                ),
                 deleted: response.worker.deleted,
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => WorkerDeleteResult {
                 state: WorkerOperationState::Rejected,
-                runtime_id: self.runtime_id.clone(),
-                worker_id: worker_id.to_string(),
+                worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 deleted: false,
                 diagnostics: vec![diagnostic],
             },
@@ -3094,8 +3077,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
     ) -> Option<crate::observation::RuntimeObservationSource> {
         Some(crate::observation::RuntimeObservationSource::remote_ws(
             crate::observation::RuntimeObservationSourceConfig {
-                runtime_id: self.runtime_id.clone(),
-                worker_id: worker_id.to_string(),
+                worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id),
                 endpoint: self.ws_endpoint(worker_id),
                 bearer_token: self
                     .runtime_capability_token(&format!("/v1/workers/{worker_id}/protocol"))
@@ -3122,8 +3104,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         ) {
             Ok(_) => WorkerInputResult {
                 state: WorkerOperationState::Accepted,
-                runtime_id: self.runtime_id.clone(),
-                worker_id: worker_id.to_string(),
+                worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => remote_input_rejected(&self.runtime_id, worker_id, diagnostic),
@@ -3144,16 +3125,14 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             &request,
         ) {
             Ok(response) => WorkerCompletionsResult {
-                runtime_id: self.runtime_id.clone(),
-                worker_id: worker_id.to_string(),
+                worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 kind: response.kind,
                 prefix: response.prefix,
                 entries: response.entries,
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => WorkerCompletionsResult {
-                runtime_id: self.runtime_id.clone(),
-                worker_id: worker_id.to_string(),
+                worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 kind: request.kind,
                 prefix: request.prefix,
                 entries: Vec::new(),
@@ -3247,10 +3226,12 @@ fn profile_source_archive_http_source(
     backend_base_url: &str,
 ) -> Result<ProfileSourceArchiveSource, String> {
     let archive = profile_source_archive_for_request(request, profile)?;
+    let target = runtime_id
+        .map(BackendResourceTarget::Runtime)
+        .unwrap_or(BackendResourceTarget::Workspace);
     let _handle = resource_broker.issue_profile_source_archive_handle(
         workspace_id.to_string(),
-        runtime_id,
-        None,
+        target,
         archive.clone(),
     );
     let etag = format!("\"profile-source:{}\"", archive.reference.digest);
@@ -3294,10 +3275,12 @@ fn builtin_profile_config_bundle(
     let (profile_source_archive, profile_source_archive_handle) = match archive_transport {
         ProfileSourceArchiveTransport::Inline => (Some(archive), None),
         ProfileSourceArchiveTransport::BackendResourceHandle => {
+            let target = runtime_id
+                .map(BackendResourceTarget::Runtime)
+                .unwrap_or(BackendResourceTarget::Workspace);
             let handle = resource_broker.issue_profile_source_archive_handle(
                 workspace_id.to_string(),
-                runtime_id,
-                None,
+                target,
                 archive,
             );
             (None, Some(handle))
@@ -3515,8 +3498,7 @@ fn embedded_input_rejected(
 ) -> WorkerInputResult {
     WorkerInputResult {
         state: WorkerOperationState::Rejected,
-        runtime_id: runtime_id.to_string(),
-        worker_id: worker_id.to_string(),
+        worker: RuntimeWorkerRef::new(runtime_id.to_string(), worker_id.to_string()),
         diagnostics: vec![diagnostic],
     }
 }
@@ -3528,8 +3510,7 @@ fn remote_input_rejected(
 ) -> WorkerInputResult {
     WorkerInputResult {
         state: WorkerOperationState::Rejected,
-        runtime_id: runtime_id.to_string(),
-        worker_id: worker_id.to_string(),
+        worker: RuntimeWorkerRef::new(runtime_id.to_string(), worker_id.to_string()),
         diagnostics: vec![diagnostic],
     }
 }
@@ -3541,8 +3522,7 @@ fn embedded_lifecycle_rejected(
 ) -> WorkerLifecycleResult {
     WorkerLifecycleResult {
         state: WorkerOperationState::Rejected,
-        runtime_id: runtime_id.to_string(),
-        worker_id: worker_id.to_string(),
+        worker: RuntimeWorkerRef::new(runtime_id.to_string(), worker_id.to_string()),
         diagnostics: vec![diagnostic],
     }
 }
@@ -3554,8 +3534,7 @@ fn remote_lifecycle_rejected(
 ) -> WorkerLifecycleResult {
     WorkerLifecycleResult {
         state: WorkerOperationState::Rejected,
-        runtime_id: runtime_id.to_string(),
-        worker_id: worker_id.to_string(),
+        worker: RuntimeWorkerRef::new(runtime_id.to_string(), worker_id.to_string()),
         diagnostics: vec![diagnostic],
     }
 }
@@ -3779,8 +3758,7 @@ fn operation_failed_or_unknown_worker(
             message: diagnostic.message,
         })
         .unwrap_or_else(|| RuntimeRegistryError::UnknownWorker {
-            runtime_id: runtime_id.to_string(),
-            worker_id: worker_id.to_string(),
+            worker: RuntimeWorkerRef::new(runtime_id, worker_id),
         })
 }
 
@@ -3887,8 +3865,7 @@ fn worker_spawn_intent_label(intent: &WorkerSpawnIntent) -> &'static str {
 pub fn placeholder_worker(host_id: impl Into<String>) -> WorkerSummary {
     let host_id = host_id.into();
     WorkerSummary {
-        runtime_id: "placeholder".to_string(),
-        worker_id: "worker-placeholder".to_string(),
+        worker: RuntimeWorkerRef::new("placeholder", "worker-placeholder"),
         host_id,
         display_name: "Worker runtime actions are not implemented".to_string(),
         label: "Worker runtime actions are not implemented".to_string(),
@@ -3949,6 +3926,29 @@ mod tests {
             base_url: "http://127.0.0.1:8787".to_string(),
             runtime_id: Some("runtime-test".to_string()),
         }
+    }
+
+    #[test]
+    fn worker_summary_keeps_flat_wire_identity_while_using_structured_internal_identity() {
+        let summary = placeholder_worker("placeholder");
+        assert_eq!(
+            summary.worker,
+            RuntimeWorkerRef::new("placeholder", "worker-placeholder")
+        );
+        let value = serde_json::to_value(summary).unwrap();
+        assert_eq!(value["runtime_id"], "placeholder");
+        assert_eq!(value["worker_id"], "worker-placeholder");
+        assert!(value.get("worker").is_none());
+
+        let lifecycle = WorkerLifecycleResult {
+            state: WorkerOperationState::Accepted,
+            worker: RuntimeWorkerRef::new("arcadia", "30"),
+            diagnostics: Vec::new(),
+        };
+        let value = serde_json::to_value(lifecycle).unwrap();
+        assert_eq!(value["runtime_id"], "arcadia");
+        assert_eq!(value["worker_id"], "30");
+        assert!(value.get("worker").is_none());
     }
 
     #[test]
@@ -4289,8 +4289,7 @@ mod tests {
                 runtime_id: runtime_id.to_string(),
                 host_id: host_id.to_string(),
                 workers: vec![WorkerSummary {
-                    runtime_id: runtime_id.to_string(),
-                    worker_id: worker_id.to_string(),
+                    worker: RuntimeWorkerRef::new(runtime_id, worker_id),
                     host_id: host_id.to_string(),
                     display_name: label.to_string(),
                     label: label.to_string(),
@@ -4382,7 +4381,7 @@ mod tests {
                 worker: self
                     .workers
                     .iter()
-                    .find(|worker| worker.worker_id == worker_id)
+                    .find(|worker| worker.worker.worker_id == worker_id)
                     .cloned(),
                 diagnostics: Vec::new(),
             }
@@ -4406,13 +4405,17 @@ mod tests {
             )),
         ]);
 
-        let from_runtime_b = registry.worker("runtime-b", "shared-worker").unwrap();
-        assert_eq!(from_runtime_b.runtime_id, "runtime-b");
+        let from_runtime_b = registry
+            .worker(&RuntimeWorkerRef::new("runtime-b", "shared-worker"))
+            .unwrap();
+        assert_eq!(from_runtime_b.worker.runtime_id, "runtime-b");
         assert_eq!(from_runtime_b.host_id, "host-b");
         assert_eq!(from_runtime_b.label, "worker from runtime b");
 
-        let from_runtime_a = registry.worker("runtime-a", "shared-worker").unwrap();
-        assert_eq!(from_runtime_a.runtime_id, "runtime-a");
+        let from_runtime_a = registry
+            .worker(&RuntimeWorkerRef::new("runtime-a", "shared-worker"))
+            .unwrap();
+        assert_eq!(from_runtime_a.worker.runtime_id, "runtime-a");
         assert_eq!(from_runtime_a.host_id, "host-a");
         assert_eq!(from_runtime_a.label, "worker from runtime a");
     }
@@ -4436,7 +4439,7 @@ mod tests {
 
         let listed = registry.list_workers_for_runtime("runtime-b", 10).unwrap();
         assert_eq!(listed.items.len(), 1);
-        assert_eq!(listed.items[0].runtime_id, "runtime-b");
+        assert_eq!(listed.items[0].worker.runtime_id, "runtime-b");
         assert_eq!(listed.items[0].host_id, "host-b");
         assert_eq!(listed.items[0].label, "worker from runtime b");
     }
@@ -4455,7 +4458,9 @@ mod tests {
             Some("builtin:companion")
         );
 
-        let worker = registry.worker("runtime-a", "worker-a").unwrap();
+        let worker = registry
+            .worker(&RuntimeWorkerRef::new("runtime-a", "worker-a"))
+            .unwrap();
         assert_eq!(worker.profile.as_deref(), Some("builtin:companion"));
     }
 
@@ -4468,7 +4473,9 @@ mod tests {
             "worker from runtime a",
         ))]);
 
-        let unknown_runtime = registry.worker("runtime-missing", "worker-a").unwrap_err();
+        let unknown_runtime = registry
+            .worker(&RuntimeWorkerRef::new("runtime-missing", "worker-a"))
+            .unwrap_err();
         assert_eq!(
             unknown_runtime,
             RuntimeRegistryError::UnknownRuntime("runtime-missing".to_string())
@@ -4478,18 +4485,19 @@ mod tests {
             Error::UnknownRuntime(runtime_id) if runtime_id == "runtime-missing"
         ));
 
-        let unknown_worker = registry.worker("runtime-a", "999").unwrap_err();
+        let unknown_worker = registry
+            .worker(&RuntimeWorkerRef::new("runtime-a", "999"))
+            .unwrap_err();
         assert_eq!(
             unknown_worker,
             RuntimeRegistryError::UnknownWorker {
-                runtime_id: "runtime-a".to_string(),
-                worker_id: "999".to_string(),
+                worker: RuntimeWorkerRef::new("runtime-a", "999"),
             }
         );
         assert!(matches!(
             unknown_worker.into_error(),
-            Error::UnknownWorker { runtime_id, worker_id }
-                if runtime_id == "runtime-a" && worker_id == "999"
+            Error::UnknownWorker { worker }
+                if worker == RuntimeWorkerRef::new("runtime-a", "999")
         ));
     }
 
@@ -4591,7 +4599,7 @@ mod tests {
         assert!(worker.capabilities.can_stop);
 
         let input = runtime.send_input(
-            &worker.worker_id,
+            &worker.worker.worker_id,
             WorkerInputRequest {
                 kind: WorkerInputKind::User,
                 content: "hello".to_string(),
@@ -4603,7 +4611,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             let detail = runtime
-                .worker(&worker.worker_id)
+                .worker(&worker.worker.worker_id)
                 .worker
                 .expect("worker detail");
             if detail.state == "idle" {
@@ -4671,15 +4679,14 @@ mod tests {
                 .any(|evidence| evidence.kind == "embedded_runtime_backend_internal_projection")
         );
         let worker = spawned.worker.expect("created embedded worker");
-        assert_eq!(worker.runtime_id, EMBEDDED_RUNTIME_ID);
+        assert_eq!(worker.worker.runtime_id, EMBEDDED_RUNTIME_ID);
         assert_eq!(worker.workspace.visibility, "backend_internal");
         assert_eq!(worker.workspace.identity, "runtime_registry_worker");
         assert_eq!(worker.implementation.kind, "embedded_worker_runtime");
         assert_eq!(worker.profile.as_deref(), Some("builtin:coder"));
         let input = registry
             .send_input(
-                EMBEDDED_RUNTIME_ID,
-                &worker.worker_id,
+                &worker.worker,
                 WorkerInputRequest {
                     kind: WorkerInputKind::User,
                     content: "hello embedded runtime".to_string(),
@@ -4688,12 +4695,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(input.state, WorkerOperationState::Accepted);
-        assert_eq!(input.runtime_id, EMBEDDED_RUNTIME_ID);
-        assert_eq!(input.worker_id, worker.worker_id);
+        assert_eq!(input.worker.runtime_id, EMBEDDED_RUNTIME_ID);
+        assert_eq!(input.worker.worker_id, worker.worker.worker_id);
 
-        let detail = registry
-            .worker(EMBEDDED_RUNTIME_ID, &worker.worker_id)
-            .unwrap();
+        let detail = registry.worker(&worker.worker).unwrap();
 
         let json = serde_json::to_string(&(embedded_summary, worker, input, detail)).unwrap();
         for forbidden in [
@@ -4871,7 +4876,7 @@ mod tests {
         );
 
         let observation = registry
-            .observation_source("remote:primary", "1")
+            .observation_source(&RuntimeWorkerRef::new("remote:primary", "1"))
             .expect("remote runtime exposes backend-owned WS observation source");
         let crate::observation::RuntimeObservationSource::RemoteWs(observation) = observation
         else {
@@ -4883,8 +4888,8 @@ mod tests {
 
         let workers = registry.list_workers(10);
         assert_eq!(workers.items.len(), 1);
-        assert_eq!(workers.items[0].runtime_id, "remote:primary");
-        assert_eq!(workers.items[0].worker_id, "1");
+        assert_eq!(workers.items[0].worker.runtime_id, "remote:primary");
+        assert_eq!(workers.items[0].worker.worker_id, "1");
         assert_eq!(
             workers.items[0].implementation.kind,
             "remote_worker_runtime"
@@ -4897,8 +4902,7 @@ mod tests {
 
         let input = registry
             .send_input(
-                "remote:primary",
-                "1",
+                &RuntimeWorkerRef::new("remote:primary", "1"),
                 WorkerInputRequest {
                     kind: WorkerInputKind::User,
                     content: "hello remote".to_string(),
@@ -4975,7 +4979,9 @@ mod tests {
         assert_eq!(workers.items[2].state, "paused");
         assert_eq!(workers.items[3].state, "idle");
 
-        let stopped_detail = registry.worker("remote:primary", "1").unwrap();
+        let stopped_detail = registry
+            .worker(&RuntimeWorkerRef::new("remote:primary", "1"))
+            .unwrap();
         assert!(!stopped_detail.capabilities.can_stop);
         assert_eq!(stopped_detail.state, "stopped");
 
@@ -5154,7 +5160,7 @@ mod tests {
         );
 
         let error = registry
-            .worker("remote:primary", "999")
+            .worker(&RuntimeWorkerRef::new("remote:primary", "999"))
             .expect_err("auth failure is a backend operation error");
         assert!(matches!(
             error,

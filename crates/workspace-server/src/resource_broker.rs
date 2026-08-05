@@ -3,7 +3,7 @@ use chrono::{Duration, Utc};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
-use worker_runtime::identity::WorkerId;
+use worker_runtime::identity::RuntimeWorkerRef;
 use worker_runtime::profile_archive::ProfileSourceArchive;
 use worker_runtime::resource::{
     BackendResourceClient, BackendResourceError, BackendResourceFetchRequest,
@@ -17,10 +17,17 @@ pub struct BackendResourceBroker {
     resources: Arc<Mutex<HashMap<String, StoredResource>>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum BackendResourceTarget<'a> {
+    Workspace,
+    Runtime(&'a str),
+    Worker(&'a RuntimeWorkerRef),
+}
+
 #[derive(Clone)]
 struct StoredResource {
     runtime_id: Option<String>,
-    worker_id: Option<String>,
+    worker: Option<RuntimeWorkerRef>,
     handle: BackendResourceHandle,
     archive: ProfileSourceArchive,
 }
@@ -29,11 +36,17 @@ impl BackendResourceBroker {
     pub fn issue_profile_source_archive_handle(
         &self,
         workspace_id: impl Into<String>,
-        runtime_id: Option<&str>,
-        worker_id: Option<&WorkerId>,
+        target: BackendResourceTarget<'_>,
         archive: ProfileSourceArchive,
     ) -> BackendResourceHandle {
         let workspace_id = workspace_id.into();
+        let (runtime_id, worker) = match target {
+            BackendResourceTarget::Workspace => (None, None),
+            BackendResourceTarget::Runtime(runtime_id) => (Some(runtime_id.to_string()), None),
+            BackendResourceTarget::Worker(worker) => {
+                (Some(worker.runtime_id.clone()), Some(worker.clone()))
+            }
+        };
         let nonce = Uuid::now_v7().to_string();
         let audit_correlation_id = format!("resource-fetch-{nonce}");
         let expires_at = Utc::now() + Duration::minutes(15);
@@ -41,8 +54,8 @@ impl BackendResourceBroker {
             kind: BackendResourceKind::ProfileSourceArchive,
             workspace_id: workspace_id.clone(),
             scope_id: Some("workspace-profile-source".to_string()),
-            runtime_id: runtime_id.map(|id| id.to_string()),
-            worker_id: worker_id.map(|id| id.to_string()),
+            runtime_id: runtime_id.clone(),
+            worker_id: worker.as_ref().map(|worker| worker.worker_id.clone()),
             resource_id: archive.reference.id.clone(),
             digest: archive.reference.digest.clone(),
             operation: BackendResourceOperation::FetchArchive,
@@ -57,8 +70,8 @@ impl BackendResourceBroker {
             profile_source_graph: Some(archive.reference.source_graph.clone()),
         };
         let stored = StoredResource {
-            runtime_id: runtime_id.map(|id| id.to_string()),
-            worker_id: worker_id.map(|id| id.to_string()),
+            runtime_id,
+            worker,
             handle: handle.clone(),
             archive,
         };
@@ -117,8 +130,10 @@ impl BackendResourceBroker {
                 });
             }
         }
-        if let Some(expected_worker_id) = stored.worker_id.as_deref() {
-            if Some(expected_worker_id) != request.worker_id.as_deref() {
+        if let Some(expected_worker) = stored.worker.as_ref() {
+            if expected_worker.runtime_id != request.runtime_id
+                || Some(expected_worker.worker_id.as_str()) != request.worker_id.as_deref()
+            {
                 return Err(BackendResourceError::Unauthorized {
                     message: "worker id does not match resource handle".to_string(),
                 });
@@ -167,7 +182,6 @@ fn verify_handle_shape(handle: &BackendResourceHandle) -> Result<(), BackendReso
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-    use worker_runtime::identity::WorkerId;
     use worker_runtime::profile_archive::{
         ProfileSourceArchive, ProfileSourceArchiveRef, ProfileSourceGraphSummary, sha256_hex,
     };
@@ -215,13 +229,13 @@ mod tests {
     fn request(
         handle: BackendResourceHandle,
         runtime_id: &str,
-        worker_id: Option<&WorkerId>,
+        worker_id: Option<&str>,
     ) -> BackendResourceFetchRequest {
         BackendResourceFetchRequest {
             audit_correlation_id: handle.audit_correlation_id.clone(),
             handle,
             runtime_id: runtime_id.to_string(),
-            worker_id: worker_id.map(|id| id.to_string()),
+            worker_id: worker_id.map(str::to_string),
         }
     }
 
@@ -231,8 +245,7 @@ mod tests {
         let runtime_id = "runtime-test";
         let handle = broker.issue_profile_source_archive_handle(
             "workspace-test",
-            Some(runtime_id),
-            None,
+            BackendResourceTarget::Runtime(runtime_id),
             archive(),
         );
         let response = broker
@@ -253,8 +266,7 @@ mod tests {
         let runtime_a = "runtime-a";
         let handle = broker.issue_profile_source_archive_handle(
             "workspace-test",
-            Some(runtime_a),
-            None,
+            BackendResourceTarget::Runtime(runtime_a),
             archive(),
         );
         let err = broker
@@ -267,16 +279,15 @@ mod tests {
     fn broker_rejects_worker_mismatch() {
         let broker = BackendResourceBroker::default();
         let runtime_id = "runtime-test";
-        let worker_a = WorkerId::new(1);
-        let worker_b = WorkerId::new(2);
+        let worker_a = RuntimeWorkerRef::new(runtime_id, "1");
+        let worker_b = RuntimeWorkerRef::new(runtime_id, "2");
         let handle = broker.issue_profile_source_archive_handle(
             "workspace-test",
-            Some(runtime_id),
-            Some(&worker_a),
+            BackendResourceTarget::Worker(&worker_a),
             archive(),
         );
         let err = broker
-            .fetch_profile_source_archive(request(handle, &runtime_id, Some(&worker_b)))
+            .fetch_profile_source_archive(request(handle, runtime_id, Some(&worker_b.worker_id)))
             .unwrap_err();
         assert!(matches!(err, BackendResourceError::Unauthorized { .. }));
     }
@@ -287,8 +298,7 @@ mod tests {
         let runtime_id = "runtime-test";
         let handle = broker.issue_profile_source_archive_handle(
             "workspace-test",
-            Some(runtime_id),
-            None,
+            BackendResourceTarget::Runtime(runtime_id),
             archive(),
         );
         broker
@@ -313,8 +323,7 @@ mod tests {
         let runtime_id = "runtime-test";
         let mut handle = broker.issue_profile_source_archive_handle(
             "workspace-test",
-            Some(runtime_id),
-            None,
+            BackendResourceTarget::Runtime(runtime_id),
             archive(),
         );
         handle.scope_id = Some("tampered-scope".to_string());
@@ -331,8 +340,7 @@ mod tests {
         let archive = archive_with_len((DEFAULT_PROFILE_SOURCE_ARCHIVE_MAX_BYTES + 1) as usize);
         let mut handle = broker.issue_profile_source_archive_handle(
             "workspace-test",
-            Some(runtime_id),
-            None,
+            BackendResourceTarget::Runtime(runtime_id),
             archive,
         );
         handle.max_bytes = DEFAULT_PROFILE_SOURCE_ARCHIVE_MAX_BYTES + 1024;

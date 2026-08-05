@@ -43,6 +43,8 @@ pub use repositories::{
 pub use server::{AuthConfig, ServerConfig, WorkspaceApi, build_router, serve};
 pub use store::{ControlPlaneStore, SqliteWorkspaceStore, WorkspaceRecord};
 
+use worker_runtime::identity::RuntimeWorkerRef;
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
@@ -65,11 +67,8 @@ pub enum Error {
     UnknownHost(String),
     #[error("unknown runtime `{0}`")]
     UnknownRuntime(String),
-    #[error("unknown worker `{worker_id}` in runtime `{runtime_id}`")]
-    UnknownWorker {
-        runtime_id: String,
-        worker_id: String,
-    },
+    #[error("unknown worker `{}` in runtime `{}`", worker.worker_id, worker.runtime_id)]
+    UnknownWorker { worker: RuntimeWorkerRef },
     #[error("invalid runtime {kind} `{value}`")]
     InvalidRuntimeIdentifier { kind: String, value: String },
     #[error("worker name is reserved for a dedicated Workspace service: {0}")]
@@ -93,6 +92,8 @@ pub enum Error {
     TicketAssignmentConflict(String),
     #[error("Workdir attachment conflict: {0}")]
     WorkdirAttachmentConflict(String),
+    #[error("Registry inconsistency: {0}")]
+    RegistryInconsistency(String),
     #[error("Worker source identity is invalid: {0}")]
     WorkerSourceIdentity(String),
     #[error("workspace identity error: {0}")]

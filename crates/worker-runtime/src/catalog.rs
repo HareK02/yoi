@@ -1,4 +1,4 @@
-use crate::identity::{WorkerId, WorkerRef};
+use crate::identity::{RuntimeWorkerRef, WorkerId, WorkerRef};
 use crate::interaction::WorkerInput;
 use crate::profile_archive::{ProfileSourceArchive, ProfileSourceArchiveRef};
 use serde::{Deserialize, Serialize};
@@ -132,9 +132,8 @@ pub struct WorkingDirectoryCleanupTarget {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkingDirectoryOccupancy {
-    pub runtime_id: String,
-    pub runtime_worker_id: u64,
-    pub worker_id: String,
+    #[serde(flatten)]
+    pub worker: RuntimeWorkerRef,
     pub display_name: String,
     pub linked_at: String,
 }

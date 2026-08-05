@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
-use worker_runtime::identity::WorkerRef;
+use worker_runtime::identity::{RuntimeWorkerRef, WorkerRef};
 use worker_runtime::observation::{WorkerObservationCursor, WorkerObservationEvent};
 
 use axum::http::StatusCode;
@@ -15,8 +15,7 @@ use tokio_tungstenite::tungstenite::{Error as TungsteniteError, Message as Tungs
 /// Backend-private source for a runtime worker observation stream.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RuntimeObservationSourceConfig {
-    pub runtime_id: String,
-    pub worker_id: String,
+    pub worker: RuntimeWorkerRef,
     pub endpoint: String,
     pub bearer_token: Option<String>,
 }
@@ -24,8 +23,8 @@ pub struct RuntimeObservationSourceConfig {
 impl std::fmt::Debug for RuntimeObservationSourceConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RuntimeObservationSourceConfig")
-            .field("runtime_id", &self.runtime_id)
-            .field("worker_id", &self.worker_id)
+            .field("runtime_id", &self.worker.runtime_id)
+            .field("worker_id", &self.worker.worker_id)
             .field("endpoint", &"<backend-private>")
             .field(
                 "bearer_token",
@@ -37,8 +36,7 @@ impl std::fmt::Debug for RuntimeObservationSourceConfig {
 
 #[derive(Clone)]
 pub struct EmbeddedRuntimeObservationSource {
-    pub runtime_id: String,
-    pub worker_id: String,
+    pub worker: RuntimeWorkerRef,
     pub runtime: worker_runtime::Runtime,
     pub worker_ref: WorkerRef,
 }
@@ -60,15 +58,15 @@ impl RuntimeObservationSource {
 
     pub fn runtime_id(&self) -> &str {
         match self {
-            Self::RemoteWs(config) => &config.runtime_id,
-            Self::Embedded(source) => &source.runtime_id,
+            Self::RemoteWs(config) => &config.worker.runtime_id,
+            Self::Embedded(source) => &source.worker.runtime_id,
         }
     }
 
     pub fn worker_id(&self) -> &str {
         match self {
-            Self::RemoteWs(config) => &config.worker_id,
-            Self::Embedded(source) => &source.worker_id,
+            Self::RemoteWs(config) => &config.worker.worker_id,
+            Self::Embedded(source) => &source.worker.worker_id,
         }
     }
 }
@@ -78,8 +76,8 @@ impl std::fmt::Debug for RuntimeObservationSource {
         match self {
             Self::RemoteWs(config) => formatter
                 .debug_struct("RemoteRuntimeObservationSource")
-                .field("runtime_id", &config.runtime_id)
-                .field("worker_id", &config.worker_id)
+                .field("runtime_id", &config.worker.runtime_id)
+                .field("worker_id", &config.worker.worker_id)
                 .field("endpoint", &"<backend-private>")
                 .field(
                     "bearer_token",
@@ -88,8 +86,8 @@ impl std::fmt::Debug for RuntimeObservationSource {
                 .finish(),
             Self::Embedded(source) => formatter
                 .debug_struct("EmbeddedRuntimeObservationSource")
-                .field("runtime_id", &source.runtime_id)
-                .field("worker_id", &source.worker_id)
+                .field("runtime_id", &source.worker.runtime_id)
+                .field("worker_id", &source.worker.worker_id)
                 .finish(),
         }
     }
@@ -98,8 +96,8 @@ impl std::fmt::Debug for RuntimeObservationSource {
 /// Event consumed from a Runtime-owned worker observation WebSocket.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuntimeObservationUpstreamEvent {
-    pub runtime_id: String,
-    pub worker_id: String,
+    #[serde(flatten)]
+    pub worker: RuntimeWorkerRef,
     pub runtime_event_id: String,
     pub payload: protocol::Event,
 }
@@ -132,11 +130,7 @@ impl ObservationProxyError {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct ObservationKey {
-    runtime_id: String,
-    worker_id: String,
-}
+type ObservationKey = RuntimeWorkerRef;
 
 /// Backend-owned in-memory v0 observation proxy state.
 #[derive(Clone)]
@@ -156,15 +150,7 @@ impl BackendObservationProxy {
     pub fn new(sources: Vec<RuntimeObservationSourceConfig>) -> Self {
         let sources = sources
             .into_iter()
-            .map(|source| {
-                (
-                    ObservationKey {
-                        runtime_id: source.runtime_id.clone(),
-                        worker_id: source.worker_id.clone(),
-                    },
-                    source,
-                )
-            })
+            .map(|source| (source.worker.clone(), source))
             .collect();
         Self {
             sources: Arc::new(sources),
@@ -173,19 +159,16 @@ impl BackendObservationProxy {
 
     pub fn source(
         &self,
-        runtime_id: &str,
-        worker_id: &str,
+        worker: &RuntimeWorkerRef,
     ) -> Result<RuntimeObservationSource, ObservationProxyError> {
         self.sources
-            .get(&ObservationKey {
-                runtime_id: runtime_id.to_string(),
-                worker_id: worker_id.to_string(),
-            })
+            .get(worker)
             .cloned()
             .map(RuntimeObservationSource::remote_ws)
             .ok_or_else(|| {
                 ObservationProxyError::WorkerNotFound(format!(
-                    "worker {worker_id} is not registered for runtime {runtime_id}"
+                    "worker {} is not registered for runtime {}",
+                    worker.worker_id, worker.runtime_id
                 ))
             })
     }
@@ -209,8 +192,7 @@ fn map_runtime_connect_error(error: TungsteniteError) -> ObservationProxyError {
 }
 
 pub struct RuntimeWsObservationClient {
-    runtime_id: String,
-    worker_id: String,
+    worker: RuntimeWorkerRef,
     stream: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
@@ -240,8 +222,7 @@ impl RuntimeWsObservationClient {
             .await
             .map_err(map_runtime_connect_error)?;
         Ok(Self {
-            runtime_id: source.runtime_id.clone(),
-            worker_id: source.worker_id.clone(),
+            worker: source.worker.clone(),
             stream,
         })
     }
@@ -291,8 +272,7 @@ impl RuntimeWsObservationClient {
                 ))
             })?;
             return Ok(RuntimeObservationUpstreamEvent {
-                runtime_id: self.runtime_id.clone(),
-                worker_id: self.worker_id.clone(),
+                worker: self.worker.clone(),
                 runtime_event_id: "protocol".to_string(),
                 payload,
             });
@@ -330,8 +310,7 @@ impl RuntimeObservationClient {
 }
 
 pub struct EmbeddedObservationClient {
-    runtime_id: String,
-    worker_id: String,
+    worker: RuntimeWorkerRef,
     worker_ref: WorkerRef,
     cursor: WorkerObservationCursor,
     receiver: tokio::sync::broadcast::Receiver<WorkerObservationEvent>,
@@ -346,7 +325,7 @@ impl EmbeddedObservationClient {
             .map_err(|err| {
                 ObservationProxyError::WorkerNotFound(format!(
                     "embedded Worker '{}' is not observable: {err}",
-                    source.worker_id
+                    source.worker.worker_id
                 ))
             })?;
         let receiver = source
@@ -355,7 +334,7 @@ impl EmbeddedObservationClient {
             .map_err(|err| {
                 ObservationProxyError::WorkerNotFound(format!(
                     "embedded Worker '{}' observation subscription is unavailable: {err}",
-                    source.worker_id
+                    source.worker.worker_id
                 ))
             })?;
         let mut queued = VecDeque::new();
@@ -365,12 +344,11 @@ impl EmbeddedObservationClient {
             .map_err(|err| {
                 ObservationProxyError::WorkerNotFound(format!(
                     "embedded Worker '{}' snapshot is unavailable: {err}",
-                    source.worker_id
+                    source.worker.worker_id
                 ))
             })?;
         queued.push_back(RuntimeObservationUpstreamEvent {
-            runtime_id: source.runtime_id.clone(),
-            worker_id: source.worker_id.clone(),
+            worker: source.worker.clone(),
             runtime_event_id: "snapshot".to_string(),
             payload: snapshot,
         });
@@ -380,19 +358,14 @@ impl EmbeddedObservationClient {
             .map_err(|err| {
                 ObservationProxyError::RuntimeUnavailable(format!(
                     "embedded Worker '{}' observation cursor is unavailable: {err}",
-                    source.worker_id
+                    source.worker.worker_id
                 ))
             })?
         {
-            queued.push_back(Self::map_event(
-                &source.runtime_id,
-                &source.worker_id,
-                event,
-            ));
+            queued.push_back(Self::map_event(&source.worker, event));
         }
         Ok(Self {
-            runtime_id: source.runtime_id.clone(),
-            worker_id: source.worker_id.clone(),
+            worker: source.worker.clone(),
             worker_ref: source.worker_ref.clone(),
             cursor,
             receiver,
@@ -418,7 +391,7 @@ impl EmbeddedObservationClient {
                                 "embedded runtime emitted a malformed cursor".into(),
                             )
                         })?;
-                    return Ok(Self::map_event(&self.runtime_id, &self.worker_id, event));
+                    return Ok(Self::map_event(&self.worker, event));
                 }
                 Ok(_) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -436,13 +409,11 @@ impl EmbeddedObservationClient {
     }
 
     fn map_event(
-        runtime_id: &str,
-        worker_id: &str,
+        worker: &RuntimeWorkerRef,
         event: WorkerObservationEvent,
     ) -> RuntimeObservationUpstreamEvent {
         RuntimeObservationUpstreamEvent {
-            runtime_id: runtime_id.to_string(),
-            worker_id: worker_id.to_string(),
+            worker: worker.clone(),
             runtime_event_id: event.cursor.clone(),
             payload: event.payload,
         }
@@ -455,8 +426,7 @@ mod tests {
 
     fn sensitive_source() -> RuntimeObservationSourceConfig {
         RuntimeObservationSourceConfig {
-            runtime_id: "remote-runtime".to_string(),
-            worker_id: "worker-1".to_string(),
+            worker: RuntimeWorkerRef::new("remote-runtime", "worker-1"),
             endpoint: "wss://remote.example.invalid/private/workers/worker-1/protocol/ws"
                 .to_string(),
             bearer_token: Some("top-secret-bearer-token".to_string()),
