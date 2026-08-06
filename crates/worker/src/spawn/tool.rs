@@ -349,9 +349,8 @@ impl Tool for SubWorkerSpawnTool {
         )
         .await
         .map_err(|error| ToolError::ExecutionFailed(format!("build Internal Worker: {error}")))?;
-        let child_scope = child.scope_handle();
-        let child_registry =
-            SpawnedWorkerRegistry::new_internal(input.name.clone(), child_scope);
+        let child_scope = child.scope().clone();
+        let child_registry = SpawnedWorkerRegistry::new_internal(input.name.clone(), child_scope);
         register_worker_tools(
             &mut child,
             self.runtime_base
@@ -837,7 +836,7 @@ mod tests {
         let runtime = TempDir::new().unwrap();
         let mut manifest = parent_manifest(&workspace_root, None);
         manifest.delegation_scope = ScopeConfig {
-            allow: vec![abs_rule(&workspace_root, Permission::Read)],
+            allow: vec![abs_rule(&workspace_root, Permission::Write)],
             deny: Vec::new(),
         };
         let spawner_scope = SharedScope::new(Scope::from_config(&manifest.scope).unwrap());
@@ -858,7 +857,7 @@ mod tests {
             registry.clone(),
             manifest.clone(),
             AvailableProfiles::discover(&workspace_root),
-            spawner_scope,
+            spawner_scope.clone(),
             DelegationScope::from_config(&manifest.delegation_scope).unwrap(),
         )
         .with_internal_client(Box::new(ScriptedInternalClient {
@@ -869,11 +868,13 @@ mod tests {
             "profile": "builtin:reviewer",
             "task": "review immutable commit",
             "scope": [{
-                "target": workspace_root,
-                "permission": "read",
+                "target": workspace_root.clone(),
+                "permission": "write",
                 "recursive": true
             }]
         });
+
+        assert!(spawner_scope.snapshot().is_writable(&workspace_root));
 
         let output = tool
             .execute(
@@ -883,6 +884,7 @@ mod tests {
             .await
             .expect("spawn project reviewer as Internal Worker");
         assert!(output.summary.contains("internal worker `reviewer-child`"));
+        assert!(!spawner_scope.snapshot().is_writable(&workspace_root));
         let record = registry
             .get_internal("reviewer-child")
             .expect("Internal reviewer registry record");
@@ -939,6 +941,7 @@ mod tests {
             .await
             .unwrap();
         assert!(registry.get_internal("reviewer-child").is_none());
+        assert!(spawner_scope.snapshot().is_writable(&workspace_root));
     }
 
     #[test]
