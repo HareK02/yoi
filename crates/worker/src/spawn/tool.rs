@@ -842,13 +842,42 @@ mod tests {
         }
     }
 
+    const INTERNAL_REVIEWER_PROFILE: &str = r#"
+slug = "reviewer"
+scope = "workspace_read"
+
+[model]
+scheme = "anthropic"
+model_id = "reviewer-model"
+
+[model.auth]
+kind = "none"
+
+[engine]
+instruction = "$yoi/reviewer"
+language = "Reviewerish"
+max_tokens = 3333
+
+[feature.ticket]
+enabled = true
+thread = true
+
+[feature.memory]
+enabled = true
+
+[memory]
+extract_threshold = 4000
+"#;
+
     #[tokio::test]
     async fn reviewer_profile_spawns_as_workspace_aware_internal_session() {
-        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
-            .unwrap();
         let runtime = TempDir::new().unwrap();
+        let workspace_root = runtime.path().join("project");
+        let available_profiles = write_project_profile_registry(
+            &workspace_root,
+            Some("reviewer"),
+            &[("reviewer", "reviewer.toml", INTERNAL_REVIEWER_PROFILE)],
+        );
         let mut manifest = parent_manifest(&workspace_root, None);
         manifest.delegation_scope = ScopeConfig {
             allow: vec![abs_rule(&workspace_root, Permission::Write)],
@@ -882,7 +911,7 @@ mod tests {
             registry.clone(),
             manifest.clone(),
             prompt_loader,
-            AvailableProfiles::discover(&workspace_root),
+            available_profiles,
             spawner_scope.clone(),
             DelegationScope::from_config(&manifest.delegation_scope).unwrap(),
         )
@@ -895,7 +924,7 @@ mod tests {
         }));
         let input = serde_json::json!({
             "name": "reviewer-child",
-            "profile": "builtin:reviewer",
+            "profile": "project:reviewer",
             "instruction": "$workspace/custom-reviewer",
             "task": "review immutable commit",
             "scope": [{
