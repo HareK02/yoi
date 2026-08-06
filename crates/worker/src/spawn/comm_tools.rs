@@ -62,15 +62,23 @@ impl Tool for SubWorkerListTool {
         let _input: SubWorkerListInput = serde_json::from_str(input_json).map_err(|error| {
             ToolError::InvalidArgument(format!("invalid SubWorkerList input: {error}"))
         })?;
-        let items = self
+        let mut items = self
             .registry
-            .list()
-            .await
+            .list_internal()
             .into_iter()
             .map(|record| SubWorkerListItem {
                 name: record.worker_name,
             })
             .collect::<Vec<_>>();
+        items.extend(
+            self.registry
+                .list()
+                .await
+                .into_iter()
+                .map(|record| SubWorkerListItem {
+                    name: record.worker_name,
+                }),
+        );
         let count = items.len();
         let content = serde_json::to_string_pretty(&serde_json::json!({ "sub_workers": items }))
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
@@ -125,6 +133,15 @@ impl Tool for SubWorkerSendTool {
     ) -> Result<ToolOutput, ToolError> {
         let input: SubWorkerSendInput = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid SubWorkerSend input: {e}")))?;
+        if let Some(record) = self.registry.get_internal(&input.name) {
+            record.session.send(input.message).await.map_err(|error| {
+                ToolError::ExecutionFailed(format!("send to `{}`: {error}", input.name))
+            })?;
+            return Ok(ToolOutput {
+                summary: format!("sent message to `{}`", input.name),
+                content: None,
+            });
+        }
         let record = self
             .registry
             .get(&input.name)
@@ -191,6 +208,35 @@ impl Tool for SubWorkerReadOutputTool {
         let input: NameInput = serde_json::from_str(input_json).map_err(|e| {
             ToolError::InvalidArgument(format!("invalid SubWorkerReadOutput input: {e}"))
         })?;
+        if let Some(record) = self.registry.get_internal(&input.name) {
+            let entries = record.session.entries();
+            let cursor = self.registry.cursor(&input.name).await;
+            let new_entries = if cursor >= entries.len() {
+                &[] as &[LogEntry]
+            } else {
+                &entries[cursor..]
+            };
+            let values = new_entries
+                .iter()
+                .filter_map(|entry| serde_json::to_value(entry).ok())
+                .collect::<Vec<_>>();
+            let new_text = extract_assistant_text(&values);
+            self.registry.set_cursor(&input.name, entries.len()).await;
+            let status = format!("{:?}", record.session.status()).to_lowercase();
+            let summary = if new_text.is_empty() {
+                format!("worker `{}` {status}; no new assistant text", input.name)
+            } else {
+                format!(
+                    "worker `{}` {status}: {} new line(s) of assistant text",
+                    input.name,
+                    new_text.lines().count()
+                )
+            };
+            return Ok(ToolOutput {
+                summary,
+                content: (!new_text.is_empty()).then_some(new_text),
+            });
+        }
         let record = self
             .registry
             .get(&input.name)
@@ -269,6 +315,22 @@ impl Tool for SubWorkerStopTool {
     ) -> Result<ToolOutput, ToolError> {
         let input: NameInput = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid SubWorkerStop input: {e}")))?;
+        if let Some(record) = self.registry.get_internal(&input.name) {
+            record.session.stop().await.map_err(|error| {
+                ToolError::ExecutionFailed(format!("stop `{}`: {error}", input.name))
+            })?;
+            self.registry
+                .remove_internal(&input.name)
+                .await
+                .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+            return Ok(ToolOutput {
+                summary: format!(
+                    "stopped worker `{}` and reclaimed delegated scope",
+                    input.name
+                ),
+                content: None,
+            });
+        }
         let record = self
             .registry
             .get(&input.name)

@@ -29,6 +29,7 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 use tracing::warn;
 
+use crate::internal_worker::InternalWorkerSessionHandle;
 use crate::runtime::dir::{RuntimeDir, SpawnedWorkerRecord};
 use crate::runtime::worker_allocation;
 
@@ -38,8 +39,16 @@ type RegistryReclaimWriter = Arc<dyn Fn(&SpawnedWorkerRecord) -> io::Result<()> 
 const RESTORE_REACHABILITY_TIMEOUT: Duration = Duration::from_millis(500);
 const REGISTRY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 
+#[derive(Clone)]
+pub(crate) struct InternalSpawnedWorkerRecord {
+    pub worker_name: String,
+    pub scope_delegated: Vec<ScopeRule>,
+    pub session: InternalWorkerSessionHandle,
+}
+
 pub struct SpawnedWorkerRegistry {
     records: Mutex<Vec<SpawnedWorkerRecord>>,
+    internal_records: std::sync::Mutex<Vec<InternalSpawnedWorkerRecord>>,
     cursors: Mutex<HashMap<String, usize>>,
     mutations: Mutex<()>,
     runtime_dir: Arc<RuntimeDir>,
@@ -58,6 +67,7 @@ impl SpawnedWorkerRegistry {
     pub fn new(runtime_dir: Arc<RuntimeDir>) -> Arc<Self> {
         Arc::new(Self {
             records: Mutex::new(Vec::new()),
+            internal_records: std::sync::Mutex::new(Vec::new()),
             cursors: Mutex::new(HashMap::new()),
             mutations: Mutex::new(()),
             runtime_dir,
@@ -170,6 +180,7 @@ impl SpawnedWorkerRegistry {
         Ok(SpawnedWorkerRegistryLoad {
             registry: Arc::new(Self {
                 records: Mutex::new(records),
+                internal_records: std::sync::Mutex::new(Vec::new()),
                 cursors: Mutex::new(HashMap::new()),
                 mutations: Mutex::new(()),
                 runtime_dir,
@@ -182,7 +193,73 @@ impl SpawnedWorkerRegistry {
         })
     }
 
-    /// Append a new record and persist the full list. Returns an I/O
+    pub(crate) fn add_internal(&self, record: InternalSpawnedWorkerRecord) -> io::Result<()> {
+        let mut records = self
+            .internal_records
+            .lock()
+            .map_err(|_| io::Error::other("internal spawned-worker registry lock poisoned"))?;
+        if records
+            .iter()
+            .any(|existing| existing.worker_name == record.worker_name)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "spawned worker `{}` is already registered",
+                    record.worker_name
+                ),
+            ));
+        }
+        records.push(record);
+        Ok(())
+    }
+
+    pub(crate) fn get_internal(&self, worker_name: &str) -> Option<InternalSpawnedWorkerRecord> {
+        self.internal_records
+            .lock()
+            .ok()?
+            .iter()
+            .find(|record| record.worker_name == worker_name)
+            .cloned()
+    }
+
+    pub(crate) fn list_internal(&self) -> Vec<InternalSpawnedWorkerRecord> {
+        self.internal_records
+            .lock()
+            .map(|records| records.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) async fn remove_internal(
+        &self,
+        worker_name: &str,
+    ) -> io::Result<Option<InternalSpawnedWorkerRecord>> {
+        let removed = {
+            let mut records = self
+                .internal_records
+                .lock()
+                .map_err(|_| io::Error::other("internal spawned-worker registry lock poisoned"))?;
+            records
+                .iter()
+                .position(|record| record.worker_name == worker_name)
+                .map(|index| records.remove(index))
+        };
+        self.cursors.lock().await.remove(worker_name);
+        if let (Some(record), Some(parent_scope)) = (&removed, &self.parent_scope) {
+            let write_rules = record
+                .scope_delegated
+                .iter()
+                .filter(|rule| rule.permission == Permission::Write)
+                .cloned()
+                .collect::<Vec<_>>();
+            parent_scope
+                .update(|current| current.with_removed_deny_rules(write_rules))
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        }
+        Ok(removed)
+    }
+
+    /// Append a new legacy process record and persist the full list.
     /// error if either persisted write fails; the in-memory state is still
     /// updated in that case — the next successful write will reconcile.
     pub async fn add(&self, record: SpawnedWorkerRecord) -> io::Result<()> {
