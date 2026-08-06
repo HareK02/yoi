@@ -3475,7 +3475,22 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                     lifecycle = ?result.lifecycle,
                     "internal Worker execution completed"
                 );
-                result.usage.as_ref().map(usage_audit_from_event)
+                let usage = result.usage.as_ref().map(usage_audit_from_event);
+                if let Some(error) = extract_internal_worker_lifecycle_error(&result.lifecycle) {
+                    audit
+                        .emit(
+                            self.workspace_client(),
+                            event_tx,
+                            memory::audit::WorkerLifecycleStatus::Cancelled,
+                            "worker_cancelled: internal Worker run rolled back before AI output",
+                            usage,
+                            Some(extract_audit_base),
+                            None,
+                        )
+                        .await;
+                    return Err(error);
+                }
+                usage
             }
             Err(err) => {
                 tracing::debug!(
@@ -3626,6 +3641,13 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             }
         }
         Ok(())
+    }
+}
+
+fn extract_internal_worker_lifecycle_error(lifecycle: &WorkerRunResult) -> Option<WorkerError> {
+    match lifecycle {
+        WorkerRunResult::RolledBack => Some(WorkerError::Engine(EngineError::Cancelled)),
+        WorkerRunResult::Finished | WorkerRunResult::Paused | WorkerRunResult::LimitReached => None,
     }
 }
 
@@ -6321,6 +6343,19 @@ mod build_summary_prompt_tests {
             .unwrap();
         assert_eq!(response.status, 200);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn rolled_back_internal_extract_is_cancelled_before_pointer_commit() {
+        let error = extract_internal_worker_lifecycle_error(&WorkerRunResult::RolledBack)
+            .expect("rolled-back extract must not enter the success path");
+
+        assert!(matches!(error, WorkerError::Engine(EngineError::Cancelled)));
+        assert!(matches!(
+            lifecycle_status_for_worker_error(&error),
+            memory::audit::WorkerLifecycleStatus::Cancelled
+        ));
+        assert!(extract_internal_worker_lifecycle_error(&WorkerRunResult::Finished).is_none());
     }
 
     fn minimal_manifest() -> WorkerManifest {

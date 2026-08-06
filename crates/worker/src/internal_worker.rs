@@ -72,6 +72,16 @@ pub(crate) struct InternalWorkerError {
 pub(crate) async fn run_internal_worker(
     spec: InternalWorkerSpec,
 ) -> Result<InternalWorkerResult, InternalWorkerError> {
+    run_internal_worker_with_prepare(spec, |_| {}).await
+}
+
+async fn run_internal_worker_with_prepare<F>(
+    spec: InternalWorkerSpec,
+    prepare: F,
+) -> Result<InternalWorkerResult, InternalWorkerError>
+where
+    F: FnOnce(&mut Worker<Box<dyn LlmClient>, EphemeralSessionStore>),
+{
     let InternalWorkerSpec {
         identity,
         mut manifest,
@@ -163,6 +173,7 @@ pub(crate) async fn run_internal_worker(
     }
     let session_id = worker.session_id();
     let segment_id = worker.segment_id();
+    prepare(&mut worker);
 
     match worker.run_text(&input).await {
         Ok(lifecycle) => Ok(InternalWorkerResult {
@@ -355,6 +366,35 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct CancelBeforeAiClient {
+        calls: Arc<AtomicUsize>,
+        cancel_sender: Arc<Mutex<Option<tokio::sync::mpsc::Sender<()>>>>,
+    }
+
+    #[async_trait]
+    impl LlmClient for CancelBeforeAiClient {
+        fn clone_boxed(&self) -> Box<dyn LlmClient> {
+            Box::new(self.clone())
+        }
+
+        async fn stream(
+            &self,
+            _request: Request,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmEvent, ClientError>> + Send>>, ClientError>
+        {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let sender = self
+                .cancel_sender
+                .lock()
+                .expect("cancel sender lock")
+                .clone()
+                .expect("cancel sender installed before run");
+            sender.send(()).await.expect("internal engine is live");
+            Ok(Box::pin(futures::stream::pending()))
+        }
+    }
+
     fn manifest() -> WorkerManifest {
         WorkerManifest::from_toml(
             r#"
@@ -412,6 +452,34 @@ permission = "write"
         assert!(matches!(result.lifecycle, WorkerRunResult::Finished));
         assert!(result.history_entries >= 4);
         assert_eq!(result.identity.kind, "test");
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_ai_item_returns_rolled_back_lifecycle() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cancel_sender = Arc::new(Mutex::new(None));
+        let mut internal_spec = spec(calls.clone(), &[]);
+        internal_spec.client = Box::new(CancelBeforeAiClient {
+            calls: calls.clone(),
+            cancel_sender: cancel_sender.clone(),
+        });
+        let prepare_sender = cancel_sender.clone();
+
+        let result = match run_internal_worker_with_prepare(internal_spec, move |worker| {
+            *prepare_sender.lock().expect("cancel sender lock") =
+                Some(worker.engine_mut().cancel_sender());
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => panic!(
+                "Worker rollback should remain a lifecycle result: {:?}",
+                error.source
+            ),
+        };
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(result.lifecycle, WorkerRunResult::RolledBack));
     }
 
     #[tokio::test]
