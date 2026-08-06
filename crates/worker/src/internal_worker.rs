@@ -195,6 +195,307 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InternalWorkerSessionStatus {
+    Idle,
+    Running,
+    Stopping,
+    Stopped,
+    Failed,
+}
+
+impl InternalWorkerSessionStatus {
+    fn encode(self) -> u8 {
+        match self {
+            Self::Idle => 0,
+            Self::Running => 1,
+            Self::Stopping => 2,
+            Self::Stopped => 3,
+            Self::Failed => 4,
+        }
+    }
+
+    fn decode(value: u8) -> Self {
+        match value {
+            0 => Self::Idle,
+            1 => Self::Running,
+            2 => Self::Stopping,
+            3 => Self::Stopped,
+            _ => Self::Failed,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum InternalWorkerSessionError {
+    #[error("failed to build internal Worker session: {message}")]
+    Build { message: String },
+    #[error("internal Worker session is busy")]
+    Busy,
+    #[error("internal Worker session is stopped")]
+    Stopped,
+    #[error("internal Worker session actor is unavailable")]
+    Unavailable,
+}
+
+enum InternalWorkerSessionCommand {
+    Run(String),
+    Stop(tokio::sync::oneshot::Sender<()>),
+}
+
+/// Parent-owned handle for a long-lived Internal Worker session.
+///
+/// The handle exposes only typed turn, history, status, and stop operations. The underlying Worker,
+/// Engine, ephemeral Store, and cancellation sender remain inside the actor task.
+#[derive(Clone)]
+pub(crate) struct InternalWorkerSessionHandle {
+    command_tx: tokio::sync::mpsc::Sender<InternalWorkerSessionCommand>,
+    status: Arc<std::sync::atomic::AtomicU8>,
+    store: EphemeralSessionStore,
+    session_id: SessionId,
+    segment_id: SegmentId,
+    last_error: Arc<Mutex<Option<String>>>,
+    state_changed: Arc<tokio::sync::Notify>,
+}
+
+impl InternalWorkerSessionHandle {
+    pub(crate) fn status(&self) -> InternalWorkerSessionStatus {
+        InternalWorkerSessionStatus::decode(self.status.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    pub(crate) fn entries(&self) -> Vec<LogEntry> {
+        self.store
+            .read_all(self.session_id, self.segment_id)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn last_error(&self) -> Option<String> {
+        self.last_error.lock().ok().and_then(|error| error.clone())
+    }
+
+    pub(crate) async fn send(
+        &self,
+        input: impl Into<String>,
+    ) -> Result<(), InternalWorkerSessionError> {
+        self.status
+            .compare_exchange(
+                InternalWorkerSessionStatus::Idle.encode(),
+                InternalWorkerSessionStatus::Running.encode(),
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map_err(
+                |current| match InternalWorkerSessionStatus::decode(current) {
+                    InternalWorkerSessionStatus::Running
+                    | InternalWorkerSessionStatus::Stopping => InternalWorkerSessionError::Busy,
+                    InternalWorkerSessionStatus::Stopped | InternalWorkerSessionStatus::Failed => {
+                        InternalWorkerSessionError::Stopped
+                    }
+                    InternalWorkerSessionStatus::Idle => InternalWorkerSessionError::Unavailable,
+                },
+            )?;
+        if self
+            .command_tx
+            .send(InternalWorkerSessionCommand::Run(input.into()))
+            .await
+            .is_err()
+        {
+            self.status.store(
+                InternalWorkerSessionStatus::Failed.encode(),
+                std::sync::atomic::Ordering::Release,
+            );
+            self.state_changed.notify_waiters();
+            return Err(InternalWorkerSessionError::Unavailable);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn wait_until_idle(&self) -> InternalWorkerSessionStatus {
+        loop {
+            let notified = self.state_changed.notified();
+            let status = self.status();
+            if status != InternalWorkerSessionStatus::Running
+                && status != InternalWorkerSessionStatus::Stopping
+            {
+                return status;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) async fn stop(&self) -> Result<(), InternalWorkerSessionError> {
+        let prior = self.status.swap(
+            InternalWorkerSessionStatus::Stopping.encode(),
+            std::sync::atomic::Ordering::AcqRel,
+        );
+        if matches!(
+            InternalWorkerSessionStatus::decode(prior),
+            InternalWorkerSessionStatus::Stopped | InternalWorkerSessionStatus::Failed
+        ) {
+            return Ok(());
+        }
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        self.command_tx
+            .send(InternalWorkerSessionCommand::Stop(done_tx))
+            .await
+            .map_err(|_| InternalWorkerSessionError::Unavailable)?;
+        done_rx
+            .await
+            .map_err(|_| InternalWorkerSessionError::Unavailable)
+    }
+}
+
+/// Start a reusable Internal Worker session and accept its first turn.
+pub(crate) async fn spawn_internal_worker_session(
+    spec: InternalWorkerSpec,
+) -> Result<InternalWorkerSessionHandle, InternalWorkerSessionError> {
+    let InternalWorkerSpec {
+        identity,
+        mut manifest,
+        client,
+        system_prompt,
+        input,
+        cache_key,
+        max_turns,
+        features,
+        required_tools,
+        authority,
+    } = spec;
+    manifest.worker.name = format!("internal-{}-{}", identity.kind, identity.run_id);
+    manifest.memory = None;
+
+    let last_usage = Arc::new(Mutex::new(None::<UsageEvent>));
+    let usage_slot = last_usage.clone();
+    let mut engine = Engine::new(client).system_prompt(system_prompt);
+    engine.on_usage(move |usage| {
+        if let Ok(mut slot) = usage_slot.lock() {
+            *slot = Some(usage.clone());
+        }
+    });
+    engine.set_cache_key(cache_key);
+    engine.set_max_turns(max_turns);
+    let store = EphemeralSessionStore::default();
+    let mut worker = Worker::new(
+        manifest,
+        engine,
+        store.clone(),
+        authority.workspace,
+        authority.filesystem,
+        authority.scope,
+    )
+    .await
+    .map_err(|source| InternalWorkerSessionError::Build {
+        message: source.to_string(),
+    })?;
+    let install_report = worker.install_features(features);
+    let installed_tools = install_report.installed_tool_names();
+    let install_failed = install_report
+        .reports
+        .iter()
+        .any(|report| !report.installed);
+    let missing = required_tools
+        .iter()
+        .filter(|required| {
+            !installed_tools
+                .iter()
+                .any(|installed| installed == **required)
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    if install_failed || !missing.is_empty() {
+        let diagnostics = install_report
+            .reports
+            .iter()
+            .flat_map(|report| report.diagnostics.iter())
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(InternalWorkerSessionError::Build {
+            message: format!(
+                "internal Worker feature installation failed: {diagnostics}; missing tools: {}",
+                missing.join(", ")
+            ),
+        });
+    }
+
+    let session_id = worker.session_id();
+    let segment_id = worker.segment_id();
+    let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(8);
+    let status = Arc::new(std::sync::atomic::AtomicU8::new(
+        InternalWorkerSessionStatus::Idle.encode(),
+    ));
+    let last_error = Arc::new(Mutex::new(None));
+    let state_changed = Arc::new(tokio::sync::Notify::new());
+    let handle = InternalWorkerSessionHandle {
+        command_tx,
+        status: status.clone(),
+        store,
+        session_id,
+        segment_id,
+        last_error: last_error.clone(),
+        state_changed: state_changed.clone(),
+    };
+
+    tokio::spawn(async move {
+        while let Some(command) = command_rx.recv().await {
+            match command {
+                InternalWorkerSessionCommand::Run(input) => {
+                    let cancel_sender = worker.engine_mut().cancel_sender();
+                    let mut run = std::pin::pin!(worker.run_text(&input));
+                    loop {
+                        tokio::select! {
+                            result = &mut run => {
+                                match result {
+                                    Ok(_) => {
+                                        status.store(InternalWorkerSessionStatus::Idle.encode(), std::sync::atomic::Ordering::Release);
+                                    }
+                                    Err(error) => {
+                                        *last_error.lock().expect("internal Worker session error lock") = Some(error.to_string());
+                                        status.store(InternalWorkerSessionStatus::Failed.encode(), std::sync::atomic::Ordering::Release);
+                                    }
+                                }
+                                state_changed.notify_waiters();
+                                break;
+                            }
+                            command = command_rx.recv() => {
+                                match command {
+                                    Some(InternalWorkerSessionCommand::Stop(done)) => {
+                                        let _ = cancel_sender.send(()).await;
+                                        let _ = (&mut run).await;
+                                        status.store(InternalWorkerSessionStatus::Stopped.encode(), std::sync::atomic::Ordering::Release);
+                                        state_changed.notify_waiters();
+                                        let _ = done.send(());
+                                        return;
+                                    }
+                                    Some(InternalWorkerSessionCommand::Run(_)) => {
+                                        // `send` reserves Running atomically, so a second Run cannot be enqueued.
+                                    }
+                                    None => {
+                                        let _ = cancel_sender.send(()).await;
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                InternalWorkerSessionCommand::Stop(done) => {
+                    status.store(
+                        InternalWorkerSessionStatus::Stopped.encode(),
+                        std::sync::atomic::Ordering::Release,
+                    );
+                    state_changed.notify_waiters();
+                    let _ = done.send(());
+                    return;
+                }
+            }
+        }
+    });
+
+    handle.send(input).await?;
+    Ok(handle)
+}
+
 /// Session history for an ephemeral internal Worker.
 ///
 /// Keeping the normal Store contract makes history/lifecycle/error records identical to a normal
@@ -399,6 +700,29 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct PendingClient {
+        calls: Arc<AtomicUsize>,
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl LlmClient for PendingClient {
+        fn clone_boxed(&self) -> Box<dyn LlmClient> {
+            Box::new(self.clone())
+        }
+
+        async fn stream(
+            &self,
+            _request: Request,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmEvent, ClientError>> + Send>>, ClientError>
+        {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            Ok(Box::pin(futures::stream::pending()))
+        }
+    }
+
     fn manifest() -> WorkerManifest {
         WorkerManifest::from_toml(
             r#"
@@ -456,6 +780,60 @@ permission = "write"
         assert!(matches!(result.lifecycle, WorkerRunResult::Finished));
         assert!(result.history_entries >= 4);
         assert_eq!(result.identity.kind, "test");
+    }
+
+    #[tokio::test]
+    async fn session_accepts_follow_up_turns_and_stops_without_runtime_registration() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handle = spawn_internal_worker_session(spec(calls.clone(), &[]))
+            .await
+            .expect("spawn Internal Worker session");
+
+        assert_eq!(
+            handle.wait_until_idle().await,
+            InternalWorkerSessionStatus::Idle
+        );
+        let entries_after_first = handle.entries().len();
+        assert!(entries_after_first >= 4);
+        handle.send("follow-up").await.expect("send follow-up turn");
+        assert_eq!(
+            handle.wait_until_idle().await,
+            InternalWorkerSessionStatus::Idle
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(handle.entries().len() > entries_after_first);
+        assert!(handle.last_error().is_none());
+
+        handle.stop().await.expect("stop Internal Worker session");
+        assert_eq!(handle.status(), InternalWorkerSessionStatus::Stopped);
+        assert!(matches!(
+            handle.send("too late").await,
+            Err(InternalWorkerSessionError::Stopped)
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_rejects_parallel_turns_and_cancels_running_turn_on_stop() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let mut internal_spec = spec(calls.clone(), &[]);
+        internal_spec.client = Box::new(PendingClient {
+            calls: calls.clone(),
+            entered: entered.clone(),
+        });
+        let handle = spawn_internal_worker_session(internal_spec)
+            .await
+            .expect("spawn running Internal Worker session");
+
+        assert_eq!(handle.status(), InternalWorkerSessionStatus::Running);
+        assert!(matches!(
+            handle.send("parallel").await,
+            Err(InternalWorkerSessionError::Busy)
+        ));
+        entered.notified().await;
+        handle.stop().await.expect("cancel and stop session");
+        assert_eq!(handle.status(), InternalWorkerSessionStatus::Stopped);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
