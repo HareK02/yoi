@@ -1577,7 +1577,6 @@ fn worker_error_code(e: &WorkerError) -> ErrorCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::dir::SpawnedWorkerRecord;
     use protocol::WorkerEvent;
     use protocol::stream::{JsonLineReader, JsonLineWriter};
     use std::time::Duration;
@@ -1834,17 +1833,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn running_scope_sub_delegated_applies_side_effects_without_notify_buffer() {
+    async fn running_legacy_scope_callback_has_no_registry_authority_or_notify() {
         let mut env = make_env().await;
-        env.spawned_registry
-            .add(SpawnedWorkerRecord {
-                worker_name: "child".into(),
-                socket_path: "/tmp/child.sock".into(),
-                scope_delegated: vec![],
-                callback_address: "/tmp/parent.sock".into(),
-            })
-            .await
-            .expect("seed child record");
         env._method_tx
             .send(Method::WorkerEvent(WorkerEvent::ScopeSubDelegated {
                 parent_worker: "child".into(),
@@ -1876,12 +1866,8 @@ mod tests {
         assert_eq!(status, WorkerStatus::Idle);
         assert!(!shutdown);
         assert!(
-            env.spawned_registry.get("grandchild").await.is_some(),
-            "ScopeSubDelegated side effects must still register the grandchild"
-        );
-        assert!(
             env.notify_buffer.is_empty(),
-            "control-plane-only ScopeSubDelegated must not enter the agent-visible notify buffer"
+            "legacy ScopeSubDelegated must not enter the agent-visible notify buffer"
         );
     }
 

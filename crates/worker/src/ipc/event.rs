@@ -26,9 +26,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use protocol::{Method, ScopeRule, WorkerEvent};
+use protocol::{Method, WorkerEvent};
 
-use crate::runtime::dir::SpawnedWorkerRecord;
 use crate::spawn::comm_tools::connect_and_send;
 use crate::spawn::registry::SpawnedWorkerRegistry;
 
@@ -85,86 +84,15 @@ pub fn render_event(event: &WorkerEvent) -> String {
     }
 }
 
-/// Apply the variant-specific side effect on the parent side.
+/// Legacy process callback events have no SubWorker registry authority.
 ///
-/// All operations are idempotent so that out-of-order delivery (e.g.
-/// `TurnEnded` arriving after `ShutDown`) does not produce errors:
-///
-/// - `TurnEnded` / `Errored`: no system work; the LLM handles the
-///   semantic response.
-/// - `ShutDown`: remove the child from `spawned_workers.json`, Worker state,
-///   and reclaim its delegated scope/allocation. Missing entries are swallowed.
-/// - `ScopeSubDelegated`: register the grandchild locally and re-emit
-///   upward to our own parent if we have one. Duplicate grandchild
-///   entries (re-delivery) are swallowed.
+/// Internal SubWorker lifecycle is applied directly through typed session handles. A callback from
+/// an externally adopted Worker may still be rendered for diagnostics, but it cannot add/remove
+/// Internal children or transfer filesystem authority.
 pub async fn apply_event_side_effects(
-    event: &WorkerEvent,
-    registry: &Arc<SpawnedWorkerRegistry>,
-    self_name: &str,
-    self_parent_socket: &Option<PathBuf>,
+    _event: &WorkerEvent,
+    _registry: &Arc<SpawnedWorkerRegistry>,
+    _self_name: &str,
+    _self_parent_socket: &Option<PathBuf>,
 ) {
-    match event {
-        WorkerEvent::TurnEnded { .. } | WorkerEvent::Errored { .. } => {}
-
-        WorkerEvent::ShutDown { worker_name } => {
-            if let Err(e) = registry.remove(worker_name).await {
-                tracing::warn!(error = %e, worker = %worker_name, "registry remove on ShutDown failed");
-            }
-        }
-
-        WorkerEvent::ScopeSubDelegated {
-            parent_worker,
-            sub_worker,
-            sub_socket,
-            scope,
-        } => {
-            if registry.get(sub_worker).await.is_some() {
-                return;
-            }
-            let callback_address = registry
-                .get(parent_worker)
-                .await
-                .map(|r| r.socket_path)
-                .unwrap_or_else(PathBuf::new);
-            let record = SpawnedWorkerRecord {
-                worker_name: sub_worker.clone(),
-                socket_path: sub_socket.clone(),
-                scope_delegated: scope.clone(),
-                callback_address,
-            };
-            if let Err(e) = registry.add(record).await {
-                tracing::warn!(
-                    error = %e,
-                    sub_worker = %sub_worker,
-                    "registry add on ScopeSubDelegated failed"
-                );
-            }
-            reemit_scope_sub_delegated(
-                self_parent_socket,
-                self_name,
-                sub_worker.clone(),
-                sub_socket.clone(),
-                scope.clone(),
-            );
-        }
-    }
-}
-
-fn reemit_scope_sub_delegated(
-    self_parent_socket: &Option<PathBuf>,
-    self_name: &str,
-    sub_worker: String,
-    sub_socket: PathBuf,
-    scope: Vec<ScopeRule>,
-) {
-    let Some(parent_socket) = self_parent_socket.clone() else {
-        return;
-    };
-    let event = WorkerEvent::ScopeSubDelegated {
-        parent_worker: self_name.to_string(),
-        sub_worker,
-        sub_socket,
-        scope,
-    };
-    fire_and_forget(Some(parent_socket), event);
 }
