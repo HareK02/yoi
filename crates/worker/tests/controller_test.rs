@@ -483,7 +483,7 @@ permission = "write"
 }
 
 #[tokio::test]
-async fn sub_worker_feature_requires_delegation_scope() {
+async fn sub_worker_feature_exposure_does_not_require_delegation_scope() {
     let manifest = r#"
 [worker]
 name = "worker-management-feature-test"
@@ -507,11 +507,9 @@ permission = "write"
     let worker = make_worker_with_pwd_and_manifest(client, manifest).await.0;
     let tmp = tempfile::tempdir().unwrap();
     let result = WorkerController::spawn(worker, tmp.path()).await;
-    assert!(result.is_err());
-    let message = result.err().unwrap().to_string();
     assert!(
-        message.contains("[feature.sub_worker].enabled = true requires non-empty"),
-        "unexpected error: {message}"
+        result.is_ok(),
+        "feature exposure must not imply delegation authority"
     );
 }
 

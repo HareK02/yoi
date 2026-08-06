@@ -1,18 +1,14 @@
-//! `SubWorkerSpawn` tool — launch a new SubWorker process as a child of this one.
+//! `SubWorkerSpawn` tool — start a parent-owned Internal Worker session.
 //!
-//! Wires worker-allocation delegation, child manifest-config construction, subprocess
-//! launch, and socket handoff into a single `Tool` implementation. When
-//! the LLM calls `SubWorkerSpawn`, a fresh SubWorker runtime command is exec'd in its own
-//! process group, the worker-allocation is updated atomically, and the child's
-//! first turn is kicked off by handing its socket a `Method::Run`.
+//! Resolves a child profile, validates filesystem delegation, constructs a normal Worker with the
+//! parent's explicit Workspace authority, installs its enabled features, and hands it to the
+//! in-process Internal Worker session actor. No Runtime Worker record, OS process, PID, Unix socket,
+//! or machine-wide child allocation is created.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
-use client::WorkerRuntimeCommand;
 use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use manifest::{
     CompactionConfigPartial, DelegationScope, EngineManifestConfig, FileUploadLimitsPartial,
@@ -22,25 +18,17 @@ use manifest::{
     WorkerManifest, WorkerManifestConfig, WorkerMetaConfig,
 };
 use serde::Deserialize;
-use tokio::net::UnixStream;
-use tokio::process::Command;
-use tokio::time::sleep;
 
-use crate::ipc::event;
+use crate::PromptLoader;
+use crate::controller::register_worker_tools;
+use crate::internal_worker::{EphemeralSessionStore, spawn_prepared_internal_worker_session};
 use crate::prompt::catalog::PromptCatalog;
-use crate::runtime::dir::SpawnedWorkerRecord;
-use crate::runtime::worker_allocation::{self, LockFileGuard, ScopeLockError};
-use crate::spawn::comm_tools::{SendRunError, send_run_and_confirm};
 use crate::spawn::registry::SpawnedWorkerRegistry;
-use protocol::WorkerEvent;
-
-/// How long we will wait for the spawned SubWorker's socket to become
-/// connectable before treating the spawn as failed.
-const SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+use crate::worker::{Worker, WorkerFilesystemAuthority};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SubWorkerSpawnInput {
-    /// Identifier for the spawned SubWorker. Must be unique machine-wide.
+    /// Identifier for the spawned Internal SubWorker. Must be unique among this Worker's direct children.
     name: String,
     /// Profile selector for child role configuration. Omit or use `default`
     /// for the effective child default profile, use `inherit` to derive
@@ -219,14 +207,12 @@ fn parse_spawn_profile_selector(raw: Option<&str>) -> Result<SpawnProfileSelecto
 /// child SubWorker and record the handoff locally. Constructed by the Worker
 /// controller once per Worker lifetime.
 pub struct SubWorkerSpawnTool {
-    /// Spawner's own worker name — becomes the spawned SubWorker's
-    /// `delegated_from` in the worker-allocation.
+    /// Spawner's own Worker name, used for direct-child identity collision checks.
     spawner_name: String,
-    /// Path to the spawner's Unix socket. Handed to the child via
-    /// `--callback` so its `WorkerEvent` callbacks have somewhere to land.
-    callback_socket: PathBuf,
-    /// Root of the `$XDG_RUNTIME_DIR/yoi/` tree, used to predict
-    /// the spawned SubWorker's socket path before the child has bound it.
+    workspace_context: crate::worker::WorkerWorkspaceContext,
+    parent_notifies: crate::ipc::notify_buffer::NotifyBuffer,
+    /// Runtime-owned root used only for bounded Internal Worker tool artifacts such as Bash spill
+    /// output. It is not an Internal Worker identity or catalog location.
     runtime_base: PathBuf,
     /// Inherited runtime workspace root for Profile/project/Ticket/workflow/
     /// memory context. SubWorkerSpawn `cwd` must not affect this value.
@@ -234,20 +220,8 @@ pub struct SubWorkerSpawnTool {
     /// Directory the spawned SubWorker's tools should use when the LLM did not
     /// override it. Defaults to the spawner's cwd.
     spawner_cwd: PathBuf,
-    /// Optional typed runtime command injected by tests. Production resolves
-    /// the runtime command from `std::env::current_exe()` at launch time.
-    runtime_command: Option<WorkerRuntimeCommand>,
-    /// Shared registry of spawned children, also used by the
-    /// worker-comm tools (`SubWorkerSend` / `SubWorkerReadOutput` / `SubWorkerStop`) and by
-    /// Worker discovery. Writes the list to runtime and durable Worker state on
-    /// each add.
+    /// Parent-owned in-memory registry shared by the five SubWorker tools.
     registry: Arc<SpawnedWorkerRegistry>,
-    /// THIS Worker's own parent-callback socket, if any. After a
-    /// successful spawn we fire `WorkerEvent::ScopeSubDelegated` upward
-    /// so the grandparent can register the grandchild directly.
-    /// `None` for top-level Workers — in that case the re-emission is a
-    /// no-op.
-    parent_socket: Option<PathBuf>,
     /// Spawner's resolved Manifest. `profile = "inherit"` derives the
     /// child config from reusable fields here, and selected profiles are
     /// merged into the same internal handoff shape before launch.
@@ -266,36 +240,42 @@ pub struct SubWorkerSpawnTool {
     /// This is intentionally separate from `spawner_scope`, which authorizes
     /// the current Worker's own direct tools.
     delegation_scope: DelegationScope,
+    internal_client_override: Option<Box<dyn llm_engine::llm_client::LlmClient>>,
 }
 
 impl SubWorkerSpawnTool {
+    #[cfg(test)]
+    fn with_internal_client(mut self, client: Box<dyn llm_engine::llm_client::LlmClient>) -> Self {
+        self.internal_client_override = Some(client);
+        self
+    }
+
     fn new(
         spawner_name: String,
-        callback_socket: PathBuf,
+        workspace_context: crate::worker::WorkerWorkspaceContext,
+        parent_notifies: crate::ipc::notify_buffer::NotifyBuffer,
         runtime_base: PathBuf,
         workspace_root: PathBuf,
         spawner_cwd: PathBuf,
         registry: Arc<SpawnedWorkerRegistry>,
-        parent_socket: Option<PathBuf>,
         spawner_manifest: WorkerManifest,
         available_profiles: AvailableProfiles,
         spawner_scope: SharedScope,
         delegation_scope: DelegationScope,
-        runtime_command: Option<WorkerRuntimeCommand>,
     ) -> Self {
         Self {
             spawner_name,
-            callback_socket,
+            workspace_context,
+            parent_notifies,
             runtime_base,
             workspace_root,
             spawner_cwd,
-            runtime_command,
             registry,
-            parent_socket,
             spawner_manifest,
             available_profiles,
             spawner_scope,
             delegation_scope,
+            internal_client_override: None,
         }
     }
 }
@@ -341,173 +321,109 @@ impl Tool for SubWorkerSpawnTool {
             )
             .map_err(|e| ToolError::InvalidArgument(format!("{e}")))?;
 
-        let predicted_socket = self.runtime_base.join(&input.name).join("sock");
-        let lock_path = worker_allocation::default_allocation_path()
-            .map_err(|e| ToolError::ExecutionFailed(format!("worker-allocation path: {e}")))?;
+        let mut child_config: WorkerManifestConfig = serde_json::from_str(&spawn_config_json)
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!("resolve child manifest: {error}"))
+            })?;
+        child_config.delegation_scope = ScopeConfig {
+            allow: scope_allow.clone(),
+            deny: Vec::new(),
+        };
+        let child_manifest =
+            WorkerManifest::try_from(WorkerManifestConfig::builtin_defaults().merge(child_config))
+                .map_err(|error| {
+                    ToolError::ExecutionFailed(format!("resolve child manifest: {error}"))
+                })?;
+        let store = EphemeralSessionStore::default();
+        let filesystem_authority =
+            WorkerFilesystemAuthority::local(self.workspace_root.clone(), child_cwd.clone());
+        let mut child = Worker::<Box<dyn llm_engine::llm_client::LlmClient>, EphemeralSessionStore>::from_internal_manifest_with_context(
+            child_manifest,
+            store.clone(),
+            PromptLoader::builtins_only(),
+            self.workspace_context.clone(),
+            filesystem_authority,
+            self.internal_client_override
+                .as_ref()
+                .map(|client| client.clone_boxed()),
+        )
+        .await
+        .map_err(|error| ToolError::ExecutionFailed(format!("build Internal Worker: {error}")))?;
+        let child_scope = child.scope_handle();
+        let child_registry =
+            SpawnedWorkerRegistry::new_internal(input.name.clone(), child_scope);
+        register_worker_tools(
+            &mut child,
+            self.runtime_base
+                .join("internal-workers")
+                .join(&input.name)
+                .join("bash-output"),
+            self.runtime_base.clone(),
+            child_registry,
+        )
+        .await
+        .map_err(|error| {
+            ToolError::ExecutionFailed(format!("install Internal Worker features: {error}"))
+        })?;
+        let child_name = input.name.clone();
+        let parent_notifies = self.parent_notifies.clone();
+        let session = spawn_prepared_internal_worker_session(
+            child,
+            store,
+            input.task.clone(),
+            Some(Arc::new(move |status| {
+                parent_notifies.push_notify(
+                    format!("SubWorker `{child_name}` turn ended with status {status:?}. Read its output before making completion decisions."),
+                    false,
+                );
+            })),
+        )
+            .await
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!("start Internal Worker session: {error}"))
+            })?;
 
-        // Reserve the allocation up front. Spawner's pid is a live
-        // placeholder; the child will rewrite it via `adopt_allocation`.
-        {
-            let mut guard = LockFileGuard::open(&lock_path)
-                .map_err(|e| ToolError::ExecutionFailed(format!("worker-allocation open: {e}")))?;
-            worker_allocation::delegate_scope(
-                &mut guard,
-                &self.spawner_name,
-                input.name.clone(),
-                std::process::id(),
-                predicted_socket.clone(),
-                scope_allow.clone(),
-                &self.delegation_scope,
-            )
-            .map_err(worker_allocation_err_to_tool)?;
-        }
-
-        // `start_outcome` covers steps that happen before the child is
-        // observably alive (exec + socket bind). Once its socket is
-        // listening, the child owns the allocation and we must not roll
-        // it back — even if later steps (Method::Run delivery, record
-        // write) fail, the child is running and will release its own
-        // entry on exit.
-
-        let start_outcome = self
-            .exec_child(
-                &input.name,
-                &spawn_config_json,
-                &predicted_socket,
-                &child_cwd,
-            )
-            .await;
-        if let Err(e) = start_outcome {
-            self.release_reservation(&lock_path, &input.name);
-            return Err(e);
-        }
-
-        // Child is live. Post-start errors propagate but do not roll
-        // back the scope allocation — the child already owns it.
-        //
-        // Mirror that ownership transfer in the spawner's in-memory
-        // scope: every `Permission::Write` rule in the delegated scope
-        // is shadowed by a `deny(Write, target)` so subsequent tool
-        // calls (Edit/Write) on the delegated paths fail with
-        // `ReadOnly`. Read access is left intact — the registry only
-        // arbitrates Write, and keeping Read lets the spawner observe
-        // the child's intermediate output through Read/Glob/Grep.
+        // Transfer delegated Write authority within this parent-owned process. The machine-wide
+        // allocation remains owned by the parent Worker; no fake child PID/socket identity is
+        // introduced.
         let revoke_write: Vec<ScopeRule> = scope_allow
             .iter()
-            .filter(|r| r.permission == Permission::Write)
+            .filter(|rule| rule.permission == Permission::Write)
             .cloned()
             .collect();
         if !revoke_write.is_empty() {
             self.spawner_scope
-                .update(|cur| cur.with_added_deny_rules(revoke_write.clone()))
-                .map_err(|e| ToolError::ExecutionFailed(format!("revoke spawner scope: {e}")))?;
+                .update(|current| current.with_added_deny_rules(revoke_write.clone()))
+                .map_err(|error| {
+                    ToolError::ExecutionFailed(format!("revoke spawner scope: {error}"))
+                })?;
         }
 
-        let record = SpawnedWorkerRecord {
+        let record = crate::spawn::registry::InternalSpawnedWorkerRecord {
             worker_name: input.name.clone(),
-            socket_path: predicted_socket.clone(),
-            scope_delegated: scope_allow.clone(),
-            callback_address: self.callback_socket.clone(),
+            scope_delegated: scope_allow,
+            session: session.clone(),
         };
-        self.registry.add(record).await.map_err(|e| {
-            ToolError::ExecutionFailed(format!("write spawned worker registry: {e}"))
-        })?;
-
-        // Notify this Worker's own parent so the grandparent can register
-        // the new grandchild directly. Fire-and-forget; top-level Workers
-        // (with no parent) skip the send inside `fire_and_forget`.
-        event::fire_and_forget(
-            self.parent_socket.clone(),
-            WorkerEvent::ScopeSubDelegated {
-                parent_worker: self.spawner_name.clone(),
-                sub_worker: input.name.clone(),
-                sub_socket: predicted_socket.clone(),
-                scope: scope_allow,
-            },
-        );
-
-        send_run_and_confirm(&predicted_socket, input.task.clone())
-            .await
-            .map_err(|err| spawn_delivery_error(&input.name, err))?;
+        if let Err(error) = self.registry.add_internal(record) {
+            let _ = session.stop().await;
+            if !revoke_write.is_empty() {
+                let _ = self
+                    .spawner_scope
+                    .update(|current| current.with_removed_deny_rules(revoke_write));
+            }
+            return Err(ToolError::ExecutionFailed(format!(
+                "register Internal Worker session: {error}"
+            )));
+        }
 
         Ok(ToolOutput {
-            summary: format!(
-                "spawned worker `{}` listening on {}",
-                input.name,
-                predicted_socket.display()
-            ),
+            summary: format!("spawned internal worker `{}`", input.name),
             content: None,
         })
     }
 }
 
 impl SubWorkerSpawnTool {
-    async fn exec_child(
-        &self,
-        worker_name: &str,
-        spawn_config_json: &str,
-        predicted_socket: &Path,
-        child_cwd: &Path,
-    ) -> Result<(), ToolError> {
-        let runtime_command = match &self.runtime_command {
-            Some(command) => command.clone(),
-            None => WorkerRuntimeCommand::resolve().map_err(|error| {
-                ToolError::ExecutionFailed(format!(
-                    "failed to resolve Worker runtime command: {error}"
-                ))
-            })?,
-        };
-
-        // Pre-create the child's runtime dir so we have a stable place to
-        // capture its stderr before it has had a chance to bind anything.
-        // The child's own `RuntimeDir::create` will `create_dir_all` the
-        // same path again — that's idempotent. On clean exit the child's
-        // RuntimeDir Drop tears the dir (and this log) down with it.
-        let worker_runtime_dir = self.runtime_base.join(worker_name);
-        tokio::fs::create_dir_all(&worker_runtime_dir)
-            .await
-            .map_err(|e| {
-                ToolError::ExecutionFailed(format!(
-                    "create runtime dir {}: {e}",
-                    worker_runtime_dir.display()
-                ))
-            })?;
-        let stderr_path = worker_runtime_dir.join("stderr.log");
-        let stderr_file = std::fs::File::create(&stderr_path).map_err(|e| {
-            ToolError::ExecutionFailed(format!("open {}: {e}", stderr_path.display()))
-        })?;
-
-        let mut cmd = Command::new(runtime_command.program());
-        cmd.args(runtime_command.prefix_args())
-            .arg("--adopt")
-            .arg("--callback")
-            .arg(&self.callback_socket)
-            .arg("--spawn-config-json")
-            .arg(spawn_config_json)
-            .arg("--workspace")
-            .arg(&self.workspace_root)
-            .current_dir(child_cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(stderr_file))
-            .process_group(0);
-
-        let child = cmd.spawn().map_err(|e| {
-            ToolError::ExecutionFailed(format!("failed to spawn `{runtime_command}`: {e}"))
-        })?;
-
-        // Default `kill_on_drop = false` keeps the process alive after
-        // the `Child` is dropped. We intentionally do not `.wait()` —
-        // when the spawner later exits, init adopts any remaining
-        // orphans. Lifecycle tracking lives in `spawned_workers.json`.
-        drop(child);
-
-        match wait_for_socket(predicted_socket, SOCKET_WAIT_TIMEOUT).await {
-            Ok(()) => Ok(()),
-            Err(e) => Err(annotate_with_stderr(e, &stderr_path).await),
-        }
-    }
-
     fn validate_delegation_scope(&self, scope_allow: &[ScopeRule]) -> Result<(), ToolError> {
         if self.delegation_scope.is_empty() && !scope_allow.is_empty() {
             return Err(ToolError::InvalidArgument(
@@ -528,12 +444,6 @@ impl SubWorkerSpawnTool {
             }
         }
         Ok(())
-    }
-
-    fn release_reservation(&self, lock_path: &Path, worker_name: &str) {
-        if let Ok(mut g) = LockFileGuard::open(lock_path) {
-            let _ = worker_allocation::release_worker(&mut g, worker_name);
-        }
     }
 }
 
@@ -816,143 +726,44 @@ fn manifest_to_reusable_config(manifest: &WorkerManifest) -> WorkerManifestConfi
 /// failure message. Capped so a chatty child can't blow up the LLM's
 /// tool-result budget — debugging beyond this should read the file
 /// directly.
-const STDERR_TAIL_BYTES: usize = 4 * 1024;
-
-async fn annotate_with_stderr(err: ToolError, stderr_path: &Path) -> ToolError {
-    let tail = match tokio::fs::read(stderr_path).await {
-        Ok(bytes) => {
-            let start = bytes.len().saturating_sub(STDERR_TAIL_BYTES);
-            String::from_utf8_lossy(&bytes[start..]).into_owned()
-        }
-        Err(_) => return err,
-    };
-    let trimmed = tail.trim();
-    if trimmed.is_empty() {
-        return err;
-    }
-    match err {
-        ToolError::ExecutionFailed(msg) => ToolError::ExecutionFailed(format!(
-            "{msg}\n--- child stderr ({}) ---\n{trimmed}",
-            stderr_path.display()
-        )),
-        other => other,
-    }
-}
-
-async fn wait_for_socket(path: &Path, timeout: Duration) -> Result<(), ToolError> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if path.exists() {
-            if let Ok(stream) = UnixStream::connect(path).await {
-                drop(stream);
-                return Ok(());
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(ToolError::ExecutionFailed(format!(
-                "spawned worker socket did not appear within {timeout:?}: {}",
-                path.display()
-            )));
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-}
-
-fn spawn_delivery_error(worker_name: &str, err: SendRunError) -> ToolError {
-    match err {
-        SendRunError::AlreadyRunning => ToolError::ExecutionFailed(format!(
-            "spawned worker `{worker_name}` rejected its initial task as already running; the worker remains registered and can be inspected or stopped"
-        )),
-        SendRunError::Rejected { code, message } => ToolError::ExecutionFailed(format!(
-            "spawned worker `{worker_name}` rejected its initial task with {code:?}: {message}; the worker remains registered and can be inspected or stopped"
-        )),
-        SendRunError::Io(msg) => ToolError::ExecutionFailed(format!(
-            "spawned worker `{worker_name}` did not confirm initial task delivery: {msg}; the worker remains registered and can be inspected or stopped"
-        )),
-    }
-}
-
-fn worker_allocation_err_to_tool(e: ScopeLockError) -> ToolError {
-    match e {
-        ScopeLockError::NotSubset { .. }
-        | ScopeLockError::WriteConflict { .. }
-        | ScopeLockError::DuplicateWorkerName(_)
-        | ScopeLockError::UnknownWorker(_)
-        | ScopeLockError::InvalidScope { .. }
-        | ScopeLockError::SegmentConflict { .. } => ToolError::InvalidArgument(e.to_string()),
-        ScopeLockError::Io(_) => ToolError::ExecutionFailed(e.to_string()),
-    }
-}
-
 /// Factory for the `SubWorkerSpawn` tool.
 pub fn sub_worker_spawn_tool(
     spawner_name: String,
-    callback_socket: PathBuf,
+    workspace_context: crate::worker::WorkerWorkspaceContext,
+    parent_notifies: crate::ipc::notify_buffer::NotifyBuffer,
     runtime_base: PathBuf,
     workspace_root: PathBuf,
     spawner_cwd: PathBuf,
     registry: Arc<SpawnedWorkerRegistry>,
-    parent_socket: Option<PathBuf>,
     spawner_manifest: WorkerManifest,
     spawner_scope: SharedScope,
     prompts: Arc<PromptCatalog>,
 ) -> ToolDefinition {
     sub_worker_spawn_tool_impl(
         spawner_name,
-        callback_socket,
+        workspace_context,
+        parent_notifies,
         runtime_base,
         workspace_root,
         spawner_cwd,
         registry,
-        parent_socket,
         spawner_manifest,
         spawner_scope,
         prompts,
-        None,
-    )
-}
-
-#[doc(hidden)]
-pub fn sub_worker_spawn_tool_with_runtime_command(
-    spawner_name: String,
-    callback_socket: PathBuf,
-    runtime_base: PathBuf,
-    workspace_root: PathBuf,
-    spawner_cwd: PathBuf,
-    registry: Arc<SpawnedWorkerRegistry>,
-    parent_socket: Option<PathBuf>,
-    spawner_manifest: WorkerManifest,
-    spawner_scope: SharedScope,
-    prompts: Arc<PromptCatalog>,
-    runtime_command: WorkerRuntimeCommand,
-) -> ToolDefinition {
-    sub_worker_spawn_tool_impl(
-        spawner_name,
-        callback_socket,
-        runtime_base,
-        workspace_root,
-        spawner_cwd,
-        registry,
-        parent_socket,
-        spawner_manifest,
-        spawner_scope,
-        prompts,
-        Some(runtime_command),
     )
 }
 
 fn sub_worker_spawn_tool_impl(
     spawner_name: String,
-    callback_socket: PathBuf,
+    workspace_context: crate::worker::WorkerWorkspaceContext,
+    parent_notifies: crate::ipc::notify_buffer::NotifyBuffer,
     runtime_base: PathBuf,
     workspace_root: PathBuf,
     spawner_cwd: PathBuf,
     registry: Arc<SpawnedWorkerRegistry>,
-    parent_socket: Option<PathBuf>,
     spawner_manifest: WorkerManifest,
     spawner_scope: SharedScope,
     prompts: Arc<PromptCatalog>,
-    runtime_command: Option<WorkerRuntimeCommand>,
 ) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(SubWorkerSpawnInput);
@@ -966,7 +777,7 @@ fn sub_worker_spawn_tool_impl(
             )
             .unwrap_or_else(|e| {
                 format!(
-                    "Spawn a new SubWorker process to split context for a delegated task. Profile description rendering failed: {e}. Available profiles:\n{}",
+                    "Spawn an in-process Internal SubWorker session to split context for a delegated task. Profile description rendering failed: {e}. Available profiles:\n{}",
                     available_profiles.compact_list()
                 )
             });
@@ -975,18 +786,17 @@ fn sub_worker_spawn_tool_impl(
             .input_schema(schema_value);
         let tool: Arc<dyn Tool> = Arc::new(SubWorkerSpawnTool::new(
             spawner_name.clone(),
-            callback_socket.clone(),
+            workspace_context.clone(),
+            parent_notifies.clone(),
             runtime_base.clone(),
             workspace_root.clone(),
             spawner_cwd.clone(),
             registry.clone(),
-            parent_socket.clone(),
             spawner_manifest.clone(),
             available_profiles,
             spawner_scope.clone(),
             DelegationScope::from_config(&spawner_manifest.delegation_scope)
                 .expect("resolved Worker manifest has a valid delegation scope"),
-            runtime_command.clone(),
         ));
         (meta, tool)
     })
@@ -995,8 +805,20 @@ fn sub_worker_spawn_tool_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::WorkspaceId;
+    use async_trait::async_trait;
+    use futures::Stream;
+    use llm_engine::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
+    use llm_engine::llm_client::{ClientError, LlmClient, Request};
     use manifest::{AuthRef, ModelManifest, SchemeKind, WorkerManifest};
     use tempfile::TempDir;
+
+    use crate::worker::{
+        WorkspaceClient, WorkspaceClientError, WorkspaceRequest, WorkspaceResponse,
+    };
 
     fn abs_rule(path: &Path, permission: Permission) -> ScopeRule {
         ScopeRule {
@@ -1004,6 +826,119 @@ mod tests {
             permission,
             recursive: true,
         }
+    }
+
+    #[tokio::test]
+    async fn reviewer_profile_spawns_as_workspace_aware_internal_session() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let runtime = TempDir::new().unwrap();
+        let mut manifest = parent_manifest(&workspace_root, None);
+        manifest.delegation_scope = ScopeConfig {
+            allow: vec![abs_rule(&workspace_root, Permission::Read)],
+            deny: Vec::new(),
+        };
+        let spawner_scope = SharedScope::new(Scope::from_config(&manifest.scope).unwrap());
+        let registry = SpawnedWorkerRegistry::new_internal("parent".into(), spawner_scope.clone());
+        let workspace_context = crate::worker::WorkerWorkspaceContext::with_client(
+            Some(WorkspaceId::new("workspace-test").unwrap()),
+            Arc::new(AvailableWorkspaceClient),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let parent_notifies = crate::ipc::notify_buffer::NotifyBuffer::new();
+        let tool = SubWorkerSpawnTool::new(
+            "parent".into(),
+            workspace_context,
+            parent_notifies.clone(),
+            runtime.path().to_path_buf(),
+            workspace_root.clone(),
+            workspace_root.clone(),
+            registry.clone(),
+            manifest.clone(),
+            AvailableProfiles::discover(&workspace_root),
+            spawner_scope,
+            DelegationScope::from_config(&manifest.delegation_scope).unwrap(),
+        )
+        .with_internal_client(Box::new(ScriptedInternalClient {
+            calls: calls.clone(),
+        }));
+        let input = serde_json::json!({
+            "name": "reviewer-child",
+            "profile": "builtin:reviewer",
+            "task": "review immutable commit",
+            "scope": [{
+                "target": workspace_root,
+                "permission": "read",
+                "recursive": true
+            }]
+        });
+
+        let output = tool
+            .execute(
+                &serde_json::to_string(&input).unwrap(),
+                llm_engine::tool::ToolExecutionContext::direct(),
+            )
+            .await
+            .expect("spawn project reviewer as Internal Worker");
+        assert!(output.summary.contains("internal worker `reviewer-child`"));
+        let record = registry
+            .get_internal("reviewer-child")
+            .expect("Internal reviewer registry record");
+        assert_eq!(
+            record.session.wait_until_idle().await,
+            crate::internal_worker::InternalWorkerSessionStatus::Idle
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(parent_notifies.len(), 1);
+        assert!(!runtime.path().join("reviewer-child/sock").exists());
+
+        let context = llm_engine::tool::ToolExecutionContext::direct();
+        let list = (crate::spawn::comm_tools::sub_worker_list_tool(registry.clone()))().1;
+        let listed = list.execute("{}", context.clone()).await.unwrap();
+        assert!(
+            listed
+                .content
+                .unwrap_or_default()
+                .contains("reviewer-child")
+        );
+
+        let read = (crate::spawn::comm_tools::sub_worker_read_output_tool(registry.clone()))().1;
+        let first_output = read
+            .execute(r#"{"name":"reviewer-child"}"#, context.clone())
+            .await
+            .unwrap();
+        assert!(
+            first_output
+                .content
+                .unwrap_or_default()
+                .contains("reviewed")
+        );
+        let second_output = read
+            .execute(r#"{"name":"reviewer-child"}"#, context.clone())
+            .await
+            .unwrap();
+        assert!(second_output.content.is_none());
+
+        let send = (crate::spawn::comm_tools::sub_worker_send_tool(registry.clone()))().1;
+        send.execute(
+            r#"{"name":"reviewer-child","message":"review follow-up"}"#,
+            context.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            record.session.wait_until_idle().await,
+            crate::internal_worker::InternalWorkerSessionStatus::Idle
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let stop = (crate::spawn::comm_tools::sub_worker_stop_tool(registry.clone()))().1;
+        stop.execute(r#"{"name":"reviewer-child"}"#, context)
+            .await
+            .unwrap();
+        assert!(registry.get_internal("reviewer-child").is_none());
     }
 
     #[test]
@@ -1101,6 +1036,58 @@ mod tests {
                 .iter()
                 .any(|rule| !delegation.allows_rule(rule).unwrap())
         );
+    }
+
+    #[derive(Clone)]
+    struct ScriptedInternalClient {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LlmClient for ScriptedInternalClient {
+        fn clone_boxed(&self) -> Box<dyn LlmClient> {
+            Box::new(self.clone())
+        }
+
+        async fn stream(
+            &self,
+            _request: Request,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmEvent, ClientError>> + Send>>, ClientError>
+        {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(LlmEvent::text_block_start(0)),
+                Ok(LlmEvent::text_delta(0, "reviewed")),
+                Ok(LlmEvent::text_block_stop(0, None)),
+                Ok(LlmEvent::Status(StatusEvent {
+                    status: ResponseStatus::Completed,
+                })),
+            ])))
+        }
+    }
+
+    #[derive(Debug)]
+    struct AvailableWorkspaceClient;
+
+    impl WorkspaceClient for AvailableWorkspaceClient {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("workspace-test")
+        }
+
+        fn kind(&self) -> &str {
+            "test"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn execute(
+            &self,
+            _request: WorkspaceRequest,
+        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            Err(WorkspaceClientError::Unavailable("not invoked".into()))
+        }
     }
 
     fn parent_manifest(root: &Path, deny: Option<&Path>) -> WorkerManifest {

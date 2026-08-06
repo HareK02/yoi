@@ -1162,6 +1162,10 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         self.workspace_context.client()
     }
 
+    pub(crate) fn workspace_context_handle(&self) -> WorkerWorkspaceContext {
+        self.workspace_context.clone()
+    }
+
     pub fn workspace_client_handle(&self) -> Arc<dyn WorkspaceClient> {
         self.workspace_context.client_handle()
     }
@@ -3946,6 +3950,79 @@ where
         worker.apply_permissions_from_manifest();
         worker.apply_prune_from_manifest();
         worker.write_worker_metadata_pending()?;
+        Ok(worker)
+    }
+
+    /// Build an in-process Internal Worker without machine-wide allocation or durable Worker metadata.
+    pub(crate) async fn from_internal_manifest_with_context(
+        manifest: WorkerManifest,
+        store: St,
+        loader: PromptLoader,
+        workspace_context: WorkerWorkspaceContext,
+        filesystem_authority: WorkerFilesystemAuthority,
+        client_override: Option<Box<dyn LlmClient>>,
+    ) -> Result<Self, WorkerError> {
+        let mut common = prepare_worker_common_with_context(
+            &manifest,
+            &loader,
+            true,
+            workspace_context,
+            filesystem_authority,
+            manifest.scope.clone(),
+        )?;
+        if let Some(client) = client_override {
+            common.client = client;
+        }
+        let session_id = session_store::new_session_id();
+        let segment_id = session_store::new_segment_id();
+        let mut engine = Engine::new(common.client);
+        apply_worker_manifest(&mut engine, &manifest.engine);
+        engine.set_cache_key(Some(segment_id.to_string()));
+        let scope = SharedScope::new(common.scope);
+        let workdir_session = workdir_session_from_authority(&common.filesystem_authority, &scope);
+        let mut worker = Self {
+            manifest,
+            engine: Some(engine),
+            store,
+            worker_metadata_writer: None,
+            segment_state: SegmentState::new(session_id, segment_id, 0),
+            filesystem_authority: common.filesystem_authority,
+            workdir_session,
+            workspace_context: common.workspace_context,
+            scope,
+            delegation_scope: common.delegation_scope,
+            hook_builder: HookRegistryBuilder::new(),
+            interceptor_installed: false,
+            compact_state: None,
+            usage_tracker: Arc::new(UsageTracker::new()),
+            metrics_tracker: Arc::new(crate::compact::metrics_tracker::MetricsTracker::new()),
+            usage_history: Arc::new(Mutex::new(Vec::new())),
+            tracker: None,
+            task_feature: TaskFeature::new(),
+            system_prompt_template: common.system_prompt_template,
+            feature_instructions: common.feature_instructions,
+            alerter: None,
+            event_tx: None,
+            in_flight: None,
+            ai_activity_counter: Arc::new(AtomicUsize::new(0)),
+            pending_notifies: NotifyBuffer::new(),
+            pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
+            scope_allocation: None,
+            callback_socket: None,
+            runtime_ticket_role: None,
+            prompts: common.prompts,
+            inject_resident_summary: true,
+            extract_in_flight: Arc::new(AtomicBool::new(false)),
+            consolidation_in_flight: Arc::new(AtomicBool::new(false)),
+            extract_pointer: Arc::new(Mutex::new(None)),
+            memory_task: None,
+            user_segments: Vec::new(),
+            sink: SegmentLogSink::new(),
+            history_persistence_wired: false,
+            log_writer: None,
+        };
+        worker.apply_permissions_from_manifest();
+        worker.apply_prune_from_manifest();
         Ok(worker)
     }
 

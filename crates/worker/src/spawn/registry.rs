@@ -1,22 +1,16 @@
-//! Shared registry of Workers spawned by this Worker.
+//! Parent-owned registry of direct Internal SubWorker sessions.
 //!
-//! `SubWorkerSpawn` writes here; the worker-comm tools (`SubWorkerSend`,
-//! `SubWorkerReadOutput`, `SubWorkerStop`) read and mutate the same instance. Discovery
-//! tools consult this registry together with durable Worker state. Runtime
-//! write-through still materialises `spawned_workers.json`, but durable state lives
-//! in the spawner's Worker metadata.
+//! `SubWorkerSpawn` inserts typed `InternalWorkerSessionHandle`s; List/Send/ReadOutput/Stop use
+//! the same in-memory authority. Internal children are not persisted, restored, discovered as
+//! Runtime Workers, or addressed through sockets. Restore consumes any legacy persisted process
+//! child records only to reclaim their delegated scope and clear obsolete metadata.
 //!
-//! `SubWorkerReadOutput` additionally owns a per-spawned-worker cursor here so
-//! two consecutive reads yield only new assistant text. The cursor is
-//! an item-index into the child's history; push-only history makes
-//! index stable across reads.
-//!
-//! Cursors intentionally do not persist; a restored registry starts with
-//! fresh read positions.
+//! `SubWorkerReadOutput` owns a per-child, process-lifetime history cursor so consecutive reads
+//! yield only new assistant text. Parent registry drop closes all session handles and synchronously
+//! returns delegated Write deny rules to the parent scope.
 
 use std::collections::HashMap;
 use std::io;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,7 +19,6 @@ use session_store::{
     WorkerMetadataStore, WorkerReclaimedChild, WorkerSpawnedChild, WorkerSpawnedScopeRule,
     WorkerStoreError,
 };
-use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 use tracing::warn;
 
@@ -36,7 +29,6 @@ use crate::runtime::worker_allocation;
 type RegistryStateWriter = Arc<dyn Fn(&[SpawnedWorkerRecord]) -> io::Result<()> + Send + Sync>;
 type RegistryReclaimWriter = Arc<dyn Fn(&SpawnedWorkerRecord) -> io::Result<()> + Send + Sync>;
 
-const RESTORE_REACHABILITY_TIMEOUT: Duration = Duration::from_millis(500);
 const REGISTRY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
@@ -51,7 +43,7 @@ pub struct SpawnedWorkerRegistry {
     internal_records: std::sync::Mutex<Vec<InternalSpawnedWorkerRecord>>,
     cursors: Mutex<HashMap<String, usize>>,
     mutations: Mutex<()>,
-    runtime_dir: Arc<RuntimeDir>,
+    runtime_dir: Option<Arc<RuntimeDir>>,
     state_writer: Option<RegistryStateWriter>,
     reclaim_writer: Option<RegistryReclaimWriter>,
     parent_name: Option<String>,
@@ -70,11 +62,25 @@ impl SpawnedWorkerRegistry {
             internal_records: std::sync::Mutex::new(Vec::new()),
             cursors: Mutex::new(HashMap::new()),
             mutations: Mutex::new(()),
-            runtime_dir,
+            runtime_dir: Some(runtime_dir),
             state_writer: None,
             reclaim_writer: None,
             parent_name: None,
             parent_scope: None,
+        })
+    }
+
+    pub(crate) fn new_internal(parent_name: String, parent_scope: SharedScope) -> Arc<Self> {
+        Arc::new(Self {
+            records: Mutex::new(Vec::new()),
+            internal_records: std::sync::Mutex::new(Vec::new()),
+            cursors: Mutex::new(HashMap::new()),
+            mutations: Mutex::new(()),
+            runtime_dir: None,
+            state_writer: None,
+            reclaim_writer: None,
+            parent_name: Some(parent_name),
+            parent_scope: Some(parent_scope),
         })
     }
 
@@ -113,7 +119,7 @@ impl SpawnedWorkerRegistry {
             .map(|m| m.spawned_children.clone())
             .unwrap_or_default();
 
-        let mut records = Vec::with_capacity(persisted_children.len());
+        let records = Vec::with_capacity(persisted_children.len());
         let mut pruned_records = Vec::new();
         for child in &persisted_children {
             let record = match record_from_worker_state(child) {
@@ -127,16 +133,11 @@ impl SpawnedWorkerRegistry {
                     continue;
                 }
             };
-            if is_reachable(&record.socket_path).await {
-                records.push(record);
-            } else {
-                warn!(
-                    worker = %record.worker_name,
-                    socket = %record.socket_path.display(),
-                    "dropping unreachable persisted spawned-worker record"
-                );
-                pruned_records.push(record);
-            }
+            warn!(
+                worker = %record.worker_name,
+                "reclaiming legacy persisted process Sub-worker during Internal session restore"
+            );
+            pruned_records.push(record);
         }
 
         runtime_dir.write_spawned_workers(&records).await?;
@@ -183,7 +184,7 @@ impl SpawnedWorkerRegistry {
                 internal_records: std::sync::Mutex::new(Vec::new()),
                 cursors: Mutex::new(HashMap::new()),
                 mutations: Mutex::new(()),
-                runtime_dir,
+                runtime_dir: Some(runtime_dir),
                 state_writer: Some(state_writer),
                 reclaim_writer: Some(reclaim_writer),
                 parent_name: Some(worker_name),
@@ -343,7 +344,9 @@ impl SpawnedWorkerRegistry {
     }
 
     async fn persist_records(&self, records: &[SpawnedWorkerRecord]) -> io::Result<()> {
-        self.runtime_dir.write_spawned_workers(records).await?;
+        if let Some(runtime_dir) = &self.runtime_dir {
+            runtime_dir.write_spawned_workers(records).await?;
+        }
         if let Some(write_state) = &self.state_writer {
             write_state(records)?;
         }
@@ -516,13 +519,24 @@ fn record_from_worker_state(
     })
 }
 
-fn store_error_to_io(error: WorkerStoreError) -> io::Error {
-    io::Error::other(error)
+impl Drop for SpawnedWorkerRegistry {
+    fn drop(&mut self) {
+        let Some(parent_scope) = &self.parent_scope else {
+            return;
+        };
+        let Ok(records) = self.internal_records.lock() else {
+            return;
+        };
+        let write_rules = records
+            .iter()
+            .flat_map(|record| record.scope_delegated.iter())
+            .filter(|rule| rule.permission == Permission::Write)
+            .cloned()
+            .collect::<Vec<_>>();
+        let _ = parent_scope.update(|current| current.with_removed_deny_rules(write_rules));
+    }
 }
 
-async fn is_reachable(socket: &Path) -> bool {
-    tokio::time::timeout(RESTORE_REACHABILITY_TIMEOUT, UnixStream::connect(socket))
-        .await
-        .map(|result| result.is_ok())
-        .unwrap_or(false)
+fn store_error_to_io(error: WorkerStoreError) -> io::Error {
+    io::Error::other(error)
 }

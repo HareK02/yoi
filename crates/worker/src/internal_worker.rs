@@ -228,6 +228,7 @@ impl InternalWorkerSessionStatus {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum InternalWorkerSessionError {
+    #[cfg(test)]
     #[error("failed to build internal Worker session: {message}")]
     Build { message: String },
     #[error("internal Worker session is busy")]
@@ -254,7 +255,6 @@ pub(crate) struct InternalWorkerSessionHandle {
     store: EphemeralSessionStore,
     session_id: SessionId,
     segment_id: SegmentId,
-    last_error: Arc<Mutex<Option<String>>>,
     state_changed: Arc<tokio::sync::Notify>,
 }
 
@@ -267,10 +267,6 @@ impl InternalWorkerSessionHandle {
         self.store
             .read_all(self.session_id, self.segment_id)
             .unwrap_or_default()
-    }
-
-    pub(crate) fn last_error(&self) -> Option<String> {
-        self.last_error.lock().ok().and_then(|error| error.clone())
     }
 
     pub(crate) async fn send(
@@ -310,6 +306,7 @@ impl InternalWorkerSessionHandle {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn wait_until_idle(&self) -> InternalWorkerSessionStatus {
         loop {
             let notified = self.state_changed.notified();
@@ -346,6 +343,7 @@ impl InternalWorkerSessionHandle {
 }
 
 /// Start a reusable Internal Worker session and accept its first turn.
+#[cfg(test)]
 pub(crate) async fn spawn_internal_worker_session(
     spec: InternalWorkerSpec,
 ) -> Result<InternalWorkerSessionHandle, InternalWorkerSessionError> {
@@ -418,13 +416,21 @@ pub(crate) async fn spawn_internal_worker_session(
         });
     }
 
+    spawn_prepared_internal_worker_session(worker, store, input, None).await
+}
+
+pub(crate) async fn spawn_prepared_internal_worker_session(
+    mut worker: Worker<Box<dyn LlmClient>, EphemeralSessionStore>,
+    store: EphemeralSessionStore,
+    input: String,
+    on_turn_end: Option<Arc<dyn Fn(InternalWorkerSessionStatus) + Send + Sync>>,
+) -> Result<InternalWorkerSessionHandle, InternalWorkerSessionError> {
     let session_id = worker.session_id();
     let segment_id = worker.segment_id();
     let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(8);
     let status = Arc::new(std::sync::atomic::AtomicU8::new(
         InternalWorkerSessionStatus::Idle.encode(),
     ));
-    let last_error = Arc::new(Mutex::new(None));
     let state_changed = Arc::new(tokio::sync::Notify::new());
     let handle = InternalWorkerSessionHandle {
         command_tx,
@@ -432,7 +438,6 @@ pub(crate) async fn spawn_internal_worker_session(
         store,
         session_id,
         segment_id,
-        last_error: last_error.clone(),
         state_changed: state_changed.clone(),
     };
 
@@ -445,14 +450,13 @@ pub(crate) async fn spawn_internal_worker_session(
                     loop {
                         tokio::select! {
                             result = &mut run => {
-                                match result {
-                                    Ok(_) => {
-                                        status.store(InternalWorkerSessionStatus::Idle.encode(), std::sync::atomic::Ordering::Release);
-                                    }
-                                    Err(error) => {
-                                        *last_error.lock().expect("internal Worker session error lock") = Some(error.to_string());
-                                        status.store(InternalWorkerSessionStatus::Failed.encode(), std::sync::atomic::Ordering::Release);
-                                    }
+                                let turn_status = match result {
+                                    Ok(_) => InternalWorkerSessionStatus::Idle,
+                                    Err(_) => InternalWorkerSessionStatus::Failed,
+                                };
+                                status.store(turn_status.encode(), std::sync::atomic::Ordering::Release);
+                                if let Some(callback) = &on_turn_end {
+                                    callback(turn_status);
                                 }
                                 state_changed.notify_waiters();
                                 break;
@@ -501,9 +505,10 @@ pub(crate) async fn spawn_internal_worker_session(
 /// Keeping the normal Store contract makes history/lifecycle/error records identical to a normal
 /// Worker while avoiding a second public persistence/catalog policy for helper executions.
 #[derive(Clone, Default)]
-struct EphemeralSessionStore {
+pub(crate) struct EphemeralSessionStore {
     entries: Arc<Mutex<HashMap<(SessionId, SegmentId), Vec<LogEntry>>>>,
     traces: Arc<Mutex<HashMap<(SessionId, SegmentId), Vec<TraceEntry>>>>,
+    worker_metadata: Arc<Mutex<HashMap<String, session_store::WorkerMetadata>>>,
 }
 
 impl EphemeralSessionStore {
@@ -627,6 +632,65 @@ impl Store for EphemeralSessionStore {
             .entry((session_id, segment_id))
             .or_default()
             .push(entry.clone());
+        Ok(())
+    }
+}
+
+impl session_store::WorkerMetadataStore for EphemeralSessionStore {
+    fn write(
+        &self,
+        metadata: &session_store::WorkerMetadata,
+    ) -> Result<(), session_store::WorkerStoreError> {
+        self.worker_metadata
+            .lock()
+            .map_err(|_| {
+                session_store::WorkerStoreError::Io(std::io::Error::other(
+                    "ephemeral metadata lock poisoned",
+                ))
+            })?
+            .insert(metadata.worker_name.clone(), metadata.clone());
+        Ok(())
+    }
+
+    fn read_by_name(
+        &self,
+        worker_name: &str,
+    ) -> Result<Option<session_store::WorkerMetadata>, session_store::WorkerStoreError> {
+        Ok(self
+            .worker_metadata
+            .lock()
+            .map_err(|_| {
+                session_store::WorkerStoreError::Io(std::io::Error::other(
+                    "ephemeral metadata lock poisoned",
+                ))
+            })?
+            .get(worker_name)
+            .cloned())
+    }
+
+    fn list_names(&self) -> Result<Vec<String>, session_store::WorkerStoreError> {
+        Ok(self
+            .worker_metadata
+            .lock()
+            .map_err(|_| {
+                session_store::WorkerStoreError::Io(std::io::Error::other(
+                    "ephemeral metadata lock poisoned",
+                ))
+            })?
+            .keys()
+            .cloned()
+            .collect())
+    }
+
+    fn delete_by_name(&self, worker_name: &str) -> Result<(), session_store::WorkerStoreError> {
+        self.worker_metadata
+            .lock()
+            .map_err(|_| {
+                session_store::WorkerStoreError::Io(std::io::Error::other(
+                    "ephemeral metadata lock poisoned",
+                ))
+            })?
+            .remove(worker_name);
         Ok(())
     }
 }
@@ -802,7 +866,6 @@ permission = "write"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(handle.entries().len() > entries_after_first);
-        assert!(handle.last_error().is_none());
 
         handle.stop().await.expect("stop Internal Worker session");
         assert_eq!(handle.status(), InternalWorkerSessionStatus::Stopped);

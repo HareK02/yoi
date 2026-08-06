@@ -54,9 +54,9 @@ worker_orchestration_guidance_section = "{% include \"$yoi/common/worker-orchest
 ticket_event_companion_notice = "{% include \"$yoi/worker/ticket_event_companion_notice\" %}"
 
 sub_worker_spawn_tool_description = """\
-Spawn a new SubWorker process to split context for a delegated task. The parent Worker's write scope is reduced by the scope passed here; the SubWorker receives its own socket and starts running `task` immediately. The SubWorker outlives the parent Worker's current turn and can be contacted again through its socket path.
+Spawn a parent-owned Internal SubWorker session to split context for a delegated task. The parent Worker's write scope is reduced by the scope passed here; the Internal SubWorker starts running `task` immediately without creating a Runtime Worker record, OS process, PID, or Unix socket. It remains available for follow-up turns until explicitly stopped or its parent exits.
 
-Optional `cwd`: when provided, it is the child process/tool default working directory only. It must be an absolute existing directory covered by the child's delegated readable scope, and it does not change workspace/Profile/memory/Ticket roots or grant authority.
+Optional `cwd`: when provided, it is the Internal SubWorker's tool default working directory only. It must be an absolute existing directory covered by the child's delegated readable scope, and it does not change workspace/Profile/memory/Ticket roots or grant authority. `name` must be unique among this Worker's direct children.
 
 Profile selection: `profile` may be omitted or set to `default` to use the effective child default profile, set to `inherit` to derive reusable child configuration from this Worker, or set to one of the registry selectors below. Raw/path profile selectors are not accepted by SubWorkerSpawn. `scope` is always the only delegated filesystem capability; profile scope is replaced by the explicit SubWorkerSpawn scope.
 

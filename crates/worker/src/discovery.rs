@@ -29,7 +29,6 @@ use session_store::{
 use tokio::net::UnixStream;
 use tokio::process::Command;
 
-use crate::runtime::dir::SpawnedWorkerRecord;
 use crate::runtime::worker_allocation;
 use crate::spawn::comm_tools::connect_and_send;
 use crate::spawn::registry::SpawnedWorkerRegistry;
@@ -44,7 +43,6 @@ pub struct WorkerDiscovery<St> {
     runtime_base: PathBuf,
     cwd: Option<PathBuf>,
     store_dir: Option<PathBuf>,
-    spawned_registry: Arc<SpawnedWorkerRegistry>,
 }
 
 impl<St> WorkerDiscovery<St>
@@ -56,7 +54,7 @@ where
         self_worker_name: String,
         runtime_base: PathBuf,
         cwd: Option<PathBuf>,
-        spawned_registry: Arc<SpawnedWorkerRegistry>,
+        _spawned_registry: Arc<SpawnedWorkerRegistry>,
     ) -> Self {
         let store_dir = store.root_dir();
         Self {
@@ -65,7 +63,6 @@ where
             runtime_base,
             cwd,
             store_dir,
-            spawned_registry,
         }
     }
 
@@ -248,20 +245,6 @@ where
                     .entry(peer.worker_name)
                     .or_insert(VisibilityReason::Peer);
             }
-        }
-
-        // The live in-memory registry covers just-spawned children even if a
-        // state write failed after the process became reachable. It is an
-        // additive visibility hint, not the source of Worker metadata.
-        for record in self.spawned_registry.list().await {
-            visible
-                .entry(record.worker_name.clone())
-                .or_insert(VisibilityReason::SpawnedChild);
-            child_sockets.insert(record.worker_name.clone(), record.socket_path.clone());
-            comm_registry.insert(
-                record.worker_name.clone(),
-                CommRegistryInfo::from_record(&record),
-            );
         }
 
         Ok(VisibilitySet {
@@ -567,14 +550,6 @@ impl CommRegistryInfo {
             registered: false,
             socket_path: None,
             scope_delegated: Vec::new(),
-        }
-    }
-
-    fn from_record(record: &SpawnedWorkerRecord) -> Self {
-        Self {
-            registered: true,
-            socket_path: Some(record.socket_path.clone()),
-            scope_delegated: record.scope_delegated.clone(),
         }
     }
 }

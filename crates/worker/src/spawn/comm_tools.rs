@@ -1,13 +1,9 @@
-//! Worker-to-Worker communication tools.
+//! Parent-facing tools for in-process Internal SubWorker sessions.
 //!
-//! Three tools in one module: `SubWorkerSend`, `SubWorkerReadOutput`, `SubWorkerStop`,
-//! all built on the same `SpawnedWorkerRegistry` handed in by
-//! the controller. Each operation is request-response: connect to the
-//! target's Unix socket, perform one method exchange, disconnect.
-//!
-//! These tools only touch Workers listed in the spawner's
-//! `SpawnedWorkerRegistry`; there is no machine-wide directory lookup, so
-//! the spawner can only reach its own descendants.
+//! All five tools share the same parent-owned `SpawnedWorkerRegistry` of typed session handles.
+//! There is no Runtime catalog lookup or child socket transport, so a Worker can operate only on
+//! its direct Internal children. The socket helper at the bottom remains solely for the legacy
+//! top-level Worker callback protocol and is not part of SubWorker communication.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -17,12 +13,11 @@ use async_trait::async_trait;
 use llm_engine::llm_client::types::{ContentPart, Item, Role};
 use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use protocol::stream::{JsonLineReader, JsonLineWriter};
-use protocol::{ErrorCode, Event, InvokeKind, Method};
+use protocol::{Event, Method};
 use serde::{Deserialize, Serialize};
 use session_store::LogEntry;
 use tokio::net::UnixStream;
 
-use crate::runtime::dir::SpawnedWorkerRecord;
 use crate::spawn::registry::SpawnedWorkerRegistry;
 
 /// Timeout applied to each socket-level operation — connect, write,
@@ -62,7 +57,7 @@ impl Tool for SubWorkerListTool {
         let _input: SubWorkerListInput = serde_json::from_str(input_json).map_err(|error| {
             ToolError::InvalidArgument(format!("invalid SubWorkerList input: {error}"))
         })?;
-        let mut items = self
+        let items = self
             .registry
             .list_internal()
             .into_iter()
@@ -70,15 +65,6 @@ impl Tool for SubWorkerListTool {
                 name: record.worker_name,
             })
             .collect::<Vec<_>>();
-        items.extend(
-            self.registry
-                .list()
-                .await
-                .into_iter()
-                .map(|record| SubWorkerListItem {
-                    name: record.worker_name,
-                }),
-        );
         let count = items.len();
         let content = serde_json::to_string_pretty(&serde_json::json!({ "sub_workers": items }))
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
@@ -142,32 +128,7 @@ impl Tool for SubWorkerSendTool {
                 content: None,
             });
         }
-        let record = self
-            .registry
-            .get(&input.name)
-            .await
-            .ok_or_else(|| unknown_worker_err(&input.name))?;
-
-        send_run_and_confirm(&record.socket_path, input.message)
-            .await
-            .map_err(|e| match e {
-                SendRunError::AlreadyRunning => ToolError::ExecutionFailed(format!(
-                    "worker `{}` is already running a turn; wait for it to finish and retry",
-                    input.name
-                )),
-                SendRunError::Rejected { code, message } => ToolError::ExecutionFailed(format!(
-                    "worker `{}` rejected the run with {code:?}: {message}",
-                    input.name
-                )),
-                SendRunError::Io(msg) => {
-                    ToolError::ExecutionFailed(format!("send to `{}`: {msg}", input.name))
-                }
-            })?;
-
-        Ok(ToolOutput {
-            summary: format!("sent message to `{}`", input.name),
-            content: None,
-        })
+        Err(unknown_worker_err(&input.name))
     }
 }
 
@@ -237,46 +198,7 @@ impl Tool for SubWorkerReadOutputTool {
                 content: (!new_text.is_empty()).then_some(new_text),
             });
         }
-        let record = self
-            .registry
-            .get(&input.name)
-            .await
-            .ok_or_else(|| unknown_worker_err(&input.name))?;
-
-        let items = match fetch_history(&record.socket_path).await {
-            Ok(items) => items,
-            Err(_) => {
-                return Ok(ToolOutput {
-                    summary: format!("worker `{}` is stopped (unreachable)", input.name),
-                    content: None,
-                });
-            }
-        };
-
-        let cursor = self.registry.cursor(&input.name).await;
-        let new_items = if cursor >= items.len() {
-            &[] as &[serde_json::Value]
-        } else {
-            &items[cursor..]
-        };
-        let new_text = extract_assistant_text(new_items);
-        self.registry.set_cursor(&input.name, items.len()).await;
-
-        let summary = if new_text.is_empty() {
-            format!("worker `{}` running; no new assistant text", input.name)
-        } else {
-            let lines = new_text.lines().count();
-            format!(
-                "worker `{}`: {lines} new line(s) of assistant text",
-                input.name
-            )
-        };
-        let content = if new_text.is_empty() {
-            None
-        } else {
-            Some(new_text)
-        };
-        Ok(ToolOutput { summary, content })
+        Err(unknown_worker_err(&input.name))
     }
 }
 
@@ -298,9 +220,7 @@ pub fn sub_worker_read_output_tool(registry: Arc<SpawnedWorkerRegistry>) -> Tool
 // SubWorkerStop
 // ---------------------------------------------------------------------------
 
-const STOP_POD_DESCRIPTION: &str = "Terminate a spawned SubWorker and reclaim the delegated scope. The SubWorker \
-receives `Shutdown`; its scope entry is released in the machine-wide \
-registry so the parent Worker can spawn a new SubWorker over the same paths.";
+const STOP_POD_DESCRIPTION: &str = "Cancel and stop a spawned Internal SubWorker session, remove it from the parent's direct-child registry, and reclaim delegated Write scope.";
 
 struct SubWorkerStopTool {
     registry: Arc<SpawnedWorkerRegistry>,
@@ -331,34 +251,7 @@ impl Tool for SubWorkerStopTool {
                 content: None,
             });
         }
-        let record = self
-            .registry
-            .get(&input.name)
-            .await
-            .ok_or_else(|| unknown_worker_err(&input.name))?;
-
-        // Best-effort Shutdown. The child's own `ScopeAllocationGuard`
-        // releases its entry on clean exit; the parent reclaim below is the
-        // authoritative operation for removing the child record and returning
-        // delegated Write scope to the spawner.
-        let _ = connect_and_send(&record.socket_path, &Method::Shutdown).await;
-
-        let scope_summary = summarize_scope(&record);
-
-        self.registry
-            .remove(&record.worker_name)
-            .await
-            .map_err(|e| {
-                ToolError::ExecutionFailed(format!("update spawned worker registry: {e}"))
-            })?;
-
-        Ok(ToolOutput {
-            summary: format!(
-                "stopped worker `{}`; reclaimed scope: {scope_summary}",
-                record.worker_name
-            ),
-            content: None,
-        })
+        Err(unknown_worker_err(&input.name))
     }
 }
 
@@ -382,29 +275,6 @@ pub fn sub_worker_stop_tool(registry: Arc<SpawnedWorkerRegistry>) -> ToolDefinit
 
 fn unknown_worker_err(name: &str) -> ToolError {
     ToolError::InvalidArgument(format!("no spawned worker named `{name}`"))
-}
-
-fn summarize_scope(record: &SpawnedWorkerRecord) -> String {
-    if record.scope_delegated.is_empty() {
-        return "(none)".into();
-    }
-    let parts: Vec<String> = record
-        .scope_delegated
-        .iter()
-        .map(|rule| {
-            let perm = match rule.permission {
-                manifest::Permission::Read => "read",
-                manifest::Permission::Write => "write",
-            };
-            let recursive = if rule.recursive {
-                ""
-            } else {
-                " [non-recursive]"
-            };
-            format!("{perm}:{}{recursive}", rule.target.display())
-        })
-        .collect();
-    parts.join(", ")
 }
 
 /// Connect with a timeout, drain the server's connect-time snapshot,
@@ -442,125 +312,6 @@ where
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))??;
         match event {
             Some(Event::Snapshot { .. }) => return Ok(()),
-            Some(_) => continue,
-            None => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "worker closed connection before Snapshot event",
-                ));
-            }
-        }
-    }
-}
-
-/// Failure modes distinguished by `SubWorkerSend`.
-#[derive(Debug)]
-pub(crate) enum SendRunError {
-    /// Target SubWorker responded with `Error { AlreadyRunning }` — the
-    /// caller can retry once the current turn ends.
-    AlreadyRunning,
-    /// Target SubWorker explicitly rejected the run after delivery reached the
-    /// controller.
-    Rejected { code: ErrorCode, message: String },
-    /// Transport, protocol, timeout, or unexpected EOF before acceptance
-    /// evidence was observed.
-    Io(String),
-}
-
-/// Write `Method::Run` to the target and read back events until we see
-/// evidence that the controller accepted the run (`UserMessage`,
-/// `TurnStart`, or a user-send `InvokeStart`) or rejected it. The connect-time
-/// event prelude is drained before sending the method so large Snapshots and
-/// large Run payloads cannot block each other on the same socket. Times out
-/// per operation so a stuck Worker doesn't hang the tool.
-pub(crate) async fn send_run_and_confirm(socket: &Path, input: String) -> Result<(), SendRunError> {
-    let stream = tokio::time::timeout(SOCKET_OP_TIMEOUT, UnixStream::connect(socket))
-        .await
-        .map_err(|_| SendRunError::Io("connect timed out".into()))?
-        .map_err(|e| SendRunError::Io(format!("connect: {e}")))?;
-    let (r, w) = stream.into_split();
-    let mut writer = JsonLineWriter::new(w);
-    let mut reader = JsonLineReader::new(r);
-
-    loop {
-        let event = tokio::time::timeout(SOCKET_OP_TIMEOUT, reader.next::<Event>())
-            .await
-            .map_err(|_| SendRunError::Io("read initial Snapshot timed out".into()))?
-            .map_err(|e| SendRunError::Io(format!("read initial Snapshot: {e}")))?;
-        match event {
-            Some(Event::Snapshot { .. }) => break,
-            Some(Event::Alert(_)) => continue,
-            Some(Event::Error {
-                code: ErrorCode::AlreadyRunning,
-                ..
-            }) => return Err(SendRunError::AlreadyRunning),
-            Some(Event::Error { code, message }) => {
-                return Err(SendRunError::Rejected { code, message });
-            }
-            Some(_) => continue,
-            None => {
-                return Err(SendRunError::Io(
-                    "connection closed before initial Snapshot".into(),
-                ));
-            }
-        }
-    }
-
-    tokio::time::timeout(
-        SOCKET_OP_TIMEOUT,
-        writer.write(&Method::Run {
-            input: vec![protocol::Segment::text(input)],
-        }),
-    )
-    .await
-    .map_err(|_| SendRunError::Io("write timed out".into()))?
-    .map_err(|e| SendRunError::Io(format!("write: {e}")))?;
-    loop {
-        let event = tokio::time::timeout(SOCKET_OP_TIMEOUT, reader.next::<Event>())
-            .await
-            .map_err(|_| SendRunError::Io("read response timed out".into()))?
-            .map_err(|e| SendRunError::Io(format!("read response: {e}")))?;
-        match event {
-            Some(Event::Error {
-                code: ErrorCode::AlreadyRunning,
-                ..
-            }) => return Err(SendRunError::AlreadyRunning),
-            Some(Event::Error { code, message }) => {
-                return Err(SendRunError::Rejected { code, message });
-            }
-            Some(Event::InvokeStart {
-                kind: InvokeKind::UserSend,
-            })
-            | Some(Event::UserMessage { .. })
-            | Some(Event::TurnStart { .. }) => return Ok(()),
-            // Other post-Snapshot events can race with the controller's
-            // response; keep reading until the Run is accepted or rejected.
-            Some(_) => continue,
-            None => return Err(SendRunError::Io("connection closed before response".into())),
-        }
-    }
-}
-
-/// Connect to a Worker's socket and read the connect-time `Event::Snapshot`.
-///
-/// Workers deliver the session-log mirror as the first non-Alert event on
-/// every new connection, so consuming it is sufficient — no explicit
-/// `GetHistory` method round trip. Returns the entries as raw JSON
-/// values; callers deserialize as `session_store::LogEntry` if they
-/// need typed access.
-async fn fetch_history(socket: &Path) -> std::io::Result<Vec<serde_json::Value>> {
-    let stream = tokio::time::timeout(SOCKET_OP_TIMEOUT, UnixStream::connect(socket))
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out"))??;
-    let (r, _w) = stream.into_split();
-    let mut reader = JsonLineReader::new(r);
-
-    loop {
-        let event = tokio::time::timeout(SOCKET_OP_TIMEOUT, reader.next::<Event>())
-            .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))??;
-        match event {
-            Some(Event::Snapshot { entries, .. }) => return Ok(entries),
             Some(_) => continue,
             None => {
                 return Err(std::io::Error::new(
@@ -654,119 +405,6 @@ mod tests {
             }
             reader.next::<Method>().await.ok().flatten()
         })
-    }
-
-    fn serve_initial_events_then_run_ack(
-        listener: UnixListener,
-        initial_events: Vec<Event>,
-        ack: Event,
-    ) -> JoinHandle<Option<Method>> {
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.ok()?;
-            let (r, w) = stream.into_split();
-            let mut reader = JsonLineReader::new(r);
-            let mut writer = JsonLineWriter::new(w);
-            for event in initial_events {
-                writer.write(&event).await.ok()?;
-            }
-            let method = reader.next::<Method>().await.ok().flatten()?;
-            writer.write(&ack).await.ok()?;
-            Some(method)
-        })
-    }
-
-    #[tokio::test]
-    async fn send_run_and_confirm_keeps_connection_open_until_user_message_ack() {
-        let tmp = TempDir::new().unwrap();
-        let socket = tmp.path().join("worker.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let received = serve_initial_events_then_run_ack(
-            listener,
-            vec![
-                Event::Alert(Alert {
-                    level: AlertLevel::Warn,
-                    source: AlertSource::Worker,
-                    message: "replayed alert".into(),
-                    timestamp_ms: 0,
-                }),
-                snapshot(Vec::new()),
-            ],
-            Event::UserMessage {
-                segments: vec![protocol::Segment::text("hello")],
-            },
-        );
-
-        send_run_and_confirm(&socket, "hello".into()).await.unwrap();
-
-        let method = received.await.unwrap().expect("expected method");
-        match method {
-            Method::Run { input } => {
-                assert_eq!(protocol::Segment::flatten_to_text(&input), "hello");
-            }
-            other => panic!("expected Run, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn send_run_and_confirm_drains_alert_and_large_snapshot_before_large_run() {
-        let tmp = TempDir::new().unwrap();
-        let socket = tmp.path().join("worker.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let large_snapshot_payload = "s".repeat(2 * 1024 * 1024);
-        let large_run_payload = "r".repeat(2 * 1024 * 1024);
-        let received = serve_initial_events_then_run_ack(
-            listener,
-            vec![
-                Event::Alert(Alert {
-                    level: AlertLevel::Warn,
-                    source: AlertSource::Worker,
-                    message: "replayed alert".into(),
-                    timestamp_ms: 0,
-                }),
-                snapshot(vec![
-                    serde_json::json!({ "payload": large_snapshot_payload }),
-                ]),
-            ],
-            Event::InvokeStart {
-                kind: InvokeKind::UserSend,
-            },
-        );
-
-        send_run_and_confirm(&socket, large_run_payload.clone())
-            .await
-            .unwrap();
-
-        let method = received.await.unwrap().expect("expected method");
-        match method {
-            Method::Run { input } => {
-                assert_eq!(
-                    protocol::Segment::flatten_to_text(&input),
-                    large_run_payload
-                );
-            }
-            other => panic!("expected Run, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn send_run_and_confirm_reports_already_running() {
-        let tmp = TempDir::new().unwrap();
-        let socket = tmp.path().join("worker.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let received = serve_initial_events_then_run_ack(
-            listener,
-            vec![snapshot(Vec::new())],
-            Event::Error {
-                code: ErrorCode::AlreadyRunning,
-                message: "busy".into(),
-            },
-        );
-
-        let err = send_run_and_confirm(&socket, "hello".into())
-            .await
-            .expect_err("expected AlreadyRunning");
-        assert!(matches!(err, SendRunError::AlreadyRunning));
-        assert!(matches!(received.await.unwrap(), Some(Method::Run { .. })));
     }
 
     #[tokio::test]

@@ -336,7 +336,6 @@ impl WorkerController {
         let fs_for_view = register_worker_tools(
             &mut worker,
             bash_output_dir,
-            runtime_dir.socket_path(),
             runtime_base.to_path_buf(),
             spawned_registry.clone(),
         )
@@ -585,10 +584,9 @@ fn wire_event_bridges_on_engine<C, St>(
 /// and the Worker-orchestration tools (SubWorkerSpawn + comm) on the Worker's
 /// Engine. Returns the WorkdirSession handle used to attach a `WorkerFsView` to
 /// the shared state.
-async fn register_worker_tools<C, St>(
+pub(crate) async fn register_worker_tools<C, St>(
     worker: &mut Worker<C, St>,
     bash_output_dir: PathBuf,
-    spawner_socket: PathBuf,
     runtime_base: PathBuf,
     spawned_registry: Arc<SpawnedWorkerRegistry>,
 ) -> std::io::Result<Option<workdir::WorkdirSessionHandle>>
@@ -620,9 +618,9 @@ where
     let mcp_config = worker.manifest().mcp.clone();
     let spawner_name = worker.manifest().worker.name.clone();
     let spawner_manifest = worker.manifest().clone();
+    let spawner_workspace_context = worker.workspace_context_handle();
+    let parent_notifies = worker.notify_buffer_handle();
     let prompts = worker.prompts().clone();
-    let self_parent_socket = worker.callback_socket().cloned();
-
     // Resolve the existing Worker–Workdir binding into the domain provider.
     // Tools only consume the provider handle; they do not own its root, cwd,
     // scope, or lifecycle. No-workdir Workers expose no local tools.
@@ -787,12 +785,6 @@ where
         // profile feature and require delegation authority up front so enabling
         // the surface cannot imply broad child scope by accident.
         if feature_config.sub_worker.enabled {
-            if spawner_manifest.delegation_scope.allow.is_empty() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "[feature.sub_worker].enabled = true requires non-empty [[delegation_scope.allow]]",
-                ));
-            }
             let spawner_cwd = local_filesystem
                 .as_ref()
                 .map(|local| local.cwd.clone())
@@ -810,12 +802,12 @@ where
             })?;
             engine.register_tool(sub_worker_spawn_tool(
                 spawner_name.clone(),
-                spawner_socket,
+                spawner_workspace_context,
+                parent_notifies,
                 runtime_base.clone(),
                 spawner_workspace_root,
                 spawner_cwd.clone(),
                 spawned_registry.clone(),
-                self_parent_socket,
                 spawner_manifest,
                 scope_handle,
                 prompts,
