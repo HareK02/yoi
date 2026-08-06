@@ -113,7 +113,10 @@ impl SpawnedWorkerRegistry {
 
         // Runtime projection is migration input only; the normal Internal registry is never
         // materialized into spawned_workers.json.
-        runtime_dir.write_spawned_workers(&[]).await?;
+        let legacy_projection_exists = runtime_dir.path().join("spawned_workers.json").exists();
+        if !persisted_children.is_empty() || legacy_projection_exists {
+            runtime_dir.write_spawned_workers(&[]).await?;
+        }
         if !persisted_children.is_empty() {
             let reclaimed = persisted_children
                 .iter()
