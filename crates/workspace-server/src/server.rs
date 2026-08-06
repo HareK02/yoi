@@ -4,9 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION, ORIGIN, SET_COOKIE};
-use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
@@ -487,6 +488,35 @@ impl WorkspaceApi {
                 );
                 return Err(error);
             }
+            let compensation_context = WorkerSpawnCompensationContext {
+                assignment: None,
+                prepared_workdir_id: Some(workdir_id.as_str()),
+                cleanup_spawned_workdir: false,
+            };
+            let registry_result = record_worker_summary(
+                self,
+                worker,
+                worker.label.as_str(),
+                worker.profile.clone(),
+                WorkerRegistryDisplayNamePolicy::PreserveExisting,
+            )
+            .map(|_| ());
+            if let Err(mut error) = finalize_worker_spawn_stage(
+                self,
+                worker,
+                &compensation_context,
+                WorkerSpawnFinalizeStage::WorkerRegistry,
+                registry_result,
+            ) {
+                append_attachment_reservation_release_diagnostic(
+                    self,
+                    workdir_id,
+                    reservation_id,
+                    &mut error,
+                );
+                return Err(error);
+            }
+
             let attachment = WorkerWorkdirLinkRecord {
                 workspace_id: self.config.workspace_id.clone(),
                 worker: worker_ref.clone(),
@@ -495,17 +525,24 @@ impl WorkspaceApi {
                 linked_at: now_registry_timestamp(),
                 unlinked_at: None,
             };
-            if let Err(error) = self
+            let attachment_result = self
                 .store
                 .finalize_reserved_worker_workdir_attachment(&attachment, reservation_id)
-            {
-                let _ = self.runtime.delete_worker(&worker_ref);
-                let _ = self.store.release_worker_workdir_attachment_reservation(
-                    &self.config.workspace_id,
+                .map_err(ApiError::from);
+            if let Err(mut error) = finalize_worker_spawn_stage(
+                self,
+                worker,
+                &compensation_context,
+                WorkerSpawnFinalizeStage::WorkdirAttachment,
+                attachment_result,
+            ) {
+                append_attachment_reservation_release_diagnostic(
+                    self,
                     workdir_id,
                     reservation_id,
+                    &mut error,
                 );
-                return Err(error.into());
+                return Err(error);
             }
         }
         Ok(result)
@@ -1055,6 +1092,63 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         )
         .fallback(get(static_or_spa_fallback))
         .with_state(api)
+        .layer(middleware::from_fn(log_failed_api_response))
+}
+
+async fn log_failed_api_response(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let response = next.run(request).await;
+    let status = response.status();
+
+    if uri.path().starts_with("/api/") && (status.is_client_error() || status.is_server_error()) {
+        let error = response.extensions().get::<ApiErrorLog>();
+        eprintln!(
+            "{} yoi-server {}",
+            Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            failed_api_log_json(&method, &uri, status, error)
+        );
+    }
+
+    response
+}
+
+fn failed_api_log_json(
+    method: &Method,
+    uri: &Uri,
+    status: StatusCode,
+    error: Option<&ApiErrorLog>,
+) -> String {
+    let event = ApiFailureLogEvent {
+        event: "api_error",
+        method: method.as_str(),
+        path: uri.path(),
+        status: status.as_u16(),
+        kind: error.map(|error| error.kind.as_str()),
+        message: error.map(|error| error.message.as_str()),
+        diagnostics: error.map(|error| error.diagnostics.as_slice()),
+    };
+    serde_json::to_string(&event).unwrap_or_else(|serialization_error| {
+        format!(
+            "{{\"event\":\"api_error\",\"status\":{},\"log_serialization_error\":{:?}}}",
+            status.as_u16(),
+            serialization_error.to_string()
+        )
+    })
+}
+
+#[derive(Serialize)]
+struct ApiFailureLogEvent<'a> {
+    event: &'static str,
+    method: &'a str,
+    path: &'a str,
+    status: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<&'a [RuntimeDiagnostic]>,
 }
 
 pub async fn serve(
@@ -6932,6 +7026,27 @@ fn finalize_worker_spawn_stage<T>(
     ))
 }
 
+fn append_attachment_reservation_release_diagnostic(
+    api: &WorkspaceApi,
+    workdir_id: &str,
+    reservation_id: &str,
+    error: &mut ApiError,
+) {
+    if let Err(release_error) = api.store.release_worker_workdir_attachment_reservation(
+        &api.config.workspace_id,
+        workdir_id,
+        reservation_id,
+    ) {
+        error.diagnostics.push(spawn_compensation_diagnostic(
+            "worker_spawn_compensation_attachment_reservation_release_failed",
+            format!(
+                "Failed to release Workdir `{workdir_id}` attachment reservation `{reservation_id}`: {}",
+                sanitize_backend_error(&release_error.to_string())
+            ),
+        ));
+    }
+}
+
 fn compensate_failed_worker_spawn(
     api: &WorkspaceApi,
     worker: &WorkerSummary,
@@ -9427,6 +9542,13 @@ struct ApiError {
     diagnostics: Vec<RuntimeDiagnostic>,
 }
 
+#[derive(Debug, Clone)]
+struct ApiErrorLog {
+    kind: String,
+    message: String,
+    diagnostics: Vec<RuntimeDiagnostic>,
+}
+
 impl From<Error> for ApiError {
     fn from(error: Error) -> Self {
         let diagnostics = match &error {
@@ -9559,7 +9681,22 @@ impl IntoResponse for ApiError {
             }
             _ => sanitize_backend_error(&self.error.to_string()),
         };
-        (
+        let log = ApiErrorLog {
+            kind: self
+                .diagnostics
+                .first()
+                .map(|diagnostic| diagnostic.code.clone())
+                .unwrap_or_else(|| {
+                    status
+                        .canonical_reason()
+                        .unwrap_or("api_error")
+                        .to_ascii_lowercase()
+                        .replace(' ', "_")
+                }),
+            message: response_message.clone(),
+            diagnostics: self.diagnostics.clone(),
+        };
+        let mut response = (
             status,
             [(CONTENT_TYPE, "application/json")],
             Json(serde_json::json!({
@@ -9569,7 +9706,9 @@ impl IntoResponse for ApiError {
             }))
             .to_string(),
         )
-            .into_response()
+            .into_response();
+        response.extensions_mut().insert(log);
+        response
     }
 }
 
@@ -9596,6 +9735,46 @@ mod tests {
         MemoryDocumentRecord, MemoryStagingRecord, ObjectiveRecord, ObjectiveResourceRecord,
         ObjectiveTicketLinkRecord, SqliteWorkspaceStore, WorkspaceRecord,
     };
+
+    #[test]
+    fn failed_api_log_is_structured_and_omits_query_values() {
+        let uri = "/api/w/workspace/tickets?access_token=secret"
+            .parse::<Uri>()
+            .expect("valid URI");
+        let error = ApiErrorLog {
+            kind: "ticket_backend_error".to_string(),
+            message: "sqlite error: FOREIGN KEY constraint failed".to_string(),
+            diagnostics: vec![RuntimeDiagnostic {
+                code: "ticket_backend_error".to_string(),
+                severity: DiagnosticSeverity::Error,
+                message: "FOREIGN KEY constraint failed".to_string(),
+            }],
+        };
+
+        let line = failed_api_log_json(
+            &Method::POST,
+            &uri,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Some(&error),
+        );
+        let event: Value = serde_json::from_str(&line).expect("structured JSON log");
+
+        assert_eq!(event["event"], "api_error");
+        assert_eq!(event["method"], "POST");
+        assert_eq!(event["path"], "/api/w/workspace/tickets");
+        assert_eq!(event["status"], 500);
+        assert_eq!(event["kind"], "ticket_backend_error");
+        assert_eq!(
+            event["message"],
+            "sqlite error: FOREIGN KEY constraint failed"
+        );
+        assert_eq!(
+            event["diagnostics"][0]["message"],
+            "FOREIGN KEY constraint failed"
+        );
+        assert!(!line.contains("access_token"));
+        assert!(!line.contains("secret"));
+    }
 
     const TEST_WORKSPACE_ID: &str = "0192f0e8-4d84-7d6e-a000-000000000001";
     const TEST_REPOSITORY_ID: &str = "main";
