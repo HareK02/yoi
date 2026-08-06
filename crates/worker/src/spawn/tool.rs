@@ -364,27 +364,10 @@ impl Tool for SubWorkerSpawnTool {
         .map_err(|error| {
             ToolError::ExecutionFailed(format!("install Internal Worker features: {error}"))
         })?;
-        let child_name = input.name.clone();
-        let parent_notifies = self.parent_notifies.clone();
-        let session = spawn_prepared_internal_worker_session(
-            child,
-            store,
-            input.task.clone(),
-            Some(Arc::new(move |status| {
-                parent_notifies.push_notify(
-                    format!("SubWorker `{child_name}` turn ended with status {status:?}. Read its output before making completion decisions."),
-                    false,
-                );
-            })),
-        )
-            .await
-            .map_err(|error| {
-                ToolError::ExecutionFailed(format!("start Internal Worker session: {error}"))
-            })?;
-
-        // Transfer delegated Write authority within this parent-owned process. The machine-wide
-        // allocation remains owned by the parent Worker; no fake child PID/socket identity is
-        // introduced.
+        // Transfer delegated Write authority before the child accepts its first turn. This closes
+        // the parallel-tool window where parent and child could otherwise both write the same path.
+        // The machine-wide allocation remains owned by the parent Worker; no fake child PID/socket
+        // identity is introduced.
         let revoke_write: Vec<ScopeRule> = scope_allow
             .iter()
             .filter(|rule| rule.permission == Permission::Write)
@@ -397,6 +380,34 @@ impl Tool for SubWorkerSpawnTool {
                     ToolError::ExecutionFailed(format!("revoke spawner scope: {error}"))
                 })?;
         }
+
+        let child_name = input.name.clone();
+        let parent_notifies = self.parent_notifies.clone();
+        let session_result = spawn_prepared_internal_worker_session(
+            child,
+            store,
+            input.task.clone(),
+            Some(Arc::new(move |status| {
+                parent_notifies.push_notify(
+                    format!("SubWorker `{child_name}` turn ended with status {status:?}. Read its output before making completion decisions."),
+                    false,
+                );
+            })),
+        )
+        .await;
+        let session = match session_result {
+            Ok(session) => session,
+            Err(error) => {
+                if !revoke_write.is_empty() {
+                    let _ = self
+                        .spawner_scope
+                        .update(|current| current.with_removed_deny_rules(revoke_write.clone()));
+                }
+                return Err(ToolError::ExecutionFailed(format!(
+                    "start Internal Worker session: {error}"
+                )));
+            }
+        };
 
         let record = crate::spawn::registry::InternalSpawnedWorkerRecord {
             worker_name: input.name.clone(),
@@ -846,6 +857,7 @@ mod tests {
             Arc::new(AvailableWorkspaceClient),
         );
         let calls = Arc::new(AtomicUsize::new(0));
+        let observed_parent_write_revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let parent_notifies = crate::ipc::notify_buffer::NotifyBuffer::new();
         let tool = SubWorkerSpawnTool::new(
             "parent".into(),
@@ -862,6 +874,9 @@ mod tests {
         )
         .with_internal_client(Box::new(ScriptedInternalClient {
             calls: calls.clone(),
+            parent_scope: spawner_scope.clone(),
+            delegated_path: workspace_root.clone(),
+            observed_parent_write_revoked: observed_parent_write_revoked.clone(),
         }));
         let input = serde_json::json!({
             "name": "reviewer-child",
@@ -893,6 +908,7 @@ mod tests {
             crate::internal_worker::InternalWorkerSessionStatus::Idle
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(observed_parent_write_revoked.load(Ordering::SeqCst));
         assert_eq!(parent_notifies.len(), 1);
         assert!(!runtime.path().join("reviewer-child/sock").exists());
 
@@ -1061,6 +1077,9 @@ mod tests {
     #[derive(Clone)]
     struct ScriptedInternalClient {
         calls: Arc<AtomicUsize>,
+        parent_scope: SharedScope,
+        delegated_path: PathBuf,
+        observed_parent_write_revoked: Arc<std::sync::atomic::AtomicBool>,
     }
 
     #[async_trait]
@@ -1075,6 +1094,13 @@ mod tests {
         ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmEvent, ClientError>> + Send>>, ClientError>
         {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.observed_parent_write_revoked.store(
+                !self
+                    .parent_scope
+                    .snapshot()
+                    .is_writable(&self.delegated_path),
+                Ordering::SeqCst,
+            );
             Ok(Box::pin(futures::stream::iter(vec![
                 Ok(LlmEvent::text_block_start(0)),
                 Ok(LlmEvent::text_delta(0, "reviewed")),
