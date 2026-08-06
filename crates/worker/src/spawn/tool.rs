@@ -942,6 +942,23 @@ mod tests {
             .unwrap();
         assert!(registry.get_internal("reviewer-child").is_none());
         assert!(spawner_scope.snapshot().is_writable(&workspace_root));
+
+        let mut teardown_input = input;
+        teardown_input["name"] = serde_json::json!("reviewer-child-parent-drop");
+        tool.execute(
+            &serde_json::to_string(&teardown_input).unwrap(),
+            llm_engine::tool::ToolExecutionContext::direct(),
+        )
+        .await
+        .unwrap();
+        assert!(!spawner_scope.snapshot().is_writable(&workspace_root));
+        drop(list);
+        drop(read);
+        drop(send);
+        drop(stop);
+        drop(tool);
+        drop(registry);
+        assert!(spawner_scope.snapshot().is_writable(&workspace_root));
     }
 
     #[test]
