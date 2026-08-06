@@ -72,15 +72,19 @@ pub(crate) struct InternalWorkerError {
 pub(crate) async fn run_internal_worker(
     spec: InternalWorkerSpec,
 ) -> Result<InternalWorkerResult, InternalWorkerError> {
-    run_internal_worker_with_prepare(spec, |_| {}).await
+    run_internal_worker_with_cancel_sender(spec, |_| {}).await
 }
 
-async fn run_internal_worker_with_prepare<F>(
+/// Execute an internal job while exposing only its cancellation capability to the caller.
+///
+/// This keeps the Internal Worker instance and its ephemeral session private while allowing an
+/// owning caller to route a real cancellation through the normal Engine lifecycle.
+pub(crate) async fn run_internal_worker_with_cancel_sender<F>(
     spec: InternalWorkerSpec,
-    prepare: F,
+    on_cancel_sender: F,
 ) -> Result<InternalWorkerResult, InternalWorkerError>
 where
-    F: FnOnce(&mut Worker<Box<dyn LlmClient>, EphemeralSessionStore>),
+    F: FnOnce(tokio::sync::mpsc::Sender<()>),
 {
     let InternalWorkerSpec {
         identity,
@@ -173,7 +177,7 @@ where
     }
     let session_id = worker.session_id();
     let segment_id = worker.segment_id();
-    prepare(&mut worker);
+    on_cancel_sender(worker.engine_mut().cancel_sender());
 
     match worker.run_text(&input).await {
         Ok(lifecycle) => Ok(InternalWorkerResult {
@@ -465,18 +469,18 @@ permission = "write"
         });
         let prepare_sender = cancel_sender.clone();
 
-        let result = match run_internal_worker_with_prepare(internal_spec, move |worker| {
-            *prepare_sender.lock().expect("cancel sender lock") =
-                Some(worker.engine_mut().cancel_sender());
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => panic!(
-                "Worker rollback should remain a lifecycle result: {:?}",
-                error.source
-            ),
-        };
+        let result =
+            match run_internal_worker_with_cancel_sender(internal_spec, move |cancel_sender| {
+                *prepare_sender.lock().expect("cancel sender lock") = Some(cancel_sender);
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => panic!(
+                    "Worker rollback should remain a lifecycle result: {:?}",
+                    error.source
+                ),
+            };
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(matches!(result.lifecycle, WorkerRunResult::RolledBack));

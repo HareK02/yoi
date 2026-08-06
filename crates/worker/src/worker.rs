@@ -45,6 +45,7 @@ use crate::hook::{
 use crate::in_flight::InFlightEvents;
 use crate::internal_worker::{
     InternalWorkerAuthority, InternalWorkerIdentity, InternalWorkerSpec, run_internal_worker,
+    run_internal_worker_with_cancel_sender,
 };
 
 const COMPACTION_EXTENSION_DOMAIN: &str = "yoi.compaction";
@@ -3245,6 +3246,16 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         memory_cfg: &manifest::MemoryConfig,
         threshold: u64,
     ) -> Result<ExtractDecision, WorkerError> {
+        self.run_extract_once_with_cancel_observer(memory_cfg, threshold, None)
+            .await
+    }
+
+    async fn run_extract_once_with_cancel_observer(
+        &mut self,
+        memory_cfg: &manifest::MemoryConfig,
+        threshold: u64,
+        cancel_observer: Option<Box<dyn FnOnce(tokio::sync::mpsc::Sender<()>) + Send + 'static>>,
+    ) -> Result<ExtractDecision, WorkerError> {
         use memory::extract;
 
         let model = memory_cfg
@@ -3441,7 +3452,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             .with_module(SessionExploreFeature::new(session_explore_state.clone()));
         let mut internal_manifest = self.manifest.clone();
         internal_manifest.model = model.clone();
-        let internal_result = run_internal_worker(InternalWorkerSpec {
+        let internal_spec = InternalWorkerSpec {
             identity: InternalWorkerIdentity {
                 kind: "memory-extract",
                 run_id: audit.run_id,
@@ -3464,8 +3475,11 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 filesystem: WorkerFilesystemAuthority::None,
                 scope: Scope::empty(),
             },
-        })
-        .await;
+        };
+        let internal_result = match cancel_observer {
+            Some(observer) => run_internal_worker_with_cancel_sender(internal_spec, observer).await,
+            None => run_internal_worker(internal_spec).await,
+        };
         let usage = match internal_result {
             Ok(result) => {
                 tracing::debug!(
@@ -5674,6 +5688,104 @@ mod build_summary_prompt_tests {
     }
 
     #[derive(Clone)]
+    struct CancelBeforeAiExtractClient {
+        cancel_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<()>>>>,
+    }
+
+    #[async_trait]
+    impl LlmClient for CancelBeforeAiExtractClient {
+        async fn stream(
+            &self,
+            _request: llm_engine::llm_client::Request,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<
+                                llm_engine::llm_client::event::Event,
+                                llm_engine::llm_client::ClientError,
+                            >,
+                        > + Send,
+                >,
+            >,
+            llm_engine::llm_client::ClientError,
+        > {
+            let tx = self
+                .cancel_tx
+                .lock()
+                .expect("cancel sender lock")
+                .clone()
+                .expect("extract caller must install the Internal Worker cancel sender");
+            tx.send(()).await.expect("cancel Internal Worker");
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        fn clone_boxed(&self) -> Box<dyn LlmClient> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingAuditWorkspaceClient {
+        requests: Mutex<Vec<WorkspaceRequest>>,
+    }
+
+    impl RecordingAuditWorkspaceClient {
+        fn lifecycle_audits(&self) -> Vec<memory::audit::WorkerLifecycleAudit> {
+            self.requests
+                .lock()
+                .expect("recorded workspace requests lock")
+                .iter()
+                .filter_map(|request| {
+                    let operation: memory::backend::MemoryBackendOperation = serde_json::from_str(
+                        request
+                            .body
+                            .as_deref()
+                            .expect("memory backend operation body"),
+                    )
+                    .expect("memory backend operation");
+                    match operation {
+                        memory::backend::MemoryBackendOperation::AppendAudit(operation) => {
+                            match operation.event.payload {
+                                memory::audit::AuditPayload::WorkerLifecycle(audit) => Some(audit),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    }
+                })
+                .collect()
+        }
+    }
+
+    impl WorkspaceClient for RecordingAuditWorkspaceClient {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("workspace-test")
+        }
+
+        fn kind(&self) -> &str {
+            "recording-audit"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn execute(
+            &self,
+            request: WorkspaceRequest,
+        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            self.requests
+                .lock()
+                .expect("recorded workspace requests lock")
+                .push(request);
+            Err(WorkspaceClientError::Unavailable(
+                "audit response is irrelevant to this regression test".to_string(),
+            ))
+        }
+    }
+
+    #[derive(Clone)]
     struct NoopClient;
 
     #[async_trait]
@@ -6345,17 +6457,138 @@ mod build_summary_prompt_tests {
         server.join().unwrap();
     }
 
-    #[test]
-    fn rolled_back_internal_extract_is_cancelled_before_pointer_commit() {
-        let error = extract_internal_worker_lifecycle_error(&WorkerRunResult::RolledBack)
-            .expect("rolled-back extract must not enter the success path");
+    #[tokio::test]
+    async fn cancelled_internal_extract_does_not_commit_pointer_or_completed_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let cancel_tx = Arc::new(Mutex::new(None));
+        let client = CancelBeforeAiExtractClient {
+            cancel_tx: cancel_tx.clone(),
+        };
+        let audit_client = Arc::new(RecordingAuditWorkspaceClient::default());
+        let mut manifest = minimal_manifest();
+        manifest.memory = Some(manifest::MemoryConfig {
+            extract_threshold: Some(1),
+            ..Default::default()
+        });
+        let memory_config = manifest.memory.clone().unwrap();
+        let mut worker = Worker::new(
+            manifest,
+            Engine::new(client),
+            store,
+            WorkerWorkspaceContext::with_client(
+                Some(WorkspaceId::new("workspace-test").unwrap()),
+                audit_client.clone(),
+            ),
+            WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone()),
+            Scope::writable(&cwd).unwrap(),
+        )
+        .await
+        .unwrap();
+        worker.ensure_segment_head().unwrap();
+        worker.wire_history_persistence();
+        let evidence = Item::user_message(
+            "The cancellation regression must leave this evidence available for retry.",
+        );
+        worker.engine_mut().set_history(vec![evidence.clone()]);
+        worker
+            .commit_entry(LogEntry::UserInput {
+                ts: segment_log::now_millis(),
+                segments: vec![text_segment(
+                    "The cancellation regression must leave this evidence available for retry.",
+                )],
+            })
+            .unwrap();
+        worker
+            .usage_history
+            .lock()
+            .expect("usage history lock")
+            .push(UsageRecord {
+                history_len: 1,
+                input_total_tokens: 100,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                output_tokens: 0,
+            });
+
+        let entries_before = worker
+            .store
+            .read_all(worker.session_id(), worker.segment_id())
+            .unwrap();
+        assert!(
+            worker
+                .extract_pointer
+                .lock()
+                .expect("extract pointer lock")
+                .is_none()
+        );
+
+        let cancel_tx_for_extract = cancel_tx.clone();
+        let error = match worker
+            .run_extract_once_with_cancel_observer(
+                &memory_config,
+                1,
+                Some(Box::new(move |cancel_sender| {
+                    *cancel_tx_for_extract
+                        .lock()
+                        .expect("cancel sender slot lock") = Some(cancel_sender);
+                })),
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("pre-AI cancellation must not complete extraction"),
+        };
 
         assert!(matches!(error, WorkerError::Engine(EngineError::Cancelled)));
-        assert!(matches!(
-            lifecycle_status_for_worker_error(&error),
-            memory::audit::WorkerLifecycleStatus::Cancelled
-        ));
-        assert!(extract_internal_worker_lifecycle_error(&WorkerRunResult::Finished).is_none());
+        assert!(
+            worker
+                .extract_pointer
+                .lock()
+                .expect("extract pointer lock")
+                .is_none()
+        );
+        assert_eq!(worker.engine().history(), &[evidence]);
+
+        let entries_after = worker
+            .store
+            .read_all(worker.session_id(), worker.segment_id())
+            .unwrap();
+        assert_eq!(entries_after.len(), entries_before.len());
+        assert!(!entries_after.iter().any(|entry| matches!(
+            entry,
+            LogEntry::Extension { domain, .. } if domain == memory::extract::EXTRACT_DOMAIN
+        )));
+
+        let audits = audit_client.lifecycle_audits();
+        assert_eq!(audits.len(), 2);
+        assert_eq!(audits[0].run_id, audits[1].run_id);
+        assert_eq!(audits[0].worker, memory::audit::AuditWorker::MemoryExtract);
+        assert_eq!(
+            audits.iter().map(|audit| audit.status).collect::<Vec<_>>(),
+            vec![
+                memory::audit::WorkerLifecycleStatus::Started,
+                memory::audit::WorkerLifecycleStatus::Cancelled,
+            ]
+        );
+        assert!(
+            !audits
+                .iter()
+                .any(|audit| { audit.status == memory::audit::WorkerLifecycleStatus::Completed })
+        );
+    }
+
+    #[test]
+    fn successful_internal_extract_lifecycles_enter_the_commit_path() {
+        for lifecycle in [
+            WorkerRunResult::Finished,
+            WorkerRunResult::Paused,
+            WorkerRunResult::LimitReached,
+        ] {
+            assert!(extract_internal_worker_lifecycle_error(&lifecycle).is_none());
+        }
     }
 
     fn minimal_manifest() -> WorkerManifest {
