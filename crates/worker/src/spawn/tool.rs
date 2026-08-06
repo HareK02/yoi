@@ -226,6 +226,7 @@ pub struct SubWorkerSpawnTool {
     /// child config from reusable fields here, and selected profiles are
     /// merged into the same internal handoff shape before launch.
     spawner_manifest: WorkerManifest,
+    prompt_loader: PromptLoader,
     /// Compact selector list shared by tool description and diagnostics.
     available_profiles: AvailableProfiles,
     /// Spawner's runtime scope. After a successful spawn, the
@@ -259,6 +260,7 @@ impl SubWorkerSpawnTool {
         spawner_cwd: PathBuf,
         registry: Arc<SpawnedWorkerRegistry>,
         spawner_manifest: WorkerManifest,
+        prompt_loader: PromptLoader,
         available_profiles: AvailableProfiles,
         spawner_scope: SharedScope,
         delegation_scope: DelegationScope,
@@ -272,6 +274,7 @@ impl SubWorkerSpawnTool {
             spawner_cwd,
             registry,
             spawner_manifest,
+            prompt_loader,
             available_profiles,
             spawner_scope,
             delegation_scope,
@@ -340,7 +343,7 @@ impl Tool for SubWorkerSpawnTool {
         let mut child = Worker::<Box<dyn llm_engine::llm_client::LlmClient>, EphemeralSessionStore>::from_internal_manifest_with_context(
             child_manifest,
             store.clone(),
-            PromptLoader::builtins_only(),
+            self.prompt_loader.clone(),
             self.workspace_context.clone(),
             filesystem_authority,
             self.internal_client_override
@@ -803,6 +806,7 @@ fn sub_worker_spawn_tool_impl(
             spawner_cwd.clone(),
             registry.clone(),
             spawner_manifest.clone(),
+            prompts.loader(),
             available_profiles,
             spawner_scope.clone(),
             DelegationScope::from_config(&spawner_manifest.delegation_scope)
@@ -858,6 +862,15 @@ mod tests {
         );
         let calls = Arc::new(AtomicUsize::new(0));
         let observed_parent_write_revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_instruction_override = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let workspace_prompts = runtime.path().join("workspace-prompts");
+        std::fs::create_dir_all(&workspace_prompts).unwrap();
+        std::fs::write(
+            workspace_prompts.join("custom-reviewer.md"),
+            "WORKSPACE REVIEWER OVERRIDE",
+        )
+        .unwrap();
+        let prompt_loader = PromptLoader::new(None, Some(workspace_prompts));
         let parent_notifies = crate::ipc::notify_buffer::NotifyBuffer::new();
         let tool = SubWorkerSpawnTool::new(
             "parent".into(),
@@ -868,6 +881,7 @@ mod tests {
             workspace_root.clone(),
             registry.clone(),
             manifest.clone(),
+            prompt_loader,
             AvailableProfiles::discover(&workspace_root),
             spawner_scope.clone(),
             DelegationScope::from_config(&manifest.delegation_scope).unwrap(),
@@ -877,10 +891,12 @@ mod tests {
             parent_scope: spawner_scope.clone(),
             delegated_path: workspace_root.clone(),
             observed_parent_write_revoked: observed_parent_write_revoked.clone(),
+            observed_instruction_override: observed_instruction_override.clone(),
         }));
         let input = serde_json::json!({
             "name": "reviewer-child",
             "profile": "builtin:reviewer",
+            "instruction": "$workspace/custom-reviewer",
             "task": "review immutable commit",
             "scope": [{
                 "target": workspace_root.clone(),
@@ -909,6 +925,7 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(observed_parent_write_revoked.load(Ordering::SeqCst));
+        assert!(observed_instruction_override.load(Ordering::SeqCst));
         assert_eq!(parent_notifies.len(), 1);
         assert!(!runtime.path().join("reviewer-child/sock").exists());
 
@@ -1080,6 +1097,7 @@ mod tests {
         parent_scope: SharedScope,
         delegated_path: PathBuf,
         observed_parent_write_revoked: Arc<std::sync::atomic::AtomicBool>,
+        observed_instruction_override: Arc<std::sync::atomic::AtomicBool>,
     }
 
     #[async_trait]
@@ -1090,7 +1108,7 @@ mod tests {
 
         async fn stream(
             &self,
-            _request: Request,
+            request: Request,
         ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmEvent, ClientError>> + Send>>, ClientError>
         {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -1099,6 +1117,13 @@ mod tests {
                     .parent_scope
                     .snapshot()
                     .is_writable(&self.delegated_path),
+                Ordering::SeqCst,
+            );
+            self.observed_instruction_override.store(
+                request
+                    .system_prompt
+                    .as_deref()
+                    .is_some_and(|prompt| prompt.contains("WORKSPACE REVIEWER OVERRIDE")),
                 Ordering::SeqCst,
             );
             Ok(Box::pin(futures::stream::iter(vec![

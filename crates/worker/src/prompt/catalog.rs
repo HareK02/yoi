@@ -251,6 +251,7 @@ struct PackFile {
 /// `$yoi` / `$user` / `$workspace`.
 pub struct PromptCatalog {
     env: Environment<'static>,
+    loader: PromptLoader,
 }
 
 impl std::fmt::Debug for PromptCatalog {
@@ -260,6 +261,10 @@ impl std::fmt::Debug for PromptCatalog {
 }
 
 impl PromptCatalog {
+    pub(crate) fn loader(&self) -> PromptLoader {
+        self.loader.clone()
+    }
+
     /// Builtin-only catalog. All `{% include %}` references must resolve
     /// through `$yoi` (user/workspace prefixes are unavailable).
     pub fn builtins_only() -> Result<Arc<Self>, CatalogError> {
@@ -483,7 +488,7 @@ fn build_catalog(
             })?;
     }
 
-    Ok(PromptCatalog { env })
+    Ok(PromptCatalog { env, loader })
 }
 
 #[cfg(test)]
