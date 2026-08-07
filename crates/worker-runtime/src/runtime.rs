@@ -2479,6 +2479,8 @@ mod tests {
             initial_input: None,
             working_directory_request: None,
             working_directory: None,
+            worker_observation_enabled: false,
+            worker_observation_grants: Vec::new(),
             workspace_api: None,
         }
     }

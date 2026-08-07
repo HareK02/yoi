@@ -372,6 +372,12 @@ pub struct WorkerSpawnRequest {
     pub resolved_config_bundle: Option<ConfigBundle>,
     #[serde(skip, default)]
     pub resolved_workspace_api: Option<WorkspaceApiRef>,
+    /// Backend-owned feature enablement; client input cannot set it.
+    #[serde(skip, default)]
+    pub resolved_worker_observation_enabled: bool,
+    /// Backend-authored peer-session grants. Browser/model input cannot set this field.
+    #[serde(skip, default)]
+    pub resolved_worker_observation_grants: Vec<worker_runtime::identity::RuntimeWorkerRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1858,6 +1864,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             initial_input: request.initial_input.clone(),
             working_directory_request: request.resolved_working_directory_request.clone(),
             working_directory: request.resolved_working_directory.clone(),
+            worker_observation_enabled: request.resolved_worker_observation_enabled,
+            worker_observation_grants: request.resolved_worker_observation_grants.clone(),
             workspace_api: Some(workspace_api),
         };
         let workspace_scope = RuntimeWorkspaceScope::new(workspace_id, "embedded-backend");
@@ -2959,6 +2967,8 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             initial_input: request.initial_input.clone(),
             working_directory_request: request.resolved_working_directory_request.clone(),
             working_directory: request.resolved_working_directory.clone(),
+            worker_observation_enabled: request.resolved_worker_observation_enabled,
+            worker_observation_grants: request.resolved_worker_observation_grants.clone(),
             workspace_api: Some(workspace_api),
         };
         match self.post_json::<_, RuntimeHttpWorkerResponse>("/v1/workers", &create) {
@@ -4538,6 +4548,8 @@ mod tests {
             resolved_working_directory_request: None,
             resolved_working_directory: None,
             resolved_config_bundle: None,
+            resolved_worker_observation_enabled: false,
+            resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: Some(test_workspace_api()),
         }
     }
@@ -4687,6 +4699,8 @@ mod tests {
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
                     resolved_config_bundle: None,
+                    resolved_worker_observation_enabled: false,
+                    resolved_worker_observation_grants: Vec::new(),
                     resolved_workspace_api: Some(test_workspace_api()),
                 },
             )
@@ -4782,6 +4796,8 @@ mod tests {
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
                     resolved_config_bundle: None,
+                    resolved_worker_observation_enabled: false,
+                    resolved_worker_observation_grants: Vec::new(),
                     resolved_workspace_api: Some(test_workspace_api()),
                 },
             )
@@ -4816,6 +4832,8 @@ mod tests {
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
                     resolved_config_bundle: None,
+                    resolved_worker_observation_enabled: false,
+                    resolved_worker_observation_grants: Vec::new(),
                     resolved_workspace_api: Some(test_workspace_api()),
                 },
             )

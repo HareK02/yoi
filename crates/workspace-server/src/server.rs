@@ -42,6 +42,7 @@ use webauthn_rs::prelude::{
 };
 use workdir::WorkdirSessionHandle;
 use workdir::http::{WorkdirSessionOperation, WorkdirSessionOperationResult};
+use worker::feature::builtin::{WorkerObservationSubject, WorkerObservationSubjectRef};
 use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest};
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
 
@@ -920,6 +921,14 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             "/api/w/{workspace_id}/orchestrator",
             get(scoped_workspace_orchestrator_status)
                 .post(scoped_start_workspace_orchestrator),
+        )
+        .route(
+            "/api/w/{workspace_id}/worker-observation/sessions",
+            get(scoped_list_worker_observation_sessions),
+        )
+        .route(
+            "/api/w/{workspace_id}/worker-observation/session",
+            post(scoped_capture_worker_observation_session),
         )
         .route(
             "/api/w/{workspace_id}/workers",
@@ -3828,6 +3837,8 @@ fn start_memory_staging_consolidation(
             resolved_working_directory_request: None,
             resolved_working_directory: None,
             resolved_config_bundle,
+            resolved_worker_observation_enabled: false,
+            resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
         },
     )?;
@@ -4200,6 +4211,120 @@ async fn scoped_workspace_orchestrator_status(
     Ok(Json(workspace_orchestrator_response(&api, "observed")))
 }
 
+async fn scoped_list_worker_observation_sessions(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
+    authorize_workspace_orchestrator_observation(&api, &source)?;
+    let sessions = workers_response(api.clone())?
+        .items
+        .into_iter()
+        .filter(|worker| {
+            !matches!(
+                worker.state.as_str(),
+                "stopped" | "failed" | "rejected" | "disconnected"
+            ) && (worker.worker.runtime_id != source.runtime_id
+                || worker.worker.worker_id != source.worker_id)
+        })
+        .take(100)
+        .map(|worker| WorkerObservationSubject {
+            subject: WorkerObservationSubjectRef::RuntimeWorker {
+                runtime_id: worker.worker.runtime_id,
+                worker_id: worker.worker.worker_id,
+            },
+            display_name: worker.display_name,
+            relation: "workspace_orchestrator_grant".to_string(),
+            status: worker.state,
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(serde_json::json!({ "sessions": sessions })))
+}
+
+async fn scoped_capture_worker_observation_session(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    headers: HeaderMap,
+    Json(subject): Json<WorkerObservationSubjectRef>,
+) -> ApiResult<Json<serde_json::Value>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
+    authorize_workspace_orchestrator_observation(&api, &source)?;
+    let WorkerObservationSubjectRef::RuntimeWorker {
+        runtime_id,
+        worker_id,
+    } = subject
+    else {
+        return Err(ApiError::from(Error::UnknownWorker {
+            worker: RuntimeWorkerRef::new("subworker", "inaccessible"),
+        }));
+    };
+    let target = RuntimeWorkerRef::new(runtime_id, worker_id);
+    let granted = workers_response(api.clone())?
+        .items
+        .into_iter()
+        .any(|worker| {
+            worker.worker == target
+                && !matches!(
+                    worker.state.as_str(),
+                    "stopped" | "failed" | "rejected" | "disconnected"
+                )
+        });
+    if !granted {
+        return Err(ApiError::from(Error::UnknownWorker { worker: target }));
+    }
+
+    let mut connection = connect_workspace_worker_protocol(&api, &target).await?;
+    let event = tokio::time::timeout(std::time::Duration::from_secs(10), connection.events.recv())
+        .await
+        .map_err(|_| {
+            ApiError::from(Error::RuntimeOperationFailed {
+                runtime_id: target.runtime_id.clone(),
+                code: "worker_observation_timeout".to_string(),
+                message: "timed out waiting for the committed session snapshot".to_string(),
+            })
+        })?
+        .ok_or_else(|| {
+            ApiError::from(Error::RuntimeOperationFailed {
+                runtime_id: target.runtime_id.clone(),
+                code: "worker_observation_closed".to_string(),
+                message: "worker protocol closed before the session snapshot".to_string(),
+            })
+        })?;
+    let protocol::Event::Snapshot { entries, .. } = event else {
+        return Err(ApiError::from(Error::RuntimeOperationFailed {
+            runtime_id: target.runtime_id.clone(),
+            code: "worker_observation_missing_snapshot".to_string(),
+            message: "worker protocol did not begin with a committed session snapshot".to_string(),
+        }));
+    };
+    Ok(Json(serde_json::json!({
+        "segment_id": format!("runtime:{}:worker:{}", target.runtime_id, target.worker_id),
+        "entries": entries,
+    })))
+}
+
+fn authorize_workspace_orchestrator_observation(
+    api: &WorkspaceApi,
+    source: &WorkerMutationSource,
+) -> ApiResult<()> {
+    let Some(orchestrator) = find_workspace_orchestrator(api) else {
+        return Err(ApiError::from(Error::UnknownWorker {
+            worker: RuntimeWorkerRef::new(source.runtime_id.clone(), source.worker_id.clone()),
+        }));
+    };
+    if orchestrator.worker.runtime_id != source.runtime_id
+        || orchestrator.worker.worker_id != source.worker_id
+    {
+        return Err(ApiError::from(Error::UnknownWorker {
+            worker: RuntimeWorkerRef::new(source.runtime_id.clone(), source.worker_id.clone()),
+        }));
+    }
+    Ok(())
+}
+
 async fn scoped_start_workspace_orchestrator(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
@@ -4258,6 +4383,17 @@ async fn scoped_start_workspace_orchestrator(
             resolved_working_directory_request: None,
             resolved_working_directory: None,
             resolved_config_bundle: None,
+            resolved_worker_observation_enabled: true,
+            resolved_worker_observation_grants: workers_response(api.clone())
+                .map(|response| {
+                    response
+                        .items
+                        .into_iter()
+                        .take(100)
+                        .map(|worker| worker.worker)
+                        .collect()
+                })
+                .unwrap_or_default(),
             resolved_workspace_api: None,
         },
     )?;
@@ -6655,6 +6791,8 @@ async fn create_workspace_worker(
             resolved_working_directory_request: None,
             resolved_working_directory,
             resolved_config_bundle,
+            resolved_worker_observation_enabled: false,
+            resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
         },
     )?;
@@ -9921,6 +10059,70 @@ mod tests {
         );
         assert_ne!(dedicated.worker.worker_id, generic.worker_ref.worker_id);
 
+        let mut observation_headers = HeaderMap::new();
+        observation_headers.insert(
+            "x-yoi-runtime-id",
+            axum::http::HeaderValue::from_str(&dedicated.worker.runtime_id).unwrap(),
+        );
+        observation_headers.insert(
+            "x-yoi-worker-id",
+            axum::http::HeaderValue::from_str(&dedicated.worker.worker_id).unwrap(),
+        );
+        let Json(sessions) = scoped_list_worker_observation_sessions(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: workspace_id.clone(),
+            }),
+            observation_headers.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            sessions["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|session| {
+                    session["subject"]["kind"] == "runtime_worker"
+                        && session["subject"]["runtime_id"] == generic.worker_ref.runtime_id
+                        && session["subject"]["worker_id"] == generic.worker_ref.worker_id
+                })
+        );
+        let Json(capture) = scoped_capture_worker_observation_session(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: workspace_id.clone(),
+            }),
+            observation_headers,
+            Json(WorkerObservationSubjectRef::RuntimeWorker {
+                runtime_id: generic.worker_ref.runtime_id.clone(),
+                worker_id: generic.worker_ref.worker_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(capture["entries"].is_array());
+
+        let mut unauthorized_headers = HeaderMap::new();
+        unauthorized_headers.insert(
+            "x-yoi-runtime-id",
+            axum::http::HeaderValue::from_str(&generic.worker_ref.runtime_id).unwrap(),
+        );
+        unauthorized_headers.insert(
+            "x-yoi-worker-id",
+            axum::http::HeaderValue::from_str(&generic.worker_ref.worker_id).unwrap(),
+        );
+        let error = scoped_list_worker_observation_sessions(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: workspace_id.clone(),
+            }),
+            unauthorized_headers,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::NOT_FOUND);
+
         let Json(existing) = scoped_start_workspace_orchestrator(
             State(api.clone()),
             AxumPath(ScopedWorkspacePath {
@@ -10691,6 +10893,8 @@ mod tests {
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
                     resolved_config_bundle,
+                    resolved_worker_observation_enabled: false,
+                    resolved_worker_observation_grants: Vec::new(),
                     resolved_workspace_api: Some(test_worker_workspace_api(
                         EMBEDDED_WORKER_RUNTIME_ID,
                     )),
@@ -10871,6 +11075,8 @@ mod tests {
             resolved_working_directory_request: None,
             resolved_working_directory: None,
             resolved_config_bundle: None,
+            resolved_worker_observation_enabled: false,
+            resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: Some(test_worker_workspace_api(EMBEDDED_WORKER_RUNTIME_ID)),
         };
         let source_worker = api
@@ -11085,6 +11291,8 @@ mod tests {
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
                     resolved_config_bundle: None,
+                    resolved_worker_observation_enabled: false,
+                    resolved_worker_observation_grants: Vec::new(),
                     resolved_workspace_api: Some(test_worker_workspace_api(
                         EMBEDDED_WORKER_RUNTIME_ID,
                     )),
@@ -11225,6 +11433,8 @@ mod tests {
             resolved_working_directory_request: None,
             resolved_working_directory: None,
             resolved_config_bundle: None,
+            resolved_worker_observation_enabled: false,
+            resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
         };
         let Json(first) = scoped_create_runtime_worker(
@@ -11455,6 +11665,8 @@ mod tests {
             resolved_working_directory_request: None,
             resolved_working_directory: None,
             resolved_config_bundle: None,
+            resolved_worker_observation_enabled: false,
+            resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
         };
         let Json(created) = scoped_create_runtime_worker(
@@ -12303,6 +12515,8 @@ mod tests {
             initial_input: None,
             working_directory_request: None,
             working_directory: None,
+            worker_observation_enabled: false,
+            worker_observation_grants: Vec::new(),
             workspace_api: None,
         }
     }
@@ -13454,6 +13668,8 @@ mod tests {
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
                     resolved_config_bundle: None,
+                    resolved_worker_observation_enabled: false,
+                    resolved_worker_observation_grants: Vec::new(),
                     resolved_workspace_api: Some(test_worker_workspace_api(
                         "embedded-worker-runtime",
                     )),
@@ -13972,6 +14188,8 @@ mod tests {
             resolved_working_directory_request: None,
             resolved_working_directory: None,
             resolved_config_bundle: Some(runtime_test_bundle()),
+            resolved_worker_observation_enabled: false,
+            resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
         };
         let spawned = api

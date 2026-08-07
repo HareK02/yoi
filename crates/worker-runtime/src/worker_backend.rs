@@ -32,18 +32,23 @@ use crate::working_directory::{
 use async_trait::async_trait;
 use manifest::paths;
 use protocol::{Method, Segment, WorkerStatus};
-use session_store::FsStore;
-use session_store::{CombinedStore, FsWorkerStore};
+use session_store::{CombinedStore, FsStore, FsWorkerStore, collect_state};
 use tokio::runtime::Runtime;
 #[cfg(feature = "ws-server")]
 use tokio::sync::broadcast;
 use workdir::{LocalWorkdirSession, Workdir, WorkdirSessionCapabilities, WorkdirSessionHandle};
 
+use worker::feature::builtin::{
+    CompositeWorkerObservationProvider, WorkerObservationError, WorkerObservationProvider,
+    WorkerObservationSubject, WorkerObservationSubjectRef, WorkerSessionCapture,
+    WorkspaceClientWorkerObservationProvider,
+};
 #[cfg(feature = "ws-server")]
 use worker::ipc::protocol_session::{live_log_entry_event, subscribe_worker_protocol_session};
 use worker::{
-    PromptLoader, RuntimeWorkspaceHttpClient, Worker, WorkerController, WorkerError,
-    WorkerFilesystemAuthority, WorkerHandle, WorkerWorkspaceContext, WorkspaceId,
+    PromptLoader, RuntimeWorkspaceHttpClient, SegmentLogSink, Worker, WorkerController,
+    WorkerError, WorkerFilesystemAuthority, WorkerHandle, WorkerSharedState,
+    WorkerWorkspaceContext, WorkspaceId,
 };
 
 const DEFAULT_BACKEND_ID: &str = "worker-crate";
@@ -102,8 +107,123 @@ pub trait RuntimeWorkerFactory: Send + Sync + 'static {
 
 /// Production factory that resolves a normal Worker profile and spawns it under
 /// `WorkerController`.
+#[derive(Default)]
+struct RuntimeWorkerObservationHub {
+    workers: Mutex<HashMap<WorkerRef, RuntimeObservedWorker>>,
+}
+
+#[derive(Clone)]
+struct RuntimeObservedWorker {
+    workspace_id: Option<String>,
+    shared_state: std::sync::Weak<WorkerSharedState>,
+    sink: SegmentLogSink,
+}
+
+impl RuntimeWorkerObservationHub {
+    fn register(&self, worker_ref: WorkerRef, workspace_id: Option<String>, handle: &WorkerHandle) {
+        if let Ok(mut workers) = self.workers.lock() {
+            workers.insert(
+                worker_ref,
+                RuntimeObservedWorker {
+                    workspace_id,
+                    shared_state: Arc::downgrade(&handle.shared_state),
+                    sink: handle.sink.clone(),
+                },
+            );
+        }
+    }
+
+    fn get(
+        &self,
+        worker_ref: &WorkerRef,
+    ) -> Option<(Option<String>, Arc<WorkerSharedState>, SegmentLogSink)> {
+        let mut workers = self.workers.lock().ok()?;
+        let entry = workers.get(worker_ref)?.clone();
+        let Some(shared_state) = entry.shared_state.upgrade() else {
+            workers.remove(worker_ref);
+            return None;
+        };
+        Some((entry.workspace_id, shared_state, entry.sink))
+    }
+}
+
+struct RuntimeGrantedWorkerObservationProvider {
+    runtime_id: String,
+    workspace_id: String,
+    grants: std::collections::HashSet<crate::identity::RuntimeWorkerRef>,
+    hub: Arc<RuntimeWorkerObservationHub>,
+}
+
+#[async_trait]
+impl WorkerObservationProvider for RuntimeGrantedWorkerObservationProvider {
+    async fn list_worker_sessions(
+        &self,
+    ) -> Result<Vec<WorkerObservationSubject>, WorkerObservationError> {
+        let mut subjects = Vec::new();
+        for grant in &self.grants {
+            if grant.runtime_id != self.runtime_id {
+                continue;
+            }
+            let Ok(worker_ref) = grant.local_worker_ref() else {
+                continue;
+            };
+            let Some((workspace_id, state, _)) = self.hub.get(&worker_ref) else {
+                continue;
+            };
+            if workspace_id.as_deref() != Some(self.workspace_id.as_str()) {
+                continue;
+            }
+            subjects.push(WorkerObservationSubject {
+                subject: WorkerObservationSubjectRef::RuntimeWorker {
+                    runtime_id: grant.runtime_id.clone(),
+                    worker_id: grant.worker_id.clone(),
+                },
+                display_name: grant.worker_id.clone(),
+                relation: "granted_peer".to_string(),
+                status: format!("{:?}", state.get_status()).to_lowercase(),
+            });
+        }
+        subjects.sort_by(|left, right| left.subject.cmp(&right.subject));
+        Ok(subjects)
+    }
+
+    async fn capture_worker_session(
+        &self,
+        subject: &WorkerObservationSubjectRef,
+    ) -> Result<WorkerSessionCapture, WorkerObservationError> {
+        let WorkerObservationSubjectRef::RuntimeWorker {
+            runtime_id,
+            worker_id,
+        } = subject
+        else {
+            return Err(WorkerObservationError::NotFound);
+        };
+        let grant = crate::identity::RuntimeWorkerRef::new(runtime_id.clone(), worker_id.clone());
+        if !self.grants.contains(&grant) || runtime_id != &self.runtime_id {
+            return Err(WorkerObservationError::NotFound);
+        }
+        let worker_ref = grant
+            .local_worker_ref()
+            .map_err(|_| WorkerObservationError::NotFound)?;
+        let (workspace_id, _, sink) = self
+            .hub
+            .get(&worker_ref)
+            .ok_or(WorkerObservationError::NotFound)?;
+        if workspace_id.as_deref() != Some(self.workspace_id.as_str()) {
+            return Err(WorkerObservationError::NotFound);
+        }
+        let entries = sink.subscribe_with_snapshot().0;
+        let state = collect_state(&entries);
+        Ok(WorkerSessionCapture {
+            segment_id: format!("runtime:{runtime_id}:worker:{worker_id}"),
+            items: state.history,
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct ProfileRuntimeWorkerFactory {
+    observation_hub: Arc<RuntimeWorkerObservationHub>,
     profile_base_dir: PathBuf,
     store_dir: Option<PathBuf>,
     worker_metadata_dir: Option<PathBuf>,
@@ -116,6 +236,7 @@ impl ProfileRuntimeWorkerFactory {
     pub fn new(profile_base_dir: impl Into<PathBuf>) -> Self {
         let profile_base_dir = profile_base_dir.into();
         Self {
+            observation_hub: Arc::new(RuntimeWorkerObservationHub::default()),
             profile_base_dir,
             store_dir: None,
             worker_metadata_dir: None,
@@ -398,6 +519,18 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             .unwrap_or(WorkerFilesystemAuthority::None);
         let workspace_backend_ref =
             RuntimeWorkspaceBackendRef::from_worker_request(&request.request);
+        let observation_runtime_id = request
+            .request
+            .workspace_api
+            .as_ref()
+            .and_then(|api| api.runtime_id.clone());
+        let observation_workspace_id = request
+            .request
+            .workspace_api
+            .as_ref()
+            .map(|api| api.workspace_id.clone());
+        let observation_grants = request.request.worker_observation_grants.clone();
+        let observation_enabled = request.request.worker_observation_enabled;
         let workspace_context = workspace_backend_ref.worker_context(&request.worker_ref);
         let selector = profile.as_ref();
         let archive = self
@@ -457,11 +590,35 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         } else {
             worker.bind_workdir_session(None);
         }
+        if let (Some(runtime_id), Some(workspace_id)) =
+            (observation_runtime_id, observation_workspace_id.clone())
+            && observation_enabled
+        {
+            let mut providers: Vec<Arc<dyn WorkerObservationProvider>> = vec![Arc::new(
+                WorkspaceClientWorkerObservationProvider::new(worker.workspace_client_handle()),
+            )];
+            if !observation_grants.is_empty() {
+                providers.push(Arc::new(RuntimeGrantedWorkerObservationProvider {
+                    runtime_id,
+                    workspace_id,
+                    grants: observation_grants.into_iter().take(100).collect(),
+                    hub: self.observation_hub.clone(),
+                }));
+            }
+            worker.bind_worker_observation_provider(Some(Arc::new(
+                CompositeWorkerObservationProvider::new(providers),
+            )));
+        }
 
         let runtime_base = self.runtime_base_dir()?;
         let (handle, _shutdown_rx) = WorkerController::spawn_runtime_managed(worker, &runtime_base)
             .await
             .map_err(|err| format!("failed to spawn Worker controller: {err}"))?;
+        self.observation_hub.register(
+            request.worker_ref.clone(),
+            observation_workspace_id,
+            &handle,
+        );
         Ok(handle)
     }
 
@@ -482,6 +639,18 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             .unwrap_or(WorkerFilesystemAuthority::None);
         let workspace_backend_ref =
             RuntimeWorkspaceBackendRef::from_worker_request(&request.request);
+        let observation_runtime_id = request
+            .request
+            .workspace_api
+            .as_ref()
+            .and_then(|api| api.runtime_id.clone());
+        let observation_workspace_id = request
+            .request
+            .workspace_api
+            .as_ref()
+            .map(|api| api.workspace_id.clone());
+        let observation_grants = request.request.worker_observation_grants.clone();
+        let observation_enabled = request.request.worker_observation_enabled;
         let workspace_context = workspace_backend_ref.worker_context(&request.worker_ref);
         let (manifest, loader) = Self::restore_fallback_manifest(&worker_name)?;
 
@@ -552,11 +721,35 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         } else {
             worker.bind_workdir_session(None);
         }
+        if let (Some(runtime_id), Some(workspace_id)) =
+            (observation_runtime_id, observation_workspace_id.clone())
+            && observation_enabled
+        {
+            let mut providers: Vec<Arc<dyn WorkerObservationProvider>> = vec![Arc::new(
+                WorkspaceClientWorkerObservationProvider::new(worker.workspace_client_handle()),
+            )];
+            if !observation_grants.is_empty() {
+                providers.push(Arc::new(RuntimeGrantedWorkerObservationProvider {
+                    runtime_id,
+                    workspace_id,
+                    grants: observation_grants.into_iter().take(100).collect(),
+                    hub: self.observation_hub.clone(),
+                }));
+            }
+            worker.bind_worker_observation_provider(Some(Arc::new(
+                CompositeWorkerObservationProvider::new(providers),
+            )));
+        }
 
         let runtime_base = self.runtime_base_dir()?;
         let (handle, _shutdown_rx) = WorkerController::spawn_runtime_managed(worker, &runtime_base)
             .await
             .map_err(|err| format!("failed to spawn restored Worker controller: {err}"))?;
+        self.observation_hub.register(
+            request.worker_ref.clone(),
+            observation_workspace_id,
+            &handle,
+        );
         Ok(handle)
     }
 }
@@ -1603,6 +1796,8 @@ mod tests {
             initial_input: None,
             working_directory_request: None,
             working_directory: None,
+            worker_observation_enabled: false,
+            worker_observation_grants: Vec::new(),
             workspace_api: None,
         }
     }
@@ -1686,6 +1881,86 @@ mod tests {
         working_directory_id: &str,
     ) -> PathBuf {
         runtime_base.join(working_directory_id).join("checkout")
+    }
+
+    #[tokio::test]
+    async fn runtime_provider_projects_only_explicit_live_canonical_grants() {
+        let hub = Arc::new(RuntimeWorkerObservationHub::default());
+        let worker_ref = WorkerRef::new(crate::identity::WorkerId::new(7));
+        let shared_state = Arc::new(WorkerSharedState::new(
+            "peer-worker".to_string(),
+            session_store::new_segment_id(),
+            "[worker]\nname = \"peer-worker\"".to_string(),
+            protocol::Greeting {
+                worker_name: "peer-worker".to_string(),
+                cwd: "/tmp".to_string(),
+                provider: "test".to_string(),
+                model: "test".to_string(),
+                scope_summary: String::new(),
+                tools: Vec::new(),
+                context_window: 1_000,
+                context_tokens: 0,
+            },
+        ));
+        hub.workers.lock().unwrap().insert(
+            worker_ref,
+            RuntimeObservedWorker {
+                workspace_id: Some("workspace-1".to_string()),
+                shared_state: Arc::downgrade(&shared_state),
+                sink: SegmentLogSink::new(),
+            },
+        );
+        let grant = crate::identity::RuntimeWorkerRef::new("runtime-1", "7");
+        let provider = RuntimeGrantedWorkerObservationProvider {
+            runtime_id: "runtime-1".to_string(),
+            workspace_id: "workspace-1".to_string(),
+            grants: std::collections::HashSet::from([grant.clone()]),
+            hub: hub.clone(),
+        };
+
+        let listed = provider.list_worker_sessions().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].subject,
+            WorkerObservationSubjectRef::RuntimeWorker {
+                runtime_id: "runtime-1".to_string(),
+                worker_id: "7".to_string(),
+            }
+        );
+        provider
+            .capture_worker_session(&listed[0].subject)
+            .await
+            .expect("granted live peer should be capturable");
+        let hidden = provider
+            .capture_worker_session(&WorkerObservationSubjectRef::RuntimeWorker {
+                runtime_id: "runtime-1".to_string(),
+                worker_id: "8".to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(hidden, WorkerObservationError::NotFound));
+
+        let cross_workspace = RuntimeGrantedWorkerObservationProvider {
+            runtime_id: "runtime-1".to_string(),
+            workspace_id: "workspace-2".to_string(),
+            grants: std::collections::HashSet::from([grant]),
+            hub: hub.clone(),
+        };
+        assert!(
+            cross_workspace
+                .list_worker_sessions()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let hidden = cross_workspace
+            .capture_worker_session(&listed[0].subject)
+            .await
+            .unwrap_err();
+        assert!(matches!(hidden, WorkerObservationError::NotFound));
+
+        drop(shared_state);
+        assert!(provider.list_worker_sessions().await.unwrap().is_empty());
     }
 
     #[test]

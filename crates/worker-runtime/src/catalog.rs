@@ -4,6 +4,10 @@ use crate::profile_archive::{ProfileSourceArchive, ProfileSourceArchiveRef};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Profile selector boundary. This is a selector, not a resolved runtime config.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
@@ -217,6 +221,14 @@ pub struct CreateWorkerRequest {
     pub working_directory_request: Option<WorkingDirectoryRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<WorkingDirectoryClaim>,
+    /// Backend-only feature enablement. Grants still define local Runtime peers;
+    /// the Workspace provider reauthorizes its dynamic set per operation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub worker_observation_enabled: bool,
+    /// Backend-authored, bounded peer session grants. Runtime revalidates each
+    /// requested capture against this exact canonical `(runtime_id, worker_id)` set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worker_observation_grants: Vec<RuntimeWorkerRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_api: Option<WorkspaceApiRef>,
 }
