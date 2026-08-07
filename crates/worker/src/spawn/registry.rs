@@ -1,15 +1,13 @@
 //! Parent-owned registry of direct Internal SubWorker sessions.
 //!
-//! `SubWorkerSpawn` inserts typed `InternalWorkerSessionHandle`s; List/Send/ReadOutput/Stop use
-//! the same in-memory authority. Internal children are not persisted, restored, discovered as
+//! `SubWorkerSpawn` inserts typed `InternalWorkerSessionHandle`s; List/Send/Stop and
+//! worker-observation use the same in-memory authority. Internal children are not persisted, restored, discovered as
 //! Runtime Workers, or addressed through sockets. Restore consumes any legacy persisted process
 //! child records only to reclaim their delegated scope and clear obsolete metadata.
-//!
-//! `SubWorkerReadOutput` owns a per-child, process-lifetime history cursor so consecutive reads
-//! yield only new assistant text. Parent registry drop closes all session handles and synchronously
-//! returns delegated Write deny rules to the parent scope.
+//! Parent registry drop closes all session handles and synchronously returns delegated Write deny
+//! rules to the parent scope.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io;
 use std::sync::{
     Arc,
@@ -20,7 +18,6 @@ use manifest::{Permission, ScopeRule, SharedScope};
 use session_store::{
     WorkerMetadataStore, WorkerReclaimedChild, WorkerSpawnedChild, WorkerStoreError,
 };
-use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::internal_worker::InternalWorkerSessionHandle;
@@ -95,7 +92,6 @@ impl Drop for InternalSpawnReservation {
 pub struct SpawnedWorkerRegistry {
     internal_records: std::sync::Mutex<Vec<InternalSpawnedWorkerRecord>>,
     internal_names: std::sync::Mutex<HashSet<String>>,
-    cursors: Mutex<HashMap<String, usize>>,
     parent_scope: Option<SharedScope>,
 }
 
@@ -111,7 +107,6 @@ impl SpawnedWorkerRegistry {
         Arc::new(Self {
             internal_records: std::sync::Mutex::new(Vec::new()),
             internal_names: std::sync::Mutex::new(HashSet::new()),
-            cursors: Mutex::new(HashMap::new()),
             parent_scope: None,
         })
     }
@@ -120,7 +115,6 @@ impl SpawnedWorkerRegistry {
         Arc::new(Self {
             internal_records: std::sync::Mutex::new(Vec::new()),
             internal_names: std::sync::Mutex::new(HashSet::new()),
-            cursors: Mutex::new(HashMap::new()),
             parent_scope: Some(parent_scope),
         })
     }
@@ -198,7 +192,6 @@ impl SpawnedWorkerRegistry {
             registry: Arc::new(Self {
                 internal_records: std::sync::Mutex::new(Vec::new()),
                 internal_names: std::sync::Mutex::new(HashSet::new()),
-                cursors: Mutex::new(HashMap::new()),
                 parent_scope,
             }),
             reclaimed_unreachable: !persisted_children.is_empty(),
@@ -292,19 +285,7 @@ impl SpawnedWorkerRegistry {
                 }
                 removed
             };
-        self.cursors.lock().await.remove(worker_name);
         Ok(removed)
-    }
-
-    pub async fn cursor(&self, worker_name: &str) -> usize {
-        *self.cursors.lock().await.get(worker_name).unwrap_or(&0)
-    }
-
-    pub async fn set_cursor(&self, worker_name: &str, value: usize) {
-        self.cursors
-            .lock()
-            .await
-            .insert(worker_name.to_owned(), value);
     }
 }
 

@@ -1,26 +1,55 @@
-//! Immutable reference view over a session history slice.
+//! Workspace- and Memory-independent exploration of an immutable ordered session capture.
 //!
-//! This module is shared substrate for internal workers that need to inspect a
-//! bounded, host-created view of session history without reading the live
-//! foreground Worker state directly.
+//! Hosts construct a capture from committed session items. The capture excludes reasoning,
+//! assigns append-stable `SessionEntryRef` values, and provides sparse overview, bounded
+//! range/search, read, and generic evidence projections without granting mutation authority.
 
 use std::sync::Arc;
 
 use llm_engine::{Item, Role};
-use memory::extract::StagingEvidence;
-use memory::schema::{EvidenceKind, SourceEvidenceRef};
+use serde::{Deserialize, Serialize};
 
 const DEFAULT_SEARCH_LIMIT: usize = 20;
 const MAX_SEARCH_LIMIT: usize = 50;
 const DEFAULT_READ_MAX_ITEMS: usize = 40;
 const MAX_READ_MAX_ITEMS: usize = 80;
 const DEFAULT_READ_MAX_BYTES: usize = 32 * 1024;
+const OVERVIEW_ANCHOR_STRIDE: usize = 8;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct SessionEntryRef(String);
+
+impl SessionEntryRef {
+    pub(crate) fn new(source_index: usize) -> Self {
+        Self(format!("E{source_index:08}"))
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        let reference = Self(value.to_string());
+        reference.source_index()?;
+        Some(reference)
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn source_index(&self) -> Option<u64> {
+        self.0.strip_prefix('E')?.parse().ok()
+    }
+}
+
+impl std::fmt::Display for SessionEntryRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReferenceKind {
     User,
     Assistant,
-    System,
     Tool,
 }
 
@@ -29,7 +58,6 @@ impl ReferenceKind {
         match self {
             Self::User => "user",
             Self::Assistant => "assistant",
-            Self::System => "system",
             Self::Tool => "tool",
         }
     }
@@ -38,14 +66,9 @@ impl ReferenceKind {
         match value {
             "user" => Some(Self::User),
             "assistant" | "agent" => Some(Self::Assistant),
-            "system" => Some(Self::System),
             "tool" => Some(Self::Tool),
             _ => None,
         }
-    }
-
-    fn evidence_kind(self) -> EvidenceKind {
-        EvidenceKind::new(EvidenceKind::MESSAGE)
     }
 }
 
@@ -73,16 +96,17 @@ impl ToolPart {
 
 #[derive(Debug, Clone)]
 pub(crate) struct OverviewItem {
-    pub id: String,
+    pub id: SessionEntryRef,
     pub entry_range: [u64; 2],
     pub kind: ReferenceKind,
     pub label: String,
     pub text: String,
+    pub intervening_entries: usize,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReferenceEntry {
-    pub id: String,
+    pub id: SessionEntryRef,
     pub entry_range: [u64; 2],
     pub kind: ReferenceKind,
     pub tool_part: Option<ToolPart>,
@@ -90,20 +114,6 @@ pub(crate) struct ReferenceEntry {
     pub label: String,
     pub summary: String,
     search_text: String,
-}
-
-impl ReferenceEntry {
-    fn evidence_kind(&self) -> EvidenceKind {
-        match (self.kind, self.tool_part) {
-            (ReferenceKind::Tool, Some(ToolPart::Input)) => {
-                EvidenceKind::new(EvidenceKind::TOOL_CALL)
-            }
-            (ReferenceKind::Tool, Some(ToolPart::Output | ToolPart::Both) | None) => {
-                EvidenceKind::new(EvidenceKind::TOOL_RESULT)
-            }
-            _ => self.kind.evidence_kind(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -114,11 +124,14 @@ pub(crate) struct SearchOptions {
     pub tool_name: Option<String>,
     pub limit: Option<usize>,
     pub min_entry_index: Option<u64>,
+    pub from: Option<SessionEntryRef>,
+    pub through: Option<SessionEntryRef>,
+    pub offset: usize,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct SearchHit {
-    pub id: String,
+    pub id: SessionEntryRef,
     pub kind: ReferenceKind,
     pub tool_part: Option<ToolPart>,
     pub tool_name: Option<String>,
@@ -162,7 +175,7 @@ impl Default for ReadOptions {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReadEntry {
-    pub id: String,
+    pub id: SessionEntryRef,
     pub kind: ReferenceKind,
     pub tool_part: Option<ToolPart>,
     pub tool_name: Option<String>,
@@ -178,14 +191,26 @@ pub(crate) struct ReadResult {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct SessionReferenceView {
+pub(crate) struct SessionEntryEvidence {
+    pub segment_id: String,
+    pub entry_ref: SessionEntryRef,
+    pub entry_range: [u64; 2],
+    pub kind: ReferenceKind,
+    pub tool_part: Option<ToolPart>,
+    pub label: String,
+    pub summary: String,
+    pub excerpt: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SessionCapture {
     segment_id: String,
     items: Arc<Vec<Item>>,
     overview: Vec<OverviewItem>,
     index: Vec<ReferenceEntry>,
 }
 
-impl SessionReferenceView {
+impl SessionCapture {
     pub(crate) fn new(segment_id: impl Into<String>, items: Vec<Item>) -> Self {
         let segment_id = segment_id.into();
         let items = Arc::new(items);
@@ -199,7 +224,7 @@ impl SessionReferenceView {
                     let kind = match role {
                         Role::User => ReferenceKind::User,
                         Role::Assistant => ReferenceKind::Assistant,
-                        Role::System => ReferenceKind::System,
+                        Role::System => continue,
                     };
                     let text = content
                         .iter()
@@ -208,7 +233,7 @@ impl SessionReferenceView {
                         .join("");
                     let label = format!("{} message", kind.as_str());
                     let summary = truncate_chars(&text, 240);
-                    let id = format!("M{idx:04}");
+                    let id = SessionEntryRef::new(idx);
                     index.push(ReferenceEntry {
                         id: id.clone(),
                         entry_range,
@@ -221,11 +246,12 @@ impl SessionReferenceView {
                     });
                     if matches!(kind, ReferenceKind::User | ReferenceKind::Assistant) {
                         overview.push(OverviewItem {
-                            id: format!("O{:04}", overview.len()),
+                            id: id.clone(),
                             entry_range,
                             kind,
                             label,
                             text,
+                            intervening_entries: 0,
                         });
                     }
                 }
@@ -234,7 +260,7 @@ impl SessionReferenceView {
                 } => {
                     let text = format!("{name}\n{arguments}");
                     index.push(ReferenceEntry {
-                        id: format!("T{idx:04}i"),
+                        id: SessionEntryRef::new(idx),
                         entry_range,
                         kind: ReferenceKind::Tool,
                         tool_part: Some(ToolPart::Input),
@@ -249,7 +275,7 @@ impl SessionReferenceView {
                 } => {
                     let text = format!("{summary}\n{}", content.as_deref().unwrap_or_default());
                     index.push(ReferenceEntry {
-                        id: format!("T{idx:04}o"),
+                        id: SessionEntryRef::new(idx),
                         entry_range,
                         kind: ReferenceKind::Tool,
                         tool_part: Some(ToolPart::Output),
@@ -261,6 +287,30 @@ impl SessionReferenceView {
                 }
                 Item::Reasoning { .. } => {}
             }
+        }
+
+        if overview.len() > 2 {
+            let last = overview.len() - 1;
+            overview = overview
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, entry)| {
+                    (index == 0 || index == last || index % OVERVIEW_ANCHOR_STRIDE == 0)
+                        .then_some(entry)
+                })
+                .collect();
+        }
+
+        for overview_index in 0..overview.len().saturating_sub(1) {
+            let current_entry = overview[overview_index].entry_range[0];
+            let next_entry = overview[overview_index + 1].entry_range[0];
+            overview[overview_index].intervening_entries = index
+                .iter()
+                .filter(|entry| {
+                    let entry_index = entry.entry_range[0];
+                    entry_index > current_entry && entry_index < next_entry
+                })
+                .count();
         }
 
         Self {
@@ -282,11 +332,21 @@ impl SessionReferenceView {
             .unwrap_or(DEFAULT_SEARCH_LIMIT)
             .clamp(1, MAX_SEARCH_LIMIT);
         let tool_name = options.tool_name.as_deref();
-        let min_entry_index = options.min_entry_index.unwrap_or(0);
+        let min_entry_index = options
+            .from
+            .as_ref()
+            .and_then(SessionEntryRef::source_index)
+            .unwrap_or_else(|| options.min_entry_index.unwrap_or(0));
+        let max_entry_index = options
+            .through
+            .as_ref()
+            .and_then(SessionEntryRef::source_index)
+            .unwrap_or(u64::MAX);
+        let mut skipped = 0usize;
         let mut hits = Vec::new();
 
         for entry in &self.index {
-            if entry.entry_range[0] < min_entry_index {
+            if entry.entry_range[0] < min_entry_index || entry.entry_range[0] > max_entry_index {
                 continue;
             }
             if let Some(kind) = options.kind {
@@ -311,6 +371,10 @@ impl SessionReferenceView {
                 }
             }
             if !query.is_empty() && !entry.search_text.to_lowercase().contains(&query) {
+                continue;
+            }
+            if skipped < options.offset {
+                skipped += 1;
                 continue;
             }
             hits.push(SearchHit {
@@ -338,7 +402,11 @@ impl SessionReferenceView {
         let mut truncated = false;
 
         let selected: Vec<&ReferenceEntry> = match selector {
-            ReadSelector::Id(id) => self.index.iter().filter(|entry| entry.id == id).collect(),
+            ReadSelector::Id(id) => self
+                .index
+                .iter()
+                .filter(|entry| entry.id.as_str() == id)
+                .collect(),
             ReadSelector::EntryRange([start, end]) => self
                 .index
                 .iter()
@@ -384,42 +452,32 @@ impl SessionReferenceView {
         ReadResult { entries, truncated }
     }
 
-    pub(crate) fn source_ref_for(&self, id: &str) -> Option<SourceEvidenceRef> {
-        let entry = self.index.iter().find(|entry| entry.id == id)?;
-        Some(SourceEvidenceRef {
-            segment_id: Some(self.segment_id.clone()),
-            entry_range: Some(entry.entry_range),
-            evidence_id: Some(entry.id.clone()),
-            evidence_kind: Some(entry.evidence_kind()),
-            label: Some(entry.label.clone()),
-            summary: Some(entry.summary.clone()),
-            ..Default::default()
-        })
-    }
-
-    pub(crate) fn staging_evidence_for(&self, id: &str) -> Option<StagingEvidence> {
-        let entry = self.index.iter().find(|entry| entry.id == id)?;
-        let read = self.read(
-            ReadSelector::Id(id),
-            ReadOptions {
-                include_tools: true,
-                tool_part: ToolPart::Both,
-                detail: ReadDetail::Compact,
-                max_items: 1,
-                max_bytes: 2 * 1024,
-            },
-        );
-        let excerpt = read
+    pub(crate) fn evidence_for(&self, id: &str) -> Option<SessionEntryEvidence> {
+        let entry = self.index.iter().find(|entry| entry.id.as_str() == id)?;
+        let excerpt = self
+            .read(
+                ReadSelector::Id(id),
+                ReadOptions {
+                    include_tools: true,
+                    tool_part: ToolPart::Both,
+                    detail: ReadDetail::Compact,
+                    max_items: 1,
+                    max_bytes: 2 * 1024,
+                },
+            )
             .entries
             .first()
             .map(|entry| entry.text.clone())
             .unwrap_or_else(|| entry.summary.clone());
-        Some(StagingEvidence {
-            id: entry.id.clone(),
-            kind: entry.evidence_kind(),
-            entry_range: Some(entry.entry_range),
-            excerpt: Some(excerpt),
-            summary: Some(entry.summary.clone()),
+        Some(SessionEntryEvidence {
+            segment_id: self.segment_id.clone(),
+            entry_ref: entry.id.clone(),
+            entry_range: entry.entry_range,
+            kind: entry.kind,
+            tool_part: entry.tool_part,
+            label: entry.label.clone(),
+            summary: entry.summary.clone(),
+            excerpt,
         })
     }
 }
@@ -486,7 +544,7 @@ mod tests {
 
     #[test]
     fn overview_contains_user_and_assistant_only() {
-        let view = SessionReferenceView::new(
+        let view = SessionCapture::new(
             "segment-1",
             vec![
                 Item::system_message("sys"),
@@ -506,7 +564,7 @@ mod tests {
 
     #[test]
     fn search_filters_tool_input_and_output() {
-        let view = SessionReferenceView::new(
+        let view = SessionCapture::new(
             "segment-1",
             vec![
                 Item::tool_call("c1", "Read", "{\"file\":\"Cargo.toml\"}"),
@@ -521,6 +579,9 @@ mod tests {
             tool_name: Some("Read".into()),
             limit: None,
             min_entry_index: None,
+            from: None,
+            through: None,
+            offset: 0,
         });
         assert_eq!(input_hits.len(), 1);
         assert_eq!(input_hits[0].tool_part, Some(ToolPart::Input));
@@ -532,6 +593,9 @@ mod tests {
             tool_name: None,
             limit: None,
             min_entry_index: None,
+            from: None,
+            through: None,
+            offset: 0,
         });
         assert_eq!(output_hits.len(), 1);
         assert_eq!(output_hits[0].tool_part, Some(ToolPart::Output));
@@ -539,7 +603,7 @@ mod tests {
 
     #[test]
     fn read_by_entry_range_is_bounded_and_can_skip_tools() {
-        let view = SessionReferenceView::new(
+        let view = SessionCapture::new(
             "segment-1",
             vec![
                 Item::user_message("one"),
@@ -570,11 +634,117 @@ mod tests {
     }
 
     #[test]
-    fn source_ref_uses_entry_range_and_evidence_id() {
-        let view = SessionReferenceView::new("segment-1", vec![Item::user_message("hello")]);
-        let source = view.source_ref_for("M0000").unwrap();
-        assert_eq!(source.segment_id.as_deref(), Some("segment-1"));
-        assert_eq!(source.entry_range, Some([0, 0]));
-        assert_eq!(source.evidence_id.as_deref(), Some("M0000"));
+    fn system_prompt_and_reasoning_are_excluded_from_every_projection() {
+        let view = SessionCapture::new(
+            "segment-1",
+            vec![
+                Item::system_message("raw secret system prompt"),
+                Item::reasoning("private chain of thought"),
+                Item::user_message("visible user entry"),
+            ],
+        );
+        let hits = view.search(&SearchOptions {
+            query: String::new(),
+            kind: None,
+            tool_part: None,
+            tool_name: None,
+            limit: None,
+            min_entry_index: None,
+            from: None,
+            through: None,
+            offset: 0,
+        });
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id.as_str(), "E00000002");
+        assert!(!hits[0].summary.contains("secret"));
+        assert!(!hits[0].summary.contains("chain of thought"));
+        assert!(
+            view.read(ReadSelector::Id("E00000000"), ReadOptions::default())
+                .entries
+                .is_empty()
+        );
+        assert!(view.evidence_for("E00000000").is_none());
+        assert_eq!(view.overview().len(), 1);
+        assert_eq!(view.overview()[0].id.as_str(), "E00000002");
+    }
+
+    #[test]
+    fn overview_is_sparse_and_reports_intervening_non_reasoning_entries() {
+        let items = (0..20)
+            .map(|index| Item::user_message(format!("message-{index}")))
+            .collect::<Vec<_>>();
+        let view = SessionCapture::new("segment-1", items);
+        let refs = view
+            .overview()
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            refs,
+            vec!["E00000000", "E00000008", "E00000016", "E00000019"]
+        );
+        assert_eq!(view.overview()[0].intervening_entries, 7);
+        assert_eq!(view.overview()[1].intervening_entries, 7);
+        assert_eq!(view.overview()[2].intervening_entries, 2);
+    }
+
+    #[test]
+    fn append_preserves_existing_session_entry_refs() {
+        let first = SessionCapture::new(
+            "segment-1",
+            vec![
+                Item::user_message("first"),
+                Item::assistant_message("second"),
+            ],
+        );
+        let appended = SessionCapture::new(
+            "segment-1",
+            vec![
+                Item::user_message("first"),
+                Item::assistant_message("second"),
+                Item::user_message("third"),
+            ],
+        );
+        let first_refs = first
+            .search(&SearchOptions {
+                query: String::new(),
+                kind: None,
+                tool_part: None,
+                tool_name: None,
+                limit: None,
+                min_entry_index: None,
+                from: None,
+                through: None,
+                offset: 0,
+            })
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        let appended_refs = appended
+            .search(&SearchOptions {
+                query: String::new(),
+                kind: None,
+                tool_part: None,
+                tool_name: None,
+                limit: None,
+                min_entry_index: None,
+                from: None,
+                through: None,
+                offset: 0,
+            })
+            .into_iter()
+            .take(2)
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        assert_eq!(first_refs, appended_refs);
+    }
+
+    #[test]
+    fn evidence_projection_uses_entry_range_and_session_entry_ref() {
+        let view = SessionCapture::new("segment-1", vec![Item::user_message("hello")]);
+        let source = view.evidence_for("E00000000").unwrap();
+        assert_eq!(source.segment_id, "segment-1");
+        assert_eq!(source.entry_range, [0, 0]);
+        assert_eq!(source.entry_ref.as_str(), "E00000000");
     }
 }

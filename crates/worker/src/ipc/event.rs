@@ -58,8 +58,8 @@ pub fn fire_and_forget(socket: Option<PathBuf>, event: WorkerEvent) {
 /// Only events classified by `WorkerEvent::should_notify_agent` are injected
 /// into the parent's LLM context as system messages; control-plane-only events
 /// keep this renderer for diagnostics/tests. Agent-visible summaries are kept
-/// deliberately short — the LLM can always call `SubWorkerReadOutput` to fetch more
-/// detail if the event summary is not enough.
+/// deliberately short — the LLM can use worker-observation tools to inspect the committed
+/// session when the event summary is not enough.
 pub fn render_event(event: &WorkerEvent) -> String {
     match event {
         WorkerEvent::TurnEnded { worker_name } => {

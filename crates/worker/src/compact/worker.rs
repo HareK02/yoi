@@ -34,8 +34,8 @@ use crate::compact::usage_tracker::UsageTracker;
 use crate::fs_view::ReadRequirement;
 #[cfg(test)]
 use crate::fs_view::slice_lines;
-use crate::session_reference::{
-    ReadDetail, ReadOptions, ReadSelector, SearchOptions, SessionReferenceView, ToolPart,
+use crate::session_capture::{
+    ReadDetail, ReadOptions, ReadSelector, SearchOptions, SessionCapture, ToolPart,
 };
 
 /// Aggregated output of a compact worker run.
@@ -150,7 +150,7 @@ this to verify details before writing the summary.";
 
 struct SessionLogToolState {
     items: Arc<Vec<Item>>,
-    view: SessionReferenceView,
+    view: SessionCapture,
 }
 
 struct SearchSessionLogTool {
@@ -185,6 +185,9 @@ impl Tool for SearchSessionLogTool {
             tool_name: None,
             limit: Some(limit),
             min_entry_index: Some(offset as u64),
+            from: None,
+            through: None,
+            offset: 0,
         });
         let blocks = hits
             .iter()
@@ -252,7 +255,7 @@ impl Tool for ReadSessionItemsTool {
             SessionReadMode::Full => ReadDetail::Full,
         };
         let read = if offset >= end {
-            crate::session_reference::ReadResult {
+            crate::session_capture::ReadResult {
                 entries: Vec::new(),
                 truncated: false,
             }
@@ -496,7 +499,7 @@ pub(crate) fn write_summary_tool(ctx: Arc<Mutex<CompactWorkerContext>>) -> ToolD
 }
 
 pub(crate) fn search_session_log_tool(items: Arc<Vec<Item>>) -> ToolDefinition {
-    let view = SessionReferenceView::new("compact-target", (*items).clone());
+    let view = SessionCapture::new("compact-target", (*items).clone());
     let state = Arc::new(SessionLogToolState { items, view });
     Arc::new(move || {
         let schema = schemars::schema_for!(SearchSessionParams);
@@ -512,7 +515,7 @@ pub(crate) fn search_session_log_tool(items: Arc<Vec<Item>>) -> ToolDefinition {
 }
 
 pub(crate) fn read_session_items_tool(items: Arc<Vec<Item>>) -> ToolDefinition {
-    let view = SessionReferenceView::new("compact-target", (*items).clone());
+    let view = SessionCapture::new("compact-target", (*items).clone());
     let state = Arc::new(SessionLogToolState { items, view });
     Arc::new(move || {
         let schema = schemars::schema_for!(ReadSessionParams);
@@ -808,7 +811,7 @@ mod tests {
                 "very large raw trace body with secret detail",
             ),
         ]);
-        let view = SessionReferenceView::new("test", (*items).clone());
+        let view = SessionCapture::new("test", (*items).clone());
         let tool: Arc<dyn Tool> = Arc::new(SearchSessionLogTool {
             state: Arc::new(SessionLogToolState { items, view }),
         });
@@ -828,7 +831,7 @@ mod tests {
             "read trace",
             "raw trace detail",
         )]);
-        let view = SessionReferenceView::new("test", (*items).clone());
+        let view = SessionCapture::new("test", (*items).clone());
         let tool: Arc<dyn Tool> = Arc::new(ReadSessionItemsTool {
             state: Arc::new(SessionLogToolState { items, view }),
         });

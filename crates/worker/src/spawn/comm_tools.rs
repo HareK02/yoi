@@ -1,6 +1,6 @@
 //! Parent-facing tools for in-process Internal SubWorker sessions.
 //!
-//! All five tools share the same parent-owned `SpawnedWorkerRegistry` of typed session handles.
+//! All four tools share the same parent-owned `SpawnedWorkerRegistry` of typed session handles.
 //! There is no Runtime catalog lookup or child socket transport, so a Worker can operate only on
 //! its direct Internal children. The socket helper at the bottom remains solely for the legacy
 //! top-level Worker callback protocol and is not part of SubWorker communication.
@@ -10,12 +10,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use llm_engine::llm_client::types::{ContentPart, Item, Role};
 use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use protocol::stream::{JsonLineReader, JsonLineWriter};
 use protocol::{Event, Method};
 use serde::{Deserialize, Serialize};
-use session_store::LogEntry;
 use tokio::net::UnixStream;
 
 use crate::spawn::registry::SpawnedWorkerRegistry;
@@ -96,7 +94,7 @@ pub fn sub_worker_list_tool(registry: Arc<SpawnedWorkerRegistry>) -> ToolDefinit
 const SEND_TO_POD_DESCRIPTION: &str = "Send a text message to a previously spawned SubWorker. The SubWorker \
 processes it as a user turn. Fails if the SubWorker is already executing a \
 turn — retry after it finishes. Does not wait for the turn to complete; \
-use `SubWorkerReadOutput` to fetch results afterwards.";
+use worker-observation tools to inspect its committed session.";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SubWorkerSendInput {
@@ -140,76 +138,6 @@ pub fn sub_worker_send_tool(registry: Arc<SpawnedWorkerRegistry>) -> ToolDefinit
             .description(SEND_TO_POD_DESCRIPTION)
             .input_schema(schema_value);
         let tool: Arc<dyn Tool> = Arc::new(SubWorkerSendTool {
-            registry: registry.clone(),
-        });
-        (meta, tool)
-    })
-}
-
-// ---------------------------------------------------------------------------
-// SubWorkerReadOutput
-// ---------------------------------------------------------------------------
-
-const READ_POD_OUTPUT_DESCRIPTION: &str = "Fetch new assistant text from a SubWorker since the last read. \
-Uses an internal cursor per-SubWorker so consecutive calls return only \
-newly-produced output. Returns the SubWorker's current status and the new \
-text, or reports `stopped` if the SubWorker can no longer be reached.";
-
-struct SubWorkerReadOutputTool {
-    registry: Arc<SpawnedWorkerRegistry>,
-}
-
-#[async_trait]
-impl Tool for SubWorkerReadOutputTool {
-    async fn execute(
-        &self,
-        input_json: &str,
-        _ctx: llm_engine::tool::ToolExecutionContext,
-    ) -> Result<ToolOutput, ToolError> {
-        let input: NameInput = serde_json::from_str(input_json).map_err(|e| {
-            ToolError::InvalidArgument(format!("invalid SubWorkerReadOutput input: {e}"))
-        })?;
-        if let Some(record) = self.registry.get_internal(&input.name) {
-            let entries = record.session.entries();
-            let cursor = self.registry.cursor(&input.name).await;
-            let new_entries = if cursor >= entries.len() {
-                &[] as &[LogEntry]
-            } else {
-                &entries[cursor..]
-            };
-            let values = new_entries
-                .iter()
-                .filter_map(|entry| serde_json::to_value(entry).ok())
-                .collect::<Vec<_>>();
-            let new_text = extract_assistant_text(&values);
-            self.registry.set_cursor(&input.name, entries.len()).await;
-            let status = format!("{:?}", record.session.status()).to_lowercase();
-            let summary = if new_text.is_empty() {
-                format!("worker `{}` {status}; no new assistant text", input.name)
-            } else {
-                format!(
-                    "worker `{}` {status}: {} new line(s) of assistant text",
-                    input.name,
-                    new_text.lines().count()
-                )
-            };
-            return Ok(ToolOutput {
-                summary,
-                content: (!new_text.is_empty()).then_some(new_text),
-            });
-        }
-        Err(unknown_worker_err(&input.name))
-    }
-}
-
-pub fn sub_worker_read_output_tool(registry: Arc<SpawnedWorkerRegistry>) -> ToolDefinition {
-    Arc::new(move || {
-        let schema = schemars::schema_for!(NameInput);
-        let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
-        let meta = ToolMeta::new("SubWorkerReadOutput")
-            .description(READ_POD_OUTPUT_DESCRIPTION)
-            .input_schema(schema_value);
-        let tool: Arc<dyn Tool> = Arc::new(SubWorkerReadOutputTool {
             registry: registry.clone(),
         });
         (meta, tool)
@@ -318,47 +246,6 @@ where
                     std::io::ErrorKind::UnexpectedEof,
                     "worker closed connection before Snapshot event",
                 ));
-            }
-        }
-    }
-}
-
-fn extract_assistant_text(entries: &[serde_json::Value]) -> String {
-    let mut out = String::new();
-    for value in entries {
-        // The wire payload is the JSON form of `session_store::LogEntry`.
-        // Walk current singular assistant items and the seeded history in
-        // post-compaction `SegmentStart` entries.
-        let Ok(entry) = serde_json::from_value::<LogEntry>(value.clone()) else {
-            continue;
-        };
-        match entry {
-            LogEntry::SegmentStart { history, .. } => {
-                for logged in history {
-                    push_assistant_text(&mut out, logged);
-                }
-            }
-            LogEntry::AssistantItem { item, .. } => push_assistant_text(&mut out, item),
-            _ => continue,
-        }
-    }
-    out
-}
-
-fn push_assistant_text(out: &mut String, logged: session_store::LoggedItem) {
-    let item: Item = logged.into();
-    if let Item::Message {
-        role: Role::Assistant,
-        content,
-        ..
-    } = item
-    {
-        for part in content {
-            if let ContentPart::Text { text } = part {
-                if !out.is_empty() {
-                    out.push_str("\n\n");
-                }
-                out.push_str(&text);
             }
         }
     }

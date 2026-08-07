@@ -11,7 +11,7 @@ pub mod model_client;
 pub mod prompt;
 pub mod runtime;
 pub mod segment_log_sink;
-mod session_reference;
+mod session_capture;
 pub mod shared_state;
 mod shutdown_after_idle;
 pub mod skill;

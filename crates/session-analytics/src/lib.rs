@@ -1600,9 +1600,12 @@ fn tool_kind(name: &str) -> &'static str {
         "WebFetch" | "WebSearch" => "web",
         "SubWorkerSpawn"
         | "SubWorkerSend"
-        | "SubWorkerReadOutput"
         | "SubWorkerList"
         | "SubWorkerStop"
+        | "ListWorkerSessions"
+        | "ViewSessionOverview"
+        | "SearchSessionEntries"
+        | "ReadSessionEntry"
         | "WorkerList"
         | "WorkerSpawn"
         | "WorkerStop"

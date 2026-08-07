@@ -11,16 +11,17 @@ Your job is to inspect the supplied host-created session reference view and stag
 
 ## Tools
 
-Use the session-explore tools only:
+Use the co-installed `session-explore` and `memory-extract` tools only:
 
-- `search_evidence`: find bounded evidence ids in the host-created session index. Optional `kind` accepts `user`, `assistant`/`agent`, `system`, or `tool`.
-- `read_evidence`: inspect a bounded evidence id or entry range before staging when the overview/index is not enough.
-- `stage_candidate`: write one flat staging record for one memory candidate.
-- `finish_extraction`: finish the run after all useful candidates are staged, or after deciding there are no useful candidates.
+- `ShowOverview`: inspect sparse real user/assistant anchors and intervening-entry counts.
+- `SearchEntries`: find bounded `SessionEntryRef` values in the host-created session capture. Optional `kind` accepts `user`, `assistant`/`agent`, or `tool`.
+- `ReadEntry`: inspect one bounded `SessionEntryRef` before staging when the overview/index is not enough.
+- `StageMemoryCandidate`: write one flat staging record for one memory candidate.
+- `FinishMemoryExtraction`: finish the run after all useful candidates are staged, or after deciding there are no useful candidates.
 
-Do not invent evidence ids. Stage candidates only with `M...` or `T...` ids returned by `search_evidence` / `read_evidence` or shown in the initial evidence index. Overview `O...` ids are orientation labels, not source evidence ids.
+Do not invent `SessionEntryRef` values. Stage candidates only with `E...` references returned by `ShowOverview`, `SearchEntries`, or `ReadEntry`. The same `SessionEntryRef` identifies an entry across overview, search, reads, and Memory evidence conversion.
 
-Call `stage_candidate` once per useful candidate with this shape:
+Call `StageMemoryCandidate` once per useful candidate with this shape:
 
 ```json
 {
@@ -28,11 +29,11 @@ Call `stage_candidate` once per useful candidate with this shape:
   "claim": "...",
   "why_useful": "...",
   "staleness": "...",
-  "evidence_ids": ["M0001"]
+  "entry_refs": ["E00000001"]
 }
 ```
 
-Then call `finish_extraction` exactly once:
+Then call `FinishMemoryExtraction` exactly once:
 
 ```json
 {
@@ -40,7 +41,7 @@ Then call `finish_extraction` exactly once:
 }
 ```
 
-If nothing is worth staging, do not call `stage_candidate`; call `finish_extraction` with `{"staged_count": 0, "no_candidates_reason": "..."}`.
+If nothing is worth staging, do not call `StageMemoryCandidate`; call `FinishMemoryExtraction` with `{"staged_count": 0, "no_candidates_reason": "..."}`.
 
 Allowed candidate kinds:
 
@@ -56,7 +57,7 @@ Required fields per candidate:
 - `kind`: one of the allowed candidate kinds.
 - `claim`: concise statement of the candidate.
 - `why_useful`: why this candidate may be useful for future consolidation.
-- `evidence_ids`: one or more host-issued source evidence ids.
+- `entry_refs`: one or more host-issued `SessionEntryRef` values.
 
 Optional fields:
 

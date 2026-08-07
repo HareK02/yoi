@@ -208,7 +208,6 @@ struct ToolCapabilities {
     memory_update_document: bool,
     sub_worker_spawn: bool,
     sub_worker_send: bool,
-    sub_worker_read_output: bool,
     sub_worker_stop: bool,
     sub_worker_list: bool,
     sub_worker_restore: bool,
@@ -224,7 +223,6 @@ impl ToolCapabilities {
                 "MemoryUpdateDocument" => capabilities.memory_update_document = true,
                 "SubWorkerSpawn" => capabilities.sub_worker_spawn = true,
                 "SubWorkerSend" => capabilities.sub_worker_send = true,
-                "SubWorkerReadOutput" => capabilities.sub_worker_read_output = true,
                 "SubWorkerStop" => capabilities.sub_worker_stop = true,
                 "SubWorkerList" => capabilities.sub_worker_list = true,
                 _ => {}
@@ -248,7 +246,6 @@ impl ToolCapabilities {
     fn sub_worker_management(self) -> bool {
         self.sub_worker_spawn
             || self.sub_worker_send
-            || self.sub_worker_read_output
             || self.sub_worker_stop
             || self.sub_worker_list
             || self.sub_worker_restore

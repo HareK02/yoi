@@ -32,7 +32,8 @@ use crate::compact::state::CompactState;
 use crate::compact::usage_tracker::UsageTracker;
 use crate::feature::builtin::memory::WorkspaceMemoryBackendError;
 use crate::feature::builtin::{
-    SessionExploreFeature, SessionExploreState, TaskFeature, render_extract_input,
+    MemoryExtractFeature, MemoryExtractState, SessionExploreFeature, SessionExploreState,
+    TaskFeature, WorkerObservationProvider, render_extract_input,
 };
 use crate::feature::{
     FeatureInstructionDeclaration, FeatureInstructionId, FeatureRegistryBuilder,
@@ -686,6 +687,9 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// the narrow snapshot/restore surface Worker needs for compaction and rewind.
     /// Store/reminder ownership stays inside the Task feature module.
     task_feature: TaskFeature,
+    /// Host-owned projection of Worker sessions explicitly granted to this Worker.
+    /// The provider reauthorizes every capture and never derives authority from model input.
+    worker_observation_provider: Option<Arc<dyn WorkerObservationProvider>>,
     /// Parsed system-prompt template awaiting first-turn materialisation.
     /// `Some` until `ensure_system_prompt_materialized` renders it once,
     /// then `None` forever — including after compaction.
@@ -839,6 +843,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
             usage_history: self.usage_history.clone(),
             tracker: None,
             task_feature: self.task_feature.clone(),
+            worker_observation_provider: None,
             system_prompt_template: None,
             feature_instructions: self.feature_instructions.clone(),
             alerter: self.alerter.clone(),
@@ -1036,6 +1041,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             usage_history: Arc::new(Mutex::new(Vec::<UsageRecord>::new())),
             tracker: None,
             task_feature: TaskFeature::new(),
+            worker_observation_provider: None,
             system_prompt_template: None,
             feature_instructions: Vec::new(),
             alerter: None,
@@ -1168,6 +1174,19 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
 
     pub fn workspace_client_handle(&self) -> Arc<dyn WorkspaceClient> {
         self.workspace_context.client_handle()
+    }
+
+    /// Bind the host-owned Worker-session observation projection. The provider
+    /// is responsible for workspace authorization and per-capture revalidation.
+    pub fn bind_worker_observation_provider(
+        &mut self,
+        provider: Option<Arc<dyn WorkerObservationProvider>>,
+    ) {
+        self.worker_observation_provider = provider;
+    }
+
+    pub(crate) fn worker_observation_provider(&self) -> Option<Arc<dyn WorkerObservationProvider>> {
+        self.worker_observation_provider.clone()
     }
 
     async fn resident_summary_from_workspace_authority(
@@ -3445,15 +3464,21 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             segment_id: source_segment_id.to_string(),
             range: [start_entry as u64, end_entry as u64],
         };
-        let session_view = crate::session_reference::SessionReferenceView::new(
+        let session_view = crate::session_capture::SessionCapture::new(
             source_segment_id.to_string(),
             items_to_extract,
         );
-        let session_explore_state =
-            SessionExploreState::new(session_view, self.workspace_client_handle(), source);
+        let session_explore_state = SessionExploreState::new(session_view.clone());
+        let memory_extract_state = MemoryExtractState::new(
+            session_view,
+            self.workspace_client_handle(),
+            source,
+            audit.run_id.to_string(),
+        );
         let input_text = render_extract_input(session_explore_state.view());
         let features = FeatureRegistryBuilder::new()
-            .with_module(SessionExploreFeature::new(session_explore_state.clone()));
+            .with_module(SessionExploreFeature::new(session_explore_state.clone()))
+            .with_module(MemoryExtractFeature::new(memory_extract_state.clone()));
         let mut internal_manifest = self.manifest.clone();
         internal_manifest.model = model.clone();
         let internal_spec = InternalWorkerSpec {
@@ -3469,10 +3494,11 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             max_turns: extract_worker_max_turns,
             features,
             required_tools: &[
-                "search_evidence",
-                "read_evidence",
-                "stage_candidate",
-                "finish_extraction",
+                "ShowOverview",
+                "SearchEntries",
+                "ReadEntry",
+                "StageMemoryCandidate",
+                "FinishMemoryExtraction",
             ],
             authority: InternalWorkerAuthority {
                 workspace: self.workspace_context.clone(),
@@ -3533,11 +3559,11 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             }
         };
 
-        let staging_results = session_explore_state.staged();
-        if !session_explore_state.is_finished() {
+        let staging_results = memory_extract_state.staged();
+        if !memory_extract_state.is_finished() {
             tracing::warn!(
                 staged_count = staging_results.len(),
-                "extract worker did not call finish_extraction; advancing pointer with staged output"
+                "extract worker did not call FinishMemoryExtraction; advancing pointer with staged output"
             );
         }
         let staging_id = staging_results.first().cloned().unwrap_or_default();
@@ -3925,6 +3951,7 @@ where
             usage_history: Arc::new(Mutex::new(Vec::new())),
             tracker: None,
             task_feature: TaskFeature::new(),
+            worker_observation_provider: None,
             system_prompt_template: common.system_prompt_template,
             feature_instructions: common.feature_instructions,
             alerter: None,
@@ -3999,6 +4026,7 @@ where
             usage_history: Arc::new(Mutex::new(Vec::new())),
             tracker: None,
             task_feature: TaskFeature::new(),
+            worker_observation_provider: None,
             system_prompt_template: common.system_prompt_template,
             feature_instructions: common.feature_instructions,
             alerter: None,
@@ -4107,6 +4135,7 @@ where
             usage_history: Arc::new(Mutex::new(Vec::new())),
             tracker: None,
             task_feature: TaskFeature::new(),
+            worker_observation_provider: None,
             system_prompt_template: common.system_prompt_template,
             feature_instructions: common.feature_instructions,
             alerter: None,
@@ -4399,6 +4428,7 @@ where
             usage_history: Arc::new(Mutex::new(state.usage_history)),
             tracker: None,
             task_feature,
+            worker_observation_provider: None,
             // Restore replays the saved system_prompt verbatim — no
             // template re-render on resume.
             system_prompt_template: None,

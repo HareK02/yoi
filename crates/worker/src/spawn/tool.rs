@@ -409,7 +409,7 @@ impl Tool for SubWorkerSpawnTool {
                     }
                 }
                 parent_notifies.push_notify(
-                    format!("SubWorker `{child_name}` turn ended with status {status:?}. Read its output before making completion decisions."),
+                    format!("SubWorker `{child_name}` turn ended with status {status:?}. Inspect its committed session with worker-observation tools before making completion decisions."),
                     true,
                 );
             })),
@@ -850,7 +850,9 @@ mod tests {
     use async_trait::async_trait;
     use futures::Stream;
     use llm_engine::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
+    use llm_engine::llm_client::types::ContentPart;
     use llm_engine::llm_client::{ClientError, LlmClient, Request};
+    use llm_engine::{Item, Role};
     use manifest::{AuthRef, ModelManifest, SchemeKind, WorkerManifest};
     use tempfile::TempDir;
 
@@ -1028,22 +1030,23 @@ extract_threshold = 4000
                 .contains("reviewer-child")
         );
 
-        let read = (crate::spawn::comm_tools::sub_worker_read_output_tool(registry.clone()))().1;
-        let first_output = read
-            .execute(r#"{"name":"reviewer-child"}"#, context.clone())
-            .await
-            .unwrap();
-        assert!(
-            first_output
-                .content
-                .unwrap_or_default()
-                .contains("reviewed")
-        );
-        let second_output = read
-            .execute(r#"{"name":"reviewer-child"}"#, context.clone())
-            .await
-            .unwrap();
-        assert!(second_output.content.is_none());
+        let observation =
+            crate::feature::builtin::worker_observation::SpawnedSubWorkerObservationProvider::new(
+                registry.clone(),
+            );
+        let observed_child =
+            crate::feature::builtin::worker_observation::WorkerObservationSubjectRef::SubWorker {
+                name: "reviewer-child".to_string(),
+            };
+        let first_capture = crate::feature::builtin::worker_observation::WorkerObservationProvider::capture_worker_session(
+            &observation,
+            &observed_child,
+        )
+        .await
+        .unwrap();
+        assert!(first_capture.items.iter().any(|item| {
+            matches!(item, Item::Message { role: Role::Assistant, content, .. } if content.iter().any(|part| matches!(part, ContentPart::Text { text } if text.contains("reviewed"))))
+        }));
 
         let send = (crate::spawn::comm_tools::sub_worker_send_tool(registry.clone()))().1;
         send.execute(
@@ -1057,6 +1060,13 @@ extract_threshold = 4000
             crate::internal_worker::InternalWorkerSessionStatus::Idle
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let latest_capture = crate::feature::builtin::worker_observation::WorkerObservationProvider::capture_worker_session(
+            &observation,
+            &observed_child,
+        )
+        .await
+        .unwrap();
+        assert!(latest_capture.items.len() > first_capture.items.len());
 
         fail_requests.store(true, Ordering::SeqCst);
         send.execute(
@@ -1094,9 +1104,9 @@ extract_threshold = 4000
         .unwrap();
         assert!(!spawner_scope.snapshot().is_writable(&workspace_root));
         drop(list);
-        drop(read);
         drop(send);
         drop(stop);
+        drop(observation);
         drop(tool);
         drop(registry);
         assert!(spawner_scope.snapshot().is_writable(&workspace_root));

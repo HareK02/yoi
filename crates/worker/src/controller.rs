@@ -21,9 +21,7 @@ use crate::shutdown_after_idle::{
     ShutdownAfterIdleRequest, TicketIntakeReadyShutdownHook, is_ticket_intake_role,
     take_shutdown_request_after_status,
 };
-use crate::spawn::comm_tools::{
-    sub_worker_list_tool, sub_worker_read_output_tool, sub_worker_send_tool, sub_worker_stop_tool,
-};
+use crate::spawn::comm_tools::{sub_worker_list_tool, sub_worker_send_tool, sub_worker_stop_tool};
 use crate::spawn::registry::SpawnedWorkerRegistry;
 use crate::spawn::tool::sub_worker_spawn_tool;
 use crate::worker::{SystemItemCommitter, Worker, WorkerError, WorkerRunResult};
@@ -57,6 +55,10 @@ impl WorkerHandle {
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.event_tx.subscribe()
+    }
+
+    pub fn committed_entries(&self) -> Vec<LogEntry> {
+        self.sink.subscribe_with_snapshot().0
     }
 
     pub fn snapshot_event(&self) -> Event {
@@ -725,6 +727,7 @@ where
         worker.register_worker_orchestration_instruction();
     }
 
+    let host_worker_observation_provider = worker.worker_observation_provider();
     {
         let workspace_client = worker.workspace_client_handle();
         let engine = worker.engine_mut();
@@ -779,7 +782,11 @@ where
             }
         }
 
-        // Worker-orchestration tools (SubWorkerSpawn + the four comm tools) share
+        let mut observation_providers: Vec<
+            Arc<dyn crate::feature::builtin::worker_observation::WorkerObservationProvider>,
+        > = Vec::new();
+
+        // Worker-orchestration tools (SubWorkerSpawn + three control tools) share
         // the Worker-scoped `SpawnedWorkerRegistry` (also consumed by the main
         // loop's `WorkerEvent` handler). Expose them only behind the explicit
         // profile feature and require delegation authority up front so enabling
@@ -814,8 +821,26 @@ where
             ));
             engine.register_tool(sub_worker_list_tool(spawned_registry.clone()));
             engine.register_tool(sub_worker_send_tool(spawned_registry.clone()));
-            engine.register_tool(sub_worker_read_output_tool(spawned_registry.clone()));
-            engine.register_tool(sub_worker_stop_tool(spawned_registry));
+            engine.register_tool(sub_worker_stop_tool(spawned_registry.clone()));
+            observation_providers.push(Arc::new(
+                crate::feature::builtin::worker_observation::SpawnedSubWorkerObservationProvider::new(
+                    spawned_registry,
+                ),
+            ));
+        }
+        if let Some(provider) = host_worker_observation_provider {
+            observation_providers.push(provider);
+        }
+        if !observation_providers.is_empty() {
+            feature_registry = feature_registry.with_module(
+                crate::feature::builtin::worker_observation::WorkerObservationFeature::new(
+                    Arc::new(
+                        crate::feature::builtin::worker_observation::CompositeWorkerObservationProvider::new(
+                            observation_providers,
+                        ),
+                    ),
+                ),
+            );
         }
     }
     let _feature_install_report = worker.install_features(feature_registry);
