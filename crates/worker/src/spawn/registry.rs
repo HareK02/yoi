@@ -9,9 +9,12 @@
 //! yield only new assistant text. Parent registry drop closes all session handles and synchronously
 //! returns delegated Write deny rules to the parent scope.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use manifest::{Permission, ScopeRule, SharedScope};
 use session_store::{
@@ -29,10 +32,69 @@ pub(crate) struct InternalSpawnedWorkerRecord {
     pub worker_name: String,
     pub scope_delegated: Vec<ScopeRule>,
     pub session: InternalWorkerSessionHandle,
+    scope_reclaimed: Arc<AtomicBool>,
+}
+
+impl InternalSpawnedWorkerRecord {
+    pub(crate) fn new(
+        worker_name: String,
+        scope_delegated: Vec<ScopeRule>,
+        session: InternalWorkerSessionHandle,
+    ) -> Self {
+        Self {
+            worker_name,
+            scope_delegated,
+            session,
+            scope_reclaimed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn claim_scope_reclaim(&self) -> bool {
+        !self.scope_reclaimed.swap(true, Ordering::AcqRel)
+    }
+
+    fn restore_scope_reclaim(&self) {
+        self.scope_reclaimed.store(false, Ordering::Release);
+    }
+}
+
+pub(crate) struct InternalSpawnReservation {
+    registry: Arc<SpawnedWorkerRegistry>,
+    worker_name: String,
+    committed: bool,
+}
+
+impl InternalSpawnReservation {
+    pub(crate) fn commit(mut self, record: InternalSpawnedWorkerRecord) -> io::Result<()> {
+        if record.worker_name != self.worker_name {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "internal SubWorker reservation name does not match record name",
+            ));
+        }
+        self.registry
+            .internal_records
+            .lock()
+            .map_err(|_| io::Error::other("internal spawned-worker registry lock poisoned"))?
+            .push(record);
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for InternalSpawnReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            if let Ok(mut names) = self.registry.internal_names.lock() {
+                names.remove(&self.worker_name);
+            }
+        }
+    }
 }
 
 pub struct SpawnedWorkerRegistry {
     internal_records: std::sync::Mutex<Vec<InternalSpawnedWorkerRecord>>,
+    internal_names: std::sync::Mutex<HashSet<String>>,
     cursors: Mutex<HashMap<String, usize>>,
     parent_scope: Option<SharedScope>,
 }
@@ -48,6 +110,7 @@ impl SpawnedWorkerRegistry {
     pub fn new(_runtime_dir: Arc<RuntimeDir>) -> Arc<Self> {
         Arc::new(Self {
             internal_records: std::sync::Mutex::new(Vec::new()),
+            internal_names: std::sync::Mutex::new(HashSet::new()),
             cursors: Mutex::new(HashMap::new()),
             parent_scope: None,
         })
@@ -56,6 +119,7 @@ impl SpawnedWorkerRegistry {
     pub(crate) fn new_internal(_parent_name: String, parent_scope: SharedScope) -> Arc<Self> {
         Arc::new(Self {
             internal_records: std::sync::Mutex::new(Vec::new()),
+            internal_names: std::sync::Mutex::new(HashSet::new()),
             cursors: Mutex::new(HashMap::new()),
             parent_scope: Some(parent_scope),
         })
@@ -133,6 +197,7 @@ impl SpawnedWorkerRegistry {
         Ok(SpawnedWorkerRegistryLoad {
             registry: Arc::new(Self {
                 internal_records: std::sync::Mutex::new(Vec::new()),
+                internal_names: std::sync::Mutex::new(HashSet::new()),
                 cursors: Mutex::new(HashMap::new()),
                 parent_scope,
             }),
@@ -140,25 +205,26 @@ impl SpawnedWorkerRegistry {
         })
     }
 
-    pub(crate) fn add_internal(&self, record: InternalSpawnedWorkerRecord) -> io::Result<()> {
-        let mut records = self
-            .internal_records
+    pub(crate) fn reserve_internal_name(
+        self: &Arc<Self>,
+        worker_name: String,
+    ) -> io::Result<InternalSpawnReservation> {
+        let mut names = self
+            .internal_names
             .lock()
-            .map_err(|_| io::Error::other("internal spawned-worker registry lock poisoned"))?;
-        if records
-            .iter()
-            .any(|existing| existing.worker_name == record.worker_name)
-        {
+            .map_err(|_| io::Error::other("internal SubWorker name registry lock poisoned"))?;
+        if !names.insert(worker_name.clone()) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                format!(
-                    "spawned worker `{}` is already registered",
-                    record.worker_name
-                ),
+                format!("spawned worker `{worker_name}` is already registered"),
             ));
         }
-        records.push(record);
-        Ok(())
+        drop(names);
+        Ok(InternalSpawnReservation {
+            registry: Arc::clone(self),
+            worker_name,
+            committed: false,
+        })
     }
 
     pub(crate) fn get_internal(&self, worker_name: &str) -> Option<InternalSpawnedWorkerRecord> {
@@ -177,26 +243,56 @@ impl SpawnedWorkerRegistry {
             .unwrap_or_default()
     }
 
+    pub(crate) fn reclaim_internal_scope(&self, worker_name: &str) -> io::Result<bool> {
+        let record = self.get_internal(worker_name).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "internal SubWorker not found")
+        })?;
+        self.reclaim_record_scope(&record)
+    }
+
+    fn reclaim_record_scope(&self, record: &InternalSpawnedWorkerRecord) -> io::Result<bool> {
+        if !record.claim_scope_reclaim() {
+            return Ok(false);
+        }
+        let result = if let Some(parent_scope) = &self.parent_scope {
+            parent_scope
+                .update(|current| current.with_removed_deny_rules(delegated_write_rules(record)))
+                .map(|_| true)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+        } else {
+            Ok(true)
+        };
+        if result.is_err() {
+            record.restore_scope_reclaim();
+        }
+        result
+    }
+
     pub(crate) async fn remove_internal(
         &self,
         worker_name: &str,
     ) -> io::Result<Option<InternalSpawnedWorkerRecord>> {
-        let removed = {
-            let mut records = self
-                .internal_records
-                .lock()
-                .map_err(|_| io::Error::other("internal spawned-worker registry lock poisoned"))?;
-            records
-                .iter()
-                .position(|record| record.worker_name == worker_name)
-                .map(|index| records.remove(index))
-        };
-        self.cursors.lock().await.remove(worker_name);
-        if let (Some(record), Some(parent_scope)) = (&removed, &self.parent_scope) {
-            parent_scope
-                .update(|current| current.with_removed_deny_rules(delegated_write_rules(record)))
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        if let Some(record) = self.get_internal(worker_name) {
+            self.reclaim_record_scope(&record)?;
         }
+        let removed =
+            {
+                let mut records = self.internal_records.lock().map_err(|_| {
+                    io::Error::other("internal spawned-worker registry lock poisoned")
+                })?;
+                let mut names = self.internal_names.lock().map_err(|_| {
+                    io::Error::other("internal SubWorker name registry lock poisoned")
+                })?;
+                let removed = records
+                    .iter()
+                    .position(|record| record.worker_name == worker_name)
+                    .map(|index| records.remove(index));
+                if removed.is_some() {
+                    names.remove(worker_name);
+                }
+                removed
+            };
+        self.cursors.lock().await.remove(worker_name);
         Ok(removed)
     }
 
@@ -222,6 +318,7 @@ impl Drop for SpawnedWorkerRegistry {
         };
         let write_rules = records
             .iter()
+            .filter(|record| !record.scope_reclaimed.load(Ordering::Acquire))
             .flat_map(delegated_write_rules)
             .collect::<Vec<_>>();
         let _ = parent_scope.update(|current| current.with_removed_deny_rules(write_rules));

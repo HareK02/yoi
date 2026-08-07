@@ -21,7 +21,9 @@ use serde::Deserialize;
 
 use crate::PromptLoader;
 use crate::controller::register_worker_tools;
-use crate::internal_worker::{EphemeralSessionStore, spawn_prepared_internal_worker_session};
+use crate::internal_worker::{
+    EphemeralSessionStore, InternalWorkerSessionStatus, prepare_internal_worker_session,
+};
 use crate::prompt::catalog::PromptCatalog;
 use crate::spawn::registry::SpawnedWorkerRegistry;
 use crate::worker::{Worker, WorkerFilesystemAuthority};
@@ -303,6 +305,10 @@ impl Tool for SubWorkerSpawnTool {
                 input.name
             )));
         }
+        let name_reservation = self
+            .registry
+            .reserve_internal_name(input.name.clone())
+            .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
 
         let scope_allow = parse_scope(&input.scope)?;
         self.validate_delegation_scope(&scope_allow)?;
@@ -385,15 +391,26 @@ impl Tool for SubWorkerSpawnTool {
         }
 
         let child_name = input.name.clone();
+        let registry = Arc::downgrade(&self.registry);
         let parent_notifies = self.parent_notifies.clone();
-        let session_result = spawn_prepared_internal_worker_session(
+        let session_result = prepare_internal_worker_session(
             child,
             store,
-            input.task.clone(),
             Some(Arc::new(move |status| {
+                if status == InternalWorkerSessionStatus::Failed {
+                    if let Some(registry) = registry.upgrade() {
+                        if let Err(error) = registry.reclaim_internal_scope(&child_name) {
+                            tracing::warn!(
+                                child_name,
+                                %error,
+                                "failed to reclaim delegated scope after Internal SubWorker failure"
+                            );
+                        }
+                    }
+                }
                 parent_notifies.push_notify(
                     format!("SubWorker `{child_name}` turn ended with status {status:?}. Read its output before making completion decisions."),
-                    false,
+                    true,
                 );
             })),
         )
@@ -407,17 +424,17 @@ impl Tool for SubWorkerSpawnTool {
                         .update(|current| current.with_removed_deny_rules(revoke_write.clone()));
                 }
                 return Err(ToolError::ExecutionFailed(format!(
-                    "start Internal Worker session: {error}"
+                    "prepare Internal Worker session: {error}"
                 )));
             }
         };
 
-        let record = crate::spawn::registry::InternalSpawnedWorkerRecord {
-            worker_name: input.name.clone(),
-            scope_delegated: scope_allow,
-            session: session.clone(),
-        };
-        if let Err(error) = self.registry.add_internal(record) {
+        let record = crate::spawn::registry::InternalSpawnedWorkerRecord::new(
+            input.name.clone(),
+            scope_allow,
+            session.clone(),
+        );
+        if let Err(error) = name_reservation.commit(record) {
             let _ = session.stop().await;
             if !revoke_write.is_empty() {
                 let _ = self
@@ -426,6 +443,13 @@ impl Tool for SubWorkerSpawnTool {
             }
             return Err(ToolError::ExecutionFailed(format!(
                 "register Internal Worker session: {error}"
+            )));
+        }
+        if let Err(error) = session.send(input.task).await {
+            let _ = session.stop().await;
+            let _ = self.registry.remove_internal(&input.name).await;
+            return Err(ToolError::ExecutionFailed(format!(
+                "start Internal Worker session: {error}"
             )));
         }
 
@@ -820,7 +844,7 @@ fn sub_worker_spawn_tool_impl(
 mod tests {
     use super::*;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use crate::WorkspaceId;
     use async_trait::async_trait;
@@ -890,8 +914,9 @@ extract_threshold = 4000
             Arc::new(AvailableWorkspaceClient),
         );
         let calls = Arc::new(AtomicUsize::new(0));
-        let observed_parent_write_revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let observed_instruction_override = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_parent_write_revoked = Arc::new(AtomicBool::new(false));
+        let observed_instruction_override = Arc::new(AtomicBool::new(false));
+        let fail_requests = Arc::new(AtomicBool::new(false));
         let workspace_prompts = runtime.path().join("workspace-prompts");
         std::fs::create_dir_all(&workspace_prompts).unwrap();
         std::fs::write(
@@ -921,6 +946,7 @@ extract_threshold = 4000
             delegated_path: workspace_root.clone(),
             observed_parent_write_revoked: observed_parent_write_revoked.clone(),
             observed_instruction_override: observed_instruction_override.clone(),
+            fail_requests: fail_requests.clone(),
         }));
         let input = serde_json::json!({
             "name": "reviewer-child",
@@ -934,6 +960,18 @@ extract_threshold = 4000
             }]
         });
 
+        assert!(spawner_scope.snapshot().is_writable(&workspace_root));
+
+        let mut invalid_input = input.clone();
+        invalid_input["scope"][0]["target"] =
+            serde_json::json!(runtime.path().join("outside-parent-scope"));
+        tool.execute(
+            &serde_json::to_string(&invalid_input).unwrap(),
+            llm_engine::tool::ToolExecutionContext::direct(),
+        )
+        .await
+        .expect_err("invalid delegation must fail before child preparation");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(spawner_scope.snapshot().is_writable(&workspace_root));
 
         let output = tool
@@ -956,7 +994,29 @@ extract_threshold = 4000
         assert!(observed_parent_write_revoked.load(Ordering::SeqCst));
         assert!(observed_instruction_override.load(Ordering::SeqCst));
         assert_eq!(parent_notifies.len(), 1);
+        assert!(
+            parent_notifies.has_auto_run_pending(),
+            "SubWorker completion must auto-invoke the parent"
+        );
         assert!(!runtime.path().join("reviewer-child/sock").exists());
+
+        let duplicate_error = tool
+            .execute(
+                &serde_json::to_string(&input).unwrap(),
+                llm_engine::tool::ToolExecutionContext::direct(),
+            )
+            .await
+            .expect_err("duplicate child name must be rejected before a first turn starts");
+        assert!(
+            format!("{duplicate_error:?}").contains("already registered"),
+            "unexpected duplicate error: {duplicate_error:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "duplicate rejection must not invoke the child provider"
+        );
+        assert_eq!(parent_notifies.len(), 1);
 
         let context = llm_engine::tool::ToolExecutionContext::direct();
         let list = (crate::spawn::comm_tools::sub_worker_list_tool(registry.clone()))().1;
@@ -998,6 +1058,24 @@ extract_threshold = 4000
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
 
+        fail_requests.store(true, Ordering::SeqCst);
+        send.execute(
+            r#"{"name":"reviewer-child","message":"trigger terminal failure"}"#,
+            context.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            record.session.wait_until_idle().await,
+            InternalWorkerSessionStatus::Failed
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(
+            spawner_scope.snapshot().is_writable(&workspace_root),
+            "Failed terminal child must automatically reclaim its delegated write scope"
+        );
+        assert!(registry.get_internal("reviewer-child").is_some());
+
         let stop = (crate::spawn::comm_tools::sub_worker_stop_tool(registry.clone()))().1;
         stop.execute(r#"{"name":"reviewer-child"}"#, context)
             .await
@@ -1005,6 +1083,7 @@ extract_threshold = 4000
         assert!(registry.get_internal("reviewer-child").is_none());
         assert!(spawner_scope.snapshot().is_writable(&workspace_root));
 
+        fail_requests.store(false, Ordering::SeqCst);
         let mut teardown_input = input;
         teardown_input["name"] = serde_json::json!("reviewer-child-parent-drop");
         tool.execute(
@@ -1127,6 +1206,7 @@ extract_threshold = 4000
         delegated_path: PathBuf,
         observed_parent_write_revoked: Arc<std::sync::atomic::AtomicBool>,
         observed_instruction_override: Arc<std::sync::atomic::AtomicBool>,
+        fail_requests: Arc<AtomicBool>,
     }
 
     #[async_trait]
@@ -1155,6 +1235,11 @@ extract_threshold = 4000
                     .is_some_and(|prompt| prompt.contains("WORKSPACE REVIEWER OVERRIDE")),
                 Ordering::SeqCst,
             );
+            if self.fail_requests.load(Ordering::SeqCst) {
+                return Err(ClientError::Config(
+                    "scripted Internal Worker failure".into(),
+                ));
+            }
             Ok(Box::pin(futures::stream::iter(vec![
                 Ok(LlmEvent::text_block_start(0)),
                 Ok(LlmEvent::text_delta(0, "reviewed")),

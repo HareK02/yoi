@@ -419,10 +419,9 @@ pub(crate) async fn spawn_internal_worker_session(
     spawn_prepared_internal_worker_session(worker, store, input, None).await
 }
 
-pub(crate) async fn spawn_prepared_internal_worker_session(
+pub(crate) async fn prepare_internal_worker_session(
     mut worker: Worker<Box<dyn LlmClient>, EphemeralSessionStore>,
     store: EphemeralSessionStore,
-    input: String,
     on_turn_end: Option<Arc<dyn Fn(InternalWorkerSessionStatus) + Send + Sync>>,
 ) -> Result<InternalWorkerSessionHandle, InternalWorkerSessionError> {
     let session_id = worker.session_id();
@@ -496,6 +495,17 @@ pub(crate) async fn spawn_prepared_internal_worker_session(
         }
     });
 
+    Ok(handle)
+}
+
+#[cfg(test)]
+pub(crate) async fn spawn_prepared_internal_worker_session(
+    worker: Worker<Box<dyn LlmClient>, EphemeralSessionStore>,
+    store: EphemeralSessionStore,
+    input: String,
+    on_turn_end: Option<Arc<dyn Fn(InternalWorkerSessionStatus) + Send + Sync>>,
+) -> Result<InternalWorkerSessionHandle, InternalWorkerSessionError> {
+    let handle = prepare_internal_worker_session(worker, store, on_turn_end).await?;
     handle.send(input).await?;
     Ok(handle)
 }
