@@ -650,6 +650,8 @@ where
     }
 }
 
+pub const WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN: &str = "worker.input-submission.v1";
+
 /// An independent agent execution unit.
 ///
 /// Holds a [`Engine`] directly and persists session state via
@@ -2182,19 +2184,24 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// the Engine is aborted, history is compacted, and execution resumes
     /// automatically.
     pub async fn run(&mut self, input: Vec<Segment>) -> Result<WorkerRunResult, WorkerError> {
+        self.run_with_input_extensions(input, Vec::new()).await
+    }
+
+    pub(crate) async fn run_with_input_extensions(
+        &mut self,
+        input: Vec<Segment>,
+        mut input_extensions: Vec<SessionExtension>,
+    ) -> Result<WorkerRunResult, WorkerError> {
         let (input, pending_flow_state) = self.prepare_flow_input(input)?;
-        let input_extensions = pending_flow_state
-            .as_ref()
-            .map(|state| {
-                serde_json::to_value(state)
-                    .map(|payload| SessionExtension::new(FLOW_RUNTIME_EXTENSION_DOMAIN, payload))
-                    .map_err(|error| {
-                        WorkerError::FlowInput(format!("serialize Flow runtime state: {error}"))
-                    })
-            })
-            .transpose()?
-            .into_iter()
-            .collect();
+        if let Some(state) = pending_flow_state.as_ref() {
+            let payload = serde_json::to_value(state).map_err(|error| {
+                WorkerError::FlowInput(format!("serialize Flow runtime state: {error}"))
+            })?;
+            input_extensions.push(SessionExtension::new(
+                FLOW_RUNTIME_EXTENSION_DOMAIN,
+                payload,
+            ));
+        }
 
         // Paused→Run transition: if the previous turn was cut short,
         // any `Item::ToolCall` whose tool never produced a matching

@@ -65,12 +65,13 @@ use crate::config::{BackendRuntimesConfigFile, RemoteRuntimeConfigFile, resolve_
 use crate::hosts::{
     ConfigBundleCheckResult, ConfigBundleSyncResult, DiagnosticSeverity, EmbeddedWorkerRuntime,
     HostSummary, RemoteRuntimeConfig, RemoteWorkerRuntime, RuntimeDiagnostic, RuntimeRegistry,
-    RuntimeRegistryError, RuntimeRegistryUnregisterResult, RuntimeSummary, WorkerCapabilitySummary,
-    WorkerCompletionsRequest, WorkerCompletionsResult, WorkerImplementationSummary,
-    WorkerInputKind, WorkerInputRequest, WorkerInputResult, WorkerLifecycleRequest,
-    WorkerLifecycleResult, WorkerOperationState, WorkerRestoreResult,
+    RuntimeRegistryError, RuntimeRegistryUnregisterResult, RuntimeSummary, TicketWorkerRole,
+    WorkerCapabilitySummary, WorkerCompletionsRequest, WorkerCompletionsResult,
+    WorkerImplementationSummary, WorkerInputKind, WorkerInputRequest, WorkerInputResult,
+    WorkerLifecycleRequest, WorkerLifecycleResult, WorkerOperationState, WorkerRestoreResult,
     WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult,
-    WorkerSpawnWorkingDirectoryRequest, WorkerSummary, WorkerWorkspaceSummary,
+    WorkerSpawnWorkingDirectoryRequest, WorkerSummary, WorkerTicketAssignmentRequest,
+    WorkerWorkspaceSummary,
 };
 use crate::identity::WorkspaceIdentity;
 use crate::memory_backend::execute_memory_backend_operation_with_authority;
@@ -1556,11 +1557,20 @@ pub struct BrowserWorkspaceOrchestratorResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct CreateWorkspaceWorkerTicketAssignmentRequest {
+    pub ticket_id: String,
+    pub operation_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateWorkspaceWorkerRequest {
     pub runtime_id: String,
     pub display_name: String,
     #[serde(default)]
     pub profile: Option<String>,
+    #[serde(default)]
+    pub ticket_assignment: Option<CreateWorkspaceWorkerTicketAssignmentRequest>,
     #[serde(default)]
     pub initial_submit: Vec<Segment>,
     #[serde(default)]
@@ -6856,12 +6866,71 @@ fn validate_worker_initial_submit(segments: &[Segment]) -> Result<()> {
     Ok(())
 }
 
+fn browser_worker_spawn_policy(
+    ticket_assignment: Option<CreateWorkspaceWorkerTicketAssignmentRequest>,
+    initial_submit: &[Segment],
+) -> Result<(
+    WorkerSpawnIntent,
+    WorkerSpawnAcceptanceRequirement,
+    Option<WorkerTicketAssignmentRequest>,
+)> {
+    let expected_segments = initial_submit.len();
+    match ticket_assignment {
+        Some(assignment) => {
+            if !initial_submit
+                .iter()
+                .any(|segment| matches!(segment, Segment::Flow { .. }))
+            {
+                return Err(Error::InvalidInput(
+                    "Ticket-assigned Coder spawn requires one Flow segment in initial_submit"
+                        .to_string(),
+                ));
+            }
+            let ticket_id = assignment.ticket_id.trim().to_string();
+            if ticket_id.is_empty() {
+                return Err(Error::InvalidInput(
+                    "ticket_id must not be empty".to_string(),
+                ));
+            }
+            let operation_id = assignment.operation_id.trim().to_string();
+            if operation_id.is_empty() {
+                return Err(Error::InvalidInput(
+                    "assignment operation_id must not be empty".to_string(),
+                ));
+            }
+            Ok((
+                WorkerSpawnIntent::TicketRole {
+                    ticket_id: ticket_id.clone(),
+                    role: TicketWorkerRole::Coder,
+                },
+                WorkerSpawnAcceptanceRequirement::RunAccepted { expected_segments },
+                Some(WorkerTicketAssignmentRequest {
+                    ticket_id,
+                    operation_id,
+                }),
+            ))
+        }
+        None => Ok((
+            WorkerSpawnIntent::WorkspaceCoding,
+            WorkerSpawnAcceptanceRequirement::RunAccepted { expected_segments },
+            None,
+        )),
+    }
+}
+
 async fn create_workspace_worker(
     State(api): State<WorkspaceApi>,
     Json(request): Json<CreateWorkspaceWorkerRequest>,
 ) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
-    let profile = request
-        .profile
+    let CreateWorkspaceWorkerRequest {
+        runtime_id,
+        display_name,
+        profile,
+        ticket_assignment,
+        initial_submit,
+        working_directory,
+    } = request;
+    let profile = profile
         .as_deref()
         .map(str::trim)
         .filter(|profile| !profile.is_empty())
@@ -6898,7 +6967,7 @@ async fn create_workspace_worker(
     } else {
         None
     };
-    let display_name = sanitize_worker_display_name(&request.display_name).ok_or_else(|| {
+    let display_name = sanitize_worker_display_name(&display_name).ok_or_else(|| {
         settings_bad_request(
             "invalid_worker_display_name",
             "display_name must contain at least one non-control character",
@@ -6907,33 +6976,28 @@ async fn create_workspace_worker(
     if display_name == crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY {
         return Err(Error::ReservedWorkerName(display_name).into());
     }
-    let initial_submit = request.initial_submit;
     validate_worker_initial_submit(&initial_submit)?;
-    let expected_segments = initial_submit.len();
-    let selected_working_directory_id = request
-        .working_directory
+    let selected_working_directory_id = working_directory
         .as_ref()
         .map(|selection| selection.working_directory_id.clone());
-    let resolved_working_directory =
-        request
-            .working_directory
-            .map(|selection| WorkingDirectoryClaim {
-                working_directory_id: selection.working_directory_id,
-                relative_cwd: selection.relative_cwd,
-            });
+    let resolved_working_directory = working_directory.map(|selection| WorkingDirectoryClaim {
+        working_directory_id: selection.working_directory_id,
+        relative_cwd: selection.relative_cwd,
+    });
     validate_working_directory_claim_for_browser(resolved_working_directory.as_ref())?;
     if resolved_working_directory.is_none() {
-        reject_no_workdir_for_non_embedded_runtime(&request.runtime_id)?;
+        reject_no_workdir_for_non_embedded_runtime(&runtime_id)?;
     }
-    let runtime_id = request.runtime_id.clone();
+    let (intent, acceptance, ticket_assignment) =
+        browser_worker_spawn_policy(ticket_assignment, &initial_submit)?;
     let result = api.spawn_workspace_worker(
         &runtime_id,
         WorkerSpawnRequest {
             requested_worker_name: Some(display_name.clone()),
-            intent: WorkerSpawnIntent::WorkspaceCoding,
-            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted { expected_segments },
+            intent,
+            acceptance,
             profile: profile_selector,
-            ticket_assignment: None,
+            ticket_assignment,
             initial_submit,
             working_directory_request: None,
             resolved_working_directory_request: None,
@@ -10271,6 +10335,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn worker_ticket_assignment_projects_coder_intent_and_run_acceptance() {
+        let initial_submit = vec![
+            Segment::Flow {
+                selector: "builtin:coder-review".to_string(),
+            },
+            Segment::text("Implement Ticket 00001KZ9E0DBS"),
+        ];
+        let assignment_request = || CreateWorkspaceWorkerTicketAssignmentRequest {
+            ticket_id: "00001KZ9E0DBS".to_string(),
+            operation_id: "worker-spawn:00001KZ9E0DBS:call-1".to_string(),
+        };
+        let (intent, acceptance, assignment) =
+            browser_worker_spawn_policy(Some(assignment_request()), &initial_submit).unwrap();
+
+        assert_eq!(
+            intent,
+            WorkerSpawnIntent::TicketRole {
+                ticket_id: "00001KZ9E0DBS".to_string(),
+                role: TicketWorkerRole::Coder,
+            }
+        );
+        assert_eq!(
+            acceptance,
+            WorkerSpawnAcceptanceRequirement::RunAccepted {
+                expected_segments: 2,
+            }
+        );
+        assert_eq!(
+            assignment,
+            Some(WorkerTicketAssignmentRequest {
+                ticket_id: "00001KZ9E0DBS".to_string(),
+                operation_id: "worker-spawn:00001KZ9E0DBS:call-1".to_string(),
+            })
+        );
+        assert!(
+            browser_worker_spawn_policy(
+                Some(CreateWorkspaceWorkerTicketAssignmentRequest {
+                    ticket_id: " ".to_string(),
+                    operation_id: "operation".to_string(),
+                }),
+                &initial_submit,
+            )
+            .is_err()
+        );
+        assert!(
+            browser_worker_spawn_policy(
+                Some(assignment_request()),
+                &[Segment::text("Ticket text without Flow")],
+            )
+            .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn worker_source_auth_rejects_cross_workspace_mutation() {
         let workspace = tempfile::tempdir().unwrap();
@@ -10282,6 +10400,7 @@ mod tests {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: "Scoped Worker".to_string(),
                 profile: Some("builtin:coder".to_string()),
+                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 working_directory: None,
             }),
@@ -10315,6 +10434,7 @@ mod tests {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: "Generic Orchestrator Profile Worker".to_string(),
                 profile: Some("builtin:orchestrator".to_string()),
+                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 working_directory: None,
             }),
@@ -10329,6 +10449,7 @@ mod tests {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string(),
                 profile: Some("builtin:orchestrator".to_string()),
+                ticket_assignment: None,
                 initial_submit: Vec::new(),
                 working_directory: None,
             }),
@@ -11046,6 +11167,7 @@ mod tests {
                 .get(handle.worker_ref())
                 .cloned()
                 .expect("execution context");
+            let submission_id = input.submission_id.clone();
             let content = input.content.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(25));
@@ -11053,10 +11175,18 @@ mod tests {
                     text: format!("server companion echoed: {content}"),
                 });
             });
-            worker_runtime::execution::WorkerExecutionResult::accepted(
-                worker_runtime::execution::WorkerExecutionOperation::Input,
-                worker_runtime::execution::WorkerExecutionRunState::Idle,
-            )
+            if let Some(submission_id) = submission_id {
+                worker_runtime::execution::WorkerExecutionResult::accepted_input_committed(
+                    worker_runtime::execution::WorkerExecutionOperation::Input,
+                    worker_runtime::execution::WorkerExecutionRunState::Idle,
+                    submission_id,
+                )
+            } else {
+                worker_runtime::execution::WorkerExecutionResult::accepted(
+                    worker_runtime::execution::WorkerExecutionOperation::Input,
+                    worker_runtime::execution::WorkerExecutionRunState::Idle,
+                )
+            }
         }
     }
 

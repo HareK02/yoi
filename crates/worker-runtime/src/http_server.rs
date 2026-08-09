@@ -2208,12 +2208,20 @@ mod tests {
         fn dispatch_input(
             &self,
             _handle: &WorkerExecutionHandle,
-            _input: WorkerInput,
+            input: WorkerInput,
         ) -> WorkerExecutionResult {
-            WorkerExecutionResult::accepted(
-                WorkerExecutionOperation::Input,
-                WorkerExecutionRunState::Idle,
-            )
+            if let Some(submission_id) = input.submission_id {
+                WorkerExecutionResult::accepted_input_committed(
+                    WorkerExecutionOperation::Input,
+                    WorkerExecutionRunState::Idle,
+                    submission_id,
+                )
+            } else {
+                WorkerExecutionResult::accepted(
+                    WorkerExecutionOperation::Input,
+                    WorkerExecutionRunState::Idle,
+                )
+            }
         }
 
         fn stop_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
@@ -2515,12 +2523,20 @@ mod ws_tests {
         fn dispatch_input(
             &self,
             _handle: &WorkerExecutionHandle,
-            _input: WorkerInput,
+            input: WorkerInput,
         ) -> WorkerExecutionResult {
-            WorkerExecutionResult::accepted(
-                WorkerExecutionOperation::Input,
-                WorkerExecutionRunState::Idle,
-            )
+            if let Some(submission_id) = input.submission_id {
+                WorkerExecutionResult::accepted_input_committed(
+                    WorkerExecutionOperation::Input,
+                    WorkerExecutionRunState::Idle,
+                    submission_id,
+                )
+            } else {
+                WorkerExecutionResult::accepted(
+                    WorkerExecutionOperation::Input,
+                    WorkerExecutionRunState::Idle,
+                )
+            }
         }
 
         fn dispatch_method(

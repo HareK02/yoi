@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use llm_engine::EngineError;
 use llm_engine::llm_client::client::LlmClient;
 use session_store::WorkerMetadataStore;
-use session_store::{LogEntry, Store};
+use session_store::{LogEntry, SessionExtension, Store};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::discovery::WorkerDiscovery;
@@ -24,7 +24,10 @@ use crate::shutdown_after_idle::{
 use crate::spawn::comm_tools::{sub_worker_list_tool, sub_worker_send_tool, sub_worker_stop_tool};
 use crate::spawn::registry::SpawnedWorkerRegistry;
 use crate::spawn::tool::sub_worker_spawn_tool;
-use crate::worker::{SystemItemCommitter, Worker, WorkerError, WorkerRunResult};
+use crate::worker::{
+    SystemItemCommitter, WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN, Worker, WorkerError,
+    WorkerRunResult,
+};
 use protocol::{
     AlertLevel, AlertSource, ErrorCode, Event, Method, RewindTargetId, RunResult, Segment,
     TurnResult, WorkerStatus,
@@ -160,6 +163,10 @@ async fn finish_controller_run<C, St>(
 /// `worker.run_for_notification()` drains the NotifyBuffer on its own.
 enum PendingRun {
     Run(Vec<Segment>),
+    RunTracked {
+        input: Vec<Segment>,
+        extension: SessionExtension,
+    },
     /// Self-initiated turn kicked from the notify buffer. The carried
     /// `InvokeKind` is the trigger that flipped the Worker from IDLE
     /// (Notify or WorkerEvent) and is recorded by the Invoke marker
@@ -177,7 +184,7 @@ impl PendingRun {
     /// notify buffer (Notify / inbound WorkerEvent) and stays silent.
     fn is_parent_originated(&self) -> bool {
         match self {
-            PendingRun::Run(_) | PendingRun::Resume => true,
+            PendingRun::Run(_) | PendingRun::RunTracked { .. } | PendingRun::Resume => true,
             PendingRun::RunForNotification(_) => false,
         }
     }
@@ -340,6 +347,7 @@ impl WorkerController {
             bash_output_dir,
             runtime_base.to_path_buf(),
             spawned_registry.clone(),
+            Some(method_tx.downgrade()),
         )
         .await?;
 
@@ -591,6 +599,7 @@ pub(crate) async fn register_worker_tools<C, St>(
     bash_output_dir: PathBuf,
     runtime_base: PathBuf,
     spawned_registry: Arc<SpawnedWorkerRegistry>,
+    parent_method_tx: Option<mpsc::WeakSender<Method>>,
 ) -> std::io::Result<Option<workdir::WorkdirSessionHandle>>
 where
     C: LlmClient + Clone + 'static,
@@ -621,7 +630,11 @@ where
     let spawner_name = worker.manifest().worker.name.clone();
     let spawner_manifest = worker.manifest().clone();
     let spawner_workspace_context = worker.workspace_context_handle();
-    let parent_notifies = worker.notify_buffer_handle();
+    let parent_notifications = parent_method_tx
+        .map(crate::spawn::tool::ParentNotificationTarget::Controller)
+        .unwrap_or_else(|| {
+            crate::spawn::tool::ParentNotificationTarget::Buffer(worker.notify_buffer_handle())
+        });
     let prompts = worker.prompts().clone();
     // Resolve the existing Worker–Workdir binding into the domain provider.
     // Tools only consume the provider handle; they do not own its root, cwd,
@@ -810,7 +823,7 @@ where
             engine.register_tool(sub_worker_spawn_tool(
                 spawner_name.clone(),
                 spawner_workspace_context,
-                parent_notifies,
+                parent_notifications,
                 runtime_base.clone(),
                 spawner_workspace_root,
                 spawner_cwd.clone(),
@@ -933,6 +946,21 @@ async fn controller_loop<C, St>(
                     )
                     .await
                 }
+                PendingRun::RunTracked { input, extension } => {
+                    drive_turn(
+                        worker.run_with_input_extensions(input, vec![extension]),
+                        &mut method_rx,
+                        &event_tx,
+                        &cancel_tx,
+                        &shared_state,
+                        &notify_buffer,
+                        self_parent_socket.as_ref(),
+                        &spawner_name,
+                        &spawned_registry,
+                        parent_originated,
+                    )
+                    .await
+                }
                 PendingRun::RunForNotification(kind) => {
                     drive_turn(
                         worker.run_for_notification(kind),
@@ -1016,6 +1044,19 @@ async fn controller_loop<C, St>(
                 // interrupt system note) is applied inside `Worker::run` itself
                 // when the worker's `last_run_interrupted` flag is set.
                 pending = Some(PendingRun::Run(input));
+            }
+
+            Method::RunTracked {
+                input,
+                submission_id,
+            } => {
+                // Runtime-correlated submissions retain their opaque id in the
+                // same durable UserInput record used for Flow state.
+                let extension = SessionExtension::new(
+                    WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN,
+                    serde_json::json!({ "submission_id": submission_id }),
+                );
+                pending = Some(PendingRun::RunTracked { input, extension });
             }
 
             Method::Notify { message, auto_run } => {
@@ -1411,7 +1452,7 @@ where
                         shutdown_requested = true;
                         let _ = cancel_tx.try_send(());
                     }
-                    Some(Method::Run { .. } | Method::Resume) => {
+                    Some(Method::Run { .. } | Method::RunTracked { .. } | Method::Resume) => {
                         let _ = event_tx.send(Event::Error {
                             code: ErrorCode::AlreadyRunning,
                             message: "Worker is already executing a turn".into(),

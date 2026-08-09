@@ -6053,6 +6053,7 @@ dependencies = [
  "tokio-tungstenite 0.29.0",
  "toml",
  "tower",
+ "uuid",
  "workdir",
  "worker",
 ]

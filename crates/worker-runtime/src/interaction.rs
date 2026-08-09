@@ -25,6 +25,10 @@ impl WorkerInputKind {
 pub struct WorkerInput {
     pub kind: WorkerInputKind,
     pub content: String,
+    /// Runtime-generated correlation id. This is never accepted from public
+    /// JSON input and is consumed only by the execution backend.
+    #[serde(skip)]
+    pub submission_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub segments: Option<Vec<Segment>>,
 }
@@ -34,6 +38,7 @@ impl WorkerInput {
         Self {
             kind: WorkerInputKind::User,
             content: content.into(),
+            submission_id: None,
             segments: None,
         }
     }
@@ -42,6 +47,7 @@ impl WorkerInput {
         Self {
             kind: WorkerInputKind::Notify,
             content: content.into(),
+            submission_id: None,
             segments: None,
         }
     }

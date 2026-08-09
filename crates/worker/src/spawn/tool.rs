@@ -18,6 +18,7 @@ use manifest::{
     WorkerManifest, WorkerManifestConfig, WorkerMetaConfig,
 };
 use serde::Deserialize;
+use tokio::sync::mpsc;
 
 use crate::PromptLoader;
 use crate::controller::register_worker_tools;
@@ -27,6 +28,7 @@ use crate::internal_worker::{
 use crate::prompt::catalog::PromptCatalog;
 use crate::spawn::registry::SpawnedWorkerRegistry;
 use crate::worker::{Worker, WorkerFilesystemAuthority};
+use protocol::Method;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SubWorkerSpawnInput {
@@ -205,6 +207,39 @@ fn parse_spawn_profile_selector(raw: Option<&str>) -> Result<SpawnProfileSelecto
     Ok(SpawnProfileSelector::Registry(ProfileSelector::named(raw)))
 }
 
+#[derive(Clone)]
+pub(crate) enum ParentNotificationTarget {
+    Controller(mpsc::WeakSender<Method>),
+    Buffer(crate::ipc::notify_buffer::NotifyBuffer),
+}
+
+impl ParentNotificationTarget {
+    fn notify(&self, message: String, auto_run: bool) {
+        match self {
+            Self::Controller(parent_method_tx) => {
+                let Some(parent_method_tx) = parent_method_tx.upgrade() else {
+                    tracing::warn!(
+                        "parent Worker controller closed before Internal SubWorker completion notification"
+                    );
+                    return;
+                };
+                tokio::spawn(async move {
+                    if let Err(error) = parent_method_tx
+                        .send(Method::Notify { message, auto_run })
+                        .await
+                    {
+                        tracing::warn!(
+                            %error,
+                            "failed to notify parent Worker about Internal SubWorker completion"
+                        );
+                    }
+                });
+            }
+            Self::Buffer(parent_notifies) => parent_notifies.push_notify(message, auto_run),
+        }
+    }
+}
+
 /// Runtime dependencies the `SubWorkerSpawn` tool needs in order to launch a
 /// child SubWorker and record the handoff locally. Constructed by the Worker
 /// controller once per Worker lifetime.
@@ -212,7 +247,7 @@ pub struct SubWorkerSpawnTool {
     /// Spawner's own Worker name, used for direct-child identity collision checks.
     spawner_name: String,
     workspace_context: crate::worker::WorkerWorkspaceContext,
-    parent_notifies: crate::ipc::notify_buffer::NotifyBuffer,
+    parent_notifications: ParentNotificationTarget,
     /// Runtime-owned root used only for bounded Internal Worker tool artifacts such as Bash spill
     /// output. It is not an Internal Worker identity or catalog location.
     runtime_base: PathBuf,
@@ -256,7 +291,7 @@ impl SubWorkerSpawnTool {
     fn new(
         spawner_name: String,
         workspace_context: crate::worker::WorkerWorkspaceContext,
-        parent_notifies: crate::ipc::notify_buffer::NotifyBuffer,
+        parent_notifications: ParentNotificationTarget,
         runtime_base: PathBuf,
         workspace_root: PathBuf,
         spawner_cwd: PathBuf,
@@ -270,7 +305,7 @@ impl SubWorkerSpawnTool {
         Self {
             spawner_name,
             workspace_context,
-            parent_notifies,
+            parent_notifications,
             runtime_base,
             workspace_root,
             spawner_cwd,
@@ -368,6 +403,7 @@ impl Tool for SubWorkerSpawnTool {
                 .join("bash-output"),
             self.runtime_base.clone(),
             child_registry,
+            None,
         )
         .await
         .map_err(|error| {
@@ -392,7 +428,7 @@ impl Tool for SubWorkerSpawnTool {
 
         let child_name = input.name.clone();
         let registry = Arc::downgrade(&self.registry);
-        let parent_notifies = self.parent_notifies.clone();
+        let parent_notifications = self.parent_notifications.clone();
         let session_result = prepare_internal_worker_session(
             child,
             store,
@@ -408,10 +444,10 @@ impl Tool for SubWorkerSpawnTool {
                         }
                     }
                 }
-                parent_notifies.push_notify(
-                    format!("SubWorker `{child_name}` turn ended with status {status:?}. Inspect its committed session with worker-observation tools before making completion decisions."),
-                    true,
+                let message = format!(
+                    "SubWorker `{child_name}` turn ended with status {status:?}. Inspect its committed session with worker-observation tools before making completion decisions."
                 );
+                parent_notifications.notify(message, true);
             })),
         )
         .await;
@@ -764,10 +800,10 @@ fn manifest_to_reusable_config(manifest: &WorkerManifest) -> WorkerManifestConfi
 /// tool-result budget — debugging beyond this should read the file
 /// directly.
 /// Factory for the `SubWorkerSpawn` tool.
-pub fn sub_worker_spawn_tool(
+pub(crate) fn sub_worker_spawn_tool(
     spawner_name: String,
     workspace_context: crate::worker::WorkerWorkspaceContext,
-    parent_notifies: crate::ipc::notify_buffer::NotifyBuffer,
+    parent_notifications: ParentNotificationTarget,
     runtime_base: PathBuf,
     workspace_root: PathBuf,
     spawner_cwd: PathBuf,
@@ -779,7 +815,7 @@ pub fn sub_worker_spawn_tool(
     sub_worker_spawn_tool_impl(
         spawner_name,
         workspace_context,
-        parent_notifies,
+        parent_notifications,
         runtime_base,
         workspace_root,
         spawner_cwd,
@@ -793,7 +829,7 @@ pub fn sub_worker_spawn_tool(
 fn sub_worker_spawn_tool_impl(
     spawner_name: String,
     workspace_context: crate::worker::WorkerWorkspaceContext,
-    parent_notifies: crate::ipc::notify_buffer::NotifyBuffer,
+    parent_notifications: ParentNotificationTarget,
     runtime_base: PathBuf,
     workspace_root: PathBuf,
     spawner_cwd: PathBuf,
@@ -824,7 +860,7 @@ fn sub_worker_spawn_tool_impl(
         let tool: Arc<dyn Tool> = Arc::new(SubWorkerSpawnTool::new(
             spawner_name.clone(),
             workspace_context.clone(),
-            parent_notifies.clone(),
+            parent_notifications.clone(),
             runtime_base.clone(),
             workspace_root.clone(),
             spawner_cwd.clone(),
@@ -845,6 +881,7 @@ mod tests {
     use super::*;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use crate::WorkspaceId;
     use async_trait::async_trait;
@@ -896,7 +933,18 @@ extract_threshold = 4000
 "#;
 
     #[tokio::test]
-    async fn reviewer_profile_spawns_as_workspace_aware_internal_session() {
+    async fn parent_controller_notification_target_does_not_keep_channel_open() {
+        let (parent_method_tx, mut parent_method_rx) = mpsc::channel(1);
+        let target = ParentNotificationTarget::Controller(parent_method_tx.downgrade());
+
+        drop(parent_method_tx);
+
+        assert!(parent_method_rx.recv().await.is_none());
+        target.notify("late completion".to_string(), true);
+    }
+
+    #[tokio::test]
+    async fn reviewer_profile_spawns_and_notifies_parent_controller() {
         let runtime = TempDir::new().unwrap();
         let workspace_root = runtime.path().join("project");
         let available_profiles = write_project_profile_registry(
@@ -927,11 +975,11 @@ extract_threshold = 4000
         )
         .unwrap();
         let prompt_loader = PromptLoader::new(None, Some(workspace_prompts));
-        let parent_notifies = crate::ipc::notify_buffer::NotifyBuffer::new();
+        let (parent_method_tx, mut parent_method_rx) = mpsc::channel(8);
         let tool = SubWorkerSpawnTool::new(
             "parent".into(),
             workspace_context,
-            parent_notifies.clone(),
+            ParentNotificationTarget::Controller(parent_method_tx.downgrade()),
             runtime.path().to_path_buf(),
             workspace_root.clone(),
             workspace_root.clone(),
@@ -995,11 +1043,17 @@ extract_threshold = 4000
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(observed_parent_write_revoked.load(Ordering::SeqCst));
         assert!(observed_instruction_override.load(Ordering::SeqCst));
-        assert_eq!(parent_notifies.len(), 1);
-        assert!(
-            parent_notifies.has_auto_run_pending(),
-            "SubWorker completion must auto-invoke the parent"
-        );
+        let completion = tokio::time::timeout(Duration::from_secs(1), parent_method_rx.recv())
+            .await
+            .expect("SubWorker completion must wake the parent method channel")
+            .expect("parent method channel remains open");
+        assert!(matches!(
+            completion,
+            Method::Notify {
+                message,
+                auto_run: true,
+            } if message.contains("SubWorker `reviewer-child` turn ended with status Idle")
+        ));
         assert!(!runtime.path().join("reviewer-child/sock").exists());
 
         let duplicate_error = tool
@@ -1018,7 +1072,10 @@ extract_threshold = 4000
             1,
             "duplicate rejection must not invoke the child provider"
         );
-        assert_eq!(parent_notifies.len(), 1);
+        assert!(matches!(
+            parent_method_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
 
         let context = llm_engine::tool::ToolExecutionContext::direct();
         let list = (crate::spawn::comm_tools::sub_worker_list_tool(registry.clone()))().1;

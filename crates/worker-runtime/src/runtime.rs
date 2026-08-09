@@ -40,6 +40,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 #[cfg(feature = "ws-server")]
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 /// Workspace-scoped Runtime authorization context supplied by a trusted backend.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -565,10 +566,12 @@ impl Runtime {
             }
         };
 
-        if let Some(initial_input) = {
+        if let Some(mut initial_input) = {
             let state = self.lock()?;
             state.worker(&worker_ref)?.request.initial_input.clone()
         } {
+            let expected_submission_id = Uuid::now_v7().to_string();
+            initial_input.submission_id = Some(expected_submission_id.clone());
             let dispatch_result = backend.dispatch_input(&handle, initial_input.clone());
             if !dispatch_result.is_accepted() {
                 let _ = backend.stop_worker(&handle);
@@ -581,15 +584,32 @@ impl Runtime {
                     result: dispatch_result,
                 });
             }
+            let has_commit_ack = dispatch_result
+                .input_commit
+                .as_ref()
+                .is_some_and(|ack| ack.submission_id == expected_submission_id);
+            if !has_commit_ack {
+                let _ = backend.stop_worker(&handle);
+                self.rollback_failed_create(&worker_ref)?;
+                let result = WorkerExecutionResult::rejected(
+                    WorkerExecutionOperation::Input,
+                    "execution backend accepted initial input without a durable session commit acknowledgement",
+                );
+                return Err(RuntimeError::WorkerExecutionRejected {
+                    worker_id: worker_ref.worker_id.clone(),
+                    operation: result.operation,
+                    outcome: result.outcome,
+                    message: result.message_or_default(),
+                    result,
+                });
+            }
+            let initial_run_state = dispatch_result.run_state;
             let detail = self.commit_created_worker(
                 &worker_ref,
                 handle,
-                WorkerExecutionRunState::Busy,
+                initial_run_state,
                 working_directory,
-                WorkerExecutionResult::accepted(
-                    WorkerExecutionOperation::Input,
-                    WorkerExecutionRunState::Busy,
-                ),
+                dispatch_result,
             )?;
             self.record_input_observation(&worker_ref, initial_input)?;
             Ok(detail)
@@ -936,9 +956,16 @@ impl Runtime {
     pub fn send_input(
         &self,
         worker_ref: &WorkerRef,
-        input: WorkerInput,
+        mut input: WorkerInput,
     ) -> Result<WorkerInteractionAck, RuntimeError> {
         validate_worker_input(&input)?;
+        let expected_submission_id = if input.kind == WorkerInputKind::User {
+            let submission_id = Uuid::now_v7().to_string();
+            input.submission_id = Some(submission_id.clone());
+            Some(submission_id)
+        } else {
+            None
+        };
         self.ensure_worker_execution(worker_ref)?;
         let (backend, handle) = {
             let state = self.lock()?;
@@ -973,6 +1000,25 @@ impl Runtime {
                 outcome: dispatch_result.outcome,
                 message: dispatch_result.message_or_default(),
                 result: dispatch_result,
+            });
+        }
+        if let Some(expected_submission_id) = expected_submission_id
+            && dispatch_result
+                .input_commit
+                .as_ref()
+                .is_none_or(|ack| ack.submission_id != expected_submission_id)
+        {
+            let result = WorkerExecutionResult::rejected(
+                WorkerExecutionOperation::Input,
+                "execution backend did not acknowledge the committed Runtime submission id",
+            );
+            self.record_execution_result(worker_ref, result.clone())?;
+            return Err(RuntimeError::WorkerExecutionRejected {
+                worker_id: worker_ref.worker_id.clone(),
+                operation: result.operation,
+                outcome: result.outcome,
+                message: result.message_or_default(),
+                result,
             });
         }
 
@@ -2460,6 +2506,7 @@ mod tests {
         let input = WorkerInput {
             kind: WorkerInputKind::User,
             content: String::new(),
+            submission_id: None,
             segments: Some(vec![protocol::Segment::Flow {
                 selector: "builtin:coder-review".to_string(),
             }]),
@@ -2472,6 +2519,7 @@ mod tests {
         let input = WorkerInput {
             kind: WorkerInputKind::User,
             content: String::new(),
+            submission_id: None,
             segments: Some(Vec::new()),
         };
         assert!(matches!(
@@ -2486,6 +2534,7 @@ mod tests {
         request.initial_input = Some(WorkerInput {
             kind: WorkerInputKind::User,
             content: String::new(),
+            submission_id: None,
             segments: Some(vec![protocol::Segment::Flow {
                 selector: "builtin:coder-review".to_string(),
             }]),
@@ -2580,6 +2629,7 @@ mod tests {
         restore_count: Mutex<u64>,
         contexts: Mutex<BTreeMap<WorkerId, WorkerExecutionContext>>,
         dispatched_inputs: Mutex<Vec<WorkerInput>>,
+        preserve_commit_ack_submission_id: AtomicBool,
         #[cfg(feature = "ws-server")]
         snapshots: Mutex<BTreeMap<WorkerId, protocol::Event>>,
     }
@@ -2587,6 +2637,11 @@ mod tests {
     impl TestExecutionBackend {
         fn set_dispatch_result(&self, result: WorkerExecutionResult) {
             *self.dispatch_result.lock().unwrap() = Some(result);
+        }
+
+        fn preserve_commit_ack_submission_id(&self) {
+            self.preserve_commit_ack_submission_id
+                .store(true, Ordering::SeqCst);
         }
 
         #[cfg(feature = "ws-server")]
@@ -2656,17 +2711,29 @@ mod tests {
             _handle: &WorkerExecutionHandle,
             input: WorkerInput,
         ) -> WorkerExecutionResult {
+            let submission_id = input.submission_id.clone();
             self.dispatched_inputs.lock().unwrap().push(input);
-            self.dispatch_result
+            let mut result = self
+                .dispatch_result
                 .lock()
                 .unwrap()
                 .clone()
                 .unwrap_or_else(|| {
-                    WorkerExecutionResult::accepted(
+                    WorkerExecutionResult::accepted_input_committed(
                         WorkerExecutionOperation::Input,
                         WorkerExecutionRunState::Idle,
+                        "test-submission",
                     )
-                })
+                });
+            if !self
+                .preserve_commit_ack_submission_id
+                .load(Ordering::SeqCst)
+                && let (Some(ack), Some(submission_id)) =
+                    (result.input_commit.as_mut(), submission_id)
+            {
+                ack.submission_id = submission_id;
+            }
+            result
         }
 
         fn stop_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
@@ -3213,6 +3280,68 @@ mod tests {
     }
 
     #[test]
+    fn create_worker_uses_committed_input_ack_run_state() {
+        let (runtime, backend) = runtime_and_backend();
+        backend.set_dispatch_result(WorkerExecutionResult::accepted_input_committed(
+            WorkerExecutionOperation::Input,
+            WorkerExecutionRunState::Idle,
+            "test-submission",
+        ));
+        let mut request = task_request("committed initial input is already idle");
+        request.initial_input = Some(WorkerInput::user("start the ticket"));
+
+        let detail = runtime.create_worker(request).unwrap();
+
+        assert_eq!(detail.status, WorkerStatus::Idle);
+    }
+
+    #[test]
+    fn create_worker_rejects_mismatched_input_commit_acknowledgement() {
+        let (runtime, backend) = runtime_and_backend();
+        backend.preserve_commit_ack_submission_id();
+        backend.set_dispatch_result(WorkerExecutionResult::accepted_input_committed(
+            WorkerExecutionOperation::Input,
+            WorkerExecutionRunState::Busy,
+            "forged-submission",
+        ));
+        let mut request = task_request("mismatched initial input commit ack");
+        request.initial_input = Some(WorkerInput::user("start the ticket"));
+
+        let error = runtime.create_worker(request).unwrap_err();
+
+        assert!(matches!(
+            error,
+            RuntimeError::WorkerExecutionRejected {
+                outcome: crate::execution::WorkerExecutionOutcome::Rejected,
+                ..
+            }
+        ));
+        assert!(runtime.list_workers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn create_worker_rejects_initial_input_without_commit_acknowledgement() {
+        let (runtime, backend) = runtime_and_backend();
+        backend.set_dispatch_result(WorkerExecutionResult::accepted(
+            WorkerExecutionOperation::Input,
+            WorkerExecutionRunState::Busy,
+        ));
+        let mut request = task_request("missing initial input commit ack");
+        request.initial_input = Some(WorkerInput::user("start the ticket"));
+
+        let error = runtime.create_worker(request).unwrap_err();
+
+        assert!(matches!(
+            error,
+            RuntimeError::WorkerExecutionRejected {
+                outcome: crate::execution::WorkerExecutionOutcome::Rejected,
+                ..
+            }
+        ));
+        assert!(runtime.list_workers().unwrap().is_empty());
+    }
+
+    #[test]
     fn create_worker_without_execution_backend_is_rejected_and_not_persisted() {
         let runtime = Runtime::new_memory();
         runtime.store_config_bundle(test_bundle()).unwrap();
@@ -3356,11 +3485,12 @@ mod tests {
         fn dispatch_input(
             &self,
             _handle: &WorkerExecutionHandle,
-            _input: WorkerInput,
+            input: WorkerInput,
         ) -> WorkerExecutionResult {
-            WorkerExecutionResult::accepted(
+            WorkerExecutionResult::accepted_input_committed(
                 WorkerExecutionOperation::Input,
                 WorkerExecutionRunState::Idle,
+                input.submission_id.expect("Runtime submission id"),
             )
         }
     }
@@ -3442,6 +3572,7 @@ mod tests {
         request.initial_input = Some(WorkerInput {
             kind: WorkerInputKind::User,
             content: String::new(),
+            submission_id: None,
             segments: Some(vec![
                 protocol::Segment::Flow {
                     selector: "builtin:coder-review".to_string(),
@@ -3479,6 +3610,7 @@ mod tests {
         let input = WorkerInput {
             kind: WorkerInputKind::User,
             content: String::new(),
+            submission_id: None,
             segments: Some(vec![protocol::Segment::Flow {
                 selector: "builtin:coder-review".to_string(),
             }]),
@@ -3488,10 +3620,16 @@ mod tests {
             .send_input(&detail.worker_ref, input.clone())
             .unwrap();
 
-        assert_eq!(
-            backend.dispatched_inputs.lock().unwrap().as_slice(),
-            &[input]
-        );
+        let dispatched = backend.dispatched_inputs.lock().unwrap();
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(dispatched[0].kind, input.kind);
+        assert_eq!(dispatched[0].content, input.content);
+        assert_eq!(dispatched[0].segments, input.segments);
+        let submission_id = dispatched[0]
+            .submission_id
+            .as_deref()
+            .expect("Runtime submission id");
+        Uuid::parse_str(submission_id).expect("submission id UUID");
     }
 
     #[cfg(feature = "ws-server")]

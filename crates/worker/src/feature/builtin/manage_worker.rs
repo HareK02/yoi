@@ -96,6 +96,9 @@ struct WorkerSpawnInput {
     runtime_id: String,
     working_directory_id: String,
     profile: String,
+    /// Optional queued Ticket to assign atomically to the new Coder Worker.
+    #[serde(default)]
+    ticket_id: Option<String>,
     #[serde(default)]
     display_name: Option<String>,
     /// Normal typed initial user submission delivered after spawn. An empty
@@ -107,10 +110,18 @@ struct WorkerSpawnInput {
 }
 
 #[derive(Debug, Serialize)]
+struct WorkerSpawnTicketAssignmentRequest {
+    ticket_id: String,
+    operation_id: String,
+}
+
+#[derive(Debug, Serialize)]
 struct WorkerSpawnRequest {
     runtime_id: String,
     display_name: String,
     profile: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ticket_assignment: Option<WorkerSpawnTicketAssignmentRequest>,
     initial_submit: Vec<Segment>,
     working_directory: WorkerWorkingDirectorySelection,
 }
@@ -170,7 +181,7 @@ impl WorkerOperation {
                 "List Backend/Runtime Worker sessions in the current Workspace. SubWorkers are excluded."
             }
             Self::Spawn => {
-                "Spawn a Backend/Runtime Worker session in an existing Workspace Workdir. The Workdir id is authority; filesystem paths and Runtime URLs are not accepted."
+                "Spawn a Backend/Runtime Worker session in an existing Workspace Workdir. The Workdir id is authority; filesystem paths and Runtime URLs are not accepted. `initial_submit` carries the normal typed user submission. Set `ticket_id` with a Flow segment in `initial_submit` to atomically assign a queued Ticket to the new Coder Worker; the operation id is derived from the durable tool call rather than model input."
             }
             Self::Stop => "Stop a Backend/Runtime Worker session in the current Workspace.",
             Self::Restore => {
@@ -185,7 +196,7 @@ impl Tool for WorkspaceWorkerTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: ToolExecutionContext,
+        ctx: ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let request = match self.operation {
             WorkerOperation::List => {
@@ -194,6 +205,17 @@ impl Tool for WorkspaceWorkerTool {
             }
             WorkerOperation::Spawn => {
                 let input = parse::<WorkerSpawnInput>(input_json, "WorkerSpawn")?;
+                let ticket_assignment = input
+                    .ticket_id
+                    .map(|ticket_id| {
+                        let ticket_id = authority_id(&ticket_id, "ticket_id")?;
+                        let call_id = non_empty(ctx.call_id.clone(), "tool call_id")?;
+                        Ok::<_, ToolError>(WorkerSpawnTicketAssignmentRequest {
+                            operation_id: format!("worker-spawn:{ticket_id}:{call_id}"),
+                            ticket_id,
+                        })
+                    })
+                    .transpose()?;
                 let request = WorkerSpawnRequest {
                     runtime_id: authority_id(&input.runtime_id, "runtime_id")?,
                     display_name: input
@@ -201,6 +223,7 @@ impl Tool for WorkspaceWorkerTool {
                         .filter(|value| !value.trim().is_empty())
                         .unwrap_or_else(|| "Workspace Worker".to_string()),
                     profile: non_empty(input.profile, "profile")?,
+                    ticket_assignment,
                     initial_submit: input.initial_submit,
                     working_directory: WorkerWorkingDirectorySelection {
                         working_directory_id: authority_id(
@@ -372,13 +395,14 @@ mod tests {
                 "runtime_id": "runtime-1",
                 "working_directory_id": "workdir-1",
                 "profile": "builtin:coder",
+                "ticket_id": "00001KZ9E0DBS",
                 "initial_submit": [
                     { "kind": "flow", "selector": "builtin:coder-review" },
                     { "kind": "text", "content": "Implement Ticket 00001" }
                 ]
             })
             .to_string(),
-            ToolExecutionContext::direct(),
+            ToolExecutionContext::new("call-1", "batch-1", 0),
         )
         .await
         .unwrap();
@@ -394,6 +418,13 @@ mod tests {
             "builtin:coder-review"
         );
         assert_eq!(body["initial_submit"][1]["kind"], "text");
+        assert_eq!(
+            body["ticket_assignment"],
+            serde_json::json!({
+                "ticket_id": "00001KZ9E0DBS",
+                "operation_id": "worker-spawn:00001KZ9E0DBS:call-1"
+            })
+        );
         assert!(body.get("initial_text").is_none());
     }
 
@@ -410,6 +441,7 @@ mod tests {
         let schema = serde_json::to_value(schemars::schema_for!(WorkerSpawnInput)).unwrap();
         let text = serde_json::to_string(&schema).unwrap();
         assert!(text.contains("initial_submit"));
+        assert!(text.contains("ticket_id"));
         assert!(text.contains("selector"));
         assert!(text.contains("flow"));
         assert!(!text.contains("initial_text"));
@@ -421,6 +453,7 @@ mod tests {
             runtime_id: "runtime-1".to_string(),
             display_name: "Coder".to_string(),
             profile: "builtin:coder".to_string(),
+            ticket_assignment: None,
             initial_submit: vec![
                 Segment::Flow {
                     selector: "builtin:coder-review".to_string(),

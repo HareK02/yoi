@@ -31,6 +31,15 @@ pub enum Method {
     Run {
         input: Vec<Segment>,
     },
+    /// Runtime-internal Run carrying an opaque correlation id that is committed
+    /// with the resulting UserInput entry. This variant is not serializable on
+    /// the public Client → Worker protocol.
+    #[serde(skip)]
+    #[cfg_attr(feature = "typescript", ts(skip))]
+    RunTracked {
+        input: Vec<Segment>,
+        submission_id: String,
+    },
     /// Human-readable text injected into the target Worker's LLM context
     /// as a non-blocking system message. `auto_run` controls whether an
     /// idle target is kicked into `RunForNotification`; weak notifications
@@ -936,6 +945,21 @@ mod tests {
                     ] if selector == "builtin:coder-review" && content == "Ticket context"
                 )
         ));
+    }
+
+    #[test]
+    fn runtime_tracked_run_is_not_public_protocol_json() {
+        let method = Method::RunTracked {
+            input: vec![Segment::text("private")],
+            submission_id: "submission-1".to_string(),
+        };
+        assert!(serde_json::to_string(&method).is_err());
+        assert!(
+            serde_json::from_str::<Method>(
+                r#"{"method":"run_tracked","input":[],"submission_id":"forged"}"#,
+            )
+            .is_err()
+        );
     }
 
     #[test]

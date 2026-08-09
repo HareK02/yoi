@@ -29,12 +29,20 @@ impl WorkerExecutionBackend for TestExecutionBackend {
     fn dispatch_input(
         &self,
         _handle: &WorkerExecutionHandle,
-        _input: worker_runtime::interaction::WorkerInput,
+        input: worker_runtime::interaction::WorkerInput,
     ) -> WorkerExecutionResult {
-        WorkerExecutionResult::accepted(
-            WorkerExecutionOperation::Input,
-            WorkerExecutionRunState::Busy,
-        )
+        if let Some(submission_id) = input.submission_id {
+            WorkerExecutionResult::accepted_input_committed(
+                WorkerExecutionOperation::Input,
+                WorkerExecutionRunState::Busy,
+                submission_id,
+            )
+        } else {
+            WorkerExecutionResult::accepted(
+                WorkerExecutionOperation::Input,
+                WorkerExecutionRunState::Busy,
+            )
+        }
     }
 
     fn stop_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
