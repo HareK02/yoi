@@ -18,6 +18,7 @@ use memory::backend::{
     MemoryBackendHttpResponse, MemoryBackendOperation, MemoryConsolidateStagingOperation,
     MemoryConsolidationOutput,
 };
+use protocol::Segment;
 use protocol::stream::{decode_method, encode_event};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -114,9 +115,6 @@ use worker_runtime::http_server::{
     RuntimeHttpSummaryResponse, RuntimeHttpWorkerResponse, RuntimeHttpWorkersResponse,
 };
 use worker_runtime::identity::RuntimeWorkerRef;
-use worker_runtime::interaction::{
-    WorkerInput as EmbeddedWorkerInput, WorkerInputKind as EmbeddedWorkerInputKind,
-};
 
 const EMBEDDED_WORKER_RUNTIME_ID: &str = "embedded-worker-runtime";
 
@@ -1558,12 +1556,13 @@ pub struct BrowserWorkspaceOrchestratorResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct BrowserCreateWorkerRequest {
+pub struct CreateWorkspaceWorkerRequest {
     pub runtime_id: String,
     pub display_name: String,
     #[serde(default)]
     pub profile: Option<String>,
-    pub initial_text: String,
+    #[serde(default)]
+    pub initial_submit: Vec<Segment>,
     #[serde(default)]
     pub working_directory: Option<BrowserWorkerWorkingDirectorySelection>,
 }
@@ -3949,11 +3948,7 @@ fn start_memory_staging_consolidation(
         &api.config.workspace_created_at,
         MEMORY_CONSOLIDATION_PROFILE,
     )?;
-    let input = EmbeddedWorkerInput {
-        kind: EmbeddedWorkerInputKind::User,
-        content: input_content,
-        segments: None,
-    };
+    let initial_submit = vec![Segment::text(input_content)];
     let result = api.spawn_workspace_worker(
         &runtime_id,
         WorkerSpawnRequest {
@@ -3964,7 +3959,7 @@ fn start_memory_staging_consolidation(
             },
             profile: profile_selector,
             ticket_assignment: None,
-            initial_input: Some(input),
+            initial_submit,
             working_directory_request: None,
             resolved_working_directory_request: None,
             resolved_working_directory: None,
@@ -4510,7 +4505,7 @@ async fn scoped_start_workspace_orchestrator(
             },
             profile: ProfileSelector::Builtin("builtin:orchestrator".to_string()),
             ticket_assignment: None,
-            initial_input: None,
+            initial_submit: Vec::new(),
             working_directory_request: None,
             resolved_working_directory_request: None,
             resolved_working_directory: None,
@@ -4574,7 +4569,7 @@ fn workspace_orchestrator_is_online(worker: &WorkerSummary) -> bool {
 async fn scoped_create_workspace_worker(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
-    Json(request): Json<BrowserCreateWorkerRequest>,
+    Json(request): Json<CreateWorkspaceWorkerRequest>,
 ) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     create_workspace_worker(State(api), Json(request)).await
@@ -6832,9 +6827,38 @@ fn configured_working_directory_request(
     ))
 }
 
+fn validate_worker_initial_submit(segments: &[Segment]) -> Result<()> {
+    let flow_selectors = segments
+        .iter()
+        .filter_map(|segment| match segment {
+            Segment::Flow { selector } => Some(selector),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if flow_selectors.len() > 1 {
+        return Err(Error::InvalidInput(
+            "initial_submit may contain at most one Flow segment".to_string(),
+        ));
+    }
+    if let Some(selector) = flow_selectors.first() {
+        selector
+            .parse::<flow::FlowSelector>()
+            .map_err(|error| Error::InvalidInput(error.to_string()))?;
+    }
+    if segments
+        .iter()
+        .any(|segment| matches!(segment, Segment::Unknown))
+    {
+        return Err(Error::InvalidInput(
+            "initial_submit must not contain unknown segment variants".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 async fn create_workspace_worker(
     State(api): State<WorkspaceApi>,
-    Json(request): Json<BrowserCreateWorkerRequest>,
+    Json(request): Json<CreateWorkspaceWorkerRequest>,
 ) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
     let profile = request
         .profile
@@ -6883,16 +6907,9 @@ async fn create_workspace_worker(
     if display_name == crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY {
         return Err(Error::ReservedWorkerName(display_name).into());
     }
-    let initial_text = request.initial_text.trim().to_string();
-    let initial_input = if initial_text.is_empty() {
-        None
-    } else {
-        Some(EmbeddedWorkerInput {
-            kind: EmbeddedWorkerInputKind::User,
-            content: initial_text.clone(),
-            segments: None,
-        })
-    };
+    let initial_submit = request.initial_submit;
+    validate_worker_initial_submit(&initial_submit)?;
+    let expected_segments = initial_submit.len();
     let selected_working_directory_id = request
         .working_directory
         .as_ref()
@@ -6914,12 +6931,10 @@ async fn create_workspace_worker(
         WorkerSpawnRequest {
             requested_worker_name: Some(display_name.clone()),
             intent: WorkerSpawnIntent::WorkspaceCoding,
-            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                expected_segments: if initial_input.is_some() { 1 } else { 0 },
-            },
+            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted { expected_segments },
             profile: profile_selector,
             ticket_assignment: None,
-            initial_input,
+            initial_submit,
             working_directory_request: None,
             resolved_working_directory_request: None,
             resolved_working_directory,
@@ -10212,6 +10227,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn worker_initial_submit_validate_flow_shape_before_spawn() {
+        let valid = vec![
+            Segment::Flow {
+                selector: "builtin:coder-review".to_string(),
+            },
+            Segment::text("Implement Ticket 00001"),
+        ];
+        assert!(validate_worker_initial_submit(&valid).is_ok());
+        assert!(validate_worker_initial_submit(&[]).is_ok());
+
+        let duplicate = vec![
+            Segment::Flow {
+                selector: "builtin:coder-review".to_string(),
+            },
+            Segment::Flow {
+                selector: "workspace:coder-review".to_string(),
+            },
+        ];
+        assert!(matches!(
+            validate_worker_initial_submit(&duplicate),
+            Err(Error::InvalidInput(message)) if message.contains("at most one")
+        ));
+        assert!(matches!(
+            validate_worker_initial_submit(&[Segment::Flow {
+                selector: "coder-review".to_string(),
+            }]),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            validate_worker_initial_submit(&[Segment::Unknown]),
+            Err(Error::InvalidInput(message)) if message.contains("unknown")
+        ));
+        assert!(
+            serde_json::from_value::<CreateWorkspaceWorkerRequest>(serde_json::json!({
+                "runtime_id": "runtime-1",
+                "display_name": "coder",
+                "initial_text": "legacy parallel authority",
+                "working_directory": { "kind": "without_workspace" }
+            }))
+            .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn worker_source_auth_rejects_cross_workspace_mutation() {
         let workspace = tempfile::tempdir().unwrap();
@@ -10219,11 +10278,11 @@ mod tests {
         let api = test_api(workspace.path()).await;
         let Json(created) = create_workspace_worker(
             State(api.clone()),
-            Json(BrowserCreateWorkerRequest {
+            Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: "Scoped Worker".to_string(),
                 profile: Some("builtin:coder".to_string()),
-                initial_text: String::new(),
+                initial_submit: Vec::new(),
                 working_directory: None,
             }),
         )
@@ -10252,11 +10311,11 @@ mod tests {
 
         let Json(generic) = create_workspace_worker(
             State(api.clone()),
-            Json(BrowserCreateWorkerRequest {
+            Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: "Generic Orchestrator Profile Worker".to_string(),
                 profile: Some("builtin:orchestrator".to_string()),
-                initial_text: String::new(),
+                initial_submit: Vec::new(),
                 working_directory: None,
             }),
         )
@@ -10266,11 +10325,11 @@ mod tests {
         assert!(find_workspace_orchestrator(&api).is_none());
         let reserved = create_workspace_worker(
             State(api.clone()),
-            Json(BrowserCreateWorkerRequest {
+            Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string(),
                 profile: Some("builtin:orchestrator".to_string()),
-                initial_text: String::new(),
+                initial_submit: Vec::new(),
                 working_directory: None,
             }),
         )
@@ -11123,7 +11182,7 @@ mod tests {
                     },
                     profile: ProfileSelector::Builtin(MEMORY_CONSOLIDATION_PROFILE.to_string()),
                     ticket_assignment: None,
-                    initial_input: None,
+                    initial_submit: Vec::new(),
                     working_directory_request: None,
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
@@ -11305,7 +11364,7 @@ mod tests {
             },
             profile: ProfileSelector::Builtin("builtin:coder".to_string()),
             ticket_assignment: None,
-            initial_input: None,
+            initial_submit: Vec::new(),
             working_directory_request: None,
             resolved_working_directory_request: None,
             resolved_working_directory: None,
@@ -11521,7 +11580,7 @@ mod tests {
                     },
                     profile: ProfileSelector::Builtin("builtin:coder".to_string()),
                     ticket_assignment: None,
-                    initial_input: None,
+                    initial_submit: Vec::new(),
                     working_directory_request: None,
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
@@ -11663,7 +11722,7 @@ mod tests {
                 ticket_id: first_ticket.id.clone(),
                 operation_id: "spawn-assignment-operation".to_string(),
             }),
-            initial_input: None,
+            initial_submit: Vec::new(),
             working_directory_request: None,
             resolved_working_directory_request: None,
             resolved_working_directory: None,
@@ -11895,7 +11954,7 @@ mod tests {
             },
             profile: ProfileSelector::Builtin("builtin:coder".to_string()),
             ticket_assignment: Some(assignment.clone()),
-            initial_input: None,
+            initial_submit: Vec::new(),
             working_directory_request: None,
             resolved_working_directory_request: None,
             resolved_working_directory: None,
@@ -12812,7 +12871,7 @@ mod tests {
                 "runtime_id": "remote-runtime",
                 "display_name": "Coding Worker",
                 "profile": "builtin:coder",
-                "initial_text": "",
+                "initial_submit": [],
                 "working_directory": {
                     "working_directory_id": working_directory_id,
                     "relative_cwd": "../escape"
@@ -13173,7 +13232,7 @@ mod tests {
             serde_json::json!({
                 "runtime_id": "embedded-worker-runtime",
                 "display_name": "",
-                "initial_text": ""
+                "initial_submit": []
             }),
         )
         .await;
@@ -13239,7 +13298,7 @@ mod tests {
                 "runtime_id": "remote-runtime",
                 "display_name": "Remote Worker",
                 "profile": "builtin:companion",
-                "initial_text": ""
+                "initial_submit": []
             })),
             StatusCode::BAD_REQUEST,
         )
@@ -13352,7 +13411,7 @@ mod tests {
                 "runtime_id": "embedded-worker-runtime",
                 "display_name": "Coding Worker",
                 "profile": "builtin:coder",
-                "initial_text": "",
+                "initial_submit": [],
                 "kind": "internal"
             })),
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -13898,7 +13957,7 @@ mod tests {
                     },
                     profile: ProfileSelector::Builtin("builtin:coder".to_string()),
                     ticket_assignment: None,
-                    initial_input: None,
+                    initial_submit: Vec::new(),
                     working_directory_request: None,
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
@@ -14418,7 +14477,7 @@ mod tests {
                 "builtin:companion".to_string(),
             ),
             ticket_assignment: None,
-            initial_input: None,
+            initial_submit: Vec::new(),
             working_directory_request: None,
             resolved_working_directory_request: None,
             resolved_working_directory: None,

@@ -3,7 +3,7 @@
   import { untrack } from 'svelte';
   import { workspaceApiPath } from '$lib/workspace/api/http';
   import { formatCurrentWorkdirRevision } from '$lib/workspace/settings/workdir-revision';
-  import { buildBrowserCreateWorkerRequest, defaultWorkerLaunchForm } from '$lib/workspace/sidebar/worker-launch';
+  import { buildCreateWorkspaceWorkerRequest, defaultWorkerLaunchForm } from '$lib/workspace/sidebar/worker-launch';
   import type {
     BrowserCreateWorkerResponse,
     BrowserWorkingDirectoryCreateResponse,
@@ -210,7 +210,7 @@
       const response = await fetch(workerApiPath('/workers'), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(buildBrowserCreateWorkerRequest({
+        body: JSON.stringify(buildCreateWorkspaceWorkerRequest({
           runtime_id: runtimeId,
           display_name: displayName,
           profile,

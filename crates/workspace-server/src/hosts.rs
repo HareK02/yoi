@@ -1,6 +1,7 @@
 use crate::Error;
 use crate::resource_broker::{BackendResourceBroker, BackendResourceTarget};
 use chrono::Utc;
+use protocol::Segment;
 use reqwest::blocking::{Client as BlockingHttpClient, RequestBuilder};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Client as AsyncHttpClient, StatusCode, Url};
@@ -359,8 +360,8 @@ pub struct WorkerSpawnRequest {
     pub profile: ProfileSelector,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket_assignment: Option<WorkerTicketAssignmentRequest>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub initial_input: Option<EmbeddedWorkerInput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub initial_submit: Vec<Segment>,
     /// Optional safe working-directory creation request. The Workspace server resolves
     /// this into a runtime-internal `WorkingDirectoryRequest` from configured
     /// repositories before calling a host.
@@ -408,6 +409,17 @@ pub enum TicketWorkerRole {
 pub enum WorkerSpawnAcceptanceRequirement {
     SocketReady,
     RunAccepted { expected_segments: usize },
+}
+
+fn initial_worker_input(segments: &[Segment]) -> Option<EmbeddedWorkerInput> {
+    if segments.is_empty() {
+        return None;
+    }
+    Some(EmbeddedWorkerInput {
+        kind: EmbeddedWorkerInputKind::User,
+        content: Segment::flatten_to_text(segments),
+        segments: Some(segments.to_vec()),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1141,6 +1153,30 @@ impl RuntimeRegistry {
         request: WorkerSpawnRequest,
     ) -> Result<WorkerSpawnResult, RuntimeRegistryError> {
         validate_backend_identifier("runtime_id", runtime_id)?;
+        match request.acceptance {
+            WorkerSpawnAcceptanceRequirement::RunAccepted { expected_segments }
+                if expected_segments != request.initial_submit.len() =>
+            {
+                return Err(RuntimeRegistryError::RuntimeOperationFailed {
+                    runtime_id: runtime_id.to_string(),
+                    code: "worker_initial_segment_count_mismatch".to_string(),
+                    message: format!(
+                        "spawn acceptance expects {expected_segments} initial segment(s), request carries {}",
+                        request.initial_submit.len()
+                    ),
+                });
+            }
+            WorkerSpawnAcceptanceRequirement::SocketReady if !request.initial_submit.is_empty() => {
+                return Err(RuntimeRegistryError::RuntimeOperationFailed {
+                    runtime_id: runtime_id.to_string(),
+                    code: "worker_initial_submit_require_run_acceptance".to_string(),
+                    message:
+                        "spawn requests with initial segments must require RunAccepted acceptance"
+                            .to_string(),
+                });
+            }
+            _ => {}
+        }
         let runtime = self.runtime(runtime_id)?;
         Ok(runtime.spawn_worker(request))
     }
@@ -1865,7 +1901,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             display_name: request.requested_worker_name.clone(),
             config_bundle: None,
             profile_source,
-            initial_input: request.initial_input.clone(),
+            initial_input: initial_worker_input(&request.initial_submit),
             working_directory_request: request.resolved_working_directory_request.clone(),
             working_directory: request.resolved_working_directory.clone(),
             worker_observation_enabled: request.resolved_worker_observation_enabled,
@@ -2970,7 +3006,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             display_name: request.requested_worker_name.clone(),
             config_bundle: None,
             profile_source,
-            initial_input: request.initial_input.clone(),
+            initial_input: initial_worker_input(&request.initial_submit),
             working_directory_request: request.resolved_working_directory_request.clone(),
             working_directory: request.resolved_working_directory.clone(),
             worker_observation_enabled: request.resolved_worker_observation_enabled,
@@ -4551,7 +4587,7 @@ mod tests {
             },
             profile: ProfileSelector::Builtin("builtin:coder".to_string()),
             ticket_assignment: None,
-            initial_input: None,
+            initial_submit: Vec::new(),
             working_directory_request: None,
             resolved_working_directory_request: None,
             resolved_working_directory: None,
@@ -4601,29 +4637,48 @@ mod tests {
     }
 
     #[test]
-    fn embedded_runtime_rejects_system_initial_input_without_worker_projection() {
-        let runtime = EmbeddedWorkerRuntime::new_memory_with_execution_backend(
-            "local:test",
-            Arc::new(AcceptingExecutionBackend::default()),
-        )
-        .expect("test backend should connect");
+    fn worker_spawn_idempotency_fingerprint_covers_canonical_initial_submit() {
         let mut request = embedded_spawn_request();
-        request.initial_input = Some(EmbeddedWorkerInput {
-            kind: EmbeddedWorkerInputKind::Notify,
-            content: "system/role instruction belongs in profile".to_string(),
-            segments: None,
+        request.ticket_assignment = Some(WorkerTicketAssignmentRequest {
+            ticket_id: "00001KVZSGT0Q".to_string(),
+            operation_id: "operation-1".to_string(),
         });
+        request.initial_submit = vec![
+            Segment::Flow {
+                selector: "builtin:coder-review".to_string(),
+            },
+            Segment::text("Implement Ticket 00001KVZSGT0Q"),
+        ];
+        request.acceptance = WorkerSpawnAcceptanceRequirement::RunAccepted {
+            expected_segments: request.initial_submit.len(),
+        };
 
-        let spawned = runtime.spawn_worker(request);
-        assert_eq!(spawned.state, WorkerOperationState::Rejected);
-        assert!(spawned.worker.is_none());
-        assert!(spawned.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "embedded_worker_initial_input_kind_invalid"
-                && diagnostic
-                    .message
-                    .contains("initial worker input must be user input")
-        }));
-        assert!(runtime.list_workers(10).items.is_empty());
+        let first = worker_spawn_idempotency(&request).unwrap().unwrap();
+        let repeated = worker_spawn_idempotency(&request).unwrap().unwrap();
+        assert_eq!(first, repeated);
+        assert_eq!(first.0, "operation-1");
+
+        let mut changed = request.clone();
+        changed.initial_submit[1] = Segment::text("Different instruction");
+        let changed = worker_spawn_idempotency(&changed).unwrap().unwrap();
+        assert_ne!(first.1, changed.1);
+    }
+
+    #[test]
+    fn shared_spawn_projects_typed_initial_submit_to_runtime_user_input() {
+        let segments = vec![
+            Segment::Flow {
+                selector: "builtin:coder-review".to_string(),
+            },
+            Segment::text("Implement Ticket 00001"),
+        ];
+
+        let input = initial_worker_input(&segments).expect("typed initial input");
+
+        assert_eq!(input.kind, EmbeddedWorkerInputKind::User);
+        assert_eq!(input.content, Segment::flatten_to_text(&segments));
+        assert_eq!(input.segments, Some(segments));
+        assert!(initial_worker_input(&[]).is_none());
     }
 
     #[test]
@@ -4702,7 +4757,7 @@ mod tests {
                     },
                     profile: ProfileSelector::Builtin("builtin:coder".to_string()),
                     ticket_assignment: None,
-                    initial_input: None,
+                    initial_submit: Vec::new(),
                     working_directory_request: None,
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
@@ -4799,7 +4854,7 @@ mod tests {
                     },
                     profile: ProfileSelector::Builtin("builtin:coder".to_string()),
                     ticket_assignment: None,
-                    initial_input: None,
+                    initial_submit: Vec::new(),
                     working_directory_request: None,
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
@@ -4835,7 +4890,7 @@ mod tests {
                     acceptance: WorkerSpawnAcceptanceRequirement::SocketReady,
                     profile: ProfileSelector::Builtin("builtin:companion".to_string()),
                     ticket_assignment: None,
-                    initial_input: None,
+                    initial_submit: Vec::new(),
                     working_directory_request: None,
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,

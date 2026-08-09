@@ -8,8 +8,10 @@ license.workspace = true
 default = ["stream"]
 stream = ["dep:tokio"]
 typescript = ["dep:ts-rs"]
+json-schema = ["dep:schemars"]
 
 [dependencies]
+schemars = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["io-util"], optional = true }

@@ -1,5 +1,5 @@
 import {
-  buildBrowserCreateWorkerRequest,
+  buildCreateWorkspaceWorkerRequest,
   defaultWorkerLaunchForm,
 } from "./worker-launch.ts";
 import type { WorkerLaunchOptionsResponse } from "./types.ts";
@@ -182,8 +182,8 @@ Deno.test("defaultWorkerLaunchForm preserves a Ticket repository target", () => 
   assertEquals(form.working_directory_selector, "work/ticket");
 });
 
-Deno.test("buildBrowserCreateWorkerRequest sends working_directory id and relative cwd only", () => {
-  const request = buildBrowserCreateWorkerRequest({
+Deno.test("buildCreateWorkspaceWorkerRequest sends working_directory id and relative cwd only", () => {
+  const request = buildCreateWorkspaceWorkerRequest({
     runtime_id: "embedded",
     display_name: "Worker",
     profile: "builtin:coder",
@@ -198,7 +198,7 @@ Deno.test("buildBrowserCreateWorkerRequest sends working_directory id and relati
     runtime_id: "embedded",
     display_name: "Worker",
     profile: "builtin:coder",
-    initial_text: "go",
+    initial_submit: [{ kind: "text", content: "go" }],
     working_directory: {
       working_directory_id: "wd-1-repo",
       relative_cwd: "crates/yoi",
@@ -206,8 +206,23 @@ Deno.test("buildBrowserCreateWorkerRequest sends working_directory id and relati
   });
 });
 
-Deno.test("buildBrowserCreateWorkerRequest omits working_directory for embedded no-workdir launches", () => {
-  const request = buildBrowserCreateWorkerRequest({
+Deno.test("buildCreateWorkspaceWorkerRequest sends no initial segments for an empty draft", () => {
+  const request = buildCreateWorkspaceWorkerRequest({
+    runtime_id: "embedded",
+    display_name: "Worker",
+    profile: "builtin:companion",
+    initial_text: "   ",
+    working_directory_id: "",
+    working_directory_repository_id: "",
+    working_directory_selector: "",
+    relative_cwd: "",
+  });
+
+  assertEquals(request.initial_submit, []);
+});
+
+Deno.test("buildCreateWorkspaceWorkerRequest omits working_directory for embedded no-workdir launches", () => {
+  const request = buildCreateWorkspaceWorkerRequest({
     runtime_id: "embedded",
     display_name: "Worker",
     profile: "builtin:companion",
@@ -222,6 +237,6 @@ Deno.test("buildBrowserCreateWorkerRequest omits working_directory for embedded 
     runtime_id: "embedded",
     display_name: "Worker",
     profile: "builtin:companion",
-    initial_text: "chat",
+    initial_submit: [{ kind: "text", content: "chat" }],
   });
 });

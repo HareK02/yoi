@@ -3428,6 +3428,43 @@ mod tests {
     }
 
     #[test]
+    fn restore_does_not_redispatch_spawn_initial_submit() {
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime = Runtime::with_execution_backend(
+            RuntimeOptions {
+                ..RuntimeOptions::default()
+            },
+            backend.clone(),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let mut request = task_request("flow restore");
+        request.initial_input = Some(WorkerInput {
+            kind: WorkerInputKind::User,
+            content: String::new(),
+            segments: Some(vec![
+                protocol::Segment::Flow {
+                    selector: "builtin:coder-review".to_string(),
+                },
+                protocol::Segment::text("Implement Ticket 00001"),
+            ]),
+        });
+        let detail = runtime.create_worker(request).unwrap();
+        assert_eq!(backend.dispatched_inputs.lock().unwrap().len(), 1);
+
+        runtime
+            .stop_worker(&detail.worker_ref, Some("restore test".to_string()))
+            .unwrap();
+        runtime.restore_worker(&detail.worker_ref).unwrap();
+
+        assert_eq!(
+            backend.dispatched_inputs.lock().unwrap().len(),
+            1,
+            "restore must continue durable Worker state without replaying spawn initial input"
+        );
+    }
+
+    #[test]
     fn send_input_dispatches_segment_only_flow_submission() {
         let backend = Arc::new(TestExecutionBackend::default());
         let runtime = Runtime::with_execution_backend(

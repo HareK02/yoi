@@ -509,7 +509,7 @@ Deno.test("workspace Worker sidebar links New to the dedicated create page", asy
   );
   assert(
     newWorkerPage.includes("worker-launch-form") &&
-      newWorkerPage.includes("buildBrowserCreateWorkerRequest") &&
+      newWorkerPage.includes("buildCreateWorkspaceWorkerRequest") &&
       newWorkerPage.includes("/workers/launch-options"),
     "New Worker page should own launch options and creation form behavior",
   );

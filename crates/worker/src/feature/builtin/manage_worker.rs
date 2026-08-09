@@ -9,6 +9,8 @@ use llm_engine::tool::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use protocol::Segment;
+
 use crate::feature::{
     FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureModule, ToolContribution,
     ToolDeclaration,
@@ -96,8 +98,10 @@ struct WorkerSpawnInput {
     profile: String,
     #[serde(default)]
     display_name: Option<String>,
+    /// Normal typed initial user submission delivered after spawn. An empty
+    /// vector starts the Worker without initial input.
     #[serde(default)]
-    initial_text: Option<String>,
+    initial_submit: Vec<Segment>,
     #[serde(default)]
     relative_cwd: Option<String>,
 }
@@ -107,7 +111,7 @@ struct WorkerSpawnRequest {
     runtime_id: String,
     display_name: String,
     profile: String,
-    initial_text: String,
+    initial_submit: Vec<Segment>,
     working_directory: WorkerWorkingDirectorySelection,
 }
 
@@ -197,7 +201,7 @@ impl Tool for WorkspaceWorkerTool {
                         .filter(|value| !value.trim().is_empty())
                         .unwrap_or_else(|| "Workspace Worker".to_string()),
                     profile: non_empty(input.profile, "profile")?,
-                    initial_text: input.initial_text.unwrap_or_default(),
+                    initial_submit: input.initial_submit,
                     working_directory: WorkerWorkingDirectorySelection {
                         working_directory_id: authority_id(
                             &input.working_directory_id,
@@ -320,7 +324,78 @@ fn validate_relative_cwd(value: &str) -> Result<String, ToolError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+    use crate::worker::{WorkspaceClientError, WorkspaceResponse};
+
+    #[derive(Debug, Default)]
+    struct RecordingWorkspaceClient {
+        requests: Mutex<Vec<WorkspaceRequest>>,
+    }
+
+    impl WorkspaceClient for RecordingWorkspaceClient {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("workspace/test")
+        }
+
+        fn kind(&self) -> &str {
+            "recording"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn execute(
+            &self,
+            request: WorkspaceRequest,
+        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            self.requests.lock().unwrap().push(request);
+            Ok(WorkspaceResponse {
+                status: 200,
+                body: "{}".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_spawn_forwards_typed_initial_submit_to_workspace_api() {
+        let client = Arc::new(RecordingWorkspaceClient::default());
+        let tool = WorkspaceWorkerTool {
+            operation: WorkerOperation::Spawn,
+            client: client.clone(),
+            workspace_id: "workspace%2Ftest".to_string(),
+        };
+        tool.execute(
+            &serde_json::json!({
+                "runtime_id": "runtime-1",
+                "working_directory_id": "workdir-1",
+                "profile": "builtin:coder",
+                "initial_submit": [
+                    { "kind": "flow", "selector": "builtin:coder-review" },
+                    { "kind": "text", "content": "Implement Ticket 00001" }
+                ]
+            })
+            .to_string(),
+            ToolExecutionContext::direct(),
+        )
+        .await
+        .unwrap();
+
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, "/api/w/workspace%2Ftest/workers");
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["initial_submit"][0]["kind"], "flow");
+        assert_eq!(
+            body["initial_submit"][0]["selector"],
+            "builtin:coder-review"
+        );
+        assert_eq!(body["initial_submit"][1]["kind"], "text");
+        assert!(body.get("initial_text").is_none());
+    }
 
     #[test]
     fn worker_tool_family_is_distinct_from_sub_worker_tools() {
@@ -331,12 +406,27 @@ mod tests {
     }
 
     #[test]
+    fn worker_spawn_schema_exposes_normal_typed_segment_variants() {
+        let schema = serde_json::to_value(schemars::schema_for!(WorkerSpawnInput)).unwrap();
+        let text = serde_json::to_string(&schema).unwrap();
+        assert!(text.contains("initial_submit"));
+        assert!(text.contains("selector"));
+        assert!(text.contains("flow"));
+        assert!(!text.contains("initial_text"));
+    }
+
+    #[test]
     fn worker_spawn_request_uses_authority_ids_without_runtime_paths() {
         let request = WorkerSpawnRequest {
             runtime_id: "runtime-1".to_string(),
             display_name: "Coder".to_string(),
             profile: "builtin:coder".to_string(),
-            initial_text: "Implement the Ticket".to_string(),
+            initial_submit: vec![
+                Segment::Flow {
+                    selector: "builtin:coder-review".to_string(),
+                },
+                Segment::text("Implement the Ticket"),
+            ],
             working_directory: WorkerWorkingDirectorySelection {
                 working_directory_id: "wd-1".to_string(),
                 relative_cwd: Some("repo".to_string()),
@@ -348,6 +438,13 @@ mod tests {
         assert!(value.get("cwd").is_none());
         assert!(value.get("runtime_url").is_none());
         assert!(value["working_directory"].get("mode").is_none());
+        assert_eq!(value["initial_submit"][0]["kind"], "flow");
+        assert_eq!(
+            value["initial_submit"][0]["selector"],
+            "builtin:coder-review"
+        );
+        assert_eq!(value["initial_submit"][1]["kind"], "text");
+        assert!(value.get("initial_text").is_none());
     }
 
     #[test]

@@ -183,6 +183,7 @@ impl WorkerEvent {
 /// the dropped intent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Segment {
     /// Free-form text. The fallback every client can produce.

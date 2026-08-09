@@ -69,6 +69,8 @@ Flow invocation uses the normal Submit/Run segment vector rather than a Worker-c
 
 Runtime accepts exactly one Flow segment only when the resolved Profile enables `feature.flow` and a Workspace client is available. The Worker asks Workspace authority only for an immutable source snapshot, creates the instance locally, replaces the Flow segment with the entered state's instructions, and commits that runtime state atomically with the remaining Submit segments before LLM execution. A Worker with an active Flow rejects the duplicate input without changing its local state or events.
 
+The generic model-facing `WorkerSpawn` accepts `initial_submit: Vec<Segment>` and routes them unchanged through the shared Workspace spawn request into Runtime `CreateWorkerRequest.initial_input`. It does not have a parallel `initial_text` or a role-specific `SpawnCoder` wrapper. Backend derives the flat content projection from the canonical segment vector, validates Flow shape before spawn, and includes the segment vector in lifecycle idempotency fingerprints. Restoring the same Worker never replays spawn initial segments.
+
 `RequestFlowTransition` accepts only:
 
 ```json

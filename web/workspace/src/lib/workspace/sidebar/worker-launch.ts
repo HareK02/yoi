@@ -1,3 +1,5 @@
+import type { Segment } from "$lib/generated/protocol";
+
 import type {
   BrowserWorkerWorkingDirectorySelection,
   WorkerLaunchOptionsResponse,
@@ -14,11 +16,11 @@ export type WorkerLaunchFormState = {
   relative_cwd: string;
 };
 
-export type BrowserCreateWorkerRequest = {
+export type CreateWorkspaceWorkerRequest = {
   runtime_id: string;
   display_name: string;
   profile: string;
-  initial_text: string;
+  initial_submit: Segment[];
   working_directory?: BrowserWorkerWorkingDirectorySelection;
 };
 
@@ -92,14 +94,16 @@ export function defaultWorkerLaunchForm(
   };
 }
 
-export function buildBrowserCreateWorkerRequest(
+export function buildCreateWorkspaceWorkerRequest(
   form: WorkerLaunchFormState,
-): BrowserCreateWorkerRequest {
-  const request: BrowserCreateWorkerRequest = {
+): CreateWorkspaceWorkerRequest {
+  const request: CreateWorkspaceWorkerRequest = {
     runtime_id: form.runtime_id,
     display_name: form.display_name,
     profile: form.profile,
-    initial_text: form.initial_text,
+    initial_submit: form.initial_text.trim()
+      ? [{ kind: "text", content: form.initial_text }]
+      : [],
   };
   if (form.working_directory_id) {
     request.working_directory = {
