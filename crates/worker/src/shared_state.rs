@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 use protocol::WorkerStatus;
@@ -28,6 +29,7 @@ pub struct WorkerSharedState {
     /// `ListCompletions` queries without going through the controller. It is
     /// unset only in unit tests that construct `WorkerSharedState` directly.
     fs_view: OnceLock<WorkerFsView>,
+    flow_transition_enabled: AtomicBool,
 }
 
 impl WorkerSharedState {
@@ -44,6 +46,7 @@ impl WorkerSharedState {
             greeting,
             status: RwLock::new(WorkerStatus::Idle),
             fs_view: OnceLock::new(),
+            flow_transition_enabled: AtomicBool::new(false),
         }
     }
 
@@ -57,6 +60,14 @@ impl WorkerSharedState {
     /// tests that didn't wire one up.
     pub fn fs_view(&self) -> Option<&WorkerFsView> {
         self.fs_view.get()
+    }
+
+    pub fn enable_flow_transition(&self) {
+        self.flow_transition_enabled.store(true, Ordering::Release);
+    }
+
+    pub fn flow_transition_enabled(&self) -> bool {
+        self.flow_transition_enabled.load(Ordering::Acquire)
     }
 
     pub fn set_status(&self, status: WorkerStatus) {

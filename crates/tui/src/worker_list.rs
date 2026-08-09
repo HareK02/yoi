@@ -1233,6 +1233,7 @@ mod tests {
                 &LogEntry::UserInput {
                     ts,
                     segments: vec![protocol::Segment::text(text)],
+                    extensions: vec![],
                 },
             )
             .unwrap();

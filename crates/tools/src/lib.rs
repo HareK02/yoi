@@ -62,6 +62,17 @@ pub fn core_builtin_tools(
     tools
 }
 
+pub fn read_only_builtin_tools(
+    session: workdir::WorkdirSessionHandle,
+) -> Vec<llm_engine::tool::ToolDefinition> {
+    debug_assert_eq!(
+        session.capabilities(),
+        workdir::WorkdirSessionCapabilities::READ_ONLY,
+        "read-only tool projection requires a read-only Workdir session"
+    );
+    core_builtin_tools(session, Tracker::new(), std::path::PathBuf::new())
+}
+
 pub fn web_builtin_tools(
     web_config: Option<manifest::WebConfig>,
 ) -> Vec<llm_engine::tool::ToolDefinition> {

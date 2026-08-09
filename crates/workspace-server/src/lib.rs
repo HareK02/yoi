@@ -57,6 +57,8 @@ pub enum Error {
     Ticket(#[from] ticket::TicketError),
     #[error("yaml error: {0}")]
     Yaml(#[from] serde_yaml::Error),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
     #[error("invalid project record id `{0}`")]
     InvalidRecordId(String),
     #[error("workspace backend config error: {0}")]

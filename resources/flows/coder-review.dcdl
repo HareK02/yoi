@@ -1,0 +1,46 @@
+{
+    schema_version = 1;
+    name = "coder-review";
+    initial = "implement";
+
+    states = {
+        implement = {
+            instructions = "Implement the requested Ticket scope, run the narrow and dependent validation required by the changed contracts, and record the concrete repository/test evidence. When the implementation is ready for independent review, request a Flow transition.";
+            transitions = {
+                review = {
+                    target = "review";
+                    condition = "The requested implementation is present, the relevant validation has completed, and there is enough bounded repository and session evidence for an independent Reviewer to evaluate the change.";
+                };
+            };
+        };
+
+        review = {
+            instructions = "Spawn one independent Reviewer SubWorker with bounded Ticket, repository, diff, and validation context. Read its committed review through worker observation. Do not review your own implementation or treat a prose status as approval. After the Reviewer returns a typed approval or concrete requested changes, request a Flow transition.";
+            transitions = {
+                approved = {
+                    target = "done";
+                    condition = "The latest independent Reviewer attempt for the current implementation completed and approved it, with no later unresolved request_changes finding.";
+                };
+                changes_requested = {
+                    target = "fix";
+                    condition = "The latest independent Reviewer attempt for the current implementation requested one or more concrete changes that remain unresolved.";
+                };
+            };
+        };
+
+        fix = {
+            instructions = "Resolve every open Reviewer finding, rerun the validation affected by the fixes, and preserve concrete evidence. Do not claim approval from the prior request_changes review. When the corrected implementation is ready for a new independent review, request a Flow transition.";
+            transitions = {
+                review = {
+                    target = "review";
+                    condition = "Every finding from the latest request_changes review has been addressed with relevant validation evidence, and the corrected implementation is ready for a fresh independent Reviewer attempt.";
+                };
+            };
+        };
+
+        done = {
+            instructions = "The Coder implementation and independent review loop is complete.";
+            terminal = true;
+        };
+    };
+}

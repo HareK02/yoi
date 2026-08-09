@@ -221,6 +221,8 @@ pub struct HostSummary {
 pub struct WorkerWorkspaceSummary {
     pub visibility: String,
     pub identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1495,6 +1497,7 @@ impl EmbeddedWorkerRuntime {
             workspace: WorkerWorkspaceSummary {
                 visibility: "backend_internal".to_string(),
                 identity: "runtime_registry_worker".to_string(),
+                workspace_id: summary.workspace_id.clone(),
             },
             state: embedded_worker_status_label(summary.status).to_string(),
             last_seen_at: None,
@@ -1533,6 +1536,7 @@ impl EmbeddedWorkerRuntime {
             workspace: WorkerWorkspaceSummary {
                 visibility: "backend_internal".to_string(),
                 identity: "runtime_registry_worker".to_string(),
+                workspace_id: detail.workspace_id.clone(),
             },
             state: embedded_worker_status_label(detail.status).to_string(),
             last_seen_at: None,
@@ -2575,6 +2579,7 @@ impl RemoteWorkerRuntime {
             workspace: WorkerWorkspaceSummary {
                 visibility: "remote_runtime".to_string(),
                 identity: "runtime_registry_worker".to_string(),
+                workspace_id: summary.workspace_id.clone(),
             },
             state: embedded_worker_status_label(summary.status).to_string(),
             last_seen_at: None,
@@ -2617,6 +2622,7 @@ impl RemoteWorkerRuntime {
             workspace: WorkerWorkspaceSummary {
                 visibility: "remote_runtime".to_string(),
                 identity: "runtime_registry_worker".to_string(),
+                workspace_id: detail.workspace_id.clone(),
             },
             state: embedded_worker_status_label(detail.status).to_string(),
             last_seen_at: None,
@@ -3885,6 +3891,7 @@ pub fn placeholder_worker(host_id: impl Into<String>) -> WorkerSummary {
         workspace: WorkerWorkspaceSummary {
             visibility: "none".to_string(),
             identity: "unsupported".to_string(),
+            workspace_id: None,
         },
         state: "unsupported".to_string(),
         last_seen_at: None,
@@ -4329,6 +4336,7 @@ mod tests {
                     workspace: WorkerWorkspaceSummary {
                         visibility: "opaque".to_string(),
                         identity: host_id.to_string(),
+                        workspace_id: None,
                     },
                     state: "available".to_string(),
                     last_seen_at: None,

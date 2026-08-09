@@ -202,6 +202,11 @@ pub enum Segment {
     /// `[Dir: <path>]` listings; the flattened user text keeps the literal
     /// `@<path>` placeholder either way.
     FileRef { path: String },
+    /// Source-qualified request for the host to start a Flow before committing
+    /// this user input. Runtime resolves it through Workspace authority and
+    /// replaces it with the entered state's instructions before Worker-side
+    /// input resolution.
+    Flow { selector: String },
     /// Unknown variant from a newer client. Worker treats this as an
     /// unresolved input — surfaces an alert and inserts a placeholder.
     /// Round-trip is lossy: re-serializing yields `{"kind":"unknown"}`.
@@ -235,6 +240,11 @@ impl Segment {
                 Segment::FileRef { path } => {
                     out.push('@');
                     out.push_str(path);
+                }
+                Segment::Flow { selector } => {
+                    out.push_str("[Flow: ");
+                    out.push_str(selector);
+                    out.push(']');
                 }
                 Segment::Unknown => {}
             }
@@ -898,6 +908,33 @@ mod tests {
             }
             other => panic!("expected Run, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn method_run_flow_segment_roundtrip() {
+        let method = Method::Run {
+            input: vec![
+                Segment::Flow {
+                    selector: "builtin:coder-review".to_string(),
+                },
+                Segment::text("Ticket context"),
+            ],
+        };
+        let json = serde_json::to_string(&method).unwrap();
+        assert!(json.contains(r#""kind":"flow""#));
+        assert!(json.contains(r#""selector":"builtin:coder-review""#));
+        let decoded = serde_json::from_str::<Method>(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            Method::Run { input }
+                if matches!(
+                    input.as_slice(),
+                    [
+                        Segment::Flow { selector },
+                        Segment::Text { content }
+                    ] if selector == "builtin:coder-review" && content == "Ticket context"
+                )
+        ));
     }
 
     #[test]

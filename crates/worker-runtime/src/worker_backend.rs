@@ -48,7 +48,7 @@ use worker::ipc::protocol_session::{live_log_entry_event, subscribe_worker_proto
 use worker::{
     PromptLoader, RuntimeWorkspaceHttpClient, SegmentLogSink, Worker, WorkerController,
     WorkerError, WorkerFilesystemAuthority, WorkerHandle, WorkerSharedState,
-    WorkerWorkspaceContext, WorkspaceId,
+    WorkerWorkspaceContext, WorkspaceClient, WorkspaceId,
 };
 
 const DEFAULT_BACKEND_ID: &str = "worker-crate";
@@ -90,6 +90,11 @@ impl Drop for OwnedRuntimeArtifactRoot {
     }
 }
 
+pub struct RuntimeWorkerController {
+    pub handle: WorkerHandle,
+    pub workspace_client: Arc<dyn WorkspaceClient>,
+}
+
 /// Factory seam used by [`WorkerRuntimeExecutionBackend`] to construct a real
 /// controller-backed Worker for a Runtime catalog entry.
 #[async_trait]
@@ -97,12 +102,12 @@ pub trait RuntimeWorkerFactory: Send + Sync + 'static {
     async fn spawn_controller(
         &self,
         request: WorkerExecutionSpawnRequest,
-    ) -> Result<WorkerHandle, String>;
+    ) -> Result<RuntimeWorkerController, String>;
 
     async fn restore_controller(
         &self,
         request: WorkerExecutionRestoreRequest,
-    ) -> Result<WorkerHandle, String>;
+    ) -> Result<RuntimeWorkerController, String>;
 }
 
 /// Production factory that resolves a normal Worker profile and spawns it under
@@ -498,7 +503,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
     async fn spawn_controller(
         &self,
         request: WorkerExecutionSpawnRequest,
-    ) -> Result<WorkerHandle, String> {
+    ) -> Result<RuntimeWorkerController, String> {
         let worker_name = Self::runtime_worker_name(&request);
         let profile = Self::runtime_profile(&request);
         let has_local_filesystem = request.working_directory.is_some();
@@ -554,6 +559,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 )?
             }
         };
+        let flow_transition_enabled = manifest.feature.flow.enabled;
 
         let store_dir = self.store_dir()?;
         let session_store = FsStore::new(&store_dir).map_err(|err| {
@@ -609,23 +615,41 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 CompositeWorkerObservationProvider::new(providers),
             )));
         }
+        if flow_transition_enabled {
+            let report = worker
+                .install_runtime_flow_transition_feature()
+                .map_err(|error| format!("install Flow transition feature: {error}"))?;
+            if report.reports.iter().any(|report| !report.installed) {
+                return Err(format!(
+                    "install Flow transition feature failed: {:?}",
+                    report.reports
+                ));
+            }
+        }
 
+        let workspace_client = worker.workspace_client_handle();
         let runtime_base = self.runtime_base_dir()?;
         let (handle, _shutdown_rx) = WorkerController::spawn_runtime_managed(worker, &runtime_base)
             .await
             .map_err(|err| format!("failed to spawn Worker controller: {err}"))?;
+        if flow_transition_enabled {
+            handle.shared_state.enable_flow_transition();
+        }
         self.observation_hub.register(
             request.worker_ref.clone(),
             observation_workspace_id,
             &handle,
         );
-        Ok(handle)
+        Ok(RuntimeWorkerController {
+            handle,
+            workspace_client,
+        })
     }
 
     async fn restore_controller(
         &self,
         request: WorkerExecutionRestoreRequest,
-    ) -> Result<WorkerHandle, String> {
+    ) -> Result<RuntimeWorkerController, String> {
         let worker_name = Self::runtime_worker_name_for_ref(&request.worker_ref);
         let filesystem_authority = request
             .working_directory
@@ -711,6 +735,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             }
             Err(err) => return Err(format!("failed to restore Worker from metadata: {err}")),
         };
+        let flow_transition_enabled = worker.manifest().feature.flow.enabled;
         if let Some(binding) = request.working_directory.as_ref() {
             worker.bind_workdir_session(Some(runtime_local_workdir_session(
                 &binding.working_directory.id,
@@ -740,23 +765,42 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 CompositeWorkerObservationProvider::new(providers),
             )));
         }
+        if flow_transition_enabled {
+            let report = worker
+                .install_runtime_flow_transition_feature()
+                .map_err(|error| format!("install Flow transition feature: {error}"))?;
+            if report.reports.iter().any(|report| !report.installed) {
+                return Err(format!(
+                    "install Flow transition feature failed: {:?}",
+                    report.reports
+                ));
+            }
+        }
 
+        let workspace_client = worker.workspace_client_handle();
         let runtime_base = self.runtime_base_dir()?;
         let (handle, _shutdown_rx) = WorkerController::spawn_runtime_managed(worker, &runtime_base)
             .await
             .map_err(|err| format!("failed to spawn restored Worker controller: {err}"))?;
+        if flow_transition_enabled {
+            handle.shared_state.enable_flow_transition();
+        }
         self.observation_hub.register(
             request.worker_ref.clone(),
             observation_workspace_id,
             &handle,
         );
-        Ok(handle)
+        Ok(RuntimeWorkerController {
+            handle,
+            workspace_client,
+        })
     }
 }
 
 struct RuntimeWorkerExecution {
     handle: WorkerHandle,
     busy: Arc<AtomicBool>,
+    workspace_client: Option<Arc<dyn WorkspaceClient>>,
 }
 
 /// `worker-runtime` execution backend backed by real `worker` crate Workers.
@@ -847,7 +891,14 @@ where
     fn get_execution(
         &self,
         handle: &WorkerExecutionHandle,
-    ) -> Result<(WorkerHandle, Arc<AtomicBool>), WorkerExecutionResult> {
+    ) -> Result<
+        (
+            WorkerHandle,
+            Arc<AtomicBool>,
+            Option<Arc<dyn WorkspaceClient>>,
+        ),
+        WorkerExecutionResult,
+    > {
         if handle.backend_id() != self.backend_id() {
             return Err(WorkerExecutionResult::rejected(
                 WorkerExecutionOperation::Input,
@@ -866,7 +917,13 @@ where
         })?;
         workers
             .get(handle.worker_ref())
-            .map(|execution| (execution.handle.clone(), execution.busy.clone()))
+            .map(|execution| {
+                (
+                    execution.handle.clone(),
+                    execution.busy.clone(),
+                    execution.workspace_client.clone(),
+                )
+            })
             .ok_or_else(|| {
                 WorkerExecutionResult::rejected(
                     WorkerExecutionOperation::Input,
@@ -899,6 +956,7 @@ where
         bridge_context: crate::execution::WorkerExecutionContext,
         handle: WorkerHandle,
         working_directory: Option<WorkingDirectoryBinding>,
+        workspace_client: Option<Arc<dyn WorkspaceClient>>,
     ) -> WorkerExecutionSpawnResult {
         let busy = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "ws-server")]
@@ -956,7 +1014,14 @@ where
                 ));
             }
         };
-        workers.insert(worker_ref.clone(), RuntimeWorkerExecution { handle, busy });
+        workers.insert(
+            worker_ref.clone(),
+            RuntimeWorkerExecution {
+                handle,
+                busy,
+                workspace_client,
+            },
+        );
 
         WorkerExecutionSpawnResult::Connected {
             handle: WorkerExecutionHandle::new(worker_ref, self.backend_id()),
@@ -1166,8 +1231,8 @@ where
         let spawn_result =
             self.run_on_adapter_runtime(async move { factory.spawn_controller(request).await });
 
-        let handle = match spawn_result {
-            Ok(handle) => handle,
+        let controller = match spawn_result {
+            Ok(controller) => controller,
             Err(message) => {
                 if let (Some(materializer), Some(binding)) = (
                     self.working_directory_materializer.as_ref(),
@@ -1186,8 +1251,9 @@ where
             WorkerExecutionOperation::Spawn,
             worker_ref,
             bridge_context,
-            handle,
+            controller.handle,
             working_directory,
+            Some(controller.workspace_client),
         )
     }
 
@@ -1267,8 +1333,8 @@ where
         let restore_result =
             self.run_on_adapter_runtime(async move { factory.restore_controller(request).await });
 
-        let handle = match restore_result {
-            Ok(handle) => handle,
+        let controller = match restore_result {
+            Ok(controller) => controller,
             Err(message) => {
                 return WorkerExecutionSpawnResult::Errored(WorkerExecutionResult::errored(
                     WorkerExecutionOperation::Restore,
@@ -1281,8 +1347,9 @@ where
             WorkerExecutionOperation::Restore,
             worker_ref,
             bridge_context,
-            handle,
+            controller.handle,
             working_directory,
+            Some(controller.workspace_client),
         )
     }
 
@@ -1291,7 +1358,7 @@ where
         handle: &WorkerExecutionHandle,
         input: WorkerInput,
     ) -> WorkerExecutionResult {
-        let (worker, busy) = match self.get_execution(handle) {
+        let (worker, busy, _workspace_client) = match self.get_execution(handle) {
             Ok(execution) => execution,
             Err(mut result) => {
                 result.operation = WorkerExecutionOperation::Input;
@@ -1374,7 +1441,7 @@ where
         handle: &WorkerExecutionHandle,
         method: Method,
     ) -> WorkerExecutionResult {
-        let (worker, busy) = match self.get_execution(handle) {
+        let (worker, busy, _workspace_client) = match self.get_execution(handle) {
             Ok(execution) => execution,
             Err(mut result) => {
                 result.operation = WorkerExecutionOperation::ProtocolMethod;
@@ -1468,7 +1535,7 @@ where
     }
 
     fn cancel_worker(&self, handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
-        let (worker, _busy) = match self.get_execution(handle) {
+        let (worker, _busy, _workspace_client) = match self.get_execution(handle) {
             Ok(execution) => execution,
             Err(mut result) => {
                 result.operation = WorkerExecutionOperation::Cancel;
@@ -1626,7 +1693,7 @@ mod tests {
         async fn spawn_controller(
             &self,
             request: WorkerExecutionSpawnRequest,
-        ) -> Result<WorkerHandle, String> {
+        ) -> Result<RuntimeWorkerController, String> {
             let manifest = WorkerManifest::from_toml(
                 r#"
                 [worker]
@@ -1668,7 +1735,7 @@ mod tests {
             let workspace_backend_ref =
                 RuntimeWorkspaceBackendRef::from_worker_request(&request.request);
             let workspace_context = workspace_backend_ref.worker_context(&request.worker_ref);
-            let workspace_client = workspace_context.client();
+            let workspace_client = workspace_context.client_handle();
             self.observed_workspace_clients.lock().unwrap().push((
                 workspace_client.kind().to_string(),
                 workspace_client.workspace_id().map(str::to_string),
@@ -1689,12 +1756,15 @@ mod tests {
                 WorkerController::spawn_runtime_managed(worker, &self.runtime_base)
                     .await
                     .map_err(|err| err.to_string())?;
-            Ok(handle)
+            Ok(RuntimeWorkerController {
+                handle,
+                workspace_client,
+            })
         }
         async fn restore_controller(
             &self,
             request: WorkerExecutionRestoreRequest,
-        ) -> Result<WorkerHandle, String> {
+        ) -> Result<RuntimeWorkerController, String> {
             let request = WorkerExecutionSpawnRequest {
                 worker_ref: request.worker_ref,
                 request: request.request,
@@ -1820,14 +1890,14 @@ mod tests {
         async fn spawn_controller(
             &self,
             _request: WorkerExecutionSpawnRequest,
-        ) -> Result<WorkerHandle, String> {
+        ) -> Result<RuntimeWorkerController, String> {
             Err("spawn failed".to_string())
         }
 
         async fn restore_controller(
             &self,
             _request: WorkerExecutionRestoreRequest,
-        ) -> Result<WorkerHandle, String> {
+        ) -> Result<RuntimeWorkerController, String> {
             Err("restore failed".to_string())
         }
     }
@@ -2040,6 +2110,9 @@ mod tests {
                 [engine]
                 max_tokens = 100
 
+                [feature.flow]
+                enabled = true
+
                 [[scope.allow]]
                 target = "{}"
                 permission = "write"
@@ -2060,8 +2133,13 @@ mod tests {
             )
             .unwrap();
 
-        let request = create_request("restore");
-        let handle = ProfileRuntimeWorkerFactory::new(root.path())
+        let mut request = create_request("restore");
+        request.workspace_api = Some(crate::catalog::WorkspaceApiRef {
+            workspace_id: "workspace-restore".to_string(),
+            base_url: "http://workspace.invalid".to_string(),
+            runtime_id: Some("runtime-restore".to_string()),
+        });
+        let controller = ProfileRuntimeWorkerFactory::new(root.path())
             .with_store_dir(&store_dir)
             .with_worker_metadata_dir(&worker_metadata_dir)
             .restore_controller(WorkerExecutionRestoreRequest {
@@ -2074,8 +2152,9 @@ mod tests {
             })
             .await
             .expect("pending restore should use the saved manifest snapshot");
+        assert!(controller.handle.shared_state.flow_transition_enabled());
 
-        handle.send(Method::Shutdown).await.unwrap();
+        controller.handle.send(Method::Shutdown).await.unwrap();
     }
 
     #[test]

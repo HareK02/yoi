@@ -912,7 +912,7 @@ fn builtin_profile_artifact(label: &str) -> Option<serde_json::Value> {
                 true,
                 true,
                 true,
-                false,
+                true,
             );
             Some(value)
         }
@@ -999,6 +999,7 @@ fn apply_role_profile(
     value["feature"]["memory"] = serde_json::json!({ "enabled": memory });
     value["feature"]["web"] = serde_json::json!({ "enabled": web });
     value["feature"]["sub_worker"] = serde_json::json!({ "enabled": sub_worker });
+    value["feature"]["flow"] = serde_json::json!({ "enabled": slug == "coder" });
     value["feature"]["worker"] =
         serde_json::json!({ "enabled": matches!(slug, "companion" | "orchestrator") });
     value["feature"]["manage_workdir"] = serde_json::json!({ "enabled": slug == "orchestrator" });
@@ -1530,7 +1531,8 @@ mod tests {
 
         let coder = resolve("coder");
         assert!(coder.feature.task.enabled);
-        assert!(!coder.feature.sub_worker.enabled);
+        assert!(coder.feature.sub_worker.enabled);
+        assert!(coder.feature.flow.enabled);
         assert!(!coder.feature.worker.enabled);
         assert!(coder.scope.allow.is_empty());
         assert!(coder.delegation_scope.allow.is_empty());
@@ -1548,6 +1550,7 @@ mod tests {
         let reviewer = resolve("reviewer");
         assert!(reviewer.feature.task.enabled);
         assert!(!reviewer.feature.sub_worker.enabled);
+        assert!(!reviewer.feature.flow.enabled);
         assert!(!reviewer.feature.worker.enabled);
         assert!(reviewer.feature.ticket.enabled);
         assert!(reviewer.feature.ticket.enabled);

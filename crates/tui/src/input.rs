@@ -47,10 +47,22 @@ impl FileRefAtom {
 }
 
 #[derive(Debug, Clone)]
+pub struct FlowRefAtom {
+    pub selector: String,
+}
+
+impl FlowRefAtom {
+    pub fn label(&self) -> String {
+        format!("[Flow: {}]", self.selector)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum Atom {
     Char(char),
     Paste(PasteRef),
     FileRef(FileRefAtom),
+    FlowRef(FlowRefAtom),
 }
 
 impl Atom {
@@ -61,6 +73,7 @@ impl Atom {
             Atom::Char(_) => None,
             Atom::Paste(p) => Some((Style::default().fg(Color::Magenta), p.label())),
             Atom::FileRef(r) => Some((Style::default().fg(Color::Cyan), r.label())),
+            Atom::FlowRef(r) => Some((Style::default().fg(Color::Yellow), r.label())),
         }
     }
 }
@@ -89,7 +102,7 @@ enum WordKind {
 fn atom_class(atom: &Atom) -> AtomClass {
     match atom {
         Atom::Char(c) => char_class(*c),
-        Atom::Paste(_) | Atom::FileRef(_) => AtomClass::Chip,
+        Atom::Paste(_) | Atom::FileRef(_) | Atom::FlowRef(_) => AtomClass::Chip,
     }
 }
 
@@ -181,6 +194,11 @@ impl InputBuffer {
                     self.atoms
                         .push(Atom::FileRef(FileRefAtom { path: path.clone() }));
                 }
+                protocol::Segment::Flow { selector } => {
+                    self.atoms.push(Atom::FlowRef(FlowRefAtom {
+                        selector: selector.clone(),
+                    }));
+                }
                 protocol::Segment::Unknown => {
                     self.atoms
                         .extend("[unknown input segment]".chars().map(Atom::Char));
@@ -208,6 +226,7 @@ impl InputBuffer {
                 Atom::Char(c) => text.push(*c),
                 Atom::Paste(paste) => text.push_str(&paste.content),
                 Atom::FileRef(file) => text.push_str(&file.path),
+                Atom::FlowRef(flow) => text.push_str(&flow.selector),
             }
         }
         text
@@ -482,6 +501,12 @@ impl InputBuffer {
                     flush_text(&mut buf, &mut out);
                     out.push(protocol::Segment::FileRef {
                         path: r.path.clone(),
+                    });
+                }
+                Atom::FlowRef(r) => {
+                    flush_text(&mut buf, &mut out);
+                    out.push(protocol::Segment::Flow {
+                        selector: r.selector.clone(),
                     });
                 }
             }
@@ -1194,7 +1219,7 @@ mod word_motion_tests {
         for a in &buf.atoms {
             match a {
                 Atom::Char(c) => out.push(*c),
-                Atom::Paste(_) | Atom::FileRef(_) => out.push_str("<P>"),
+                Atom::Paste(_) | Atom::FileRef(_) | Atom::FlowRef(_) => out.push_str("<P>"),
             }
         }
         out

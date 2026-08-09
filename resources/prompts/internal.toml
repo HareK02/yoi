@@ -14,6 +14,8 @@ memory_extract_system = "{% include \"$yoi/internal/memory_extract_system\" %}"
 
 memory_consolidation_system = "{% include \"$yoi/internal/memory_consolidation_system\" %}"
 
+flow_verifier_system = "{% include \"$yoi/internal/flow_verifier_system\" %}"
+
 notify_wrapper = """\
 [Notification]
 {{ message }}

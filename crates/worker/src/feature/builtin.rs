@@ -4,6 +4,7 @@
 //! same descriptor-approved registry path used by feature modules. They are not
 //! an external plugin-loading surface.
 
+pub mod flow_transition;
 pub mod manage_workdir;
 pub mod manage_worker;
 pub mod memory;

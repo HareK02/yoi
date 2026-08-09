@@ -36,6 +36,7 @@ fn round_trip_write_and_read() {
         },
         LogEntry::UserInput {
             ts: 2000,
+            extensions: vec![],
             segments: vec![protocol::Segment::text("Hello")],
         },
         LogEntry::AssistantItem {
@@ -214,6 +215,7 @@ fn read_entry_count_matches_append_tally() {
         },
         LogEntry::UserInput {
             ts: 2000,
+            extensions: vec![],
             segments: vec![protocol::Segment::text("Hello")],
         },
     ];
@@ -253,6 +255,7 @@ fn unterminated_utf8_tail_is_ignored_and_replaced_on_append() {
 
     let next = LogEntry::UserInput {
         ts: 2,
+        extensions: vec![],
         segments: vec![protocol::Segment::text("recovered")],
     };
     store.append(sid, segid, &next).unwrap();

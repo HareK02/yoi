@@ -453,6 +453,7 @@ async fn session_auto_forks_on_conflict() {
     // Simulate another Worker writing to the same segment behind our back.
     let extra_entry = LogEntry::UserInput {
         ts: 9999,
+        extensions: vec![],
         segments: vec![protocol::Segment::text("Interloper")],
     };
     store.append(sid, original_segid, &extra_entry).unwrap();

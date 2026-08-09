@@ -2333,7 +2333,11 @@ fn validate_create_worker_request(request: &CreateWorkerRequest) -> Result<(), R
                 kind: format!("{:?}", input.kind),
             });
         }
-        if input.content.trim().is_empty() {
+        let has_segments = input
+            .segments
+            .as_ref()
+            .is_some_and(|segments| !segments.is_empty());
+        if input.content.trim().is_empty() && !has_segments {
             return Err(RuntimeError::InvalidRequest(
                 "initial_input.content must not be empty".to_string(),
             ));
@@ -2369,7 +2373,11 @@ fn validate_create_workspace_scope(
 }
 
 fn validate_worker_input(input: &WorkerInput) -> Result<(), RuntimeError> {
-    if !input.kind.is_empty_content_allowed() && input.content.trim().is_empty() {
+    let has_segments = input
+        .segments
+        .as_ref()
+        .is_some_and(|segments| !segments.is_empty());
+    if !input.kind.is_empty_content_allowed() && input.content.trim().is_empty() && !has_segments {
         return Err(RuntimeError::InvalidRequest(
             "worker input content must not be empty".to_string(),
         ));
@@ -2446,6 +2454,44 @@ mod tests {
     #[cfg(feature = "fs-store")]
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn typed_segments_allow_empty_flat_content() {
+        let input = WorkerInput {
+            kind: WorkerInputKind::User,
+            content: String::new(),
+            segments: Some(vec![protocol::Segment::Flow {
+                selector: "builtin:coder-review".to_string(),
+            }]),
+        };
+        assert!(validate_worker_input(&input).is_ok());
+    }
+
+    #[test]
+    fn empty_user_input_without_segments_is_rejected() {
+        let input = WorkerInput {
+            kind: WorkerInputKind::User,
+            content: String::new(),
+            segments: Some(Vec::new()),
+        };
+        assert!(matches!(
+            validate_worker_input(&input),
+            Err(RuntimeError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn typed_flow_segments_allow_empty_initial_flat_content() {
+        let mut request = task_request("flow");
+        request.initial_input = Some(WorkerInput {
+            kind: WorkerInputKind::User,
+            content: String::new(),
+            segments: Some(vec![protocol::Segment::Flow {
+                selector: "builtin:coder-review".to_string(),
+            }]),
+        });
+        assert!(validate_create_worker_request(&request).is_ok());
+    }
 
     fn task_request(_objective: &str) -> CreateWorkerRequest {
         let profile = ProfileSelector::Builtin("builtin:coder".to_string());
@@ -2533,6 +2579,7 @@ mod tests {
         restore_result: Mutex<Option<WorkerExecutionSpawnResult>>,
         restore_count: Mutex<u64>,
         contexts: Mutex<BTreeMap<WorkerId, WorkerExecutionContext>>,
+        dispatched_inputs: Mutex<Vec<WorkerInput>>,
         #[cfg(feature = "ws-server")]
         snapshots: Mutex<BTreeMap<WorkerId, protocol::Event>>,
     }
@@ -2607,8 +2654,9 @@ mod tests {
         fn dispatch_input(
             &self,
             _handle: &WorkerExecutionHandle,
-            _input: WorkerInput,
+            input: WorkerInput,
         ) -> WorkerExecutionResult {
+            self.dispatched_inputs.lock().unwrap().push(input);
             self.dispatch_result
                 .lock()
                 .unwrap()
@@ -3376,6 +3424,36 @@ mod tests {
         assert_eq!(
             runtime.worker_detail(&detail.worker_ref).unwrap().status,
             WorkerStatus::Idle
+        );
+    }
+
+    #[test]
+    fn send_input_dispatches_segment_only_flow_submission() {
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime = Runtime::with_execution_backend(
+            RuntimeOptions {
+                ..RuntimeOptions::default()
+            },
+            backend.clone(),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let detail = runtime.create_worker(task_request("flow segment")).unwrap();
+        let input = WorkerInput {
+            kind: WorkerInputKind::User,
+            content: String::new(),
+            segments: Some(vec![protocol::Segment::Flow {
+                selector: "builtin:coder-review".to_string(),
+            }]),
+        };
+
+        runtime
+            .send_input(&detail.worker_ref, input.clone())
+            .unwrap();
+
+        assert_eq!(
+            backend.dispatched_inputs.lock().unwrap().as_slice(),
+            &[input]
         );
     }
 

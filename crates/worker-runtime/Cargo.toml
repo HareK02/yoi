@@ -28,6 +28,7 @@ base64.workspace = true
 axum = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 decodal.workspace = true
+flow = { path = "../flow" }
 manifest.workspace = true
 protocol.workspace = true
 serde = { workspace = true, features = ["derive"] }

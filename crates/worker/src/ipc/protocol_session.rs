@@ -84,6 +84,7 @@ mod tests {
         let segments = vec![protocol::Segment::text("hello from log")];
         let event = live_log_entry_event(LogEntry::UserInput {
             ts: session_store::segment_log::now_millis(),
+            extensions: vec![],
             segments: segments.clone(),
         })
         .expect("UserInput must be live-relevant");

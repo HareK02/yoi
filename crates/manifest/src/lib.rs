@@ -113,6 +113,8 @@ pub struct FeatureConfig {
     #[serde(default)]
     pub sub_worker: FeatureFlagConfig,
     #[serde(default)]
+    pub flow: FeatureFlagConfig,
+    #[serde(default)]
     pub worker: FeatureFlagConfig,
     #[serde(default)]
     pub objective: FeatureFlagConfig,
@@ -131,6 +133,7 @@ impl Default for FeatureConfig {
             memory: MemoryFeatureConfig::disabled(),
             web: FeatureFlagConfig::disabled(),
             sub_worker: FeatureFlagConfig::disabled(),
+            flow: FeatureFlagConfig::disabled(),
             worker: FeatureFlagConfig::disabled(),
             objective: FeatureFlagConfig::disabled(),
             manage_workdir: FeatureFlagConfig::disabled(),

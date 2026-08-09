@@ -31,6 +31,21 @@ use crate::system_item::SystemItem;
 /// - `RunCompleted` / `RunErrored` — marks end of a `run()` or `resume()` call
 /// - `PausedTurnAbandoned` — explicit abandon/cancel of a paused interrupted turn
 /// - `ConfigChanged` — `RequestConfig` mutation
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionExtension {
+    pub domain: String,
+    pub payload: serde_json::Value,
+}
+
+impl SessionExtension {
+    pub fn new(domain: impl Into<String>, payload: serde_json::Value) -> Self {
+        Self {
+            domain: domain.into(),
+            payload,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LogEntry {
@@ -80,7 +95,15 @@ pub enum LogEntry {
     /// file refs) on segment restore.
     /// Replay flattens these into a `Item::user_message` for the worker
     /// history; the worker layer never sees segments directly.
-    UserInput { ts: u64, segments: Vec<Segment> },
+    UserInput {
+        ts: u64,
+        segments: Vec<Segment>,
+        /// Typed durable state committed atomically with this input record.
+        /// Runtime-owned Flow invocation uses this to avoid a Backend-instance
+        /// commit that can get ahead of Worker history.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        extensions: Vec<SessionExtension>,
+    },
 
     /// One assistant-side item appended to history — assistant message,
     /// reasoning, or tool call. Singular: one entry per history item so
@@ -243,10 +266,19 @@ pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
                 // log ends first, restore must treat the turn as interrupted.
                 state.last_run_interrupted = true;
             }
-            LogEntry::UserInput { segments, .. } => {
+            LogEntry::UserInput {
+                segments,
+                extensions,
+                ..
+            } => {
                 let text = Segment::flatten_to_text(segments);
                 state.history.push(Item::user_message(text));
                 state.user_segments.push(segments.clone());
+                state.extensions.extend(
+                    extensions
+                        .iter()
+                        .map(|extension| (extension.domain.clone(), extension.payload.clone())),
+                );
             }
             LogEntry::AssistantItem { item, .. } => {
                 state.history.push(Item::from(item.clone()));
@@ -350,6 +382,7 @@ mod tests {
             },
             LogEntry::UserInput {
                 ts: 2000,
+                extensions: vec![],
                 segments: vec![Segment::text("Hello")],
             },
             LogEntry::AssistantItem {
@@ -389,6 +422,7 @@ mod tests {
             },
             LogEntry::UserInput {
                 ts: 2001,
+                extensions: vec![],
                 segments: vec![Segment::text("run a tool")],
             },
             LogEntry::AssistantItem {
@@ -414,6 +448,7 @@ mod tests {
             },
             LogEntry::UserInput {
                 ts: 2000,
+                extensions: vec![],
                 segments: vec![Segment::text("Check weather")],
             },
             LogEntry::AssistantItem {
@@ -472,6 +507,7 @@ mod tests {
             },
             LogEntry::UserInput {
                 ts: 2000,
+                extensions: vec![],
                 segments: vec![Segment::text("hi")],
             },
             LogEntry::LlmUsage {
@@ -519,6 +555,7 @@ mod tests {
             },
             LogEntry::UserInput {
                 ts: 2000,
+                extensions: vec![],
                 segments: vec![Segment::text("hi")],
             },
         ]);
@@ -595,6 +632,7 @@ mod tests {
             },
             LogEntry::UserInput {
                 ts: 101,
+                extensions: vec![],
                 segments: vec![Segment::text("hi")],
             },
             LogEntry::TurnEnd {
@@ -705,6 +743,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn user_input_extensions_restore_with_the_same_committed_input() {
+        let segments = vec![Segment::text("Flow instructions"), Segment::text("Ticket")];
+        let entry = LogEntry::UserInput {
+            ts: 9999,
+            segments: segments.clone(),
+            extensions: vec![SessionExtension::new(
+                "flow.runtime.v1",
+                serde_json::json!({ "state": "implement", "revision": 0 }),
+            )],
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let decoded: LogEntry = serde_json::from_str(&json).unwrap();
+        let state = collect_state(&[decoded]);
+        assert_eq!(state.user_segments, vec![segments]);
+        assert_eq!(state.extensions.len(), 1);
+        assert_eq!(state.extensions[0].0, "flow.runtime.v1");
+        assert_eq!(state.extensions[0].1["state"], "implement");
+    }
+
     /// Mixed segments survive a JSON round-trip through `LogEntry::UserInput`,
     /// and `collect_state` derives `Item::user_message` from the flattened
     /// text while preserving the original segments separately. This covers
@@ -727,6 +785,7 @@ mod tests {
         ];
         let entry = LogEntry::UserInput {
             ts: 4242,
+            extensions: vec![],
             segments: segments.clone(),
         };
         // JSON round-trip preserves the variant byte-for-byte.

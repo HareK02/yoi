@@ -13,7 +13,8 @@ use llm_engine::llm_client::types::Role;
 use llm_engine::state::Mutable;
 use llm_engine::{Engine, EngineError, EngineResult, ToolOutputLimits, UsageRecord};
 use session_store::{
-    LogEntry, SegmentId, SessionId, Store, StoreError, SystemItem, segment_log, to_logged,
+    LogEntry, SegmentId, SessionExtension, SessionId, Store, StoreError, SystemItem, segment_log,
+    to_logged,
 };
 use session_store::{
     WorkerActiveSegmentRef, WorkerMetadata, WorkerMetadataStore, WorkerReclaimedChild,
@@ -80,7 +81,9 @@ use protocol::{
 use tokio::net::UnixStream;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
-use workdir::{LocalWorkdirSession, WorkdirSessionCapabilities, WorkdirSessionHandle};
+use workdir::{
+    LocalWorkdirSession, ReadOnlyWorkdirSession, WorkdirSessionCapabilities, WorkdirSessionHandle,
+};
 
 const RESTORE_RECONCILIATION_REACHABILITY_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -545,6 +548,7 @@ struct EmptyTurnRollbackSnapshot {
     usage_history_len: usize,
     ai_activity_count: usize,
     last_run_interrupted: bool,
+    flow_runtime_state: Option<flow::FlowRuntimeState>,
 }
 
 fn is_ai_materialized_item(item: &Item) -> bool {
@@ -624,6 +628,28 @@ where
     }
 }
 
+struct SessionFlowRuntimeStateCommitter<St: Store + Clone> {
+    writer: LogWriterHandle<St>,
+}
+
+impl<St> crate::feature::builtin::flow_transition::FlowRuntimeStateCommitter
+    for SessionFlowRuntimeStateCommitter<St>
+where
+    St: Store + Clone + Send + Sync + 'static,
+{
+    fn commit(&self, state: &flow::FlowRuntimeState) -> Result<(), String> {
+        let payload = serde_json::to_value(state)
+            .map_err(|error| format!("serialize Flow runtime state: {error}"))?;
+        self.writer
+            .append_entry(LogEntry::Extension {
+                ts: segment_log::now_millis(),
+                domain: FLOW_RUNTIME_EXTENSION_DOMAIN.to_string(),
+                payload,
+            })
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// An independent agent execution unit.
 ///
 /// Holds a [`Engine`] directly and persists session state via
@@ -650,6 +676,10 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// Path-free workspace identity/client context injected by Runtime/host.
     /// This never grants local filesystem authority.
     workspace_context: WorkerWorkspaceContext,
+    /// Runtime-owned durable Flow state reconstructed from Worker session
+    /// extensions on restore.
+    flow_runtime_state: Arc<Mutex<Option<flow::FlowRuntimeState>>>,
+    flow_feature_enabled: bool,
     /// Shared, atomically-swappable view of the Worker's resolved scope.
     /// Cloned into local WorkdirSession providers used by builtin tools, fs_view,
     /// and compaction so updates propagate at the next permission check.
@@ -833,6 +863,8 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
             filesystem_authority: self.filesystem_authority.clone(),
             workdir_session: self.workdir_session.clone(),
             workspace_context: self.workspace_context.clone(),
+            flow_runtime_state: self.flow_runtime_state.clone(),
+            flow_feature_enabled: self.flow_feature_enabled,
             scope: self.scope.clone(),
             delegation_scope: self.delegation_scope.clone(),
             hook_builder: HookRegistryBuilder::new(),
@@ -1031,6 +1063,8 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             filesystem_authority,
             workdir_session,
             workspace_context,
+            flow_runtime_state: Arc::new(Mutex::new(None)),
+            flow_feature_enabled: false,
             scope,
             delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
@@ -1315,6 +1349,81 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             self.register_feature_instruction(instruction);
         }
         report
+    }
+
+    /// Install the Flow transition feature against this Worker's Runtime-owned
+    /// durable Flow state. Workspace authority is used only when resolving a
+    /// new immutable source snapshot during Submit.
+    pub fn install_runtime_flow_transition_feature(
+        &mut self,
+    ) -> Result<FeatureRegistryInstallReport, String>
+    where
+        C: Clone + Send + Sync + 'static,
+        St: Clone + Send + Sync + 'static,
+    {
+        self.flow_feature_enabled = true;
+        let writer = LogWriterHandle {
+            store: self.store.clone(),
+            state: self.segment_state.clone(),
+            sink: self.sink.clone(),
+            in_flight: self.in_flight.clone(),
+        };
+        let coordinator = Arc::new(
+            crate::feature::builtin::flow_transition::RuntimeFlowCoordinatorClient::new(
+                self.flow_runtime_state.clone(),
+                Arc::new(SessionFlowRuntimeStateCommitter { writer }),
+            ),
+        );
+        Ok(self.install_flow_transition_feature(coordinator))
+    }
+
+    /// Install the Flow transition tool for a host-authorized active Flow instance.
+    ///
+    /// The coordinator is already bound to the authenticated Workspace/Worker;
+    /// model input cannot select an instance or Worker identity. The verifier uses
+    /// an immutable capture of the current committed segment and, for local
+    /// Workdirs, exposes only Read/Glob/Grep through a read-only session.
+    pub fn install_flow_transition_feature(
+        &mut self,
+        coordinator: Arc<dyn crate::feature::builtin::flow_transition::FlowCoordinatorClient>,
+    ) -> FeatureRegistryInstallReport
+    where
+        C: Clone + Send + Sync + 'static,
+        St: Clone + Send + Sync + 'static,
+    {
+        let location = self.segment_state.location();
+        let capture = crate::feature::builtin::flow_transition::StoreFlowParentCapture::new(
+            self.store.clone(),
+            location.session_id,
+            location.segment_id,
+        );
+        let read_only_tools = self
+            .workdir_session
+            .clone()
+            .map(|source| Arc::new(ReadOnlyWorkdirSession::new(source)) as WorkdirSessionHandle)
+            .map(tools::read_only_builtin_tools)
+            .unwrap_or_default();
+        let client = self
+            .engine
+            .as_ref()
+            .expect("worker taken during run")
+            .client()
+            .clone();
+        let verifier = Arc::new(
+            crate::feature::builtin::flow_transition::WorkerBackedFlowVerifier::new(
+                client,
+                self.manifest.clone(),
+                capture,
+                read_only_tools,
+            ),
+        );
+        let state = crate::feature::builtin::flow_transition::FlowTransitionState::new(
+            coordinator,
+            verifier,
+        );
+        self.install_features(FeatureRegistryBuilder::new().with_module(
+            crate::feature::builtin::flow_transition::FlowTransitionFeature::new(state),
+        ))
     }
 
     /// Reference to the store.
@@ -1910,6 +2019,11 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             usage_history_len,
             ai_activity_count: self.ai_activity_counter.load(Ordering::SeqCst),
             last_run_interrupted: self.engine().last_run_interrupted(),
+            flow_runtime_state: self
+                .flow_runtime_state
+                .lock()
+                .expect("flow_runtime_state poisoned")
+                .clone(),
         }
     }
 
@@ -1936,6 +2050,10 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         self.engine_mut().truncate_history(snapshot.history_len);
         self.engine_mut()
             .set_last_run_interrupted(snapshot.last_run_interrupted);
+        *self
+            .flow_runtime_state
+            .lock()
+            .expect("flow_runtime_state poisoned") = snapshot.flow_runtime_state;
         self.user_segments.truncate(snapshot.user_segments_len);
         *self
             .pending_attachments
@@ -1956,6 +2074,102 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         Ok(())
     }
 
+    fn prepare_flow_input(
+        &self,
+        input: Vec<Segment>,
+    ) -> Result<(Vec<Segment>, Option<flow::FlowRuntimeState>), WorkerError> {
+        let flow_segments = input
+            .iter()
+            .filter_map(|segment| match segment {
+                Segment::Flow { selector } => Some(selector.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if flow_segments.is_empty() {
+            return Ok((input, None));
+        }
+        if flow_segments.len() != 1 {
+            return Err(WorkerError::FlowInput(
+                "one Submit may contain at most one Flow segment".to_string(),
+            ));
+        }
+        if !self.flow_feature_enabled {
+            return Err(WorkerError::FlowInput(
+                "resolved Profile does not enable feature.flow".to_string(),
+            ));
+        }
+        if self
+            .flow_runtime_state
+            .lock()
+            .expect("flow_runtime_state poisoned")
+            .as_ref()
+            .is_some_and(|state| state.instance.status == flow::FlowInstanceStatus::Active)
+        {
+            return Err(WorkerError::FlowInput(
+                "Worker already has an active Flow instance".to_string(),
+            ));
+        }
+
+        let selector = flow_segments[0]
+            .parse::<flow::FlowSelector>()
+            .map_err(|error| WorkerError::FlowInput(error.to_string()))?;
+        let workspace = self.workspace_context.client_handle();
+        if !workspace.is_available() {
+            return Err(WorkerError::FlowInput(
+                "Workspace client is unavailable".to_string(),
+            ));
+        }
+        let workspace_id = workspace
+            .workspace_id()
+            .filter(|workspace_id| !workspace_id.trim().is_empty())
+            .ok_or_else(|| {
+                WorkerError::FlowInput("Workspace client has no Workspace scope".to_string())
+            })?;
+        let request = flow::FlowSourceResolveRequest {
+            selector: selector.clone(),
+        };
+        let response = workspace
+            .execute(WorkspaceRequest {
+                method: WorkspaceRequestMethod::Post,
+                path: format!("/api/w/{workspace_id}/flows/resolve"),
+                body: Some(serde_json::to_string(&request).map_err(|error| {
+                    WorkerError::FlowInput(format!("serialize Flow source request: {error}"))
+                })?),
+            })
+            .map_err(|error| WorkerError::FlowInput(error.to_string()))?;
+        if !(200..300).contains(&response.status) {
+            let message = serde_json::from_str::<serde_json::Value>(&response.body)
+                .ok()
+                .and_then(|body| {
+                    body.get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .unwrap_or_else(|| "Workspace rejected Flow source resolution".to_string());
+            return Err(WorkerError::FlowInput(message));
+        }
+        let source: flow::ResolvedFlowSource = serde_json::from_str(&response.body)
+            .map_err(|error| WorkerError::FlowInput(format!("decode Flow source: {error}")))?;
+        if source.workspace_id != workspace_id || source.selector != selector {
+            return Err(WorkerError::FlowInput(
+                "Workspace returned a Flow source outside the requested scope".to_string(),
+            ));
+        }
+        let (state, initial_instructions) =
+            flow::FlowRuntimeState::start(&source, uuid::Uuid::now_v7().to_string())
+                .map_err(|error| WorkerError::FlowInput(error.to_string()))?;
+        let input = input
+            .into_iter()
+            .map(|segment| match segment {
+                Segment::Flow { .. } => Segment::Text {
+                    content: initial_instructions.clone(),
+                },
+                other => other,
+            })
+            .collect();
+        Ok((input, Some(state)))
+    }
+
     /// Send user input and run until the LLM turn completes.
     ///
     /// `input` is a typed segment list (see [`protocol::Segment`]). The
@@ -1968,6 +2182,20 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// the Engine is aborted, history is compacted, and execution resumes
     /// automatically.
     pub async fn run(&mut self, input: Vec<Segment>) -> Result<WorkerRunResult, WorkerError> {
+        let (input, pending_flow_state) = self.prepare_flow_input(input)?;
+        let input_extensions = pending_flow_state
+            .as_ref()
+            .map(|state| {
+                serde_json::to_value(state)
+                    .map(|payload| SessionExtension::new(FLOW_RUNTIME_EXTENSION_DOMAIN, payload))
+                    .map_err(|error| {
+                        WorkerError::FlowInput(format!("serialize Flow runtime state: {error}"))
+                    })
+            })
+            .transpose()?
+            .into_iter()
+            .collect();
+
         // Paused→Run transition: if the previous turn was cut short,
         // any `Item::ToolCall` whose tool never produced a matching
         // `ToolResult` is closed with a synthetic one, and a short
@@ -1998,7 +2226,14 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         self.commit_entry(LogEntry::UserInput {
             ts: segment_log::now_millis(),
             segments: input.clone(),
+            extensions: input_extensions,
         })?;
+        if let Some(state) = pending_flow_state {
+            *self
+                .flow_runtime_state
+                .lock()
+                .expect("flow_runtime_state poisoned") = Some(state);
+        }
         self.user_segments.push(input.clone());
 
         // Resolve `@<path>` file refs to system messages stashed for the
@@ -2150,6 +2385,15 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         for seg in segments {
             match seg {
                 Segment::Text { .. } | Segment::Paste { .. } | Segment::FileRef { .. } => {}
+                Segment::Flow { selector } => {
+                    self.alert(
+                        AlertLevel::Error,
+                        AlertSource::Worker,
+                        format!(
+                            "received unresolved Flow invocation {selector:?}; Runtime must resolve Flow segments through Workspace authority before Worker input"
+                        ),
+                    );
+                }
                 Segment::Unknown => {
                     self.alert(
                         AlertLevel::Warn,
@@ -3043,7 +3287,23 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 at_turn_index: source_turn_count,
             }),
         };
-        let initial_entries = vec![entry.clone()];
+        let mut initial_entries = vec![entry.clone()];
+        if let Some(flow_state) = self
+            .flow_runtime_state
+            .lock()
+            .expect("flow_runtime_state poisoned")
+            .as_ref()
+        {
+            initial_entries.push(LogEntry::Extension {
+                ts: segment_log::now_millis(),
+                domain: FLOW_RUNTIME_EXTENSION_DOMAIN.to_string(),
+                payload: serde_json::to_value(flow_state).map_err(|error| {
+                    WorkerError::InvalidState(format!(
+                        "serialize Flow runtime state during compaction: {error}"
+                    ))
+                })?,
+            });
+        }
         self.store
             .create_segment(old_loc.session_id, new_segment_id, &initial_entries)?;
         self.segment_state.set_location(SegmentLocation {
@@ -3052,12 +3312,10 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         });
         self.segment_state
             .set_entries_written(initial_entries.len());
-        let session_start = entry;
-        // Broadcast the SegmentStart through the sink. This atomically
-        // resets the mirror to the replacement segment prefix so any subscriber
-        // querying after this point sees the post-compaction prefix, including
-        // durable extension state.
-        self.sink.reset_with_initial_entries(vec![session_start]);
+        // Broadcast the complete compacted prefix. Runtime-owned extensions
+        // must remain visible and restorable with the replacement segment.
+        self.sink
+            .reset_with_initial_entries(initial_entries.clone());
         // Keep workers.json pointing at the live segment_id. Without this
         // a concurrent `restore_from_manifest(new_segment_id)` would
         // see no live writer and grab the session this Worker just moved
@@ -3941,6 +4199,8 @@ where
             filesystem_authority: common.filesystem_authority,
             workdir_session,
             workspace_context: common.workspace_context,
+            flow_runtime_state: Arc::new(Mutex::new(None)),
+            flow_feature_enabled: false,
             scope,
             delegation_scope: common.delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
@@ -4016,6 +4276,8 @@ where
             filesystem_authority: common.filesystem_authority,
             workdir_session,
             workspace_context: common.workspace_context,
+            flow_runtime_state: Arc::new(Mutex::new(None)),
+            flow_feature_enabled: false,
             scope,
             delegation_scope: common.delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
@@ -4125,6 +4387,8 @@ where
             filesystem_authority: common.filesystem_authority,
             workdir_session,
             workspace_context: common.workspace_context,
+            flow_runtime_state: Arc::new(Mutex::new(None)),
+            flow_feature_enabled: false,
             scope,
             delegation_scope: common.delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
@@ -4418,6 +4682,10 @@ where
             filesystem_authority: common.filesystem_authority,
             workdir_session,
             workspace_context: common.workspace_context,
+            flow_runtime_state: Arc::new(Mutex::new(restored_flow_runtime_state(
+                &state.extensions,
+            )?)),
+            flow_feature_enabled: false,
             scope,
             delegation_scope: common.delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
@@ -4896,7 +5164,7 @@ fn build_rewind_targets(segment_id: uuid::Uuid, entries: &[LogEntry]) -> Vec<Rew
     let mut turn_index = 0usize;
     let mut targets = Vec::new();
     for (entry_index, entry) in entries.iter().enumerate() {
-        if let LogEntry::UserInput { segments, ts } = entry {
+        if let LogEntry::UserInput { segments, ts, .. } = entry {
             turn_index += 1;
             let truncate_entries = rewind_truncate_entries(entries, entry_index);
             let tool_warning = suffix_has_tool_side_effects(&entries[truncate_entries..]);
@@ -4960,6 +5228,11 @@ fn preview_segments(segments: &[Segment]) -> String {
                 preview.push('@');
                 preview.push_str(path);
             }
+            Segment::Flow { selector } => {
+                preview.push_str("[Flow: ");
+                preview.push_str(selector);
+                preview.push(']');
+            }
             Segment::Unknown => preview.push_str("[unknown input segment]"),
         }
     }
@@ -4972,8 +5245,31 @@ fn preview_segments(segments: &[Segment]) -> String {
     out
 }
 
+const FLOW_RUNTIME_EXTENSION_DOMAIN: &str = "flow.runtime.v1";
+
+fn restored_flow_runtime_state(
+    extensions: &[(String, serde_json::Value)],
+) -> Result<Option<flow::FlowRuntimeState>, WorkerError> {
+    extensions
+        .iter()
+        .rev()
+        .find(|(domain, _)| domain == FLOW_RUNTIME_EXTENSION_DOMAIN)
+        .map(|(_, payload)| {
+            serde_json::from_value(payload.clone()).map_err(|error| {
+                WorkerError::InvalidState(format!("invalid persisted Flow runtime state: {error}"))
+            })
+        })
+        .transpose()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
+    #[error("invalid durable Worker state: {0}")]
+    InvalidState(String),
+
+    #[error("Flow input rejected: {0}")]
+    FlowInput(String),
+
     #[error(transparent)]
     Engine(#[from] EngineError),
 
@@ -5892,6 +6188,64 @@ mod build_summary_prompt_tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct FlowSourceWorkspaceClient {
+        requests: Mutex<Vec<WorkspaceRequest>>,
+    }
+
+    impl WorkspaceClient for FlowSourceWorkspaceClient {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("workspace-test")
+        }
+
+        fn kind(&self) -> &str {
+            "flow-source-test"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn execute(
+            &self,
+            request: WorkspaceRequest,
+        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            self.requests
+                .lock()
+                .expect("Flow source request lock")
+                .push(request);
+            let definition = flow::compile_flow_source(
+                r#"{
+                    schema_version = 1;
+                    name = "coder-review";
+                    initial = "implement";
+                    states = {
+                        implement = {
+                            instructions = "Implement the Ticket and request review.";
+                            transitions = {
+                                done = { target = "done"; condition = "The work is approved."; };
+                            };
+                        };
+                        done = { instructions = "Complete."; terminal = true; };
+                    };
+                }"#,
+            )
+            .unwrap();
+            let source = flow::ResolvedFlowSource {
+                selector: "builtin:coder-review".parse().unwrap(),
+                workspace_id: "workspace-test".to_string(),
+                flow_id: "flow-source-1".to_string(),
+                revision: 3,
+                content_digest: definition.content_digest.clone(),
+                definition,
+            };
+            Ok(WorkspaceResponse {
+                status: 200,
+                body: serde_json::to_string(&source).unwrap(),
+            })
+        }
+    }
+
     #[derive(Clone)]
     struct NoopClient;
 
@@ -5925,6 +6279,154 @@ mod build_summary_prompt_tests {
         Segment::Text {
             content: text.into(),
         }
+    }
+
+    #[tokio::test]
+    async fn flow_transition_feature_installs_runtime_local_coordinator() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let workspace_client = Arc::new(RecordingAuditWorkspaceClient::default());
+        let mut worker = Worker::new(
+            minimal_manifest(),
+            Engine::new(NoopClient),
+            store,
+            WorkerWorkspaceContext::with_client(
+                Some(WorkspaceId::new("workspace-test").unwrap()),
+                workspace_client,
+            ),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        worker.ensure_segment_head().unwrap();
+        let report = worker
+            .install_runtime_flow_transition_feature()
+            .expect("scoped Workspace Flow feature");
+        assert_eq!(report.reports.len(), 1);
+        assert!(report.reports[0].installed);
+        assert_eq!(
+            report.reports[0]
+                .installed_tools
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["RequestFlowTransition"]
+        );
+    }
+
+    #[tokio::test]
+    async fn flow_submit_persists_runtime_state_atomically_with_worker_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let workspace_client = Arc::new(FlowSourceWorkspaceClient::default());
+        let mut worker = Worker::new(
+            minimal_manifest(),
+            Engine::new(NoopClient),
+            store.clone(),
+            WorkerWorkspaceContext::with_client(
+                Some(WorkspaceId::new("workspace-test").unwrap()),
+                workspace_client.clone(),
+            ),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        worker.ensure_segment_head().unwrap();
+        let disabled = worker.prepare_flow_input(vec![Segment::Flow {
+            selector: "builtin:coder-review".to_string(),
+        }]);
+        assert!(
+            matches!(disabled, Err(WorkerError::FlowInput(message)) if message.contains("feature.flow"))
+        );
+        worker.install_runtime_flow_transition_feature().unwrap();
+        let multiple = worker.prepare_flow_input(vec![
+            Segment::Flow {
+                selector: "builtin:coder-review".to_string(),
+            },
+            Segment::Flow {
+                selector: "workspace:coder-review".to_string(),
+            },
+        ]);
+        assert!(
+            matches!(multiple, Err(WorkerError::FlowInput(message)) if message.contains("at most one"))
+        );
+        let invalid = worker.prepare_flow_input(vec![Segment::Flow {
+            selector: "coder-review".to_string(),
+        }]);
+        assert!(matches!(invalid, Err(WorkerError::FlowInput(_))));
+
+        let (segments, state) = worker
+            .prepare_flow_input(vec![
+                Segment::Flow {
+                    selector: "builtin:coder-review".to_string(),
+                },
+                Segment::text("Implement Ticket 00001"),
+            ])
+            .unwrap();
+        let state = state.expect("new Flow runtime state");
+        let extension = SessionExtension::new(
+            FLOW_RUNTIME_EXTENSION_DOMAIN,
+            serde_json::to_value(&state).unwrap(),
+        );
+        worker
+            .commit_entry(LogEntry::UserInput {
+                ts: segment_log::now_millis(),
+                segments: segments.clone(),
+                extensions: vec![extension],
+            })
+            .unwrap();
+        *worker
+            .flow_runtime_state
+            .lock()
+            .expect("flow runtime state lock") = Some(state.clone());
+
+        assert!(matches!(segments[0], Segment::Text { .. }));
+        assert_eq!(segments[1], Segment::text("Implement Ticket 00001"));
+        assert_eq!(state.instance.definition_revision, 3);
+        assert_eq!(state.instance.current_state.as_str(), "implement");
+        assert_eq!(workspace_client.requests.lock().unwrap().len(), 1);
+
+        let location = worker.segment_state.location();
+        let restored = session_store::collect_state(
+            &store
+                .read_all(location.session_id, location.segment_id)
+                .unwrap(),
+        );
+        let restored_flow = restored_flow_runtime_state(&restored.extensions)
+            .unwrap()
+            .expect("restored Flow state");
+        assert_eq!(restored_flow, state);
+        assert_eq!(restored.user_segments, vec![segments]);
+
+        let duplicate = worker.prepare_flow_input(vec![Segment::Flow {
+            selector: "builtin:coder-review".to_string(),
+        }]);
+        assert!(
+            matches!(duplicate, Err(WorkerError::FlowInput(message)) if message.contains("active Flow"))
+        );
+
+        let mut detached = Worker::new(
+            minimal_manifest(),
+            Engine::new(NoopClient),
+            session_store::FsStore::new(dir.path().join("detached-sessions")).unwrap(),
+            WorkerWorkspaceContext::unavailable(
+                Some(WorkspaceId::new("workspace-test").unwrap()),
+                "test unavailable",
+            ),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        detached.install_runtime_flow_transition_feature().unwrap();
+        let unavailable = detached.prepare_flow_input(vec![Segment::Flow {
+            selector: "builtin:coder-review".to_string(),
+        }]);
+        assert!(
+            matches!(unavailable, Err(WorkerError::FlowInput(message)) if message.contains("unavailable"))
+        );
     }
 
     async fn rewind_test_worker() -> (
@@ -5972,6 +6474,7 @@ mod build_summary_prompt_tests {
             worker,
             LogEntry::UserInput {
                 ts: ts + 1,
+                extensions: vec![],
                 segments: vec![text_segment(text)],
             },
         );
@@ -6603,6 +7106,7 @@ mod build_summary_prompt_tests {
         worker
             .commit_entry(LogEntry::UserInput {
                 ts: segment_log::now_millis(),
+                extensions: vec![],
                 segments: vec![text_segment(
                     "The cancellation regression must leave this evidence available for retry.",
                 )],

@@ -12,6 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use chrono::{Duration, SecondsFormat, Utc};
+use flow::{FlowSourceKind, FlowSourceResolveRequest, ResolvedFlowSource};
 use futures::{SinkExt, StreamExt};
 use memory::backend::{
     MemoryBackendHttpResponse, MemoryBackendOperation, MemoryConsolidateStagingOperation,
@@ -96,9 +97,9 @@ use crate::runtime_subscription::RuntimeSubscriptionBroker;
 use crate::skills;
 use crate::store::{
     AccountRecord, ApiTokenRecord, AuthChallengeRecord, BrowserSessionRecord, ControlPlaneStore,
-    DeviceLoginFlowRecord, PasskeyCredentialRecord, RepositoryRecord, TicketWorkerAssignmentRecord,
-    UserRecord, WorkdirRegistryRecord, WorkerRegistryRecord, WorkerWorkdirLinkRecord,
-    WorkspaceRecord,
+    DeviceLoginFlowRecord, FlowSourceRecord, PasskeyCredentialRecord, RepositoryRecord,
+    TicketWorkerAssignmentRecord, UserRecord, WorkdirRegistryRecord, WorkerRegistryRecord,
+    WorkerWorkdirLinkRecord, WorkspaceRecord,
 };
 use crate::{Error, Result};
 use worker_runtime::catalog::{
@@ -699,6 +700,18 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             get(scoped_get_profile_source)
                 .put(scoped_update_profile_source)
                 .delete(scoped_delete_profile_source),
+        )
+        .route(
+            "/api/w/{workspace_id}/flows",
+            get(scoped_list_flows).put(scoped_put_flow),
+        )
+        .route(
+            "/api/w/{workspace_id}/flows/resolve",
+            post(scoped_resolve_flow_source),
+        )
+        .route(
+            "/api/w/{workspace_id}/flows/{flow_id}",
+            get(scoped_get_flow),
         )
         .route("/api/tickets", get(list_tickets))
         .route(
@@ -1670,6 +1683,19 @@ struct ScopedWorkspacePath {
 }
 
 #[derive(Debug, Deserialize)]
+struct ScopedFlowPath {
+    workspace_id: String,
+    flow_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PutFlowRequest {
+    path: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AttachCurrentWorkerWorkdirRequest {
     workdir_id: String,
@@ -1751,6 +1777,107 @@ fn validate_workspace_scope(api: &WorkspaceApi, workspace_id: &str) -> ApiResult
     } else {
         Err(workspace_id_mismatch_error())
     }
+}
+
+async fn scoped_list_flows(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+) -> ApiResult<Json<Vec<FlowSourceRecord>>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    Ok(Json(api.store.list_flow_sources(&path.workspace_id)?))
+}
+
+async fn scoped_put_flow(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Json(request): Json<PutFlowRequest>,
+) -> ApiResult<Json<FlowSourceRecord>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let definition = flow::compile_flow_source(&request.content).map_err(|error| {
+        Error::InvalidInput(format!(
+            "invalid Flow source: {}",
+            serde_json::to_string(&error.diagnostics)
+                .unwrap_or_else(|_| "diagnostics unavailable".to_string())
+        ))
+    })?;
+    let expected_path = format!("flows/{}.dcdl", definition.name);
+    if request.path != expected_path {
+        return Err(
+            Error::InvalidInput(format!("Flow source path must be `{expected_path}`")).into(),
+        );
+    }
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    Ok(Json(api.store.put_flow_source_for_kind(
+        &path.workspace_id,
+        FlowSourceKind::Workspace,
+        &request.path,
+        &request.content,
+        &now,
+    )?))
+}
+
+async fn scoped_resolve_flow_source(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Json(request): Json<FlowSourceResolveRequest>,
+) -> ApiResult<Json<ResolvedFlowSource>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let resolved = match &request.selector {
+        flow::FlowSelector::Builtin { slug } => {
+            let builtin = flow::builtin_flow_source(slug)
+                .ok_or_else(|| Error::InvalidRecordId(request.selector.to_string()))?;
+            let definition = builtin.compile().map_err(|error| {
+                Error::Store(format!(
+                    "compile built-in Flow {slug:?}: {:?}",
+                    error.diagnostics
+                ))
+            })?;
+            ResolvedFlowSource {
+                selector: request.selector.clone(),
+                workspace_id: path.workspace_id,
+                flow_id: format!("builtin:{slug}"),
+                revision: builtin.revision,
+                content_digest: definition.content_digest.clone(),
+                definition,
+            }
+        }
+        flow::FlowSelector::Workspace { slug } => {
+            let source = api
+                .store
+                .get_flow_source_by_name(&path.workspace_id, FlowSourceKind::Workspace, slug)?
+                .ok_or_else(|| Error::InvalidRecordId(request.selector.to_string()))?;
+            let revision = api
+                .store
+                .get_flow_source_revision(&path.workspace_id, &source.flow_id, source.revision)?
+                .ok_or_else(|| {
+                    Error::Store(format!(
+                        "resolved Flow revision {}@{} is missing",
+                        source.flow_id, source.revision
+                    ))
+                })?;
+            ResolvedFlowSource {
+                selector: request.selector.clone(),
+                workspace_id: path.workspace_id,
+                flow_id: source.flow_id,
+                revision: source.revision,
+                content_digest: revision.content_digest,
+                definition: revision.definition,
+            }
+        }
+    };
+    Ok(Json(resolved))
+}
+
+async fn scoped_get_flow(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedFlowPath>,
+) -> ApiResult<Json<FlowSourceRecord>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let source = api
+        .store
+        .get_flow_source(&path.workspace_id, &path.flow_id)?
+        .ok_or_else(|| Error::InvalidRecordId(path.flow_id))?;
+    Ok(Json(source))
 }
 
 async fn scoped_get_workspace(
@@ -3157,7 +3284,7 @@ fn notify_ticket_recipients(
 
 fn authenticate_worker_mutation_source(
     api: &WorkspaceApi,
-    _workspace_id: &str,
+    workspace_id: &str,
     headers: &HeaderMap,
 ) -> Result<WorkerMutationSource> {
     let runtime_id = headers
@@ -3173,9 +3300,14 @@ fn authenticate_worker_mutation_source(
             Error::WorkerSourceIdentity("missing Runtime-bound Worker id".to_string())
         })?;
     let worker = RuntimeWorkerRef::new(runtime_id, worker_id);
-    api.runtime.worker(&worker).map_err(|_| {
+    let summary = api.runtime.worker(&worker).map_err(|_| {
         Error::WorkerSourceIdentity("Runtime-bound Worker identity does not exist".to_string())
     })?;
+    if summary.workspace.workspace_id.as_deref() != Some(workspace_id) {
+        return Err(Error::WorkerSourceIdentity(format!(
+            "Runtime-bound Worker is not scoped to Workspace {workspace_id}"
+        )));
+    }
     Ok(worker)
 }
 
@@ -6757,7 +6889,7 @@ async fn create_workspace_worker(
     } else {
         Some(EmbeddedWorkerInput {
             kind: EmbeddedWorkerInputKind::User,
-            content: initial_text,
+            content: initial_text.clone(),
             segments: None,
         })
     };
@@ -6776,8 +6908,9 @@ async fn create_workspace_worker(
     if resolved_working_directory.is_none() {
         reject_no_workdir_for_non_embedded_runtime(&request.runtime_id)?;
     }
+    let runtime_id = request.runtime_id.clone();
     let result = api.spawn_workspace_worker(
-        &request.runtime_id,
+        &runtime_id,
         WorkerSpawnRequest {
             requested_worker_name: Some(display_name.clone()),
             intent: WorkerSpawnIntent::WorkspaceCoding,
@@ -6798,7 +6931,7 @@ async fn create_workspace_worker(
     )?;
     Ok(Json(record_browser_worker_spawn(
         &api,
-        request.runtime_id,
+        runtime_id,
         display_name,
         selected_working_directory_id,
         result,
@@ -8949,6 +9082,7 @@ fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> WorkerSummary 
         workspace: WorkerWorkspaceSummary {
             visibility: "backend_registry".to_string(),
             identity: record.workspace_id.clone(),
+            workspace_id: Some(record.workspace_id.clone()),
         },
         profile: record.profile.clone(),
         implementation: WorkerImplementationSummary {
@@ -9729,7 +9863,7 @@ impl IntoResponse for ApiError {
             Error::TicketAssignmentConflict(_) | Error::WorkdirAttachmentConflict(_) => {
                 StatusCode::CONFLICT
             }
-            Error::WorkerSourceIdentity(_) => StatusCode::BAD_REQUEST,
+            Error::WorkerSourceIdentity(_) | Error::InvalidInput(_) => StatusCode::BAD_REQUEST,
             Error::InvalidRuntimeIdentifier { .. } | Error::ReservedWorkerName(_) => {
                 StatusCode::BAD_REQUEST
             }
@@ -10006,6 +10140,107 @@ mod tests {
         let serialized = serde_json::to_string(&projected).unwrap();
         assert!(!serialized.contains("/tmp/"));
         assert!(!serialized.contains("materialized_path"));
+    }
+
+    #[tokio::test]
+    async fn flow_source_resolution_returns_immutable_workspace_and_builtin_snapshots() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let source = r#"{
+            schema_version = 1;
+            name = "browser-flow";
+            initial = "work";
+            states = {
+                work = {
+                    instructions = "Implement and validate the requested change.";
+                    transitions = {
+                        done = { target = "done"; condition = "The work is complete."; };
+                    };
+                };
+                done = { instructions = ""; terminal = true; };
+            };
+        }"#;
+        let stored = api
+            .store
+            .put_flow_source_for_kind(
+                &api.config.workspace_id,
+                FlowSourceKind::Workspace,
+                "flows/browser-flow.dcdl",
+                source,
+                "2026-08-06T00:00:00Z",
+            )
+            .unwrap();
+
+        let Json(resolved) = scoped_resolve_flow_source(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: api.config.workspace_id.clone(),
+            }),
+            Json(FlowSourceResolveRequest {
+                selector: "workspace:browser-flow".parse().unwrap(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.flow_id, stored.flow_id);
+        assert_eq!(resolved.revision, stored.revision);
+        assert_eq!(resolved.content_digest, stored.content_digest);
+        assert_eq!(resolved.definition.name, "browser-flow");
+
+        let Json(builtin) = scoped_resolve_flow_source(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: api.config.workspace_id.clone(),
+            }),
+            Json(FlowSourceResolveRequest {
+                selector: "builtin:coder-review".parse().unwrap(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(builtin.definition.name, "coder-review");
+        assert_eq!(builtin.selector.to_string(), "builtin:coder-review");
+        assert_eq!(builtin.flow_id, "builtin:coder-review");
+        assert_eq!(builtin.revision, 1);
+        assert_eq!(
+            api.store
+                .list_flow_sources(&api.config.workspace_id)
+                .unwrap(),
+            vec![stored],
+            "built-in resolution must not mutate Workspace source authority",
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_source_auth_rejects_cross_workspace_mutation() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let Json(created) = create_workspace_worker(
+            State(api.clone()),
+            Json(BrowserCreateWorkerRequest {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                display_name: "Scoped Worker".to_string(),
+                profile: Some("builtin:coder".to_string()),
+                initial_text: String::new(),
+                working_directory: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-yoi-runtime-id",
+            axum::http::HeaderValue::from_str(&created.worker_ref.runtime_id).unwrap(),
+        );
+        headers.insert(
+            "x-yoi-worker-id",
+            axum::http::HeaderValue::from_str(&created.worker_ref.worker_id).unwrap(),
+        );
+        let error =
+            authenticate_worker_mutation_source(&api, "other-workspace", &headers).unwrap_err();
+        assert!(matches!(error, Error::WorkerSourceIdentity(_)));
     }
 
     #[tokio::test]
@@ -14373,6 +14608,81 @@ mod tests {
             }
         }
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn scoped_flow_source_route_persists_compiled_dcdl() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = test_app(temp.path()).await;
+        let workspace_id = test_identity().workspace_id;
+        let source = r#"{
+            schema_version = 1;
+            name = "route-flow";
+            initial = "work";
+            states = {
+                work = {
+                    instructions = "Do the work.";
+                    transitions = {
+                        done = {
+                            target = "done";
+                            condition = "The work is complete.";
+                        };
+                    };
+                };
+                done = { instructions = ""; terminal = true; };
+            };
+        }"#;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/api/w/{workspace_id}/flows"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "path": "flows/route-flow.dcdl",
+                            "content": source,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/w/{workspace_id}/flows"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/api/w/{workspace_id}/flows"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "path": "flows/broken.dcdl",
+                            "content": "{ schema_version = 1; }",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

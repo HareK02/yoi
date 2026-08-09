@@ -65,6 +65,8 @@ pub enum WorkerPrompt {
     MemoryExtractSystem,
     /// System prompt of the memory consolidation (integration + tidy) Engine.
     MemoryConsolidationSystem,
+    /// System prompt of the bounded Flow transition verifier.
+    FlowVerifierSystem,
     /// Wrapper around an incoming `Method::Notify` message injected into
     /// the next LLM request context as a transient system message.
     NotifyWrapper,
@@ -99,6 +101,7 @@ impl WorkerPrompt {
             Self::CompactSystem => "compact_system",
             Self::MemoryExtractSystem => "memory_extract_system",
             Self::MemoryConsolidationSystem => "memory_consolidation_system",
+            Self::FlowVerifierSystem => "flow_verifier_system",
             Self::NotifyWrapper => "notify_wrapper",
             Self::InterruptToolResultSummary => "interrupt_tool_result_summary",
             Self::InterruptSystemNote => "interrupt_system_note",
@@ -118,6 +121,7 @@ impl WorkerPrompt {
         WorkerPrompt::CompactSystem,
         WorkerPrompt::MemoryExtractSystem,
         WorkerPrompt::MemoryConsolidationSystem,
+        WorkerPrompt::FlowVerifierSystem,
         WorkerPrompt::NotifyWrapper,
         WorkerPrompt::InterruptToolResultSummary,
         WorkerPrompt::InterruptSystemNote,
@@ -133,6 +137,7 @@ impl WorkerPrompt {
         "compact_system",
         "memory_extract_system",
         "memory_consolidation_system",
+        "flow_verifier_system",
         "notify_wrapper",
         "interrupt_tool_result_summary",
         "interrupt_system_note",
@@ -340,6 +345,11 @@ impl PromptCatalog {
             WorkerPrompt::MemoryConsolidationSystem,
             single("language", language),
         )
+    }
+
+    /// Render `WorkerPrompt::FlowVerifierSystem` (no inputs).
+    pub fn flow_verifier_system(&self) -> Result<String, CatalogError> {
+        self.render(WorkerPrompt::FlowVerifierSystem, Value::UNDEFINED)
     }
 
     /// Render `WorkerPrompt::NotifyWrapper` with `{{ message }}`.

@@ -79,7 +79,7 @@ message: string,
  */
 timestamp_ms: number, };
 
-export type Segment = { "kind": "text", content: string, } | { "kind": "paste", id: number, chars: number, lines: number, content: string, } | { "kind": "file_ref", path: string, } | { "kind": "unknown" };
+export type Segment = { "kind": "text", content: string, } | { "kind": "paste", id: number, chars: number, lines: number, content: string, } | { "kind": "file_ref", path: string, } | { "kind": "flow", selector: string, } | { "kind": "unknown" };
 
 export type WorkerEvent = { "kind": "turn_ended", worker_name: string, } | { "kind": "errored", worker_name: string, message: string, } | { "kind": "shut_down", worker_name: string, } | { "kind": "scope_sub_delegated",
 /**

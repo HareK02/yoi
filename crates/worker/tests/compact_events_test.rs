@@ -310,6 +310,7 @@ permission = "write"
             &LogEntry::UserInput {
                 ts: 9999,
                 segments: vec![protocol::Segment::text("interloper")],
+                extensions: vec![],
             },
         )
         .unwrap();

@@ -85,6 +85,8 @@ pub struct FeatureConfigPartial {
     #[serde(default)]
     pub sub_worker: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
+    pub flow: Option<FeatureFlagConfigPartial>,
+    #[serde(default)]
     pub worker: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
     pub objective: Option<FeatureFlagConfigPartial>,
@@ -107,6 +109,7 @@ impl FeatureConfigPartial {
                 other.sub_worker,
                 FeatureFlagConfigPartial::merge,
             ),
+            flow: merge_option(self.flow, other.flow, FeatureFlagConfigPartial::merge),
             worker: merge_option(self.worker, other.worker, FeatureFlagConfigPartial::merge),
             objective: merge_option(
                 self.objective,
@@ -190,6 +193,7 @@ impl From<FeatureConfigPartial> for FeatureConfig {
                 .sub_worker
                 .map(FeatureFlagConfig::from)
                 .unwrap_or_default(),
+            flow: value.flow.map(FeatureFlagConfig::from).unwrap_or_default(),
             worker: value
                 .worker
                 .map(FeatureFlagConfig::from)
@@ -279,6 +283,7 @@ impl From<FeatureConfig> for FeatureConfigPartial {
             memory: Some(value.memory.into()),
             web: Some(value.web.into()),
             sub_worker: Some(value.sub_worker.into()),
+            flow: Some(value.flow.into()),
             worker: Some(value.worker.into()),
             objective: Some(value.objective.into()),
             manage_workdir: Some(value.manage_workdir.into()),

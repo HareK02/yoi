@@ -252,6 +252,7 @@ mod tests {
     fn user_input(text: &str) -> LogEntry {
         LogEntry::UserInput {
             ts: now_millis(),
+            extensions: vec![],
             segments: vec![protocol::Segment::Text {
                 content: text.to_owned(),
             }],

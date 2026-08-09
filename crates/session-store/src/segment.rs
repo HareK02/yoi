@@ -184,6 +184,18 @@ pub fn save_user_input(
     segment_id: SegmentId,
     segments: Vec<Segment>,
 ) -> Result<(), StoreError> {
+    save_user_input_with_extensions(store, session_id, segment_id, segments, Vec::new())
+}
+
+/// Atomically persist one typed user submission and Runtime-owned session
+/// extensions in the same log record.
+pub fn save_user_input_with_extensions(
+    store: &impl Store,
+    session_id: SessionId,
+    segment_id: SegmentId,
+    segments: Vec<Segment>,
+    extensions: Vec<segment_log::SessionExtension>,
+) -> Result<(), StoreError> {
     append_entry(
         store,
         session_id,
@@ -191,6 +203,7 @@ pub fn save_user_input(
         LogEntry::UserInput {
             ts: segment_log::now_millis(),
             segments,
+            extensions,
         },
     )
 }

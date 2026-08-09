@@ -3,8 +3,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use flow::{CompiledFlowDefinition, FlowSourceKind, compile_flow_source};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use worker_runtime::identity::RuntimeWorkerRef;
 
@@ -138,6 +140,16 @@ const MIGRATIONS: &[Migration] = &[
         version: 24,
         name: "create Worker Workdir attachment reservations",
         apply: create_worker_workdir_attachment_reservations,
+    },
+    Migration {
+        version: 25,
+        name: "create Flow source authority",
+        apply: create_flow_source_authority,
+    },
+    Migration {
+        version: 26,
+        name: "remove Backend-owned Flow runtime authority",
+        apply: remove_backend_flow_runtime_authority,
     },
 ];
 
@@ -408,6 +420,31 @@ pub struct MemoryStagingResolutionRecord {
     pub resolved_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FlowSourceRecord {
+    pub workspace_id: String,
+    pub flow_id: String,
+    pub source_kind: FlowSourceKind,
+    pub name: String,
+    pub path: String,
+    pub content: String,
+    pub content_digest: String,
+    pub revision: u64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FlowSourceRevisionRecord {
+    pub workspace_id: String,
+    pub flow_id: String,
+    pub revision: u64,
+    pub content: String,
+    pub content_digest: String,
+    pub definition: CompiledFlowDefinition,
+    pub created_at: String,
+}
+
 #[async_trait]
 pub trait ControlPlaneStore: Send + Sync {
     async fn schema_version(&self) -> Result<i64>;
@@ -416,6 +453,33 @@ pub trait ControlPlaneStore: Send + Sync {
     fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>>;
     fn upsert_repository(&self, record: &RepositoryRecord) -> Result<()>;
     fn list_repositories(&self, workspace_id: &str) -> Result<Vec<RepositoryRecord>>;
+
+    fn put_flow_source_for_kind(
+        &self,
+        workspace_id: &str,
+        source_kind: FlowSourceKind,
+        path: &str,
+        content: &str,
+        now: &str,
+    ) -> Result<FlowSourceRecord>;
+    fn get_flow_source_by_name(
+        &self,
+        workspace_id: &str,
+        source_kind: FlowSourceKind,
+        name: &str,
+    ) -> Result<Option<FlowSourceRecord>>;
+    fn list_flow_sources(&self, workspace_id: &str) -> Result<Vec<FlowSourceRecord>>;
+    fn get_flow_source(
+        &self,
+        workspace_id: &str,
+        flow_id: &str,
+    ) -> Result<Option<FlowSourceRecord>>;
+    fn get_flow_source_revision(
+        &self,
+        workspace_id: &str,
+        flow_id: &str,
+        revision: u64,
+    ) -> Result<Option<FlowSourceRevisionRecord>>;
 
     fn upsert_objective(&self, record: &ObjectiveRecord) -> Result<()>;
     fn list_objectives(&self, workspace_id: &str, limit: usize) -> Result<Vec<ObjectiveRecord>>;
@@ -863,6 +927,219 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let rows = stmt.query_map(params![workspace_id], read_repository_record)?;
             rows.collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(Error::from)
+        })
+    }
+
+    fn put_flow_source_for_kind(
+        &self,
+        workspace_id: &str,
+        source_kind: FlowSourceKind,
+        path: &str,
+        content: &str,
+        now: &str,
+    ) -> Result<FlowSourceRecord> {
+        if source_kind != FlowSourceKind::Workspace {
+            return Err(Error::Store(
+                "built-in Flow sources are resource authority and cannot be written to Workspace DB"
+                    .to_string(),
+            ));
+        }
+        let name = flow_source_name(path)?;
+        let definition = compile_flow_source(content).map_err(|error| {
+            Error::Store(format!(
+                "compile Flow source {path:?}: {:?}",
+                error.diagnostics
+            ))
+        })?;
+        if definition.name != name {
+            return Err(Error::Store(format!(
+                "Flow source name {:?} does not match path slug {name:?}",
+                definition.name
+            )));
+        }
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let existing = tx
+                .query_row(
+                    r#"SELECT workspace_id, flow_id, source_kind, name, path, content,
+                              content_digest, revision, created_at, updated_at
+                       FROM flow_sources
+                       WHERE workspace_id = ?1 AND source_kind = ?2 AND name = ?3"#,
+                    params![workspace_id, source_kind.as_str(), name],
+                    read_flow_source_record,
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                if existing.content_digest == definition.content_digest {
+                    tx.commit()?;
+                    return Ok(existing);
+                }
+                let revision = existing
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Store("Flow source revision overflowed".to_string()))?;
+                let definition_json = serde_json::to_string(&definition)
+                    .map_err(|error| Error::Store(error.to_string()))?;
+                tx.execute(
+                    r#"INSERT INTO flow_source_revisions (
+                           workspace_id, flow_id, revision, content, content_digest,
+                           definition_json, created_at
+                       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+                    params![
+                        workspace_id,
+                        existing.flow_id,
+                        revision,
+                        content,
+                        definition.content_digest,
+                        definition_json,
+                        now
+                    ],
+                )?;
+                tx.execute(
+                    r#"UPDATE flow_sources
+                       SET path = ?4, content = ?5, content_digest = ?6,
+                           revision = ?7, updated_at = ?8
+                       WHERE workspace_id = ?1 AND source_kind = ?2 AND name = ?3"#,
+                    params![
+                        workspace_id,
+                        source_kind.as_str(),
+                        name,
+                        path,
+                        content,
+                        definition.content_digest,
+                        revision,
+                        now
+                    ],
+                )?;
+                tx.commit()?;
+                return Ok(FlowSourceRecord {
+                    revision,
+                    path: path.to_string(),
+                    content: content.to_string(),
+                    content_digest: definition.content_digest,
+                    updated_at: now.to_string(),
+                    ..existing
+                });
+            }
+
+            let flow_id = Uuid::now_v7().to_string();
+            let definition_json = serde_json::to_string(&definition)
+                .map_err(|error| Error::Store(error.to_string()))?;
+            tx.execute(
+                r#"INSERT INTO flow_sources (
+                       workspace_id, flow_id, source_kind, name, path, content,
+                       content_digest, revision, created_at, updated_at
+                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?8)"#,
+                params![
+                    workspace_id,
+                    flow_id,
+                    source_kind.as_str(),
+                    name,
+                    path,
+                    content,
+                    definition.content_digest,
+                    now
+                ],
+            )?;
+            tx.execute(
+                r#"INSERT INTO flow_source_revisions (
+                       workspace_id, flow_id, revision, content, content_digest,
+                       definition_json, created_at
+                   ) VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6)"#,
+                params![
+                    workspace_id,
+                    flow_id,
+                    content,
+                    definition.content_digest,
+                    definition_json,
+                    now
+                ],
+            )?;
+            tx.commit()?;
+            Ok(FlowSourceRecord {
+                workspace_id: workspace_id.to_string(),
+                flow_id,
+                source_kind,
+                name,
+                path: path.to_string(),
+                content: content.to_string(),
+                content_digest: definition.content_digest,
+                revision: 1,
+                created_at: now.to_string(),
+                updated_at: now.to_string(),
+            })
+        })
+    }
+
+    fn get_flow_source_by_name(
+        &self,
+        workspace_id: &str,
+        source_kind: FlowSourceKind,
+        name: &str,
+    ) -> Result<Option<FlowSourceRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                r#"SELECT workspace_id, flow_id, source_kind, name, path, content,
+                          content_digest, revision, created_at, updated_at
+                   FROM flow_sources
+                   WHERE workspace_id = ?1 AND source_kind = ?2 AND name = ?3"#,
+                params![workspace_id, source_kind.as_str(), name],
+                read_flow_source_record,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn list_flow_sources(&self, workspace_id: &str) -> Result<Vec<FlowSourceRecord>> {
+        self.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                r#"SELECT workspace_id, flow_id, source_kind, name, path, content,
+                          content_digest, revision, created_at, updated_at
+                   FROM flow_sources WHERE workspace_id = ?1
+                   ORDER BY source_kind ASC, name ASC"#,
+            )?;
+            let rows = statement.query_map(params![workspace_id], read_flow_source_record)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
+        })
+    }
+
+    fn get_flow_source(
+        &self,
+        workspace_id: &str,
+        flow_id: &str,
+    ) -> Result<Option<FlowSourceRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                r#"SELECT workspace_id, flow_id, source_kind, name, path, content,
+                          content_digest, revision, created_at, updated_at
+                   FROM flow_sources WHERE workspace_id = ?1 AND flow_id = ?2"#,
+                params![workspace_id, flow_id],
+                read_flow_source_record,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn get_flow_source_revision(
+        &self,
+        workspace_id: &str,
+        flow_id: &str,
+        revision: u64,
+    ) -> Result<Option<FlowSourceRevisionRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                r#"SELECT workspace_id, flow_id, revision, content, content_digest,
+                          definition_json, created_at
+                   FROM flow_source_revisions
+                   WHERE workspace_id = ?1 AND flow_id = ?2 AND revision = ?3"#,
+                params![workspace_id, flow_id, revision],
+                read_flow_source_revision_record,
+            )
+            .optional()
+            .map_err(Error::from)
         })
     }
 
@@ -2660,6 +2937,79 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     }
 }
 
+fn flow_source_name(path: &str) -> Result<String> {
+    let file_name = path
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::Store("Flow source path has no file name".to_string()))?;
+    let name = file_name
+        .strip_suffix(".dcdl")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::Store("Flow source path must end in .dcdl".to_string()))?;
+    flow::FlowSelector::builtin(name)
+        .map_err(|error| Error::Store(format!("invalid Flow source slug: {error}")))?;
+    Ok(name.to_string())
+}
+
+fn read_flow_source_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<FlowSourceRecord> {
+    let source_kind = match row.get::<_, String>(2)?.as_str() {
+        "builtin" => FlowSourceKind::Builtin,
+        "workspace" => FlowSourceKind::Workspace,
+        other => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                format!("invalid Flow source kind {other:?}").into(),
+            ));
+        }
+    };
+    let revision = row.get::<_, i64>(7)?;
+    Ok(FlowSourceRecord {
+        workspace_id: row.get(0)?,
+        flow_id: row.get(1)?,
+        source_kind,
+        name: row.get(3)?,
+        path: row.get(4)?,
+        content: row.get(5)?,
+        content_digest: row.get(6)?,
+        revision: u64::try_from(revision).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                7,
+                rusqlite::types::Type::Integer,
+                Box::new(error),
+            )
+        })?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+    })
+}
+
+fn read_flow_source_revision_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<FlowSourceRevisionRecord> {
+    let revision = row.get::<_, i64>(2)?;
+    let definition_json = row.get::<_, String>(5)?;
+    let definition = serde_json::from_str(&definition_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(FlowSourceRevisionRecord {
+        workspace_id: row.get(0)?,
+        flow_id: row.get(1)?,
+        revision: u64::try_from(revision).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Integer,
+                Box::new(error),
+            )
+        })?,
+        content: row.get(3)?,
+        content_digest: row.get(4)?,
+        definition,
+        created_at: row.get(6)?,
+    })
+}
+
 fn read_workspace_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
     Ok(WorkspaceRecord {
         workspace_id: row.get(0)?,
@@ -3623,6 +3973,52 @@ CREATE TABLE IF NOT EXISTS __yoi_schema_migrations (
     Ok(())
 }
 
+fn create_flow_source_authority(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+CREATE TABLE flow_sources (
+    workspace_id TEXT NOT NULL,
+    flow_id TEXT NOT NULL,
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('builtin', 'workspace')),
+    name TEXT NOT NULL,
+    path TEXT NOT NULL,
+    content TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, flow_id),
+    UNIQUE (workspace_id, source_kind, name),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+);
+CREATE TABLE flow_source_revisions (
+    workspace_id TEXT NOT NULL,
+    flow_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    content TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    definition_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, flow_id, revision),
+    FOREIGN KEY (workspace_id, flow_id)
+        REFERENCES flow_sources(workspace_id, flow_id) ON DELETE CASCADE
+);
+"#,
+    )?;
+    Ok(())
+}
+
+fn remove_backend_flow_runtime_authority(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+DROP TABLE IF EXISTS flow_events;
+DROP TABLE IF EXISTS flow_transition_attempts;
+DROP TABLE IF EXISTS flow_instances;
+"#,
+    )?;
+    Ok(())
+}
+
 fn current_schema_version(conn: &Connection) -> Result<i64> {
     conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM __yoi_schema_migrations",
@@ -4182,8 +4578,45 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 24);
+        assert_eq!(current_schema_version(&conn).unwrap(), 26);
         assert!(table_exists(&conn, "worker_workdir_attachment_reservations").unwrap());
+    }
+
+    #[test]
+    fn schema_v26_removes_legacy_backend_flow_runtime_tables() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_sqlite(&conn).unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 25)
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            (migration.apply)(&tx).unwrap();
+            tx.execute(
+                "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+                params![migration.version, migration.name],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        conn.execute_batch(
+            r#"
+CREATE TABLE flow_instances (instance_id TEXT PRIMARY KEY);
+CREATE TABLE flow_transition_attempts (attempt_id TEXT PRIMARY KEY);
+CREATE TABLE flow_events (event_id TEXT PRIMARY KEY);
+"#,
+        )
+        .unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 25);
+
+        apply_migrations(&conn).unwrap();
+
+        assert_eq!(current_schema_version(&conn).unwrap(), 26);
+        assert!(table_exists(&conn, "flow_sources").unwrap());
+        assert!(table_exists(&conn, "flow_source_revisions").unwrap());
+        assert!(!table_exists(&conn, "flow_instances").unwrap());
+        assert!(!table_exists(&conn, "flow_transition_attempts").unwrap());
+        assert!(!table_exists(&conn, "flow_events").unwrap());
     }
 
     #[tokio::test]
@@ -4192,7 +4625,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 24);
+        assert_eq!(store.schema_version().await.unwrap(), 26);
         assert!(
             !store
                 .with_conn(|conn| table_exists(conn, "worker_workspace_credentials"))
@@ -4209,11 +4642,86 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 24);
+        assert_eq!(reopened.schema_version().await.unwrap(), 26);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_flow_sources_keep_revisions_and_builtins_stay_resources() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteWorkspaceStore::open(dir.path().join("server.db")).unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "workspace-a".to_string(),
+                owner_account_id: None,
+                display_name: "Workspace A".to_string(),
+                state: "active".to_string(),
+                created_at: "2026-08-06T00:00:00Z".to_string(),
+                updated_at: "2026-08-06T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+        let workspace_source = r#"{
+            schema_version = 1;
+            name = "coder-review";
+            initial = "work";
+            states = {
+                work = {
+                    instructions = "Workspace revision one.";
+                    transitions = { done = { target = "done"; condition = "Done."; }; };
+                };
+                done = { instructions = ""; terminal = true; };
+            };
+        }"#;
+        let workspace = store
+            .put_flow_source_for_kind(
+                "workspace-a",
+                FlowSourceKind::Workspace,
+                "flows/coder-review.dcdl",
+                workspace_source,
+                "2026-08-06T00:00:01Z",
+            )
+            .unwrap();
+        let builtin = flow::builtin_flow_source("coder-review").unwrap();
+        assert_eq!(builtin.slug, workspace.name);
+        assert!(
+            store
+                .put_flow_source_for_kind(
+                    "workspace-a",
+                    FlowSourceKind::Builtin,
+                    builtin.path,
+                    builtin.content,
+                    "2026-08-06T00:00:02Z",
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.list_flow_sources("workspace-a").unwrap(),
+            vec![workspace.clone()]
+        );
+
+        let revision_two =
+            workspace_source.replace("Workspace revision one.", "Workspace revision two.");
+        let updated = store
+            .put_flow_source_for_kind(
+                "workspace-a",
+                FlowSourceKind::Workspace,
+                "flows/coder-review.dcdl",
+                &revision_two,
+                "2026-08-06T00:00:03Z",
+            )
+            .unwrap();
+        assert_eq!(updated.flow_id, workspace.flow_id);
+        assert_eq!(updated.revision, 2);
+        let pinned = store
+            .get_flow_source_revision("workspace-a", &workspace.flow_id, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pinned.content, workspace_source);
+        assert_eq!(pinned.definition.name, "coder-review");
     }
 
     #[tokio::test]
@@ -4681,7 +5189,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 24);
+        assert_eq!(store.schema_version().await.unwrap(), 26);
 
         store
             .with_conn(|conn| {
@@ -4870,7 +5378,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 24);
+        assert_eq!(store.schema_version().await.unwrap(), 26);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -4908,7 +5416,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 24);
+        assert_eq!(store.schema_version().await.unwrap(), 26);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -5156,7 +5664,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 24);
+        assert_eq!(store.schema_version().await.unwrap(), 26);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),

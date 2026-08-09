@@ -11,6 +11,7 @@ mod operation;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -157,6 +158,105 @@ pub trait WorkdirSession: std::fmt::Debug + Send + Sync {
 }
 
 pub type WorkdirSessionHandle = Arc<dyn WorkdirSession>;
+
+/// Ephemeral least-authority view over an existing Workdir session.
+///
+/// The wrapper exposes only stat/read/list/glob/grep and never forwards write,
+/// edit, command, or close authority to the underlying Worker session. Closing
+/// the wrapper is terminal for the view but deliberately leaves the owner's
+/// source session open.
+#[derive(Debug)]
+pub struct ReadOnlyWorkdirSession {
+    source: WorkdirSessionHandle,
+    closed: AtomicBool,
+}
+
+impl ReadOnlyWorkdirSession {
+    pub fn new(source: WorkdirSessionHandle) -> Self {
+        Self {
+            source,
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn ensure_open(&self) -> Result<(), WorkdirError> {
+        if self.closed.load(Ordering::Acquire) {
+            Err(WorkdirError::Unavailable(
+                "read-only Workdir session is closed".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[async_trait]
+impl WorkdirSession for ReadOnlyWorkdirSession {
+    fn workdir(&self) -> &Workdir {
+        self.source.workdir()
+    }
+
+    fn capabilities(&self) -> WorkdirSessionCapabilities {
+        WorkdirSessionCapabilities::READ_ONLY
+    }
+
+    async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {
+        self.ensure_open()?;
+        self.source.stat(request).await
+    }
+
+    async fn read(&self, request: ReadRequest) -> Result<ReadResult, WorkdirError> {
+        self.ensure_open()?;
+        self.source.read(request).await
+    }
+
+    async fn write(&self, _request: WriteRequest) -> Result<WriteResult, WorkdirError> {
+        Err(WorkdirError::Unsupported(WorkdirSessionCapability::Write))
+    }
+
+    async fn edit(&self, _request: EditRequest) -> Result<EditResult, WorkdirError> {
+        Err(WorkdirError::Unsupported(WorkdirSessionCapability::Edit))
+    }
+
+    async fn list(&self, request: ListRequest) -> Result<ListResult, WorkdirError> {
+        self.ensure_open()?;
+        self.source.list(request).await
+    }
+
+    async fn glob(&self, request: GlobRequest) -> Result<GlobResult, WorkdirError> {
+        self.ensure_open()?;
+        self.source.glob(request).await
+    }
+
+    async fn grep(&self, request: GrepRequest) -> Result<GrepResult, WorkdirError> {
+        self.ensure_open()?;
+        self.source.grep(request).await
+    }
+
+    async fn start_command(&self, _request: CommandRequest) -> Result<CommandHandle, WorkdirError> {
+        Err(WorkdirError::Unsupported(WorkdirSessionCapability::Command))
+    }
+
+    async fn command_status(&self, _handle: CommandHandle) -> Result<CommandStatus, WorkdirError> {
+        Err(WorkdirError::Unsupported(WorkdirSessionCapability::Command))
+    }
+
+    async fn command_output(
+        &self,
+        _request: CommandOutputRequest,
+    ) -> Result<CommandOutput, WorkdirError> {
+        Err(WorkdirError::Unsupported(WorkdirSessionCapability::Command))
+    }
+
+    async fn cancel_command(&self, _handle: CommandHandle) -> Result<(), WorkdirError> {
+        Err(WorkdirError::Unsupported(WorkdirSessionCapability::Command))
+    }
+
+    async fn close(&self) -> Result<(), WorkdirError> {
+        self.closed.store(true, Ordering::Release);
+        Ok(())
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkdirError {
