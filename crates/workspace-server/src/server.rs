@@ -10422,6 +10422,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_profile_backend_launches_and_restores_workspace_orchestrator() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let config = test_server_config(workspace.path());
+        let store = SqliteWorkspaceStore::open(config.database_path.clone()).unwrap();
+        let api = WorkspaceApi::new(config, Arc::new(store)).await.unwrap();
+        let workspace_id = api.config.workspace_id.clone();
+
+        let result = scoped_start_workspace_orchestrator(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: workspace_id.clone(),
+            }),
+        )
+        .await;
+
+        let Json(started) = result.unwrap_or_else(|error| {
+            panic!(
+                "production Workspace Orchestrator launch failed: error={:?}, diagnostics={:?}",
+                error.error, error.diagnostics
+            )
+        });
+        assert_eq!(started.disposition, "created");
+        assert!(started.online);
+        let worker = started
+            .worker
+            .expect("production Workspace Orchestrator Worker")
+            .worker;
+
+        let stopped = api
+            .runtime
+            .stop_worker(
+                &worker,
+                WorkerLifecycleRequest {
+                    reason: Some("production Orchestrator restore regression test".to_string()),
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(stopped.state, WorkerOperationState::Accepted);
+        let Json(restored) = scoped_start_workspace_orchestrator(
+            State(api),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored.disposition, "restored");
+        assert!(restored.online);
+        assert_eq!(
+            restored.worker.expect("restored Orchestrator").worker,
+            worker
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_orchestrator_spawn_stays_offline_and_can_be_retried() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let config = test_server_config(workspace.path());
+        let store = SqliteWorkspaceStore::open(config.database_path.clone()).unwrap();
+        let api = WorkspaceApi::new_with_execution_backend(
+            config,
+            Arc::new(store),
+            Arc::new(DeterministicExecutionBackend::fail_first_spawn(
+                "provider setup rejected safe-root /tmp/private token=private-token session_id=private-session",
+            )),
+        )
+        .await
+        .unwrap();
+        let workspace_id = api.config.workspace_id.clone();
+
+        let error = scoped_start_workspace_orchestrator(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: workspace_id.clone(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.error,
+            Error::RuntimeOperationFailed {
+                ref code,
+                ..
+            } if code == "workspace_orchestrator_spawn_rejected"
+        ));
+        assert!(error.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "embedded_worker_execution_rejected"
+                && diagnostic
+                    .message
+                    .contains("provider setup rejected safe-root")
+                && !diagnostic.message.contains("/tmp/private")
+                && !diagnostic.message.contains("private-token")
+                && !diagnostic.message.contains("private-session")
+        }));
+        assert!(find_workspace_orchestrator(&api).is_none());
+        assert!(!workspace_orchestrator_response(&api, "failed").online);
+
+        let Json(retried) = scoped_start_workspace_orchestrator(
+            State(api),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(retried.disposition, "created");
+        assert!(retried.online);
+    }
+
+    #[tokio::test]
     async fn explicit_orchestrator_launch_marks_only_the_dedicated_worker() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
@@ -11036,6 +11145,7 @@ mod tests {
             >,
         >,
         materializer: worker_runtime::working_directory::LocalGitWorktreeMaterializer,
+        spawn_failure: std::sync::Mutex<Option<String>>,
     }
 
     impl Default for DeterministicExecutionBackend {
@@ -11053,7 +11163,16 @@ mod tests {
                 materializer: worker_runtime::working_directory::LocalGitWorktreeMaterializer::new(
                     std::env::temp_dir().join(unique),
                 ),
+                spawn_failure: std::sync::Mutex::new(None),
             }
+        }
+    }
+
+    impl DeterministicExecutionBackend {
+        fn fail_first_spawn(message: impl Into<String>) -> Self {
+            let backend = Self::default();
+            *backend.spawn_failure.lock().unwrap() = Some(message.into());
+            backend
         }
     }
 
@@ -11104,6 +11223,14 @@ mod tests {
             &self,
             request: worker_runtime::execution::WorkerExecutionSpawnRequest,
         ) -> worker_runtime::execution::WorkerExecutionSpawnResult {
+            if let Some(message) = self.spawn_failure.lock().unwrap().take() {
+                return worker_runtime::execution::WorkerExecutionSpawnResult::Errored(
+                    worker_runtime::execution::WorkerExecutionResult::errored(
+                        worker_runtime::execution::WorkerExecutionOperation::Spawn,
+                        message,
+                    ),
+                );
+            }
             let working_directory = match request.request.working_directory.as_ref() {
                 Some(claim) => match self.materializer.bind_working_directory(
                     &claim.working_directory_id,

@@ -3602,6 +3602,59 @@ fn embedded_workdir_unsupported_diagnostic() -> RuntimeDiagnostic {
     )
 }
 
+fn sanitize_embedded_execution_message(
+    message: &str,
+    operation: &impl std::fmt::Debug,
+    outcome: &impl std::fmt::Debug,
+) -> String {
+    let summary =
+        format!("Embedded Worker execution backend rejected {operation:?} with {outcome:?}");
+    let mut redact_next = false;
+    let detail = message
+        .split_whitespace()
+        .map(|part| {
+            if redact_next {
+                redact_next = false;
+                return "[redacted]";
+            }
+            let lowercase = part.to_ascii_lowercase();
+            let label =
+                lowercase.trim_matches(|character: char| !character.is_ascii_alphanumeric());
+            if matches!(
+                label,
+                "bearer" | "credential" | "key" | "password" | "secret" | "session" | "token"
+            ) {
+                redact_next = true;
+            }
+            if part.contains('/')
+                || part.contains('\\')
+                || lowercase.contains("credential=")
+                || lowercase.contains("key=")
+                || lowercase.contains("password=")
+                || lowercase.contains("secret=")
+                || lowercase.contains("session=")
+                || lowercase.contains("session_id=")
+                || lowercase.contains("token=")
+            {
+                "[redacted]"
+            } else {
+                part
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let detail = detail.trim();
+    if detail.is_empty() {
+        return summary;
+    }
+    let truncated = detail.chars().count() > 512;
+    let mut detail = detail.chars().take(512).collect::<String>();
+    if truncated {
+        detail.push('…');
+    }
+    format!("{summary}: {detail}")
+}
+
 fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnostic {
     match error {
         EmbeddedRuntimeError::RuntimeStopped => diagnostic(
@@ -3621,11 +3674,14 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
             "Embedded Worker has no execution backend attached".to_string(),
         ),
         EmbeddedRuntimeError::WorkerExecutionRejected {
-            operation, outcome, ..
+            operation,
+            outcome,
+            message,
+            ..
         } => diagnostic(
             "embedded_worker_execution_rejected",
             DiagnosticSeverity::Warning,
-            format!("Embedded Worker execution backend rejected {operation:?} with {outcome:?}"),
+            sanitize_embedded_execution_message(message, operation, outcome),
         ),
         EmbeddedRuntimeError::LimitTooLarge { requested, max } => diagnostic(
             "embedded_runtime_limit_too_large",
@@ -4263,7 +4319,7 @@ mod tests {
             worker_runtime::execution::WorkerExecutionSpawnResult::Errored(
                 worker_runtime::execution::WorkerExecutionResult::errored(
                     worker_runtime::execution::WorkerExecutionOperation::Spawn,
-                    "provider setup failed at /tmp/secret-provider-config",
+                    "provider setup failed at /tmp/secret-provider-config token=secret-value session_id=session-42",
                 ),
             )
         }
@@ -4643,7 +4699,12 @@ mod tests {
         assert!(spawned.acceptance_evidence.is_empty());
         assert!(spawned.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "embedded_worker_execution_rejected"
+                && diagnostic
+                    .message
+                    .contains("provider setup failed at [redacted]")
                 && !diagnostic.message.contains("/tmp/secret-provider-config")
+                && !diagnostic.message.contains("secret-value")
+                && !diagnostic.message.contains("session-42")
         }));
         assert!(spawned.worker.is_none());
     }

@@ -7,7 +7,7 @@ import "./base.dcdl" // {
         task = { enabled = true; };
         memory = { enabled = true; };
         web = { enabled = true; };
-        sub_worker = { enabled = true; };
+        sub_worker = { enabled = false; };
         worker = { enabled = true; };
         manage_workdir = { enabled = true; };
         ticket = { enabled = true; thread = true; orchestration_control = true; };
