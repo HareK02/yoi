@@ -52,8 +52,10 @@ backend への proxy はこの現象の直接原因ではない。
 
 ## 改善案
 
-- UI 全体で使う ID 生成 helper を用意し、secure context に依存しない実装にする。
-  `crypto.getRandomValues()` から UUID v4 相当を生成する方法で十分である。
+- `WorkspaceMultiplexer` の client/request correlation ID は、module-local の単調増加
+  sequence から生成する。これらは1ページ・1接続内で重複しなければよく、暗号学的乱数や
+  永続的なglobal uniquenessは不要なので、`crypto`、`Math.random()`、時刻依存のfallbackを
+  使わない。
 - `WorkspaceMultiplexer.subscribe()` の同期初期化失敗を Console の diagnostic/state に
   反映し、初期値の `connecting` に留まらないようにする。
 - LAN 上の平文 HTTP を開発時の対応経路とするなら、insecure context から subscription
@@ -67,3 +69,9 @@ backend への proxy はこの現象の直接原因ではない。
 `--host` は Vite の listener を LAN に bind するだけであり、配信 origin を secure
 context に変えるものではない。localhost で正常に動くことだけでは、LAN IP の HTTP
 アクセスでも同じブラウザ API が利用できることを証明できない。
+
+## Resolution (2026-08-06)
+
+`WorkspaceMultiplexer` の client/request ID をmodule-localの単調増加sequenceへ変更した。
+これによりWebSocket接続開始経路からsecure-context限定の `crypto.randomUUID()` 依存を除去した。
+IDはlocal correlationにのみ使われ、認証・認可・capability authorityには使われない。

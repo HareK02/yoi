@@ -736,6 +736,11 @@ Deno.test("Workspace Worker list and Console share the multiplexed connection", 
     "Sidebar and Console should share one Workspace multiplexer and route Worker methods through a subscription lane",
   );
   assert(
+    multiplexer.includes('nextMultiplexerId') &&
+      !multiplexer.includes('crypto.randomUUID'),
+    "Workspace subscription correlation IDs should not require secure-context crypto APIs",
+  );
+  assert(
     multiplexer.includes("this.#socket?.readyState === WebSocket.OPEN") &&
       multiplexer.includes("this.#sendSubscribe(subscription)") &&
       consolePage.includes("const targetWorker = data.worker") &&

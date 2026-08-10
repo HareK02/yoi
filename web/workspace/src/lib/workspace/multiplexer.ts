@@ -26,6 +26,12 @@ export type WorkspaceMultiplexerSubscription = {
 };
 
 const multiplexers = new Map<string, WorkspaceMultiplexer>();
+let nextMultiplexerSequence = 0;
+
+function nextMultiplexerId(kind: 'client' | 'request'): string {
+  nextMultiplexerSequence += 1;
+  return `${kind}-${nextMultiplexerSequence}`;
+}
 
 export function workspaceMultiplexer(workspaceId: string): WorkspaceMultiplexer {
   let multiplexer = multiplexers.get(workspaceId);
@@ -53,7 +59,7 @@ export class WorkspaceMultiplexer {
     selector: EventSubscriptionSelector,
     listener: Listener,
   ): WorkspaceMultiplexerSubscription {
-    const clientId = crypto.randomUUID();
+    const clientId = nextMultiplexerId('client');
     const subscription: ActiveSubscription = {
       clientId,
       selector,
@@ -112,7 +118,7 @@ export class WorkspaceMultiplexer {
   }
 
   #sendSubscribe(subscription: ActiveSubscription): void {
-    const requestId = crypto.randomUUID();
+    const requestId = nextMultiplexerId('request');
     subscription.requestId = requestId;
     this.#requests.set(requestId, subscription.clientId);
     this.#send({
@@ -198,7 +204,7 @@ export class WorkspaceMultiplexer {
         message: {
           method: 'unsubscribe_events',
           params: {
-            request_id: crypto.randomUUID(),
+            request_id: nextMultiplexerId('request'),
             subscription_id: subscription.subscriptionId,
           },
         },
