@@ -2383,10 +2383,10 @@ struct BrowserCloseTicketRequest {
 fn browser_ticket_backend(api: &WorkspaceApi) -> Result<SqliteTicketBackend> {
     let config = ticket::config::TicketConfig::load_workspace(&api.config.workspace_root)
         .map_err(|error| Error::Config(format!("load Ticket workspace settings: {error}")))?;
-    Ok(SqliteTicketBackend::new(
+    Ok(SqliteTicketBackend::open_verified(
         api.config.database_path.clone(),
         api.config.workspace_id.clone(),
-    )
+    )?
     .with_record_language(config.ticket_record_language()))
 }
 
@@ -2553,10 +2553,11 @@ async fn execute_worker_ticket_rest_operation(
     validate_workspace_scope(api, workspace_id)?;
     let config = ticket::config::TicketConfig::load_workspace(&api.config.workspace_root)
         .map_err(|error| Error::Config(format!("load Ticket workspace settings: {error}")))?;
-    let mut backend = SqliteTicketBackend::new(
+    let mut backend = SqliteTicketBackend::open_verified(
         api.config.database_path.clone(),
         api.config.workspace_id.clone(),
     )
+    .map_err(Error::from)?
     .with_record_language(config.ticket_record_language());
     let operation_kind = ticket_mutation_operation_kind(&operation);
     let is_mutation = operation_kind != "read";
@@ -15225,7 +15226,7 @@ mod tests {
     ) {
         use ticket::TicketBackend as _;
 
-        let backend = ticket::SqliteTicketBackend::new(database_path, workspace_id);
+        let backend = ticket::SqliteTicketBackend::open(database_path, workspace_id).unwrap();
         let mut input = ticket::NewTicket::new(title);
         input.workflow_state = Some(state);
         backend.create(input).unwrap();

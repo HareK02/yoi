@@ -754,6 +754,7 @@ impl SqliteWorkspaceStore {
     pub fn from_connection(conn: Connection) -> Result<Self> {
         configure_sqlite(&conn)?;
         apply_migrations(&conn)?;
+        ticket::migrate_sqlite_ticket_schema(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -4525,6 +4526,45 @@ fn table_columns(conn: &Connection, table_name: &str) -> Result<Vec<String>> {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn startup_composes_ticket_migrations_when_control_plane_is_current() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_sqlite(&conn).unwrap();
+        apply_migrations(&conn).unwrap();
+        assert!(!table_exists(&conn, "ticket_schema_migrations").unwrap());
+
+        let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
+        store
+            .with_conn(|conn| {
+                ticket::verify_sqlite_ticket_schema(conn)?;
+                let latest = conn.query_row(
+                    "SELECT MAX(version) FROM ticket_schema_migrations",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                assert_eq!(latest, ticket::LATEST_SQLITE_TICKET_SCHEMA_VERSION);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn startup_fails_closed_when_current_ticket_schema_has_drifted() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_sqlite(&conn).unwrap();
+        apply_migrations(&conn).unwrap();
+        ticket::migrate_sqlite_ticket_schema(&conn).unwrap();
+        conn.execute_batch("DROP TABLE typed_ticket_artifacts")
+            .unwrap();
+
+        let result = SqliteWorkspaceStore::from_connection(conn);
+        let error = match result {
+            Ok(_) => panic!("schema drift unexpectedly passed startup verification"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("typed_ticket_artifacts"));
+    }
 
     #[test]
     fn removes_unused_control_plane_ticket_tables() {

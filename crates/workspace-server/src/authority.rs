@@ -131,7 +131,7 @@ impl SqliteWorkspaceAuthority {
         Ok(Self {
             workspace_id: workspace_id.clone(),
             store: SqliteWorkspaceStore::open(&database_path)?,
-            ticket_backend: SqliteTicketBackend::new(database_path, workspace_id),
+            ticket_backend: SqliteTicketBackend::open_verified(database_path, workspace_id)?,
         })
     }
 
@@ -725,7 +725,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_ticket(dir.path(), "00000000001J2", "Read bridge", "ready");
         let db_path = dir.path().join("workspace.db");
-        SqliteTicketBackend::new(&db_path, "workspace-test")
+        SqliteTicketBackend::open(&db_path, "workspace-test")
+            .unwrap()
             .import_from_local_backend(&ticket::LocalTicketBackend::new(
                 dir.path().join(".yoi/tickets"),
             ))

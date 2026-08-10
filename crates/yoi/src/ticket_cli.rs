@@ -370,7 +370,7 @@ fn backend_for_workspace(workspace: &Path) -> Result<Box<dyn TicketBackend>, Tic
     let workspace_id = workspace_id_for_workspace(workspace)?;
     let db_path = server_database_path(workspace)?;
     Ok(Box::new(
-        SqliteTicketBackend::new(db_path, workspace_id)
+        SqliteTicketBackend::open(db_path, workspace_id)?
             .with_record_language(config.ticket_record_language()),
     ))
 }
@@ -381,7 +381,7 @@ fn import_local(workspace: &Path) -> Result<TicketCliOutput, TicketCliError> {
         .with_record_language(config.ticket_record_language());
     let workspace_id = workspace_id_for_workspace(workspace)?;
     let db_path = server_database_path(workspace)?;
-    let sqlite = SqliteTicketBackend::new(db_path.clone(), workspace_id)
+    let sqlite = SqliteTicketBackend::open(db_path.clone(), workspace_id)?
         .with_record_language(config.ticket_record_language());
     sqlite.import_from_local_backend(&local)?;
     Ok(success(format!(
