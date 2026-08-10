@@ -101,7 +101,7 @@ fn meta_has_description_and_schema() {
 }
 
 #[tokio::test]
-async fn view_image_reads_scoped_bytes_without_serializing_them_as_text() {
+async fn view_image_reads_scoped_bytes_into_durable_tool_detail() {
     let dir = TempDir::new().unwrap();
     let spill = TempDir::new().unwrap();
     let scope = scope_with_spill(dir.path(), spill.path());
@@ -119,7 +119,10 @@ async fn view_image_reads_scoped_bytes_without_serializing_them_as_text() {
     assert_eq!(image.data(), png);
     let serialized = serde_json::to_string(&output).unwrap();
     assert!(!serialized.contains("private-image-body"));
-    assert!(!serialized.contains("attachments"));
+    assert!(serialized.contains("attachments"));
+    let restored: llm_engine::tool::ToolOutput = serde_json::from_str(&serialized).unwrap();
+    let llm_engine::tool::Attachment::Image(restored_image) = &restored.attachments[0];
+    assert_eq!(restored_image.data(), png);
 
     let escaped = call_err(&tool, json!({ "path": "../outside.png" })).await;
     assert!(escaped.to_string().contains("scope") || escaped.to_string().contains("path"));

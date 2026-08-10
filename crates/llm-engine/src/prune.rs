@@ -110,25 +110,30 @@ impl Default for PruneConfig {
     }
 }
 
-/// Set `content = None` on each `Item::ToolResult` at the given indices.
+/// Remove detailed text and attachments from each `Item::ToolResult` at the given indices.
 ///
-/// Returns the number of items that were actually modified — items that
-/// are already content-less are counted as 0. Intended for use on a
-/// request-context clone (never on a persistent history).
+/// The mandatory summary remains. Returns the number of items that were actually
+/// modified — results that already contain no detail are counted as 0. Intended
+/// for use on a request-context clone (never on a persistent history).
 pub fn project(items: &mut [Item], indices: &[usize]) -> usize {
     let mut count = 0;
     for &i in indices {
-        if let Item::ToolResult { content, .. } = &mut items[i]
-            && content.is_some()
+        if let Item::ToolResult {
+            content,
+            attachments,
+            ..
+        } = &mut items[i]
+            && (content.is_some() || !attachments.is_empty())
         {
             *content = None;
+            attachments.clear();
             count += 1;
         }
     }
     count
 }
 
-/// Indices of `Item::ToolResult { content: Some(_), .. }` that lie before
+/// Indices of detailed `Item::ToolResult` values that lie before
 /// the suffix protected by `protected_tokens`. Pure: does not mutate `items`.
 ///
 /// Returns an empty vector when token estimates are unavailable (`NoData`) or
@@ -159,8 +164,10 @@ pub fn evaluate_candidates(
         .enumerate()
         .filter_map(|(i, item)| match item {
             Item::ToolResult {
-                content: Some(_), ..
-            } => Some(i),
+                content,
+                attachments,
+                ..
+            } if content.is_some() || !attachments.is_empty() => Some(i),
             _ => None,
         })
         .collect();
@@ -371,6 +378,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn project_drops_image_detail_but_keeps_summary_and_persistent_source() {
+        let original = vec![Item::tool_result_item_with_attachments(
+            "call_image",
+            "Attached image/png image (12 bytes)",
+            None,
+            false,
+            vec![crate::tool::Attachment::Image(
+                crate::tool::ImageAttachment::new("image/png", b"image-body".to_vec()),
+            )],
+        )];
+        let mut request_context = original.clone();
+
+        let estimates = uniform_estimates(&original, 100);
+        assert_eq!(prunable_indices(&original, 0, &estimates), vec![0]);
+
+        assert_eq!(project(&mut request_context, &[0]), 1);
+        assert!(matches!(
+            &request_context[0],
+            Item::ToolResult {
+                summary,
+                content: None,
+                attachments,
+                ..
+            } if summary == "Attached image/png image (12 bytes)" && attachments.is_empty()
+        ));
+        assert!(matches!(
+            &original[0],
+            Item::ToolResult { attachments, .. } if attachments.len() == 1
+        ));
     }
 
     #[test]

@@ -7,13 +7,30 @@
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 
-use crate::llm_client::{
-    Request,
-    capability::{ModelCapability, ReasoningControl, ReasoningSupport},
-    types::{ContentPart, Item, Role, ToolDefinition, image_data_url, parse_tool_arguments},
+use crate::{
+    llm_client::{
+        Request,
+        capability::{ModelCapability, ReasoningControl, ReasoningSupport},
+        types::{ContentPart, Item, Role, ToolDefinition, image_data_url, parse_tool_arguments},
+    },
+    tool::Attachment,
 };
 
 use super::OpenAIResponsesScheme;
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub(crate) enum FunctionCallOutputBody {
+    Text(String),
+    ContentItems(Vec<FunctionCallOutputContentItem>),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum FunctionCallOutputContentItem {
+    InputText { text: String },
+    InputImage { image_url: String },
+}
 
 /// `/v1/responses` のリクエスト body。
 #[derive(Debug, Serialize)]
@@ -89,7 +106,10 @@ pub(crate) enum InputItem {
         arguments: String,
     },
     /// function tool の結果（user 側）。
-    FunctionCallOutput { call_id: String, output: String },
+    FunctionCallOutput {
+        call_id: String,
+        output: FunctionCallOutputBody,
+    },
     /// reasoning item。`encrypted_content` があれば必ず添える。
     Reasoning {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -114,10 +134,6 @@ pub(crate) enum InputContent {
     /// user / developer 側のテキスト
     InputText { text: String },
     /// user 側の画像
-    InputImage {
-        image_url: String,
-        detail: &'static str,
-    },
     /// assistant 側のテキスト
     OutputText { text: String },
 }
@@ -249,15 +265,6 @@ fn convert_items_to_input(items: &[Item], supports_images: bool) -> Vec<InputIte
                     .iter()
                     .map(|part| match part {
                         ContentPart::Text { text } => text_variant(text.clone()),
-                        ContentPart::Image { media_type, source }
-                            if matches!(role, Role::User) && supports_images =>
-                        {
-                            InputContent::InputImage {
-                                image_url: image_data_url(media_type, source.data()),
-                                detail: "auto",
-                            }
-                        }
-                        ContentPart::Image { .. } => text_variant(part.as_text().to_string()),
                         ContentPart::Refusal { refusal } => text_variant(refusal.clone()),
                     })
                     .collect();
@@ -284,11 +291,29 @@ fn convert_items_to_input(items: &[Item], supports_images: bool) -> Vec<InputIte
                 call_id,
                 summary,
                 content,
+                attachments,
                 ..
             } => {
-                let output = match content {
+                let text = match content {
                     Some(c) => format!("{summary}\n{c}"),
                     None => summary.clone(),
+                };
+                let output = if attachments.is_empty() {
+                    FunctionCallOutputBody::Text(text)
+                } else if supports_images {
+                    let mut parts = vec![FunctionCallOutputContentItem::InputText { text }];
+                    parts.extend(attachments.iter().map(|attachment| {
+                        let Attachment::Image(image) = attachment;
+                        FunctionCallOutputContentItem::InputImage {
+                            image_url: image_data_url(image.mime_type(), image.data()),
+                        }
+                    }));
+                    FunctionCallOutputBody::ContentItems(parts)
+                } else {
+                    FunctionCallOutputBody::Text(format!(
+                        "{text}\n[{} image attachment(s) omitted: model does not support images]",
+                        attachments.len()
+                    ))
                 };
                 out.push(InputItem::FunctionCallOutput {
                     call_id: call_id.clone(),
@@ -701,7 +726,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_user_image_uses_responses_input_image_content() {
+    fn durable_tool_image_uses_function_call_output_content_items() {
         let scheme = OpenAIResponsesScheme::new();
         let image = std::sync::Arc::<[u8]>::from(&b"\x89PNG\r\n\x1a\nbody"[..]);
         let item = Item::tool_result_item_with_attachments(
@@ -710,32 +735,35 @@ mod tests {
             None,
             false,
             vec![crate::tool::Attachment::Image(
-                crate::tool::ImageAttachment::new("image/png", image.clone()),
+                crate::tool::ImageAttachment::new("image/png", image),
             )],
         );
+        let persisted = serde_json::to_string(&item).unwrap();
+        let restored: Item = serde_json::from_str(&persisted).unwrap();
         let req = Request::new()
             .item(Item::tool_call(
                 "call_image",
                 "ViewImage",
                 r#"{"path":"a.png"}"#,
             ))
-            .item(item)
-            .item(Item::user_message_parts(vec![ContentPart::image(
-                "image/png",
-                image,
-            )]));
+            .item(restored);
         let body = scheme.build_request("gpt-5", &req, &cap_with_reasoning());
         let json = serde_json::to_value(&body).unwrap();
 
         assert_eq!(json["input"][1]["type"], "function_call_output");
-        assert_eq!(json["input"][2]["type"], "message");
-        assert_eq!(json["input"][2]["content"][0]["type"], "input_image");
+        assert_eq!(json["input"].as_array().unwrap().len(), 2);
+        assert_eq!(json["input"][1]["output"][0]["type"], "input_text");
+        assert_eq!(json["input"][1]["output"][1]["type"], "input_image");
         assert!(
-            json["input"][2]["content"][0]["image_url"]
+            json["input"][1]["output"][1]["image_url"]
                 .as_str()
                 .unwrap()
                 .starts_with("data:image/png;base64,")
         );
+        let rebuilt =
+            serde_json::to_value(scheme.build_request("gpt-5", &req, &cap_with_reasoning()))
+                .unwrap();
+        assert_eq!(rebuilt["input"], json["input"]);
 
         let mut no_vision = cap_with_reasoning();
         no_vision.vision = false;

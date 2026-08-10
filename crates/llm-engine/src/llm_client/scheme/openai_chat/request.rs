@@ -5,10 +5,13 @@
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::llm_client::{
-    Request,
-    capability::{ModelCapability, ReasoningControl, ReasoningSupport},
-    types::{ContentPart, Item, Role, ToolDefinition, image_data_url, parse_tool_arguments},
+use crate::{
+    llm_client::{
+        Request,
+        capability::{ModelCapability, ReasoningControl, ReasoningSupport},
+        types::{ContentPart, Item, Role, ToolDefinition, image_data_url, parse_tool_arguments},
+    },
+    tool::Attachment,
 };
 
 use super::OpenAIScheme;
@@ -185,6 +188,21 @@ impl OpenAIScheme {
     /// - Assistant messages have role "assistant"
     /// - Tool calls are within assistant messages as tool_calls array
     /// - Tool results have role "tool" with tool_call_id
+    fn flush_pending_tool_result_images(
+        messages: &mut Vec<OpenAIMessage>,
+        pending_images: &mut Vec<OpenAIContentPart>,
+    ) {
+        if !pending_images.is_empty() {
+            messages.push(OpenAIMessage {
+                role: "user".to_string(),
+                content: Some(OpenAIContent::Parts(std::mem::take(pending_images))),
+                tool_calls: vec![],
+                tool_call_id: None,
+                name: None,
+            });
+        }
+    }
+
     fn convert_items_to_messages(
         &self,
         items: &[Item],
@@ -193,8 +211,15 @@ impl OpenAIScheme {
         let mut messages = Vec::new();
         let mut pending_tool_calls: Vec<OpenAIToolCall> = Vec::new();
         let mut pending_assistant_text: Option<String> = None;
+        let mut pending_tool_result_images: Vec<OpenAIContentPart> = Vec::new();
 
         for item in items {
+            if !matches!(item, Item::ToolResult { .. }) {
+                Self::flush_pending_tool_result_images(
+                    &mut messages,
+                    &mut pending_tool_result_images,
+                );
+            }
             match item {
                 Item::Message { role, content, .. } => {
                     // Flush pending tool calls
@@ -209,41 +234,13 @@ impl OpenAIScheme {
                         Role::Assistant => "assistant",
                         Role::System => "system",
                     };
-                    let has_image = matches!(role, Role::User)
-                        && supports_images
-                        && content
+                    let message_content = OpenAIContent::Text(
+                        content
                             .iter()
-                            .any(|part| matches!(part, ContentPart::Image { .. }));
-                    let message_content = if has_image {
-                        OpenAIContent::Parts(
-                            content
-                                .iter()
-                                .map(|part| match part {
-                                    ContentPart::Text { text } => {
-                                        OpenAIContentPart::Text { text: text.clone() }
-                                    }
-                                    ContentPart::Image { media_type, source } => {
-                                        OpenAIContentPart::ImageUrl {
-                                            image_url: ImageUrl {
-                                                url: image_data_url(media_type, source.data()),
-                                            },
-                                        }
-                                    }
-                                    ContentPart::Refusal { refusal } => OpenAIContentPart::Text {
-                                        text: refusal.clone(),
-                                    },
-                                })
-                                .collect(),
-                        )
-                    } else {
-                        OpenAIContent::Text(
-                            content
-                                .iter()
-                                .map(ContentPart::as_text)
-                                .collect::<Vec<_>>()
-                                .join(""),
-                        )
-                    };
+                            .map(ContentPart::as_text)
+                            .collect::<Vec<_>>()
+                            .join(""),
+                    );
 
                     messages.push(OpenAIMessage {
                         role: openai_role.to_string(),
@@ -277,19 +274,35 @@ impl OpenAIScheme {
                     call_id,
                     summary,
                     content,
+                    attachments,
                     ..
                 } => {
-                    // Flush pending tool calls before tool result
+                    // OpenAI requires every parallel tool result before a new user message.
                     self.flush_pending_assistant(
                         &mut messages,
                         &mut pending_tool_calls,
                         &mut pending_assistant_text,
                     );
 
-                    let text = match content {
+                    let mut text = match content {
                         Some(c) => format!("{summary}\n{c}"),
                         None => summary.clone(),
                     };
+                    if supports_images {
+                        pending_tool_result_images.extend(attachments.iter().map(|attachment| {
+                            let Attachment::Image(image) = attachment;
+                            OpenAIContentPart::ImageUrl {
+                                image_url: ImageUrl {
+                                    url: image_data_url(image.mime_type(), image.data()),
+                                },
+                            }
+                        }));
+                    } else if !attachments.is_empty() {
+                        text.push_str(&format!(
+                            "\n[{} image attachment(s) omitted: model does not support images]",
+                            attachments.len()
+                        ));
+                    }
                     messages.push(OpenAIMessage {
                         role: "tool".to_string(),
                         content: Some(OpenAIContent::Text(text)),
@@ -317,6 +330,7 @@ impl OpenAIScheme {
             &mut pending_tool_calls,
             &mut pending_assistant_text,
         );
+        Self::flush_pending_tool_result_images(&mut messages, &mut pending_tool_result_images);
 
         messages
     }
@@ -481,28 +495,27 @@ mod tests {
     }
 
     #[test]
-    fn parallel_tool_results_precede_synthetic_image_message() {
+    fn parallel_tool_results_precede_durable_image_projection() {
         let scheme = OpenAIScheme::new();
         let image = std::sync::Arc::<[u8]>::from(&b"\x89PNG\r\n\x1a\nbody"[..]);
         let request = Request::new()
             .item(Item::tool_call("call_image", "ViewImage", "{}"))
             .item(Item::tool_call("call_text", "Read", "{}"))
-            .item(Item::tool_result_item(
+            .item(Item::tool_result_item_with_attachments(
                 "call_image",
                 "Attached image",
                 None,
                 false,
+                vec![crate::tool::Attachment::Image(
+                    crate::tool::ImageAttachment::new("image/png", image),
+                )],
             ))
             .item(Item::tool_result_item(
                 "call_text",
                 "Read text",
                 None,
                 false,
-            ))
-            .item(Item::user_message_parts(vec![ContentPart::image(
-                "image/png",
-                image,
-            )]));
+            ));
         let json = serde_json::to_value(
             &scheme
                 .build_request("gpt-4o", &request, &vision_cap())
@@ -518,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_image_is_structured_as_following_user_content_without_persisting_bytes() {
+    fn durable_tool_image_is_deterministically_lowered_to_following_user_content() {
         let scheme = OpenAIScheme::new();
         let image = std::sync::Arc::<[u8]>::from(&b"\x89PNG\r\n\x1a\nbody"[..]);
         let attachment = crate::tool::Attachment::Image(crate::tool::ImageAttachment::new(
@@ -533,8 +546,8 @@ mod tests {
             vec![attachment],
         );
         let persisted = serde_json::to_string(&item).unwrap();
-        assert!(!persisted.contains("base64"));
-        assert!(!persisted.contains("attachments"));
+        assert!(persisted.contains("attachments"));
+        let restored: Item = serde_json::from_str(&persisted).unwrap();
 
         let request = Request::new()
             .item(Item::tool_call(
@@ -542,13 +555,16 @@ mod tests {
                 "ViewImage",
                 r#"{"path":"a.png"}"#,
             ))
-            .item(item)
-            .item(Item::user_message_parts(vec![ContentPart::image(
-                "image/png",
-                image,
-            )]));
+            .item(restored);
         let body = scheme.build_request("gpt-4o", &request, &vision_cap());
         let json = serde_json::to_value(&body.messages).unwrap();
+        let rebuilt = serde_json::to_value(
+            &scheme
+                .build_request("gpt-4o", &request, &vision_cap())
+                .messages,
+        )
+        .unwrap();
+        assert_eq!(rebuilt, json);
 
         assert_eq!(json[0]["role"], "assistant");
         assert_eq!(json[1]["role"], "tool");

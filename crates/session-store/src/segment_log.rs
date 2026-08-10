@@ -474,6 +474,36 @@ mod tests {
     }
 
     #[test]
+    fn replay_restores_durable_tool_image_detail() {
+        let entry = LogEntry::ToolResult {
+            ts: 3500,
+            item: Item::tool_result_item_with_attachments(
+                "call_image",
+                "attached",
+                None,
+                false,
+                vec![llm_engine::tool::Attachment::Image(
+                    llm_engine::tool::ImageAttachment::new("image/png", b"durable-image".to_vec()),
+                )],
+            )
+            .into(),
+        };
+        let persisted = serde_json::to_string(&entry).unwrap();
+        let restored_entry: LogEntry = serde_json::from_str(&persisted).unwrap();
+        let state = collect_state(&[restored_entry]);
+
+        assert!(matches!(
+            &state.history[0],
+            Item::ToolResult { attachments, .. }
+                if matches!(
+                    attachments.as_slice(),
+                    [llm_engine::tool::Attachment::Image(image)]
+                        if image.data() == b"durable-image"
+                )
+        ));
+    }
+
+    #[test]
     fn replay_config_changed() {
         let state = collect_state(&[
             LogEntry::SegmentStart {

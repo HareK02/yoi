@@ -19,19 +19,15 @@ use crate::{
     },
     llm_client::{
         ClientError, ConfigWarning, LlmClient, Request, RequestConfig, ResponseStream,
-        ToolDefinition,
-        error::is_retryable,
-        event::Event,
-        retry::RetryPolicy,
-        transport::DEFAULT_FIRST_STREAM_EVENT_TIMEOUT,
-        types::{ContentPart, parse_tool_arguments},
+        ToolDefinition, error::is_retryable, event::Event, retry::RetryPolicy,
+        transport::DEFAULT_FIRST_STREAM_EVENT_TIMEOUT, types::parse_tool_arguments,
     },
     state::{EngineState, Locked, Mutable},
     timeline::event::{ErrorEvent, StatusEvent, UsageEvent},
     timeline::{TextBlockCollector, ThinkingBlockCollector, Timeline, ToolCallCollector},
     tool::{
-        Attachment, ToolCall, ToolDefinition as EngineToolDefinition, ToolError,
-        ToolExecutionContext, ToolOutputLimits, ToolResult, truncate_content,
+        ToolCall, ToolDefinition as EngineToolDefinition, ToolError, ToolExecutionContext,
+        ToolOutputLimits, ToolResult, truncate_content,
     },
     tool_server::{ToolServer, ToolServerHandle},
 };
@@ -157,33 +153,6 @@ pub struct LlmRetryNotice {
 enum StreamCompletion {
     Complete,
     Interrupted { reason: String },
-}
-
-fn project_transient_attachments(items: &mut Vec<Item>) {
-    let mut projected = Vec::with_capacity(items.len());
-    let mut pending_parts = Vec::new();
-
-    for mut item in items.drain(..) {
-        let is_tool_result = matches!(item, Item::ToolResult { .. });
-        if !is_tool_result && !pending_parts.is_empty() {
-            projected.push(Item::user_message_parts(std::mem::take(&mut pending_parts)));
-        }
-        if let Item::ToolResult { attachments, .. } = &item {
-            for attachment in attachments {
-                let Attachment::Image(image) = attachment;
-                pending_parts.push(ContentPart::image(
-                    image.mime_type(),
-                    Arc::from(image.data()),
-                ));
-            }
-        }
-        item.clear_transient_attachments();
-        projected.push(item);
-    }
-    if !pending_parts.is_empty() {
-        projected.push(Item::user_message_parts(pending_parts));
-    }
-    *items = projected;
 }
 
 pub struct Engine<C: LlmClient, S: EngineState = Mutable> {
@@ -1280,8 +1249,6 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                 cb(current_llm_call);
             }
 
-            project_transient_attachments(&mut request_context);
-
             // Stream LLM response
             self.emit_lifecycle_trace(
                 current_turn,
@@ -1290,12 +1257,6 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                 items_trace_payload(&request_context, tool_definitions.len(), None, false),
             );
             let request = self.build_request(&tool_definitions, &request_context);
-            // Structured attachments are single-use provider payloads. `request`
-            // owns its Arc-backed copy; history is cleared before any later turn
-            // can persist or resend the binary body.
-            for item in &mut self.history {
-                item.clear_transient_attachments();
-            }
             self.emit_lifecycle_trace(
                 current_turn,
                 current_llm_call,
@@ -2199,48 +2160,36 @@ fn item_kind(item: &Item) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm_client::types::Role;
+    use crate::tool::{Attachment, ImageAttachment};
     use std::time::Duration;
 
     #[test]
-    fn transient_tool_attachment_becomes_non_persistent_user_image_part() {
-        let body: Arc<[u8]> = Arc::from(&b"secret-image-body"[..]);
-        let mut items = vec![Item::tool_result_item_with_attachments(
+    fn tool_attachment_round_trips_through_durable_history_json() {
+        let body: Arc<[u8]> = Arc::from(&b"image-body"[..]);
+        let items = vec![Item::tool_result_item_with_attachments(
             "call_image",
             "attached",
             None,
             false,
-            vec![Attachment::Image(crate::tool::ImageAttachment::new(
+            vec![Attachment::Image(ImageAttachment::new(
                 "image/png",
                 body.clone(),
             ))],
         )];
 
-        project_transient_attachments(&mut items);
-
-        assert!(matches!(
-            &items[0],
-            Item::ToolResult { attachments, .. } if attachments.is_empty()
-        ));
-        match &items[1] {
-            Item::Message {
-                role: Role::User,
-                content,
-                ..
-            } => match &content[0] {
-                ContentPart::Image { media_type, source } => {
-                    assert_eq!(media_type, "image/png");
-                    assert_eq!(source.data(), body.as_ref());
-                    assert_eq!(source.bytes(), body.len());
-                    assert_eq!(content[0].as_text(), "[image attachment omitted]");
-                }
-                other => panic!("unexpected content part: {other:?}"),
-            },
-            other => panic!("unexpected projected item: {other:?}"),
-        }
         let persisted = serde_json::to_string(&items).unwrap();
-        assert!(!persisted.contains("secret-image-body"));
-        assert!(!persisted.contains("base64"));
+        assert!(persisted.contains("aW1hZ2UtYm9keQ=="));
+        let restored: Vec<Item> = serde_json::from_str(&persisted).unwrap();
+        assert_eq!(restored, items);
+        assert!(matches!(
+            &restored[0],
+            Item::ToolResult { attachments, .. }
+                if matches!(
+                    attachments.as_slice(),
+                    [Attachment::Image(image)]
+                        if image.mime_type() == "image/png" && image.data() == body.as_ref()
+                )
+        ));
     }
 
     #[tokio::test]

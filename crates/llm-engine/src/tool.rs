@@ -6,7 +6,8 @@
 use std::{collections::HashMap, fmt, sync::Arc};
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -120,12 +121,39 @@ impl fmt::Debug for ImageAttachment {
     }
 }
 
-/// Request-local binary payload emitted by a tool.
-///
-/// Attachments are deliberately excluded from serde. They may be projected into
-/// the immediately following provider request, but never into persisted history,
-/// protocol events, logs, or telemetry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
+struct ImageAttachmentWire {
+    mime_type: String,
+    data: String,
+}
+
+impl Serialize for ImageAttachment {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        ImageAttachmentWire {
+            mime_type: self.mime_type.clone(),
+            data: STANDARD.encode(self.data.as_ref()),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ImageAttachment {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ImageAttachmentWire::deserialize(deserializer)?;
+        let data = STANDARD.decode(wire.data).map_err(D::Error::custom)?;
+        Ok(Self::new(wire.mime_type, data))
+    }
+}
+
+/// Durable binary detail emitted by a tool and handled by normal ToolResult pruning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum Attachment {
     Image(ImageAttachment),
 }
@@ -133,8 +161,8 @@ pub enum Attachment {
 /// Tool execution result.
 ///
 /// Every output has a mandatory `summary` (1-2 lines) that persists in
-/// conversation history even after pruning. The optional `content` carries
-/// full text details. `attachments` are request-local and are never serialized.
+/// conversation history even after pruning. Optional text and binary details are
+/// committed to history and may later be omitted only by normal ToolResult pruning.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolOutput {
     /// Short summary (1-2 lines). Always remains in history.
@@ -142,8 +170,8 @@ pub struct ToolOutput {
     /// Detailed text output. Removed by Prune when old enough.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    /// Structured binary payloads for the immediately following model request.
-    #[serde(skip, default)]
+    /// Durable binary details handled by the same pruning lifecycle as `content`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
 }
 
@@ -409,8 +437,8 @@ pub struct ToolResult {
     /// Whether this is an error
     #[serde(default)]
     pub is_error: bool,
-    /// Request-local structured payloads. Never serialized or persisted.
-    #[serde(skip, default)]
+    /// Durable binary details (prunable with `content`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
 }
 

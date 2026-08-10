@@ -124,8 +124,8 @@ pub enum Item {
         /// Whether the tool result represents an execution error.
         #[serde(default, skip_serializing_if = "is_false")]
         is_error: bool,
-        /// Request-local structured payloads. Never serialized or persisted.
-        #[serde(skip, default)]
+        /// Durable binary details (removed with `content` by normal pruning).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<Attachment>,
     },
 
@@ -264,7 +264,7 @@ impl Item {
         Self::tool_result_item_with_attachments(call_id, summary, content, is_error, Vec::new())
     }
 
-    /// Create a tool result item with request-local structured attachments.
+    /// Create a tool result item with durable, prunable structured attachments.
     pub fn tool_result_item_with_attachments(
         call_id: impl Into<String>,
         summary: impl Into<String>,
@@ -279,13 +279,6 @@ impl Item {
             content,
             is_error,
             attachments,
-        }
-    }
-
-    /// Drop request-local attachments after constructing the provider request.
-    pub fn clear_transient_attachments(&mut self) {
-        if let Self::ToolResult { attachments, .. } = self {
-            attachments.clear();
         }
     }
 
@@ -457,38 +450,6 @@ pub fn parse_tool_arguments(arguments: &str) -> serde_json::Value {
 // Content Parts - Components within message items
 // ============================================================================
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ImageSource {
-    bytes: usize,
-    #[serde(skip, default)]
-    data: Arc<[u8]>,
-}
-
-impl ImageSource {
-    pub fn new(data: Arc<[u8]>) -> Self {
-        Self {
-            bytes: data.len(),
-            data,
-        }
-    }
-
-    pub fn data(&self) -> &[u8] {
-        &self.data
-    }
-
-    pub fn bytes(&self) -> usize {
-        self.bytes
-    }
-}
-
-impl fmt::Debug for ImageSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ImageSource")
-            .field("bytes", &self.bytes)
-            .finish()
-    }
-}
-
 /// Content part within a message item
 ///
 /// Text content is role-agnostic; the containing Item's Role determines
@@ -500,12 +461,6 @@ pub enum ContentPart {
     Text {
         /// The text content
         text: String,
-    },
-
-    /// Request-local image content. The source bytes are never serialized.
-    Image {
-        media_type: String,
-        source: ImageSource,
     },
 
     /// Refusal content (for assistant messages)
@@ -528,20 +483,10 @@ impl ContentPart {
         }
     }
 
-    pub fn image(media_type: impl Into<String>, data: Arc<[u8]>) -> Self {
-        Self::Image {
-            media_type: media_type.into(),
-            source: ImageSource::new(data),
-        }
-    }
-
-    /// Get a bounded textual projection. Image content is represented by an
-    /// explicit placeholder rather than silently becoming an empty string,
-    /// filesystem path, data URL, or base64 body.
+    /// Get a textual projection of the content part.
     pub fn as_text(&self) -> &str {
         match self {
             Self::Text { text } => text,
-            Self::Image { .. } => "[image attachment omitted]",
             Self::Refusal { refusal } => refusal,
         }
     }

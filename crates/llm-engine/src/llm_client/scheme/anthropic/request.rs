@@ -268,9 +268,6 @@ impl AnthropicScheme {
                         .iter()
                         .map(|p| match p {
                             ContentPart::Text { text } => AnthropicContentPart::text(text.clone()),
-                            ContentPart::Image { .. } => {
-                                AnthropicContentPart::text(p.as_text().to_string())
-                            }
                             ContentPart::Refusal { refusal } => {
                                 AnthropicContentPart::text(refusal.clone())
                             }

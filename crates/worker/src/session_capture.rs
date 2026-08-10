@@ -271,9 +271,20 @@ impl SessionCapture {
                     });
                 }
                 Item::ToolResult {
-                    summary, content, ..
+                    summary,
+                    content,
+                    attachments,
+                    ..
                 } => {
-                    let text = format!("{summary}\n{}", content.as_deref().unwrap_or_default());
+                    let attachment_marker = if attachments.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n[{} image attachment(s)]", attachments.len())
+                    };
+                    let text = format!(
+                        "{summary}\n{}{attachment_marker}",
+                        content.as_deref().unwrap_or_default(),
+                    );
                     index.push(ReferenceEntry {
                         id: SessionEntryRef::new(idx),
                         entry_range,
@@ -506,21 +517,29 @@ fn render_item(
         Item::ToolResult {
             summary,
             content,
+            attachments,
             is_error,
             ..
-        } => match detail {
-            ReadDetail::Compact => format!(
-                "[{} ToolOutput{}]\nsummary: {summary}\ncontent: (omitted)",
-                entry.id,
-                if *is_error { " error" } else { "" }
-            ),
-            ReadDetail::Full => format!(
-                "[{} ToolOutput{}]\nsummary: {summary}\ncontent: {}",
-                entry.id,
-                if *is_error { " error" } else { "" },
-                content.as_deref().unwrap_or_default()
-            ),
-        },
+        } => {
+            let attachment_line = if attachments.is_empty() {
+                String::new()
+            } else {
+                format!("\nattachments: {} image(s)", attachments.len())
+            };
+            match detail {
+                ReadDetail::Compact => format!(
+                    "[{} ToolOutput{}]\nsummary: {summary}\ncontent: (omitted){attachment_line}",
+                    entry.id,
+                    if *is_error { " error" } else { "" },
+                ),
+                ReadDetail::Full => format!(
+                    "[{} ToolOutput{}]\nsummary: {summary}\ncontent: {}{attachment_line}",
+                    entry.id,
+                    if *is_error { " error" } else { "" },
+                    content.as_deref().unwrap_or_default(),
+                ),
+            }
+        }
         Item::Reasoning { .. } => format!("[{} Reasoning omitted]", entry.id),
     };
     truncate_chars(&text, max_bytes)
@@ -631,6 +650,38 @@ mod tests {
                 .iter()
                 .all(|entry| entry.kind != ReferenceKind::Tool)
         );
+    }
+
+    #[test]
+    fn tool_image_projection_exposes_only_bounded_metadata() {
+        let view = SessionCapture::new(
+            "segment-1",
+            vec![Item::tool_result_item_with_attachments(
+                "c1",
+                "attached",
+                None,
+                false,
+                vec![llm_engine::tool::Attachment::Image(
+                    llm_engine::tool::ImageAttachment::new(
+                        "image/png",
+                        b"private-image-body".to_vec(),
+                    ),
+                )],
+            )],
+        );
+
+        let result = view.read(
+            ReadSelector::Id("E00000000"),
+            ReadOptions {
+                include_tools: true,
+                detail: ReadDetail::Full,
+                ..ReadOptions::default()
+            },
+        );
+        assert_eq!(result.entries.len(), 1);
+        assert!(result.entries[0].text.contains("attachments: 1 image(s)"));
+        assert!(!result.entries[0].text.contains("private-image-body"));
+        assert!(!result.entries[0].text.contains("cHJpdmF0ZS"));
     }
 
     #[test]

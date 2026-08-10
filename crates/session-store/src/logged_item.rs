@@ -12,11 +12,34 @@
 //! `Reasoning::encrypted_content` is preserved because OpenAI Responses ZDR
 //! requires it on stateless re-send.
 
-use llm_engine::llm_client::types::{ContentPart, Item, Role};
-use serde::{Deserialize, Serialize};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use llm_engine::{
+    llm_client::types::{ContentPart, Item, Role},
+    tool::{Attachment, ImageAttachment},
+};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+mod base64_bytes {
+    use super::*;
+
+    pub fn serialize<S>(data: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&STANDARD.encode(data))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        STANDARD.decode(encoded).map_err(D::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -36,6 +59,8 @@ pub enum LoggedItem {
         summary: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         content: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<LoggedAttachment>,
         #[serde(default, skip_serializing_if = "is_false")]
         is_error: bool,
     },
@@ -67,6 +92,16 @@ pub enum LoggedContentPart {
     Refusal { refusal: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LoggedAttachment {
+    Image {
+        mime_type: String,
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Item ↔ LoggedItem
 // ---------------------------------------------------------------------------
@@ -92,12 +127,14 @@ impl From<&Item> for LoggedItem {
                 call_id,
                 summary,
                 content,
+                attachments,
                 is_error,
                 ..
             } => Self::ToolResult {
                 call_id: call_id.clone(),
                 summary: summary.clone(),
                 content: content.clone(),
+                attachments: attachments.iter().map(LoggedAttachment::from).collect(),
                 is_error: *is_error,
             },
             Item::Reasoning {
@@ -146,6 +183,7 @@ impl From<LoggedItem> for Item {
                 call_id,
                 summary,
                 content,
+                attachments,
                 is_error,
             } => Item::ToolResult {
                 id: None,
@@ -153,7 +191,7 @@ impl From<LoggedItem> for Item {
                 summary,
                 content,
                 is_error,
-                attachments: Vec::new(),
+                attachments: attachments.into_iter().map(Attachment::from).collect(),
             },
             LoggedItem::Reasoning {
                 text,
@@ -214,9 +252,6 @@ impl From<&ContentPart> for LoggedContentPart {
     fn from(part: &ContentPart) -> Self {
         match part {
             ContentPart::Text { text } => Self::Text { text: text.clone() },
-            ContentPart::Image { .. } => Self::Text {
-                text: part.as_text().to_string(),
-            },
             ContentPart::Refusal { refusal } => Self::Refusal {
                 refusal: refusal.clone(),
             },
@@ -229,6 +264,27 @@ impl From<LoggedContentPart> for ContentPart {
         match part {
             LoggedContentPart::Text { text } => Self::Text { text },
             LoggedContentPart::Refusal { refusal } => Self::Refusal { refusal },
+        }
+    }
+}
+
+impl From<&Attachment> for LoggedAttachment {
+    fn from(attachment: &Attachment) -> Self {
+        match attachment {
+            Attachment::Image(image) => Self::Image {
+                mime_type: image.mime_type().to_string(),
+                data: image.data().to_vec(),
+            },
+        }
+    }
+}
+
+impl From<LoggedAttachment> for Attachment {
+    fn from(attachment: LoggedAttachment) -> Self {
+        match attachment {
+            LoggedAttachment::Image { mime_type, data } => {
+                Self::Image(ImageAttachment::new(mime_type, data))
+            }
         }
     }
 }
@@ -375,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_persistence_drops_binary_attachments() {
+    fn tool_result_persistence_round_trips_binary_attachments() {
         let original = Item::tool_result_item_with_attachments(
             "call_image",
             "attached",
@@ -390,11 +446,17 @@ mod tests {
         );
         let logged: LoggedItem = (&original).into();
         let json = serde_json::to_string(&logged).unwrap();
-        assert!(!json.contains("secret-image-body"));
-        assert!(!json.contains("attachments"));
+        assert!(json.contains("attachments"));
+        assert!(json.contains("c2VjcmV0LWltYWdlLWJvZHk="));
 
-        match Item::from(logged) {
-            Item::ToolResult { attachments, .. } => assert!(attachments.is_empty()),
+        let restored: LoggedItem = serde_json::from_str(&json).unwrap();
+        match Item::from(restored) {
+            Item::ToolResult { attachments, .. } => assert!(matches!(
+                attachments.as_slice(),
+                [Attachment::Image(image)]
+                    if image.mime_type() == "image/png"
+                        && image.data() == b"secret-image-body"
+            )),
             other => panic!("unexpected variant: {other:?}"),
         }
     }
