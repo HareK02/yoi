@@ -396,6 +396,7 @@ impl WorkspaceApi {
         runtime_id: &str,
         mut request: WorkerSpawnRequest,
     ) -> ApiResult<WorkerSpawnResult> {
+        self.validate_worker_spawn_repository_scope(&request)?;
         let workspace_api = self.workspace_api_ref(runtime_id);
         request.resolved_workspace_api = Some(workspace_api.clone());
         let attachment_reservation =
@@ -572,6 +573,64 @@ impl WorkspaceApi {
 
     fn repository_reader(&self) -> RepositoryRegistryReader {
         RepositoryRegistryReader::new(self.config.repositories.clone())
+    }
+
+    fn require_workspace_repository(&self, repository_id: &str) -> ApiResult<RepositoryRecord> {
+        self.store
+            .get_repository(&self.config.workspace_id, repository_id)?
+            .ok_or_else(|| ApiError::from(Error::UnknownRepository(repository_id.to_string())))
+    }
+
+    fn require_configured_workspace_repository(
+        &self,
+        repository_id: &str,
+    ) -> ApiResult<ConfiguredRepository> {
+        self.require_workspace_repository(repository_id)?;
+        self.config
+            .repositories
+            .iter()
+            .find(|repository| repository.id == repository_id)
+            .cloned()
+            .ok_or_else(|| ApiError::from(Error::UnknownRepository(repository_id.to_string())))
+    }
+
+    fn validate_worker_spawn_repository_scope(
+        &self,
+        request: &WorkerSpawnRequest,
+    ) -> ApiResult<()> {
+        let selected_repository_id =
+            if let Some(working_directory) = request.resolved_working_directory_request.as_ref() {
+                let repository_id = working_directory.repository.id.as_str();
+                self.require_workspace_repository(repository_id)?;
+                Some(repository_id.to_string())
+            } else if let Some(claim) = request.resolved_working_directory.as_ref() {
+                let workdir = self
+                    .store
+                    .get_workdir_registry(&self.config.workspace_id, &claim.working_directory_id)?
+                    .ok_or_else(|| {
+                        ApiError::from(Error::Config(format!(
+                            "unknown working directory `{}` in this Workspace",
+                            claim.working_directory_id
+                        )))
+                    })?;
+                self.require_workspace_repository(&workdir.repository_id)?;
+                Some(workdir.repository_id)
+            } else {
+                None
+            };
+
+        if let WorkerSpawnIntent::TicketRole { ticket_id, .. } = &request.intent {
+            let ticket = self.authority.ticket(ticket_id)?;
+            if let Some(repository_id) = ticket.repository_id.as_deref() {
+                self.require_workspace_repository(repository_id)?;
+                if selected_repository_id.as_deref() != Some(repository_id) {
+                    return Err(ApiError::from(Error::Config(format!(
+                        "Ticket `{ticket_id}` targets repository `{repository_id}`, but the Worker launch does not resolve that repository in this Workspace"
+                    ))));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2401,11 +2460,10 @@ async fn scoped_edit_ticket_item(
 ) -> ApiResult<Json<TicketDetail>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     if let Some(TicketTargetEdit::Set { repository_id, .. }) = request.target.as_ref() {
-        if !api
+        if api
             .store
-            .list_repositories(&api.config.workspace_id)?
-            .iter()
-            .any(|repository| repository.repository_id == *repository_id)
+            .get_repository(&api.config.workspace_id, repository_id)?
+            .is_none()
         {
             return Err(settings_bad_request(
                 "unknown_ticket_repository",
@@ -2563,6 +2621,7 @@ async fn execute_worker_ticket_rest_operation(
     let is_mutation = operation_kind != "read";
     let target = ticket_mutation_target(&operation).cloned();
     let source = authenticate_worker_mutation_source(api, workspace_id, &headers)?;
+    validate_ticket_repository_operation(api, &operation)?;
     let before = target.as_ref().and_then(|id| backend.show(id.clone()).ok());
     let previous_state = before
         .as_ref()
@@ -3104,6 +3163,24 @@ fn ticket_mutation_target(operation: &TicketBackendOperation) -> Option<&TicketI
         | TicketBackendOperation::AddOrchestrationPlanRecord { id, .. } => Some(id),
         _ => None,
     }
+}
+
+fn validate_ticket_repository_operation(
+    api: &WorkspaceApi,
+    operation: &TicketBackendOperation,
+) -> ApiResult<()> {
+    let repository_id = match operation {
+        TicketBackendOperation::Create { input } => input.repository_id.as_deref(),
+        TicketBackendOperation::EditItem { edit, .. } => match edit.target.as_ref() {
+            Some(TicketTargetEdit::Set { repository_id, .. }) => Some(repository_id.as_str()),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(repository_id) = repository_id {
+        api.require_workspace_repository(repository_id)?;
+    }
+    Ok(())
 }
 
 fn bind_worker_ticket_operation_source(
@@ -6819,19 +6896,22 @@ fn working_directory_request_from_repository(
 }
 
 fn configured_working_directory_request(
-    config: &ServerConfig,
+    api: &WorkspaceApi,
     request: &WorkerSpawnWorkingDirectoryRequest,
 ) -> Result<WorkingDirectoryRequest> {
-    let repository = config
+    if api
+        .store
+        .get_repository(&api.config.workspace_id, &request.repository_id)?
+        .is_none()
+    {
+        return Err(Error::UnknownRepository(request.repository_id.clone()));
+    }
+    let repository = api
+        .config
         .repositories
         .iter()
         .find(|repository| repository.id == request.repository_id)
-        .ok_or_else(|| {
-            Error::Config(format!(
-                "unknown repository id `{}` for Worker working directory",
-                request.repository_id
-            ))
-        })?;
+        .ok_or_else(|| Error::UnknownRepository(request.repository_id.clone()))?;
     Ok(working_directory_request_from_repository(
         repository,
         request.selector.as_deref(),
@@ -7635,9 +7715,7 @@ async fn create_runtime_worker(
     request.resolved_working_directory_request = request
         .working_directory_request
         .as_ref()
-        .map(|working_directory| {
-            configured_working_directory_request(&api.config, working_directory)
-        })
+        .map(|working_directory| configured_working_directory_request(&api, working_directory))
         .transpose()?;
     let prepared_workdir_id = if let Some(working_directory_request) =
         request.resolved_working_directory_request.as_mut()
@@ -9568,12 +9646,7 @@ fn working_directory_request_for_browser(
     api: &WorkspaceApi,
     request: BrowserWorkingDirectoryCreateRequest,
 ) -> ApiResult<WorkingDirectoryRequest> {
-    let repository = api
-        .config
-        .repositories
-        .iter()
-        .find(|repository| repository.id == request.repository_id)
-        .ok_or_else(|| Error::UnknownRepository(request.repository_id.clone()))?;
+    let repository = api.require_configured_workspace_repository(&request.repository_id)?;
     let selector = request
         .selector
         .or_else(|| repository.default_selector.clone())
@@ -10336,6 +10409,111 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn repository_bound_ticket_flow_and_workdir_launches_fail_closed_across_workspaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let other_workspace = WorkspaceRecord {
+            workspace_id: "other-workspace".to_string(),
+            owner_account_id: None,
+            display_name: "Other Workspace".to_string(),
+            state: "active".to_string(),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+        api.store.upsert_workspace(&other_workspace).await.unwrap();
+        api.store
+            .upsert_repository(&RepositoryRecord {
+                workspace_id: other_workspace.workspace_id.clone(),
+                repository_id: "foreign".to_string(),
+                name: "Foreign".to_string(),
+                kind: "git".to_string(),
+                provider: Some("git".to_string()),
+                uri: dir.path().join("foreign").display().to_string(),
+                default_ref: Some("HEAD".to_string()),
+                auth_ref_kind: None,
+                auth_ref_key: None,
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+            })
+            .unwrap();
+
+        let mut create_input = ticket::NewTicket::new("Foreign repository target");
+        create_input.repository_id = Some("foreign".to_string());
+        assert!(
+            validate_ticket_repository_operation(
+                &api,
+                &TicketBackendOperation::Create {
+                    input: create_input.clone(),
+                },
+            )
+            .is_err()
+        );
+
+        let ticket = browser_ticket_backend(&api)
+            .unwrap()
+            .create(create_input)
+            .unwrap();
+        let flow_ticket_launch = WorkerSpawnRequest {
+            requested_worker_name: Some("cross-workspace-ticket".to_string()),
+            intent: WorkerSpawnIntent::TicketRole {
+                ticket_id: ticket.id,
+                role: TicketWorkerRole::Coder,
+            },
+            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                expected_segments: 2,
+            },
+            profile: ProfileSelector::Builtin("builtin:coder".to_string()),
+            ticket_assignment: None,
+            initial_submit: vec![
+                Segment::Flow {
+                    selector: "builtin:coder-review".to_string(),
+                },
+                Segment::text("Implement the Ticket"),
+            ],
+            working_directory_request: None,
+            resolved_working_directory_request: None,
+            resolved_working_directory: None,
+            resolved_config_bundle: None,
+            resolved_worker_observation_enabled: false,
+            resolved_worker_observation_grants: Vec::new(),
+            resolved_workspace_api: None,
+        };
+        assert!(
+            api.validate_worker_spawn_repository_scope(&flow_ticket_launch)
+                .is_err()
+        );
+
+        let mut foreign_repository = api.config.repositories[0].clone();
+        foreign_repository.id = "foreign".to_string();
+        let workdir_flow_launch = WorkerSpawnRequest {
+            requested_worker_name: Some("cross-workspace-workdir".to_string()),
+            intent: WorkerSpawnIntent::WorkspaceCoding,
+            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                expected_segments: 1,
+            },
+            profile: ProfileSelector::Builtin("builtin:coder".to_string()),
+            ticket_assignment: None,
+            initial_submit: vec![Segment::Flow {
+                selector: "builtin:coder-review".to_string(),
+            }],
+            working_directory_request: None,
+            resolved_working_directory_request: Some(working_directory_request_from_repository(
+                &foreign_repository,
+                Some("HEAD"),
+            )),
+            resolved_working_directory: None,
+            resolved_config_bundle: None,
+            resolved_worker_observation_enabled: false,
+            resolved_worker_observation_grants: Vec::new(),
+            resolved_workspace_api: None,
+        };
+        assert!(
+            api.validate_worker_spawn_repository_scope(&workdir_flow_launch)
+                .is_err()
+        );
+    }
+
     #[test]
     fn worker_ticket_assignment_projects_coder_intent_and_run_acceptance() {
         let initial_submit = vec![
@@ -10678,6 +10856,7 @@ mod tests {
     async fn workspace_workdir_summaries_include_runtime_observed_rows() {
         let dir = tempfile::tempdir().unwrap();
         let api = test_api(dir.path()).await;
+        seed_test_repository(&api, "repo");
         api.store
             .upsert_workdir_registry(&WorkdirRegistryRecord {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
@@ -12563,7 +12742,34 @@ mod tests {
         runtime_worker_id.to_string()
     }
 
+    fn seed_test_repository(api: &WorkspaceApi, repository_id: &str) {
+        if api
+            .store
+            .get_repository(&api.config.workspace_id, repository_id)
+            .unwrap()
+            .is_some()
+        {
+            return;
+        }
+        api.store
+            .upsert_repository(&RepositoryRecord {
+                workspace_id: api.config.workspace_id.clone(),
+                repository_id: repository_id.to_string(),
+                name: repository_id.to_string(),
+                kind: "git".to_string(),
+                provider: Some("git".to_string()),
+                uri: api.config.workspace_root.display().to_string(),
+                default_ref: Some("HEAD".to_string()),
+                auth_ref_kind: None,
+                auth_ref_key: None,
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+            })
+            .unwrap();
+    }
+
     fn seed_cleanup_workdir(api: &WorkspaceApi, workdir_id: &str, status: &str, cleanliness: &str) {
+        seed_test_repository(api, "repo-test");
         let now = now_registry_timestamp();
         api.store
             .upsert_workdir_registry(&WorkdirRegistryRecord {
@@ -14449,9 +14655,7 @@ mod tests {
             "/api/runtimes/embedded-worker-runtime/workers",
             json!({
                 "intent": {
-                    "kind": "ticket_role",
-                    "ticket_id": "00001KVZSGT0Q",
-                    "role": "coder"
+                    "kind": "workspace_coding"
                 },
                 "requested_worker_name": "api-friendly-name",
                 "acceptance": {
