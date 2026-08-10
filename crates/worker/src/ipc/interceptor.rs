@@ -328,6 +328,8 @@ impl Interceptor for WorkerInterceptor {
             output: ToolOutput {
                 summary: info.result.summary.clone(),
                 content: info.result.content.clone(),
+
+                attachments: Vec::new(),
             },
         };
         for hook in &self.registry.post_tool_call {
@@ -911,6 +913,8 @@ mod tests {
                 ToolOutput {
                     summary: "ok".into(),
                     content: Some("full".into()),
+
+                    attachments: Vec::new(),
                 },
             ),
             meta: info.meta,

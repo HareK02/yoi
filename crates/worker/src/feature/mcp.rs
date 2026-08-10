@@ -781,6 +781,7 @@ fn render_list_resources_result(result: ListResourcesResult) -> Result<ToolOutpu
     Ok(ToolOutput {
         summary,
         content: Some(content),
+        attachments: Vec::new(),
     })
 }
 
@@ -822,6 +823,7 @@ fn render_read_resource_result(result: ReadResourceResult) -> Result<ToolOutput,
     Ok(ToolOutput {
         summary,
         content: Some(content),
+        attachments: Vec::new(),
     })
 }
 
@@ -876,6 +878,7 @@ fn render_list_prompts_result(result: ListPromptsResult) -> Result<ToolOutput, T
     Ok(ToolOutput {
         summary,
         content: Some(content),
+        attachments: Vec::new(),
     })
 }
 
@@ -924,6 +927,7 @@ fn render_get_prompt_result(result: GetPromptResult) -> Result<ToolOutput, ToolE
     Ok(ToolOutput {
         summary,
         content: Some(content),
+        attachments: Vec::new(),
     })
 }
 
@@ -1242,6 +1246,7 @@ fn render_call_tool_result(
     Ok(ToolOutput {
         summary,
         content: Some(content),
+        attachments: Vec::new(),
     })
 }
 

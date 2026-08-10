@@ -492,6 +492,8 @@ impl Tool for SubWorkerSpawnTool {
         Ok(ToolOutput {
             summary: format!("spawned internal worker `{}`", input.name),
             content: None,
+
+            attachments: Vec::new(),
         })
     }
 }

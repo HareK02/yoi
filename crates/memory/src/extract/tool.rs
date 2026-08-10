@@ -85,6 +85,7 @@ impl Tool for WriteExtractedTool {
         Ok(ToolOutput {
             summary,
             content: None,
+            attachments: Vec::new(),
         })
     }
 }

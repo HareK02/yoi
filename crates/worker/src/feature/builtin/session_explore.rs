@@ -384,6 +384,7 @@ fn json_output(summary: String, value: serde_json::Value) -> Result<ToolOutput, 
     Ok(ToolOutput {
         summary,
         content: Some(content),
+        attachments: Vec::new(),
     })
 }
 

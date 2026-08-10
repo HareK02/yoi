@@ -11,7 +11,7 @@ use llm_engine::tool::{Tool, ToolDefinition, ToolMeta};
 use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
 use serde_json::json;
 use tempfile::TempDir;
-use tools::{Tracker, core_builtin_tools};
+use tools::{Tracker, core_builtin_tools, view_image_tool};
 use workdir::{LocalWorkdirSession, WorkdirSessionHandle};
 
 fn scope_with_spill(workspace: &Path, spill: &Path) -> Scope {
@@ -98,6 +98,31 @@ fn meta_has_description_and_schema() {
             meta.name
         );
     }
+}
+
+#[tokio::test]
+async fn view_image_reads_scoped_bytes_without_serializing_them_as_text() {
+    let dir = TempDir::new().unwrap();
+    let spill = TempDir::new().unwrap();
+    let scope = scope_with_spill(dir.path(), spill.path());
+    let session: WorkdirSessionHandle =
+        Arc::new(LocalWorkdirSession::new(scope, dir.path().to_path_buf()));
+    let png = b"\x89PNG\r\n\x1a\nprivate-image-body";
+    std::fs::write(dir.path().join("image.png"), png).unwrap();
+    let definition = view_image_tool(session);
+    let (_meta, tool) = definition();
+
+    let output = call(&tool, json!({ "path": "image.png" })).await;
+    assert_eq!(output.attachments.len(), 1);
+    let llm_engine::tool::Attachment::Image(image) = &output.attachments[0];
+    assert_eq!(image.mime_type(), "image/png");
+    assert_eq!(image.data(), png);
+    let serialized = serde_json::to_string(&output).unwrap();
+    assert!(!serialized.contains("private-image-body"));
+    assert!(!serialized.contains("attachments"));
+
+    let escaped = call_err(&tool, json!({ "path": "../outside.png" })).await;
+    assert!(escaped.to_string().contains("scope") || escaped.to_string().contains("path"));
 }
 
 #[tokio::test]

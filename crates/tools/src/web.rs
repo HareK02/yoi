@@ -1743,6 +1743,7 @@ fn json_output(value: Value) -> ToolOutput {
     ToolOutput {
         summary,
         content: Some(content),
+        attachments: Vec::new(),
     }
 }
 

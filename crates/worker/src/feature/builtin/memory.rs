@@ -292,6 +292,7 @@ fn tool_output(output: MemoryToolOutput) -> ToolOutput {
     ToolOutput {
         summary: output.summary,
         content: output.content,
+        attachments: Vec::new(),
     }
 }
 

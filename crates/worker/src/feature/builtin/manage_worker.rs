@@ -283,6 +283,7 @@ impl Tool for WorkspaceWorkerTool {
         Ok(ToolOutput {
             summary: format!("{} completed", self.operation.tool_name()),
             content: Some(response.body),
+            attachments: Vec::new(),
         })
     }
 }

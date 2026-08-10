@@ -86,6 +86,7 @@ impl Tool for ReadTool {
         Ok(ToolOutput {
             summary,
             content: Some(rendered.body),
+            attachments: Vec::new(),
         })
     }
 }

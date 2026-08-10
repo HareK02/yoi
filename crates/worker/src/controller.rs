@@ -648,6 +648,12 @@ where
                 tracker.clone(),
                 bash_output_dir,
             ));
+        if feature_config.image.enabled && model_supports_image_attachments(&spawner_manifest.model)
+        {
+            worker
+                .engine_mut()
+                .register_tool(tools::view_image_tool(workdir.clone()));
+        }
         (Some(workdir), Some(tracker))
     } else {
         (None, None)
@@ -1570,6 +1576,16 @@ where
     }
 }
 
+fn model_supports_image_attachments(model: &manifest::ModelManifest) -> bool {
+    manifest::model_catalog::resolve_model_manifest(model).is_ok_and(|model| {
+        model.capability.is_some_and(|capability| capability.vision)
+            && matches!(
+                model.scheme,
+                manifest::SchemeKind::OpenaiChat | manifest::SchemeKind::OpenaiResponses
+            )
+    })
+}
+
 fn build_greeting<C, St>(worker: &Worker<C, St>) -> protocol::Greeting
 where
     C: LlmClient,
@@ -1648,6 +1664,20 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio::net::UnixListener;
+
+    #[test]
+    fn image_attachment_gate_requires_vision_and_supported_openai_scheme() {
+        let openai = manifest::ModelManifest {
+            ref_: Some("codex-oauth/gpt-5.6-sol".to_string()),
+            ..Default::default()
+        };
+        let anthropic = manifest::ModelManifest {
+            ref_: Some("anthropic/claude-opus-4-8".to_string()),
+            ..Default::default()
+        };
+        assert!(model_supports_image_attachments(&openai));
+        assert!(!model_supports_image_attachments(&anthropic));
+    }
 
     #[test]
     fn pending_run_parent_origin_table() {

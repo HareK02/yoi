@@ -76,6 +76,7 @@ impl Tool for WriteTool {
         Ok(ToolOutput {
             summary,
             content: None,
+            attachments: Vec::new(),
         })
     }
 }

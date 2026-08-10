@@ -962,6 +962,7 @@ fn builtin_base_profile_artifact() -> serde_json::Value {
             "task": { "enabled": true },
             "memory": { "enabled": true },
             "web": { "enabled": true },
+            "image": { "enabled": true },
             "sub_worker": { "enabled": true },
             "worker": { "enabled": false },
             "objective": { "enabled": true },
@@ -998,6 +999,7 @@ fn apply_role_profile(
     value["feature"]["task"] = serde_json::json!({ "enabled": task });
     value["feature"]["memory"] = serde_json::json!({ "enabled": memory });
     value["feature"]["web"] = serde_json::json!({ "enabled": web });
+    value["feature"]["image"] = serde_json::json!({ "enabled": true });
     value["feature"]["sub_worker"] = serde_json::json!({ "enabled": sub_worker });
     value["feature"]["flow"] = serde_json::json!({ "enabled": slug == "coder" });
     value["feature"]["worker"] =

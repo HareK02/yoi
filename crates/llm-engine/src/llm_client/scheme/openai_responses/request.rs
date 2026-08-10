@@ -10,7 +10,7 @@ use serde_json::Value;
 use crate::llm_client::{
     Request,
     capability::{ModelCapability, ReasoningControl, ReasoningSupport},
-    types::{ContentPart, Item, Role, ToolDefinition, parse_tool_arguments},
+    types::{ContentPart, Item, Role, ToolDefinition, image_data_url, parse_tool_arguments},
 };
 
 use super::OpenAIResponsesScheme;
@@ -89,12 +89,7 @@ pub(crate) enum InputItem {
         arguments: String,
     },
     /// function tool の結果（user 側）。
-    FunctionCallOutput {
-        call_id: String,
-        /// Responses は文字列 or 構造化 output を許すが、ここでは
-        /// `summary` + `content` を改行連結した文字列で送る。
-        output: String,
-    },
+    FunctionCallOutput { call_id: String, output: String },
     /// reasoning item。`encrypted_content` があれば必ず添える。
     Reasoning {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -118,6 +113,11 @@ pub(crate) enum InputItem {
 pub(crate) enum InputContent {
     /// user / developer 側のテキスト
     InputText { text: String },
+    /// user 側の画像
+    InputImage {
+        image_url: String,
+        detail: &'static str,
+    },
     /// assistant 側のテキスト
     OutputText { text: String },
 }
@@ -173,7 +173,7 @@ impl OpenAIResponsesScheme {
         request: &Request,
         capability: &ModelCapability,
     ) -> ResponsesRequest {
-        let input = convert_items_to_input(&request.items);
+        let input = convert_items_to_input(&request.items, capability.vision);
         let tools = request.tools.iter().map(convert_tool).collect();
 
         // Reasoning 投影: capability が Effort / Both をサポートし、かつ
@@ -234,7 +234,7 @@ impl OpenAIResponsesScheme {
 }
 
 /// `Item` 列を `input[]` に変換する。
-fn convert_items_to_input(items: &[Item]) -> Vec<InputItem> {
+fn convert_items_to_input(items: &[Item], supports_images: bool) -> Vec<InputItem> {
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         match item {
@@ -247,8 +247,17 @@ fn convert_items_to_input(items: &[Item]) -> Vec<InputItem> {
                     };
                 let parts: Vec<InputContent> = content
                     .iter()
-                    .map(|p| match p {
+                    .map(|part| match part {
                         ContentPart::Text { text } => text_variant(text.clone()),
+                        ContentPart::Image { media_type, source }
+                            if matches!(role, Role::User) && supports_images =>
+                        {
+                            InputContent::InputImage {
+                                image_url: image_data_url(media_type, source.data()),
+                                detail: "auto",
+                            }
+                        }
+                        ContentPart::Image { .. } => text_variant(part.as_text().to_string()),
                         ContentPart::Refusal { refusal } => text_variant(refusal.clone()),
                     })
                     .collect();
@@ -277,13 +286,13 @@ fn convert_items_to_input(items: &[Item]) -> Vec<InputItem> {
                 content,
                 ..
             } => {
-                let text = match content {
+                let output = match content {
                     Some(c) => format!("{summary}\n{c}"),
                     None => summary.clone(),
                 };
                 out.push(InputItem::FunctionCallOutput {
                     call_id: call_id.clone(),
-                    output: text,
+                    output,
                 });
             }
             Item::Reasoning {
@@ -689,5 +698,49 @@ mod tests {
         assert_eq!(json["include"][0], "reasoning.encrypted_content");
         assert_eq!(json["tools"][0]["type"], "function");
         assert_eq!(json["tools"][0]["name"], "t");
+    }
+
+    #[test]
+    fn synthetic_user_image_uses_responses_input_image_content() {
+        let scheme = OpenAIResponsesScheme::new();
+        let image = std::sync::Arc::<[u8]>::from(&b"\x89PNG\r\n\x1a\nbody"[..]);
+        let item = Item::tool_result_item_with_attachments(
+            "call_image",
+            "Attached image",
+            None,
+            false,
+            vec![crate::tool::Attachment::Image(
+                crate::tool::ImageAttachment::new("image/png", image.clone()),
+            )],
+        );
+        let req = Request::new()
+            .item(Item::tool_call(
+                "call_image",
+                "ViewImage",
+                r#"{"path":"a.png"}"#,
+            ))
+            .item(item)
+            .item(Item::user_message_parts(vec![ContentPart::image(
+                "image/png",
+                image,
+            )]));
+        let body = scheme.build_request("gpt-5", &req, &cap_with_reasoning());
+        let json = serde_json::to_value(&body).unwrap();
+
+        assert_eq!(json["input"][1]["type"], "function_call_output");
+        assert_eq!(json["input"][2]["type"], "message");
+        assert_eq!(json["input"][2]["content"][0]["type"], "input_image");
+        assert!(
+            json["input"][2]["content"][0]["image_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
+
+        let mut no_vision = cap_with_reasoning();
+        no_vision.vision = false;
+        let disabled =
+            serde_json::to_string(&scheme.build_request("gpt-5", &req, &no_vision)).unwrap();
+        assert!(!disabled.contains("data:image"));
     }
 }

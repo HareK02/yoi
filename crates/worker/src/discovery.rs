@@ -854,6 +854,7 @@ where
         Ok(ToolOutput {
             summary,
             content: Some(json_content(&items)?),
+            attachments: Vec::new(),
         })
     }
 }
@@ -890,6 +891,8 @@ where
         Ok(ToolOutput {
             summary,
             content: Some(json_content(&result)?),
+
+            attachments: Vec::new(),
         })
     }
 }
@@ -982,6 +985,7 @@ where
         Ok(ToolOutput {
             summary: format!("sent peer message to `{}`", input.name),
             content: None,
+            attachments: Vec::new(),
         })
     }
 }

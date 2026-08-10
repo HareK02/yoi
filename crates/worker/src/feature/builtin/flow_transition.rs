@@ -253,6 +253,7 @@ impl Tool for RequestFlowTransitionTool {
         Ok(ToolOutput {
             summary,
             content: Some(content),
+            attachments: Vec::new(),
         })
     }
 }
@@ -422,6 +423,7 @@ impl Tool for FinishFlowVerificationTool {
         Ok(ToolOutput {
             summary: "Recorded complete Flow verification verdicts.".to_string(),
             content: Some("{\"accepted\":true}".to_string()),
+            attachments: Vec::new(),
         })
     }
 }

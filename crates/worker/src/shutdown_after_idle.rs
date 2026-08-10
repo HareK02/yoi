@@ -89,6 +89,8 @@ mod tests {
             output: ToolOutput {
                 summary: "result".to_string(),
                 content: None,
+
+                attachments: Vec::new(),
             },
         }
     }

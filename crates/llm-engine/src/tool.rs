@@ -3,8 +3,7 @@
 //! Traits for defining tools callable by LLM.
 //! Usually auto-implemented using the `#[tool]` macro.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -89,19 +88,63 @@ pub(crate) fn truncate_content(content: &mut String, limit: usize) {
     content.push_str(&suffix_template.replace("%BYTES%", &dropped.to_string()));
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct ImageAttachment {
+    mime_type: String,
+    data: Arc<[u8]>,
+}
+
+impl ImageAttachment {
+    pub fn new(mime_type: impl Into<String>, data: impl Into<Arc<[u8]>>) -> Self {
+        Self {
+            mime_type: mime_type.into(),
+            data: data.into(),
+        }
+    }
+
+    pub fn mime_type(&self) -> &str {
+        &self.mime_type
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl fmt::Debug for ImageAttachment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ImageAttachment")
+            .field("mime_type", &self.mime_type)
+            .field("bytes", &self.data.len())
+            .finish()
+    }
+}
+
+/// Request-local binary payload emitted by a tool.
+///
+/// Attachments are deliberately excluded from serde. They may be projected into
+/// the immediately following provider request, but never into persisted history,
+/// protocol events, logs, or telemetry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Attachment {
+    Image(ImageAttachment),
+}
+
 /// Tool execution result.
 ///
 /// Every output has a mandatory `summary` (1-2 lines) that persists in
 /// conversation history even after pruning. The optional `content` carries
-/// full details and is removed by the Prune mechanism when the context
-/// grows too large.
+/// full text details. `attachments` are request-local and are never serialized.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolOutput {
     /// Short summary (1-2 lines). Always remains in history.
     pub summary: String,
-    /// Detailed output. Removed by Prune when old enough.
+    /// Detailed text output. Removed by Prune when old enough.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Structured binary payloads for the immediately following model request.
+    #[serde(skip, default)]
+    pub attachments: Vec<Attachment>,
 }
 
 impl From<String> for ToolOutput {
@@ -110,6 +153,7 @@ impl From<String> for ToolOutput {
             ToolOutput {
                 summary: s,
                 content: None,
+                attachments: Vec::new(),
             }
         } else {
             let lines = s.lines().count();
@@ -118,6 +162,7 @@ impl From<String> for ToolOutput {
             ToolOutput {
                 summary,
                 content: Some(s),
+                attachments: Vec::new(),
             }
         }
     }
@@ -364,6 +409,9 @@ pub struct ToolResult {
     /// Whether this is an error
     #[serde(default)]
     pub is_error: bool,
+    /// Request-local structured payloads. Never serialized or persisted.
+    #[serde(skip, default)]
+    pub attachments: Vec<Attachment>,
 }
 
 impl ToolResult {
@@ -374,6 +422,7 @@ impl ToolResult {
             summary: output.summary,
             content: output.content,
             is_error: false,
+            attachments: output.attachments,
         }
     }
 
@@ -384,6 +433,7 @@ impl ToolResult {
             summary: message.into(),
             content: None,
             is_error: true,
+            attachments: Vec::new(),
         }
     }
 }

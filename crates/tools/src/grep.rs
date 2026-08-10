@@ -120,6 +120,7 @@ impl Tool for GrepTool {
         Ok(ToolOutput {
             summary,
             content: (!result.output.is_empty()).then_some(result.output),
+            attachments: Vec::new(),
         })
     }
 }

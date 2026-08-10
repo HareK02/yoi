@@ -41,6 +41,8 @@ impl WorkspaceHttpObjectiveBackend {
         Ok(ToolOutput {
             summary: format!("Listed {count} objective(s)"),
             content: Some(serde_json::to_string_pretty(&response).map_err(decode_error)?),
+
+            attachments: Vec::new(),
         })
     }
 
@@ -249,6 +251,8 @@ fn objective_output(summary: String, response: ObjectiveDetail) -> Result<ToolOu
     Ok(ToolOutput {
         summary,
         content: Some(serde_json::to_string_pretty(&response).map_err(decode_error)?),
+
+        attachments: Vec::new(),
     })
 }
 

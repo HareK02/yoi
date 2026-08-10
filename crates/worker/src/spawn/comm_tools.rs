@@ -69,6 +69,7 @@ impl Tool for SubWorkerListTool {
         Ok(ToolOutput {
             summary: format!("listed {count} child SubWorker(s)"),
             content: Some(content),
+            attachments: Vec::new(),
         })
     }
 }
@@ -124,6 +125,7 @@ impl Tool for SubWorkerSendTool {
             return Ok(ToolOutput {
                 summary: format!("sent message to `{}`", input.name),
                 content: None,
+                attachments: Vec::new(),
             });
         }
         Err(unknown_worker_err(&input.name))
@@ -177,6 +179,7 @@ impl Tool for SubWorkerStopTool {
                     input.name
                 ),
                 content: None,
+                attachments: Vec::new(),
             });
         }
         Err(unknown_worker_err(&input.name))

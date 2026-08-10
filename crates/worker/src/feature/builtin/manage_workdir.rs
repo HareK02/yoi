@@ -492,6 +492,7 @@ fn workdir_output<T: Serialize>(summary: String, value: &T) -> Result<ToolOutput
     Ok(ToolOutput {
         summary,
         content: Some(serde_json::to_string_pretty(value).map_err(decode_error)?),
+        attachments: Vec::new(),
     })
 }
 

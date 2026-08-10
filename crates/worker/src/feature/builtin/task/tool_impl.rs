@@ -111,6 +111,8 @@ impl Tool for TaskListTool {
         Ok(ToolOutput {
             summary: list_overview(active_tasks.len(), tasks.len()),
             content: Some(render_task_list(&tasks)),
+
+            attachments: Vec::new(),
         })
     }
 }
@@ -131,6 +133,8 @@ impl Tool for TaskGetTool {
         Ok(ToolOutput {
             summary: format!("Task {} ({}) {}", task.taskid, task.status, task.subject),
             content: Some(content),
+
+            attachments: Vec::new(),
         })
     }
 }
@@ -170,6 +174,8 @@ fn task_output(summary: String, task: &TaskEntry) -> ToolOutput {
     ToolOutput {
         summary,
         content: Some(serde_json::to_string_pretty(task).unwrap_or_default()),
+
+        attachments: Vec::new(),
     }
 }
 

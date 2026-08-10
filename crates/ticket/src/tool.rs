@@ -1703,6 +1703,7 @@ fn json_output(summary: String, value: impl Serialize) -> ToolOutput {
     ToolOutput {
         summary,
         content: Some(serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())),
+        attachments: Vec::new(),
     }
 }
 

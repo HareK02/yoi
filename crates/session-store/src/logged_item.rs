@@ -153,6 +153,7 @@ impl From<LoggedItem> for Item {
                 summary,
                 content,
                 is_error,
+                attachments: Vec::new(),
             },
             LoggedItem::Reasoning {
                 text,
@@ -213,6 +214,9 @@ impl From<&ContentPart> for LoggedContentPart {
     fn from(part: &ContentPart) -> Self {
         match part {
             ContentPart::Text { text } => Self::Text { text: text.clone() },
+            ContentPart::Image { .. } => Self::Text {
+                text: part.as_text().to_string(),
+            },
             ContentPart::Refusal { refusal } => Self::Refusal {
                 refusal: refusal.clone(),
             },
@@ -366,6 +370,31 @@ mod tests {
         assert_eq!(value["is_error"], true);
         match Item::from(logged) {
             Item::ToolResult { is_error, .. } => assert!(is_error),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_result_persistence_drops_binary_attachments() {
+        let original = Item::tool_result_item_with_attachments(
+            "call_image",
+            "attached",
+            None,
+            false,
+            vec![llm_engine::tool::Attachment::Image(
+                llm_engine::tool::ImageAttachment::new(
+                    "image/png",
+                    std::sync::Arc::<[u8]>::from(&b"secret-image-body"[..]),
+                ),
+            )],
+        );
+        let logged: LoggedItem = (&original).into();
+        let json = serde_json::to_string(&logged).unwrap();
+        assert!(!json.contains("secret-image-body"));
+        assert!(!json.contains("attachments"));
+
+        match Item::from(logged) {
+            Item::ToolResult { attachments, .. } => assert!(attachments.is_empty()),
             other => panic!("unexpected variant: {other:?}"),
         }
     }

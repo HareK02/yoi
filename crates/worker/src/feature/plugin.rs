@@ -4098,6 +4098,8 @@ impl PluginInstance {
                 Ok(ToolOutput {
                     summary: format!("{tool_name}: {tool_calls}"),
                     content: Some(String::from_utf8_lossy(&input).to_string()),
+
+                    attachments: Vec::new(),
                 })
             }
             PluginInstanceRuntime::ComponentInstance(runtime) => {
@@ -5447,7 +5449,11 @@ fn decode_plugin_wasm_output(bytes: &[u8]) -> Result<ToolOutput, PluginWasmError
             ));
         }
     };
-    Ok(ToolOutput { summary, content })
+    Ok(ToolOutput {
+        summary,
+        content,
+        attachments: Vec::new(),
+    })
 }
 
 fn bounded_message(message: impl Into<String>) -> String {

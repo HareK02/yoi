@@ -228,6 +228,8 @@ impl Tool for SearchSessionLogTool {
         Ok(ToolOutput {
             summary,
             content: (!content.is_empty()).then_some(content),
+
+            attachments: Vec::new(),
         })
     }
 }
@@ -290,6 +292,8 @@ impl Tool for ReadSessionItemsTool {
         Ok(ToolOutput {
             summary,
             content: (!content.is_empty()).then_some(content),
+
+            attachments: Vec::new(),
         })
     }
 }
@@ -395,6 +399,8 @@ impl Tool for MarkReadRequiredTool {
         Ok(ToolOutput {
             summary,
             content: None,
+
+            attachments: Vec::new(),
         })
     }
 }
@@ -423,6 +429,8 @@ impl Tool for AddReferenceTool {
         Ok(ToolOutput {
             summary: format!("Added reference {}", params.file_path.display()),
             content: None,
+
+            attachments: Vec::new(),
         })
     }
 }
@@ -452,6 +460,8 @@ impl Tool for WriteSummaryTool {
         Ok(ToolOutput {
             summary: note.to_string(),
             content: None,
+
+            attachments: Vec::new(),
         })
     }
 }

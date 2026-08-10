@@ -85,6 +85,7 @@ impl Tool for EditTool {
         Ok(ToolOutput {
             summary,
             content: Some(preview),
+            attachments: Vec::new(),
         })
     }
 }

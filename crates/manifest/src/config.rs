@@ -83,6 +83,8 @@ pub struct FeatureConfigPartial {
     #[serde(default)]
     pub web: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
+    pub image: Option<FeatureFlagConfigPartial>,
+    #[serde(default)]
     pub sub_worker: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
     pub flow: Option<FeatureFlagConfigPartial>,
@@ -104,6 +106,7 @@ impl FeatureConfigPartial {
             task: merge_option(self.task, other.task, FeatureFlagConfigPartial::merge),
             memory: merge_option(self.memory, other.memory, MemoryFeatureConfigPartial::merge),
             web: merge_option(self.web, other.web, FeatureFlagConfigPartial::merge),
+            image: merge_option(self.image, other.image, FeatureFlagConfigPartial::merge),
             sub_worker: merge_option(
                 self.sub_worker,
                 other.sub_worker,
@@ -189,6 +192,7 @@ impl From<FeatureConfigPartial> for FeatureConfig {
                 .map(MemoryFeatureConfig::from)
                 .unwrap_or_default(),
             web: value.web.map(FeatureFlagConfig::from).unwrap_or_default(),
+            image: value.image.map(FeatureFlagConfig::from).unwrap_or_default(),
             sub_worker: value
                 .sub_worker
                 .map(FeatureFlagConfig::from)
@@ -282,6 +286,7 @@ impl From<FeatureConfig> for FeatureConfigPartial {
             task: Some(value.task.into()),
             memory: Some(value.memory.into()),
             web: Some(value.web.into()),
+            image: Some(value.image.into()),
             sub_worker: Some(value.sub_worker.into()),
             flow: Some(value.flow.into()),
             worker: Some(value.worker.into()),

@@ -25,6 +25,7 @@ feature = {
     task = { enabled = true; };
     memory = { enabled = true; };
     web = { enabled = true; };
+    image = { enabled = true; };
     sub_worker = { enabled = true; };
     worker = { enabled = false; };
     objective = { enabled = true; };

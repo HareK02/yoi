@@ -96,7 +96,11 @@ impl Tool for BashTool {
         } else {
             Some(output.content)
         };
-        Ok(ToolOutput { summary, content })
+        Ok(ToolOutput {
+            summary,
+            content,
+            attachments: Vec::new(),
+        })
     }
 }
 

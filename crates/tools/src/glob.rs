@@ -69,6 +69,7 @@ impl Tool for GlobTool {
         Ok(ToolOutput {
             summary,
             content: (!body.is_empty()).then_some(body),
+            attachments: Vec::new(),
         })
     }
 }

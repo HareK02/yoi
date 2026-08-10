@@ -235,6 +235,7 @@ impl Tool for StageMemoryCandidateTool {
         Ok(ToolOutput {
             summary: format!("Staged Memory candidate {staging_id}."),
             content: Some(format!("staging_id: {staging_id}")),
+            attachments: Vec::new(),
         })
     }
 }
@@ -281,6 +282,7 @@ impl Tool for FinishMemoryExtractionTool {
                     format!("Finished extraction with {actual} staged candidate(s).")
                 }),
             content: None,
+            attachments: Vec::new(),
         })
     }
 }

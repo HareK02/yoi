@@ -8,7 +8,7 @@ use serde_json::Value;
 use crate::llm_client::{
     Request,
     capability::{ModelCapability, ReasoningControl, ReasoningSupport},
-    types::{Item, Role, ToolDefinition, parse_tool_arguments},
+    types::{ContentPart, Item, Role, ToolDefinition, image_data_url, parse_tool_arguments},
 };
 
 use super::OpenAIScheme;
@@ -134,7 +134,7 @@ impl OpenAIScheme {
         }
 
         // Convert items to messages
-        messages.extend(self.convert_items_to_messages(&request.items));
+        messages.extend(self.convert_items_to_messages(&request.items, capability.vision));
 
         let tools = request.tools.iter().map(|t| self.convert_tool(t)).collect();
 
@@ -185,7 +185,11 @@ impl OpenAIScheme {
     /// - Assistant messages have role "assistant"
     /// - Tool calls are within assistant messages as tool_calls array
     /// - Tool results have role "tool" with tool_call_id
-    fn convert_items_to_messages(&self, items: &[Item]) -> Vec<OpenAIMessage> {
+    fn convert_items_to_messages(
+        &self,
+        items: &[Item],
+        supports_images: bool,
+    ) -> Vec<OpenAIMessage> {
         let mut messages = Vec::new();
         let mut pending_tool_calls: Vec<OpenAIToolCall> = Vec::new();
         let mut pending_assistant_text: Option<String> = None;
@@ -205,16 +209,45 @@ impl OpenAIScheme {
                         Role::Assistant => "assistant",
                         Role::System => "system",
                     };
-
-                    let text_content: String = content
-                        .iter()
-                        .map(|p| p.as_text())
-                        .collect::<Vec<_>>()
-                        .join("");
+                    let has_image = matches!(role, Role::User)
+                        && supports_images
+                        && content
+                            .iter()
+                            .any(|part| matches!(part, ContentPart::Image { .. }));
+                    let message_content = if has_image {
+                        OpenAIContent::Parts(
+                            content
+                                .iter()
+                                .map(|part| match part {
+                                    ContentPart::Text { text } => {
+                                        OpenAIContentPart::Text { text: text.clone() }
+                                    }
+                                    ContentPart::Image { media_type, source } => {
+                                        OpenAIContentPart::ImageUrl {
+                                            image_url: ImageUrl {
+                                                url: image_data_url(media_type, source.data()),
+                                            },
+                                        }
+                                    }
+                                    ContentPart::Refusal { refusal } => OpenAIContentPart::Text {
+                                        text: refusal.clone(),
+                                    },
+                                })
+                                .collect(),
+                        )
+                    } else {
+                        OpenAIContent::Text(
+                            content
+                                .iter()
+                                .map(ContentPart::as_text)
+                                .collect::<Vec<_>>()
+                                .join(""),
+                        )
+                    };
 
                     messages.push(OpenAIMessage {
                         role: openai_role.to_string(),
-                        content: Some(OpenAIContent::Text(text_content)),
+                        content: Some(message_content),
                         tool_calls: vec![],
                         tool_call_id: None,
                         name: None,
@@ -334,6 +367,13 @@ mod tests {
         }
     }
 
+    fn vision_cap() -> ModelCapability {
+        ModelCapability {
+            vision: true,
+            ..cap()
+        }
+    }
+
     #[test]
     fn test_build_simple_request() {
         let scheme = OpenAIScheme::new();
@@ -438,5 +478,93 @@ mod tests {
         assert_eq!(body.messages[1].role, "assistant");
         assert_eq!(body.messages[1].tool_calls.len(), 1);
         assert_eq!(body.messages[2].role, "tool");
+    }
+
+    #[test]
+    fn parallel_tool_results_precede_synthetic_image_message() {
+        let scheme = OpenAIScheme::new();
+        let image = std::sync::Arc::<[u8]>::from(&b"\x89PNG\r\n\x1a\nbody"[..]);
+        let request = Request::new()
+            .item(Item::tool_call("call_image", "ViewImage", "{}"))
+            .item(Item::tool_call("call_text", "Read", "{}"))
+            .item(Item::tool_result_item(
+                "call_image",
+                "Attached image",
+                None,
+                false,
+            ))
+            .item(Item::tool_result_item(
+                "call_text",
+                "Read text",
+                None,
+                false,
+            ))
+            .item(Item::user_message_parts(vec![ContentPart::image(
+                "image/png",
+                image,
+            )]));
+        let json = serde_json::to_value(
+            &scheme
+                .build_request("gpt-4o", &request, &vision_cap())
+                .messages,
+        )
+        .unwrap();
+
+        assert_eq!(json[0]["role"], "assistant");
+        assert_eq!(json[1]["role"], "tool");
+        assert_eq!(json[2]["role"], "tool");
+        assert_eq!(json[3]["role"], "user");
+        assert_eq!(json[3]["content"][0]["type"], "image_url");
+    }
+
+    #[test]
+    fn tool_image_is_structured_as_following_user_content_without_persisting_bytes() {
+        let scheme = OpenAIScheme::new();
+        let image = std::sync::Arc::<[u8]>::from(&b"\x89PNG\r\n\x1a\nbody"[..]);
+        let attachment = crate::tool::Attachment::Image(crate::tool::ImageAttachment::new(
+            "image/png",
+            image.clone(),
+        ));
+        let item = Item::tool_result_item_with_attachments(
+            "call_image",
+            "Attached image",
+            None,
+            false,
+            vec![attachment],
+        );
+        let persisted = serde_json::to_string(&item).unwrap();
+        assert!(!persisted.contains("base64"));
+        assert!(!persisted.contains("attachments"));
+
+        let request = Request::new()
+            .item(Item::tool_call(
+                "call_image",
+                "ViewImage",
+                r#"{"path":"a.png"}"#,
+            ))
+            .item(item)
+            .item(Item::user_message_parts(vec![ContentPart::image(
+                "image/png",
+                image,
+            )]));
+        let body = scheme.build_request("gpt-4o", &request, &vision_cap());
+        let json = serde_json::to_value(&body.messages).unwrap();
+
+        assert_eq!(json[0]["role"], "assistant");
+        assert_eq!(json[1]["role"], "tool");
+        assert_eq!(json[2]["role"], "user");
+        assert_eq!(json[2]["content"][0]["type"], "image_url");
+        assert!(
+            json[2]["content"][0]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
+
+        let mut no_vision = cap();
+        no_vision.vision = false;
+        let disabled =
+            serde_json::to_string(&scheme.build_request("gpt-4o", &request, &no_vision)).unwrap();
+        assert!(!disabled.contains("data:image"));
     }
 }
