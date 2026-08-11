@@ -1497,6 +1497,9 @@ impl EmbeddedWorkerRuntime {
 
     pub fn from_runtime(workspace_id: impl AsRef<str>, runtime: worker_runtime::Runtime) -> Self {
         let workspace_id = workspace_id.as_ref().to_string();
+        runtime
+            .bind_runtime_identity(EMBEDDED_RUNTIME_ID)
+            .expect("fresh embedded Runtime must accept its Backend-owned identity");
         Self {
             runtime_id: EMBEDDED_RUNTIME_ID.to_string(),
             host_id: host_id_for_embedded_workspace(&workspace_id),

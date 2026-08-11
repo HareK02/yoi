@@ -156,6 +156,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "scope Repository identity and references by Workspace",
         apply: scope_repository_identity_by_workspace,
     },
+    Migration {
+        version: 28,
+        name: "create Worker retention authority",
+        apply: crate::retention::create_worker_retention_tables,
+    },
 ];
 
 struct Migration {
@@ -772,12 +777,23 @@ impl SqliteWorkspaceStore {
         })
     }
 
-    fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    pub(crate) fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let conn = self
             .conn
             .lock()
             .map_err(|_| Error::Store("sqlite connection lock poisoned".to_string()))?;
         f(&conn)
+    }
+
+    pub(crate) fn with_conn_mut<T>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> Result<T>,
+    ) -> Result<T> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| Error::Store("sqlite connection lock poisoned".to_string()))?;
+        f(&mut conn)
     }
 
     pub fn upsert_trusted_runtime(&self, record: &TrustedRuntimeRecord) -> Result<()> {
@@ -1919,6 +1935,23 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
 
     fn upsert_worker_registry(&self, record: &WorkerRegistryRecord) -> Result<()> {
         self.with_conn(|conn| {
+            let removal_blocks_upsert: bool = conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM worker_removal_operations
+                    WHERE workspace_id = ?1 AND runtime_id = ?2
+                      AND CAST(worker_id AS INTEGER) = ?3
+                      AND state IN ('executing', 'failed', 'succeeded')
+                )",
+                params![
+                    record.workspace_id,
+                    record.worker.runtime_id,
+                    record.worker.worker_id
+                ],
+                |row| row.get(0),
+            )?;
+            if removal_blocks_upsert {
+                return Ok(());
+            }
             conn.execute(
                 r#"INSERT INTO worker_registry (
                     workspace_id, runtime_id, runtime_worker_id, display_name, profile,
@@ -1937,7 +1970,14 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     session_ref = excluded.session_ref,
                     summary_ref = excluded.summary_ref,
                     diagnostics_ref = excluded.diagnostics_ref,
-                    updated_at = excluded.updated_at"#,
+                    updated_at = excluded.updated_at
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM worker_removal_operations retention
+                    WHERE retention.workspace_id = excluded.workspace_id
+                      AND retention.runtime_id = excluded.runtime_id
+                      AND CAST(retention.worker_id AS INTEGER) = excluded.runtime_worker_id
+                      AND retention.state IN ('executing', 'failed', 'succeeded')
+                )"#,
                 params![
                     record.workspace_id,
                     record.worker.runtime_id,
@@ -2006,7 +2046,13 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let changed = conn.execute(
                 r#"UPDATE worker_registry
                    SET retention_state = ?4, updated_at = ?5
-                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3"#,
+                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3
+                     AND NOT EXISTS (
+                       SELECT 1 FROM worker_removal_operations retention
+                       WHERE retention.workspace_id = ?1 AND retention.runtime_id = ?2
+                         AND CAST(retention.worker_id AS INTEGER) = ?3
+                         AND retention.state IN ('executing', 'failed')
+                     )"#,
                 params![
                     workspace_id,
                     worker.runtime_id,
@@ -2192,6 +2238,28 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<TicketWorkerAssignmentUpdate> {
         self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
+            let removal_blocks_assignment: bool = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM worker_removal_operations
+                    WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
+                      AND state IN ('executing', 'failed', 'succeeded')
+                    UNION ALL
+                    SELECT 1 FROM worker_tombstones
+                    WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
+                )",
+                params![
+                    record.workspace_id,
+                    record.worker.runtime_id,
+                    record.worker.worker_id
+                ],
+                |row| row.get(0),
+            )?;
+            if removal_blocks_assignment {
+                return Err(Error::TicketAssignmentConflict(format!(
+                    "Worker {}/{} is being retained or has been removed",
+                    record.worker.runtime_id, record.worker.worker_id
+                )));
+            }
             let mut reserved_operation = false;
             if let Some(existing) =
                 read_assignment_operation(&tx, &record.workspace_id, operation_id)?
@@ -4847,7 +4915,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 27);
+        assert_eq!(current_schema_version(&conn).unwrap(), 28);
         assert!(table_exists(&conn, "worker_workdir_attachment_reservations").unwrap());
     }
 
@@ -4880,7 +4948,7 @@ CREATE TABLE flow_events (event_id TEXT PRIMARY KEY);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 27);
+        assert_eq!(current_schema_version(&conn).unwrap(), 28);
         assert!(table_exists(&conn, "flow_sources").unwrap());
         assert!(table_exists(&conn, "flow_source_revisions").unwrap());
         assert!(!table_exists(&conn, "flow_instances").unwrap());
@@ -4947,7 +5015,7 @@ INSERT INTO worker_workdir_attachment_reservations (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 27);
+        assert_eq!(current_schema_version(&conn).unwrap(), 28);
         let repositories_sql: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'repositories'",
@@ -5127,7 +5195,7 @@ INSERT INTO workdir_registry (
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 27);
+        assert_eq!(store.schema_version().await.unwrap(), 28);
         assert!(
             !store
                 .with_conn(|conn| table_exists(conn, "worker_workspace_credentials"))
@@ -5144,7 +5212,7 @@ INSERT INTO workdir_registry (
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 27);
+        assert_eq!(reopened.schema_version().await.unwrap(), 28);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -5691,7 +5759,7 @@ INSERT INTO workdir_registry (
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 27);
+        assert_eq!(store.schema_version().await.unwrap(), 28);
 
         store
             .with_conn(|conn| {
@@ -5880,7 +5948,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 27);
+        assert_eq!(store.schema_version().await.unwrap(), 28);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -5946,7 +6014,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 27);
+        assert_eq!(store.schema_version().await.unwrap(), 28);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -6209,7 +6277,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 27);
+        assert_eq!(store.schema_version().await.unwrap(), 28);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),
