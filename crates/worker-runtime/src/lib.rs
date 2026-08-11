@@ -22,6 +22,8 @@ pub mod management;
 pub mod observation;
 pub mod profile_archive;
 pub mod resource;
+#[cfg(feature = "fs-store")]
+pub mod retention;
 mod runtime;
 pub mod worker_backend;
 pub mod working_directory;

@@ -26,6 +26,11 @@ use crate::management::{
 };
 #[cfg(feature = "ws-server")]
 use crate::observation::{WorkerObservationCursor, WorkerObservationEvent};
+#[cfg(feature = "fs-store")]
+use crate::retention::{
+    FsWorkerRetentionProvider, WorkerRetentionExecutionRequest, WorkerRetentionExecutionResult,
+    WorkerRetentionInventory, WorkerRetentionProvider,
+};
 use protocol::subscription::{
     EventSubscriptionSelector, SubscriptionEventPayload, SubscriptionSnapshot,
     SubscriptionValidationError, SubscriptionWorkdirId, SubscriptionWorker, SubscriptionWorkerId,
@@ -1648,6 +1653,118 @@ impl Runtime {
         Ok(())
     }
 
+    /// Bind the Backend registry identity once. Retention evidence fails closed
+    /// until the Runtime host supplies this trusted configuration.
+    pub fn bind_runtime_identity(&self, runtime_id: &str) -> Result<(), RuntimeError> {
+        if runtime_id.trim().is_empty() || runtime_id.len() > 160 {
+            return Err(RuntimeError::InvalidRequest(
+                "Runtime identity must be non-empty and bounded".to_string(),
+            ));
+        }
+        let mut state = self.lock()?;
+        match state.runtime_identity.as_deref() {
+            Some(current) if current == runtime_id => Ok(()),
+            Some(_) => Err(RuntimeError::InvalidRequest(
+                "Runtime identity is already bound".to_string(),
+            )),
+            None => {
+                state.runtime_identity = Some(runtime_id.to_string());
+                Ok(())
+            }
+        }
+    }
+
+    /// Read canonical aggregate facts needed by a Backend removal plan.
+    #[cfg(feature = "fs-store")]
+    pub fn worker_retention_inventory(
+        &self,
+        workspace_id: &str,
+        worker_ref: &WorkerRef,
+    ) -> Result<WorkerRetentionInventory, RuntimeError> {
+        let state = self.lock()?;
+        let runtime_id = state.runtime_identity.as_deref().ok_or_else(|| {
+            RuntimeError::InvalidRequest(
+                "Runtime identity is not bound for Worker retention".to_string(),
+            )
+        })?;
+        let worker = state.worker(worker_ref)?;
+        if worker.workspace_id.as_deref() != Some(workspace_id) {
+            return Err(RuntimeError::WorkerNotFound {
+                worker_id: worker_ref.worker_id,
+            });
+        }
+        let store = state.fs_store().ok_or_else(|| {
+            RuntimeError::InvalidRequest(
+                "Worker retention archive authority requires an fs-backed Runtime".to_string(),
+            )
+        })?;
+        FsWorkerRetentionProvider::new(store.runtime_dir()).inventory(
+            workspace_id,
+            runtime_id,
+            worker.worker_id,
+            worker.run_generation,
+        )
+    }
+
+    /// Execute a Backend-resolved retention plan. Only stopped Workers are
+    /// eligible. Provider receipt lookup happens before live lookup so exact
+    /// retries converge after aggregate removal.
+    #[cfg(feature = "fs-store")]
+    pub fn execute_worker_retention(
+        &self,
+        request: &WorkerRetentionExecutionRequest,
+    ) -> Result<WorkerRetentionExecutionResult, RuntimeError> {
+        let mut state = self.lock()?;
+        let runtime_id = state.runtime_identity.clone().ok_or_else(|| {
+            RuntimeError::InvalidRequest(
+                "Runtime identity is not bound for Worker retention".to_string(),
+            )
+        })?;
+        if request.source_runtime_id != runtime_id {
+            return Err(RuntimeError::InvalidRequest(
+                "Worker retention Runtime identity mismatch".to_string(),
+            ));
+        }
+        let store = state.fs_store().ok_or_else(|| {
+            RuntimeError::InvalidRequest(
+                "Worker retention execution requires an fs-backed Runtime".to_string(),
+            )
+        })?;
+        let provider = FsWorkerRetentionProvider::new(store.runtime_dir());
+        if let Some(completed) =
+            provider.completed(&request.operation_id, &request.input_fingerprint)?
+        {
+            state.workers.remove(&request.worker_id);
+            state.persist_runtime_snapshot()?;
+            return Ok(completed);
+        }
+        let Some(worker) = state.workers.get(&request.worker_id) else {
+            // Recover a pending receipt after a crash between aggregate removal
+            // and final receipt/Runtime catalog commit.
+            return provider.recover_after_source_removal(request);
+        };
+        if worker.workspace_id.as_deref() != Some(request.workspace_id.as_str()) {
+            return Err(RuntimeError::WorkerNotFound {
+                worker_id: request.worker_id,
+            });
+        }
+        if worker.status != WorkerStatus::Stopped {
+            return Err(RuntimeError::InvalidRequest(
+                "Worker retention requires a stopped Worker".to_string(),
+            ));
+        }
+        if worker.run_generation != request.expected_run_generation {
+            return Err(RuntimeError::InvalidRequest(format!(
+                "Worker retention plan expected generation {}, current generation is {}",
+                request.expected_run_generation, worker.run_generation
+            )));
+        }
+        let result = provider.execute(request)?;
+        state.workers.remove(&request.worker_id);
+        state.persist_runtime_snapshot()?;
+        Ok(result)
+    }
+
     fn lock(&self) -> Result<MutexGuard<'_, RuntimeState>, RuntimeError> {
         self.inner.lock().map_err(|_| RuntimeError::StatePoisoned)
     }
@@ -1673,6 +1790,9 @@ struct SubscriptionSink {
 struct RuntimeState {
     display_name: Option<String>,
     backend: RuntimeBackendKind,
+    /// Backend-bound stable identity used for cross-boundary retention evidence.
+    /// It is configured once by the Runtime host and never model input.
+    runtime_identity: Option<String>,
     #[cfg_attr(not(feature = "fs-store"), allow(dead_code))]
     persistence: RuntimePersistence,
     status: RuntimeStatus,
@@ -1701,6 +1821,7 @@ impl RuntimeState {
         Self {
             display_name,
             backend: RuntimeBackendKind::Memory,
+            runtime_identity: None,
             persistence: RuntimePersistence::Memory,
             status: RuntimeStatus::Running,
             execution_backend: None,
@@ -1729,6 +1850,7 @@ impl RuntimeState {
         Self {
             display_name,
             backend: RuntimeBackendKind::FsStore,
+            runtime_identity: None,
             persistence: RuntimePersistence::Fs(store),
             status: RuntimeStatus::Running,
             execution_backend: None,
@@ -1779,6 +1901,7 @@ impl RuntimeState {
         Ok(Self {
             display_name: persisted.display_name,
             backend: RuntimeBackendKind::FsStore,
+            runtime_identity: None,
             persistence: RuntimePersistence::Fs(store),
             status: persisted.status,
             execution_backend: None,
@@ -2549,6 +2672,18 @@ mod tests {
     #[cfg(feature = "fs-store")]
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn runtime_identity_binding_is_immutable_and_host_owned() {
+        let runtime = Runtime::new_memory();
+        runtime.bind_runtime_identity("runtime-a").unwrap();
+        runtime.bind_runtime_identity("runtime-a").unwrap();
+        assert!(runtime.bind_runtime_identity("runtime-b").is_err());
+        assert_eq!(
+            runtime.lock().unwrap().runtime_identity.as_deref(),
+            Some("runtime-a")
+        );
+    }
 
     #[test]
     fn typed_segments_allow_empty_flat_content() {
