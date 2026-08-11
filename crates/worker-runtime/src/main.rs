@@ -18,7 +18,7 @@ use worker_runtime::auth::{
     RuntimeHttpAuthConfig, RuntimeIdentityMaterial, TrustedServerKey, decode_public_key,
 };
 use worker_runtime::error::RuntimeError;
-use worker_runtime::fs_store::FsRuntimeStoreOptions;
+use worker_runtime::fs_store::{FsRuntimeStore, FsRuntimeStoreOptions};
 use worker_runtime::http_server::{
     RuntimeHttpServerConfig, RuntimeHttpServerError, RuntimeHttpStoreSelection,
 };
@@ -80,9 +80,13 @@ fn run() -> Result<(), ProcessError> {
 
 fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
     let fs_paths = config.resolved_fs_paths();
+    let runtime_store_dir = match &config.http.store {
+        RuntimeHttpStoreSelection::Memory => fs_paths.runtime_dir.clone(),
+        RuntimeHttpStoreSelection::Fs { root } => root.clone(),
+        _ => fs_paths.runtime_dir.clone(),
+    };
     let mut factory = ProfileRuntimeWorkerFactory::new(fs_paths.worker_dir.join("worker-root"))
-        .with_store_dir(fs_paths.worker_dir.join("sessions"))
-        .with_worker_metadata_dir(fs_paths.worker_dir.join("metadata"));
+        .with_runtime_store_dir(runtime_store_dir);
     if let Some(endpoint) = config.backend_resource_endpoint.clone() {
         factory = factory.with_resource_client(Arc::new(
             worker_runtime::resource::HttpBackendResourceClient::new(
@@ -105,6 +109,12 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
                 .map_err(ProcessError::Runtime)
         }
         RuntimeHttpStoreSelection::Fs { root } => {
+            FsRuntimeStore::migrate_legacy_worker_aggregates(
+                root,
+                fs_paths.worker_dir.join("sessions"),
+                fs_paths.worker_dir.join("metadata"),
+            )
+            .map_err(ProcessError::Runtime)?;
             let mut options = FsRuntimeStoreOptions::new(root.clone());
             options.display_name = config.http.display_name.clone();
             Runtime::with_fs_store_and_execution_backend(options, backend)

@@ -42,6 +42,8 @@ pub struct SpawnedWorkerRecord {
 pub struct RuntimeDir {
     path: PathBuf,
     write_legacy_snapshots: bool,
+    preserve_on_drop: bool,
+    socket_file_name: &'static str,
 }
 
 impl RuntimeDir {
@@ -56,6 +58,8 @@ impl RuntimeDir {
         Ok(Self {
             path,
             write_legacy_snapshots: true,
+            preserve_on_drop: false,
+            socket_file_name: "sock",
         })
     }
 
@@ -69,6 +73,36 @@ impl RuntimeDir {
         Ok(Self {
             path,
             write_legacy_snapshots: false,
+            preserve_on_drop: false,
+            socket_file_name: "sock",
+        })
+    }
+
+    /// Create an exact, persistent generation-scoped Worker run directory.
+    /// Existing directories are rejected so stale artifacts cannot be reused.
+    pub async fn create_worker_run(path: &Path) -> Result<Self, io::Error> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("run path has no parent"))?;
+        fs::create_dir_all(parent).await?;
+        fs::create_dir(path).await?;
+        fs::create_dir(path.join("artifacts")).await?;
+        fs::create_dir(path.join("spawned")).await?;
+        for log in ["worker.out.log", "worker.err.log"] {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path.join(log))
+                .await?;
+            file.sync_all().await?;
+        }
+        std::fs::File::open(path)?.sync_all()?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            write_legacy_snapshots: false,
+            preserve_on_drop: true,
+            socket_file_name: "worker.sock",
         })
     }
 
@@ -116,13 +150,24 @@ impl RuntimeDir {
     /// that only know the worker name (e.g. the TUI's attach flow)
     /// predict the same path via [`manifest::paths::worker_socket_path`].
     pub fn socket_path(&self) -> PathBuf {
-        self.path.join("sock")
+        self.path.join(self.socket_file_name)
+    }
+
+    pub async fn close_socket(&self) -> Result<(), io::Error> {
+        match fs::remove_file(self.socket_path()).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 }
 
 impl Drop for RuntimeDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        let _ = std::fs::remove_file(self.socket_path());
+        if !self.preserve_on_drop {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 }
 

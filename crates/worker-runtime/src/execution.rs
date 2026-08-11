@@ -245,6 +245,8 @@ impl fmt::Debug for WorkerExecutionContext {
 #[derive(Clone, Debug)]
 pub struct WorkerExecutionSpawnRequest {
     pub worker_ref: WorkerRef,
+    /// Monotonic execution generation reserved durably before launch.
+    pub run_generation: u64,
     pub request: crate::catalog::CreateWorkerRequest,
     pub context: WorkerExecutionContext,
     pub working_directory: Option<WorkingDirectoryBinding>,
@@ -255,6 +257,8 @@ pub struct WorkerExecutionSpawnRequest {
 #[derive(Clone, Debug)]
 pub struct WorkerExecutionRestoreRequest {
     pub worker_ref: WorkerRef,
+    /// Monotonic execution generation reserved durably before restore.
+    pub run_generation: u64,
     pub request: crate::catalog::CreateWorkerRequest,
     pub context: WorkerExecutionContext,
     pub previous_working_directory: Option<WorkingDirectoryStatus>,

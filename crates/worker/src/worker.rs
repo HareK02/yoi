@@ -3067,13 +3067,13 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
 
     /// Compact the current session by summarising history via a
     /// disposable Engine, then replacing history with
-    /// `[summary, ...recent_turns]` and creating a new session.
+    /// `[summary, ...recent_turns]` in a new Segment of the same Session.
     ///
     /// The summary Engine uses:
     /// - `compaction.model` from the manifest if configured, or
     /// - a clone of the main LlmClient via `clone_boxed()`.
     ///
-    /// Returns the new session ID.
+    /// Returns the new Segment ID. The Worker keeps its Session ID.
     pub async fn compact(&mut self, retained_tokens: u64) -> Result<SegmentId, WorkerError> {
         use crate::compact::worker::{
             CompactWorkerContext, CompactWorkerInterceptor, add_reference_tool,
