@@ -224,6 +224,18 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
     fn execute(&self, request: WorkspaceRequest)
     -> Result<WorkspaceResponse, WorkspaceClientError>;
 
+    /// Executes the destructive WorkerRemove operation through Runtime-owned source proof.
+    /// Target identity is operation data; source identity and permission are never caller inputs.
+    fn execute_worker_remove(
+        &self,
+        _target_runtime_id: &str,
+        _target_worker_id: &str,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        Err(WorkspaceClientError::Unavailable(
+            "Runtime-owned WorkerRemove forwarding is unavailable".to_string(),
+        ))
+    }
+
     /// Trusted review-attempt context is injected by the Internal SubWorker spawn layer.
     /// It is never accepted from a model-visible tool argument.
     fn reviewer_attempt_context(&self) -> Option<&ReviewerAttemptContext> {
@@ -313,53 +325,31 @@ impl WorkspaceClient for ReviewerChildWorkspaceClient {
     }
 }
 
-/// HTTP forwarding client created by Runtime for one concrete Worker execution.
-///
-/// The upstream endpoint and source headers are private implementation details;
-/// model-visible tools can only submit [`WorkspaceRequest`] values through the
-/// [`WorkspaceClient`] trait.
-pub struct RuntimeWorkspaceHttpClient {
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct TestWorkspaceHttpClient {
     workspace_id: String,
     base_url: String,
-    runtime_id: String,
-    worker_id: String,
 }
 
-impl std::fmt::Debug for RuntimeWorkspaceHttpClient {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("RuntimeWorkspaceHttpClient")
-            .field("workspace_id", &self.workspace_id)
-            .field("base_url", &self.base_url)
-            .field("runtime_id", &self.runtime_id)
-            .field("worker_id", &self.worker_id)
-            .finish()
-    }
-}
-
-impl RuntimeWorkspaceHttpClient {
-    pub fn new(
-        workspace_id: impl Into<String>,
-        base_url: impl Into<String>,
-        runtime_id: impl Into<String>,
-        worker_id: impl Into<String>,
-    ) -> Self {
+#[cfg(test)]
+impl TestWorkspaceHttpClient {
+    pub(crate) fn new(workspace_id: impl Into<String>, base_url: impl Into<String>) -> Self {
         Self {
             workspace_id: workspace_id.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
-            runtime_id: runtime_id.into(),
-            worker_id: worker_id.into(),
         }
     }
 }
 
-impl WorkspaceClient for RuntimeWorkspaceHttpClient {
+#[cfg(test)]
+impl WorkspaceClient for TestWorkspaceHttpClient {
     fn workspace_id(&self) -> Option<&str> {
         Some(&self.workspace_id)
     }
 
     fn kind(&self) -> &str {
-        "runtime-http-proxy"
+        "test-http"
     }
 
     fn is_available(&self) -> bool {
@@ -371,32 +361,28 @@ impl WorkspaceClient for RuntimeWorkspaceHttpClient {
         request: WorkspaceRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         let base_url = self.base_url.clone();
-        let runtime_id = self.runtime_id.clone();
-        let worker_id = self.worker_id.clone();
         if tokio::runtime::Handle::try_current().is_ok() {
-            std::thread::spawn(move || {
-                execute_runtime_workspace_http(&base_url, &runtime_id, &worker_id, request)
-            })
-            .join()
-            .map_err(|_| {
-                WorkspaceClientError::Request("workspace request thread panicked".to_string())
-            })?
+            std::thread::spawn(move || execute_test_workspace_http(&base_url, request))
+                .join()
+                .map_err(|_| {
+                    WorkspaceClientError::Request(
+                        "test workspace request thread panicked".to_string(),
+                    )
+                })?
         } else {
-            execute_runtime_workspace_http(&base_url, &runtime_id, &worker_id, request)
+            execute_test_workspace_http(&base_url, request)
         }
     }
 }
 
-fn execute_runtime_workspace_http(
+#[cfg(test)]
+fn execute_test_workspace_http(
     base_url: &str,
-    runtime_id: &str,
-    worker_id: &str,
     request: WorkspaceRequest,
 ) -> Result<WorkspaceResponse, WorkspaceClientError> {
     if !request.path.starts_with('/') || request.path.starts_with("//") {
         return Err(WorkspaceClientError::InvalidPath(request.path));
     }
-    let url = format!("{base_url}{}", request.path);
     let method = match request.method {
         WorkspaceRequestMethod::Get => reqwest::Method::GET,
         WorkspaceRequestMethod::Post => reqwest::Method::POST,
@@ -405,16 +391,11 @@ fn execute_runtime_workspace_http(
         WorkspaceRequestMethod::Delete => reqwest::Method::DELETE,
     };
     let client = reqwest::blocking::Client::new();
-    let mut request_builder = client
-        .request(method, url)
-        .header("x-yoi-runtime-id", runtime_id)
-        .header("x-yoi-worker-id", worker_id);
+    let mut builder = client.request(method, format!("{base_url}{}", request.path));
     if let Some(body) = request.body {
-        request_builder = request_builder
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body);
+        builder = builder.body(body);
     }
-    let response = request_builder
+    let response = builder
         .send()
         .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
     let status = response.status().as_u16();
@@ -6959,11 +6940,9 @@ mod build_summary_prompt_tests {
         });
         WorkerWorkspaceContext::with_client(
             Some(WorkspaceId::new("test-memory").unwrap()),
-            Arc::new(RuntimeWorkspaceHttpClient::new(
+            Arc::new(TestWorkspaceHttpClient::new(
                 "test-memory",
                 format!("http://{addr}"),
-                "test-runtime",
-                "test-worker",
             )),
         )
     }
@@ -7096,11 +7075,9 @@ mod build_summary_prompt_tests {
                 store,
                 WorkerWorkspaceContext::with_client(
                     Some(WorkspaceId::new("ws-skill").unwrap()),
-                    Arc::new(RuntimeWorkspaceHttpClient::new(
+                    Arc::new(TestWorkspaceHttpClient::new(
                         "ws-skill",
                         format!("http://{addr}"),
-                        "test-runtime",
-                        "test-worker",
                     )),
                 ),
                 authority,
@@ -7140,58 +7117,6 @@ mod build_summary_prompt_tests {
                     && body == history_text
             )
         }));
-    }
-
-    #[test]
-    fn runtime_workspace_client_sends_runtime_worker_identity_without_bearer() {
-        use std::io::{BufRead, BufReader, Write};
-        use std::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut first_line = String::new();
-            reader.read_line(&mut first_line).unwrap();
-            assert!(first_line.contains("/api/w/workspace-a/tickets/search"));
-            let mut runtime_id = String::new();
-            let mut worker_id = String::new();
-            let mut authorization = String::new();
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                if let Some(value) = line.strip_prefix("x-yoi-runtime-id: ") {
-                    runtime_id = value.trim().to_string();
-                }
-                if let Some(value) = line.strip_prefix("x-yoi-worker-id: ") {
-                    worker_id = value.trim().to_string();
-                }
-                if let Some(value) = line.strip_prefix("authorization: ") {
-                    authorization = value.trim().to_string();
-                }
-                if line == "\r\n" || line.is_empty() {
-                    break;
-                }
-            }
-            assert_eq!(runtime_id, "runtime-a");
-            assert_eq!(worker_id, "worker-a");
-            assert!(authorization.is_empty());
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
-                .unwrap();
-        });
-        let client = RuntimeWorkspaceHttpClient::new(
-            "workspace-a",
-            format!("http://{address}"),
-            "runtime-a",
-            "worker-a",
-        );
-        let response = client
-            .execute(WorkspaceRequest::get("/api/w/workspace-a/tickets/search"))
-            .unwrap();
-        assert_eq!(response.status, 200);
-        server.join().unwrap();
     }
 
     #[tokio::test]

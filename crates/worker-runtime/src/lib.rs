@@ -26,6 +26,7 @@ pub mod resource;
 pub mod retention;
 mod runtime;
 pub mod worker_backend;
+pub mod worker_source;
 pub mod working_directory;
 
 #[cfg(feature = "fs-store")]

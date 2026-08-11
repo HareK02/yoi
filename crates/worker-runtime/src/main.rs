@@ -87,6 +87,9 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
     };
     let mut factory = ProfileRuntimeWorkerFactory::new(fs_paths.worker_dir.join("worker-root"))
         .with_runtime_store_dir(runtime_store_dir);
+    if let Some(identity) = read_runtime_auth_file(&runtime_auth_path(config))?.identity {
+        factory = factory.with_remote_worker_mutation_identity(identity);
+    }
     if let Some(endpoint) = config.backend_resource_endpoint.clone() {
         factory = factory.with_resource_client(Arc::new(
             worker_runtime::resource::HttpBackendResourceClient::new(

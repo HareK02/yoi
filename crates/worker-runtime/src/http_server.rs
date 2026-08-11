@@ -1753,7 +1753,6 @@ mod tests {
         request.workspace_api = Some(WorkspaceApiRef {
             workspace_id: workspace_id.to_string(),
             base_url: format!("https://workspace.example/{workspace_id}"),
-            runtime_id: None,
         });
         request
     }
@@ -2324,7 +2323,6 @@ mod tests {
                 workspace_api: WorkspaceApiRef {
                     workspace_id: "local".to_string(),
                     base_url: "http://127.0.0.1:8787".to_string(),
-                    runtime_id: None,
                 },
             },
         )

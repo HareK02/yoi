@@ -1354,7 +1354,7 @@ mod tests {
         let path = temp.path().join("server.db");
         {
             let s = SqliteWorkspaceStore::open(&path).unwrap();
-            s.with_conn(|c|{c.execute("INSERT INTO workspaces(workspace_id,display_name,state,created_at,updated_at)VALUES('legacy','Legacy','active','old','old')",[])?;c.execute_batch("DROP TRIGGER seed_worker_retention_policy_after_workspace_insert;DROP TABLE worker_retention_audit_events;DROP TABLE worker_tombstones;DROP TABLE worker_session_archives;DROP TABLE worker_diagnostics_archives;DROP TABLE worker_orphan_diagnostics;DROP TABLE worker_removal_operations;DROP TABLE workspace_worker_retention_policies;DROP TABLE workspace_worker_retention_policy_revisions;DELETE FROM __yoi_schema_migrations WHERE version=28;")?;Ok(())}).unwrap();
+            s.with_conn(|c|{c.execute("INSERT INTO workspaces(workspace_id,display_name,state,created_at,updated_at)VALUES('legacy','Legacy','active','old','old')",[])?;c.execute_batch("DROP TRIGGER seed_worker_retention_policy_after_workspace_insert;DROP TABLE worker_retention_audit_events;DROP TABLE worker_tombstones;DROP TABLE worker_session_archives;DROP TABLE worker_diagnostics_archives;DROP TABLE worker_orphan_diagnostics;DROP TABLE worker_removal_operations;DROP TABLE workspace_worker_retention_policies;DROP TABLE workspace_worker_retention_policy_revisions;DELETE FROM __yoi_schema_migrations WHERE version>=28;")?;Ok(())}).unwrap();
         }
         let reopened = SqliteWorkspaceStore::open(&path).unwrap();
         let p = reopened.worker_retention_policy("legacy").unwrap().unwrap();

@@ -628,12 +628,7 @@ mod tests {
     #[test]
     fn workspace_http_objective_tools_include_objective_crud_tools() {
         let names = tool_names(workspace_http_objective_tools(Arc::new(
-            crate::worker::RuntimeWorkspaceHttpClient::new(
-                "workspace",
-                "http://backend",
-                "test-runtime",
-                "test-worker",
-            ),
+            crate::worker::TestWorkspaceHttpClient::new("workspace", "http://backend"),
         )));
 
         assert_eq!(

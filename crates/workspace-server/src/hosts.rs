@@ -55,7 +55,7 @@ use worker_runtime::interaction::{
 use worker_runtime::management::{RuntimeOptions as EmbeddedRuntimeOptions, RuntimeStatus};
 use worker_runtime::profile_archive::{ProfileSourceArchive, ProfileSourceArchiveInput};
 
-const EMBEDDED_RUNTIME_ID: &str = "embedded-worker-runtime";
+pub(crate) const EMBEDDED_RUNTIME_ID: &str = "embedded-worker-runtime";
 const EMBEDDED_HOST_KIND: &str = "embedded-worker-runtime-host";
 const REMOTE_HOST_KIND: &str = "remote-worker-runtime-host";
 const MAX_DIAGNOSTICS: usize = 16;
@@ -4039,7 +4039,6 @@ mod tests {
         WorkspaceApiRef {
             workspace_id: "workspace-test".to_string(),
             base_url: "http://127.0.0.1:8787".to_string(),
-            runtime_id: Some("runtime-test".to_string()),
         }
     }
 
