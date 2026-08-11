@@ -15,9 +15,9 @@ type SortableWorker = Pick<
 
 function workerStateRank(state: Worker['state']): number {
   switch (state) {
-    case 'idle':
-      return 0;
     case 'running':
+      return 0;
+    case 'idle':
       return 1;
     case 'stopped':
       return 2;

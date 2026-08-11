@@ -6,7 +6,7 @@
   } from './worker-subscription';
   import { canShowWorkerInSidebar } from './workers';
 
-  const MAX_VISIBLE_WORKERS = 6;
+  const COLLAPSED_WORKER_COUNT = 6;
 
   type Props = {
     currentPath?: string;
@@ -17,15 +17,21 @@
   let loading = $state(true);
   let error = $state<string | null>(null);
   let workers = $state<SidebarWorker[]>([]);
+  let expanded = $state(false);
+  let visibleWorkers = $derived(
+    expanded ? workers : workers.slice(0, COLLAPSED_WORKER_COUNT),
+  );
+  let hiddenWorkerCount = $derived(
+    Math.max(0, workers.length - COLLAPSED_WORKER_COUNT),
+  );
 
   $effect(() => {
+    expanded = false;
     const subscription = workspaceWorkersStore(workspaceId);
     return subscription.subscribe((state) => {
       loading = state.loading;
       error = state.error;
-      workers = state.workers
-        .filter(canShowWorkerInSidebar)
-        .slice(0, MAX_VISIBLE_WORKERS);
+      workers = state.workers.filter(canShowWorkerInSidebar);
     });
   });
 </script>
@@ -60,7 +66,7 @@
   {:else}
     {#if error}<p class="section-state error">{error}</p>{/if}
     <ul class="nav-list" aria-label="Workers">
-      {#each workers as worker (`${worker.runtime_id}:${worker.worker_id}`)}
+      {#each visibleWorkers as worker (`${worker.runtime_id}:${worker.worker_id}`)}
         {@const href = workerConsoleHref(worker, workspaceId)}
         <li>
           <a
@@ -84,5 +90,29 @@
         </li>
       {/each}
     </ul>
+    {#if workers.length > COLLAPSED_WORKER_COUNT}
+      <button
+        class="worker-overflow-toggle"
+        type="button"
+        aria-expanded={expanded}
+        aria-label={expanded
+          ? 'Collapse Worker list'
+          : `Show ${hiddenWorkerCount} more Workers`}
+        title={expanded
+          ? 'Collapse Worker list'
+          : `Show ${hiddenWorkerCount} more Workers`}
+        onclick={() => (expanded = !expanded)}
+      >
+        <span class="worker-overflow-line" aria-hidden="true"></span>
+        <svg
+          class="worker-overflow-chevron"
+          viewBox="0 0 24 24"
+          aria-hidden="true"
+        >
+          <path d="m6 9 6 6 6-6"></path>
+        </svg>
+        <span class="worker-overflow-line" aria-hidden="true"></span>
+      </button>
+    {/if}
   {/if}
 </section>

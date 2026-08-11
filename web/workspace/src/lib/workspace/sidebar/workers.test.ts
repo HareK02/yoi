@@ -66,7 +66,7 @@ Deno.test("live runtime workers are sidebar targets and console targets", () => 
   assertEquals(canOpenWorkerConsole(liveWorker), true);
 });
 
-Deno.test("sidebar workers sort idle then running then stopped", () => {
+Deno.test("sidebar workers sort running then idle then stopped", () => {
   const workers = [
     worker({ worker_id: "3", display_name: "Stopped", state: "stopped" }),
     worker({ worker_id: "2", display_name: "Running", state: "running" }),
@@ -74,5 +74,5 @@ Deno.test("sidebar workers sort idle then running then stopped", () => {
     worker({ worker_id: "1", display_name: "Idle A", state: "idle" }),
   ];
   workers.sort(compareWorkersForSidebar);
-  assertEquals(workers.map((candidate) => candidate.worker_id).join(","), "1,4,2,3");
+  assertEquals(workers.map((candidate) => candidate.worker_id).join(","), "2,1,4,3");
 });

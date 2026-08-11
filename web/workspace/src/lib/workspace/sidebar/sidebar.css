@@ -277,6 +277,47 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .worker-overflow-toggle {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+    gap: var(--space-2);
+    width: 100%;
+    margin: var(--space-1) 0 0;
+    padding: var(--space-1) var(--space-2);
+    align-items: center;
+    border: 0;
+    border-radius: var(--radius-soft);
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+  .worker-overflow-toggle:hover,
+  .worker-overflow-toggle:focus-visible {
+    background: var(--interactive-hover);
+    color: var(--text-strong);
+  }
+  .worker-overflow-toggle:focus-visible {
+    outline: 1px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .worker-overflow-line {
+    height: 1px;
+    background: currentColor;
+    opacity: 0.45;
+  }
+  .worker-overflow-chevron {
+    width: 0.875rem;
+    height: 0.875rem;
+    fill: none;
+    stroke: currentColor;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-width: 1.75;
+    transition: transform 140ms ease;
+  }
+  .worker-overflow-toggle[aria-expanded="true"] .worker-overflow-chevron {
+    transform: rotate(180deg);
+  }
   @keyframes worker-status-spin {
     to {
       transform: rotate(360deg);

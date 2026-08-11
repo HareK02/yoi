@@ -94,6 +94,9 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
   const sidebar = await Deno.readTextFile(
     new URL("../sidebar/WorkspaceSidebar.svelte", import.meta.url),
   );
+  const sidebarCss = await Deno.readTextFile(
+    new URL("../sidebar/sidebar.css", import.meta.url),
+  );
 
   assert(
     workspacePage.includes("ticketsHref") &&
@@ -131,6 +134,17 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
       workersNav.includes("worker.working_directory_id ?? '—'") &&
       !workersNav.includes('aria-disabled="true"'),
     "Workers sidebar should link to the Worker list page and show state indicators with repository/workdir metadata",
+  );
+  assert(
+    workersNav.includes("COLLAPSED_WORKER_COUNT = 6") &&
+      workersNav.includes("workers.length > COLLAPSED_WORKER_COUNT") &&
+      workersNav.includes("aria-expanded={expanded}") &&
+      workersNav.includes("worker-overflow-chevron") &&
+      !workersNav.includes("MAX_VISIBLE_WORKERS") &&
+      sidebarCss.includes(".worker-overflow-toggle") &&
+      sidebarCss.includes('[aria-expanded="true"] .worker-overflow-chevron') &&
+      sidebarCss.includes("transform: rotate(180deg)"),
+    "Workers sidebar should collapse overflow behind a graphical chevron without dropping Workers",
   );
   assert(
     !sidebar.includes("CompanionNavSection") &&
