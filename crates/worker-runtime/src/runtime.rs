@@ -548,6 +548,7 @@ impl Runtime {
                 worker_ref: worker_ref.clone(),
                 run_generation: 1,
                 request,
+                workspace_scope: scope.cloned(),
                 context: self.execution_context(worker_ref.clone()),
                 working_directory: None,
                 config_bundle: None,
@@ -826,13 +827,10 @@ impl Runtime {
             if let Some(existing) = worker.request.workspace_api.as_ref()
                 && (existing.workspace_id != workspace_api.workspace_id
                     || existing.base_url.trim_end_matches('/')
-                        != workspace_api.base_url.trim_end_matches('/')
-                    || existing.runtime_id.as_ref().is_some_and(|runtime_id| {
-                        workspace_api.runtime_id.as_ref() != Some(runtime_id)
-                    }))
+                        != workspace_api.base_url.trim_end_matches('/'))
             {
                 return Err(RuntimeError::InvalidRequest(
-                    "Workspace API replacement cannot change Worker Workspace identity, Runtime identity, or base URL"
+                    "Workspace API replacement cannot change Worker Workspace identity or base URL"
                         .to_string(),
                 ));
             }
@@ -902,10 +900,17 @@ impl Runtime {
             })?;
             state.worker_mut(worker_ref)?.run_generation = run_generation;
             state.persist_worker(&worker_ref.worker_id)?;
+            let workspace_scope = worker_request.workspace_api.as_ref().and_then(|api| {
+                state
+                    .workspace_owners
+                    .get(&api.workspace_id)
+                    .map(|server_id| RuntimeWorkspaceScope::new(&api.workspace_id, server_id))
+            });
             let request = WorkerExecutionRestoreRequest {
                 worker_ref: worker_ref.clone(),
                 run_generation,
                 request: worker_request,
+                workspace_scope,
                 context: self.execution_context(worker_ref.clone()),
                 previous_working_directory,
                 working_directory: None,
@@ -1595,9 +1600,15 @@ impl Runtime {
         };
 
         for candidate in candidates {
-            let backend = {
+            let (backend, workspace_scope) = {
                 let state = self.lock()?;
-                state.execution_backend.clone()
+                let workspace_scope = candidate.request.workspace_api.as_ref().and_then(|api| {
+                    state
+                        .workspace_owners
+                        .get(&api.workspace_id)
+                        .map(|server_id| RuntimeWorkspaceScope::new(&api.workspace_id, server_id))
+                });
+                (state.execution_backend.clone(), workspace_scope)
             };
             let Some(backend) = backend else {
                 return Ok(());
@@ -1606,6 +1617,7 @@ impl Runtime {
                 worker_ref: candidate.worker_ref.clone(),
                 run_generation: candidate.run_generation,
                 request: candidate.request,
+                workspace_scope,
                 context: self.execution_context(candidate.worker_ref.clone()),
                 previous_working_directory: candidate.previous_working_directory,
                 working_directory: None,
@@ -2790,7 +2802,6 @@ mod tests {
         request.workspace_api = Some(WorkspaceApiRef {
             workspace_id: workspace_id.to_string(),
             base_url: format!("https://workspace.example/{workspace_id}"),
-            runtime_id: None,
         });
         request
     }
@@ -3239,7 +3250,6 @@ mod tests {
         let replacement = WorkspaceApiRef {
             workspace_id: "workspace-a".to_string(),
             base_url: "https://workspace.example/workspace-a/".to_string(),
-            runtime_id: Some("runtime-a".to_string()),
         };
 
         runtime

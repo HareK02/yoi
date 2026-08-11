@@ -24,6 +24,7 @@ pub mod runtime_subscription;
 pub mod server;
 pub mod skills;
 pub mod store;
+pub mod worker_source;
 mod workspace_subscription;
 
 pub use authority::{

@@ -1376,12 +1376,7 @@ provider = "github"
     #[tokio::test(flavor = "multi_thread")]
     async fn workspace_http_backend_invoke_is_safe_inside_async_context() {
         let backend = WorkspaceHttpTicketBackend::new(Arc::new(
-            crate::worker::RuntimeWorkspaceHttpClient::new(
-                "workspace-a",
-                "not-a-url",
-                "test-runtime",
-                "test-worker",
-            ),
+            crate::worker::TestWorkspaceHttpClient::new("workspace-a", "not-a-url"),
         ));
 
         let error = backend
@@ -1412,11 +1407,9 @@ provider = "github"
                 .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
                 .unwrap();
         });
-        let client = Arc::new(crate::worker::RuntimeWorkspaceHttpClient::new(
+        let client = Arc::new(crate::worker::TestWorkspaceHttpClient::new(
             "workspace-a",
             format!("http://{address}"),
-            "test-runtime",
-            "worker-a",
         ));
         let backend = WorkspaceHttpTicketBackend::new(client);
 
@@ -1457,12 +1450,7 @@ provider = "github"
         });
 
         let backend = WorkspaceHttpTicketBackend::new(Arc::new(
-            crate::worker::RuntimeWorkspaceHttpClient::new(
-                "workspace-a",
-                base_url,
-                "test-runtime",
-                "test-worker",
-            ),
+            crate::worker::TestWorkspaceHttpClient::new("workspace-a", base_url),
         ));
         let created = backend.create(NewTicket::new("HTTP ticket")).unwrap();
 

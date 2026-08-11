@@ -212,8 +212,8 @@ mod tests {
                     break;
                 }
             }
-            assert_eq!(runtime_header.as_deref(), Some("runtime-test"));
-            assert_eq!(worker_header.as_deref(), Some("test-worker"));
+            assert_eq!(runtime_header, None);
+            assert_eq!(worker_header, None);
             assert_eq!(authorization, None);
             let body = serde_json::json!({
                 "authority": "workspace-backend-skills-v0",
@@ -236,12 +236,7 @@ mod tests {
             .unwrap();
         });
 
-        let client = crate::worker::RuntimeWorkspaceHttpClient::new(
-            "ws-1",
-            format!("http://{addr}"),
-            "runtime-test",
-            "test-worker",
-        );
+        let client = crate::worker::TestWorkspaceHttpClient::new("ws-1", format!("http://{addr}"));
         let catalog = (&client as &dyn WorkspaceClient).list_skills().unwrap();
         assert_eq!(catalog.entries[0].name, "triage-errors");
         assert_eq!(catalog.entries[0].provenance.id, "workspace:triage-errors");

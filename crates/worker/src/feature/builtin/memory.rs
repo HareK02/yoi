@@ -346,11 +346,9 @@ mod tests {
     use llm_engine::tool::ToolDefinition;
 
     fn test_client() -> Arc<dyn WorkspaceClient> {
-        Arc::new(crate::worker::RuntimeWorkspaceHttpClient::new(
+        Arc::new(crate::worker::TestWorkspaceHttpClient::new(
             "workspace",
             "http://backend",
-            "test-runtime",
-            "test-worker",
         ))
     }
 

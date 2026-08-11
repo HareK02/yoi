@@ -62,15 +62,15 @@ use crate::companion::{
 };
 use crate::config::{BackendRuntimesConfigFile, RemoteRuntimeConfigFile, resolve_remote_runtime};
 use crate::hosts::{
-    ConfigBundleCheckResult, ConfigBundleSyncResult, DiagnosticSeverity, EmbeddedWorkerRuntime,
-    HostSummary, RemoteRuntimeConfig, RemoteWorkerRuntime, RuntimeDiagnostic, RuntimeRegistry,
-    RuntimeRegistryError, RuntimeRegistryUnregisterResult, RuntimeSummary, TicketWorkerRole,
-    WorkerCapabilitySummary, WorkerCompletionsRequest, WorkerCompletionsResult,
-    WorkerImplementationSummary, WorkerInputKind, WorkerInputRequest, WorkerInputResult,
-    WorkerLifecycleRequest, WorkerLifecycleResult, WorkerOperationState, WorkerRestoreResult,
-    WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult,
-    WorkerSpawnWorkingDirectoryRequest, WorkerSummary, WorkerTicketAssignmentRequest,
-    WorkerWorkspaceSummary,
+    ConfigBundleCheckResult, ConfigBundleSyncResult, DiagnosticSeverity, EMBEDDED_RUNTIME_ID,
+    EmbeddedWorkerRuntime, HostSummary, RemoteRuntimeConfig, RemoteWorkerRuntime,
+    RuntimeDiagnostic, RuntimeRegistry, RuntimeRegistryError, RuntimeRegistryUnregisterResult,
+    RuntimeSummary, TicketWorkerRole, WorkerCapabilitySummary, WorkerCompletionsRequest,
+    WorkerCompletionsResult, WorkerImplementationSummary, WorkerInputKind, WorkerInputRequest,
+    WorkerInputResult, WorkerLifecycleRequest, WorkerLifecycleResult, WorkerOperationState,
+    WorkerRestoreResult, WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest,
+    WorkerSpawnResult, WorkerSpawnWorkingDirectoryRequest, WorkerSummary,
+    WorkerTicketAssignmentRequest, WorkerWorkspaceSummary,
 };
 use crate::identity::WorkspaceIdentity;
 use crate::memory_backend::execute_memory_backend_operation_with_authority;
@@ -250,8 +250,8 @@ const ORCHESTRATOR_ATTENTION_PROMPT: &str = include_str!(concat!(
 
 #[derive(Clone)]
 pub struct WorkspaceApi {
-    config: ServerConfig,
-    store: Arc<dyn ControlPlaneStore>,
+    pub(crate) config: ServerConfig,
+    pub(crate) store: Arc<dyn ControlPlaneStore>,
     authority: SqliteWorkspaceAuthority,
     runtime: Arc<RuntimeRegistry>,
     companion: Arc<CompanionConsole>,
@@ -269,6 +269,15 @@ impl WorkspaceApi {
         let resource_broker = BackendResourceBroker::default();
         let execution_backend = WorkerRuntimeExecutionBackend::new(
             ProfileRuntimeWorkerFactory::new(config.workspace_root.clone())
+                .with_embedded_worker_mutation_dispatcher(
+                    EMBEDDED_RUNTIME_ID,
+                    Arc::new(
+                        crate::worker_source::EmbeddedServerWorkerMutationDispatcher::new(
+                            config.clone(),
+                            store.clone(),
+                        ),
+                    ),
+                )
                 .with_runtime_store_dir(config.embedded_runtime_store_root.clone())
                 .with_resource_client(Arc::new(resource_broker.clone())),
         )
@@ -394,7 +403,7 @@ impl WorkspaceApi {
         &self.runtime_subscription_broker
     }
 
-    fn workspace_api_ref(&self, runtime_id: &str) -> WorkspaceApiRef {
+    fn workspace_api_ref(&self, _runtime_id: &str) -> WorkspaceApiRef {
         WorkspaceApiRef {
             workspace_id: self.config.workspace_id.clone(),
             base_url: self
@@ -404,7 +413,6 @@ impl WorkspaceApi {
                 .unwrap_or_else(|| "http://127.0.0.1:8787".to_string())
                 .trim_end_matches('/')
                 .to_string(),
-            runtime_id: Some(runtime_id.to_string()),
         }
     }
 
@@ -1117,6 +1125,10 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/companion/cancel",
             post(scoped_post_companion_cancel),
+        )
+        .route(
+            "/api/w/{workspace_id}/workers/remove",
+            post(scoped_worker_remove_source_boundary),
         )
         .route(
             "/api/runtimes/{runtime_id}/workers",
@@ -4809,6 +4821,71 @@ async fn scoped_workspace_protocol_ws(
             crate::workspace_subscription::serve_workspace_subscription(api, socket)
         })
         .into_response())
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerRemoveBoundaryRequest {
+    target_runtime_id: String,
+    target_worker_id: String,
+}
+
+async fn scoped_worker_remove_source_boundary(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    headers: HeaderMap,
+    Json(request): Json<WorkerRemoveBoundaryRequest>,
+) -> Response {
+    if let Err(error) = validate_workspace_scope(&api, &path.workspace_id) {
+        return error.into_response();
+    }
+    let proof = match crate::worker_source::presented_worker_remove_source(&headers, None) {
+        Ok(proof) => proof,
+        Err(error) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    match crate::worker_source::verify_worker_remove_source(
+        &api,
+        proof,
+        &request.target_runtime_id,
+        &request.target_worker_id,
+    )
+    .await
+    {
+        Ok(source) => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "error": "WorkerRemove lifecycle is deferred to its consumer Ticket",
+                "source": {
+                    "runtime_id": source.runtime_id,
+                    "worker_id": source.worker_id,
+                    "actor_kind": source.actor_kind,
+                    "permission": source.permission,
+                }
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            let status = match error {
+                crate::worker_source::WorkerMutationSourceProofError::Replay => {
+                    StatusCode::CONFLICT
+                }
+                crate::worker_source::WorkerMutationSourceProofError::Authority(_) => {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+                _ => StatusCode::FORBIDDEN,
+            };
+            (
+                status,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn scoped_list_workers(
@@ -10561,12 +10638,19 @@ mod tests {
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message;
     use tower::ServiceExt;
+    use worker_runtime::auth::{
+        RuntimeIdentityMaterial, RuntimeWorkerMutationSourceSigner, WORKER_REMOVE_PERMISSION,
+        decode_worker_mutation_source_claims,
+    };
     use worker_runtime::resource::BackendResourceClient;
+    use worker_runtime::worker_source::{
+        RuntimeOwnedWorkerMutationProof, RuntimeWorkerMutationSourceAuthority,
+    };
     use worker_runtime::working_directory::WorkingDirectoryMaterializer;
 
     use crate::hosts::{
-        TicketWorkerRole, WorkerInputKind, WorkerOperationState, WorkerSpawnAcceptanceRequirement,
-        WorkerSpawnIntent,
+        RemoteRuntimeAuthConfig, RuntimeCapabilitySummary, TicketWorkerRole, WorkerInputKind,
+        WorkerOperationState, WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent,
     };
     use crate::store::{
         MemoryDocumentRecord, MemoryStagingRecord, ObjectiveRecord, ObjectiveResourceRecord,
@@ -10643,11 +10727,10 @@ mod tests {
     const TEST_REPOSITORY_ID: &str = "main";
     const TEST_CREATED_AT: &str = "2026-06-23T06:43:28Z";
 
-    fn test_worker_workspace_api(runtime_id: &str) -> WorkspaceApiRef {
+    fn test_worker_workspace_api(_runtime_id: &str) -> WorkspaceApiRef {
         WorkspaceApiRef {
             workspace_id: TEST_WORKSPACE_ID.to_string(),
             base_url: "http://127.0.0.1:8787".to_string(),
-            runtime_id: Some(runtime_id.to_string()),
         }
     }
 
@@ -13139,6 +13222,359 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn destructive_worker_remove_rejects_browser_and_legacy_source_headers() {
+        let headers = HeaderMap::new();
+        assert!(matches!(
+            crate::worker_source::presented_worker_remove_source(&headers, None),
+            Err(crate::worker_source::WorkerMutationSourceProofError::Missing)
+        ));
+
+        let mut spoofed = HeaderMap::new();
+        spoofed.insert("x-yoi-runtime-id", "runtime-spoofed".parse().unwrap());
+        spoofed.insert("x-yoi-worker-id", "worker-spoofed".parse().unwrap());
+        assert!(matches!(
+            crate::worker_source::presented_worker_remove_source(&spoofed, None),
+            Err(crate::worker_source::WorkerMutationSourceProofError::Missing)
+        ));
+
+        let temp = tempfile::tempdir().unwrap();
+        let app = build_router(test_api(temp.path()).await);
+        let body = r#"{"target_runtime_id":"runtime-target","target_worker_id":"target-worker"}"#;
+        let browser = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/w/{TEST_WORKSPACE_ID}/workers/remove"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(browser.status(), StatusCode::UNAUTHORIZED);
+        let legacy = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/w/{TEST_WORKSPACE_ID}/workers/remove"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("x-yoi-runtime-id", "runtime-spoofed")
+                    .header("x-yoi-worker-id", "worker-spoofed")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn embedded_worker_remove_proof_derives_source_and_rejects_replay_and_wrong_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        seed_worker_source_member(&api, EMBEDDED_RUNTIME_ID, "7");
+        let scope = worker_runtime::RuntimeWorkspaceScope::new(
+            api.config.workspace_id.clone(),
+            "server-unused-for-embedded",
+        );
+        let authority = RuntimeWorkerMutationSourceAuthority::embedded(
+            EMBEDDED_RUNTIME_ID,
+            &api.config.workspace_id,
+        );
+        let RuntimeOwnedWorkerMutationProof::InProcess(proof) = authority
+            .issue_worker_remove(&scope, "7", "runtime-target", "target-worker")
+            .unwrap()
+        else {
+            panic!("embedded Runtime must produce in-process claims");
+        };
+
+        let wrong_target = crate::worker_source::verify_worker_remove_source(
+            &api,
+            crate::worker_source::PresentedWorkerMutationSourceProof::InProcess(proof.clone()),
+            "runtime-target",
+            "different-worker",
+        )
+        .await;
+        assert!(matches!(
+            wrong_target,
+            Err(crate::worker_source::WorkerMutationSourceProofError::Invalid)
+        ));
+
+        let verified = crate::worker_source::verify_worker_remove_source(
+            &api,
+            crate::worker_source::PresentedWorkerMutationSourceProof::InProcess(proof.clone()),
+            "runtime-target",
+            "target-worker",
+        )
+        .await
+        .unwrap();
+        assert_eq!(verified.runtime_id, EMBEDDED_RUNTIME_ID);
+        assert_eq!(verified.worker_id, "7");
+        assert_eq!(verified.permission, WORKER_REMOVE_PERMISSION);
+
+        let replay = crate::worker_source::verify_worker_remove_source(
+            &api,
+            crate::worker_source::PresentedWorkerMutationSourceProof::InProcess(proof),
+            "runtime-target",
+            "target-worker",
+        )
+        .await;
+        assert!(matches!(
+            replay,
+            Err(crate::worker_source::WorkerMutationSourceProofError::Replay)
+        ));
+
+        let RuntimeOwnedWorkerMutationProof::InProcess(fresh_proof) = authority
+            .issue_worker_remove(&scope, "7", "runtime-target", "target-worker")
+            .unwrap()
+        else {
+            panic!("embedded Runtime must produce in-process claims");
+        };
+        let dispatcher = crate::worker_source::EmbeddedServerWorkerMutationDispatcher::new(
+            api.config.clone(),
+            api.store.clone(),
+        );
+        let response =
+            worker_runtime::worker_source::EmbeddedWorkerMutationDispatcher::execute_worker_remove(
+                &dispatcher,
+                fresh_proof,
+                "runtime-target",
+                "target-worker",
+            )
+            .unwrap();
+        assert_eq!(response.status, 501);
+    }
+
+    #[tokio::test]
+    async fn remote_worker_remove_proof_requires_current_runtime_trust_scope_and_catalog_member() {
+        let temp = tempfile::tempdir().unwrap();
+        let identity = RuntimeIdentityMaterial::generate("runtime-remote").unwrap();
+        let mut config = test_server_config(temp.path());
+        config.remote_runtime_sources.push(RemoteRuntimeConfig {
+            runtime_id: "runtime-remote".to_string(),
+            display_name: "Remote Runtime".to_string(),
+            base_url: "https://runtime.invalid".to_string(),
+            bearer_token: None,
+            auth: Some(RemoteRuntimeAuthConfig {
+                server_id: "server-main".to_string(),
+                server_private_key: identity.private_key.clone(),
+            }),
+            cached_capabilities: RuntimeCapabilitySummary {
+                can_list_hosts: true,
+                can_list_workers: true,
+                can_get_worker: true,
+                can_spawn_worker: true,
+                can_stop_worker: true,
+                has_workspace_fs: false,
+                has_shell: false,
+                has_git: false,
+                supports_worktrees: false,
+                supports_backend_internal_tools: false,
+                workspace_scope: TEST_WORKSPACE_ID.to_string(),
+                max_workers: 1,
+                os: "test".to_string(),
+                arch: "test".to_string(),
+            },
+            cached_status: "connected".to_string(),
+            timeout: std::time::Duration::from_secs(1),
+        });
+        let store = SqliteWorkspaceStore::open(config.database_path.clone()).unwrap();
+        let trust = crate::store::TrustedRuntimeRecord {
+            runtime_id: "runtime-remote".to_string(),
+            display_name: "Remote Runtime".to_string(),
+            base_url: "https://runtime.invalid".to_string(),
+            public_key: identity.public_key.clone(),
+            created_at: "2026-08-11T00:00:00Z".to_string(),
+            updated_at: "2026-08-11T00:00:00Z".to_string(),
+            revoked_at: None,
+        };
+        store.upsert_trusted_runtime(&trust).unwrap();
+        let api = WorkspaceApi::new_with_execution_backend(
+            config,
+            Arc::new(store),
+            Arc::new(DeterministicExecutionBackend::default()),
+        )
+        .await
+        .unwrap();
+        seed_worker_source_member(&api, "runtime-remote", "7");
+
+        let signer = RuntimeWorkerMutationSourceSigner::from_identity(&identity);
+        let token = signer
+            .issue_worker_remove(
+                "server-main",
+                &api.config.workspace_id,
+                "7",
+                "runtime-target",
+                "target-worker",
+                60,
+            )
+            .unwrap();
+        let verified = crate::worker_source::verify_worker_remove_source(
+            &api,
+            crate::worker_source::PresentedWorkerMutationSourceProof::Remote(&token),
+            "runtime-target",
+            "target-worker",
+        )
+        .await
+        .unwrap();
+        assert_eq!(verified.runtime_id, "runtime-remote");
+        assert_eq!(verified.worker_id, "7");
+
+        let wrong_scope = signer
+            .issue_worker_remove(
+                "server-wrong",
+                &api.config.workspace_id,
+                "7",
+                "runtime-target",
+                "target-worker",
+                60,
+            )
+            .unwrap();
+        assert!(matches!(
+            crate::worker_source::verify_worker_remove_source(
+                &api,
+                crate::worker_source::PresentedWorkerMutationSourceProof::Remote(&wrong_scope),
+                "runtime-target",
+                "target-worker",
+            )
+            .await,
+            Err(crate::worker_source::WorkerMutationSourceProofError::WrongAudience)
+        ));
+
+        let wrong_workspace = signer
+            .issue_worker_remove(
+                "server-main",
+                "workspace-other",
+                "7",
+                "runtime-target",
+                "target-worker",
+                60,
+            )
+            .unwrap();
+        assert!(matches!(
+            crate::worker_source::verify_worker_remove_source(
+                &api,
+                crate::worker_source::PresentedWorkerMutationSourceProof::Remote(&wrong_workspace),
+                "runtime-target",
+                "target-worker",
+            )
+            .await,
+            Err(crate::worker_source::WorkerMutationSourceProofError::WrongWorkspace)
+        ));
+
+        let missing_worker = signer
+            .issue_worker_remove(
+                "server-main",
+                &api.config.workspace_id,
+                "999",
+                "runtime-target",
+                "target-worker",
+                60,
+            )
+            .unwrap();
+        assert!(matches!(
+            crate::worker_source::verify_worker_remove_source(
+                &api,
+                crate::worker_source::PresentedWorkerMutationSourceProof::Remote(&missing_worker),
+                "runtime-target",
+                "target-worker",
+            )
+            .await,
+            Err(crate::worker_source::WorkerMutationSourceProofError::WorkerCatalogMembership)
+        ));
+
+        let mut expired_claims = decode_worker_mutation_source_claims(&token).unwrap();
+        expired_claims.iat = 1;
+        expired_claims.exp = 2;
+        expired_claims.jti = "expired-proof".to_string();
+        let expired = signer.sign(&expired_claims).unwrap();
+        assert!(matches!(
+            crate::worker_source::verify_worker_remove_source(
+                &api,
+                crate::worker_source::PresentedWorkerMutationSourceProof::Remote(&expired),
+                "runtime-target",
+                "target-worker",
+            )
+            .await,
+            Err(crate::worker_source::WorkerMutationSourceProofError::Expired)
+        ));
+
+        let route_token = signer
+            .issue_worker_remove(
+                "server-main",
+                &api.config.workspace_id,
+                "7",
+                "runtime-target",
+                "target-worker",
+                60,
+            )
+            .unwrap();
+        let route_response = build_router(api.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/w/{TEST_WORKSPACE_ID}/workers/remove"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(
+                        worker_runtime::auth::WORKER_MUTATION_SOURCE_PROOF_HEADER,
+                        route_token,
+                    )
+                    .body(Body::from(
+                        r#"{"target_runtime_id":"runtime-target","target_worker_id":"target-worker"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(route_response.status(), StatusCode::NOT_IMPLEMENTED);
+
+        let mut revoked = trust;
+        revoked.revoked_at = Some("2026-08-11T00:01:00Z".to_string());
+        let authority = SqliteWorkspaceStore::open(api.config.database_path.clone()).unwrap();
+        authority.upsert_trusted_runtime(&revoked).unwrap();
+        let revoked_token = signer
+            .issue_worker_remove(
+                "server-main",
+                &api.config.workspace_id,
+                "7",
+                "runtime-target",
+                "target-worker",
+                60,
+            )
+            .unwrap();
+        assert!(matches!(
+            crate::worker_source::verify_worker_remove_source(
+                &api,
+                crate::worker_source::PresentedWorkerMutationSourceProof::Remote(&revoked_token),
+                "runtime-target",
+                "target-worker",
+            )
+            .await,
+            Err(crate::worker_source::WorkerMutationSourceProofError::RevokedRuntimeTrust)
+        ));
+    }
+
+    fn seed_worker_source_member(api: &WorkspaceApi, runtime_id: &str, worker_id: &str) {
+        let now = now_registry_timestamp();
+        api.store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: api.config.workspace_id.clone(),
+                worker: RuntimeWorkerRef::new(runtime_id, worker_id),
+                display_name: worker_id.to_string(),
+                profile: None,
+                retention_state: "normal".to_string(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .unwrap();
     }
 
     fn seed_cleanup_worker(

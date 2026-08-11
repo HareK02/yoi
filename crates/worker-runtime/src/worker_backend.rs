@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
+use crate::auth::RuntimeIdentityMaterial;
 use crate::catalog::{
     CreateWorkerRequest, ProfileSourceArchiveHttpRef, ProfileSourceArchiveSource,
     WorkingDirectoryRequest, WorkingDirectoryStatus,
@@ -26,6 +27,9 @@ use crate::execution::{
 use crate::identity::WorkerRef;
 use crate::interaction::{WorkerInput, WorkerInputKind};
 use crate::resource::{BackendResourceClient, ProfileSourceArchiveCache};
+use crate::worker_source::{
+    EmbeddedWorkerMutationDispatcher, RuntimeOwnedWorkspaceClient, RuntimeWorkerMutationForwarder,
+};
 use crate::working_directory::{
     WorkingDirectoryBinding, WorkingDirectoryDiagnostic, WorkingDirectoryMaterializer,
 };
@@ -49,10 +53,9 @@ use worker::feature::builtin::{
 #[cfg(feature = "ws-server")]
 use worker::ipc::protocol_session::{live_log_entry_event, subscribe_worker_protocol_session};
 use worker::{
-    PromptLoader, RuntimeWorkspaceHttpClient, SegmentLogSink,
-    WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN, Worker, WorkerController, WorkerError,
-    WorkerFilesystemAuthority, WorkerHandle, WorkerSharedState, WorkerWorkspaceContext,
-    WorkspaceClient, WorkspaceId,
+    PromptLoader, SegmentLogSink, WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN, Worker,
+    WorkerController, WorkerError, WorkerFilesystemAuthority, WorkerHandle, WorkerSharedState,
+    WorkerWorkspaceContext, WorkspaceClient, WorkspaceId,
 };
 
 const DEFAULT_BACKEND_ID: &str = "worker-crate";
@@ -215,6 +218,9 @@ pub struct ProfileRuntimeWorkerFactory {
     worker_aggregate_root: Option<PathBuf>,
     resource_client: Option<Arc<dyn BackendResourceClient>>,
     profile_archive_cache: Arc<ProfileSourceArchiveCache>,
+    runtime_id: Option<String>,
+    worker_mutation_identity: Option<RuntimeIdentityMaterial>,
+    embedded_worker_mutation_dispatcher: Option<Arc<dyn EmbeddedWorkerMutationDispatcher>>,
 }
 
 impl ProfileRuntimeWorkerFactory {
@@ -226,7 +232,36 @@ impl ProfileRuntimeWorkerFactory {
             worker_aggregate_root: None,
             resource_client: None,
             profile_archive_cache: Arc::new(ProfileSourceArchiveCache::default()),
+            runtime_id: None,
+            worker_mutation_identity: None,
+            embedded_worker_mutation_dispatcher: None,
         }
+    }
+
+    pub fn with_runtime_id(mut self, runtime_id: impl Into<String>) -> Self {
+        self.runtime_id = Some(runtime_id.into());
+        self
+    }
+
+    pub fn with_remote_worker_mutation_identity(
+        mut self,
+        identity: RuntimeIdentityMaterial,
+    ) -> Self {
+        self.runtime_id = Some(identity.identity_id.clone());
+        self.worker_mutation_identity = Some(identity);
+        self.embedded_worker_mutation_dispatcher = None;
+        self
+    }
+
+    pub fn with_embedded_worker_mutation_dispatcher(
+        mut self,
+        runtime_id: impl Into<String>,
+        dispatcher: Arc<dyn EmbeddedWorkerMutationDispatcher>,
+    ) -> Self {
+        self.runtime_id = Some(runtime_id.into());
+        self.worker_mutation_identity = None;
+        self.embedded_worker_mutation_dispatcher = Some(dispatcher);
+        self
     }
 
     pub fn with_runtime_store_dir(mut self, runtime_store_dir: impl Into<PathBuf>) -> Self {
@@ -348,38 +383,59 @@ enum RuntimeWorkspaceBackendRef {
 }
 
 impl RuntimeWorkspaceBackendRef {
-    fn from_worker_request(request: &CreateWorkerRequest) -> Self {
-        if let Some(api) = request.workspace_api.as_ref()
-            && let Some(runtime_id) = api
-                .runtime_id
-                .as_ref()
-                .filter(|runtime_id| !runtime_id.trim().is_empty())
-        {
+    fn from_worker_request(request: &CreateWorkerRequest, runtime_id: Option<&str>) -> Self {
+        if let (Some(api), Some(runtime_id)) = (request.workspace_api.as_ref(), runtime_id) {
             return Self::Http {
                 workspace_id: api.workspace_id.clone(),
                 base_url: api.base_url.clone(),
-                runtime_id: runtime_id.clone(),
+                runtime_id: runtime_id.to_string(),
             };
         }
         Self::None
     }
 
-    fn worker_context(&self, worker_ref: &WorkerRef) -> WorkerWorkspaceContext {
+    fn worker_context(
+        &self,
+        worker_ref: &WorkerRef,
+        workspace_scope: Option<&crate::runtime::RuntimeWorkspaceScope>,
+        mutation_identity: Option<&RuntimeIdentityMaterial>,
+        embedded_dispatcher: Option<&Arc<dyn EmbeddedWorkerMutationDispatcher>>,
+    ) -> WorkerWorkspaceContext {
         match self {
             Self::None => WorkerWorkspaceContext::no_workspace(),
             Self::Http {
                 workspace_id,
                 base_url,
                 runtime_id,
-            } => WorkerWorkspaceContext::with_client(
-                WorkspaceId::new(workspace_id.clone()).ok(),
-                Arc::new(RuntimeWorkspaceHttpClient::new(
+            } => {
+                let mut client = RuntimeOwnedWorkspaceClient::new(
                     workspace_id.clone(),
                     base_url.clone(),
                     runtime_id.clone(),
                     worker_ref.worker_id.to_string(),
-                )),
-            ),
+                );
+                if let (Some(scope), Some(identity)) = (workspace_scope, mutation_identity) {
+                    client = client.with_worker_remove(RuntimeWorkerMutationForwarder::remote(
+                        identity,
+                        scope.clone(),
+                        worker_ref.worker_id.to_string(),
+                        base_url.clone(),
+                    ));
+                } else if let (Some(scope), Some(dispatcher)) =
+                    (workspace_scope, embedded_dispatcher)
+                {
+                    client = client.with_worker_remove(RuntimeWorkerMutationForwarder::embedded(
+                        runtime_id,
+                        scope.clone(),
+                        worker_ref.worker_id.to_string(),
+                        (*dispatcher).clone(),
+                    ));
+                }
+                WorkerWorkspaceContext::with_client(
+                    WorkspaceId::new(workspace_id.clone()).ok(),
+                    Arc::new(client),
+                )
+            }
         }
     }
 }
@@ -478,13 +534,11 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 )
             })
             .unwrap_or(WorkerFilesystemAuthority::None);
-        let workspace_backend_ref =
-            RuntimeWorkspaceBackendRef::from_worker_request(&request.request);
-        let observation_runtime_id = request
-            .request
-            .workspace_api
-            .as_ref()
-            .and_then(|api| api.runtime_id.clone());
+        let workspace_backend_ref = RuntimeWorkspaceBackendRef::from_worker_request(
+            &request.request,
+            self.runtime_id.as_deref(),
+        );
+        let observation_runtime_id = self.runtime_id.clone();
         let observation_workspace_id = request
             .request
             .workspace_api
@@ -492,7 +546,12 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             .map(|api| api.workspace_id.clone());
         let observation_grants = request.request.worker_observation_grants.clone();
         let observation_enabled = request.request.worker_observation_enabled;
-        let workspace_context = workspace_backend_ref.worker_context(&request.worker_ref);
+        let workspace_context = workspace_backend_ref.worker_context(
+            &request.worker_ref,
+            request.workspace_scope.as_ref(),
+            self.worker_mutation_identity.as_ref(),
+            self.embedded_worker_mutation_dispatcher.as_ref(),
+        );
         let selector = profile.as_ref();
         let archive = self
             .resolve_profile_source_archive(&request.request.profile_source)
@@ -628,13 +687,11 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 )
             })
             .unwrap_or(WorkerFilesystemAuthority::None);
-        let workspace_backend_ref =
-            RuntimeWorkspaceBackendRef::from_worker_request(&request.request);
-        let observation_runtime_id = request
-            .request
-            .workspace_api
-            .as_ref()
-            .and_then(|api| api.runtime_id.clone());
+        let workspace_backend_ref = RuntimeWorkspaceBackendRef::from_worker_request(
+            &request.request,
+            self.runtime_id.as_deref(),
+        );
+        let observation_runtime_id = self.runtime_id.clone();
         let observation_workspace_id = request
             .request
             .workspace_api
@@ -642,7 +699,12 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             .map(|api| api.workspace_id.clone());
         let observation_grants = request.request.worker_observation_grants.clone();
         let observation_enabled = request.request.worker_observation_enabled;
-        let workspace_context = workspace_backend_ref.worker_context(&request.worker_ref);
+        let workspace_context = workspace_backend_ref.worker_context(
+            &request.worker_ref,
+            request.workspace_scope.as_ref(),
+            self.worker_mutation_identity.as_ref(),
+            self.embedded_worker_mutation_dispatcher.as_ref(),
+        );
         let (manifest, loader) = Self::restore_fallback_manifest(&worker_name)?;
 
         let worker_aggregate_dir = self.worker_aggregate_dir(&request.worker_ref)?;
@@ -1757,6 +1819,36 @@ mod tests {
     use session_store::{LogEntry, WorkerMetadataStore};
 
     #[test]
+    fn restart_restore_reconstructs_runtime_owned_worker_mutation_client() {
+        let identity = RuntimeIdentityMaterial::generate("runtime-source").unwrap();
+        let worker_ref = WorkerRef::new(crate::identity::WorkerId::new(17));
+        let backend = RuntimeWorkspaceBackendRef::Http {
+            workspace_id: "workspace-a".to_string(),
+            base_url: "https://server.invalid".to_string(),
+            runtime_id: "runtime-source".to_string(),
+        };
+        let scope = crate::runtime::RuntimeWorkspaceScope::new("workspace-a", "server-main");
+
+        let before_restart =
+            backend.worker_context(&worker_ref, Some(&scope), Some(&identity), None);
+        let after_restore =
+            backend.worker_context(&worker_ref, Some(&scope), Some(&identity), None);
+
+        assert_eq!(
+            before_restart.client_handle().kind(),
+            "runtime-owned-workspace-client"
+        );
+        assert_eq!(
+            after_restore.client_handle().kind(),
+            "runtime-owned-workspace-client"
+        );
+        assert_eq!(
+            after_restore.client_handle().workspace_id(),
+            Some("workspace-a")
+        );
+    }
+
+    #[test]
     fn notify_run_state_allows_running_worker_inbox_delivery() {
         assert_eq!(
             accepted_notify_run_state(WorkerStatus::Running, true),
@@ -1878,9 +1970,16 @@ mod tests {
                 .as_ref()
                 .map(|binding| binding.root().to_path_buf())
                 .unwrap_or_else(|| self.cwd.clone());
-            let workspace_backend_ref =
-                RuntimeWorkspaceBackendRef::from_worker_request(&request.request);
-            let workspace_context = workspace_backend_ref.worker_context(&request.worker_ref);
+            let workspace_backend_ref = RuntimeWorkspaceBackendRef::from_worker_request(
+                &request.request,
+                Some("runtime-test"),
+            );
+            let workspace_context = workspace_backend_ref.worker_context(
+                &request.worker_ref,
+                request.workspace_scope.as_ref(),
+                None,
+                None,
+            );
             let workspace_client = workspace_context.client_handle();
             self.observed_workspace_clients.lock().unwrap().push((
                 workspace_client.kind().to_string(),
@@ -1916,6 +2015,7 @@ mod tests {
                 worker_ref: request.worker_ref,
                 run_generation: request.run_generation,
                 request: request.request,
+                workspace_scope: request.workspace_scope,
                 context: request.context,
                 working_directory: request.working_directory,
                 config_bundle: request.config_bundle,
@@ -2188,6 +2288,7 @@ mod tests {
             worker_ref: worker_ref.clone(),
             run_generation: 1,
             request: create_request("1"),
+            workspace_scope: None,
             context: test_execution_context(worker_ref),
             working_directory: None,
             config_bundle: None,
@@ -2286,14 +2387,15 @@ mod tests {
         request.workspace_api = Some(crate::catalog::WorkspaceApiRef {
             workspace_id: "workspace-restore".to_string(),
             base_url: "http://workspace.invalid".to_string(),
-            runtime_id: Some("runtime-restore".to_string()),
         });
         let controller = ProfileRuntimeWorkerFactory::new(root.path())
+            .with_runtime_id("runtime-restore")
             .with_runtime_store_dir(&runtime_store_dir)
             .restore_controller(WorkerExecutionRestoreRequest {
                 worker_ref: worker_ref.clone(),
                 run_generation: 1,
                 request,
+                workspace_scope: None,
                 context: test_execution_context(worker_ref),
                 previous_working_directory: None,
                 working_directory: None,
@@ -2420,7 +2522,6 @@ mod tests {
         request.workspace_api = Some(crate::catalog::WorkspaceApiRef {
             workspace_id: "ws-test".to_string(),
             base_url: "http://127.0.0.1:3999".to_string(),
-            runtime_id: Some("runtime-test".to_string()),
         });
         let detail = runtime.create_worker(request).unwrap();
 
@@ -2453,7 +2554,7 @@ mod tests {
         assert_eq!(
             observed_workspace_clients.lock().unwrap().as_slice(),
             &[(
-                "runtime-http-proxy".to_string(),
+                "runtime-owned-workspace-client".to_string(),
                 Some("ws-test".to_string()),
                 true,
             )]

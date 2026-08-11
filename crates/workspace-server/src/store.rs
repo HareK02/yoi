@@ -161,6 +161,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create Worker retention authority",
         apply: crate::retention::create_worker_retention_tables,
     },
+    Migration {
+        version: 29,
+        name: "create Worker mutation source proof replay guard",
+        apply: create_worker_mutation_source_proof_replay_guard,
+    },
 ];
 
 struct Migration {
@@ -460,6 +465,15 @@ pub trait ControlPlaneStore: Send + Sync {
     async fn schema_version(&self) -> Result<i64>;
     async fn upsert_workspace(&self, record: &WorkspaceRecord) -> Result<()>;
     async fn get_workspace(&self, workspace_id: &str) -> Result<Option<WorkspaceRecord>>;
+    async fn get_trusted_runtime(&self, runtime_id: &str) -> Result<Option<TrustedRuntimeRecord>>;
+    async fn consume_worker_mutation_source_jti(
+        &self,
+        runtime_id: &str,
+        jti: &str,
+        expires_at: u64,
+        now_seconds: u64,
+        consumed_at: &str,
+    ) -> Result<bool>;
     fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>>;
     fn upsert_repository(&self, record: &RepositoryRecord) -> Result<()>;
     fn get_repository(
@@ -893,6 +907,44 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )
             .optional()
             .map_err(Error::from)
+        })
+    }
+
+    async fn get_trusted_runtime(&self, runtime_id: &str) -> Result<Option<TrustedRuntimeRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                r#"SELECT runtime_id, display_name, base_url, public_key, created_at, updated_at, revoked_at
+                   FROM trusted_runtime_records WHERE runtime_id = ?1"#,
+                params![runtime_id],
+                read_trusted_runtime_record,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    async fn consume_worker_mutation_source_jti(
+        &self,
+        runtime_id: &str,
+        jti: &str,
+        expires_at: u64,
+        now_seconds: u64,
+        consumed_at: &str,
+    ) -> Result<bool> {
+        self.with_conn(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            transaction.execute(
+                "DELETE FROM worker_mutation_source_proof_jtis WHERE expires_at < ?1",
+                params![now_seconds],
+            )?;
+            let inserted = transaction.execute(
+                r#"INSERT OR IGNORE INTO worker_mutation_source_proof_jtis (
+                    runtime_id, jti, expires_at, consumed_at
+                ) VALUES (?1, ?2, ?3, ?4)"#,
+                params![runtime_id, jti, expires_at, consumed_at],
+            )?;
+            transaction.commit()?;
+            Ok(inserted == 1)
         })
     }
 
@@ -4326,6 +4378,23 @@ fn current_schema_version(conn: &Connection) -> Result<i64> {
     .map_err(Error::from)
 }
 
+fn create_worker_mutation_source_proof_replay_guard(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS worker_mutation_source_proof_jtis (
+            runtime_id TEXT NOT NULL,
+            jti TEXT NOT NULL,
+            expires_at INTEGER NOT NULL,
+            consumed_at TEXT NOT NULL,
+            PRIMARY KEY (runtime_id, jti)
+        );
+        CREATE INDEX IF NOT EXISTS idx_worker_mutation_source_proof_jtis_expiry
+            ON worker_mutation_source_proof_jtis(expires_at);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn apply_migrations(conn: &Connection) -> Result<()> {
     let current = current_schema_version(conn)?;
     for migration in MIGRATIONS
@@ -4915,7 +4984,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 28);
+        assert_eq!(current_schema_version(&conn).unwrap(), 29);
         assert!(table_exists(&conn, "worker_workdir_attachment_reservations").unwrap());
     }
 
@@ -4948,7 +5017,7 @@ CREATE TABLE flow_events (event_id TEXT PRIMARY KEY);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 28);
+        assert_eq!(current_schema_version(&conn).unwrap(), 29);
         assert!(table_exists(&conn, "flow_sources").unwrap());
         assert!(table_exists(&conn, "flow_source_revisions").unwrap());
         assert!(!table_exists(&conn, "flow_instances").unwrap());
@@ -5015,7 +5084,7 @@ INSERT INTO worker_workdir_attachment_reservations (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 28);
+        assert_eq!(current_schema_version(&conn).unwrap(), 29);
         let repositories_sql: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'repositories'",
@@ -5195,7 +5264,7 @@ INSERT INTO workdir_registry (
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 28);
+        assert_eq!(store.schema_version().await.unwrap(), 29);
         assert!(
             !store
                 .with_conn(|conn| table_exists(conn, "worker_workspace_credentials"))
@@ -5212,7 +5281,7 @@ INSERT INTO workdir_registry (
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 28);
+        assert_eq!(reopened.schema_version().await.unwrap(), 29);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -5759,7 +5828,7 @@ INSERT INTO workdir_registry (
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 28);
+        assert_eq!(store.schema_version().await.unwrap(), 29);
 
         store
             .with_conn(|conn| {
@@ -5948,7 +6017,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 28);
+        assert_eq!(store.schema_version().await.unwrap(), 29);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -6014,7 +6083,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 28);
+        assert_eq!(store.schema_version().await.unwrap(), 29);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -6277,7 +6346,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 28);
+        assert_eq!(store.schema_version().await.unwrap(), 29);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),
@@ -6452,6 +6521,51 @@ CREATE TABLE ticket_assignment_operations (
                 .consume_device_login_token("device", "2026-07-22T00:05:00Z")
                 .unwrap(),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_mutation_source_jti_replay_guard_survives_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        store
+            .upsert_trusted_runtime(&TrustedRuntimeRecord {
+                runtime_id: "runtime-a".to_string(),
+                display_name: "Runtime A".to_string(),
+                base_url: "https://runtime.invalid".to_string(),
+                public_key: "public-key".to_string(),
+                created_at: "2026-08-11T00:00:00Z".to_string(),
+                updated_at: "2026-08-11T00:00:00Z".to_string(),
+                revoked_at: None,
+            })
+            .unwrap();
+        assert!(
+            store
+                .consume_worker_mutation_source_jti(
+                    "runtime-a",
+                    "proof-1",
+                    2_000,
+                    1_000,
+                    "2026-08-11T00:00:00Z",
+                )
+                .await
+                .unwrap()
+        );
+        drop(store);
+
+        let reopened = SqliteWorkspaceStore::open(&path).unwrap();
+        assert!(
+            !reopened
+                .consume_worker_mutation_source_jti(
+                    "runtime-a",
+                    "proof-1",
+                    2_000,
+                    1_001,
+                    "2026-08-11T00:00:01Z",
+                )
+                .await
+                .unwrap()
         );
     }
 
