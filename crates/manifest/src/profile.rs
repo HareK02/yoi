@@ -1570,6 +1570,18 @@ mod tests {
     }
 
     #[test]
+    fn orchestrator_role_keeps_review_routing_owned_by_coder() {
+        let prompt = include_str!("../../../resources/prompts/role/orchestrator.md");
+
+        assert!(prompt.contains("assigned Coder owns its review/fix loop"));
+        assert!(prompt.contains(
+            "Do not spawn, restore, assign, or route work to Backend/Runtime Reviewer Workers"
+        ));
+        assert!(prompt.contains("never compensate by creating an independent Reviewer Worker"));
+        assert!(!prompt.contains("sibling Coder/Reviewer Workers"));
+    }
+
+    #[test]
     fn profile_resolution_requires_runtime_worker_name() {
         let tmp = TempDir::new().unwrap();
         let err = ProfileResolver::new()
