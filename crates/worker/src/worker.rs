@@ -6389,7 +6389,10 @@ mod build_summary_prompt_tests {
             .lock()
             .expect("flow runtime state lock") = Some(state.clone());
 
-        assert!(matches!(segments[0], Segment::Text { .. }));
+        assert_eq!(
+            segments[0],
+            Segment::text("Implement the Ticket and request review.")
+        );
         assert_eq!(segments[1], Segment::text("Implement Ticket 00001"));
         assert_eq!(state.instance.definition_revision, 3);
         assert_eq!(state.instance.current_state.as_str(), "implement");

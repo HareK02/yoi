@@ -10281,7 +10281,7 @@ mod tests {
         assert_eq!(builtin.definition.name, "coder-review");
         assert_eq!(builtin.selector.to_string(), "builtin:coder-review");
         assert_eq!(builtin.flow_id, "builtin:coder-review");
-        assert_eq!(builtin.revision, 1);
+        assert_eq!(builtin.revision, 2);
         assert_eq!(
             api.store
                 .list_flow_sources(&api.config.workspace_id)

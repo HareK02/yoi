@@ -24,7 +24,7 @@ pub fn builtin_flow_source(slug: &str) -> Option<BuiltinFlowSource> {
     match slug {
         CODER_REVIEW_FLOW_SLUG => Some(BuiltinFlowSource {
             slug: CODER_REVIEW_FLOW_SLUG,
-            revision: 1,
+            revision: 2,
             path: "builtin/flows/coder-review.dcdl",
             content: CODER_REVIEW_FLOW_SOURCE,
         }),
@@ -35,7 +35,7 @@ pub fn builtin_flow_source(slug: &str) -> Option<BuiltinFlowSource> {
 pub fn builtin_flow_sources() -> &'static [BuiltinFlowSource] {
     const SOURCES: &[BuiltinFlowSource] = &[BuiltinFlowSource {
         slug: CODER_REVIEW_FLOW_SLUG,
-        revision: 1,
+        revision: 2,
         path: "builtin/flows/coder-review.dcdl",
         content: CODER_REVIEW_FLOW_SOURCE,
     }];
@@ -61,9 +61,32 @@ mod tests {
                 )
             });
             assert_eq!(definition.name, source.slug);
-            assert_eq!(
-                builtin_flow_source(source.slug).map(|item| item.content),
-                Some(source.content)
+            let selected =
+                builtin_flow_source(source.slug).expect("builtin Flow must be selectable");
+            assert_eq!(selected.content, source.content);
+            assert_eq!(selected.revision, source.revision);
+        }
+    }
+
+    #[test]
+    fn coder_review_starts_on_a_ticket_branch_and_requires_committed_review_evidence() {
+        let source =
+            builtin_flow_source(CODER_REVIEW_FLOW_SLUG).expect("coder-review Flow must exist");
+
+        for required in [
+            "detached HEAD",
+            "work/<ticket-id>-<slug>",
+            "explicitly authorized",
+            "git add",
+            "git commit",
+            "Workdir is clean",
+            "current head commit",
+            "same Ticket work branch",
+            "new revision",
+        ] {
+            assert!(
+                source.content.contains(required),
+                "coder-review Flow must preserve branch/commit policy token {required:?}"
             );
         }
     }
