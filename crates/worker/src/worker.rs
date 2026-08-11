@@ -223,6 +223,94 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
     fn is_available(&self) -> bool;
     fn execute(&self, request: WorkspaceRequest)
     -> Result<WorkspaceResponse, WorkspaceClientError>;
+
+    /// Trusted review-attempt context is injected by the Internal SubWorker spawn layer.
+    /// It is never accepted from a model-visible tool argument.
+    fn reviewer_attempt_context(&self) -> Option<&ReviewerAttemptContext> {
+        None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewerAttemptContext {
+    pub ticket_id: String,
+    pub revision_id: String,
+}
+
+#[derive(Debug)]
+pub struct ReviewerChildWorkspaceClient {
+    inner: Arc<dyn WorkspaceClient>,
+    context: ReviewerAttemptContext,
+    capability_token: String,
+}
+
+impl ReviewerChildWorkspaceClient {
+    pub fn new(
+        inner: Arc<dyn WorkspaceClient>,
+        context: ReviewerAttemptContext,
+        capability_token: String,
+    ) -> Self {
+        Self {
+            inner,
+            context,
+            capability_token,
+        }
+    }
+}
+
+impl WorkspaceClient for ReviewerChildWorkspaceClient {
+    fn workspace_id(&self) -> Option<&str> {
+        self.inner.workspace_id()
+    }
+    fn kind(&self) -> &str {
+        "runtime-reviewer-child"
+    }
+    fn is_available(&self) -> bool {
+        self.inner.is_available()
+    }
+    fn reviewer_attempt_context(&self) -> Option<&ReviewerAttemptContext> {
+        Some(&self.context)
+    }
+
+    fn execute(
+        &self,
+        mut request: WorkspaceRequest,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        let expected_path = format!(
+            "/api/w/{}/tickets/{}/merge-request/reviews",
+            self.workspace_id().unwrap_or_default(),
+            self.context.ticket_id
+        );
+        if request.method == WorkspaceRequestMethod::Post && request.path == expected_path {
+            let body = request.body.take().ok_or_else(|| {
+                WorkspaceClientError::Request("review submission requires a JSON body".to_string())
+            })?;
+            let mut value: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
+            let object = value.as_object_mut().ok_or_else(|| {
+                WorkspaceClientError::Request(
+                    "review submission body must be an object".to_string(),
+                )
+            })?;
+            object.insert(
+                "revision_id".to_string(),
+                serde_json::Value::String(self.context.revision_id.clone()),
+            );
+            object.insert(
+                "capability_token".to_string(),
+                serde_json::Value::String(self.capability_token.clone()),
+            );
+            request.body = Some(
+                serde_json::to_string(&value)
+                    .map_err(|error| WorkspaceClientError::Request(error.to_string()))?,
+            );
+        } else if request.method != WorkspaceRequestMethod::Get {
+            return Err(WorkspaceClientError::Unavailable(
+                "Reviewer child Workspace authority is read-only except for its one attested Merge Request review submission".to_string(),
+            ));
+        }
+        self.inner.execute(request)
+    }
 }
 
 /// HTTP forwarding client created by Runtime for one concrete Worker execution.
@@ -362,6 +450,36 @@ impl WorkspaceClient for MarkerWorkspaceClient {
         _request: WorkspaceRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         Err(WorkspaceClientError::Unavailable(self.reason.clone()))
+    }
+}
+
+#[cfg(test)]
+mod reviewer_client_tests {
+    use super::*;
+
+    #[test]
+    fn reviewer_child_client_denies_non_review_workspace_mutations() {
+        let inner: Arc<dyn WorkspaceClient> = Arc::new(MarkerWorkspaceClient {
+            workspace_id: Some("ws".to_string()),
+            kind: "marker".to_string(),
+            available: true,
+            reason: "forwarded".to_string(),
+        });
+        let client = ReviewerChildWorkspaceClient::new(
+            inner,
+            ReviewerAttemptContext {
+                ticket_id: "T1".into(),
+                revision_id: "V1".into(),
+            },
+            "secret".into(),
+        );
+        let request = WorkspaceRequest::json(
+            WorkspaceRequestMethod::Post,
+            "/api/w/ws/tickets/T1/comments",
+            "{}".to_string(),
+        );
+        let error = client.execute(request).unwrap_err();
+        assert!(error.to_string().contains("read-only"));
     }
 }
 

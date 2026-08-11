@@ -17,8 +17,7 @@ use crate::{
     Result as TicketResult, Ticket, TicketBackend, TicketBodyReplacement, TicketDoctorDiagnostic,
     TicketDoctorReport, TicketDoctorSeverity, TicketError, TicketEventKind, TicketIdOrSlug,
     TicketIntakeSummary, TicketListState, TicketRef, TicketRelation, TicketRelationKind,
-    TicketRelationView, TicketReview, TicketReviewResult, TicketStateChange, TicketSummary,
-    TicketWorkflowState, default_author,
+    TicketRelationView, TicketStateChange, TicketSummary, TicketWorkflowState, default_author,
 };
 
 const DEFAULT_LIST_LIMIT: usize = 50;
@@ -34,7 +33,7 @@ const MAX_BODY_MAX_BYTES: usize = 64 * 1024;
 const DEFAULT_DIAGNOSTIC_LIMIT: usize = 100;
 const MAX_DIAGNOSTIC_LIMIT: usize = 500;
 
-pub const TICKET_BASE_TOOL_NAMES: [&str; 15] = [
+pub const TICKET_BASE_TOOL_NAMES: [&str; 14] = [
     "TicketCreate",
     "TicketEditItem",
     "TicketList",
@@ -43,7 +42,6 @@ pub const TICKET_BASE_TOOL_NAMES: [&str; 15] = [
     "TicketPlan",
     "TicketDecision",
     "TicketImplementationReport",
-    "TicketReview",
     "TicketIntakeReady",
     "TicketQueue",
     "TicketWorkflowState",
@@ -69,7 +67,7 @@ pub const TICKET_ORCHESTRATION_TOOL_NAMES: [&str; 4] = [
 pub const TICKET_ORCHESTRATION_READ_ONLY_TOOL_NAMES: [&str; 2] =
     ["TicketRelationQuery", "TicketOrchestrationPlanQuery"];
 
-pub const TICKET_TOOL_NAMES: [&str; 19] = [
+pub const TICKET_TOOL_NAMES: [&str; 18] = [
     "TicketCreate",
     "TicketEditItem",
     "TicketList",
@@ -78,7 +76,6 @@ pub const TICKET_TOOL_NAMES: [&str; 19] = [
     "TicketPlan",
     "TicketDecision",
     "TicketImplementationReport",
-    "TicketReview",
     "TicketIntakeReady",
     "TicketQueue",
     "TicketWorkflowState",
@@ -100,14 +97,13 @@ pub const TICKET_READ_ONLY_TOOL_NAMES: [&str; 6] = [
     "TicketOrchestrationPlanQuery",
 ];
 
-pub const TICKET_MUTATING_TOOL_NAMES: [&str; 13] = [
+pub const TICKET_MUTATING_TOOL_NAMES: [&str; 12] = [
     "TicketCreate",
     "TicketEditItem",
     "TicketComment",
     "TicketPlan",
     "TicketDecision",
     "TicketImplementationReport",
-    "TicketReview",
     "TicketIntakeReady",
     "TicketQueue",
     "TicketWorkflowState",
@@ -134,8 +130,6 @@ const PLAN_DESCRIPTION: &str = "Append a typed Ticket plan event. `body` is Mark
 const DECISION_DESCRIPTION: &str = "Append a typed Ticket decision event. `body` is Markdown.";
 const IMPLEMENTATION_REPORT_DESCRIPTION: &str =
     "Append a typed Ticket implementation_report event. `body` is Markdown.";
-const REVIEW_DESCRIPTION: &str = "Append a Ticket review event. `result` must be `approve` or \
-`request_changes`; `body` is Markdown. Writes stay inside the configured Ticket backend root.";
 const INTAKE_READY_DESCRIPTION: &str = "Mark an existing Ticket planning lane ready through the typed \
 Ticket backend. The tool appends a bounded `intake_summary`, appends a typed `state_changed` event \
 for `state`, and transitions state to `ready`.";
@@ -175,7 +169,6 @@ fn base_tool_description(name: &str) -> &'static str {
         "TicketPlan" => PLAN_DESCRIPTION,
         "TicketDecision" => DECISION_DESCRIPTION,
         "TicketImplementationReport" => IMPLEMENTATION_REPORT_DESCRIPTION,
-        "TicketReview" => REVIEW_DESCRIPTION,
         "TicketIntakeReady" => INTAKE_READY_DESCRIPTION,
         "TicketQueue" => QUEUE_DESCRIPTION,
         "TicketWorkflowState" => WORKFLOW_STATE_DESCRIPTION,
@@ -317,10 +310,6 @@ impl TicketBackend for TicketToolBackend {
 
     fn queue_ready(&self, id: TicketIdOrSlug, queued_by: &str) -> TicketResult<()> {
         self.backend.queue_ready(id, queued_by)
-    }
-
-    fn review(&self, id: TicketIdOrSlug, review: TicketReview) -> TicketResult<()> {
-        self.backend.review(id, review)
     }
 
     fn close(&self, id: TicketIdOrSlug, resolution: MarkdownText) -> TicketResult<()> {
@@ -551,23 +540,6 @@ struct TicketThreadEventParams {
     /// Ticket id.
     ticket: String,
     /// Markdown event body.
-    body: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-enum TicketReviewResultParam {
-    Approve,
-    RequestChanges,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct TicketReviewParams {
-    /// Ticket id.
-    ticket: String,
-    /// Review result: `approve` or `request_changes`.
-    result: TicketReviewResultParam,
-    /// Markdown review body.
     body: String,
 }
 
@@ -836,11 +808,6 @@ struct TicketDecisionTool {
 
 #[derive(Clone)]
 struct TicketImplementationReportTool {
-    backend: TicketToolBackend,
-}
-
-#[derive(Clone)]
-struct TicketReviewTool {
     backend: TicketToolBackend,
 }
 
@@ -1116,34 +1083,6 @@ impl_ticket_thread_event_tool!(
     "TicketImplementationReport",
     TicketEventKind::ImplementationReport
 );
-
-#[async_trait]
-impl Tool for TicketReviewTool {
-    async fn execute(
-        &self,
-        input_json: &str,
-        _ctx: llm_engine::tool::ToolExecutionContext,
-    ) -> Result<ToolOutput, ToolError> {
-        let params: TicketReviewParams = parse_input("TicketReview", input_json)?;
-        let result = match params.result {
-            TicketReviewResultParam::Approve => TicketReviewResult::Approve,
-            TicketReviewResultParam::RequestChanges => TicketReviewResult::RequestChanges,
-        };
-        let result_str = result.as_str().to_string();
-        let review = TicketReview {
-            result,
-            author: None,
-            body: MarkdownText::new(params.body),
-        };
-        self.backend
-            .review(TicketIdOrSlug::Query(params.ticket.clone()), review)
-            .map_err(|error| backend_error("TicketReview", error))?;
-        Ok(json_output(
-            format!("Appended {result_str} review to ticket {}", params.ticket),
-            json!({ "ticket": params.ticket, "review": result_str, "ok": true }),
-        ))
-    }
-}
 
 #[async_trait]
 impl Tool for TicketIntakeReadyTool {
@@ -1731,7 +1670,6 @@ fn input_schema(name: &str) -> Value {
         "TicketComment" | "TicketPlan" | "TicketDecision" | "TicketImplementationReport" => {
             serde_json::to_value(schemars::schema_for!(TicketThreadEventParams))
         }
-        "TicketReview" => serde_json::to_value(schemars::schema_for!(TicketReviewParams)),
         "TicketIntakeReady" => serde_json::to_value(schemars::schema_for!(TicketIntakeReadyParams)),
         "TicketQueue" => serde_json::to_value(schemars::schema_for!(TicketQueueParams)),
         "TicketWorkflowState" => {
@@ -1777,7 +1715,6 @@ impl_from_backend!(TicketCommentTool);
 impl_from_backend!(TicketPlanTool);
 impl_from_backend!(TicketDecisionTool);
 impl_from_backend!(TicketImplementationReportTool);
-impl_from_backend!(TicketReviewTool);
 impl_from_backend!(TicketIntakeReadyTool);
 impl_from_backend!(TicketQueueTool);
 impl_from_backend!(TicketWorkflowStateTool);
@@ -1804,7 +1741,6 @@ pub fn ticket_tools(backend: impl Into<TicketToolBackend>) -> Vec<ToolDefinition
             "TicketImplementationReport",
             backend.clone(),
         ),
-        tool_definition::<TicketReviewTool>("TicketReview", backend.clone()),
         tool_definition::<TicketIntakeReadyTool>("TicketIntakeReady", backend.clone()),
         tool_definition::<TicketQueueTool>("TicketQueue", backend.clone()),
         tool_definition::<TicketWorkflowStateTool>("TicketWorkflowState", backend.clone()),
@@ -1880,7 +1816,6 @@ mod tests {
                 "TicketPlan",
                 "TicketDecision",
                 "TicketImplementationReport",
-                "TicketReview",
                 "TicketIntakeReady",
                 "TicketQueue",
                 "TicketWorkflowState",
@@ -2373,12 +2308,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_tools_comment_review_state_and_close_are_doctor_clean() {
+    async fn ticket_tools_report_state_and_close_are_doctor_clean() {
         let temp = TempDir::new().unwrap();
         let backend = backend(&temp);
         let created = backend.create(NewTicket::new("Flow Tool")).unwrap();
         let report = tool_by_name(backend.clone(), "TicketImplementationReport");
-        let review = tool_by_name(backend.clone(), "TicketReview");
         let close = tool_by_name(backend.clone(), "TicketClose");
         let doctor = tool_by_name(backend.clone(), "TicketDoctor");
 
@@ -2387,18 +2321,6 @@ mod tests {
                 &json!({
                     "ticket": created.id.clone(),
                     "body": "Implemented."
-                })
-                .to_string(),
-                Default::default(),
-            )
-            .await
-            .unwrap();
-        review
-            .execute(
-                &json!({
-                    "ticket": created.id.clone(),
-                    "result": "approve",
-                    "body": "Looks good."
                 })
                 .to_string(),
                 Default::default(),
@@ -2426,12 +2348,6 @@ mod tests {
                 .events
                 .iter()
                 .any(|event| event.kind == TicketEventKind::ImplementationReport)
-        );
-        assert!(
-            closed
-                .events
-                .iter()
-                .any(|event| event.kind == TicketEventKind::Review)
         );
         assert!(
             closed
@@ -2852,7 +2768,6 @@ mod tests {
             "TicketPlan",
             "TicketDecision",
             "TicketImplementationReport",
-            "TicketReview",
             "TicketIntakeReady",
             "TicketQueue",
             "TicketRelationRecord",

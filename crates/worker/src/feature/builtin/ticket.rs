@@ -14,12 +14,13 @@ use ticket::{
     NewTicketRelation, OrchestrationPlanKind, OrchestrationPlanRecord, Result as TicketResult,
     Ticket, TicketBackend, TicketBackendOperation, TicketBackendOperationResult,
     TicketDoctorReport, TicketError, TicketIdOrSlug, TicketIntakeSummary, TicketListQuery,
-    TicketRef, TicketRelation, TicketRelationKind, TicketRelationView, TicketReview,
-    TicketStateChange, TicketSummary,
+    TicketRef, TicketRelation, TicketRelationKind, TicketRelationView, TicketStateChange,
+    TicketSummary,
     config::{DEFAULT_TICKET_BACKEND_RELATIVE_PATH, TicketConfig},
     tool::{TICKET_TOOL_NAMES, TicketToolBackend, ticket_tool_description, ticket_tools},
 };
 
+use super::merge_request;
 use crate::feature::{
     FeatureDescriptor, FeatureDiagnostic, FeatureInstallContext, FeatureInstallError,
     FeatureInstructionContribution, FeatureInstructionDeclaration, FeatureInstructionId,
@@ -100,7 +101,7 @@ impl TicketFeatureAccess {
     pub const fn review() -> Self {
         Self {
             authoring: false,
-            thread: true,
+            thread: false,
             intake: false,
             orchestration_control: false,
         }
@@ -141,7 +142,7 @@ const AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketRelationRecord",
 ];
 
-const THREAD_TOOL_NAMES: &[&str] = &["TicketComment", "TicketReview"];
+const THREAD_TOOL_NAMES: &[&str] = &["TicketComment"];
 
 const INTAKE_TOOL_NAMES: &[&str] = &["TicketIntakeReady"];
 
@@ -152,7 +153,6 @@ const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketList",
     "TicketShow",
     "TicketComment",
-    "TicketReview",
     "TicketQueue",
     "TicketClose",
     "TicketDependencyCheck",
@@ -167,7 +167,6 @@ const ORCHESTRATION_CONTROL_TOOL_NAMES: &[&str] = &[
     "TicketList",
     "TicketShow",
     "TicketComment",
-    "TicketReview",
     "TicketWorkflowState",
     "TicketClose",
     "TicketDependencyCheck",
@@ -340,6 +339,22 @@ impl FeatureModule for TicketFeature {
                 ticket_tool_description(name, self.record_language.as_deref()),
             ));
         }
+        if let TicketFeatureBackend::WorkspaceClient(client) = &self.backend {
+            let names: Vec<&str> = if client.reviewer_attempt_context().is_some() {
+                vec![
+                    "MergeRequestShow",
+                    merge_request::MERGE_REQUEST_REVIEW_TOOL_NAME,
+                ]
+            } else {
+                merge_request::MERGE_REQUEST_COMMON_TOOL_NAMES.to_vec()
+            };
+            for name in names {
+                descriptor = descriptor.with_tool(ToolDeclaration::new(
+                    name,
+                    merge_request::description(name).unwrap_or("Merge Request operation."),
+                ));
+            }
+        }
         descriptor
     }
 
@@ -372,6 +387,17 @@ impl FeatureModule for TicketFeature {
                 continue;
             }
             tools.register(ToolContribution::new(name, definition))?;
+        }
+        if let TicketFeatureBackend::WorkspaceClient(client) = &self.backend {
+            let definitions = if client.reviewer_attempt_context().is_some() {
+                merge_request::reviewer_tools(client.clone())
+            } else {
+                merge_request::common_tools(client.clone())
+            };
+            for definition in definitions {
+                let (meta, _) = definition();
+                tools.register(ToolContribution::new(meta.name.clone(), definition))?;
+            }
         }
         Ok(())
     }
@@ -611,14 +637,6 @@ impl WorkspaceHttpTicketBackend {
                 format!("{base}/{}/workflow/queue", Self::ticket_path(&id)),
                 None,
             ),
-            TicketBackendOperation::Review { id, review } => Self::request_unit(
-                client,
-                WorkspaceRequestMethod::Post,
-                format!("{base}/{}/workflow/review", Self::ticket_path(&id)),
-                Some(serde_json::to_value(review).map_err(|error| {
-                    TicketError::Conflict(format!("serialize Ticket review: {error}"))
-                })?),
-            ),
             TicketBackendOperation::Close { id, resolution } => Self::request_unit(
                 client,
                 WorkspaceRequestMethod::Post,
@@ -837,15 +855,6 @@ impl TicketBackend for WorkspaceHttpTicketBackend {
             id,
             queued_by: queued_by.to_string(),
         })? {
-            TicketBackendOperationResult::Unit => Ok(()),
-            other => Err(TicketError::Conflict(format!(
-                "unexpected ticket backend response: {other:?}"
-            ))),
-        }
-    }
-
-    fn review(&self, id: TicketIdOrSlug, review: TicketReview) -> TicketResult<()> {
-        match self.invoke(TicketBackendOperation::Review { id, review })? {
             TicketBackendOperationResult::Unit => Ok(()),
             other => Err(TicketError::Conflict(format!(
                 "unexpected ticket backend response: {other:?}"
@@ -1075,7 +1084,6 @@ mod tests {
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>();
         assert!(work_report_tools.contains(&"TicketComment"));
-        assert!(work_report_tools.contains(&"TicketReview"));
         assert!(!work_report_tools.contains(&"TicketWorkflowState"));
 
         let review = ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::review());
@@ -1085,7 +1093,6 @@ mod tests {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>();
-        assert!(review_tools.contains(&"TicketReview"));
         assert!(!review_tools.contains(&"TicketWorkflowState"));
     }
 

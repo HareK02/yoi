@@ -12,8 +12,8 @@ use ticket::config::{
 use ticket::{
     LocalTicketBackend, MarkdownText, NewTicket, NewTicketEvent, NewTicketRelation,
     SqliteTicketBackend, TicketBackend, TicketDoctorSeverity, TicketEventKind, TicketIdOrSlug,
-    TicketIntakeSummary, TicketListQuery, TicketListState, TicketRelationKind, TicketReview,
-    TicketReviewResult, TicketSummary, TicketWorkflowState,
+    TicketIntakeSummary, TicketListQuery, TicketListState, TicketRelationKind, TicketSummary,
+    TicketWorkflowState,
 };
 
 const DEFAULT_LIST_LIMIT: usize = 50;
@@ -35,7 +35,6 @@ pub enum TicketCommand {
     List(ListOptions),
     Show { query: String },
     Comment(CommentOptions),
-    Review(ReviewOptions),
     State(StateOptions),
     Close(CloseOptions),
     Relation(RelationOptions),
@@ -64,13 +63,6 @@ pub struct ListOptions {
 pub struct CommentOptions {
     pub query: String,
     pub role: TicketEventKind,
-    pub body: BodySource,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewOptions {
-    pub query: String,
-    pub result: TicketReviewResult,
     pub body: BodySource,
 }
 
@@ -194,7 +186,6 @@ pub fn parse_ticket_args(args: &[String]) -> Result<TicketCli, TicketCliError> {
             query: parse_one_positional("show", &args[1..])?,
         },
         "comment" => TicketCommand::Comment(parse_comment(&args[1..])?),
-        "review" => TicketCommand::Review(parse_review(&args[1..])?),
         "state" => TicketCommand::State(parse_state(&args[1..])?),
         "close" => TicketCommand::Close(parse_close(&args[1..])?),
         "relation" => TicketCommand::Relation(parse_relation(&args[1..])?),
@@ -249,7 +240,6 @@ fn run_command(
                 TicketCommand::List(options) => list(backend.as_ref(), options),
                 TicketCommand::Show { query } => show(backend.as_ref(), query),
                 TicketCommand::Comment(options) => comment(backend.as_ref(), options),
-                TicketCommand::Review(options) => review(backend.as_ref(), options),
                 TicketCommand::State(options) => state(backend.as_ref(), options),
                 TicketCommand::Close(options) => close(backend.as_ref(), options),
                 TicketCommand::Relation(options) => relation(backend.as_ref(), options),
@@ -633,23 +623,6 @@ fn comment(
     Ok(success(format!("appended\t{}\t{}\n", options.query, role)))
 }
 
-fn review(
-    backend: &dyn TicketBackend,
-    options: ReviewOptions,
-) -> Result<TicketCliOutput, TicketCliError> {
-    let result = options.result.as_str().to_string();
-    let review = TicketReview {
-        result: options.result,
-        author: Some(default_author()),
-        body: MarkdownText::new(read_body_source(&options.body)?),
-    };
-    backend.review(TicketIdOrSlug::Query(options.query.clone()), review)?;
-    Ok(success(format!(
-        "reviewed\t{}\t{}\n",
-        options.query, result
-    )))
-}
-
 fn state(
     backend: &dyn TicketBackend,
     options: StateOptions,
@@ -660,7 +633,11 @@ fn state(
         StateTarget::Ready => TicketWorkflowState::Ready,
         StateTarget::Queued => TicketWorkflowState::Queued,
         StateTarget::InProgress => TicketWorkflowState::InProgress,
-        StateTarget::Done => TicketWorkflowState::Done,
+        StateTarget::Done => {
+            return Err(TicketCliError::new(
+                "done is guarded by MergeRequestComplete with an approved immutable revision and operation_id",
+            ));
+        }
         StateTarget::Closed => {
             return Err(TicketCliError::new(
                 "yoi ticket state <ticket> closed cannot write resolution.md; use `yoi ticket close <ticket> --resolution <text>` instead",
@@ -965,64 +942,6 @@ fn parse_comment(args: &[String]) -> Result<CommentOptions, TicketCliError> {
     })
 }
 
-fn parse_review(args: &[String]) -> Result<ReviewOptions, TicketCliError> {
-    if args.is_empty() || args[0].starts_with('-') {
-        return Err(TicketCliError::new("review requires <id>"));
-    }
-    let query = args[0].clone();
-    let mut approve = false;
-    let mut request_changes = false;
-    let mut file = None;
-    let mut message = None;
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--approve" => {
-                approve = true;
-                i += 1;
-            }
-            "--request-changes" => {
-                request_changes = true;
-                i += 1;
-            }
-            _ => match option_with_value(args, &mut i)? {
-                Some(("--file", value)) => file = Some(PathBuf::from(value)),
-                Some(("--message", value)) => message = Some(value),
-                Some((name, _)) => {
-                    return Err(TicketCliError::new(format!(
-                        "unknown review argument: {name}"
-                    )));
-                }
-                None => {
-                    return Err(TicketCliError::new(format!(
-                        "unknown review argument: {}",
-                        args[i]
-                    )));
-                }
-            },
-        }
-    }
-    let result = match (approve, request_changes) {
-        (true, false) => TicketReviewResult::Approve,
-        (false, true) => TicketReviewResult::RequestChanges,
-        (false, false) => {
-            return Err(TicketCliError::new(
-                "review requires exactly one of --approve or --request-changes",
-            ));
-        }
-        (true, true) => {
-            return Err(TicketCliError::new(
-                "review accepts exactly one of --approve or --request-changes",
-            ));
-        }
-    };
-    Ok(ReviewOptions {
-        query,
-        result,
-        body: exactly_one_body("review", file, message)?,
-    })
-}
-
 fn parse_state(args: &[String]) -> Result<StateOptions, TicketCliError> {
     if args.len() != 2 {
         return Err(TicketCliError::new(
@@ -1244,7 +1163,7 @@ fn default_author() -> String {
 }
 
 fn help_text() -> &'static str {
-    "yoi ticket\n\nUsage:\n  yoi ticket init\n  yoi ticket import-local\n  yoi ticket create --title <title>\n  yoi ticket list [--state active|all|planning|ready|queued|inprogress|done|closed[,..]] [--limit <n>]\n  yoi ticket show <id>\n  yoi ticket comment <id> [--role comment|plan|decision|implementation_report] (--file <path>|--message <text>)\n  yoi ticket review <id> (--approve|--request-changes) (--file <path>|--message <text>)\n  yoi ticket state <id> <planning|ready|queued|inprogress|done|closed>\n  yoi ticket close <id> (--resolution <text>|--file <path>)\n  yoi ticket relation add --ticket <id> --kind <depends_on|blocks|related|supersedes|duplicate_of> --target <id> [--note <text>]\n  yoi ticket relation list [--ticket <id>] [--kind <kind>]\n  yoi ticket doctor\n\nOptions:\n  -h, --help    Print help\n\nBackend:\n  Tickets are stored in the workspace SQLite DB under the Yoi data directory.\n  `yoi ticket import-local` imports the legacy .yoi/tickets backend root configured in .yoi/workspace.toml.\n  `yoi ticket init` writes explicit fixed role profiles and optional [ticket].language into .yoi/workspace.toml, but does not create .yoi/tickets.\n"
+    "yoi ticket\n\nUsage:\n  yoi ticket init\n  yoi ticket import-local\n  yoi ticket create --title <title>\n  yoi ticket list [--state active|all|planning|ready|queued|inprogress|done|closed[,..]] [--limit <n>]\n  yoi ticket show <id>\n  yoi ticket comment <id> [--role comment|plan|decision|implementation_report] (--file <path>|--message <text>)\n  yoi ticket state <id> <planning|ready|queued|inprogress|closed>\n  yoi ticket close <id> (--resolution <text>|--file <path>)\n  yoi ticket relation add --ticket <id> --kind <depends_on|blocks|related|supersedes|duplicate_of> --target <id> [--note <text>]\n  yoi ticket relation list [--ticket <id>] [--kind <kind>]\n  yoi ticket doctor\n\nOptions:\n  -h, --help    Print help\n\nBackend:\n  Tickets are stored in the workspace SQLite DB under the Yoi data directory.\n  `yoi ticket import-local` imports the legacy .yoi/tickets backend root configured in .yoi/workspace.toml.\n  `yoi ticket init` writes explicit fixed role profiles and optional [ticket].language into .yoi/workspace.toml, but does not create .yoi/tickets.\n"
 }
 
 #[cfg(test)]
@@ -1375,7 +1294,7 @@ mod tests {
     }
 
     #[test]
-    fn ticket_cli_create_list_show_comment_review_state_close_and_doctor() {
+    fn ticket_cli_create_list_show_comment_state_close_and_doctor() {
         let temp = TempDir::new().unwrap();
 
         let created = run(&temp, &["create", "--title", "CLI Created"]);
@@ -1416,22 +1335,6 @@ mod tests {
                 .contains(&format!("appended\t{}\timplementation_report", ticket_id))
         );
 
-        let reviewed = run(
-            &temp,
-            &[
-                "review",
-                &ticket_id,
-                "--approve",
-                "--message",
-                "Looks good.",
-            ],
-        );
-        assert!(
-            reviewed
-                .stdout
-                .contains(&format!("reviewed\t{}\tapprove", ticket_id))
-        );
-
         let ready = run(&temp, &["state", &ticket_id, "ready"]);
         assert_eq!(ready.stdout, format!("state\t{}\tready\n", ticket_id));
         let ready_listed = run(&temp, &["list", "--state", "ready"]);
@@ -1450,10 +1353,10 @@ mod tests {
         let inprogress_listed = run(&temp, &["list", "--state", "inprogress"]);
         assert!(inprogress_listed.stdout.contains(&ticket_id));
 
-        let done = run(&temp, &["state", &ticket_id, "done"]);
-        assert_eq!(done.stdout, format!("state\t{}\tdone\n", ticket_id));
-        let done_listed = run(&temp, &["list", "--state", "done"]);
-        assert!(done_listed.stdout.contains(&ticket_id));
+        let done_error = parse_ticket_args(&args(&["state", &ticket_id, "done"]))
+            .and_then(|cli| run_in_workspace(cli, temp.path()))
+            .unwrap_err();
+        assert!(done_error.to_string().contains("MergeRequestComplete"));
 
         let closed = run(
             &temp,
@@ -1469,7 +1372,6 @@ mod tests {
         assert!(final_show.stdout.contains("State: closed"));
         assert!(final_show.stdout.contains("Done via yoi ticket."));
         assert!(final_show.stdout.contains("implementation_report"));
-        assert!(final_show.stdout.contains("review"));
     }
 
     #[test]
@@ -1587,20 +1489,6 @@ mod tests {
             "ticket",
             "--file",
             "body.md",
-            "--message",
-            "body",
-        ]))
-        .unwrap_err();
-        assert!(err.to_string().contains("exactly one"));
-    }
-
-    #[test]
-    fn ticket_cli_rejects_ambiguous_review_result() {
-        let err = parse_ticket_args(&args(&[
-            "review",
-            "ticket",
-            "--approve",
-            "--request-changes",
             "--message",
             "body",
         ]))

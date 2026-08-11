@@ -24,7 +24,7 @@ Use the highest-level interface that matches the work:
 
 - Use `yoi panel` for the Ticket/Intake/Orchestrator workspace Dashboard and role-launch actions.
 - Use `yoi objective ...` for lightweight medium-term Objective records and their non-blocking canonical Ticket links.
-- Inside Workers, use typed Ticket tools to create, inspect, comment, review, and close Tickets.
+- Inside Workers, use typed Ticket tools for Ticket records and typed Merge Request tools for immutable implementation/review/completion evidence.
 - For multi-step work, follow the typed Ticket role surfaces and recorded Ticket lifecycle gates.
 
 Maintainers can inspect the local `.yoi/tickets/` files directly when debugging storage, but normal user instructions should go through `yoi panel`, Ticket tools, or `yoi ticket ...`.
@@ -37,8 +37,8 @@ Workers with the Ticket built-in feature can use typed Ticket tools:
 - `TicketList` — lightweight bounded overview for selecting ids; it returns short summaries only and must not be used as body/thread/artifact authority.
 - `TicketShow` — detailed authority for a single Ticket, including body/thread/artifact metadata/resolution context subject to its own bounds.
 - `TicketComment`
-- `TicketReview`
-- `TicketWorkflowState`
+- `MergeRequestShow`, `MergeRequestOpen`, `MergeRequestAddRevision`, `MergeRequestComplete`
+- `MergeRequestReviewSubmit` — available only inside the attested direct-child Reviewer attempt; attempt/revision capability material is not model input.
 - `TicketClose`
 - `TicketRelationRecord`
 - `TicketRelationQuery`
@@ -52,7 +52,7 @@ Use them when a Worker needs to materialize or update project records:
 
 - Intake creates a new Ticket after user agreement.
 - Orchestrator records routing decisions and intent packets.
-- Reviewer records approve/request-changes review results.
+- Reviewer commits an approve/request-changes result against one immutable Merge Request revision.
 - Maintainer closes a Ticket with a resolution when merge/validation/cleanup evidence is complete.
 
 Do not bypass Ticket lifecycle gates just because Ticket tools are available. Ticket mutation is a project-record operation and should remain auditable.
@@ -241,9 +241,9 @@ Implementation normally happens in a child git worktree created by the Orchestra
 
 ### 5. Review
 
-Reviewer Workers should be sibling Workers, not children of coder Workers. They should read the Ticket, intent packet, diff, implementation report, and validation evidence.
+The assigned Coder launches the Reviewer as an actual direct-child `builtin:reviewer` SubWorker with read-only scope and a structured handoff bound to the current immutable Merge Request revision. Server authority revalidates the parent assignment, Runtime-owned child session, effective profile, one-shot review attempt, and revision; prose output is not approval.
 
-Review results should be recorded with the `TicketReview` tool. Maintainers working directly with the local backend can use the `yoi ticket` CLI documented later.
+The Reviewer records the structured result with `MergeRequestReviewSubmit`. Request changes requires a new immutable revision and a fresh child attempt. `MergeRequestComplete` performs guarded Ticket completion with operation-id dedupe/CAS semantics; Flow transitions are not completion authority.
 
 Blockers must be fixed or explicitly escalated before merge-ready submission.
 

@@ -2482,6 +2482,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "merge-request"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6164,6 +6175,7 @@ dependencies = [
  "futures",
  "manifest",
  "memory",
+ "merge-request",
  "project-record",
  "protocol",
  "reqwest",

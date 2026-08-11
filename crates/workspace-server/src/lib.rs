@@ -55,6 +55,8 @@ pub enum Error {
     Sqlite(#[from] rusqlite::Error),
     #[error("ticket error: {0}")]
     Ticket(#[from] ticket::TicketError),
+    #[error("merge request error: {0}")]
+    MergeRequest(#[from] merge_request::MergeRequestError),
     #[error("yaml error: {0}")]
     Yaml(#[from] serde_yaml::Error),
     #[error("invalid input: {0}")]
@@ -88,6 +90,14 @@ pub enum Error {
     },
     #[error("unknown local repository `{0}`")]
     UnknownRepository(String),
+    #[error(
+        "merge confirmation requires an authenticated Browser session; API tokens and Worker actors are not accepted"
+    )]
+    BrowserMergeConfirmationRequired,
+    #[error(
+        "Merge Request reopen requires an authenticated Browser session and explicit confirmation"
+    )]
+    BrowserReopenConfirmationRequired,
     #[error("workspace id does not match this Workspace backend")]
     WorkspaceIdMismatch,
     #[error("Ticket assignment conflict: {0}")]

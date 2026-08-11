@@ -7,7 +7,7 @@ use crate::{Result, TicketError, sqlite_err};
 
 const MIGRATION_TABLE: &str = "ticket_schema_migrations";
 const MAX_SCHEMA_DIAGNOSTICS: usize = 32;
-pub const LATEST_SQLITE_TICKET_SCHEMA_VERSION: i64 = 2;
+pub const LATEST_SQLITE_TICKET_SCHEMA_VERSION: i64 = 3;
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -26,6 +26,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 2,
         name: "add_ticket_repository_target",
         apply: add_ticket_repository_target,
+    },
+    Migration {
+        version: 3,
+        name: "convert_legacy_reviews_to_comments",
+        apply: retire_legacy_ticket_review_events,
     },
 ];
 
@@ -475,6 +480,33 @@ fn add_ticket_repository_target(connection: &Connection) -> Result<()> {
     add_column_if_missing(connection, "typed_tickets", "ref_selector", "TEXT")
 }
 
+fn retire_legacy_ticket_review_events(connection: &Connection) -> Result<()> {
+    // Historical prose remains visible for audit, but it is explicitly converted to a
+    // non-authoritative comment. Approval authority now lives only in Merge Requests.
+    connection
+        .execute_batch(
+            r#"
+        INSERT OR REPLACE INTO typed_ticket_event_attributes
+            (workspace_id, ticket_id, event_index, key, value)
+        SELECT workspace_id, ticket_id, event_index, 'legacy_event_kind', 'review'
+        FROM typed_ticket_events WHERE kind = 'review';
+        UPDATE typed_ticket_events
+        SET kind = 'comment', status = NULL, heading = 'Legacy review (non-authoritative)'
+        WHERE kind = 'review';
+        DELETE FROM typed_ticket_event_attributes
+        WHERE key IN ('result', 'review_result', 'status')
+          AND EXISTS (
+            SELECT 1 FROM typed_ticket_events event
+            WHERE event.workspace_id = typed_ticket_event_attributes.workspace_id
+              AND event.ticket_id = typed_ticket_event_attributes.ticket_id
+              AND event.event_index = typed_ticket_event_attributes.event_index
+              AND event.heading = 'Legacy review (non-authoritative)'
+          );
+        "#,
+        )
+        .map_err(sqlite_err)
+}
+
 fn add_column_if_missing(
     connection: &Connection,
     table: &str,
@@ -809,10 +841,10 @@ mod tests {
         verify_sqlite_ticket_schema(&connection).unwrap();
 
         let versions = load_applied_migrations(&connection).unwrap();
-        assert_eq!(versions.len(), 2);
+        assert_eq!(versions.len(), 3);
         assert_eq!(
             versions.get(&LATEST_SQLITE_TICKET_SCHEMA_VERSION),
-            Some(&"add_ticket_repository_target".to_string())
+            Some(&"convert_legacy_reviews_to_comments".to_string())
         );
     }
 
@@ -957,7 +989,7 @@ mod tests {
                 .to_string()
                 .contains("unsupported Ticket schema migration version 99")
         );
-        assert_eq!(load_applied_migrations(&connection).unwrap().len(), 3);
+        assert_eq!(load_applied_migrations(&connection).unwrap().len(), 4);
     }
 
     #[test]
@@ -1051,6 +1083,31 @@ mod tests {
     }
 
     #[test]
+    fn legacy_review_upgrade_preserves_prose_as_non_authoritative_comment() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate_sqlite_ticket_schema(&connection).unwrap();
+        connection.execute("INSERT INTO typed_tickets (workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit) VALUES ('workspace-1','ticket-1','ticket-1','title','open','task','medium','body','inprogress',1)",[]).unwrap();
+        connection.execute("INSERT INTO typed_ticket_events (workspace_id,ticket_id,event_index,kind,author,at,status,heading,body) VALUES ('workspace-1','ticket-1',0,'review','reviewer','2026-08-11T00:00:00Z','approve','Review','legacy evidence')",[]).unwrap();
+        connection.execute("INSERT INTO typed_ticket_event_attributes (workspace_id,ticket_id,event_index,key,value) VALUES ('workspace-1','ticket-1',0,'result','approve')",[]).unwrap();
+        connection
+            .execute("DELETE FROM ticket_schema_migrations WHERE version=3", [])
+            .unwrap();
+        migrate_sqlite_ticket_schema(&connection).unwrap();
+        let (kind,status,heading,body):(String,Option<String>,Option<String>,Option<String>)=connection.query_row("SELECT kind,status,heading,body FROM typed_ticket_events WHERE workspace_id='workspace-1' AND ticket_id='ticket-1' AND event_index=0",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!(kind, "comment");
+        assert_eq!(status, None);
+        assert_eq!(
+            heading.as_deref(),
+            Some("Legacy review (non-authoritative)")
+        );
+        assert_eq!(body.as_deref(), Some("legacy evidence"));
+        let attributes:i64=connection.query_row("SELECT COUNT(*) FROM typed_ticket_event_attributes WHERE workspace_id='workspace-1' AND ticket_id='ticket-1'",[],|row|row.get(0)).unwrap();
+        assert_eq!(attributes, 1);
+        let legacy:String=connection.query_row("SELECT value FROM typed_ticket_event_attributes WHERE workspace_id='workspace-1' AND ticket_id='ticket-1' AND key='legacy_event_kind'",[],|row|row.get(0)).unwrap();
+        assert_eq!(legacy, "review");
+    }
+
+    #[test]
     fn concurrent_migrators_converge_on_one_version_history() {
         let directory = tempdir().unwrap();
         let database = directory.path().join("tickets.db");
@@ -1072,6 +1129,6 @@ mod tests {
 
         let connection = Connection::open(database).unwrap();
         verify_sqlite_ticket_schema(&connection).unwrap();
-        assert_eq!(load_applied_migrations(&connection).unwrap().len(), 2);
+        assert_eq!(load_applied_migrations(&connection).unwrap().len(), 3);
     }
 }
