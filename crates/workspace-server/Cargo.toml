@@ -32,6 +32,7 @@ sha2.workspace = true
 thiserror.workspace = true
 ticket.workspace = true
 memory.workspace = true
+merge-request.workspace = true
 tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-tungstenite.workspace = true
 worker.workspace = true

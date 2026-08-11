@@ -17,6 +17,16 @@
     TicketDetail,
   } from "$lib/workspace/sidebar/types";
 
+  type MergeRequestDetail = {
+    state: "draft" | "open" | "closed" | "merged";
+    review_status: "pending" | "approved" | "changes_requested";
+    current_revision: { revision_id: string; head_commit: string; head_tree: string; diff_digest: string; changed_paths: string[]; summary: string };
+    current_review?: { decision: string; body: string; reviewer_effective_profile: string } | null;
+    merged_at?: string | null;
+  };
+
+  const MUTABLE_TICKET_STATES = TICKET_STATES.filter((state) => state !== "done");
+
   const { data } = $props<{
     data: {
       workspaceId: string;
@@ -24,6 +34,7 @@
       ticket: ApiResult<TicketDetail>;
       repositories: ApiResult<RepositoryListResponse>;
       orchestrator: ApiResult<WorkspaceOrchestratorStatus>;
+      mergeRequest: ApiResult<MergeRequestDetail | null>;
     };
   }>();
 
@@ -34,6 +45,7 @@
   const orchestratorOnline = initialData.orchestrator.data?.online ?? false;
 
   let ticket = $state<TicketDetail>(loadedTicket);
+  let mergeRequest = $state<MergeRequestDetail | null>(initialData.mergeRequest.data ?? null);
   let editing = $state(false);
   let editTitle = $state(loadedTicket.title);
   let editBody = $state(loadedTicket.body);
@@ -43,8 +55,7 @@
   let transitionReason = $state("");
   let threadRole = $state("comment");
   let threadBody = $state("");
-  let reviewResult = $state("approve");
-  let reviewBody = $state("");
+  let confirmMerge = $state(false);
   let resolution = $state("");
   let busy = $state<string | null>(null);
   let errorMessage = $state<string | null>(null);
@@ -134,15 +145,27 @@
     ) threadBody = "";
   }
 
-  async function review(event: SubmitEvent) {
-    event.preventDefault();
-    if (!reviewBody.trim()) return;
-    if (
-      await mutate("review", "/review", {
-        result: reviewResult,
-        body: reviewBody.trim(),
-      })
-    ) reviewBody = "";
+  async function mergeConfirmedRevision() {
+    if (!mergeRequest || !confirmMerge || busy) return;
+    busy = "merge";
+    errorMessage = null;
+    try {
+      mergeRequest = await workspaceApiJsonWithBody<MergeRequestDetail>(
+        `${ticketPath}/merge-request/merge`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            expected_revision_id: mergeRequest.current_revision.revision_id,
+            explicit_confirmation: true,
+          }),
+        },
+      );
+      confirmMerge = false;
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : String(error);
+    } finally {
+      busy = null;
+    }
   }
 
   async function closeTicket(event: SubmitEvent) {
@@ -277,7 +300,6 @@
           <p>The Orchestrator is online. Start a role-specific Worker with the Ticket target below.</p>
           <div class="ticket-role-actions">
             <a class="workspace-primary-button" href={ticketWorkerLaunchHref(data.workspaceId, ticket, "coder")}>Coder</a>
-            <a class="workspace-secondary-button" href={ticketWorkerLaunchHref(data.workspaceId, ticket, "reviewer")}>Reviewer</a>
           </div>
         {:else}
           <p class="workspace-callout">Start the Workspace Orchestrator from the Ticket panel before launching Ticket Workers.</p>
@@ -311,7 +333,7 @@
         <form class="ticket-control-form" onsubmit={transition}>
           <label>State
             <select bind:value={nextState}>
-              {#each TICKET_STATES as state}<option value={state}>{state}</option>{/each}
+              {#each MUTABLE_TICKET_STATES as state}<option value={state}>{state}</option>{/each}
             </select>
           </label>
           <label>Reason<input bind:value={transitionReason} placeholder="Optional decision context" /></label>
@@ -340,17 +362,27 @@
         </form>
       </details>
 
-      <details class="ticket-control-card">
-        <summary>Record review</summary>
-        <form class="ticket-control-form" onsubmit={review}>
-          <label>Result<select bind:value={reviewResult}>
-            <option value="approve">Approve</option>
-            <option value="request_changes">Request changes</option>
-          </select></label>
-          <label>Review body<textarea bind:value={reviewBody} rows="5" required></textarea></label>
-          <button class="workspace-secondary-button" type="submit" disabled={busy === "review" || !reviewBody.trim()}>Record review</button>
-        </form>
-      </details>
+      <section class="ticket-control-card">
+        <header><h2>Merge Request</h2></header>
+        {#if data.mergeRequest.error}
+          <p class="workspace-callout is-error">{data.mergeRequest.error}</p>
+        {:else if mergeRequest}
+          <p><strong>{mergeRequest.state}</strong> · {mergeRequest.review_status}</p>
+          <p><code>{mergeRequest.current_revision.revision_id}</code></p>
+          <p>Head <code>{mergeRequest.current_revision.head_commit}</code></p>
+          {#if mergeRequest.current_revision.summary}<p>{mergeRequest.current_revision.summary}</p>{/if}
+          {#if mergeRequest.current_review}
+            <p><strong>{mergeRequest.current_review.decision}</strong> by {mergeRequest.current_review.reviewer_effective_profile}</p>
+            {#if mergeRequest.current_review.body}<RichMarkdown text={mergeRequest.current_review.body} />{/if}
+          {/if}
+          {#if mergeRequest.state === "open" && mergeRequest.review_status === "approved"}
+            <label><input type="checkbox" bind:checked={confirmMerge} /> Explicitly confirm merge of this revision</label>
+            <button class="workspace-primary-button" type="button" disabled={!confirmMerge || busy !== null} onclick={mergeConfirmedRevision}>Confirm merge</button>
+          {/if}
+        {:else}
+          <p class="workspace-empty-copy">The assigned Coder has not opened a Merge Request.</p>
+        {/if}
+      </section>
 
       {#if ticket.state !== "closed"}
         <details class="ticket-control-card ticket-close-card">

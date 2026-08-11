@@ -295,7 +295,6 @@ pub enum TicketEventKind {
     Plan,
     Decision,
     ImplementationReport,
-    Review,
     StateChanged,
     IntakeSummary,
     StatusChanged,
@@ -311,7 +310,6 @@ impl TicketEventKind {
             Self::Plan => "plan",
             Self::Decision => "decision",
             Self::ImplementationReport => "implementation_report",
-            Self::Review => "review",
             Self::StateChanged => "state_changed",
             Self::IntakeSummary => "intake_summary",
             Self::StatusChanged => "status_changed",
@@ -327,7 +325,6 @@ impl TicketEventKind {
             Self::Plan => "Plan".to_string(),
             Self::Decision => "Decision".to_string(),
             Self::ImplementationReport => "Implementation report".to_string(),
-            Self::Review => "Review".to_string(),
             Self::StateChanged => "State changed".to_string(),
             Self::IntakeSummary => "Intake summary".to_string(),
             Self::StatusChanged => "Status changed".to_string(),
@@ -345,47 +342,11 @@ impl From<&str> for TicketEventKind {
             "plan" => Self::Plan,
             "decision" => Self::Decision,
             "implementation_report" => Self::ImplementationReport,
-            "review" => Self::Review,
+            "review" => Self::Comment,
             "state_changed" => Self::StateChanged,
             "intake_summary" => Self::IntakeSummary,
             "status_changed" => Self::StatusChanged,
             "close" | "closed" => Self::Close,
-            other => Self::Other(other.to_string()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TicketReviewResult {
-    Approve,
-    RequestChanges,
-    Other(String),
-}
-
-impl TicketReviewResult {
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Approve => "approve",
-            Self::RequestChanges => "request_changes",
-            Self::Other(value) => value.as_str(),
-        }
-    }
-
-    fn heading(&self) -> String {
-        match self {
-            Self::Approve => "Review: approve".to_string(),
-            Self::RequestChanges => "Review: request changes".to_string(),
-            Self::Other(value) => format!("Review: {value}"),
-        }
-    }
-}
-
-impl From<&str> for TicketReviewResult {
-    fn from(value: &str) -> Self {
-        match value {
-            "approve" => Self::Approve,
-            "request_changes" => Self::RequestChanges,
             other => Self::Other(other.to_string()),
         }
     }
@@ -457,31 +418,6 @@ impl TicketIntakeSummary {
             author: None,
             body: body.into(),
             references: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TicketReview {
-    pub result: TicketReviewResult,
-    pub author: Option<String>,
-    pub body: MarkdownText,
-}
-
-impl TicketReview {
-    pub fn approve(body: impl Into<MarkdownText>) -> Self {
-        Self {
-            result: TicketReviewResult::Approve,
-            author: None,
-            body: body.into(),
-        }
-    }
-
-    pub fn request_changes(body: impl Into<MarkdownText>) -> Self {
-        Self {
-            result: TicketReviewResult::RequestChanges,
-            author: None,
-            body: body.into(),
         }
     }
 }
@@ -1578,7 +1514,6 @@ pub trait TicketBackend {
         change: TicketStateChange,
     ) -> Result<()>;
     fn queue_ready(&self, id: TicketIdOrSlug, queued_by: &str) -> Result<()>;
-    fn review(&self, id: TicketIdOrSlug, review: TicketReview) -> Result<()>;
     fn close(&self, id: TicketIdOrSlug, resolution: MarkdownText) -> Result<()>;
     fn add_ticket_relation(
         &self,
@@ -1655,10 +1590,6 @@ pub enum TicketBackendOperation {
     QueueReady {
         id: TicketIdOrSlug,
         queued_by: String,
-    },
-    Review {
-        id: TicketIdOrSlug,
-        review: TicketReview,
     },
     Close {
         id: TicketIdOrSlug,
@@ -1761,10 +1692,6 @@ where
         }
         TicketBackendOperation::QueueReady { id, queued_by } => {
             backend.queue_ready(id, &queued_by)?;
-            TicketBackendOperationResult::Unit
-        }
-        TicketBackendOperation::Review { id, review } => {
-            backend.review(id, review)?;
             TicketBackendOperationResult::Unit
         }
         TicketBackendOperation::Close { id, resolution } => {
@@ -3201,34 +3128,6 @@ impl TicketBackend for SqliteTicketBackend {
         })
     }
 
-    fn review(&self, id: TicketIdOrSlug, review: TicketReview) -> Result<()> {
-        self.with_write(|conn| {
-            let ticket_id = self.resolve_ticket_id(conn, id)?;
-            let at = now_utc();
-            let mut attributes = BTreeMap::new();
-            attributes.insert("result".to_string(), review.result.as_str().to_string());
-            self.insert_event(
-                conn,
-                &ticket_id,
-                &TicketEvent {
-                    kind: TicketEventKind::Review,
-                    author: Some(review.author.unwrap_or_else(default_author)),
-                    at: Some(at.clone()),
-                    status: Some(review.result.as_str().to_string()),
-                    from: None,
-                    to: None,
-                    reason: None,
-                    state_field: None,
-                    heading: Some(review.result.heading()),
-                    body: review.body,
-                    references: Vec::new(),
-                    attributes,
-                },
-            )?;
-            self.touch_ticket(conn, &ticket_id, &at)
-        })
-    }
-
     fn close(&self, id: TicketIdOrSlug, resolution: MarkdownText) -> Result<()> {
         self.with_write(|conn| {
             let ticket_id = self.resolve_ticket_id(conn, id)?;
@@ -3801,21 +3700,6 @@ impl TicketBackend for LocalTicketBackend {
             TicketWorkflowState::Queued,
             change,
             &[("queued_by", queued_by), ("queued_at", at.as_str())],
-        )
-    }
-
-    fn review(&self, id: TicketIdOrSlug, review: TicketReview) -> Result<()> {
-        let _lock = self.acquire_lock()?;
-        let dir = self.find_ticket_dir(&id)?;
-        let author = review.author.unwrap_or_else(default_author);
-        self.append_thread_event(
-            &dir,
-            "review",
-            &review.result.heading(),
-            &author,
-            Some(review.result.as_str()),
-            &[],
-            &review.body,
         )
     }
 
@@ -5337,7 +5221,8 @@ fn parse_thread(path: &Path) -> Result<Vec<TicketEvent>> {
             .strip_prefix("<!-- ")
             .and_then(|v| v.strip_suffix(" -->"))
         {
-            let attrs = parse_event_comment(comment);
+            let mut attrs = parse_event_comment(comment);
+            let legacy_review = attrs.get("event").is_some_and(|value| value == "review");
             let kind = attrs
                 .get("event")
                 .map(|value| TicketEventKind::from(value.as_str()))
@@ -5369,11 +5254,22 @@ fn parse_thread(path: &Path) -> Result<Vec<TicketEvent>> {
             while body.ends_with('\n') {
                 body.pop();
             }
+            if legacy_review {
+                heading = Some("Legacy review (non-authoritative)".to_string());
+                attrs.remove("status");
+                attrs.remove("result");
+                attrs.insert("event".to_string(), "comment".to_string());
+                attrs.insert("legacy_event_kind".to_string(), "review".to_string());
+            }
             events.push(TicketEvent {
                 kind,
                 author: attrs.get("author").cloned(),
                 at: attrs.get("at").cloned(),
-                status: attrs.get("status").cloned(),
+                status: if legacy_review {
+                    None
+                } else {
+                    attrs.get("status").cloned()
+                },
                 from: attrs.get("from").cloned(),
                 to: attrs.get("to").cloned(),
                 reason: attrs.get("reason").cloned(),
@@ -6380,12 +6276,6 @@ state: planning
             )
             .unwrap();
         backend
-            .review(
-                TicketIdOrSlug::Id(created.id.clone()),
-                TicketReview::approve("Looks good."),
-            )
-            .unwrap();
-        backend
             .close(
                 TicketIdOrSlug::Id(created.id.clone()),
                 MarkdownText::new("Done."),
@@ -6404,13 +6294,6 @@ state: planning
         assert!(ticket.events.iter().any(|event| {
             event.kind == TicketEventKind::Comment && event.body.0.contains("Imported into SQLite")
         }));
-        assert!(
-            ticket
-                .events
-                .iter()
-                .any(|event| event.kind == TicketEventKind::Review
-                    && event.body.0.contains("Looks good"))
-        );
         assert!(
             ticket
                 .resolution
@@ -6524,7 +6407,7 @@ state: planning
     }
 
     #[test]
-    fn add_event_review_status_and_close_preserve_local_layout() {
+    fn add_event_status_and_close_preserve_local_layout() {
         let tmp = TempDir::new().unwrap();
         let backend = backend(&tmp);
         let ticket = backend.create(NewTicket::new("Flow Ticket")).unwrap();
@@ -6532,12 +6415,6 @@ state: planning
             .add_event(
                 TicketIdOrSlug::Id(ticket.id.clone()),
                 NewTicketEvent::new(TicketEventKind::Plan, "Implementation plan."),
-            )
-            .unwrap();
-        backend
-            .review(
-                TicketIdOrSlug::Id(ticket.id.clone()),
-                TicketReview::approve("Looks good."),
             )
             .unwrap();
         let mut summary = TicketIntakeSummary::new("Ready for queue.");
@@ -6563,8 +6440,6 @@ state: planning
         let closed_dir = tmp.path().join("tickets").join(&ticket.id);
         assert!(closed_dir.join("resolution.md").exists());
         let thread = fs::read_to_string(closed_dir.join("thread.md")).unwrap();
-        assert!(thread.contains("<!-- event: review"));
-        assert!(thread.contains("status: approve"));
         assert!(thread.contains("<!-- event: close"));
         let report = backend.doctor().unwrap();
         assert!(report.is_ok(), "{:?}", report.diagnostics);
@@ -6588,14 +6463,6 @@ state: planning
         comment.author = Some("bad\nauthor".into());
         assert!(matches!(
             backend.add_event(TicketIdOrSlug::Id(ticket.id.clone()), comment),
-            Err(TicketError::Conflict(_))
-        ));
-        assert_eq!(fs::read_to_string(&thread_path).unwrap(), original);
-
-        let mut review = TicketReview::approve("This must not append either.");
-        review.author = Some("bad-->author".into());
-        assert!(matches!(
-            backend.review(TicketIdOrSlug::Id(ticket.id.clone()), review),
             Err(TicketError::Conflict(_))
         ));
         assert_eq!(fs::read_to_string(&thread_path).unwrap(), original);

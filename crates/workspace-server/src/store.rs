@@ -765,6 +765,7 @@ impl SqliteWorkspaceStore {
         configure_sqlite(&conn)?;
         apply_migrations(&conn)?;
         ticket::migrate_sqlite_ticket_schema(&conn)?;
+        merge_request::migrate(&conn).map_err(|error| Error::Store(error.to_string()))?;
         validate_workspace_repository_references(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),

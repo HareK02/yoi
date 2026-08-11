@@ -9,6 +9,7 @@ pub mod manage_workdir;
 pub mod manage_worker;
 pub mod memory;
 pub mod memory_extract;
+pub mod merge_request;
 pub mod objective;
 pub mod session_explore;
 pub mod task;

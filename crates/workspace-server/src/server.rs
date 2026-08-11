@@ -24,8 +24,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ticket::{
     MarkdownText, NewTicketEvent, TicketBackend, TicketBodyReplacement, TicketEventKind,
-    TicketIdOrSlug, TicketItemEdit, TicketReview, TicketReviewResult, TicketStateChange,
-    TicketTargetEdit, TicketWorkflowState,
+    TicketIdOrSlug, TicketItemEdit, TicketStateChange, TicketTargetEdit, TicketWorkflowState,
 };
 use ticket::{
     SqliteTicketBackend, TicketBackendOperation, TicketBackendOperationResult,
@@ -861,8 +860,40 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             post(scoped_queue_ticket_record),
         )
         .route(
-            "/api/w/{workspace_id}/tickets/{id}/workflow/review",
-            post(scoped_review_ticket_record),
+            "/api/w/{workspace_id}/tickets/{id}/merge-request",
+            get(scoped_show_merge_request).post(scoped_open_merge_request),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/merge-request/readiness",
+            get(scoped_merge_request_readiness),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/merge-request/revisions",
+            post(scoped_add_merge_request_revision),
+        )
+        .route(
+            "/api/w/{workspace_id}/internal/reviewer-child-sessions",
+            post(scoped_register_reviewer_child_session),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/merge-request/review-attempts",
+            post(scoped_register_merge_request_review_attempt),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/merge-request/reviews",
+            post(scoped_submit_merge_request_review),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/merge-request/complete",
+            post(scoped_complete_merge_request),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/merge-request/reopen",
+            post(scoped_reopen_merge_request),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/merge-request/merge",
+            post(scoped_confirm_merge_request),
         )
         .route(
             "/api/w/{workspace_id}/tickets/{id}/workflow/close",
@@ -901,10 +932,6 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/tickets/{id}/events",
             post(scoped_append_ticket_event),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/reviews",
-            post(scoped_review_ticket),
         )
         .route(
             "/api/w/{workspace_id}/tickets/{id}/queue",
@@ -2421,14 +2448,6 @@ struct BrowserAppendTicketEventRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BrowserReviewTicketRequest {
-    result: TicketReviewResult,
-    body: String,
-    author: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct BrowserQueueTicketRequest {
     queued_by: Option<String>,
 }
@@ -2505,6 +2524,11 @@ async fn scoped_transition_ticket_state(
     Json(request): Json<BrowserTransitionTicketStateRequest>,
 ) -> ApiResult<Json<TicketDetail>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
+    if request.state == TicketWorkflowState::Done {
+        return Err(Error::TicketAssignmentConflict(
+            "done is guarded by MergeRequestComplete with an approved immutable revision and operation_id".to_string(),
+        ).into());
+    }
     let current = api.authority.ticket(&path.id)?;
     let mut change = TicketStateChange::new(
         current.state,
@@ -2531,25 +2555,6 @@ async fn scoped_append_ticket_event(
     event.author = request.author;
     browser_ticket_backend(&api)?
         .add_event(TicketIdOrSlug::Id(path.id.clone()), event)
-        .map_err(Error::from)?;
-    browser_ticket_detail(&api, &path.id)
-}
-
-async fn scoped_review_ticket(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedRecordPath>,
-    Json(request): Json<BrowserReviewTicketRequest>,
-) -> ApiResult<Json<TicketDetail>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    browser_ticket_backend(&api)?
-        .review(
-            TicketIdOrSlug::Id(path.id.clone()),
-            TicketReview {
-                result: request.result,
-                body: MarkdownText::new(request.body),
-                author: request.author,
-            },
-        )
         .map_err(Error::from)?;
     browser_ticket_detail(&api, &path.id)
 }
@@ -2602,6 +2607,16 @@ async fn scoped_close_ticket(
     browser_ticket_detail(&api, &path.id)
 }
 
+fn reject_unguarded_ticket_completion(operation: &TicketBackendOperation) -> Result<()> {
+    if matches!(operation, TicketBackendOperation::SetWorkflowState { change, .. } if change.to == "done")
+    {
+        return Err(Error::TicketAssignmentConflict(
+            "done is guarded by MergeRequestComplete with an approved immutable revision and operation_id".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 async fn execute_worker_ticket_rest_operation(
     api: &WorkspaceApi,
     workspace_id: &str,
@@ -2621,6 +2636,7 @@ async fn execute_worker_ticket_rest_operation(
     let is_mutation = operation_kind != "read";
     let target = ticket_mutation_target(&operation).cloned();
     let source = authenticate_worker_mutation_source(api, workspace_id, &headers)?;
+    reject_unguarded_ticket_completion(&operation)?;
     validate_ticket_repository_operation(api, &operation)?;
     let before = target.as_ref().and_then(|id| backend.show(id.clone()).ok());
     let previous_state = before
@@ -2969,23 +2985,393 @@ async fn scoped_queue_ticket_record(
     ticket_rest_unit(result)
 }
 
-async fn scoped_review_ticket_record(
-    State(api): State<WorkspaceApi>,
-    AxumPath((workspace_id, id)): AxumPath<(String, String)>,
-    headers: HeaderMap,
-    Json(review): Json<TicketReview>,
-) -> ApiResult<StatusCode> {
-    let result = execute_worker_ticket_rest_operation(
-        &api,
-        &workspace_id,
-        headers,
-        TicketBackendOperation::Review {
-            id: TicketIdOrSlug::Query(id),
-            review,
-        },
+#[derive(Debug, serde::Deserialize)]
+struct OpenMergeRequestRequest {
+    repository_id: String,
+    revision_id: String,
+    base_commit: String,
+    head_commit: String,
+    head_tree: String,
+    diff_digest: String,
+    #[serde(default)]
+    changed_paths: Vec<String>,
+    #[serde(default)]
+    summary: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AddMergeRequestRevisionRequest {
+    expected_current_revision_id: String,
+    revision_id: String,
+    base_commit: String,
+    head_commit: String,
+    head_tree: String,
+    diff_digest: String,
+    #[serde(default)]
+    changed_paths: Vec<String>,
+    #[serde(default)]
+    summary: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RegisterReviewerChildSessionRequest {
+    child_session_id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RegisterMergeRequestReviewAttemptRequest {
+    attempt_id: String,
+    revision_id: String,
+    child_session_id: String,
+    capability_token: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SubmitMergeRequestReviewRequest {
+    revision_id: String,
+    capability_token: String,
+    decision: merge_request::ReviewDecision,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    findings: Vec<merge_request::ReviewFinding>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CompleteMergeRequestRequest {
+    operation_id: String,
+    expected_revision_id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RevisionTransitionRequest {
+    expected_revision_id: String,
+    explicit_confirmation: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ConfirmMergeRequestRequest {
+    expected_revision_id: String,
+    explicit_confirmation: bool,
+}
+
+fn parse_workspace_id(value: &str) -> ApiResult<String> {
+    if value.trim().is_empty() {
+        return Err(Error::InvalidInput("workspace_id must not be empty".to_string()).into());
+    }
+    Ok(value.to_string())
+}
+
+fn require_workspace_access(workspace_id: &str, api: &WorkspaceApi) -> ApiResult<()> {
+    if workspace_id != api.workspace_id() {
+        return Err(Error::WorkspaceIdMismatch.into());
+    }
+    Ok(())
+}
+
+fn merge_request_store(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+) -> ApiResult<merge_request::SqliteMergeRequestStore> {
+    require_workspace_access(workspace_id, api)?;
+    merge_request::SqliteMergeRequestStore::open_verified(
+        api.config.database_path.clone(),
+        workspace_id,
     )
-    .await?;
-    ticket_rest_unit(result)
+    .map_err(Error::from)
+    .map_err(Into::into)
+}
+
+async fn scoped_show_merge_request(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+) -> ApiResult<Json<merge_request::MergeRequest>> {
+    let workspace_id = parse_workspace_id(&workspace_id)?;
+    let store = merge_request_store(&api, &workspace_id)?;
+    let value = store
+        .show_for_ticket(&ticket_id)?
+        .ok_or_else(|| Error::from(merge_request::MergeRequestError::NotFound(ticket_id)))?;
+    Ok(Json(value))
+}
+
+async fn scoped_merge_request_readiness(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+) -> ApiResult<Json<merge_request::MergeRequestReadiness>> {
+    let workspace_id = parse_workspace_id(&workspace_id)?;
+    Ok(Json(
+        merge_request_store(&api, &workspace_id)?.readiness_for_ticket(&ticket_id)?,
+    ))
+}
+
+async fn scoped_open_merge_request(
+    State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    Json(input): Json<OpenMergeRequestRequest>,
+) -> ApiResult<Json<merge_request::MergeRequest>> {
+    let workspace_id = parse_workspace_id(&workspace_id)?;
+    require_workspace_access(&workspace_id, &api)?;
+    let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
+    let assignment = api
+        .store
+        .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
+        .ok_or_else(|| {
+            Error::TicketAssignmentConflict("Ticket has no current assigned Coder".to_string())
+        })?;
+    if assignment.worker.runtime_id != source.runtime_id
+        || assignment.worker.worker_id != source.worker_id
+    {
+        return Err(Error::TicketAssignmentConflict(
+            "authenticated Worker is not the current Ticket assignee".to_string(),
+        )
+        .into());
+    }
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let revision = merge_request::MergeRequestRevision {
+        revision_id: input.revision_id,
+        ordinal: 1,
+        base_commit: input.base_commit,
+        head_commit: input.head_commit,
+        head_tree: input.head_tree,
+        diff_digest: input.diff_digest,
+        changed_paths: input.changed_paths,
+        summary: input.summary,
+        assignment_id: assignment.assignment_id.clone(),
+        created_at: now.clone(),
+    };
+    let mr = merge_request_store(&api, &workspace_id)?.open_merge_request(
+        merge_request::OpenMergeRequest {
+            merge_request_id: format!("mr_{}", Uuid::now_v7().simple()),
+            ticket_id,
+            repository_id: input.repository_id,
+            revision,
+            authenticated_runtime_id: source.runtime_id,
+            authenticated_worker_id: source.worker_id,
+            now,
+        },
+    )?;
+    Ok(Json(mr))
+}
+
+async fn scoped_add_merge_request_revision(
+    State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    Json(input): Json<AddMergeRequestRevisionRequest>,
+) -> ApiResult<Json<merge_request::MergeRequest>> {
+    let workspace_id = parse_workspace_id(&workspace_id)?;
+    require_workspace_access(&workspace_id, &api)?;
+    let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
+    let assignment = api
+        .store
+        .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
+        .ok_or_else(|| {
+            Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
+        })?;
+    if assignment.worker.runtime_id != source.runtime_id
+        || assignment.worker.worker_id != source.worker_id
+    {
+        return Err(Error::TicketAssignmentConflict(
+            "authenticated Worker is not the current Ticket assignee".into(),
+        )
+        .into());
+    }
+    let current = merge_request_store(&api, &workspace_id)?
+        .show_for_ticket(&ticket_id)?
+        .ok_or_else(|| {
+            Error::from(merge_request::MergeRequestError::NotFound(
+                ticket_id.clone(),
+            ))
+        })?;
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let mr =
+        merge_request_store(&api, &workspace_id)?.add_revision(merge_request::AddRevision {
+            ticket_id,
+            expected_current_revision_id: input.expected_current_revision_id,
+            revision: merge_request::MergeRequestRevision {
+                revision_id: input.revision_id,
+                ordinal: current.current_revision.ordinal + 1,
+                base_commit: input.base_commit,
+                head_commit: input.head_commit,
+                head_tree: input.head_tree,
+                diff_digest: input.diff_digest,
+                changed_paths: input.changed_paths,
+                summary: input.summary,
+                assignment_id: assignment.assignment_id,
+                created_at: now.clone(),
+            },
+            authenticated_runtime_id: source.runtime_id,
+            authenticated_worker_id: source.worker_id,
+            now,
+        })?;
+    Ok(Json(mr))
+}
+
+async fn scoped_register_reviewer_child_session(
+    State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
+    AxumPath(workspace_id): AxumPath<String>,
+    Json(input): Json<RegisterReviewerChildSessionRequest>,
+) -> ApiResult<StatusCode> {
+    let workspace_id = parse_workspace_id(&workspace_id)?;
+    require_workspace_access(&workspace_id, &api)?;
+    let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
+    merge_request_store(&api, &workspace_id)?.register_reviewer_child_session(
+        merge_request::RegisterReviewerChildSession {
+            parent_runtime_id: source.runtime_id,
+            parent_worker_id: source.worker_id,
+            child_session_id: input.child_session_id,
+            now: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        },
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn scoped_register_merge_request_review_attempt(
+    State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    Json(input): Json<RegisterMergeRequestReviewAttemptRequest>,
+) -> ApiResult<StatusCode> {
+    let workspace_id = parse_workspace_id(&workspace_id)?;
+    require_workspace_access(&workspace_id, &api)?;
+    let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
+    let assignment = api
+        .store
+        .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
+        .ok_or_else(|| {
+            Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
+        })?;
+    if assignment.worker.runtime_id != source.runtime_id
+        || assignment.worker.worker_id != source.worker_id
+    {
+        return Err(Error::TicketAssignmentConflict(
+            "authenticated Worker is not the current Ticket assignee".into(),
+        )
+        .into());
+    }
+    merge_request_store(&api, &workspace_id)?.register_review_attempt(
+        merge_request::RegisterReviewAttempt {
+            attempt_id: input.attempt_id,
+            ticket_id,
+            revision_id: input.revision_id,
+            parent_assignment_id: assignment.assignment_id,
+            parent_runtime_id: source.runtime_id,
+            parent_worker_id: source.worker_id,
+            child_session_id: input.child_session_id,
+            capability_token: input.capability_token,
+            now: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        },
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn scoped_submit_merge_request_review(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    Json(input): Json<SubmitMergeRequestReviewRequest>,
+) -> ApiResult<Json<merge_request::MergeRequestReview>> {
+    let workspace_id = parse_workspace_id(&workspace_id)?;
+    let review =
+        merge_request_store(&api, &workspace_id)?.submit_review(merge_request::SubmitReview {
+            ticket_id,
+            revision_id: input.revision_id,
+            capability_token: input.capability_token,
+            decision: input.decision,
+            body: input.body,
+            findings: input.findings,
+            now: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        })?;
+    Ok(Json(review))
+}
+
+async fn scoped_complete_merge_request(
+    State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    Json(input): Json<CompleteMergeRequestRequest>,
+) -> ApiResult<Json<merge_request::CompletionOutcome>> {
+    let workspace_id = parse_workspace_id(&workspace_id)?;
+    require_workspace_access(&workspace_id, &api)?;
+    let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
+    let assignment = api
+        .store
+        .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
+        .ok_or_else(|| {
+            Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
+        })?;
+    if assignment.worker.runtime_id != source.runtime_id
+        || assignment.worker.worker_id != source.worker_id
+    {
+        return Err(Error::TicketAssignmentConflict(
+            "authenticated Worker is not the current Ticket assignee".into(),
+        )
+        .into());
+    }
+    let outcome = merge_request_store(&api, &workspace_id)?.complete(
+        merge_request::CompleteMergeRequest {
+            operation_id: input.operation_id,
+            ticket_id,
+            expected_revision_id: input.expected_revision_id,
+            assignment_id: assignment.assignment_id,
+            authenticated_runtime_id: source.runtime_id,
+            authenticated_worker_id: source.worker_id,
+            now: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        },
+    )?;
+    Ok(Json(outcome))
+}
+
+async fn scoped_reopen_merge_request(
+    State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    Json(input): Json<RevisionTransitionRequest>,
+) -> ApiResult<Json<merge_request::MergeRequest>> {
+    let workspace_id = parse_workspace_id(&workspace_id)?;
+    require_workspace_access(&workspace_id, &api)?;
+    reject_non_browser_merge_auth(&headers)
+        .map_err(|_| Error::BrowserReopenConfirmationRequired)?;
+    let _actor = require_actor(&api, &headers).await?;
+    if !input.explicit_confirmation {
+        return Err(Error::BrowserReopenConfirmationRequired.into());
+    }
+    Ok(Json(merge_request_store(&api, &workspace_id)?.reopen(
+        &ticket_id,
+        &input.expected_revision_id,
+        &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+    )?))
+}
+
+fn reject_non_browser_merge_auth(headers: &HeaderMap) -> Result<()> {
+    if headers.contains_key("authorization") {
+        return Err(Error::BrowserMergeConfirmationRequired);
+    }
+    Ok(())
+}
+
+async fn scoped_confirm_merge_request(
+    State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    Json(input): Json<ConfirmMergeRequestRequest>,
+) -> ApiResult<Json<merge_request::MergeRequest>> {
+    let workspace_id = parse_workspace_id(&workspace_id)?;
+    require_workspace_access(&workspace_id, &api)?;
+    reject_non_browser_merge_auth(&headers)?;
+    let actor = require_actor(&api, &headers).await?;
+    let mr = merge_request_store(&api, &workspace_id)?.confirm_merge(
+        merge_request::MergeConfirmation {
+            ticket_id,
+            expected_revision_id: input.expected_revision_id,
+            authenticated_account_id: actor.account_id,
+            actor_kind: "user".to_string(),
+            explicit_confirmation: input.explicit_confirmation,
+            now: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        },
+    )?;
+    Ok(Json(mr))
 }
 
 async fn scoped_close_ticket_record(
@@ -3157,7 +3543,6 @@ fn ticket_mutation_target(operation: &TicketBackendOperation) -> Option<&TicketI
         | TicketBackendOperation::SetWorkflowState { id, .. }
         | TicketBackendOperation::MarkIntakeReady { id, .. }
         | TicketBackendOperation::QueueReady { id, .. }
-        | TicketBackendOperation::Review { id, .. }
         | TicketBackendOperation::Close { id, .. }
         | TicketBackendOperation::AddTicketRelation { id, .. }
         | TicketBackendOperation::AddOrchestrationPlanRecord { id, .. } => Some(id),
@@ -3203,7 +3588,6 @@ fn bind_worker_ticket_operation_source(
             change.author = Some(author);
         }
         TicketBackendOperation::QueueReady { queued_by, .. } => *queued_by = author,
-        TicketBackendOperation::Review { review, .. } => review.author = Some(author),
         TicketBackendOperation::AddTicketRelation { relation, .. } => {
             relation.author = Some(author)
         }
@@ -3225,7 +3609,6 @@ fn ticket_mutation_operation_kind(operation: &TicketBackendOperation) -> &'stati
         TicketBackendOperation::SetWorkflowState { .. } => "set_workflow_state",
         TicketBackendOperation::MarkIntakeReady { .. } => "mark_intake_ready",
         TicketBackendOperation::QueueReady { .. } => "queue_ready",
-        TicketBackendOperation::Review { .. } => "review",
         TicketBackendOperation::Close { .. } => "close",
         TicketBackendOperation::AddTicketRelation { .. } => "add_relation",
         TicketBackendOperation::AddOrchestrationPlanRecord { .. } => "add_plan_record",
@@ -7299,10 +7682,7 @@ struct RuntimeConfigBundleAvailabilityQuery {
     digest: String,
 }
 
-fn reject_workdir_for_embedded_runtime(
-    runtime_id: &str,
-    has_workdir: bool,
-) -> std::result::Result<(), ApiError> {
+fn reject_workdir_for_embedded_runtime(runtime_id: &str, has_workdir: bool) -> ApiResult<()> {
     if runtime_id != EMBEDDED_WORKER_RUNTIME_ID || !has_workdir {
         return Ok(());
     }
@@ -7320,9 +7700,7 @@ fn reject_workdir_for_embedded_runtime(
     ))
 }
 
-fn reject_no_workdir_for_non_embedded_runtime(
-    runtime_id: &str,
-) -> std::result::Result<(), ApiError> {
+fn reject_no_workdir_for_non_embedded_runtime(runtime_id: &str) -> ApiResult<()> {
     if runtime_id == EMBEDDED_WORKER_RUNTIME_ID {
         return Ok(());
     }
@@ -9974,6 +10352,12 @@ struct ApiErrorLog {
     diagnostics: Vec<RuntimeDiagnostic>,
 }
 
+impl From<merge_request::MergeRequestError> for ApiError {
+    fn from(error: merge_request::MergeRequestError) -> Self {
+        Error::MergeRequest(error).into()
+    }
+}
+
 impl From<Error> for ApiError {
     fn from(error: Error) -> Self {
         let diagnostics = match &error {
@@ -10013,6 +10397,9 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.error {
+            Error::BrowserMergeConfirmationRequired | Error::BrowserReopenConfirmationRequired => {
+                StatusCode::FORBIDDEN
+            }
             Error::TicketAssignmentConflict(_) | Error::WorkdirAttachmentConflict(_) => {
                 StatusCode::CONFLICT
             }
@@ -10020,7 +10407,14 @@ impl IntoResponse for ApiError {
             Error::InvalidRuntimeIdentifier { .. } | Error::ReservedWorkerName(_) => {
                 StatusCode::BAD_REQUEST
             }
-            Error::Ticket(ticket::TicketError::NotFound(_)) => StatusCode::NOT_FOUND,
+            Error::Ticket(ticket::TicketError::NotFound(_))
+            | Error::MergeRequest(merge_request::MergeRequestError::NotFound(_)) => {
+                StatusCode::NOT_FOUND
+            }
+            Error::MergeRequest(merge_request::MergeRequestError::Empty(_)) => {
+                StatusCode::BAD_REQUEST
+            }
+            Error::MergeRequest(_) => StatusCode::CONFLICT,
             Error::Ticket(
                 ticket::TicketError::Ambiguous { .. }
                 | ticket::TicketError::Locked { .. }
@@ -10160,6 +10554,32 @@ mod tests {
         MemoryDocumentRecord, MemoryStagingRecord, ObjectiveRecord, ObjectiveResourceRecord,
         ObjectiveTicketLinkRecord, SqliteWorkspaceStore, WorkspaceRecord,
     };
+
+    #[test]
+    fn merge_confirmation_rejects_api_token_actor_before_session_resolution() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer api-token".parse().unwrap());
+        assert!(matches!(
+            reject_non_browser_merge_auth(&headers),
+            Err(Error::BrowserMergeConfirmationRequired)
+        ));
+        assert!(reject_non_browser_merge_auth(&HeaderMap::new()).is_ok());
+    }
+
+    #[test]
+    fn flow_or_generic_worker_state_change_is_not_ticket_completion_authority() {
+        let operation = TicketBackendOperation::SetWorkflowState {
+            id: TicketIdOrSlug::Query("T1".to_string()),
+            change: TicketStateChange::new(
+                "inprogress",
+                "done",
+                "flow reached terminal state",
+                "terminal flow state",
+            ),
+        };
+        let error = reject_unguarded_ticket_completion(&operation).unwrap_err();
+        assert!(error.to_string().contains("MergeRequestComplete"));
+    }
 
     #[test]
     fn failed_api_log_is_structured_and_omits_query_values() {
@@ -12596,21 +13016,6 @@ mod tests {
         .unwrap();
         assert_eq!(queued.state, "queued");
         assert_eq!(queued.queued_by.as_deref(), Some("browser-user"));
-        let Json(reviewed) = scoped_review_ticket(
-            State(api.clone()),
-            AxumPath(path()),
-            Json(BrowserReviewTicketRequest {
-                result: TicketReviewResult::Approve,
-                body: "API review".to_string(),
-                author: Some("reviewer".to_string()),
-            }),
-        )
-        .await
-        .unwrap();
-        assert!(reviewed.events.iter().any(|event| {
-            event.kind == "review" && event.body.as_deref() == Some("API review")
-        }));
-
         let Json(closed) = scoped_close_ticket(
             State(api),
             AxumPath(path()),
