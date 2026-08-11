@@ -29,7 +29,7 @@ use crate::observation::{WorkerObservationCursor, WorkerObservationEvent};
 #[cfg(feature = "fs-store")]
 use crate::retention::{
     FsWorkerRetentionProvider, WorkerRetentionExecutionRequest, WorkerRetentionExecutionResult,
-    WorkerRetentionInventory, WorkerRetentionProvider,
+    WorkerRetentionInventory, WorkerRetentionInventorySnapshot, WorkerRetentionProvider,
 };
 use protocol::subscription::{
     EventSubscriptionSelector, SubscriptionEventPayload, SubscriptionSnapshot,
@@ -1706,6 +1706,29 @@ impl Runtime {
         )
     }
 
+    /// Enumerate host-authoritative Runtime inventory for Backend orphan
+    /// reconciliation. Runtime identity and Workspace scope are derived here,
+    /// not accepted in a diagnostic payload.
+    #[cfg(feature = "fs-store")]
+    pub fn list_worker_retention_inventory(
+        &self,
+        workspace_id: &str,
+    ) -> Result<WorkerRetentionInventorySnapshot, RuntimeError> {
+        let state = self.lock()?;
+        let runtime_id = state.runtime_identity.as_deref().ok_or_else(|| {
+            RuntimeError::InvalidRequest(
+                "Runtime identity is not bound for Worker retention".to_string(),
+            )
+        })?;
+        let store = state.fs_store().ok_or_else(|| {
+            RuntimeError::InvalidRequest(
+                "Worker retention inventory requires an fs-backed Runtime".to_string(),
+            )
+        })?;
+        let provider = FsWorkerRetentionProvider::new(store.runtime_dir());
+        provider.snapshot(workspace_id, runtime_id)
+    }
+
     /// Execute a Backend-resolved retention plan. Only stopped Workers are
     /// eligible. Provider receipt lookup happens before live lookup so exact
     /// retries converge after aggregate removal.
@@ -1731,9 +1754,7 @@ impl Runtime {
             )
         })?;
         let provider = FsWorkerRetentionProvider::new(store.runtime_dir());
-        if let Some(completed) =
-            provider.completed(&request.operation_id, &request.input_fingerprint)?
-        {
+        if let Some(completed) = provider.completed_for(request)? {
             state.workers.remove(&request.worker_id);
             state.persist_runtime_snapshot()?;
             return Ok(completed);

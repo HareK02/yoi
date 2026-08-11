@@ -7,10 +7,12 @@ use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use worker_runtime::identity::RuntimeWorkerRef;
 use worker_runtime::retention::{
-    DiagnosticsDisposition, SessionDisposition, WorkerRetentionExecutionRequest,
-    WorkerRetentionExecutionResult, WorkerRetentionInventory,
+    DiagnosticsDisposition, RuntimeWorkerAggregateDiagnostic, SessionDisposition,
+    WorkerRetentionExecutionRequest, WorkerRetentionExecutionResult, WorkerRetentionInventory,
+    WorkerRetentionInventorySnapshot,
 };
 
 pub const CONSERVATIVE_POLICY_ID: &str = "workspace-default-conservative";
@@ -366,7 +368,7 @@ impl SqliteWorkspaceStore {
                 "Runtime Worker id is not a canonical unsigned integer".to_string(),
             )
         })?;
-        let removed_at = Utc::now().to_rfc3339();
+        let removed_at = plan.created_at.clone();
         Ok(PreparedWorkerRemoval {
             runtime_request: WorkerRetentionExecutionRequest {
                 operation_id: plan.operation_id.clone(),
@@ -462,14 +464,109 @@ impl SqliteWorkspaceStore {
         }).map_err(map_error)
     }
 
-    pub fn record_worker_orphan_diagnostic(
+    /// Compare trusted Runtime inventory with the Backend worker registry and
+    /// persist bounded diagnostics for both orphan directions. This operation
+    /// is diagnostic-only: a Runtime aggregate without Backend authority is
+    /// never assigned an implicit purge disposition.
+    pub fn reconcile_worker_retention_inventory(
         &self,
-        d: &WorkerOrphanDiagnostic,
-    ) -> Result<(), WorkerRetentionError> {
-        bounded("orphan category", &d.category, 160)?;
-        bounded("orphan detail", &d.detail, 2000)?;
-        self.with_conn(|conn|{conn.execute("INSERT OR IGNORE INTO worker_orphan_diagnostics(diagnostic_id,workspace_id,runtime_id,worker_id,category,detail,observed_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![d.diagnostic_id,d.workspace_id,d.runtime_id,d.worker_id,d.category,d.detail,d.observed_at])?;Ok(())})?;
-        Ok(())
+        snapshot: &WorkerRetentionInventorySnapshot,
+    ) -> Result<Vec<WorkerOrphanDiagnostic>, WorkerRetentionError> {
+        self.reconcile_worker_retention_inventory_parts(
+            snapshot.workspace_id(),
+            snapshot.runtime_id(),
+            snapshot.workers(),
+            snapshot.diagnostics(),
+        )
+    }
+
+    fn reconcile_worker_retention_inventory_parts(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        inventory: &[WorkerRetentionInventory],
+        runtime_diagnostics: &[RuntimeWorkerAggregateDiagnostic],
+    ) -> Result<Vec<WorkerOrphanDiagnostic>, WorkerRetentionError> {
+        bounded("Workspace id", workspace_id, 160)?;
+        bounded("Runtime id", runtime_id, 160)?;
+        let mut runtime_workers = BTreeMap::new();
+        for item in inventory {
+            if item.workspace_id != workspace_id || item.runtime_id != runtime_id {
+                return Err(WorkerRetentionError::CrossWorkspace);
+            }
+            let worker_id = item.worker_id.to_string();
+            if runtime_workers.insert(worker_id.clone(), item).is_some() {
+                return Err(WorkerRetentionError::Invalid(format!(
+                    "duplicate Runtime inventory for Worker {worker_id}"
+                )));
+            }
+        }
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let policy_configured = load_policy(&tx, workspace_id)?.is_some();
+            let mut statement = tx.prepare(
+                "SELECT CAST(runtime_worker_id AS TEXT), retention_state
+                 FROM worker_registry WHERE workspace_id=?1 AND runtime_id=?2",
+            )?;
+            let registry = statement
+                .query_map(params![workspace_id, runtime_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
+            drop(statement);
+            let runtime_ids = runtime_workers.keys().cloned().collect::<BTreeSet<_>>();
+            let registry_ids = registry.keys().cloned().collect::<BTreeSet<_>>();
+            let observed_at = Utc::now().to_rfc3339();
+            let mut diagnostics = runtime_diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    orphan_diagnostic(
+                        workspace_id,
+                        runtime_id,
+                        diagnostic.worker_id(),
+                        diagnostic.category(),
+                        diagnostic.detail(),
+                        &observed_at,
+                    )
+                })
+                .collect::<Vec<_>>();
+            for worker_id in runtime_ids.difference(&registry_ids) {
+                let category = if policy_configured {
+                    "runtime_aggregate_without_backend_registry"
+                } else {
+                    "runtime_aggregate_policy_missing_fail_closed"
+                };
+                diagnostics.push(orphan_diagnostic(
+                    workspace_id,
+                    runtime_id,
+                    worker_id,
+                    category,
+                    "Runtime canonical aggregate is absent from Backend worker_registry; removal is blocked pending reconciliation",
+                    &observed_at,
+                ));
+            }
+            for worker_id in registry_ids.difference(&runtime_ids) {
+                let category = if registry.get(worker_id).map(String::as_str) == Some("pinned") {
+                    "backend_registry_without_runtime_aggregate_pinned"
+                } else {
+                    "backend_registry_without_runtime_aggregate"
+                };
+                diagnostics.push(orphan_diagnostic(
+                    workspace_id,
+                    runtime_id,
+                    worker_id,
+                    category,
+                    "Backend worker_registry record has no Runtime canonical aggregate",
+                    &observed_at,
+                ));
+            }
+            for diagnostic in &diagnostics {
+                insert_orphan_diagnostic(&tx, diagnostic)?;
+            }
+            tx.commit()?;
+            Ok(diagnostics)
+        })
+        .map_err(WorkerRetentionError::Store)
     }
 
     pub fn worker_tombstone(
@@ -479,6 +576,49 @@ impl SqliteWorkspaceStore {
     ) -> crate::Result<Option<WorkerTombstone>> {
         self.with_conn(|conn|conn.query_row("SELECT display_name,profile,worker_created_at,removed_at,archive_id,policy_id,policy_revision,operation_id FROM worker_tombstones WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",params![workspace_id,worker.runtime_id,worker.worker_id],|r|Ok(WorkerTombstone{workspace_id:workspace_id.into(),worker:worker.clone(),display_name:r.get(0)?,profile:r.get(1)?,created_at:r.get(2)?,removed_at:r.get(3)?,archive_id:r.get(4)?,policy_id:r.get(5)?,policy_revision:r.get::<_,i64>(6)? as u64,operation_id:r.get(7)?})).optional().map_err(StoreError::from))
     }
+}
+
+fn orphan_diagnostic(
+    workspace_id: &str,
+    runtime_id: &str,
+    worker_id: &str,
+    category: &str,
+    detail: &str,
+    observed_at: &str,
+) -> WorkerOrphanDiagnostic {
+    let identity = format!("{workspace_id}\0{runtime_id}\0{worker_id}\0{category}");
+    WorkerOrphanDiagnostic {
+        diagnostic_id: stable("wod", &identity),
+        workspace_id: workspace_id.to_string(),
+        runtime_id: runtime_id.to_string(),
+        worker_id: worker_id.to_string(),
+        category: category.to_string(),
+        detail: detail.to_string(),
+        observed_at: observed_at.to_string(),
+    }
+}
+
+fn insert_orphan_diagnostic(
+    conn: &Connection,
+    diagnostic: &WorkerOrphanDiagnostic,
+) -> crate::Result<()> {
+    conn.execute(
+        "INSERT INTO worker_orphan_diagnostics
+         (diagnostic_id,workspace_id,runtime_id,worker_id,category,detail,observed_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7)
+         ON CONFLICT(diagnostic_id) DO UPDATE SET
+           detail=excluded.detail, observed_at=excluded.observed_at",
+        params![
+            diagnostic.diagnostic_id,
+            diagnostic.workspace_id,
+            diagnostic.runtime_id,
+            diagnostic.worker_id,
+            diagnostic.category,
+            diagnostic.detail,
+            diagnostic.observed_at
+        ],
+    )?;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -948,6 +1088,10 @@ mod tests {
         );
         assert_eq!(prepared.runtime_request.policy_revision, 1);
         assert_eq!(prepared.runtime_request.worker_id, WorkerId::new(1));
+        let retry = s
+            .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
+            .unwrap();
+        assert_eq!(retry.runtime_request, prepared.runtime_request);
     }
 
     #[test]
@@ -1018,27 +1162,54 @@ mod tests {
         assert!(
             matches!(&p.blockers[..],[WorkerRemovalBlocker::CurrentAssignment{assignment_id,ticket_id}] if assignment_id=="assignment"&&ticket_id=="ticket")
         );
-        let d = WorkerOrphanDiagnostic {
-            diagnostic_id: "orphan".into(),
+        let runtime_only = WorkerRetentionInventory {
             workspace_id: "w".into(),
             runtime_id: "r".into(),
-            worker_id: "missing".into(),
-            category: "runtime_without_catalog".into(),
-            detail: "bounded diagnostic".into(),
-            observed_at: "t".into(),
+            worker_id: WorkerId::new(2),
+            run_generation: 1,
+            session_id: Some("orphan-session".into()),
+            segment_ids: vec![],
+            session_bytes: 10,
+            diagnostics_bytes: 0,
         };
-        s.record_worker_orphan_diagnostic(&d).unwrap();
-        let n: i64 = s
-            .with_conn(|c| {
-                c.query_row(
-                    "SELECT COUNT(*) FROM worker_orphan_diagnostics WHERE diagnostic_id='orphan'",
+        let diagnostics = s
+            .reconcile_worker_retention_inventory_parts("w", "r", &[runtime_only], &[])
+            .unwrap();
+        assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics.iter().any(|item| {
+            item.worker_id == "2" && item.category == "runtime_aggregate_without_backend_registry"
+        }));
+        assert!(diagnostics.iter().any(|item| {
+            item.worker_id == "1" && item.category == "backend_registry_without_runtime_aggregate"
+        }));
+        let count: i64 = s
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM worker_orphan_diagnostics WHERE workspace_id='w' AND runtime_id='r'",
                     [],
-                    |r| r.get(0),
+                    |row| row.get(0),
                 )
                 .map_err(StoreError::from)
             })
             .unwrap();
-        assert_eq!(n, 1);
+        assert_eq!(count, 2);
+        let mut wrong_scope = inv();
+        wrong_scope.workspace_id = "other".into();
+        assert!(matches!(
+            s.reconcile_worker_retention_inventory_parts("w", "r", &[wrong_scope], &[]),
+            Err(WorkerRetentionError::CrossWorkspace)
+        ));
+        let unchanged: i64 = s
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM worker_orphan_diagnostics WHERE workspace_id='w' AND runtime_id='r'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(StoreError::from)
+            })
+            .unwrap();
+        assert_eq!(unchanged, 2);
     }
     #[test]
     fn concurrent_plan_converges_and_purge_omits_tombstone() {
