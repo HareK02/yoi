@@ -421,7 +421,11 @@ async fn pre_run_compact_success_broadcasts_start_and_done() {
     // Drain run events so only compact events remain in `rx`.
     let _ = drain(&mut rx);
 
+    let session_before = worker.session_id();
+    let segment_before = worker.segment_id();
     worker.try_pre_run_compact().await;
+    assert_eq!(worker.session_id(), session_before);
+    assert_ne!(worker.segment_id(), segment_before);
 
     let events = drain(&mut rx);
     let kinds: Vec<&str> = events
@@ -442,7 +446,7 @@ async fn pre_run_compact_success_broadcasts_start_and_done() {
         "unexpected CompactFailed in {kinds:?}"
     );
 
-    // CompactDone carries the new session id.
+    // CompactDone carries the new Segment ID; the Session ID is unchanged.
     let new_id_in_event = events.iter().find_map(|e| match e {
         Event::CompactDone { new_segment_id } => Some(*new_segment_id),
         _ => None,
@@ -583,11 +587,11 @@ async fn compact_resets_extract_pointer_so_extract_can_fire_again() {
     );
 
     // Compact runs. Without the fix the in-memory pointer would still
-    // reference the old session's history_len.
+    // reference the old Segment's history_len.
     worker.try_pre_run_compact().await;
     assert!(
         worker.extract_pointer().is_none(),
-        "extract_pointer must be reset to None after compact (matches cold-restore on the new session)"
+        "extract_pointer must be reset to None after compact (matches cold-restore on the new Segment)"
     );
 }
 

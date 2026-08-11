@@ -1,45 +1,85 @@
-# Worker, session, and state authority
+# Worker aggregate, Session, and run authority
 
-Yoi separates replayable history from current Worker identity because they answer different questions.
+A Runtime-managed Worker is the canonical durable aggregate. One Worker owns exactly one Session for its lifetime; compaction and forks create Segments inside that Session rather than replacing the Session identity.
 
-A session log answers: "what happened and what can be replayed?" Worker metadata answers: "what does this Worker name currently refer to?" Live sockets and registries answer only: "what seems reachable right now?"
+This identity rule separates durable conversation history from execution attempts:
 
-## Session logs
+- **Worker ID** identifies the Runtime catalog aggregate and remains stable across stop/restore.
+- **Session ID** identifies that Worker's sole replayable history and remains stable across compaction.
+- **Segment ID** identifies a branch or compacted history projection inside the Session.
+- **run generation** identifies one process/controller execution attempt and increases before every spawn or restore.
 
-Session JSONL is the durable replay record. It contains committed user inputs, assistant items, tool results, system/runtime events that must explain later behavior, segment boundaries, and persisted effective snapshots needed to understand a run.
+## Canonical Runtime layout
 
-The session log should be append-oriented and schema drift should be compile-visible. Compatibility shims that silently reinterpret old plural/current entries make future readers less safe.
+Filesystem Runtime stores materialize one aggregate under `workers/<worker_id>/`:
 
-Session logs do not own current Worker-name state. A historical session can be replayable without being the active session for a Worker name.
+```text
+workers/<worker_id>/
+  worker.json
+  metadata.json
+  session/
+    session.json
+    segments/
+      <segment_id>.jsonl
+      <segment_id>.trace.jsonl
+  runs/
+    <generation>/
+      worker.sock
+      worker.out.log
+      worker.err.log
+      artifacts/
+      spawned/
+```
 
-## Worker metadata
+`worker.json` is Runtime catalog authority: Workspace attribution, create/restore request, execution binding, and the last durably reserved run generation. `metadata.json` is the current Worker projection used to restore active/pending Segment pointers, resolved manifest state, delegation metadata, and child/peer visibility. It is not a second transcript.
 
-Worker metadata is the current-state layer keyed by Worker name. It records active/pending session pointers, resolved manifest snapshots, current delegation metadata, spawned-child visibility, and restoration information.
+`session/session.json` fixes the single Session ID for the aggregate. The Worker-specific Session store rejects attempts to address another Session ID. Session JSONL is the append-oriented replay authority for committed user inputs, assistant items, tool results, system/runtime events, Segment lineage, and effective snapshots required to explain later behavior.
 
-This avoids reconstructing current Worker state by scanning every session log. It also gives `--worker <name>`, TUI resume, `ListWorkers`, and `RestoreWorker` a single current authority.
+The normal execution path resolves all three stores from the trusted `WorkerRef`. It does not fall back to process-global Session or Worker-metadata roots. Those roots are legacy migration inputs only.
 
-Worker metadata should stay thin. It is not a second transcript, and it should not duplicate model conversation content.
+## Segment lifecycle
 
-## Live runtime hints
+A new Worker materializes its Session when the initial Segment is created. The Session ID then remains stable.
 
-Sockets, process registries, and runtime files are liveness hints. They are useful for attach, status probing, and fast discovery, but they are not final proof that work completed or that a Worker's state changed durably.
+Compaction writes a new Segment in the same Session with `compacted_from` lineage. Forking likewise writes a sibling Segment in the same Session with `forked_from` lineage. Allocation, UI, and event surfaces therefore report the new **Segment ID**, never a "new Session". A different Session requires a different Worker aggregate.
 
-A reachable pending Worker should be visible even if durable logs have not materialized yet. Missing restore labels should degrade labels and diagnostics, not hide a live attachable Worker.
+This keeps existing Worker IDs, Session IDs, Segment references, observation entry references, and UI routes meaningful across compaction and restore.
 
-## Spawned children and delegation
+## Run lifecycle
 
-Parent-visible children are sourced from Worker metadata, not from a transient runtime mirror. Restoring a parent should reconstruct reachable children where possible and keep stopped-but-restorable children visible when metadata supports it.
+Run generations are monotonic per Worker. Runtime durably reserves and persists the next generation before invoking the execution backend:
 
-Delegated write scope is a capability loan. Stopping, shutting down, or pruning a child must reclaim the parent's effective write permissions while preserving explicit base denies.
+- initial spawn reserves generation `1`;
+- explicit restore reserves the next generation;
+- startup restoration after a process crash reserves the next generation before reconnecting providers or observation state.
 
-## Peer Workers
+A generation directory is created with `create_new` semantics. An existing directory is a collision and is never reused as a new execution. This makes a crash between reservation and controller startup recoverable: startup consumes another generation instead of treating stale socket/log state as live authority.
 
-Peer visibility is also Worker metadata, but it is distinct from spawned-child delegation. A TUI user can run `:peer <worker-name>` while attached to an idle Worker to register reciprocal peer metadata with another existing Worker. This is a metadata-level registration, not live target-controller consent.
+Stopping a Worker waits for controller shutdown completion and removes `worker.sock`. The generation directory and diagnostic files remain evidence. How old generations are retained, archived, or purged is a separate policy; aggregate creation and migration do not invent that disposition.
 
-A peer relationship only makes the Workers mutually visible through `ListWorkers` with visibility source `peer`. It does not grant filesystem scope, create a child output cursor, make either Worker the other's parent, or imply child completion notifications. Peer messages use `SendToPeerWorker`, which delivers a labeled notification into the target Worker's normal durable notification/history path. `SendToPeerWorker` requires the peer to be live and fails clearly for non-live peers rather than auto-restoring them.
+Live sockets and provider sessions are execution hints, not durable identity. Restore reconstructs Workspace client attribution, observation registration, and Workdir/provider bindings from Runtime/Backend authority while keeping the Worker and Session identities unchanged.
 
-## Notifications are not authority
+## Legacy migration
 
-Worker completion notifications are UX hints. Before treating delegated work as complete, inspect queryable evidence: child output, session/log state, worktree status, diffs, and validation output.
+Startup migration recognizes the versioned `worker-aggregate-v1` format and treats legacy process-global metadata/Session directories as read-only sources.
 
-This is why orchestration code should expose state-aware operations such as `ListWorkers` and `RestoreWorker`, rather than letting a background alert decide workflow state by itself.
+The migration is serialized by an OS file lock and writes a versioned manifest with per-Worker checkpoints and diagnostics. For each unambiguous catalog Worker it:
+
+1. validates Worker metadata identity and the referenced Session;
+2. parses Segment and trace JSONL, tolerating only the existing crash-truncated final-line rule;
+3. stages `session.json` plus all Segment files under the target Worker aggregate;
+4. fsyncs files and directories, atomically renames the staged Session directory, and fsyncs its parent;
+5. atomically writes and fsyncs `metadata.json`;
+6. atomically updates the migration checkpoint.
+
+Reruns validate exact Session identity, the complete source/target filename set, and file bytes before accepting an existing target. Mixed old/new stores and a crash between Session rename, metadata copy, and checkpoint update therefore converge without replacing divergent data.
+
+Migration fails closed on target collisions, corrupt complete JSONL records, or ambiguous ownership. If multiple legacy metadata sources reference one Session—including metadata with no catalog Worker—the Session is not assigned to either aggregate. The manifest records the shared reference. Legacy metadata or Session directories with no catalog-backed owner are also recorded as orphans and left untouched; they do not become normal authority and are not silently deleted.
+
+Legacy sources remain available for audit and recovery after a successful copy. Archive/retention disposition and Orchestrator-driven Worker removal are intentionally outside this migration contract.
+
+## Child, peer, and notification state
+
+Parent-visible children and peer registrations are current Worker metadata, distinct from Session history and run liveness. Restoring a parent reconstructs reachable children where possible and retains stopped-but-restorable visibility when metadata supports it. Delegated write scope is a capability loan; stopping or pruning a child must reclaim the parent's effective permissions.
+
+Peer registration does not grant filesystem authority, imply parent ownership, or make notifications completion proof. Notifications remain UX hints committed through the normal Worker history path. Completion decisions must reread durable Ticket, repository, review, and test evidence rather than relying on a socket event or final assistant message.

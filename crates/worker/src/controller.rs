@@ -211,7 +211,7 @@ impl WorkerController {
         C: LlmClient + Clone + 'static,
         St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
     {
-        Self::spawn_inner(worker, runtime_base, false).await
+        Self::spawn_inner(worker, runtime_base, false, None).await
     }
 
     /// Spawn a Worker owned by `worker-runtime`.
@@ -227,20 +227,37 @@ impl WorkerController {
         C: LlmClient + Clone + 'static,
         St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
     {
-        Self::spawn_inner(worker, runtime_base, true).await
+        Self::spawn_inner(worker, runtime_base, true, None).await
+    }
+
+    /// Spawn into an exact persistent `runs/<generation>` directory.
+    pub async fn spawn_runtime_managed_run<C, St>(
+        worker: Worker<C, St>,
+        run_dir: &Path,
+    ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
+    where
+        C: LlmClient + Clone + 'static,
+        St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+    {
+        let parent = run_dir
+            .parent()
+            .ok_or_else(|| std::io::Error::other("run path has no parent"))?;
+        Self::spawn_inner(worker, parent, true, Some(run_dir)).await
     }
 
     async fn spawn_inner<C, St>(
         worker: Worker<C, St>,
         runtime_base: &Path,
         runtime_managed: bool,
+        runtime_run: Option<&Path>,
     ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
     where
         C: LlmClient + Clone + 'static,
         St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
     {
         let session = worker.workdir_session().cloned();
-        let result = Self::spawn_initialized(worker, runtime_base, runtime_managed).await;
+        let result =
+            Self::spawn_initialized(worker, runtime_base, runtime_managed, runtime_run).await;
         if result.is_err()
             && let Some(session) = session
             && let Err(error) = session.close().await
@@ -254,6 +271,7 @@ impl WorkerController {
         mut worker: Worker<C, St>,
         runtime_base: &Path,
         runtime_managed: bool,
+        runtime_run: Option<&Path>,
     ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
     where
         C: LlmClient + Clone + 'static,
@@ -273,7 +291,9 @@ impl WorkerController {
         // the spawn-tool factories need its socket path, and before the
         // initial status/history writes consume the greeting we build
         // after registration is complete.
-        let runtime_dir = Arc::new(if runtime_managed {
+        let runtime_dir = Arc::new(if let Some(run_dir) = runtime_run {
+            RuntimeDir::create_worker_run(run_dir).await?
+        } else if runtime_managed {
             RuntimeDir::create_transient(runtime_base, &worker.manifest().worker.name).await?
         } else {
             RuntimeDir::create(runtime_base, &worker.manifest().worker.name).await?
@@ -1296,6 +1316,11 @@ async fn controller_loop<C, St>(
                 }
             }
         }
+    }
+
+    drop(_socket_server);
+    if let Err(error) = runtime_dir.close_socket().await {
+        tracing::warn!(%error, "Worker runtime socket cleanup failed");
     }
 
     // Background memory jobs own extract/consolidate workers after a
