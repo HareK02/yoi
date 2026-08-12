@@ -747,6 +747,21 @@ compact_system = "PREFIX\n{% include \"$yoi/internal/compact_system\" %}"
     }
 
     #[test]
+    fn orchestrator_role_prompt_fences_worker_remove_authority() {
+        let source = include_str!("../../../../resources/prompts/role/orchestrator.md");
+        assert!(source.contains("Use `WorkerRemove` only for a terminal or authoritatively reassigned non-internal Coder"));
+        assert!(source.contains("exact current `updated_at` value"));
+        assert!(source.contains("must have no current Ticket assignment"));
+        assert!(source.contains("pending notification, Reviewer handoff, legal hold, or pin"));
+        assert!(source.contains("After removal, reread the Worker catalog and attachment state"));
+        assert!(source.contains("attachment-close, and attachment-release conflicts"));
+        assert!(source.contains("preserves the Workdir materialization"));
+        assert!(!source.contains("source proof"));
+        assert!(!source.contains("provider handle"));
+        assert!(!source.contains("retention plan"));
+    }
+
+    #[test]
     fn sub_worker_spawn_tool_description_renders_profile_block() {
         let cat = PromptCatalog::builtins_only().unwrap();
         let rendered = cat

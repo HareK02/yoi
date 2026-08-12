@@ -151,6 +151,21 @@ const MIGRATIONS: &[Migration] = &[
         name: "remove Backend-owned Flow runtime authority",
         apply: remove_backend_flow_runtime_authority,
     },
+    Migration {
+        version: 27,
+        name: "scope Repository identity and references by Workspace",
+        apply: scope_repository_identity_by_workspace,
+    },
+    Migration {
+        version: 28,
+        name: "create Worker retention authority",
+        apply: crate::retention::create_worker_retention_tables,
+    },
+    Migration {
+        version: 29,
+        name: "create Worker mutation source proof replay guard",
+        apply: create_worker_mutation_source_proof_replay_guard,
+    },
 ];
 
 struct Migration {
@@ -450,8 +465,89 @@ pub trait ControlPlaneStore: Send + Sync {
     async fn schema_version(&self) -> Result<i64>;
     async fn upsert_workspace(&self, record: &WorkspaceRecord) -> Result<()>;
     async fn get_workspace(&self, workspace_id: &str) -> Result<Option<WorkspaceRecord>>;
+    async fn get_trusted_runtime(&self, runtime_id: &str) -> Result<Option<TrustedRuntimeRecord>>;
+    async fn consume_worker_mutation_source_jti(
+        &self,
+        runtime_id: &str,
+        jti: &str,
+        expires_at: u64,
+        now_seconds: u64,
+        consumed_at: &str,
+    ) -> Result<bool>;
+    fn plan_worker_removal(
+        &self,
+        request: &crate::retention::WorkerRemovalPlanRequest,
+        inventory: &worker_runtime::retention::WorkerRetentionInventory,
+    ) -> std::result::Result<
+        crate::retention::WorkerRemovalPlan,
+        crate::retention::WorkerRetentionError,
+    > {
+        let _ = (request, inventory);
+        Err(crate::retention::WorkerRetentionError::Invalid(
+            "Worker retention authority is unavailable".to_string(),
+        ))
+    }
+    fn prepare_worker_removal_execution(
+        &self,
+        workspace_id: &str,
+        plan_id: &str,
+        input_fingerprint: &str,
+    ) -> std::result::Result<
+        crate::retention::PreparedWorkerRemoval,
+        crate::retention::WorkerRetentionError,
+    > {
+        let _ = (workspace_id, plan_id, input_fingerprint);
+        Err(crate::retention::WorkerRetentionError::Invalid(
+            "Worker retention authority is unavailable".to_string(),
+        ))
+    }
+    fn recover_worker_removal_execution(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        expected_worker_revision: &str,
+        reason: &str,
+    ) -> std::result::Result<
+        Option<crate::retention::PreparedWorkerRemoval>,
+        crate::retention::WorkerRetentionError,
+    > {
+        let _ = (workspace_id, worker, expected_worker_revision, reason);
+        Ok(None)
+    }
+    fn fail_worker_removal(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+        input_fingerprint: &str,
+        category: &str,
+    ) -> std::result::Result<(), crate::retention::WorkerRetentionError> {
+        let _ = (workspace_id, operation_id, input_fingerprint, category);
+        Err(crate::retention::WorkerRetentionError::Invalid(
+            "Worker retention authority is unavailable".to_string(),
+        ))
+    }
+    fn commit_worker_removal(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+        input_fingerprint: &str,
+        result: &worker_runtime::retention::WorkerRetentionExecutionResult,
+    ) -> std::result::Result<
+        crate::retention::WorkerRemovalPlan,
+        crate::retention::WorkerRetentionError,
+    > {
+        let _ = (workspace_id, operation_id, input_fingerprint, result);
+        Err(crate::retention::WorkerRetentionError::Invalid(
+            "Worker retention authority is unavailable".to_string(),
+        ))
+    }
     fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>>;
     fn upsert_repository(&self, record: &RepositoryRecord) -> Result<()>;
+    fn get_repository(
+        &self,
+        workspace_id: &str,
+        repository_id: &str,
+    ) -> Result<Option<RepositoryRecord>>;
     fn list_repositories(&self, workspace_id: &str) -> Result<Vec<RepositoryRecord>>;
 
     fn put_flow_source_for_kind(
@@ -754,17 +850,31 @@ impl SqliteWorkspaceStore {
     pub fn from_connection(conn: Connection) -> Result<Self> {
         configure_sqlite(&conn)?;
         apply_migrations(&conn)?;
+        ticket::migrate_sqlite_ticket_schema(&conn)?;
+        merge_request::migrate(&conn).map_err(|error| Error::Store(error.to_string()))?;
+        validate_workspace_repository_references(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
     }
 
-    fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    pub(crate) fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let conn = self
             .conn
             .lock()
             .map_err(|_| Error::Store("sqlite connection lock poisoned".to_string()))?;
         f(&conn)
+    }
+
+    pub(crate) fn with_conn_mut<T>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> Result<T>,
+    ) -> Result<T> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| Error::Store("sqlite connection lock poisoned".to_string()))?;
+        f(&mut conn)
     }
 
     pub fn upsert_trusted_runtime(&self, record: &TrustedRuntimeRecord) -> Result<()> {
@@ -867,6 +977,126 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    async fn get_trusted_runtime(&self, runtime_id: &str) -> Result<Option<TrustedRuntimeRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                r#"SELECT runtime_id, display_name, base_url, public_key, created_at, updated_at, revoked_at
+                   FROM trusted_runtime_records WHERE runtime_id = ?1"#,
+                params![runtime_id],
+                read_trusted_runtime_record,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    async fn consume_worker_mutation_source_jti(
+        &self,
+        runtime_id: &str,
+        jti: &str,
+        expires_at: u64,
+        now_seconds: u64,
+        consumed_at: &str,
+    ) -> Result<bool> {
+        self.with_conn(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            transaction.execute(
+                "DELETE FROM worker_mutation_source_proof_jtis WHERE expires_at < ?1",
+                params![now_seconds],
+            )?;
+            let inserted = transaction.execute(
+                r#"INSERT OR IGNORE INTO worker_mutation_source_proof_jtis (
+                    runtime_id, jti, expires_at, consumed_at
+                ) VALUES (?1, ?2, ?3, ?4)"#,
+                params![runtime_id, jti, expires_at, consumed_at],
+            )?;
+            transaction.commit()?;
+            Ok(inserted == 1)
+        })
+    }
+
+    fn plan_worker_removal(
+        &self,
+        request: &crate::retention::WorkerRemovalPlanRequest,
+        inventory: &worker_runtime::retention::WorkerRetentionInventory,
+    ) -> std::result::Result<
+        crate::retention::WorkerRemovalPlan,
+        crate::retention::WorkerRetentionError,
+    > {
+        SqliteWorkspaceStore::plan_worker_removal(self, request, inventory)
+    }
+
+    fn prepare_worker_removal_execution(
+        &self,
+        workspace_id: &str,
+        plan_id: &str,
+        input_fingerprint: &str,
+    ) -> std::result::Result<
+        crate::retention::PreparedWorkerRemoval,
+        crate::retention::WorkerRetentionError,
+    > {
+        SqliteWorkspaceStore::prepare_worker_removal_execution(
+            self,
+            workspace_id,
+            plan_id,
+            input_fingerprint,
+        )
+    }
+
+    fn recover_worker_removal_execution(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        expected_worker_revision: &str,
+        reason: &str,
+    ) -> std::result::Result<
+        Option<crate::retention::PreparedWorkerRemoval>,
+        crate::retention::WorkerRetentionError,
+    > {
+        SqliteWorkspaceStore::recover_worker_removal_execution(
+            self,
+            workspace_id,
+            worker,
+            expected_worker_revision,
+            reason,
+        )
+    }
+
+    fn fail_worker_removal(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+        input_fingerprint: &str,
+        category: &str,
+    ) -> std::result::Result<(), crate::retention::WorkerRetentionError> {
+        SqliteWorkspaceStore::fail_worker_removal(
+            self,
+            workspace_id,
+            operation_id,
+            input_fingerprint,
+            category,
+        )
+    }
+
+    fn commit_worker_removal(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+        input_fingerprint: &str,
+        result: &worker_runtime::retention::WorkerRetentionExecutionResult,
+    ) -> std::result::Result<
+        crate::retention::WorkerRemovalPlan,
+        crate::retention::WorkerRetentionError,
+    > {
+        SqliteWorkspaceStore::commit_worker_removal(
+            self,
+            workspace_id,
+            operation_id,
+            input_fingerprint,
+            result,
+        )
+    }
+
     fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
@@ -887,8 +1117,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     workspace_id, repository_id, name, kind, provider, uri, default_ref,
                     auth_ref_kind, auth_ref_key, created_at, updated_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                ON CONFLICT(repository_id) DO UPDATE SET
-                    workspace_id = excluded.workspace_id,
+                ON CONFLICT(workspace_id, repository_id) DO UPDATE SET
                     name = excluded.name,
                     kind = excluded.kind,
                     provider = excluded.provider,
@@ -912,6 +1141,25 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 ],
             )?;
             Ok(())
+        })
+    }
+
+    fn get_repository(
+        &self,
+        workspace_id: &str,
+        repository_id: &str,
+    ) -> Result<Option<RepositoryRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                r#"SELECT workspace_id, repository_id, name, kind, provider, uri, default_ref,
+                          auth_ref_kind, auth_ref_key, created_at, updated_at
+                   FROM repositories
+                   WHERE workspace_id = ?1 AND repository_id = ?2"#,
+                params![workspace_id, repository_id],
+                read_repository_record,
+            )
+            .optional()
+            .map_err(Error::from)
         })
     }
 
@@ -1888,6 +2136,23 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
 
     fn upsert_worker_registry(&self, record: &WorkerRegistryRecord) -> Result<()> {
         self.with_conn(|conn| {
+            let removal_blocks_upsert: bool = conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM worker_removal_operations
+                    WHERE workspace_id = ?1 AND runtime_id = ?2
+                      AND CAST(worker_id AS INTEGER) = ?3
+                      AND state IN ('executing', 'failed', 'succeeded')
+                )",
+                params![
+                    record.workspace_id,
+                    record.worker.runtime_id,
+                    record.worker.worker_id
+                ],
+                |row| row.get(0),
+            )?;
+            if removal_blocks_upsert {
+                return Ok(());
+            }
             conn.execute(
                 r#"INSERT INTO worker_registry (
                     workspace_id, runtime_id, runtime_worker_id, display_name, profile,
@@ -1906,7 +2171,14 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     session_ref = excluded.session_ref,
                     summary_ref = excluded.summary_ref,
                     diagnostics_ref = excluded.diagnostics_ref,
-                    updated_at = excluded.updated_at"#,
+                    updated_at = excluded.updated_at
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM worker_removal_operations retention
+                    WHERE retention.workspace_id = excluded.workspace_id
+                      AND retention.runtime_id = excluded.runtime_id
+                      AND CAST(retention.worker_id AS INTEGER) = excluded.runtime_worker_id
+                      AND retention.state IN ('executing', 'failed', 'succeeded')
+                )"#,
                 params![
                     record.workspace_id,
                     record.worker.runtime_id,
@@ -1975,7 +2247,13 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let changed = conn.execute(
                 r#"UPDATE worker_registry
                    SET retention_state = ?4, updated_at = ?5
-                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3"#,
+                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3
+                     AND NOT EXISTS (
+                       SELECT 1 FROM worker_removal_operations retention
+                       WHERE retention.workspace_id = ?1 AND retention.runtime_id = ?2
+                         AND CAST(retention.worker_id AS INTEGER) = ?3
+                         AND retention.state IN ('executing', 'failed')
+                     )"#,
                 params![
                     workspace_id,
                     worker.runtime_id,
@@ -2161,6 +2439,28 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<TicketWorkerAssignmentUpdate> {
         self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
+            let removal_blocks_assignment: bool = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM worker_removal_operations
+                    WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
+                      AND state IN ('executing', 'failed', 'succeeded')
+                    UNION ALL
+                    SELECT 1 FROM worker_tombstones
+                    WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
+                )",
+                params![
+                    record.workspace_id,
+                    record.worker.runtime_id,
+                    record.worker.worker_id
+                ],
+                |row| row.get(0),
+            )?;
+            if removal_blocks_assignment {
+                return Err(Error::TicketAssignmentConflict(format!(
+                    "Worker {}/{} is being retained or has been removed",
+                    record.worker.runtime_id, record.worker.worker_id
+                )));
+            }
             let mut reserved_operation = false;
             if let Some(existing) =
                 read_assignment_operation(&tx, &record.workspace_id, operation_id)?
@@ -4019,6 +4319,205 @@ DROP TABLE IF EXISTS flow_instances;
     Ok(())
 }
 
+fn scope_repository_identity_by_workspace(conn: &Connection) -> Result<()> {
+    validate_workspace_repository_references(conn)?;
+    conn.execute_batch(
+        r#"
+CREATE TABLE repositories_v27 (
+    workspace_id TEXT NOT NULL,
+    repository_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    provider TEXT,
+    uri TEXT NOT NULL,
+    default_ref TEXT,
+    auth_ref_kind TEXT,
+    auth_ref_key TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, repository_id),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+);
+INSERT INTO repositories_v27 (
+    workspace_id, repository_id, name, kind, provider, uri, default_ref,
+    auth_ref_kind, auth_ref_key, created_at, updated_at
+)
+SELECT workspace_id, repository_id, name, kind, provider, uri, default_ref,
+       auth_ref_kind, auth_ref_key, created_at, updated_at
+FROM repositories;
+
+CREATE TABLE artifacts_v27 (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    artifact_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    uri TEXT NOT NULL,
+    media_type TEXT,
+    sha256 TEXT,
+    size_bytes INTEGER,
+    summary TEXT,
+    created_at TEXT NOT NULL,
+    created_by_kind TEXT NOT NULL,
+    created_by_key TEXT NOT NULL,
+    created_by_display TEXT NOT NULL,
+    created_by_source_kind TEXT,
+    created_by_source_key TEXT,
+    ticket_id TEXT,
+    objective_id TEXT,
+    event_id TEXT,
+    worker_ref_kind TEXT,
+    worker_ref_key TEXT,
+    worker_display TEXT,
+    repository_id TEXT,
+    source_kind TEXT,
+    source_revision TEXT,
+    FOREIGN KEY (workspace_id, repository_id)
+        REFERENCES repositories_v27(workspace_id, repository_id)
+);
+INSERT INTO artifacts_v27 (
+    workspace_id, artifact_id, kind, uri, media_type, sha256, size_bytes, summary,
+    created_at, created_by_kind, created_by_key, created_by_display,
+    created_by_source_kind, created_by_source_key, ticket_id, objective_id, event_id,
+    worker_ref_kind, worker_ref_key, worker_display, repository_id, source_kind,
+    source_revision
+)
+SELECT workspace_id, artifact_id, kind, uri, media_type, sha256, size_bytes, summary,
+       created_at, created_by_kind, created_by_key, created_by_display,
+       created_by_source_kind, created_by_source_key, ticket_id, objective_id, event_id,
+       worker_ref_kind, worker_ref_key, worker_display, repository_id, source_kind,
+       source_revision
+FROM artifacts;
+
+CREATE TABLE workdir_registry_v27 (
+    workspace_id TEXT NOT NULL,
+    workdir_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    repository_id TEXT NOT NULL,
+    creation_selector TEXT,
+    creation_ref TEXT,
+    materialization_status TEXT NOT NULL CHECK (materialization_status IN ('pending', 'present', 'not_found', 'corrupted', 'unknown', 'failed')),
+    cleanliness TEXT NOT NULL CHECK (cleanliness IN ('clean', 'dirty', 'unknown')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    current_selector TEXT,
+    current_ref TEXT,
+    PRIMARY KEY (workspace_id, workdir_id),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, repository_id)
+        REFERENCES repositories_v27(workspace_id, repository_id)
+);
+INSERT INTO workdir_registry_v27 (
+    workspace_id, workdir_id, runtime_id, repository_id,
+    creation_selector, creation_ref, current_selector, current_ref,
+    materialization_status, cleanliness, created_at, updated_at
+)
+SELECT workspace_id, workdir_id, runtime_id, repository_id,
+       creation_selector, creation_ref, current_selector, current_ref,
+       materialization_status, cleanliness, created_at, updated_at
+FROM workdir_registry;
+
+CREATE TABLE worker_workdir_links_v27 (
+    workspace_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    runtime_worker_id INTEGER NOT NULL,
+    workdir_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    linked_at TEXT NOT NULL,
+    unlinked_at TEXT,
+    PRIMARY KEY (workspace_id, runtime_id, runtime_worker_id, workdir_id, role),
+    FOREIGN KEY (workspace_id, runtime_id, runtime_worker_id)
+        REFERENCES worker_registry(workspace_id, runtime_id, runtime_worker_id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, workdir_id)
+        REFERENCES workdir_registry_v27(workspace_id, workdir_id) ON DELETE CASCADE
+);
+INSERT INTO worker_workdir_links_v27 (
+    workspace_id, runtime_id, runtime_worker_id, workdir_id, role, linked_at, unlinked_at
+)
+SELECT workspace_id, runtime_id, runtime_worker_id, workdir_id, role, linked_at, unlinked_at
+FROM worker_workdir_links;
+
+CREATE TABLE worker_workdir_attachment_reservations_v27 (
+    workspace_id TEXT NOT NULL,
+    workdir_id TEXT NOT NULL,
+    reservation_id TEXT NOT NULL,
+    reserved_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, workdir_id),
+    FOREIGN KEY (workspace_id, workdir_id)
+        REFERENCES workdir_registry_v27(workspace_id, workdir_id) ON DELETE CASCADE
+);
+INSERT INTO worker_workdir_attachment_reservations_v27 (
+    workspace_id, workdir_id, reservation_id, reserved_at
+)
+SELECT workspace_id, workdir_id, reservation_id, reserved_at
+FROM worker_workdir_attachment_reservations;
+
+DROP TABLE worker_workdir_links;
+DROP TABLE worker_workdir_attachment_reservations;
+DROP TABLE workdir_registry;
+DROP TABLE artifacts;
+DROP TABLE repositories;
+ALTER TABLE repositories_v27 RENAME TO repositories;
+ALTER TABLE artifacts_v27 RENAME TO artifacts;
+ALTER TABLE workdir_registry_v27 RENAME TO workdir_registry;
+ALTER TABLE worker_workdir_links_v27 RENAME TO worker_workdir_links;
+ALTER TABLE worker_workdir_attachment_reservations_v27
+    RENAME TO worker_workdir_attachment_reservations;
+
+CREATE INDEX idx_workdir_registry_workspace_updated
+    ON workdir_registry(workspace_id, updated_at DESC);
+CREATE INDEX idx_worker_workdir_links_worker
+    ON worker_workdir_links(workspace_id, runtime_id, runtime_worker_id, linked_at DESC);
+CREATE UNIQUE INDEX ux_worker_workdir_links_active_worker
+    ON worker_workdir_links(workspace_id, runtime_id, runtime_worker_id)
+    WHERE unlinked_at IS NULL;
+CREATE UNIQUE INDEX ux_worker_workdir_links_active_workdir
+    ON worker_workdir_links(workspace_id, workdir_id)
+    WHERE unlinked_at IS NULL;
+CREATE UNIQUE INDEX ux_worker_workdir_attachment_reservation_id
+    ON worker_workdir_attachment_reservations(workspace_id, reservation_id);
+"#,
+    )?;
+    Ok(())
+}
+
+fn validate_workspace_repository_references(conn: &Connection) -> Result<()> {
+    for (table, repository_nullable) in [
+        ("workdir_registry", false),
+        ("artifacts", true),
+        // `typed_tickets` is owned and migrated by the Ticket component. The control-plane
+        // migration may reject an already-invalid integrated reference, but must not rebuild
+        // that component table or claim its schema authority.
+        ("typed_tickets", true),
+    ] {
+        if !table_exists(conn, table)? || !column_exists(conn, table, "repository_id")? {
+            continue;
+        }
+        let null_filter = if repository_nullable {
+            "child.repository_id IS NOT NULL AND"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT child.workspace_id, child.repository_id FROM {table} AS child \
+             WHERE {null_filter} NOT EXISTS (\
+                 SELECT 1 FROM repositories AS repository \
+                 WHERE repository.workspace_id = child.workspace_id \
+                   AND repository.repository_id = child.repository_id\
+             ) LIMIT 1"
+        );
+        let invalid = conn
+            .query_row(&sql, [], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .optional()?;
+        if let Some((workspace_id, repository_id)) = invalid {
+            return Err(Error::Store(format!(
+                "invalid Workspace-owned repository reference: {table} contains repository `{repository_id}` outside Workspace `{workspace_id}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn current_schema_version(conn: &Connection) -> Result<i64> {
     conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM __yoi_schema_migrations",
@@ -4026,6 +4525,23 @@ fn current_schema_version(conn: &Connection) -> Result<i64> {
         |row| row.get(0),
     )
     .map_err(Error::from)
+}
+
+fn create_worker_mutation_source_proof_replay_guard(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS worker_mutation_source_proof_jtis (
+            runtime_id TEXT NOT NULL,
+            jti TEXT NOT NULL,
+            expires_at INTEGER NOT NULL,
+            consumed_at TEXT NOT NULL,
+            PRIMARY KEY (runtime_id, jti)
+        );
+        CREATE INDEX IF NOT EXISTS idx_worker_mutation_source_proof_jtis_expiry
+            ON worker_mutation_source_proof_jtis(expires_at);
+        "#,
+    )?;
+    Ok(())
 }
 
 fn apply_migrations(conn: &Connection) -> Result<()> {
@@ -4527,6 +5043,45 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
+    fn startup_composes_ticket_migrations_when_control_plane_is_current() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_sqlite(&conn).unwrap();
+        apply_migrations(&conn).unwrap();
+        assert!(!table_exists(&conn, "ticket_schema_migrations").unwrap());
+
+        let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
+        store
+            .with_conn(|conn| {
+                ticket::verify_sqlite_ticket_schema(conn)?;
+                let latest = conn.query_row(
+                    "SELECT MAX(version) FROM ticket_schema_migrations",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                assert_eq!(latest, ticket::LATEST_SQLITE_TICKET_SCHEMA_VERSION);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn startup_fails_closed_when_current_ticket_schema_has_drifted() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_sqlite(&conn).unwrap();
+        apply_migrations(&conn).unwrap();
+        ticket::migrate_sqlite_ticket_schema(&conn).unwrap();
+        conn.execute_batch("DROP TABLE typed_ticket_artifacts")
+            .unwrap();
+
+        let result = SqliteWorkspaceStore::from_connection(conn);
+        let error = match result {
+            Ok(_) => panic!("schema drift unexpectedly passed startup verification"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("typed_ticket_artifacts"));
+    }
+
+    #[test]
     fn removes_unused_control_plane_ticket_tables() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -4578,7 +5133,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 26);
+        assert_eq!(current_schema_version(&conn).unwrap(), 29);
         assert!(table_exists(&conn, "worker_workdir_attachment_reservations").unwrap());
     }
 
@@ -4611,12 +5166,245 @@ CREATE TABLE flow_events (event_id TEXT PRIMARY KEY);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 26);
+        assert_eq!(current_schema_version(&conn).unwrap(), 29);
         assert!(table_exists(&conn, "flow_sources").unwrap());
         assert!(table_exists(&conn, "flow_source_revisions").unwrap());
         assert!(!table_exists(&conn, "flow_instances").unwrap());
         assert!(!table_exists(&conn, "flow_transition_attempts").unwrap());
         assert!(!table_exists(&conn, "flow_events").unwrap());
+    }
+
+    #[test]
+    fn schema_v27_upgrades_repository_identity_without_losing_workspace_owned_references() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_sqlite(&conn).unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 26)
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            (migration.apply)(&tx).unwrap();
+            tx.execute(
+                "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+                params![migration.version, migration.name],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        conn.execute_batch(
+            r#"
+INSERT INTO workspaces (
+    workspace_id, display_name, state, created_at, updated_at
+) VALUES
+    ('workspace-a', 'Workspace A', 'active', '1', '1'),
+    ('workspace-b', 'Workspace B', 'active', '1', '1');
+INSERT INTO repositories (
+    repository_id, workspace_id, name, kind, uri, created_at, updated_at
+) VALUES ('main', 'workspace-a', 'Main', 'git', '/repo-a', '1', '1');
+INSERT INTO artifacts (
+    workspace_id, artifact_id, kind, uri, created_at,
+    created_by_kind, created_by_key, created_by_display, repository_id
+) VALUES (
+    'workspace-a', 'artifact-1', 'report', 'artifact://1', '1',
+    'worker', 'worker-1', 'Worker 1', 'main'
+);
+INSERT INTO worker_registry (
+    workspace_id, runtime_id, runtime_worker_id, display_name,
+    retention_state, created_at, updated_at
+) VALUES ('workspace-a', 'runtime-a', 1, 'Worker 1', 'normal', '1', '1');
+INSERT INTO workdir_registry (
+    workspace_id, workdir_id, runtime_id, repository_id,
+    creation_selector, creation_ref, materialization_status,
+    cleanliness, created_at, updated_at, current_selector, current_ref
+) VALUES (
+    'workspace-a', 'workdir-1', 'runtime-a', 'main',
+    'develop', 'abc', 'present', 'clean', '1', '1', 'develop', 'abc'
+);
+INSERT INTO worker_workdir_links (
+    workspace_id, runtime_id, runtime_worker_id, workdir_id,
+    role, linked_at, unlinked_at
+) VALUES ('workspace-a', 'runtime-a', 1, 'workdir-1', 'attachment', '1', NULL);
+INSERT INTO worker_workdir_attachment_reservations (
+    workspace_id, workdir_id, reservation_id, reserved_at
+) VALUES ('workspace-a', 'workdir-1', 'reservation-1', '1');
+"#,
+        )
+        .unwrap();
+
+        apply_migrations(&conn).unwrap();
+
+        assert_eq!(current_schema_version(&conn).unwrap(), 29);
+        let repositories_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'repositories'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(repositories_sql.contains("PRIMARY KEY (workspace_id, repository_id)"));
+        let preserved: (i64, i64, i64) = (
+            conn.query_row("SELECT COUNT(*) FROM artifacts", [], |row| row.get(0))
+                .unwrap(),
+            conn.query_row("SELECT COUNT(*) FROM worker_workdir_links", [], |row| {
+                row.get(0)
+            })
+            .unwrap(),
+            conn.query_row(
+                "SELECT COUNT(*) FROM worker_workdir_attachment_reservations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        );
+        assert_eq!(preserved, (1, 1, 1));
+        let foreign_key_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_violations, 0);
+        conn.execute(
+            r#"INSERT INTO repositories (
+                workspace_id, repository_id, name, kind, uri, created_at, updated_at
+            ) VALUES ('workspace-b', 'main', 'Other Main', 'git', '/repo-b', '2', '2')"#,
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM repositories WHERE repository_id = 'main'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+        assert!(
+            conn.execute(
+                r#"INSERT INTO workdir_registry (
+                    workspace_id, workdir_id, runtime_id, repository_id,
+                    materialization_status, cleanliness, created_at, updated_at
+                ) VALUES ('workspace-b', 'invalid', 'runtime-b', 'missing',
+                          'present', 'clean', '2', '2')"#,
+                [],
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                r#"INSERT INTO artifacts (
+                    workspace_id, artifact_id, kind, uri, created_at,
+                    created_by_kind, created_by_key, created_by_display, repository_id
+                ) VALUES ('workspace-b', 'invalid-artifact', 'report', 'artifact://invalid', '2',
+                          'worker', 'worker-2', 'Worker 2', 'missing')"#,
+                [],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn schema_v27_rejects_cross_workspace_legacy_repository_references() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_sqlite(&conn).unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 26)
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            (migration.apply)(&tx).unwrap();
+            tx.execute(
+                "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+                params![migration.version, migration.name],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        conn.execute_batch(
+            r#"
+INSERT INTO workspaces (
+    workspace_id, display_name, state, created_at, updated_at
+) VALUES
+    ('workspace-a', 'Workspace A', 'active', '1', '1'),
+    ('workspace-b', 'Workspace B', 'active', '1', '1');
+INSERT INTO repositories (
+    repository_id, workspace_id, name, kind, uri, created_at, updated_at
+) VALUES ('main', 'workspace-a', 'Main', 'git', '/repo-a', '1', '1');
+INSERT INTO workdir_registry (
+    workspace_id, workdir_id, runtime_id, repository_id,
+    materialization_status, cleanliness, created_at, updated_at
+) VALUES ('workspace-b', 'foreign-workdir', 'runtime-b', 'main',
+          'present', 'clean', '1', '1');
+"#,
+        )
+        .unwrap();
+
+        let error = apply_migrations(&conn).unwrap_err();
+
+        assert!(error.to_string().contains("workdir_registry"));
+        assert!(error.to_string().contains("workspace-b"));
+        assert_eq!(current_schema_version(&conn).unwrap(), 26);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM workdir_registry", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_cross_workspace_ticket_repository_reference_without_claiming_ticket_schema()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let database_path = dir.path().join("workspace.sqlite");
+        let store = SqliteWorkspaceStore::open(&database_path).unwrap();
+        for workspace_id in ["workspace-a", "workspace-b"] {
+            store
+                .upsert_workspace(&WorkspaceRecord {
+                    workspace_id: workspace_id.to_string(),
+                    owner_account_id: None,
+                    display_name: workspace_id.to_string(),
+                    state: "active".to_string(),
+                    created_at: "1".to_string(),
+                    updated_at: "1".to_string(),
+                })
+                .await
+                .unwrap();
+        }
+        store
+            .upsert_repository(&RepositoryRecord {
+                workspace_id: "workspace-a".to_string(),
+                repository_id: "main".to_string(),
+                name: "Main".to_string(),
+                kind: "git".to_string(),
+                provider: Some("git".to_string()),
+                uri: "/repo-a".to_string(),
+                default_ref: Some("HEAD".to_string()),
+                auth_ref_kind: None,
+                auth_ref_key: None,
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+            })
+            .unwrap();
+        drop(store);
+
+        let backend = ticket::SqliteTicketBackend::open_verified(
+            database_path.clone(),
+            "workspace-b".to_string(),
+        )
+        .unwrap();
+        let mut input = ticket::NewTicket::new("Foreign repository");
+        input.repository_id = Some("main".to_string());
+        ticket::TicketBackend::create(&backend, input).unwrap();
+        drop(backend);
+
+        let error = match SqliteWorkspaceStore::open(&database_path) {
+            Ok(_) => panic!("cross-Workspace Ticket repository reference must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("typed_tickets"));
+        assert!(error.to_string().contains("workspace-b"));
     }
 
     #[tokio::test]
@@ -4625,7 +5413,7 @@ CREATE TABLE flow_events (event_id TEXT PRIMARY KEY);
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 26);
+        assert_eq!(store.schema_version().await.unwrap(), 29);
         assert!(
             !store
                 .with_conn(|conn| table_exists(conn, "worker_workspace_credentials"))
@@ -4642,7 +5430,7 @@ CREATE TABLE flow_events (event_id TEXT PRIMARY KEY);
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 26);
+        assert_eq!(reopened.schema_version().await.unwrap(), 29);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -5189,7 +5977,7 @@ CREATE TABLE flow_events (event_id TEXT PRIMARY KEY);
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 26);
+        assert_eq!(store.schema_version().await.unwrap(), 29);
 
         store
             .with_conn(|conn| {
@@ -5378,7 +6166,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 26);
+        assert_eq!(store.schema_version().await.unwrap(), 29);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -5404,19 +6192,47 @@ CREATE TABLE ticket_assignment_operations (
         };
         store.upsert_repository(&repository).unwrap();
         assert_eq!(
+            store.get_repository("local-dev", "main").unwrap(),
+            Some(repository.clone())
+        );
+        assert_eq!(
             store.list_repositories("local-dev").unwrap(),
-            vec![repository]
+            vec![repository.clone()]
         );
         assert_eq!(
             store.list_repositories("other-workspace").unwrap(),
             Vec::new()
+        );
+
+        let other_workspace = WorkspaceRecord {
+            workspace_id: "other-workspace".to_string(),
+            owner_account_id: None,
+            display_name: "Other Workspace".to_string(),
+            state: "active".to_string(),
+            created_at: "3".to_string(),
+            updated_at: "3".to_string(),
+        };
+        store.upsert_workspace(&other_workspace).await.unwrap();
+        let mut other_repository = repository.clone();
+        other_repository.workspace_id = other_workspace.workspace_id.clone();
+        other_repository.name = "Other Yoi".to_string();
+        other_repository.uri = "/other/yoi".to_string();
+        store.upsert_repository(&other_repository).unwrap();
+
+        assert_eq!(
+            store.get_repository("local-dev", "main").unwrap(),
+            Some(repository)
+        );
+        assert_eq!(
+            store.get_repository("other-workspace", "main").unwrap(),
+            Some(other_repository)
         );
     }
 
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 26);
+        assert_eq!(store.schema_version().await.unwrap(), 29);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -5502,6 +6318,21 @@ CREATE TABLE ticket_assignment_operations (
             updated_at: "1".to_string(),
         };
         store.upsert_workspace(&workspace).await.unwrap();
+        store
+            .upsert_repository(&RepositoryRecord {
+                workspace_id: workspace.workspace_id.clone(),
+                repository_id: "repo".to_string(),
+                name: "Repository".to_string(),
+                kind: "git".to_string(),
+                provider: Some("git".to_string()),
+                uri: ".".to_string(),
+                default_ref: Some("HEAD".to_string()),
+                auth_ref_kind: None,
+                auth_ref_key: None,
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+            })
+            .unwrap();
 
         let worker = WorkerRegistryRecord {
             workspace_id: "local-dev".to_string(),
@@ -5664,7 +6495,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 26);
+        assert_eq!(store.schema_version().await.unwrap(), 29);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),
@@ -5839,6 +6670,51 @@ CREATE TABLE ticket_assignment_operations (
                 .consume_device_login_token("device", "2026-07-22T00:05:00Z")
                 .unwrap(),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_mutation_source_jti_replay_guard_survives_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        store
+            .upsert_trusted_runtime(&TrustedRuntimeRecord {
+                runtime_id: "runtime-a".to_string(),
+                display_name: "Runtime A".to_string(),
+                base_url: "https://runtime.invalid".to_string(),
+                public_key: "public-key".to_string(),
+                created_at: "2026-08-11T00:00:00Z".to_string(),
+                updated_at: "2026-08-11T00:00:00Z".to_string(),
+                revoked_at: None,
+            })
+            .unwrap();
+        assert!(
+            store
+                .consume_worker_mutation_source_jti(
+                    "runtime-a",
+                    "proof-1",
+                    2_000,
+                    1_000,
+                    "2026-08-11T00:00:00Z",
+                )
+                .await
+                .unwrap()
+        );
+        drop(store);
+
+        let reopened = SqliteWorkspaceStore::open(&path).unwrap();
+        assert!(
+            !reopened
+                .consume_worker_mutation_source_jti(
+                    "runtime-a",
+                    "proof-1",
+                    2_000,
+                    1_001,
+                    "2026-08-11T00:00:01Z",
+                )
+                .await
+                .unwrap()
         );
     }
 

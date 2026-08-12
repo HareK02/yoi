@@ -120,15 +120,15 @@ pub fn adopt_allocation(
 /// The Worker's in-memory `segment_id` can change underneath the
 /// allocation in two normal places:
 ///
-/// - `Worker::compact` mints a fresh session and swaps it in.
-/// - `session_store::ensure_head_or_fork` auto-forks when another
+/// - `Worker::compact` mints a fresh Segment in the same Session.
+/// - `session_store::ensure_head_or_fork` auto-forks within that Session when another
 ///   writer has advanced the store head behind our back.
 ///
 /// Both paths must call this so subsequent [`lookup_segment`] queries
-/// find the live session id, not the old one. Without this update a
+/// find the live Segment id, not the old one. Without this update a
 /// concurrent `restore_from_manifest(new_id)` would see "no live
 /// writer" and proceed to register a competing allocation on the
-/// session this Worker just moved into.
+/// Segment lineage this Worker just moved into.
 ///
 /// The lock is opened once and the allocation is rewritten inside the
 /// guard, so the segment_id collision check is atomic with the

@@ -10,10 +10,11 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
+use crate::auth::RuntimeIdentityMaterial;
 use crate::catalog::{
     CreateWorkerRequest, ProfileSourceArchiveHttpRef, ProfileSourceArchiveSource,
     WorkingDirectoryRequest, WorkingDirectoryStatus,
@@ -26,13 +27,19 @@ use crate::execution::{
 use crate::identity::WorkerRef;
 use crate::interaction::{WorkerInput, WorkerInputKind};
 use crate::resource::{BackendResourceClient, ProfileSourceArchiveCache};
+use crate::worker_source::{
+    EmbeddedWorkerMutationDispatcher, RuntimeOwnedWorkspaceClient, RuntimeWorkerMutationForwarder,
+};
 use crate::working_directory::{
     WorkingDirectoryBinding, WorkingDirectoryDiagnostic, WorkingDirectoryMaterializer,
 };
 use async_trait::async_trait;
-use manifest::paths;
 use protocol::{Event, Method, Segment, WorkerStatus};
-use session_store::{CombinedStore, FsStore, FsWorkerStore, LogEntry, collect_state};
+use session_store::{
+    CombinedStore, LogEntry, WorkerAggregateStore, WorkerSessionStore, collect_state,
+};
+#[cfg(test)]
+use session_store::{FsStore, FsWorkerStore};
 use tokio::runtime::Runtime;
 #[cfg(feature = "ws-server")]
 use tokio::sync::broadcast;
@@ -46,10 +53,9 @@ use worker::feature::builtin::{
 #[cfg(feature = "ws-server")]
 use worker::ipc::protocol_session::{live_log_entry_event, subscribe_worker_protocol_session};
 use worker::{
-    PromptLoader, RuntimeWorkspaceHttpClient, SegmentLogSink,
-    WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN, Worker, WorkerController, WorkerError,
-    WorkerFilesystemAuthority, WorkerHandle, WorkerSharedState, WorkerWorkspaceContext,
-    WorkspaceClient, WorkspaceId,
+    PromptLoader, SegmentLogSink, WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN, Worker,
+    WorkerController, WorkerError, WorkerFilesystemAuthority, WorkerHandle, WorkerSharedState,
+    WorkerWorkspaceContext, WorkspaceClient, WorkspaceId,
 };
 
 const DEFAULT_BACKEND_ID: &str = "worker-crate";
@@ -57,7 +63,6 @@ const RUNTIME_TASK_TIMEOUT: Duration = Duration::from_secs(10);
 // Keep this below the adapter task timeout so a failed acknowledgement task
 // returns a typed execution error instead of leaving the outer waiter to time out.
 const USER_INPUT_COMMIT_TIMEOUT: Duration = Duration::from_secs(9);
-static NEXT_RUNTIME_ARTIFACT_ROOT: AtomicU64 = AtomicU64::new(1);
 
 fn user_input_has_submission(entry: &LogEntry, submission_id: &str) -> bool {
     let LogEntry::UserInput { extensions, .. } = entry else {
@@ -69,43 +74,9 @@ fn user_input_has_submission(entry: &LogEntry, submission_id: &str) -> bool {
     })
 }
 
-#[derive(Clone)]
-enum RuntimeArtifactRoot {
-    Owned(Arc<OwnedRuntimeArtifactRoot>),
-    External(PathBuf),
-}
-
-impl RuntimeArtifactRoot {
-    fn owned() -> Self {
-        let sequence = NEXT_RUNTIME_ARTIFACT_ROOT.fetch_add(1, Ordering::Relaxed);
-        Self::Owned(Arc::new(OwnedRuntimeArtifactRoot {
-            path: std::env::temp_dir().join(format!(
-                "yoi-worker-runtime-artifacts-{}-{sequence}",
-                std::process::id()
-            )),
-        }))
-    }
-
-    fn path(&self) -> &std::path::Path {
-        match self {
-            Self::Owned(root) => &root.path,
-            Self::External(path) => path,
-        }
-    }
-}
-
-struct OwnedRuntimeArtifactRoot {
-    path: PathBuf,
-}
-
-impl Drop for OwnedRuntimeArtifactRoot {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
 pub struct RuntimeWorkerController {
     pub handle: WorkerHandle,
+    pub shutdown: Arc<tokio::sync::Mutex<Option<worker::ShutdownReceiver>>>,
     pub workspace_client: Arc<dyn WorkspaceClient>,
 }
 
@@ -244,11 +215,12 @@ impl WorkerObservationProvider for RuntimeGrantedWorkerObservationProvider {
 pub struct ProfileRuntimeWorkerFactory {
     observation_hub: Arc<RuntimeWorkerObservationHub>,
     profile_base_dir: PathBuf,
-    store_dir: Option<PathBuf>,
-    worker_metadata_dir: Option<PathBuf>,
-    runtime_base_dir: RuntimeArtifactRoot,
+    worker_aggregate_root: Option<PathBuf>,
     resource_client: Option<Arc<dyn BackendResourceClient>>,
     profile_archive_cache: Arc<ProfileSourceArchiveCache>,
+    runtime_id: Option<String>,
+    worker_mutation_identity: Option<RuntimeIdentityMaterial>,
+    embedded_worker_mutation_dispatcher: Option<Arc<dyn EmbeddedWorkerMutationDispatcher>>,
 }
 
 impl ProfileRuntimeWorkerFactory {
@@ -257,26 +229,43 @@ impl ProfileRuntimeWorkerFactory {
         Self {
             observation_hub: Arc::new(RuntimeWorkerObservationHub::default()),
             profile_base_dir,
-            store_dir: None,
-            worker_metadata_dir: None,
-            runtime_base_dir: RuntimeArtifactRoot::owned(),
+            worker_aggregate_root: None,
             resource_client: None,
             profile_archive_cache: Arc::new(ProfileSourceArchiveCache::default()),
+            runtime_id: None,
+            worker_mutation_identity: None,
+            embedded_worker_mutation_dispatcher: None,
         }
     }
 
-    pub fn with_store_dir(mut self, store_dir: impl Into<PathBuf>) -> Self {
-        self.store_dir = Some(store_dir.into());
+    pub fn with_runtime_id(mut self, runtime_id: impl Into<String>) -> Self {
+        self.runtime_id = Some(runtime_id.into());
         self
     }
 
-    pub fn with_worker_metadata_dir(mut self, worker_metadata_dir: impl Into<PathBuf>) -> Self {
-        self.worker_metadata_dir = Some(worker_metadata_dir.into());
+    pub fn with_remote_worker_mutation_identity(
+        mut self,
+        identity: RuntimeIdentityMaterial,
+    ) -> Self {
+        self.runtime_id = Some(identity.identity_id.clone());
+        self.worker_mutation_identity = Some(identity);
+        self.embedded_worker_mutation_dispatcher = None;
         self
     }
 
-    pub fn with_runtime_base_dir(mut self, runtime_base_dir: impl Into<PathBuf>) -> Self {
-        self.runtime_base_dir = RuntimeArtifactRoot::External(runtime_base_dir.into());
+    pub fn with_embedded_worker_mutation_dispatcher(
+        mut self,
+        runtime_id: impl Into<String>,
+        dispatcher: Arc<dyn EmbeddedWorkerMutationDispatcher>,
+    ) -> Self {
+        self.runtime_id = Some(runtime_id.into());
+        self.worker_mutation_identity = None;
+        self.embedded_worker_mutation_dispatcher = Some(dispatcher);
+        self
+    }
+
+    pub fn with_runtime_store_dir(mut self, runtime_store_dir: impl Into<PathBuf>) -> Self {
+        self.worker_aggregate_root = Some(runtime_store_dir.into().join("workers"));
         self
     }
 
@@ -285,26 +274,14 @@ impl ProfileRuntimeWorkerFactory {
         self
     }
 
-    fn store_dir(&self) -> Result<PathBuf, String> {
-        self.store_dir
-            .clone()
-            .or_else(paths::sessions_dir)
+    fn worker_aggregate_dir(&self, worker_ref: &WorkerRef) -> Result<PathBuf, String> {
+        self.worker_aggregate_root
+            .as_ref()
+            .map(|root| root.join(worker_ref.worker_id.to_string()))
             .ok_or_else(|| {
-                "could not resolve sessions directory (set YOI_DATA_DIR, YOI_HOME, XDG_DATA_HOME, or HOME)"
+                "Runtime Worker aggregate root is not configured; global Session/metadata roots are migration-only"
                     .to_string()
             })
-    }
-
-    fn worker_metadata_dir(&self, store_dir: &std::path::Path) -> PathBuf {
-        self.worker_metadata_dir
-            .clone()
-            .or_else(|| paths::data_dir().map(|data_dir| data_dir.join("workers")))
-            .or_else(|| store_dir.parent().map(|parent| parent.join("workers")))
-            .unwrap_or_else(|| PathBuf::from("workers"))
-    }
-
-    fn runtime_base_dir(&self) -> Result<PathBuf, String> {
-        Ok(self.runtime_base_dir.path().to_path_buf())
     }
 
     fn runtime_worker_name_for_ref(worker_ref: &crate::identity::WorkerRef) -> String {
@@ -406,38 +383,59 @@ enum RuntimeWorkspaceBackendRef {
 }
 
 impl RuntimeWorkspaceBackendRef {
-    fn from_worker_request(request: &CreateWorkerRequest) -> Self {
-        if let Some(api) = request.workspace_api.as_ref()
-            && let Some(runtime_id) = api
-                .runtime_id
-                .as_ref()
-                .filter(|runtime_id| !runtime_id.trim().is_empty())
-        {
+    fn from_worker_request(request: &CreateWorkerRequest, runtime_id: Option<&str>) -> Self {
+        if let (Some(api), Some(runtime_id)) = (request.workspace_api.as_ref(), runtime_id) {
             return Self::Http {
                 workspace_id: api.workspace_id.clone(),
                 base_url: api.base_url.clone(),
-                runtime_id: runtime_id.clone(),
+                runtime_id: runtime_id.to_string(),
             };
         }
         Self::None
     }
 
-    fn worker_context(&self, worker_ref: &WorkerRef) -> WorkerWorkspaceContext {
+    fn worker_context(
+        &self,
+        worker_ref: &WorkerRef,
+        workspace_scope: Option<&crate::runtime::RuntimeWorkspaceScope>,
+        mutation_identity: Option<&RuntimeIdentityMaterial>,
+        embedded_dispatcher: Option<&Arc<dyn EmbeddedWorkerMutationDispatcher>>,
+    ) -> WorkerWorkspaceContext {
         match self {
             Self::None => WorkerWorkspaceContext::no_workspace(),
             Self::Http {
                 workspace_id,
                 base_url,
                 runtime_id,
-            } => WorkerWorkspaceContext::with_client(
-                WorkspaceId::new(workspace_id.clone()).ok(),
-                Arc::new(RuntimeWorkspaceHttpClient::new(
+            } => {
+                let mut client = RuntimeOwnedWorkspaceClient::new(
                     workspace_id.clone(),
                     base_url.clone(),
                     runtime_id.clone(),
                     worker_ref.worker_id.to_string(),
-                )),
-            ),
+                );
+                if let (Some(scope), Some(identity)) = (workspace_scope, mutation_identity) {
+                    client = client.with_worker_remove(RuntimeWorkerMutationForwarder::remote(
+                        identity,
+                        scope.clone(),
+                        worker_ref.worker_id.to_string(),
+                        base_url.clone(),
+                    ));
+                } else if let (Some(scope), Some(dispatcher)) =
+                    (workspace_scope, embedded_dispatcher)
+                {
+                    client = client.with_worker_remove(RuntimeWorkerMutationForwarder::embedded(
+                        runtime_id,
+                        scope.clone(),
+                        worker_ref.worker_id.to_string(),
+                        (*dispatcher).clone(),
+                    ));
+                }
+                WorkerWorkspaceContext::with_client(
+                    WorkspaceId::new(workspace_id.clone()).ok(),
+                    Arc::new(client),
+                )
+            }
         }
     }
 }
@@ -536,13 +534,11 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 )
             })
             .unwrap_or(WorkerFilesystemAuthority::None);
-        let workspace_backend_ref =
-            RuntimeWorkspaceBackendRef::from_worker_request(&request.request);
-        let observation_runtime_id = request
-            .request
-            .workspace_api
-            .as_ref()
-            .and_then(|api| api.runtime_id.clone());
+        let workspace_backend_ref = RuntimeWorkspaceBackendRef::from_worker_request(
+            &request.request,
+            self.runtime_id.as_deref(),
+        );
+        let observation_runtime_id = self.runtime_id.clone();
         let observation_workspace_id = request
             .request
             .workspace_api
@@ -550,7 +546,12 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             .map(|api| api.workspace_id.clone());
         let observation_grants = request.request.worker_observation_grants.clone();
         let observation_enabled = request.request.worker_observation_enabled;
-        let workspace_context = workspace_backend_ref.worker_context(&request.worker_ref);
+        let workspace_context = workspace_backend_ref.worker_context(
+            &request.worker_ref,
+            request.workspace_scope.as_ref(),
+            self.worker_mutation_identity.as_ref(),
+            self.embedded_worker_mutation_dispatcher.as_ref(),
+        );
         let selector = profile.as_ref();
         let archive = self
             .resolve_profile_source_archive(&request.request.profile_source)
@@ -575,20 +576,23 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         };
         let flow_transition_enabled = manifest.feature.flow.enabled;
 
-        let store_dir = self.store_dir()?;
-        let session_store = FsStore::new(&store_dir).map_err(|err| {
+        let worker_aggregate_dir = self.worker_aggregate_dir(&request.worker_ref)?;
+        let session_dir = worker_aggregate_dir.join("session");
+        let session_store = WorkerSessionStore::new(&session_dir).map_err(|err| {
             format!(
-                "failed to initialize session store at {}: {err}",
-                store_dir.display()
+                "failed to initialize canonical Worker Session store at {}: {err}",
+                session_dir.display()
             )
         })?;
-        let worker_metadata_dir = self.worker_metadata_dir(&store_dir);
-        let worker_metadata_store = FsWorkerStore::new(&worker_metadata_dir).map_err(|err| {
-            format!(
-                "failed to initialize worker metadata store at {}: {err}",
-                worker_metadata_dir.display()
-            )
-        })?;
+        let worker_metadata_store =
+            WorkerAggregateStore::new(&worker_aggregate_dir, worker_name.clone()).map_err(
+                |err| {
+                    format!(
+                        "failed to initialize canonical Worker metadata store at {}: {err}",
+                        worker_aggregate_dir.display()
+                    )
+                },
+            )?;
         let store = CombinedStore::new(session_store, worker_metadata_store);
 
         let mut worker = Worker::from_manifest_with_context(
@@ -642,10 +646,17 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         }
 
         let workspace_client = worker.workspace_client_handle();
-        let runtime_base = self.runtime_base_dir()?;
-        let (handle, _shutdown_rx) = WorkerController::spawn_runtime_managed(worker, &runtime_base)
+        let run_dir = worker_aggregate_dir
+            .join("runs")
+            .join(request.run_generation.to_string());
+        let (handle, shutdown_rx) = WorkerController::spawn_runtime_managed_run(worker, &run_dir)
             .await
-            .map_err(|err| format!("failed to spawn Worker controller: {err}"))?;
+            .map_err(|err| {
+                format!(
+                    "failed to spawn Worker controller in {}: {err}",
+                    run_dir.display()
+                )
+            })?;
         if flow_transition_enabled {
             handle.shared_state.enable_flow_transition();
         }
@@ -656,6 +667,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         );
         Ok(RuntimeWorkerController {
             handle,
+            shutdown: Arc::new(tokio::sync::Mutex::new(Some(shutdown_rx))),
             workspace_client,
         })
     }
@@ -675,13 +687,11 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 )
             })
             .unwrap_or(WorkerFilesystemAuthority::None);
-        let workspace_backend_ref =
-            RuntimeWorkspaceBackendRef::from_worker_request(&request.request);
-        let observation_runtime_id = request
-            .request
-            .workspace_api
-            .as_ref()
-            .and_then(|api| api.runtime_id.clone());
+        let workspace_backend_ref = RuntimeWorkspaceBackendRef::from_worker_request(
+            &request.request,
+            self.runtime_id.as_deref(),
+        );
+        let observation_runtime_id = self.runtime_id.clone();
         let observation_workspace_id = request
             .request
             .workspace_api
@@ -689,29 +699,37 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             .map(|api| api.workspace_id.clone());
         let observation_grants = request.request.worker_observation_grants.clone();
         let observation_enabled = request.request.worker_observation_enabled;
-        let workspace_context = workspace_backend_ref.worker_context(&request.worker_ref);
+        let workspace_context = workspace_backend_ref.worker_context(
+            &request.worker_ref,
+            request.workspace_scope.as_ref(),
+            self.worker_mutation_identity.as_ref(),
+            self.embedded_worker_mutation_dispatcher.as_ref(),
+        );
         let (manifest, loader) = Self::restore_fallback_manifest(&worker_name)?;
 
-        let store_dir = self.store_dir()?;
-        let session_store = FsStore::new(&store_dir).map_err(|err| {
+        let worker_aggregate_dir = self.worker_aggregate_dir(&request.worker_ref)?;
+        let session_dir = worker_aggregate_dir.join("session");
+        let session_store = WorkerSessionStore::new(&session_dir).map_err(|err| {
             format!(
-                "failed to initialize session store at {}: {err}",
-                store_dir.display()
+                "failed to initialize canonical Worker Session store at {}: {err}",
+                session_dir.display()
             )
         })?;
-        let worker_metadata_dir = self.worker_metadata_dir(&store_dir);
-        let worker_metadata_store = FsWorkerStore::new(&worker_metadata_dir).map_err(|err| {
-            format!(
-                "failed to initialize worker metadata store at {}: {err}",
-                worker_metadata_dir.display()
-            )
-        })?;
+        let worker_metadata_store =
+            WorkerAggregateStore::new(&worker_aggregate_dir, worker_name.clone()).map_err(
+                |err| {
+                    format!(
+                        "failed to initialize canonical Worker metadata store at {}: {err}",
+                        worker_aggregate_dir.display()
+                    )
+                },
+            )?;
         let store = CombinedStore::new(session_store, worker_metadata_store);
 
         let mut worker = match Worker::restore_from_worker_metadata_with_context(
             &worker_name,
             manifest.clone(),
-            store,
+            store.clone(),
             loader.clone(),
             workspace_context.clone(),
             filesystem_authority.clone(),
@@ -722,20 +740,6 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             Err(WorkerError::WorkerMetadataPending { .. })
                 if request.request.initial_input.is_none() =>
             {
-                let session_store = FsStore::new(&store_dir).map_err(|err| {
-                    format!(
-                        "failed to initialize session store at {}: {err}",
-                        store_dir.display()
-                    )
-                })?;
-                let worker_metadata_store =
-                    FsWorkerStore::new(&worker_metadata_dir).map_err(|err| {
-                        format!(
-                            "failed to initialize worker metadata store at {}: {err}",
-                            worker_metadata_dir.display()
-                        )
-                    })?;
-                let store = CombinedStore::new(session_store, worker_metadata_store);
                 Worker::restore_pending_from_worker_metadata_with_context(
                     &worker_name,
                     manifest.clone(),
@@ -792,10 +796,17 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         }
 
         let workspace_client = worker.workspace_client_handle();
-        let runtime_base = self.runtime_base_dir()?;
-        let (handle, _shutdown_rx) = WorkerController::spawn_runtime_managed(worker, &runtime_base)
+        let run_dir = worker_aggregate_dir
+            .join("runs")
+            .join(request.run_generation.to_string());
+        let (handle, shutdown_rx) = WorkerController::spawn_runtime_managed_run(worker, &run_dir)
             .await
-            .map_err(|err| format!("failed to spawn restored Worker controller: {err}"))?;
+            .map_err(|err| {
+                format!(
+                    "failed to spawn restored Worker controller in {}: {err}",
+                    run_dir.display()
+                )
+            })?;
         if flow_transition_enabled {
             handle.shared_state.enable_flow_transition();
         }
@@ -806,6 +817,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         );
         Ok(RuntimeWorkerController {
             handle,
+            shutdown: Arc::new(tokio::sync::Mutex::new(Some(shutdown_rx))),
             workspace_client,
         })
     }
@@ -813,6 +825,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
 
 struct RuntimeWorkerExecution {
     handle: WorkerHandle,
+    shutdown: Arc<tokio::sync::Mutex<Option<worker::ShutdownReceiver>>>,
     busy: Arc<AtomicBool>,
     workspace_client: Option<Arc<dyn WorkspaceClient>>,
 }
@@ -828,7 +841,10 @@ pub struct WorkerRuntimeExecutionBackend<F = ProfileRuntimeWorkerFactory> {
 
 impl WorkerRuntimeExecutionBackend<ProfileRuntimeWorkerFactory> {
     pub fn from_workspace(workspace_root: impl Into<PathBuf>) -> Result<Self, String> {
-        Self::new(ProfileRuntimeWorkerFactory::new(workspace_root))
+        let workspace_root = workspace_root.into();
+        let factory = ProfileRuntimeWorkerFactory::new(&workspace_root)
+            .with_runtime_store_dir(workspace_root.join(".yoi/runtime-store"));
+        Self::new(factory)
     }
 }
 
@@ -1094,6 +1110,7 @@ where
         worker_ref: crate::identity::WorkerRef,
         bridge_context: crate::execution::WorkerExecutionContext,
         handle: WorkerHandle,
+        shutdown: Arc<tokio::sync::Mutex<Option<worker::ShutdownReceiver>>>,
         working_directory: Option<WorkingDirectoryBinding>,
         workspace_client: Option<Arc<dyn WorkspaceClient>>,
     ) -> WorkerExecutionSpawnResult {
@@ -1157,6 +1174,7 @@ where
             worker_ref.clone(),
             RuntimeWorkerExecution {
                 handle,
+                shutdown,
                 busy,
                 workspace_client,
             },
@@ -1393,6 +1411,7 @@ where
             worker_ref,
             bridge_context,
             controller.handle,
+            controller.shutdown,
             working_directory,
             Some(controller.workspace_client),
         )
@@ -1489,6 +1508,7 @@ where
             worker_ref,
             bridge_context,
             controller.handle,
+            controller.shutdown,
             working_directory,
             Some(controller.workspace_client),
         )
@@ -1698,12 +1718,28 @@ where
                 "execution handle does not reference a live Worker",
             );
         };
-        self.send_method(
+        let shutdown = execution.shutdown.clone();
+        let result = self.send_method(
             WorkerExecutionOperation::Stop,
             execution.handle,
             Method::Shutdown,
             WorkerExecutionRunState::Stopped,
-        )
+        );
+        if result.outcome != crate::execution::WorkerExecutionOutcome::Accepted {
+            return result;
+        }
+        match self.run_on_adapter_runtime(async move {
+            let receiver = shutdown.lock().await.take();
+            if let Some(receiver) = receiver {
+                receiver
+                    .await
+                    .map_err(|_| "Worker shutdown completion channel closed".to_string())?;
+            }
+            Ok(())
+        }) {
+            Ok(()) => result,
+            Err(message) => WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message),
+        }
     }
 
     fn cancel_worker(&self, handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
@@ -1781,6 +1817,36 @@ mod tests {
     use llm_engine::llm_client::{ClientError, LlmClient, Request};
     use manifest::{Scope, WorkerManifest};
     use session_store::{LogEntry, WorkerMetadataStore};
+
+    #[test]
+    fn restart_restore_reconstructs_runtime_owned_worker_mutation_client() {
+        let identity = RuntimeIdentityMaterial::generate("runtime-source").unwrap();
+        let worker_ref = WorkerRef::new(crate::identity::WorkerId::new(17));
+        let backend = RuntimeWorkspaceBackendRef::Http {
+            workspace_id: "workspace-a".to_string(),
+            base_url: "https://server.invalid".to_string(),
+            runtime_id: "runtime-source".to_string(),
+        };
+        let scope = crate::runtime::RuntimeWorkspaceScope::new("workspace-a", "server-main");
+
+        let before_restart =
+            backend.worker_context(&worker_ref, Some(&scope), Some(&identity), None);
+        let after_restore =
+            backend.worker_context(&worker_ref, Some(&scope), Some(&identity), None);
+
+        assert_eq!(
+            before_restart.client_handle().kind(),
+            "runtime-owned-workspace-client"
+        );
+        assert_eq!(
+            after_restore.client_handle().kind(),
+            "runtime-owned-workspace-client"
+        );
+        assert_eq!(
+            after_restore.client_handle().workspace_id(),
+            Some("workspace-a")
+        );
+    }
 
     #[test]
     fn notify_run_state_allows_running_worker_inbox_delivery() {
@@ -1904,9 +1970,16 @@ mod tests {
                 .as_ref()
                 .map(|binding| binding.root().to_path_buf())
                 .unwrap_or_else(|| self.cwd.clone());
-            let workspace_backend_ref =
-                RuntimeWorkspaceBackendRef::from_worker_request(&request.request);
-            let workspace_context = workspace_backend_ref.worker_context(&request.worker_ref);
+            let workspace_backend_ref = RuntimeWorkspaceBackendRef::from_worker_request(
+                &request.request,
+                Some("runtime-test"),
+            );
+            let workspace_context = workspace_backend_ref.worker_context(
+                &request.worker_ref,
+                request.workspace_scope.as_ref(),
+                None,
+                None,
+            );
             let workspace_client = workspace_context.client_handle();
             self.observed_workspace_clients.lock().unwrap().push((
                 workspace_client.kind().to_string(),
@@ -1924,12 +1997,13 @@ mod tests {
             )
             .await
             .map_err(|err| err.to_string())?;
-            let (handle, _shutdown_rx) =
+            let (handle, shutdown_rx) =
                 WorkerController::spawn_runtime_managed(worker, &self.runtime_base)
                     .await
                     .map_err(|err| err.to_string())?;
             Ok(RuntimeWorkerController {
                 handle,
+                shutdown: Arc::new(tokio::sync::Mutex::new(Some(shutdown_rx))),
                 workspace_client,
             })
         }
@@ -1939,7 +2013,9 @@ mod tests {
         ) -> Result<RuntimeWorkerController, String> {
             let request = WorkerExecutionSpawnRequest {
                 worker_ref: request.worker_ref,
+                run_generation: request.run_generation,
                 request: request.request,
+                workspace_scope: request.workspace_scope,
                 context: request.context,
                 working_directory: request.working_directory,
                 config_bundle: request.config_bundle,
@@ -2210,7 +2286,9 @@ mod tests {
         let worker_ref = crate::identity::WorkerRef::new(crate::identity::WorkerId::new(1));
         let request = WorkerExecutionSpawnRequest {
             worker_ref: worker_ref.clone(),
+            run_generation: 1,
             request: create_request("1"),
+            workspace_scope: None,
             context: test_execution_context(worker_ref),
             working_directory: None,
             config_bundle: None,
@@ -2263,9 +2341,9 @@ mod tests {
     #[tokio::test]
     async fn restore_pending_worker_uses_saved_manifest_snapshot() {
         let root = tempfile::tempdir().unwrap();
-        let store_dir = root.path().join("sessions");
-        let worker_metadata_dir = root.path().join("workers");
+        let runtime_store_dir = root.path().join("runtime");
         let worker_ref = WorkerRef::new(crate::identity::WorkerId::new(1));
+        let worker_aggregate_dir = runtime_store_dir.join("workers/1");
         let worker_name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&worker_ref);
         let session_id = session_store::new_session_id();
         let manifest = manifest::WorkerManifest::from_toml(&format!(
@@ -2294,7 +2372,7 @@ mod tests {
             root.path().display(),
         ))
         .unwrap();
-        FsWorkerStore::new(&worker_metadata_dir)
+        WorkerAggregateStore::new(&worker_aggregate_dir, &worker_name)
             .unwrap()
             .set_active(
                 &worker_name,
@@ -2309,14 +2387,15 @@ mod tests {
         request.workspace_api = Some(crate::catalog::WorkspaceApiRef {
             workspace_id: "workspace-restore".to_string(),
             base_url: "http://workspace.invalid".to_string(),
-            runtime_id: Some("runtime-restore".to_string()),
         });
         let controller = ProfileRuntimeWorkerFactory::new(root.path())
-            .with_store_dir(&store_dir)
-            .with_worker_metadata_dir(&worker_metadata_dir)
+            .with_runtime_id("runtime-restore")
+            .with_runtime_store_dir(&runtime_store_dir)
             .restore_controller(WorkerExecutionRestoreRequest {
                 worker_ref: worker_ref.clone(),
+                run_generation: 1,
                 request,
+                workspace_scope: None,
                 context: test_execution_context(worker_ref),
                 previous_working_directory: None,
                 working_directory: None,
@@ -2325,8 +2404,23 @@ mod tests {
             .await
             .expect("pending restore should use the saved manifest snapshot");
         assert!(controller.handle.shared_state.flow_transition_enabled());
+        let run_dir = runtime_store_dir.join("workers/1/runs/1");
+        assert!(run_dir.join("worker.sock").exists());
+        assert!(run_dir.join("worker.out.log").is_file());
+        assert!(run_dir.join("worker.err.log").is_file());
+        assert!(run_dir.join("artifacts").is_dir());
+        assert!(run_dir.join("spawned").is_dir());
 
+        let shutdown = controller.shutdown.clone();
         controller.handle.send(Method::Shutdown).await.unwrap();
+        if let Some(receiver) = shutdown.lock().await.take() {
+            receiver.await.unwrap();
+        }
+        assert!(
+            run_dir.is_dir(),
+            "run evidence remains until a separate retention policy disposes it"
+        );
+        assert!(!run_dir.join("worker.sock").exists());
     }
 
     #[test]
@@ -2428,7 +2522,6 @@ mod tests {
         request.workspace_api = Some(crate::catalog::WorkspaceApiRef {
             workspace_id: "ws-test".to_string(),
             base_url: "http://127.0.0.1:3999".to_string(),
-            runtime_id: Some("runtime-test".to_string()),
         });
         let detail = runtime.create_worker(request).unwrap();
 
@@ -2461,7 +2554,7 @@ mod tests {
         assert_eq!(
             observed_workspace_clients.lock().unwrap().as_slice(),
             &[(
-                "runtime-http-proxy".to_string(),
+                "runtime-owned-workspace-client".to_string(),
                 Some("ws-test".to_string()),
                 true,
             )]

@@ -20,7 +20,12 @@ use serde_yaml::{Mapping as YamlMapping, Value as YamlValue};
 use thiserror::Error;
 
 pub mod config;
+mod sqlite_schema;
 pub mod tool;
+
+pub use sqlite_schema::{
+    LATEST_SQLITE_TICKET_SCHEMA_VERSION, migrate_sqlite_ticket_schema, verify_sqlite_ticket_schema,
+};
 
 const REQUIRED_FIELDS: [&str; 4] = ["title", "state", "created_at", "updated_at"];
 const MAX_STATE_CHANGE_REASON_BYTES: usize = 1024;
@@ -290,7 +295,6 @@ pub enum TicketEventKind {
     Plan,
     Decision,
     ImplementationReport,
-    Review,
     StateChanged,
     IntakeSummary,
     StatusChanged,
@@ -306,7 +310,6 @@ impl TicketEventKind {
             Self::Plan => "plan",
             Self::Decision => "decision",
             Self::ImplementationReport => "implementation_report",
-            Self::Review => "review",
             Self::StateChanged => "state_changed",
             Self::IntakeSummary => "intake_summary",
             Self::StatusChanged => "status_changed",
@@ -322,7 +325,6 @@ impl TicketEventKind {
             Self::Plan => "Plan".to_string(),
             Self::Decision => "Decision".to_string(),
             Self::ImplementationReport => "Implementation report".to_string(),
-            Self::Review => "Review".to_string(),
             Self::StateChanged => "State changed".to_string(),
             Self::IntakeSummary => "Intake summary".to_string(),
             Self::StatusChanged => "Status changed".to_string(),
@@ -340,47 +342,11 @@ impl From<&str> for TicketEventKind {
             "plan" => Self::Plan,
             "decision" => Self::Decision,
             "implementation_report" => Self::ImplementationReport,
-            "review" => Self::Review,
+            "review" => Self::Comment,
             "state_changed" => Self::StateChanged,
             "intake_summary" => Self::IntakeSummary,
             "status_changed" => Self::StatusChanged,
             "close" | "closed" => Self::Close,
-            other => Self::Other(other.to_string()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TicketReviewResult {
-    Approve,
-    RequestChanges,
-    Other(String),
-}
-
-impl TicketReviewResult {
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Approve => "approve",
-            Self::RequestChanges => "request_changes",
-            Self::Other(value) => value.as_str(),
-        }
-    }
-
-    fn heading(&self) -> String {
-        match self {
-            Self::Approve => "Review: approve".to_string(),
-            Self::RequestChanges => "Review: request changes".to_string(),
-            Self::Other(value) => format!("Review: {value}"),
-        }
-    }
-}
-
-impl From<&str> for TicketReviewResult {
-    fn from(value: &str) -> Self {
-        match value {
-            "approve" => Self::Approve,
-            "request_changes" => Self::RequestChanges,
             other => Self::Other(other.to_string()),
         }
     }
@@ -452,31 +418,6 @@ impl TicketIntakeSummary {
             author: None,
             body: body.into(),
             references: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TicketReview {
-    pub result: TicketReviewResult,
-    pub author: Option<String>,
-    pub body: MarkdownText,
-}
-
-impl TicketReview {
-    pub fn approve(body: impl Into<MarkdownText>) -> Self {
-        Self {
-            result: TicketReviewResult::Approve,
-            author: None,
-            body: body.into(),
-        }
-    }
-
-    pub fn request_changes(body: impl Into<MarkdownText>) -> Self {
-        Self {
-            result: TicketReviewResult::RequestChanges,
-            author: None,
-            body: body.into(),
         }
     }
 }
@@ -1573,7 +1514,6 @@ pub trait TicketBackend {
         change: TicketStateChange,
     ) -> Result<()>;
     fn queue_ready(&self, id: TicketIdOrSlug, queued_by: &str) -> Result<()>;
-    fn review(&self, id: TicketIdOrSlug, review: TicketReview) -> Result<()>;
     fn close(&self, id: TicketIdOrSlug, resolution: MarkdownText) -> Result<()>;
     fn add_ticket_relation(
         &self,
@@ -1650,10 +1590,6 @@ pub enum TicketBackendOperation {
     QueueReady {
         id: TicketIdOrSlug,
         queued_by: String,
-    },
-    Review {
-        id: TicketIdOrSlug,
-        review: TicketReview,
     },
     Close {
         id: TicketIdOrSlug,
@@ -1756,10 +1692,6 @@ where
         }
         TicketBackendOperation::QueueReady { id, queued_by } => {
             backend.queue_ready(id, &queued_by)?;
-            TicketBackendOperationResult::Unit
-        }
-        TicketBackendOperation::Review { id, review } => {
-            backend.review(id, review)?;
             TicketBackendOperationResult::Unit
         }
         TicketBackendOperation::Close { id, resolution } => {
@@ -2301,7 +2233,7 @@ impl fmt::Debug for SqliteTicketBackend {
 }
 
 impl SqliteTicketBackend {
-    pub fn new(db_path: impl Into<PathBuf>, workspace_id: impl Into<String>) -> Self {
+    fn configured(db_path: impl Into<PathBuf>, workspace_id: impl Into<String>) -> Self {
         Self {
             db_path: db_path.into(),
             workspace_id: workspace_id.into(),
@@ -2309,6 +2241,27 @@ impl SqliteTicketBackend {
             event_attributes: BTreeMap::new(),
             mutation_hook: None,
         }
+    }
+
+    /// Opens a standalone Ticket backend, applying all Ticket-owned migrations once.
+    pub fn open(db_path: impl Into<PathBuf>, workspace_id: impl Into<String>) -> Result<Self> {
+        let backend = Self::configured(db_path, workspace_id);
+        let connection = backend.connect()?;
+        migrate_sqlite_ticket_schema(&connection)?;
+        Ok(backend)
+    }
+
+    /// Connects to a database whose Ticket schema was composed by its startup owner.
+    ///
+    /// This performs verification only and never creates or alters schema objects.
+    pub fn open_verified(
+        db_path: impl Into<PathBuf>,
+        workspace_id: impl Into<String>,
+    ) -> Result<Self> {
+        let backend = Self::configured(db_path, workspace_id);
+        let connection = backend.connect()?;
+        verify_sqlite_ticket_schema(&connection)?;
+        Ok(backend)
     }
 
     pub fn with_event_attributes(mut self, attributes: BTreeMap<String, String>) -> Self {
@@ -2338,7 +2291,6 @@ impl SqliteTicketBackend {
 
     pub fn import_from_local_backend(&self, local: &LocalTicketBackend) -> Result<()> {
         let conn = self.open_connection()?;
-        self.ensure_schema(&conn)?;
         conn.execute_batch("BEGIN IMMEDIATE").map_err(sqlite_err)?;
         let result = (|| {
             for summary in local.list(TicketListQuery::all())? {
@@ -2351,7 +2303,7 @@ impl SqliteTicketBackend {
         finish_sqlite_transaction(&conn, result)
     }
 
-    fn open_connection(&self) -> Result<Connection> {
+    fn connect(&self) -> Result<Connection> {
         if let Some(parent) = self.db_path.parent() {
             fs::create_dir_all(parent).map_err(|error| io_err(parent, error))?;
         }
@@ -2361,115 +2313,20 @@ impl SqliteTicketBackend {
         Ok(conn)
     }
 
-    fn ensure_schema(&self, conn: &Connection) -> Result<()> {
-        conn.execute_batch(r#"
-CREATE TABLE IF NOT EXISTS typed_tickets (
-    workspace_id TEXT NOT NULL,
-    ticket_id TEXT NOT NULL,
-    slug TEXT NOT NULL,
-    title TEXT NOT NULL,
-    status TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    priority TEXT NOT NULL,
-    body TEXT NOT NULL,
-    created_at TEXT,
-    updated_at TEXT,
-    assignee TEXT,
-    readiness TEXT,
-    workflow_state TEXT NOT NULL,
-    workflow_state_explicit INTEGER NOT NULL,
-    queued_by TEXT,
-    queued_at TEXT,
-    resolution TEXT,
-    repository_id TEXT,
-    ref_selector TEXT,
-    PRIMARY KEY (workspace_id, ticket_id)
-);
-CREATE TABLE IF NOT EXISTS typed_ticket_labels (
-    workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, ordinal INTEGER NOT NULL, label TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, ticket_id, ordinal),
-    FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS typed_ticket_risk_flags (
-    workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, ordinal INTEGER NOT NULL, risk_flag TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, ticket_id, ordinal),
-    FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS typed_ticket_raw_frontmatter (
-    workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, ticket_id, key),
-    FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS typed_ticket_events (
-    workspace_id TEXT NOT NULL,
-    ticket_id TEXT NOT NULL,
-    event_index INTEGER NOT NULL,
-    kind TEXT NOT NULL,
-    author TEXT,
-    at TEXT,
-    status TEXT,
-    from_state TEXT,
-    to_state TEXT,
-    reason TEXT,
-    state_field TEXT,
-    heading TEXT,
-    body TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, ticket_id, event_index),
-    FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS typed_ticket_event_references (
-    workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, event_index INTEGER NOT NULL, ordinal INTEGER NOT NULL, kind TEXT NOT NULL, target TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, ticket_id, event_index, ordinal),
-    FOREIGN KEY (workspace_id, ticket_id, event_index) REFERENCES typed_ticket_events(workspace_id, ticket_id, event_index) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS typed_ticket_event_attributes (
-    workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, event_index INTEGER NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, ticket_id, event_index, key),
-    FOREIGN KEY (workspace_id, ticket_id, event_index) REFERENCES typed_ticket_events(workspace_id, ticket_id, event_index) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS typed_ticket_relations (
-    workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, kind TEXT NOT NULL, target TEXT NOT NULL, note TEXT, author TEXT NOT NULL, at TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, ticket_id, kind, target),
-    FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS typed_ticket_orchestration_plans (
-    workspace_id TEXT NOT NULL,
-    ticket_id TEXT NOT NULL,
-    record_id TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    related_ticket TEXT,
-    note TEXT,
-    accepted_summary TEXT,
-    accepted_branch TEXT,
-    accepted_worktree TEXT,
-    accepted_role_plan TEXT,
-    author TEXT NOT NULL,
-    at TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, ticket_id, record_id),
-    FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS typed_ticket_artifacts (
-    workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, relative_path TEXT NOT NULL, content BLOB NOT NULL,
-    PRIMARY KEY (workspace_id, ticket_id, relative_path),
-    FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
-);
-"#)
-        .map_err(sqlite_err)?;
-        ensure_sqlite_ticket_column(conn, "repository_id", "TEXT")?;
-        ensure_sqlite_ticket_column(conn, "ref_selector", "TEXT")?;
-        Ok(())
+    fn open_connection(&self) -> Result<Connection> {
+        let connection = self.connect()?;
+        verify_sqlite_ticket_schema(&connection)?;
+        Ok(connection)
     }
 
     fn with_write<R>(&self, op: impl FnOnce(&Connection) -> Result<R>) -> Result<R> {
         let conn = self.open_connection()?;
-        self.ensure_schema(&conn)?;
         conn.execute_batch("BEGIN IMMEDIATE").map_err(sqlite_err)?;
         finish_sqlite_transaction(&conn, op(&conn))
     }
 
     fn with_read<R>(&self, op: impl FnOnce(&Connection) -> Result<R>) -> Result<R> {
         let conn = self.open_connection()?;
-        self.ensure_schema(&conn)?;
         op(&conn)
     }
 
@@ -2915,30 +2772,6 @@ CREATE TABLE IF NOT EXISTS typed_ticket_artifacts (
     }
 }
 
-fn ensure_sqlite_ticket_column(
-    conn: &rusqlite::Connection,
-    name: &str,
-    sql_type: &str,
-) -> Result<()> {
-    let mut statement = conn
-        .prepare("PRAGMA table_info(typed_tickets)")
-        .map_err(sqlite_err)?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(sqlite_err)?;
-    for column in columns {
-        if column.map_err(sqlite_err)? == name {
-            return Ok(());
-        }
-    }
-    conn.execute(
-        format!("ALTER TABLE typed_tickets ADD COLUMN {name} {sql_type}").as_str(),
-        [],
-    )
-    .map_err(sqlite_err)?;
-    Ok(())
-}
-
 fn finish_sqlite_transaction<R>(conn: &Connection, result: Result<R>) -> Result<R> {
     match result {
         Ok(output) => {
@@ -3292,34 +3125,6 @@ impl TicketBackend for SqliteTicketBackend {
             let at = now_utc();
             conn.execute("UPDATE typed_tickets SET workflow_state = 'queued', workflow_state_explicit = 1, queued_by = ?3, queued_at = ?4, updated_at = ?4 WHERE workspace_id = ?1 AND ticket_id = ?2", params![self.workspace_id, ticket_id, queued_by, at]).map_err(sqlite_err)?;
             self.insert_event(conn, &ticket_id, &TicketEvent { kind: TicketEventKind::StateChanged, author: Some(queued_by.to_string()), at: Some(at), status: None, from: Some("ready".to_string()), to: Some("queued".to_string()), reason: Some("queued".to_string()), state_field: Some("state".to_string()), heading: Some(TicketEventKind::StateChanged.heading()), body: MarkdownText::new(format!("Queued for Orchestrator by {queued_by}.")), references: Vec::new(), attributes: BTreeMap::new() })
-        })
-    }
-
-    fn review(&self, id: TicketIdOrSlug, review: TicketReview) -> Result<()> {
-        self.with_write(|conn| {
-            let ticket_id = self.resolve_ticket_id(conn, id)?;
-            let at = now_utc();
-            let mut attributes = BTreeMap::new();
-            attributes.insert("result".to_string(), review.result.as_str().to_string());
-            self.insert_event(
-                conn,
-                &ticket_id,
-                &TicketEvent {
-                    kind: TicketEventKind::Review,
-                    author: Some(review.author.unwrap_or_else(default_author)),
-                    at: Some(at.clone()),
-                    status: Some(review.result.as_str().to_string()),
-                    from: None,
-                    to: None,
-                    reason: None,
-                    state_field: None,
-                    heading: Some(review.result.heading()),
-                    body: review.body,
-                    references: Vec::new(),
-                    attributes,
-                },
-            )?;
-            self.touch_ticket(conn, &ticket_id, &at)
         })
     }
 
@@ -3895,21 +3700,6 @@ impl TicketBackend for LocalTicketBackend {
             TicketWorkflowState::Queued,
             change,
             &[("queued_by", queued_by), ("queued_at", at.as_str())],
-        )
-    }
-
-    fn review(&self, id: TicketIdOrSlug, review: TicketReview) -> Result<()> {
-        let _lock = self.acquire_lock()?;
-        let dir = self.find_ticket_dir(&id)?;
-        let author = review.author.unwrap_or_else(default_author);
-        self.append_thread_event(
-            &dir,
-            "review",
-            &review.result.heading(),
-            &author,
-            Some(review.result.as_str()),
-            &[],
-            &review.body,
         )
     }
 
@@ -5431,7 +5221,8 @@ fn parse_thread(path: &Path) -> Result<Vec<TicketEvent>> {
             .strip_prefix("<!-- ")
             .and_then(|v| v.strip_suffix(" -->"))
         {
-            let attrs = parse_event_comment(comment);
+            let mut attrs = parse_event_comment(comment);
+            let legacy_review = attrs.get("event").is_some_and(|value| value == "review");
             let kind = attrs
                 .get("event")
                 .map(|value| TicketEventKind::from(value.as_str()))
@@ -5463,11 +5254,22 @@ fn parse_thread(path: &Path) -> Result<Vec<TicketEvent>> {
             while body.ends_with('\n') {
                 body.pop();
             }
+            if legacy_review {
+                heading = Some("Legacy review (non-authoritative)".to_string());
+                attrs.remove("status");
+                attrs.remove("result");
+                attrs.insert("event".to_string(), "comment".to_string());
+                attrs.insert("legacy_event_kind".to_string(), "review".to_string());
+            }
             events.push(TicketEvent {
                 kind,
                 author: attrs.get("author").cloned(),
                 at: attrs.get("at").cloned(),
-                status: attrs.get("status").cloned(),
+                status: if legacy_review {
+                    None
+                } else {
+                    attrs.get("status").cloned()
+                },
                 from: attrs.get("from").cloned(),
                 to: attrs.get("to").cloned(),
                 reason: attrs.get("reason").cloned(),
@@ -6406,26 +6208,9 @@ state: planning
     #[test]
     fn sqlite_backend_persists_and_edits_ticket_target() {
         let tmp = TempDir::new().unwrap();
-        let backend = SqliteTicketBackend::new(tmp.path().join("workspace.db"), "workspace-test");
+        let backend =
+            SqliteTicketBackend::open(tmp.path().join("workspace.db"), "workspace-test").unwrap();
         assert_ticket_target_edit_semantics(&backend);
-    }
-
-    #[test]
-    fn sqlite_ticket_target_columns_are_added_to_existing_table() {
-        let tmp = TempDir::new().unwrap();
-        let conn = rusqlite::Connection::open(tmp.path().join("workspace.db")).unwrap();
-        conn.execute_batch("CREATE TABLE typed_tickets (ticket_id TEXT PRIMARY KEY);")
-            .unwrap();
-        ensure_sqlite_ticket_column(&conn, "repository_id", "TEXT").unwrap();
-        ensure_sqlite_ticket_column(&conn, "ref_selector", "TEXT").unwrap();
-        let mut statement = conn.prepare("PRAGMA table_info(typed_tickets)").unwrap();
-        let columns = statement
-            .query_map([], |row| row.get::<_, String>(1))
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(columns.iter().any(|column| column == "repository_id"));
-        assert!(columns.iter().any(|column| column == "ref_selector"));
     }
 
     #[test]
@@ -6438,7 +6223,8 @@ state: planning
     #[test]
     fn sqlite_backend_edit_item_supports_partial_body_replacement() {
         let tmp = TempDir::new().unwrap();
-        let backend = SqliteTicketBackend::new(tmp.path().join("workspace.db"), "workspace-test");
+        let backend =
+            SqliteTicketBackend::open(tmp.path().join("workspace.db"), "workspace-test").unwrap();
         assert_partial_body_replacement_semantics(&backend);
     }
 
@@ -6446,7 +6232,7 @@ state: planning
     fn sqlite_mutation_hook_failure_rolls_back_ticket_event() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("workspace.db");
-        let backend = SqliteTicketBackend::new(&db_path, "workspace-test");
+        let backend = SqliteTicketBackend::open(&db_path, "workspace-test").unwrap();
         let created = backend.create(NewTicket::new("Atomic mutation")).unwrap();
         let before = backend
             .show(TicketIdOrSlug::Id(created.id.clone()))
@@ -6480,18 +6266,13 @@ state: planning
     #[test]
     fn sqlite_backend_persists_core_ticket_operations() {
         let tmp = TempDir::new().unwrap();
-        let backend = SqliteTicketBackend::new(tmp.path().join("workspace.db"), "workspace-test");
+        let backend =
+            SqliteTicketBackend::open(tmp.path().join("workspace.db"), "workspace-test").unwrap();
         let created = backend.create(NewTicket::new("SQLite Ticket")).unwrap();
         backend
             .add_event(
                 TicketIdOrSlug::Id(created.id.clone()),
                 NewTicketEvent::new(TicketEventKind::Comment, "Imported into SQLite."),
-            )
-            .unwrap();
-        backend
-            .review(
-                TicketIdOrSlug::Id(created.id.clone()),
-                TicketReview::approve("Looks good."),
             )
             .unwrap();
         backend
@@ -6501,7 +6282,9 @@ state: planning
             )
             .unwrap();
 
-        let reopened = SqliteTicketBackend::new(tmp.path().join("workspace.db"), "workspace-test");
+        let reopened =
+            SqliteTicketBackend::open_verified(tmp.path().join("workspace.db"), "workspace-test")
+                .unwrap();
         let list = reopened.list(TicketListQuery::all()).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, created.id);
@@ -6511,13 +6294,6 @@ state: planning
         assert!(ticket.events.iter().any(|event| {
             event.kind == TicketEventKind::Comment && event.body.0.contains("Imported into SQLite")
         }));
-        assert!(
-            ticket
-                .events
-                .iter()
-                .any(|event| event.kind == TicketEventKind::Review
-                    && event.body.0.contains("Looks good"))
-        );
         assert!(
             ticket
                 .resolution
@@ -6531,7 +6307,8 @@ state: planning
         let tmp = TempDir::new().unwrap();
         let local = backend(&tmp);
         let created = local.create(NewTicket::new("Legacy Ticket")).unwrap();
-        let db = SqliteTicketBackend::new(tmp.path().join("workspace.db"), "workspace-test");
+        let db =
+            SqliteTicketBackend::open(tmp.path().join("workspace.db"), "workspace-test").unwrap();
         db.import_from_local_backend(&local).unwrap();
 
         let ticket = db.show(TicketIdOrSlug::Id(created.id.clone())).unwrap();
@@ -6630,7 +6407,7 @@ state: planning
     }
 
     #[test]
-    fn add_event_review_status_and_close_preserve_local_layout() {
+    fn add_event_status_and_close_preserve_local_layout() {
         let tmp = TempDir::new().unwrap();
         let backend = backend(&tmp);
         let ticket = backend.create(NewTicket::new("Flow Ticket")).unwrap();
@@ -6638,12 +6415,6 @@ state: planning
             .add_event(
                 TicketIdOrSlug::Id(ticket.id.clone()),
                 NewTicketEvent::new(TicketEventKind::Plan, "Implementation plan."),
-            )
-            .unwrap();
-        backend
-            .review(
-                TicketIdOrSlug::Id(ticket.id.clone()),
-                TicketReview::approve("Looks good."),
             )
             .unwrap();
         let mut summary = TicketIntakeSummary::new("Ready for queue.");
@@ -6669,8 +6440,6 @@ state: planning
         let closed_dir = tmp.path().join("tickets").join(&ticket.id);
         assert!(closed_dir.join("resolution.md").exists());
         let thread = fs::read_to_string(closed_dir.join("thread.md")).unwrap();
-        assert!(thread.contains("<!-- event: review"));
-        assert!(thread.contains("status: approve"));
         assert!(thread.contains("<!-- event: close"));
         let report = backend.doctor().unwrap();
         assert!(report.is_ok(), "{:?}", report.diagnostics);
@@ -6694,14 +6463,6 @@ state: planning
         comment.author = Some("bad\nauthor".into());
         assert!(matches!(
             backend.add_event(TicketIdOrSlug::Id(ticket.id.clone()), comment),
-            Err(TicketError::Conflict(_))
-        ));
-        assert_eq!(fs::read_to_string(&thread_path).unwrap(), original);
-
-        let mut review = TicketReview::approve("This must not append either.");
-        review.author = Some("bad-->author".into());
-        assert!(matches!(
-            backend.review(TicketIdOrSlug::Id(ticket.id.clone()), review),
             Err(TicketError::Conflict(_))
         ));
         assert_eq!(fs::read_to_string(&thread_path).unwrap(), original);

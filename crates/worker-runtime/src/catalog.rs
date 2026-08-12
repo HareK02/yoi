@@ -179,8 +179,6 @@ pub struct WorkingDirectoryStatus {
 pub struct WorkspaceApiRef {
     pub workspace_id: String,
     pub base_url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime_id: Option<String>,
 }
 
 impl std::fmt::Debug for WorkspaceApiRef {
@@ -189,7 +187,6 @@ impl std::fmt::Debug for WorkspaceApiRef {
             .debug_struct("WorkspaceApiRef")
             .field("workspace_id", &self.workspace_id)
             .field("base_url", &self.base_url)
-            .field("runtime_id", &self.runtime_id)
             .finish()
     }
 }
@@ -291,4 +288,32 @@ pub struct WorkerDetail {
 pub struct WorkerLifecycleAck {
     pub worker_ref: WorkerRef,
     pub status: WorkerStatus,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkspaceApiRef;
+
+    #[test]
+    fn workspace_api_ref_public_schema_contains_no_source_credentials_or_claim_choices() {
+        let value = serde_json::to_value(WorkspaceApiRef {
+            workspace_id: "workspace-a".to_string(),
+            base_url: "https://server.invalid".to_string(),
+        })
+        .unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 2);
+        assert!(object.contains_key("workspace_id"));
+        assert!(object.contains_key("base_url"));
+        for forbidden in [
+            "runtime_id",
+            "worker_id",
+            "permission",
+            "private_key",
+            "bearer_token",
+            "signing_handle",
+        ] {
+            assert!(!object.contains_key(forbidden), "unexpected {forbidden}");
+        }
+    }
 }

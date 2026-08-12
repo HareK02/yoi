@@ -9,6 +9,6 @@ import "./base.dcdl" // {
         web = { enabled = true; };
         sub_worker = { enabled = false; };
         worker = { enabled = false; };
-        ticket = { enabled = true; thread = true; };
+        ticket = { enabled = true; thread = false; };
     };
 }

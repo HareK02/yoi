@@ -1524,7 +1524,7 @@ fn render_compact(lines: &mut Vec<Line<'static>>, evt: &CompactEvent, width: u16
                 .collect::<String>();
             let elapsed = elapsed_suffix(*elapsed_secs);
             (
-                format!("[compact] done (new session {short}){elapsed}"),
+                format!("[compact] done (new segment {short}){elapsed}"),
                 MessageKind::NoticeWarn,
             )
         }

@@ -26,6 +26,11 @@ use crate::management::{
 };
 #[cfg(feature = "ws-server")]
 use crate::observation::{WorkerObservationCursor, WorkerObservationEvent};
+#[cfg(feature = "fs-store")]
+use crate::retention::{
+    FsWorkerRetentionProvider, WorkerRetentionExecutionRequest, WorkerRetentionExecutionResult,
+    WorkerRetentionInventory, WorkerRetentionInventorySnapshot, WorkerRetentionProvider,
+};
 use protocol::subscription::{
     EventSubscriptionSelector, SubscriptionEventPayload, SubscriptionSnapshot,
     SubscriptionValidationError, SubscriptionWorkdirId, SubscriptionWorker, SubscriptionWorkerId,
@@ -532,13 +537,18 @@ impl Runtime {
                 status: WorkerStatus::Stopped,
                 workspace_id: scope.map(|scope| scope.workspace_id.clone()),
                 request: request.clone(),
+                run_generation: 1,
                 working_directory: None,
                 execution_handle: None,
             };
             state.workers.insert(worker_id, record);
+            state.persist_runtime_snapshot()?;
+            state.persist_worker(&worker_ref.worker_id)?;
             let spawn_request = WorkerExecutionSpawnRequest {
                 worker_ref: worker_ref.clone(),
+                run_generation: 1,
                 request,
+                workspace_scope: scope.cloned(),
                 context: self.execution_context(worker_ref.clone()),
                 working_directory: None,
                 config_bundle: None,
@@ -817,13 +827,10 @@ impl Runtime {
             if let Some(existing) = worker.request.workspace_api.as_ref()
                 && (existing.workspace_id != workspace_api.workspace_id
                     || existing.base_url.trim_end_matches('/')
-                        != workspace_api.base_url.trim_end_matches('/')
-                    || existing.runtime_id.as_ref().is_some_and(|runtime_id| {
-                        workspace_api.runtime_id.as_ref() != Some(runtime_id)
-                    }))
+                        != workspace_api.base_url.trim_end_matches('/'))
             {
                 return Err(RuntimeError::InvalidRequest(
-                    "Workspace API replacement cannot change Worker Workspace identity, Runtime identity, or base URL"
+                    "Workspace API replacement cannot change Worker Workspace identity or base URL"
                         .to_string(),
                 ));
             }
@@ -859,35 +866,53 @@ impl Runtime {
     /// present this is idempotent; otherwise the configured backend is tried.
     pub fn restore_worker(&self, worker_ref: &WorkerRef) -> Result<WorkerDetail, RuntimeError> {
         let (backend, request) = {
-            let state = self.lock()?;
+            let mut state = self.lock()?;
             state.ensure_running()?;
-            let worker = state.worker(worker_ref)?;
-            if worker.execution_handle.is_some() {
-                return Ok(worker.detail());
-            }
-            if worker.status == WorkerStatus::Cancelled {
-                return Err(RuntimeError::InvalidRequest(format!(
-                    "worker {} is cancelled",
-                    worker_ref.worker_id
-                )));
-            }
+            let (worker_request, previous_working_directory, config_bundle, run_generation) = {
+                let worker = state.worker(worker_ref)?;
+                if worker.execution_handle.is_some() {
+                    return Ok(worker.detail());
+                }
+                if worker.status == WorkerStatus::Cancelled {
+                    return Err(RuntimeError::InvalidRequest(format!(
+                        "worker {} is cancelled",
+                        worker_ref.worker_id
+                    )));
+                }
+                let config_bundle = worker
+                    .request
+                    .config_bundle
+                    .as_ref()
+                    .and_then(|bundle_ref| state.config_bundles.get(&bundle_ref.id))
+                    .cloned();
+                (
+                    worker.request.clone(),
+                    worker.working_directory.clone(),
+                    config_bundle,
+                    worker.run_generation.saturating_add(1).max(1),
+                )
+            };
             let backend = state.execution_backend.clone().ok_or_else(|| {
                 RuntimeError::WorkerExecutionUnavailable {
                     worker_id: worker_ref.worker_id.clone(),
                     message: "runtime has no execution backend".to_string(),
                 }
             })?;
-            let config_bundle = worker
-                .request
-                .config_bundle
-                .as_ref()
-                .and_then(|bundle_ref| state.config_bundles.get(&bundle_ref.id))
-                .cloned();
+            state.worker_mut(worker_ref)?.run_generation = run_generation;
+            state.persist_worker(&worker_ref.worker_id)?;
+            let workspace_scope = worker_request.workspace_api.as_ref().and_then(|api| {
+                state
+                    .workspace_owners
+                    .get(&api.workspace_id)
+                    .map(|server_id| RuntimeWorkspaceScope::new(&api.workspace_id, server_id))
+            });
             let request = WorkerExecutionRestoreRequest {
                 worker_ref: worker_ref.clone(),
-                request: worker.request.clone(),
+                run_generation,
+                request: worker_request,
+                workspace_scope,
                 context: self.execution_context(worker_ref.clone()),
-                previous_working_directory: worker.working_directory.clone(),
+                previous_working_directory,
                 working_directory: None,
                 config_bundle,
             };
@@ -1514,47 +1539,85 @@ impl Runtime {
         struct RestoreCandidate {
             worker_ref: WorkerRef,
             request: CreateWorkerRequest,
+            run_generation: u64,
             previous_working_directory: Option<CatalogWorkingDirectoryStatus>,
             config_bundle: Option<ConfigBundle>,
         }
 
         let candidates = {
-            let state = self.lock()?;
+            let mut state = self.lock()?;
             if state.execution_backend.is_none() {
                 return Ok(());
             }
-            state
+            let worker_ids = state
                 .workers
                 .values()
                 .filter(|worker| worker.execution_handle.is_none())
-                .map(|worker| {
+                .map(|worker| worker.worker_id)
+                .collect::<Vec<_>>();
+            let mut candidates = Vec::with_capacity(worker_ids.len());
+            for worker_id in worker_ids {
+                let (
+                    worker_ref,
+                    request,
+                    previous_working_directory,
+                    config_bundle,
+                    run_generation,
+                ) = {
+                    let worker = state
+                        .workers
+                        .get(&worker_id)
+                        .expect("collected Worker exists");
                     let config_bundle = worker
                         .request
                         .config_bundle
                         .as_ref()
                         .and_then(|bundle_ref| state.config_bundles.get(&bundle_ref.id))
                         .cloned();
-                    RestoreCandidate {
-                        worker_ref: worker.worker_ref.clone(),
-                        request: worker.request.clone(),
-                        previous_working_directory: worker.working_directory.clone(),
+                    (
+                        worker.worker_ref.clone(),
+                        worker.request.clone(),
+                        worker.working_directory.clone(),
                         config_bundle,
-                    }
-                })
-                .collect::<Vec<_>>()
+                        worker.run_generation.saturating_add(1).max(1),
+                    )
+                };
+                state
+                    .workers
+                    .get_mut(&worker_id)
+                    .expect("collected Worker exists")
+                    .run_generation = run_generation;
+                state.persist_worker(&worker_id)?;
+                candidates.push(RestoreCandidate {
+                    worker_ref,
+                    request,
+                    run_generation,
+                    previous_working_directory,
+                    config_bundle,
+                });
+            }
+            candidates
         };
 
         for candidate in candidates {
-            let backend = {
+            let (backend, workspace_scope) = {
                 let state = self.lock()?;
-                state.execution_backend.clone()
+                let workspace_scope = candidate.request.workspace_api.as_ref().and_then(|api| {
+                    state
+                        .workspace_owners
+                        .get(&api.workspace_id)
+                        .map(|server_id| RuntimeWorkspaceScope::new(&api.workspace_id, server_id))
+                });
+                (state.execution_backend.clone(), workspace_scope)
             };
             let Some(backend) = backend else {
                 return Ok(());
             };
             let request = WorkerExecutionRestoreRequest {
                 worker_ref: candidate.worker_ref.clone(),
+                run_generation: candidate.run_generation,
                 request: candidate.request,
+                workspace_scope,
                 context: self.execution_context(candidate.worker_ref.clone()),
                 previous_working_directory: candidate.previous_working_directory,
                 working_directory: None,
@@ -1602,6 +1665,139 @@ impl Runtime {
         Ok(())
     }
 
+    /// Bind the Backend registry identity once. Retention evidence fails closed
+    /// until the Runtime host supplies this trusted configuration.
+    pub fn bind_runtime_identity(&self, runtime_id: &str) -> Result<(), RuntimeError> {
+        if runtime_id.trim().is_empty() || runtime_id.len() > 160 {
+            return Err(RuntimeError::InvalidRequest(
+                "Runtime identity must be non-empty and bounded".to_string(),
+            ));
+        }
+        let mut state = self.lock()?;
+        match state.runtime_identity.as_deref() {
+            Some(current) if current == runtime_id => Ok(()),
+            Some(_) => Err(RuntimeError::InvalidRequest(
+                "Runtime identity is already bound".to_string(),
+            )),
+            None => {
+                state.runtime_identity = Some(runtime_id.to_string());
+                Ok(())
+            }
+        }
+    }
+
+    /// Read canonical aggregate facts needed by a Backend removal plan.
+    #[cfg(feature = "fs-store")]
+    pub fn worker_retention_inventory(
+        &self,
+        workspace_id: &str,
+        worker_ref: &WorkerRef,
+    ) -> Result<WorkerRetentionInventory, RuntimeError> {
+        let state = self.lock()?;
+        let runtime_id = state.runtime_identity.as_deref().ok_or_else(|| {
+            RuntimeError::InvalidRequest(
+                "Runtime identity is not bound for Worker retention".to_string(),
+            )
+        })?;
+        let worker = state.worker(worker_ref)?;
+        if worker.workspace_id.as_deref() != Some(workspace_id) {
+            return Err(RuntimeError::WorkerNotFound {
+                worker_id: worker_ref.worker_id,
+            });
+        }
+        let store = state.fs_store().ok_or_else(|| {
+            RuntimeError::InvalidRequest(
+                "Worker retention archive authority requires an fs-backed Runtime".to_string(),
+            )
+        })?;
+        FsWorkerRetentionProvider::new(store.runtime_dir()).inventory(
+            workspace_id,
+            runtime_id,
+            worker.worker_id,
+            worker.run_generation,
+        )
+    }
+
+    /// Enumerate host-authoritative Runtime inventory for Backend orphan
+    /// reconciliation. Runtime identity and Workspace scope are derived here,
+    /// not accepted in a diagnostic payload.
+    #[cfg(feature = "fs-store")]
+    pub fn list_worker_retention_inventory(
+        &self,
+        workspace_id: &str,
+    ) -> Result<WorkerRetentionInventorySnapshot, RuntimeError> {
+        let state = self.lock()?;
+        let runtime_id = state.runtime_identity.as_deref().ok_or_else(|| {
+            RuntimeError::InvalidRequest(
+                "Runtime identity is not bound for Worker retention".to_string(),
+            )
+        })?;
+        let store = state.fs_store().ok_or_else(|| {
+            RuntimeError::InvalidRequest(
+                "Worker retention inventory requires an fs-backed Runtime".to_string(),
+            )
+        })?;
+        let provider = FsWorkerRetentionProvider::new(store.runtime_dir());
+        provider.snapshot(workspace_id, runtime_id)
+    }
+
+    /// Execute a Backend-resolved retention plan. Only stopped Workers are
+    /// eligible. Provider receipt lookup happens before live lookup so exact
+    /// retries converge after aggregate removal.
+    #[cfg(feature = "fs-store")]
+    pub fn execute_worker_retention(
+        &self,
+        request: &WorkerRetentionExecutionRequest,
+    ) -> Result<WorkerRetentionExecutionResult, RuntimeError> {
+        let mut state = self.lock()?;
+        let runtime_id = state.runtime_identity.clone().ok_or_else(|| {
+            RuntimeError::InvalidRequest(
+                "Runtime identity is not bound for Worker retention".to_string(),
+            )
+        })?;
+        if request.source_runtime_id != runtime_id {
+            return Err(RuntimeError::InvalidRequest(
+                "Worker retention Runtime identity mismatch".to_string(),
+            ));
+        }
+        let store = state.fs_store().ok_or_else(|| {
+            RuntimeError::InvalidRequest(
+                "Worker retention execution requires an fs-backed Runtime".to_string(),
+            )
+        })?;
+        let provider = FsWorkerRetentionProvider::new(store.runtime_dir());
+        if let Some(completed) = provider.completed_for(request)? {
+            state.workers.remove(&request.worker_id);
+            state.persist_runtime_snapshot()?;
+            return Ok(completed);
+        }
+        let Some(worker) = state.workers.get(&request.worker_id) else {
+            // Recover a pending receipt after a crash between aggregate removal
+            // and final receipt/Runtime catalog commit.
+            return provider.recover_after_source_removal(request);
+        };
+        if worker.workspace_id.as_deref() != Some(request.workspace_id.as_str()) {
+            return Err(RuntimeError::WorkerNotFound {
+                worker_id: request.worker_id,
+            });
+        }
+        if worker.status != WorkerStatus::Stopped {
+            return Err(RuntimeError::InvalidRequest(
+                "Worker retention requires a stopped Worker".to_string(),
+            ));
+        }
+        if worker.run_generation != request.expected_run_generation {
+            return Err(RuntimeError::InvalidRequest(format!(
+                "Worker retention plan expected generation {}, current generation is {}",
+                request.expected_run_generation, worker.run_generation
+            )));
+        }
+        let result = provider.execute(request)?;
+        state.workers.remove(&request.worker_id);
+        state.persist_runtime_snapshot()?;
+        Ok(result)
+    }
+
     fn lock(&self) -> Result<MutexGuard<'_, RuntimeState>, RuntimeError> {
         self.inner.lock().map_err(|_| RuntimeError::StatePoisoned)
     }
@@ -1627,6 +1823,9 @@ struct SubscriptionSink {
 struct RuntimeState {
     display_name: Option<String>,
     backend: RuntimeBackendKind,
+    /// Backend-bound stable identity used for cross-boundary retention evidence.
+    /// It is configured once by the Runtime host and never model input.
+    runtime_identity: Option<String>,
     #[cfg_attr(not(feature = "fs-store"), allow(dead_code))]
     persistence: RuntimePersistence,
     status: RuntimeStatus,
@@ -1655,6 +1854,7 @@ impl RuntimeState {
         Self {
             display_name,
             backend: RuntimeBackendKind::Memory,
+            runtime_identity: None,
             persistence: RuntimePersistence::Memory,
             status: RuntimeStatus::Running,
             execution_backend: None,
@@ -1683,6 +1883,7 @@ impl RuntimeState {
         Self {
             display_name,
             backend: RuntimeBackendKind::FsStore,
+            runtime_identity: None,
             persistence: RuntimePersistence::Fs(store),
             status: RuntimeStatus::Running,
             execution_backend: None,
@@ -1723,6 +1924,7 @@ impl RuntimeState {
                     status: WorkerStatus::Stopped,
                     workspace_id: worker.workspace_id,
                     request: worker.request,
+                    run_generation: worker.run_generation,
                     working_directory: worker.working_directory,
                     execution_handle: None,
                 },
@@ -1732,6 +1934,7 @@ impl RuntimeState {
         Ok(Self {
             display_name: persisted.display_name,
             backend: RuntimeBackendKind::FsStore,
+            runtime_identity: None,
             persistence: RuntimePersistence::Fs(store),
             status: persisted.status,
             execution_backend: None,
@@ -2281,6 +2484,7 @@ struct WorkerRecord {
     status: WorkerStatus,
     workspace_id: Option<String>,
     request: CreateWorkerRequest,
+    run_generation: u64,
     working_directory: Option<CatalogWorkingDirectoryStatus>,
     execution_handle: Option<WorkerExecutionHandle>,
 }
@@ -2324,6 +2528,7 @@ impl WorkerRecord {
             worker_ref: self.worker_ref.clone(),
             worker_id: self.worker_id.clone(),
             request: self.request.clone(),
+            run_generation: self.run_generation,
             workspace_id: self.workspace_id.clone(),
             working_directory: self.working_directory.clone(),
         }
@@ -2502,6 +2707,18 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
+    fn runtime_identity_binding_is_immutable_and_host_owned() {
+        let runtime = Runtime::new_memory();
+        runtime.bind_runtime_identity("runtime-a").unwrap();
+        runtime.bind_runtime_identity("runtime-a").unwrap();
+        assert!(runtime.bind_runtime_identity("runtime-b").is_err());
+        assert_eq!(
+            runtime.lock().unwrap().runtime_identity.as_deref(),
+            Some("runtime-a")
+        );
+    }
+
+    #[test]
     fn typed_segments_allow_empty_flat_content() {
         let input = WorkerInput {
             kind: WorkerInputKind::User,
@@ -2585,7 +2802,6 @@ mod tests {
         request.workspace_api = Some(WorkspaceApiRef {
             workspace_id: workspace_id.to_string(),
             base_url: format!("https://workspace.example/{workspace_id}"),
-            runtime_id: None,
         });
         request
     }
@@ -2627,6 +2843,7 @@ mod tests {
         dispatch_result: Mutex<Option<WorkerExecutionResult>>,
         restore_result: Mutex<Option<WorkerExecutionSpawnResult>>,
         restore_count: Mutex<u64>,
+        run_generations: Mutex<Vec<u64>>,
         contexts: Mutex<BTreeMap<WorkerId, WorkerExecutionContext>>,
         dispatched_inputs: Mutex<Vec<WorkerInput>>,
         preserve_commit_ack_submission_id: AtomicBool,
@@ -2670,6 +2887,10 @@ mod tests {
         }
 
         fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
+            self.run_generations
+                .lock()
+                .unwrap()
+                .push(request.run_generation);
             self.contexts
                 .lock()
                 .unwrap()
@@ -2689,6 +2910,10 @@ mod tests {
             request: WorkerExecutionRestoreRequest,
         ) -> WorkerExecutionSpawnResult {
             *self.restore_count.lock().unwrap() += 1;
+            self.run_generations
+                .lock()
+                .unwrap()
+                .push(request.run_generation);
             if let Some(result) = self.restore_result.lock().unwrap().clone() {
                 return result;
             }
@@ -3025,7 +3250,6 @@ mod tests {
         let replacement = WorkspaceApiRef {
             workspace_id: "workspace-a".to_string(),
             base_url: "https://workspace.example/workspace-a/".to_string(),
-            runtime_id: Some("runtime-a".to_string()),
         };
 
         runtime
@@ -3551,6 +3775,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(*backend.restore_count.lock().unwrap(), 1);
+        assert_eq!(*backend.run_generations.lock().unwrap(), vec![1, 2]);
         assert_eq!(
             runtime.worker_detail(&detail.worker_ref).unwrap().status,
             WorkerStatus::Idle

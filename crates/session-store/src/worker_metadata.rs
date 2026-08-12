@@ -319,6 +319,115 @@ pub trait WorkerMetadataStore: Send + Sync {
     }
 }
 
+/// Metadata store for one canonical Worker aggregate.
+///
+/// The Worker key is fixed by Runtime authority and metadata lives directly at
+/// `<worker-aggregate>/metadata.json`. This store cannot address another
+/// Worker's global metadata root.
+#[derive(Clone)]
+pub struct WorkerAggregateStore {
+    root: PathBuf,
+    worker_name: String,
+}
+
+impl WorkerAggregateStore {
+    pub fn new(
+        root: impl Into<PathBuf>,
+        worker_name: impl Into<String>,
+    ) -> Result<Self, WorkerStoreError> {
+        let root = root.into();
+        let worker_name = worker_name.into();
+        validate_worker_name(&worker_name)?;
+        fs::create_dir_all(&root)?;
+        Ok(Self { root, worker_name })
+    }
+
+    fn validate_name(&self, worker_name: &str) -> Result<(), WorkerStoreError> {
+        validate_worker_name(worker_name)?;
+        if worker_name == self.worker_name {
+            Ok(())
+        } else {
+            Err(WorkerStoreError::InvalidWorkerName(format!(
+                "aggregate owns `{}`; requested `{worker_name}`",
+                self.worker_name
+            )))
+        }
+    }
+
+    fn metadata_path(&self) -> PathBuf {
+        self.root.join("metadata.json")
+    }
+}
+
+impl WorkerMetadataStore for WorkerAggregateStore {
+    fn write(&self, metadata: &WorkerMetadata) -> Result<(), WorkerStoreError> {
+        self.validate_name(&metadata.worker_name)?;
+        let mut content = serde_json::to_vec_pretty(metadata)?;
+        content.push(b'\n');
+        let path = self.metadata_path();
+        let temp = self.root.join(format!(
+            ".metadata.json.tmp-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let result = (|| -> Result<(), WorkerStoreError> {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            file.write_all(&content)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temp, &path)?;
+            std::fs::File::open(&self.root)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(temp);
+        }
+        result
+    }
+
+    fn read_by_name(&self, worker_name: &str) -> Result<Option<WorkerMetadata>, WorkerStoreError> {
+        self.validate_name(worker_name)?;
+        let content = match fs::read(self.metadata_path()) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let metadata: WorkerMetadata = serde_json::from_slice(&content)?;
+        if metadata.worker_name != self.worker_name {
+            return Err(WorkerStoreError::InvalidWorkerName(format!(
+                "aggregate identity mismatch: expected `{}`, found `{}`",
+                self.worker_name, metadata.worker_name
+            )));
+        }
+        Ok(Some(metadata))
+    }
+
+    fn list_names(&self) -> Result<Vec<String>, WorkerStoreError> {
+        Ok(if self.metadata_path().is_file() {
+            vec![self.worker_name.clone()]
+        } else {
+            Vec::new()
+        })
+    }
+
+    fn root_dir(&self) -> Option<PathBuf> {
+        Some(self.root.clone())
+    }
+
+    fn delete_by_name(&self, worker_name: &str) -> Result<(), WorkerStoreError> {
+        self.validate_name(worker_name)?;
+        match fs::remove_file(self.metadata_path()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
 /// Filesystem-backed Worker metadata store.
 #[derive(Clone)]
 pub struct FsWorkerStore {
@@ -553,6 +662,27 @@ mod tests {
         let restored: WorkerMetadata = serde_json::from_str(&json).unwrap();
 
         assert_eq!(restored, metadata);
+    }
+
+    #[test]
+    fn worker_aggregate_store_writes_one_fixed_metadata_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkerAggregateStore::new(tmp.path(), "worker-runtime-7").unwrap();
+        let metadata = WorkerMetadata::new("worker-runtime-7", None);
+        store.write(&metadata).unwrap();
+
+        assert!(tmp.path().join("metadata.json").is_file());
+        assert_eq!(store.list_names().unwrap(), vec!["worker-runtime-7"]);
+        assert_eq!(
+            store
+                .read_by_name("worker-runtime-7")
+                .unwrap()
+                .unwrap()
+                .worker_name,
+            "worker-runtime-7"
+        );
+        let error = store.read_by_name("worker-runtime-8").unwrap_err();
+        assert!(error.to_string().contains("aggregate owns"));
     }
 
     #[test]

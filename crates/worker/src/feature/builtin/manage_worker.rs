@@ -77,6 +77,11 @@ impl FeatureModule for ManageWorkerFeature {
                     self.client.clone(),
                     workspace_id.clone(),
                 ),
+                WorkerOperation::Remove => definition::<WorkerRemoveInput>(
+                    operation,
+                    self.client.clone(),
+                    workspace_id.clone(),
+                ),
             };
             context
                 .tools()
@@ -149,6 +154,15 @@ struct WorkerStopInput {
     reason: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WorkerRemoveInput {
+    runtime_id: String,
+    worker_id: String,
+    expected_worker_revision: String,
+    reason: String,
+}
+
 struct WorkspaceWorkerTool {
     operation: WorkerOperation,
     client: Arc<dyn WorkspaceClient>,
@@ -161,10 +175,17 @@ enum WorkerOperation {
     Spawn,
     Stop,
     Restore,
+    Remove,
 }
 
 impl WorkerOperation {
-    const ALL: [Self; 4] = [Self::List, Self::Spawn, Self::Stop, Self::Restore];
+    const ALL: [Self; 5] = [
+        Self::List,
+        Self::Spawn,
+        Self::Stop,
+        Self::Restore,
+        Self::Remove,
+    ];
 
     fn tool_name(self) -> &'static str {
         match self {
@@ -172,6 +193,7 @@ impl WorkerOperation {
             Self::Spawn => "WorkerSpawn",
             Self::Stop => "WorkerStop",
             Self::Restore => "WorkerRestore",
+            Self::Remove => "WorkerRemove",
         }
     }
 
@@ -187,6 +209,9 @@ impl WorkerOperation {
             Self::Restore => {
                 "Restore a stopped Backend/Runtime Worker session in the current Workspace."
             }
+            Self::Remove => {
+                "Remove an eligible stopped, unassigned, non-internal Worker. Supply the current Worker revision and a bounded reason; Backend validation and retention are authoritative."
+            }
         }
     }
 }
@@ -198,82 +223,107 @@ impl Tool for WorkspaceWorkerTool {
         input_json: &str,
         ctx: ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
-        let request = match self.operation {
-            WorkerOperation::List => {
-                parse::<WorkerListInput>(input_json, "WorkerList")?;
-                WorkspaceRequest::get(format!("/api/w/{}/workers", self.workspace_id))
+        let response = match self.operation {
+            WorkerOperation::Remove => {
+                let input = parse::<WorkerRemoveInput>(input_json, "WorkerRemove")?;
+                let runtime_id = authority_id(&input.runtime_id, "runtime_id")?;
+                let worker_id = authority_id(&input.worker_id, "worker_id")?;
+                let expected_worker_revision =
+                    non_empty(input.expected_worker_revision, "expected_worker_revision")?;
+                let reason = non_empty(input.reason, "reason")?;
+                if reason.len() > 512 {
+                    return Err(ToolError::ExecutionFailed(
+                        "reason must contain at most 512 bytes".to_string(),
+                    ));
+                }
+                self.client
+                    .execute_worker_remove(
+                        &runtime_id,
+                        &worker_id,
+                        &expected_worker_revision,
+                        &reason,
+                    )
+                    .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?
             }
-            WorkerOperation::Spawn => {
-                let input = parse::<WorkerSpawnInput>(input_json, "WorkerSpawn")?;
-                let ticket_assignment = input
-                    .ticket_id
-                    .map(|ticket_id| {
-                        let ticket_id = authority_id(&ticket_id, "ticket_id")?;
-                        let call_id = non_empty(ctx.call_id.clone(), "tool call_id")?;
-                        Ok::<_, ToolError>(WorkerSpawnTicketAssignmentRequest {
-                            operation_id: format!("worker-spawn:{ticket_id}:{call_id}"),
-                            ticket_id,
-                        })
-                    })
-                    .transpose()?;
-                let request = WorkerSpawnRequest {
-                    runtime_id: authority_id(&input.runtime_id, "runtime_id")?,
-                    display_name: input
-                        .display_name
-                        .filter(|value| !value.trim().is_empty())
-                        .unwrap_or_else(|| "Workspace Worker".to_string()),
-                    profile: non_empty(input.profile, "profile")?,
-                    ticket_assignment,
-                    initial_submit: input.initial_submit,
-                    working_directory: WorkerWorkingDirectorySelection {
-                        working_directory_id: authority_id(
-                            &input.working_directory_id,
-                            "working_directory_id",
-                        )?,
-                        relative_cwd: input
-                            .relative_cwd
-                            .map(|value| validate_relative_cwd(&value))
-                            .transpose()?,
-                    },
+            operation => {
+                let request = match operation {
+                    WorkerOperation::List => {
+                        parse::<WorkerListInput>(input_json, "WorkerList")?;
+                        WorkspaceRequest::get(format!("/api/w/{}/workers", self.workspace_id))
+                    }
+                    WorkerOperation::Spawn => {
+                        let input = parse::<WorkerSpawnInput>(input_json, "WorkerSpawn")?;
+                        let ticket_assignment = input
+                            .ticket_id
+                            .map(|ticket_id| {
+                                let ticket_id = authority_id(&ticket_id, "ticket_id")?;
+                                let call_id = non_empty(ctx.call_id.clone(), "tool call_id")?;
+                                Ok::<_, ToolError>(WorkerSpawnTicketAssignmentRequest {
+                                    operation_id: format!("worker-spawn:{ticket_id}:{call_id}"),
+                                    ticket_id,
+                                })
+                            })
+                            .transpose()?;
+                        let request = WorkerSpawnRequest {
+                            runtime_id: authority_id(&input.runtime_id, "runtime_id")?,
+                            display_name: input
+                                .display_name
+                                .filter(|value| !value.trim().is_empty())
+                                .unwrap_or_else(|| "Workspace Worker".to_string()),
+                            profile: non_empty(input.profile, "profile")?,
+                            ticket_assignment,
+                            initial_submit: input.initial_submit,
+                            working_directory: WorkerWorkingDirectorySelection {
+                                working_directory_id: authority_id(
+                                    &input.working_directory_id,
+                                    "working_directory_id",
+                                )?,
+                                relative_cwd: input
+                                    .relative_cwd
+                                    .map(|value| validate_relative_cwd(&value))
+                                    .transpose()?,
+                            },
+                        };
+                        WorkspaceRequest::json(
+                            WorkspaceRequestMethod::Post,
+                            format!("/api/w/{}/workers", self.workspace_id),
+                            serde_json::to_string(&request)
+                                .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?,
+                        )
+                    }
+                    WorkerOperation::Stop => {
+                        let input = parse::<WorkerStopInput>(input_json, "WorkerStop")?;
+                        let runtime_id = authority_id(&input.runtime_id, "runtime_id")?;
+                        let worker_id = authority_id(&input.worker_id, "worker_id")?;
+                        WorkspaceRequest::json(
+                            WorkspaceRequestMethod::Post,
+                            format!(
+                                "/api/w/{}/runtimes/{runtime_id}/workers/{worker_id}/stop",
+                                self.workspace_id
+                            ),
+                            serde_json::json!({ "reason": input.reason }).to_string(),
+                        )
+                    }
+                    WorkerOperation::Restore => {
+                        let input = parse::<WorkerTargetInput>(input_json, "WorkerRestore")?;
+                        let runtime_id = authority_id(&input.runtime_id, "runtime_id")?;
+                        let worker_id = authority_id(&input.worker_id, "worker_id")?;
+                        WorkspaceRequest::json(
+                            WorkspaceRequestMethod::Post,
+                            format!(
+                                "/api/w/{}/runtimes/{runtime_id}/workers/{worker_id}/restore",
+                                self.workspace_id
+                            ),
+                            "{}",
+                        )
+                    }
+                    WorkerOperation::Remove => unreachable!("handled above"),
                 };
-                WorkspaceRequest::json(
-                    WorkspaceRequestMethod::Post,
-                    format!("/api/w/{}/workers", self.workspace_id),
-                    serde_json::to_string(&request)
-                        .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?,
-                )
-            }
-            WorkerOperation::Stop => {
-                let input = parse::<WorkerStopInput>(input_json, "WorkerStop")?;
-                let runtime_id = authority_id(&input.runtime_id, "runtime_id")?;
-                let worker_id = authority_id(&input.worker_id, "worker_id")?;
-                WorkspaceRequest::json(
-                    WorkspaceRequestMethod::Post,
-                    format!(
-                        "/api/w/{}/runtimes/{runtime_id}/workers/{worker_id}/stop",
-                        self.workspace_id
-                    ),
-                    serde_json::json!({ "reason": input.reason }).to_string(),
-                )
-            }
-            WorkerOperation::Restore => {
-                let input = parse::<WorkerTargetInput>(input_json, "WorkerRestore")?;
-                let runtime_id = authority_id(&input.runtime_id, "runtime_id")?;
-                let worker_id = authority_id(&input.worker_id, "worker_id")?;
-                WorkspaceRequest::json(
-                    WorkspaceRequestMethod::Post,
-                    format!(
-                        "/api/w/{}/runtimes/{runtime_id}/workers/{worker_id}/restore",
-                        self.workspace_id
-                    ),
-                    "{}",
-                )
+                self.client
+                    .execute(request)
+                    .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?
             }
         };
-        let response = self
-            .client
-            .execute(request)
-            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
         if !response.is_success() {
             return Err(ToolError::ExecutionFailed(format!(
                 "Workspace Worker operation returned HTTP {}: {}",
@@ -356,6 +406,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct RecordingWorkspaceClient {
         requests: Mutex<Vec<WorkspaceRequest>>,
+        removals: Mutex<Vec<(String, String, String, String)>>,
     }
 
     impl WorkspaceClient for RecordingWorkspaceClient {
@@ -379,6 +430,25 @@ mod tests {
             Ok(WorkspaceResponse {
                 status: 200,
                 body: "{}".to_string(),
+            })
+        }
+
+        fn execute_worker_remove(
+            &self,
+            target_runtime_id: &str,
+            target_worker_id: &str,
+            expected_worker_revision: &str,
+            reason: &str,
+        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            self.removals.lock().unwrap().push((
+                target_runtime_id.to_string(),
+                target_worker_id.to_string(),
+                expected_worker_revision.to_string(),
+                reason.to_string(),
+            ));
+            Ok(WorkspaceResponse {
+                status: 200,
+                body: r#"{"removed":true}"#.to_string(),
             })
         }
     }
@@ -433,7 +503,13 @@ mod tests {
     fn worker_tool_family_is_distinct_from_sub_worker_tools() {
         assert_eq!(
             WorkerOperation::ALL.map(WorkerOperation::tool_name),
-            ["WorkerList", "WorkerSpawn", "WorkerStop", "WorkerRestore"]
+            [
+                "WorkerList",
+                "WorkerSpawn",
+                "WorkerStop",
+                "WorkerRestore",
+                "WorkerRemove",
+            ]
         );
     }
 
@@ -479,6 +555,92 @@ mod tests {
         );
         assert_eq!(value["initial_submit"][1]["kind"], "text");
         assert!(value.get("initial_text").is_none());
+    }
+
+    #[tokio::test]
+    async fn worker_remove_forwards_only_target_revision_and_bounded_reason() {
+        let client = Arc::new(RecordingWorkspaceClient::default());
+        let tool = WorkspaceWorkerTool {
+            operation: WorkerOperation::Remove,
+            client: client.clone(),
+            workspace_id: "workspace%2Ftest".to_string(),
+        };
+        tool.execute(
+            &serde_json::json!({
+                "runtime_id": "runtime-1",
+                "worker_id": "worker-7",
+                "expected_worker_revision": "2026-08-11T20:00:00Z",
+                "reason": "  retire completed Worker  "
+            })
+            .to_string(),
+            ToolExecutionContext::new("call-remove", "batch-remove", 0),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            client.removals.lock().unwrap().as_slice(),
+            [(
+                "runtime-1".to_string(),
+                "worker-7".to_string(),
+                "2026-08-11T20:00:00Z".to_string(),
+                "retire completed Worker".to_string(),
+            )]
+        );
+
+        let schema = serde_json::to_value(schemars::schema_for!(WorkerRemoveInput))
+            .unwrap()
+            .to_string();
+        for field in [
+            "runtime_id",
+            "worker_id",
+            "expected_worker_revision",
+            "reason",
+        ] {
+            assert!(schema.contains(field));
+        }
+        for forbidden in ["proof", "actor", "workspace_id", "policy", "plan", "stage"] {
+            assert!(!schema.contains(forbidden), "schema leaked {forbidden}");
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_remove_rejects_empty_oversized_and_unknown_authority_input() {
+        let client = Arc::new(RecordingWorkspaceClient::default());
+        let tool = WorkspaceWorkerTool {
+            operation: WorkerOperation::Remove,
+            client: client.clone(),
+            workspace_id: "workspace%2Ftest".to_string(),
+        };
+        for reason in ["   ".to_string(), "x".repeat(513)] {
+            let _error = tool
+                .execute(
+                    &serde_json::json!({
+                        "runtime_id": "runtime-1",
+                        "worker_id": "worker-7",
+                        "expected_worker_revision": "revision-1",
+                        "reason": reason,
+                    })
+                    .to_string(),
+                    ToolExecutionContext::new("call-invalid", "batch-remove", 0),
+                )
+                .await
+                .unwrap_err();
+        }
+        let _error = tool
+            .execute(
+                &serde_json::json!({
+                    "runtime_id": "runtime-1",
+                    "worker_id": "worker-7",
+                    "expected_worker_revision": "revision-1",
+                    "reason": "retire",
+                    "source_proof": "caller-controlled"
+                })
+                .to_string(),
+                ToolExecutionContext::new("call-spoof", "batch-remove", 0),
+            )
+            .await
+            .unwrap_err();
+        assert!(client.removals.lock().unwrap().is_empty());
     }
 
     #[test]

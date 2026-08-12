@@ -5,7 +5,7 @@
 
     states = {
         implement = {
-            instructions = "Before editing, inspect the assigned Workdir's Git state. A newly delegated Git Workdir normally starts at a detached HEAD. If HEAD is detached, create and switch to a local branch named `work/<ticket-id>-<slug>`, using the canonical Ticket id and a short lowercase kebab-case slug derived from the Ticket title or implementation scope. If the Workdir is already on a suitable work branch after restore, keep it. Never delete, reset, or overwrite an existing branch to resolve a name collision; choose a concise collision-free suffix and report the actual branch. For this assigned Ticket Workdir, you are explicitly authorized to create or switch the local work branch and to use `git add` and `git commit`. Commit coherent, validated implementation slices while working; do not push, merge, force-rewrite a submitted revision, delete branches, or discard pre-existing changes. Implement the requested Ticket scope, run the narrow and dependent validation required by the changed contracts, and record the concrete repository/test evidence. Before requesting review, commit all intended changes and confirm that the Workdir is clean.";
+            instructions = "Before editing, inspect the assigned Workdir's Git state. A newly delegated Git Workdir normally starts at a detached HEAD. If HEAD is detached, create and switch to a local branch named `work/<ticket-id>-<slug>`, using the canonical Ticket id and a short lowercase kebab-case slug derived from the Ticket title or implementation scope. If the Workdir is already on a suitable work branch after restore, keep it. Never delete, reset, or overwrite an existing branch to resolve a name collision; choose a concise collision-free suffix and report the actual branch. For this assigned Ticket Workdir, you are explicitly authorized to create or switch the local work branch and to use `git add` and `git commit`. Commit coherent, validated implementation slices while working; do not push, merge, force-rewrite a submitted revision, delete branches, or discard pre-existing changes. Implement the requested Ticket scope, run the narrow and dependent validation required by the changed contracts, and record concrete evidence. Open or update the Ticket Merge Request with immutable repository revision evidence. Before requesting independent review, commit all intended changes, confirm that the Workdir is clean, and make the current MR revision authoritative. A Flow transition is never Ticket completion authority.";
             transitions = {
                 review = {
                     target = "review";
@@ -15,11 +15,11 @@
         };
 
         review = {
-            instructions = "Spawn one independent Reviewer SubWorker with bounded Ticket, repository, diff, and validation context. Read its committed review through worker observation. Do not review your own implementation or treat a prose status as approval. After the Reviewer returns a typed approval or concrete requested changes, request a Flow transition.";
+            instructions = "Spawn one actual direct-child SubWorker with profile builtin:reviewer, read-only scope, and a structured review handoff bound to the current immutable Merge Request revision. The child must commit MergeRequestReviewSubmit; prose output and Worker observation are not approval authority. After the structured current-revision result exists, request a Flow transition.";
             transitions = {
                 approved = {
-                    target = "done";
-                    condition = "The latest independent Reviewer attempt for the current implementation completed and approved it, with no later unresolved request_changes finding.";
+                    target = "complete";
+                    condition = "The authoritative Merge Request current revision has a structured approve result from its registered direct-child builtin:reviewer attempt, with no later unresolved request_changes finding. The Flow transition itself does not complete the Ticket.";
                 };
                 changes_requested = {
                     target = "fix";
@@ -38,8 +38,18 @@
             };
         };
 
+        complete = {
+            instructions = "Call MergeRequestComplete with a fresh operation_id and the approved current revision. The Server must revalidate current assignment, immutable revision, registered Reviewer attempt, and Ticket inprogress CAS. Only after the authoritative operation returns Ticket state done, request a Flow transition.";
+            transitions = {
+                completed = {
+                    target = "done";
+                    condition = "MergeRequestComplete durably returned done for this exact operation_id and current approved revision. A Flow state or prose report alone is never sufficient.";
+                };
+            };
+        };
+
         done = {
-            instructions = "The Coder implementation and independent review loop is complete.";
+            instructions = "The guarded Merge Request completion operation committed Ticket state done. Flow terminal state only reflects that durable authority.";
             terminal = true;
         };
     };

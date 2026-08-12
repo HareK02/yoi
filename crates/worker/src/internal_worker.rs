@@ -259,6 +259,10 @@ pub(crate) struct InternalWorkerSessionHandle {
 }
 
 impl InternalWorkerSessionHandle {
+    pub(crate) fn session_id_string(&self) -> String {
+        self.session_id.to_string()
+    }
+
     pub(crate) fn status(&self) -> InternalWorkerSessionStatus {
         InternalWorkerSessionStatus::decode(self.status.load(std::sync::atomic::Ordering::Acquire))
     }

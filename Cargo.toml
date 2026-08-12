@@ -23,6 +23,7 @@ members = [
     "crates/tui",
     "crates/memory",
     "crates/ticket",
+    "crates/merge-request",
     "crates/project-record",
     "crates/workspace-server",
     "tests/e2e",
@@ -50,6 +51,7 @@ default-members = [
     "crates/tui",
     "crates/memory",
     "crates/ticket",
+    "crates/merge-request",
     "crates/project-record",
     "crates/workspace-server",
 ]
@@ -67,6 +69,7 @@ manifest = { path = "crates/manifest" }
 mcp = { path = "crates/mcp" }
 lint-common = { path = "crates/lint-common" }
 memory = { path = "crates/memory" }
+merge-request = { path = "crates/merge-request" }
 ticket = { path = "crates/ticket" }
 project-record = { path = "crates/project-record" }
 worker = { path = "crates/worker" }

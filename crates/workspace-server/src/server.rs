@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, Request, State};
@@ -24,8 +24,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ticket::{
     MarkdownText, NewTicketEvent, TicketBackend, TicketBodyReplacement, TicketEventKind,
-    TicketIdOrSlug, TicketItemEdit, TicketReview, TicketReviewResult, TicketStateChange,
-    TicketTargetEdit, TicketWorkflowState,
+    TicketIdOrSlug, TicketItemEdit, TicketStateChange, TicketTargetEdit, TicketWorkflowState,
 };
 use ticket::{
     SqliteTicketBackend, TicketBackendOperation, TicketBackendOperationResult,
@@ -63,15 +62,15 @@ use crate::companion::{
 };
 use crate::config::{BackendRuntimesConfigFile, RemoteRuntimeConfigFile, resolve_remote_runtime};
 use crate::hosts::{
-    ConfigBundleCheckResult, ConfigBundleSyncResult, DiagnosticSeverity, EmbeddedWorkerRuntime,
-    HostSummary, RemoteRuntimeConfig, RemoteWorkerRuntime, RuntimeDiagnostic, RuntimeRegistry,
-    RuntimeRegistryError, RuntimeRegistryUnregisterResult, RuntimeSummary, TicketWorkerRole,
-    WorkerCapabilitySummary, WorkerCompletionsRequest, WorkerCompletionsResult,
-    WorkerImplementationSummary, WorkerInputKind, WorkerInputRequest, WorkerInputResult,
-    WorkerLifecycleRequest, WorkerLifecycleResult, WorkerOperationState, WorkerRestoreResult,
-    WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult,
-    WorkerSpawnWorkingDirectoryRequest, WorkerSummary, WorkerTicketAssignmentRequest,
-    WorkerWorkspaceSummary,
+    ConfigBundleCheckResult, ConfigBundleSyncResult, DiagnosticSeverity, EMBEDDED_RUNTIME_ID,
+    EmbeddedWorkerRuntime, HostSummary, RemoteRuntimeConfig, RemoteWorkerRuntime,
+    RuntimeDiagnostic, RuntimeRegistry, RuntimeRegistryError, RuntimeRegistryUnregisterResult,
+    RuntimeSummary, TicketWorkerRole, WorkerCapabilitySummary, WorkerCompletionsRequest,
+    WorkerCompletionsResult, WorkerImplementationSummary, WorkerInputKind, WorkerInputRequest,
+    WorkerInputResult, WorkerLifecycleRequest, WorkerLifecycleResult, WorkerOperationState,
+    WorkerRestoreResult, WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest,
+    WorkerSpawnResult, WorkerSpawnWorkingDirectoryRequest, WorkerSummary,
+    WorkerTicketAssignmentRequest, WorkerWorkspaceSummary,
 };
 use crate::identity::WorkspaceIdentity;
 use crate::memory_backend::execute_memory_backend_operation_with_authority;
@@ -251,8 +250,8 @@ const ORCHESTRATOR_ATTENTION_PROMPT: &str = include_str!(concat!(
 
 #[derive(Clone)]
 pub struct WorkspaceApi {
-    config: ServerConfig,
-    store: Arc<dyn ControlPlaneStore>,
+    pub(crate) config: ServerConfig,
+    pub(crate) store: Arc<dyn ControlPlaneStore>,
     authority: SqliteWorkspaceAuthority,
     runtime: Arc<RuntimeRegistry>,
     companion: Arc<CompanionConsole>,
@@ -263,13 +262,399 @@ pub struct WorkspaceApi {
     resource_broker: BackendResourceBroker,
     workdir_sessions: Arc<Mutex<HashMap<RuntimeWorkerRef, WorkdirSessionHandle>>>,
     workdir_session_locks: Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<tokio::sync::Mutex<()>>>>>,
+    worker_remove_locks: Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+#[derive(Clone)]
+struct WorkspaceWorkerRemoveExecutor {
+    workspace_id: String,
+    store: Arc<dyn ControlPlaneStore>,
+    runtime: Weak<RuntimeRegistry>,
+    workdir_sessions: Arc<Mutex<HashMap<RuntimeWorkerRef, WorkdirSessionHandle>>>,
+    workdir_session_locks: Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<tokio::sync::Mutex<()>>>>>,
+    worker_remove_locks: Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+impl WorkspaceWorkerRemoveExecutor {
+    fn new(api: &WorkspaceApi) -> Self {
+        Self {
+            workspace_id: api.config.workspace_id.clone(),
+            store: api.store.clone(),
+            runtime: Arc::downgrade(&api.runtime),
+            workdir_sessions: api.workdir_sessions.clone(),
+            workdir_session_locks: api.workdir_session_locks.clone(),
+            worker_remove_locks: api.worker_remove_locks.clone(),
+        }
+    }
+
+    async fn resume_worker_retention(
+        &self,
+        runtime: &RuntimeRegistry,
+        target: &RuntimeWorkerRef,
+        prepared: crate::retention::PreparedWorkerRemoval,
+    ) -> std::result::Result<worker::WorkspaceResponse, String> {
+        let result =
+            match runtime.execute_worker_retention(target, prepared.runtime_request.clone()) {
+                Ok(result) => result,
+                Err(_) => {
+                    return Ok(worker_remove_error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "runtime_retention_failed",
+                        "Runtime retention recovery failed; removal can be retried",
+                    ));
+                }
+            };
+        match self.store.commit_worker_removal(
+            &self.workspace_id,
+            &prepared.plan.operation_id,
+            &prepared.plan.input_fingerprint,
+            &result,
+        ) {
+            Ok(_) => Ok(worker_remove_success_response(target)),
+            Err(error) => Ok(worker_retention_error_response(error)),
+        }
+    }
+
+    async fn execute_async(
+        &self,
+        source: crate::worker_source::VerifiedWorkerMutationSource,
+        target_runtime_id: &str,
+        target_worker_id: &str,
+        expected_worker_revision: &str,
+        reason: &str,
+    ) -> std::result::Result<worker::WorkspaceResponse, String> {
+        let reason = reason.trim();
+        if reason.is_empty() || reason.len() > 512 {
+            return Ok(worker_remove_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_reason",
+                "WorkerRemove reason must be between 1 and 512 bytes",
+            ));
+        }
+        let runtime = self.runtime.upgrade().ok_or_else(|| {
+            "Workspace Runtime registry is unavailable during WorkerRemove".to_string()
+        })?;
+        let source_is_current_orchestrator =
+            runtime.list_workers(1_000).items.into_iter().any(|worker| {
+                worker.worker.runtime_id == source.runtime_id
+                    && worker.worker.worker_id == source.worker_id
+                    && worker.singleton_key.as_deref()
+                        == Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY)
+            });
+        if !source_is_current_orchestrator {
+            return Ok(worker_remove_error_response(
+                StatusCode::FORBIDDEN,
+                "orchestrator_required",
+                "WorkerRemove is restricted to the current Workspace Orchestrator",
+            ));
+        }
+        if source.runtime_id == target_runtime_id && source.worker_id == target_worker_id {
+            return Ok(worker_remove_error_response(
+                StatusCode::CONFLICT,
+                "self_removal_forbidden",
+                "The current Orchestrator cannot remove itself",
+            ));
+        }
+
+        let target = RuntimeWorkerRef {
+            runtime_id: target_runtime_id.to_string(),
+            worker_id: target_worker_id.to_string(),
+        };
+        let remove_lock = {
+            let mut locks = self
+                .worker_remove_locks
+                .lock()
+                .map_err(|_| "WorkerRemove lock registry was poisoned".to_string())?;
+            locks
+                .entry(target.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _remove_guard = remove_lock.lock().await;
+        let workdir_session_lock = {
+            let mut locks = self
+                .workdir_session_locks
+                .lock()
+                .map_err(|_| "Workdir session lock registry was poisoned".to_string())?;
+            locks
+                .entry(target.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _workdir_session_guard = workdir_session_lock.lock().await;
+
+        let prepared = self
+            .store
+            .recover_worker_removal_execution(
+                &self.workspace_id,
+                &target,
+                expected_worker_revision,
+                reason,
+            )
+            .map_err(|_| "Worker removal recovery authority is unavailable".to_string())?;
+        if let Some(prepared) = prepared {
+            if prepared.plan.state == crate::retention::WorkerRemovalPlanState::Succeeded {
+                return Ok(worker_remove_success_response(&target));
+            }
+            let must_close_session =
+                prepared.prior_failure_category.as_deref() == Some("workdir_session_close_failed");
+            let must_release_attachment = must_close_session
+                || prepared.prior_failure_category.as_deref()
+                    == Some("workdir_attachment_release_failed");
+            let prepared =
+                if prepared.plan.state == crate::retention::WorkerRemovalPlanState::Failed {
+                    match self.store.prepare_worker_removal_execution(
+                        &self.workspace_id,
+                        &prepared.plan.plan_id,
+                        &prepared.plan.input_fingerprint,
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(error) => return Ok(worker_retention_error_response(error)),
+                    }
+                } else {
+                    prepared
+                };
+            if must_close_session {
+                let session = {
+                    self.workdir_sessions
+                        .lock()
+                        .map_err(|_| "Workdir session registry was poisoned".to_string())?
+                        .get(&target)
+                        .cloned()
+                };
+                if let Some(session) = session {
+                    if session.close().await.is_err() {
+                        let _ = self.store.fail_worker_removal(
+                            &self.workspace_id,
+                            &prepared.plan.operation_id,
+                            &prepared.plan.input_fingerprint,
+                            "workdir_session_close_failed",
+                        );
+                        return Ok(worker_remove_error_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "attachment_close_failed",
+                            "Worker Workdir session could not be closed; removal can be retried",
+                        ));
+                    }
+                    self.workdir_sessions
+                        .lock()
+                        .map_err(|_| "Workdir session registry was poisoned".to_string())?
+                        .remove(&target);
+                }
+            }
+            if must_release_attachment
+                && self
+                    .store
+                    .detach_worker_workdir(
+                        &self.workspace_id,
+                        &target,
+                        None,
+                        &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                    )
+                    .is_err()
+            {
+                let _ = self.store.fail_worker_removal(
+                    &self.workspace_id,
+                    &prepared.plan.operation_id,
+                    &prepared.plan.input_fingerprint,
+                    "workdir_attachment_release_failed",
+                );
+                return Ok(worker_remove_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "attachment_release_failed",
+                    "Worker Workdir attachment could not be released; removal can be retried",
+                ));
+            }
+            return self
+                .resume_worker_retention(&runtime, &target, prepared)
+                .await;
+        }
+
+        let worker = match runtime.worker(&target) {
+            Ok(worker) => worker,
+            Err(_) => {
+                return Ok(worker_remove_error_response(
+                    StatusCode::NOT_FOUND,
+                    "worker_not_found",
+                    "Worker was not found in this Workspace",
+                ));
+            }
+        };
+        if worker.singleton_key.is_some() {
+            return Ok(worker_remove_error_response(
+                StatusCode::CONFLICT,
+                "internal_worker_forbidden",
+                "Internal service Workers cannot be removed with WorkerRemove",
+            ));
+        }
+        if !worker.state.eq_ignore_ascii_case("stopped") {
+            return Ok(worker_remove_error_response(
+                StatusCode::CONFLICT,
+                "worker_not_stopped",
+                "Worker must be stopped before removal",
+            ));
+        }
+
+        let inventory = match runtime.worker_retention_inventory(&target) {
+            Ok(inventory) => inventory,
+            Err(_) => {
+                return Ok(worker_remove_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "retention_inventory_unavailable",
+                    "Retention inventory could not be loaded; removal can be retried",
+                ));
+            }
+        };
+        let request = crate::retention::WorkerRemovalPlanRequest {
+            workspace_id: self.workspace_id.clone(),
+            worker: target.clone(),
+            expected_worker_revision: expected_worker_revision.to_string(),
+            reason: reason.to_string(),
+        };
+        let plan = match self.store.plan_worker_removal(&request, &inventory) {
+            Ok(plan) => plan,
+            Err(error) => return Ok(worker_retention_error_response(error)),
+        };
+        let prepared = match self.store.prepare_worker_removal_execution(
+            &self.workspace_id,
+            &plan.plan_id,
+            &plan.input_fingerprint,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => return Ok(worker_retention_error_response(error)),
+        };
+
+        let session = self
+            .workdir_sessions
+            .lock()
+            .map_err(|_| "Workdir session registry was poisoned".to_string())?
+            .get(&target)
+            .cloned();
+        if let Some(session) = session {
+            if session.close().await.is_err() {
+                let _ = self.store.fail_worker_removal(
+                    &self.workspace_id,
+                    &plan.operation_id,
+                    &plan.input_fingerprint,
+                    "workdir_session_close_failed",
+                );
+                return Ok(worker_remove_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "attachment_close_failed",
+                    "Worker Workdir session could not be closed; removal can be retried",
+                ));
+            }
+            self.workdir_sessions
+                .lock()
+                .map_err(|_| "Workdir session registry was poisoned".to_string())?
+                .remove(&target);
+        }
+
+        if let Err(_) = self.store.detach_worker_workdir(
+            &self.workspace_id,
+            &target,
+            None,
+            &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        ) {
+            let _ = self.store.fail_worker_removal(
+                &self.workspace_id,
+                &plan.operation_id,
+                &plan.input_fingerprint,
+                "workdir_attachment_release_failed",
+            );
+            return Ok(worker_remove_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "attachment_release_failed",
+                "Worker Workdir attachment could not be released; removal can be retried",
+            ));
+        }
+
+        let retention_result =
+            match runtime.execute_worker_retention(&target, prepared.runtime_request.clone()) {
+                Ok(result) => result,
+                Err(_) => {
+                    let _ = self.store.fail_worker_removal(
+                        &self.workspace_id,
+                        &plan.operation_id,
+                        &plan.input_fingerprint,
+                        "runtime_retention_failed",
+                    );
+                    return Ok(worker_remove_error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "runtime_retention_failed",
+                        "Runtime retention execution failed; removal can be retried",
+                    ));
+                }
+            };
+        match self.store.commit_worker_removal(
+            &self.workspace_id,
+            &plan.operation_id,
+            &plan.input_fingerprint,
+            &retention_result,
+        ) {
+            Ok(_) => {}
+            Err(error) => {
+                let _ = self.store.fail_worker_removal(
+                    &self.workspace_id,
+                    &plan.operation_id,
+                    &plan.input_fingerprint,
+                    "metadata_commit_failed",
+                );
+                return Ok(worker_retention_error_response(error));
+            }
+        };
+        Ok(worker_remove_success_response(&target))
+    }
+}
+
+impl crate::worker_source::VerifiedWorkerRemoveExecutor for WorkspaceWorkerRemoveExecutor {
+    fn execute(
+        &self,
+        source: crate::worker_source::VerifiedWorkerMutationSource,
+        target_runtime_id: &str,
+        target_worker_id: &str,
+        expected_worker_revision: &str,
+        reason: &str,
+    ) -> std::result::Result<worker::WorkspaceResponse, String> {
+        let executor = self.clone();
+        let target_runtime_id = target_runtime_id.to_string();
+        let target_worker_id = target_worker_id.to_string();
+        let expected_worker_revision = expected_worker_revision.to_string();
+        let reason = reason.to_string();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?
+                .block_on(executor.execute_async(
+                    source,
+                    &target_runtime_id,
+                    &target_worker_id,
+                    &expected_worker_revision,
+                    &reason,
+                ))
+        })
+        .join()
+        .map_err(|_| "embedded WorkerRemove executor thread panicked".to_string())?
+    }
 }
 
 impl WorkspaceApi {
     pub async fn new(config: ServerConfig, store: Arc<dyn ControlPlaneStore>) -> Result<Self> {
         let resource_broker = BackendResourceBroker::default();
+        let worker_remove_dispatcher = Arc::new(
+            crate::worker_source::EmbeddedServerWorkerMutationDispatcher::new(
+                config.clone(),
+                store.clone(),
+            ),
+        );
         let execution_backend = WorkerRuntimeExecutionBackend::new(
             ProfileRuntimeWorkerFactory::new(config.workspace_root.clone())
+                .with_embedded_worker_mutation_dispatcher(
+                    EMBEDDED_RUNTIME_ID,
+                    worker_remove_dispatcher.clone(),
+                )
+                .with_runtime_store_dir(config.embedded_runtime_store_root.clone())
                 .with_resource_client(Arc::new(resource_broker.clone())),
         )
         .map_err(|err| {
@@ -282,6 +667,7 @@ impl WorkspaceApi {
             store,
             Arc::new(execution_backend),
             resource_broker,
+            Some(worker_remove_dispatcher),
         )
         .await
     }
@@ -297,6 +683,7 @@ impl WorkspaceApi {
             store,
             execution_backend,
             BackendResourceBroker::default(),
+            None,
         )
         .await
     }
@@ -306,6 +693,9 @@ impl WorkspaceApi {
         store: Arc<dyn ControlPlaneStore>,
         execution_backend: Arc<dyn worker_runtime::execution::WorkerExecutionBackend>,
         resource_broker: BackendResourceBroker,
+        worker_remove_dispatcher: Option<
+            Arc<crate::worker_source::EmbeddedServerWorkerMutationDispatcher>,
+        >,
     ) -> Result<Self> {
         store
             .upsert_workspace(&WorkspaceRecord {
@@ -319,6 +709,23 @@ impl WorkspaceApi {
             .await?;
         import_configured_repositories(store.as_ref(), &config)?;
         config.repositories = load_configured_repositories_from_store(store.as_ref(), &config)?;
+        let default_embedded_root =
+            ServerConfig::default_embedded_runtime_store_root(&config.workspace_id);
+        if config.embedded_runtime_store_root == default_embedded_root
+            && let (Some(legacy_sessions), Some(data_dir)) =
+                (manifest::paths::sessions_dir(), manifest::paths::data_dir())
+        {
+            worker_runtime::fs_store::FsRuntimeStore::migrate_legacy_worker_aggregates(
+                &config.embedded_runtime_store_root,
+                legacy_sessions,
+                data_dir.join("workers"),
+            )
+            .map_err(|error| {
+                crate::Error::Store(format!(
+                    "failed to migrate embedded Runtime Worker aggregates: {error}"
+                ))
+            })?;
+        }
         let embedded_runtime = EmbeddedWorkerRuntime::new_fs_store_with_execution_backend(
             config.workspace_id.clone(),
             config.embedded_runtime_store_root.clone(),
@@ -350,7 +757,7 @@ impl WorkspaceApi {
         let runtime = Arc::new(runtime);
         let companion = Arc::new(CompanionConsole::disabled());
         let observation_proxy = BackendObservationProxy::new(config.runtime_event_sources.clone());
-        Ok(Self {
+        let api = Self {
             authority: SqliteWorkspaceAuthority::new(
                 config.database_path.clone(),
                 config.workspace_id.clone(),
@@ -366,7 +773,14 @@ impl WorkspaceApi {
             resource_broker,
             workdir_sessions: Arc::new(Mutex::new(HashMap::new())),
             workdir_session_locks: Arc::new(Mutex::new(HashMap::new())),
-        })
+            worker_remove_locks: Arc::new(Mutex::new(HashMap::new())),
+        };
+        if let Some(dispatcher) = worker_remove_dispatcher {
+            dispatcher
+                .install_executor(Arc::new(WorkspaceWorkerRemoveExecutor::new(&api)))
+                .map_err(|message| Error::Config(message.to_string()))?;
+        }
+        Ok(api)
     }
 
     pub fn workspace_id(&self) -> &str {
@@ -377,7 +791,7 @@ impl WorkspaceApi {
         &self.runtime_subscription_broker
     }
 
-    fn workspace_api_ref(&self, runtime_id: &str) -> WorkspaceApiRef {
+    fn workspace_api_ref(&self, _runtime_id: &str) -> WorkspaceApiRef {
         WorkspaceApiRef {
             workspace_id: self.config.workspace_id.clone(),
             base_url: self
@@ -387,7 +801,6 @@ impl WorkspaceApi {
                 .unwrap_or_else(|| "http://127.0.0.1:8787".to_string())
                 .trim_end_matches('/')
                 .to_string(),
-            runtime_id: Some(runtime_id.to_string()),
         }
     }
 
@@ -396,6 +809,7 @@ impl WorkspaceApi {
         runtime_id: &str,
         mut request: WorkerSpawnRequest,
     ) -> ApiResult<WorkerSpawnResult> {
+        self.validate_worker_spawn_repository_scope(&request)?;
         let workspace_api = self.workspace_api_ref(runtime_id);
         request.resolved_workspace_api = Some(workspace_api.clone());
         let attachment_reservation =
@@ -572,6 +986,64 @@ impl WorkspaceApi {
 
     fn repository_reader(&self) -> RepositoryRegistryReader {
         RepositoryRegistryReader::new(self.config.repositories.clone())
+    }
+
+    fn require_workspace_repository(&self, repository_id: &str) -> ApiResult<RepositoryRecord> {
+        self.store
+            .get_repository(&self.config.workspace_id, repository_id)?
+            .ok_or_else(|| ApiError::from(Error::UnknownRepository(repository_id.to_string())))
+    }
+
+    fn require_configured_workspace_repository(
+        &self,
+        repository_id: &str,
+    ) -> ApiResult<ConfiguredRepository> {
+        self.require_workspace_repository(repository_id)?;
+        self.config
+            .repositories
+            .iter()
+            .find(|repository| repository.id == repository_id)
+            .cloned()
+            .ok_or_else(|| ApiError::from(Error::UnknownRepository(repository_id.to_string())))
+    }
+
+    fn validate_worker_spawn_repository_scope(
+        &self,
+        request: &WorkerSpawnRequest,
+    ) -> ApiResult<()> {
+        let selected_repository_id =
+            if let Some(working_directory) = request.resolved_working_directory_request.as_ref() {
+                let repository_id = working_directory.repository.id.as_str();
+                self.require_workspace_repository(repository_id)?;
+                Some(repository_id.to_string())
+            } else if let Some(claim) = request.resolved_working_directory.as_ref() {
+                let workdir = self
+                    .store
+                    .get_workdir_registry(&self.config.workspace_id, &claim.working_directory_id)?
+                    .ok_or_else(|| {
+                        ApiError::from(Error::Config(format!(
+                            "unknown working directory `{}` in this Workspace",
+                            claim.working_directory_id
+                        )))
+                    })?;
+                self.require_workspace_repository(&workdir.repository_id)?;
+                Some(workdir.repository_id)
+            } else {
+                None
+            };
+
+        if let WorkerSpawnIntent::TicketRole { ticket_id, .. } = &request.intent {
+            let ticket = self.authority.ticket(ticket_id)?;
+            if let Some(repository_id) = ticket.repository_id.as_deref() {
+                self.require_workspace_repository(repository_id)?;
+                if selected_repository_id.as_deref() != Some(repository_id) {
+                    return Err(ApiError::from(Error::Config(format!(
+                        "Ticket `{ticket_id}` targets repository `{repository_id}`, but the Worker launch does not resolve that repository in this Workspace"
+                    ))));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -802,8 +1274,40 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             post(scoped_queue_ticket_record),
         )
         .route(
-            "/api/w/{workspace_id}/tickets/{id}/workflow/review",
-            post(scoped_review_ticket_record),
+            "/api/w/{workspace_id}/tickets/{id}/merge-request",
+            get(scoped_show_merge_request).post(scoped_open_merge_request),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/merge-request/readiness",
+            get(scoped_merge_request_readiness),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/merge-request/revisions",
+            post(scoped_add_merge_request_revision),
+        )
+        .route(
+            "/api/w/{workspace_id}/internal/reviewer-child-sessions",
+            post(scoped_register_reviewer_child_session),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/merge-request/review-attempts",
+            post(scoped_register_merge_request_review_attempt),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/merge-request/reviews",
+            post(scoped_submit_merge_request_review),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/merge-request/complete",
+            post(scoped_complete_merge_request),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/merge-request/reopen",
+            post(scoped_reopen_merge_request),
+        )
+        .route(
+            "/api/w/{workspace_id}/tickets/{id}/merge-request/merge",
+            post(scoped_confirm_merge_request),
         )
         .route(
             "/api/w/{workspace_id}/tickets/{id}/workflow/close",
@@ -842,10 +1346,6 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/tickets/{id}/events",
             post(scoped_append_ticket_event),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/reviews",
-            post(scoped_review_ticket),
         )
         .route(
             "/api/w/{workspace_id}/tickets/{id}/queue",
@@ -1013,6 +1513,10 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/companion/cancel",
             post(scoped_post_companion_cancel),
+        )
+        .route(
+            "/api/w/{workspace_id}/workers/remove",
+            post(scoped_worker_remove_source_boundary),
         )
         .route(
             "/api/runtimes/{runtime_id}/workers",
@@ -2362,14 +2866,6 @@ struct BrowserAppendTicketEventRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BrowserReviewTicketRequest {
-    result: TicketReviewResult,
-    body: String,
-    author: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct BrowserQueueTicketRequest {
     queued_by: Option<String>,
 }
@@ -2383,10 +2879,10 @@ struct BrowserCloseTicketRequest {
 fn browser_ticket_backend(api: &WorkspaceApi) -> Result<SqliteTicketBackend> {
     let config = ticket::config::TicketConfig::load_workspace(&api.config.workspace_root)
         .map_err(|error| Error::Config(format!("load Ticket workspace settings: {error}")))?;
-    Ok(SqliteTicketBackend::new(
+    Ok(SqliteTicketBackend::open_verified(
         api.config.database_path.clone(),
         api.config.workspace_id.clone(),
-    )
+    )?
     .with_record_language(config.ticket_record_language()))
 }
 
@@ -2401,11 +2897,10 @@ async fn scoped_edit_ticket_item(
 ) -> ApiResult<Json<TicketDetail>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     if let Some(TicketTargetEdit::Set { repository_id, .. }) = request.target.as_ref() {
-        if !api
+        if api
             .store
-            .list_repositories(&api.config.workspace_id)?
-            .iter()
-            .any(|repository| repository.repository_id == *repository_id)
+            .get_repository(&api.config.workspace_id, repository_id)?
+            .is_none()
         {
             return Err(settings_bad_request(
                 "unknown_ticket_repository",
@@ -2447,6 +2942,11 @@ async fn scoped_transition_ticket_state(
     Json(request): Json<BrowserTransitionTicketStateRequest>,
 ) -> ApiResult<Json<TicketDetail>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
+    if request.state == TicketWorkflowState::Done {
+        return Err(Error::TicketAssignmentConflict(
+            "done is guarded by MergeRequestComplete with an approved immutable revision and operation_id".to_string(),
+        ).into());
+    }
     let current = api.authority.ticket(&path.id)?;
     let mut change = TicketStateChange::new(
         current.state,
@@ -2473,25 +2973,6 @@ async fn scoped_append_ticket_event(
     event.author = request.author;
     browser_ticket_backend(&api)?
         .add_event(TicketIdOrSlug::Id(path.id.clone()), event)
-        .map_err(Error::from)?;
-    browser_ticket_detail(&api, &path.id)
-}
-
-async fn scoped_review_ticket(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedRecordPath>,
-    Json(request): Json<BrowserReviewTicketRequest>,
-) -> ApiResult<Json<TicketDetail>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    browser_ticket_backend(&api)?
-        .review(
-            TicketIdOrSlug::Id(path.id.clone()),
-            TicketReview {
-                result: request.result,
-                body: MarkdownText::new(request.body),
-                author: request.author,
-            },
-        )
         .map_err(Error::from)?;
     browser_ticket_detail(&api, &path.id)
 }
@@ -2544,6 +3025,16 @@ async fn scoped_close_ticket(
     browser_ticket_detail(&api, &path.id)
 }
 
+fn reject_unguarded_ticket_completion(operation: &TicketBackendOperation) -> Result<()> {
+    if matches!(operation, TicketBackendOperation::SetWorkflowState { change, .. } if change.to == "done")
+    {
+        return Err(Error::TicketAssignmentConflict(
+            "done is guarded by MergeRequestComplete with an approved immutable revision and operation_id".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 async fn execute_worker_ticket_rest_operation(
     api: &WorkspaceApi,
     workspace_id: &str,
@@ -2553,15 +3044,18 @@ async fn execute_worker_ticket_rest_operation(
     validate_workspace_scope(api, workspace_id)?;
     let config = ticket::config::TicketConfig::load_workspace(&api.config.workspace_root)
         .map_err(|error| Error::Config(format!("load Ticket workspace settings: {error}")))?;
-    let mut backend = SqliteTicketBackend::new(
+    let mut backend = SqliteTicketBackend::open_verified(
         api.config.database_path.clone(),
         api.config.workspace_id.clone(),
     )
+    .map_err(Error::from)?
     .with_record_language(config.ticket_record_language());
     let operation_kind = ticket_mutation_operation_kind(&operation);
     let is_mutation = operation_kind != "read";
     let target = ticket_mutation_target(&operation).cloned();
     let source = authenticate_worker_mutation_source(api, workspace_id, &headers)?;
+    reject_unguarded_ticket_completion(&operation)?;
+    validate_ticket_repository_operation(api, &operation)?;
     let before = target.as_ref().and_then(|id| backend.show(id.clone()).ok());
     let previous_state = before
         .as_ref()
@@ -2909,23 +3403,393 @@ async fn scoped_queue_ticket_record(
     ticket_rest_unit(result)
 }
 
-async fn scoped_review_ticket_record(
-    State(api): State<WorkspaceApi>,
-    AxumPath((workspace_id, id)): AxumPath<(String, String)>,
-    headers: HeaderMap,
-    Json(review): Json<TicketReview>,
-) -> ApiResult<StatusCode> {
-    let result = execute_worker_ticket_rest_operation(
-        &api,
-        &workspace_id,
-        headers,
-        TicketBackendOperation::Review {
-            id: TicketIdOrSlug::Query(id),
-            review,
-        },
+#[derive(Debug, serde::Deserialize)]
+struct OpenMergeRequestRequest {
+    repository_id: String,
+    revision_id: String,
+    base_commit: String,
+    head_commit: String,
+    head_tree: String,
+    diff_digest: String,
+    #[serde(default)]
+    changed_paths: Vec<String>,
+    #[serde(default)]
+    summary: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AddMergeRequestRevisionRequest {
+    expected_current_revision_id: String,
+    revision_id: String,
+    base_commit: String,
+    head_commit: String,
+    head_tree: String,
+    diff_digest: String,
+    #[serde(default)]
+    changed_paths: Vec<String>,
+    #[serde(default)]
+    summary: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RegisterReviewerChildSessionRequest {
+    child_session_id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RegisterMergeRequestReviewAttemptRequest {
+    attempt_id: String,
+    revision_id: String,
+    child_session_id: String,
+    capability_token: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SubmitMergeRequestReviewRequest {
+    revision_id: String,
+    capability_token: String,
+    decision: merge_request::ReviewDecision,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    findings: Vec<merge_request::ReviewFinding>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CompleteMergeRequestRequest {
+    operation_id: String,
+    expected_revision_id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RevisionTransitionRequest {
+    expected_revision_id: String,
+    explicit_confirmation: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ConfirmMergeRequestRequest {
+    expected_revision_id: String,
+    explicit_confirmation: bool,
+}
+
+fn parse_workspace_id(value: &str) -> ApiResult<String> {
+    if value.trim().is_empty() {
+        return Err(Error::InvalidInput("workspace_id must not be empty".to_string()).into());
+    }
+    Ok(value.to_string())
+}
+
+fn require_workspace_access(workspace_id: &str, api: &WorkspaceApi) -> ApiResult<()> {
+    if workspace_id != api.workspace_id() {
+        return Err(Error::WorkspaceIdMismatch.into());
+    }
+    Ok(())
+}
+
+fn merge_request_store(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+) -> ApiResult<merge_request::SqliteMergeRequestStore> {
+    require_workspace_access(workspace_id, api)?;
+    merge_request::SqliteMergeRequestStore::open_verified(
+        api.config.database_path.clone(),
+        workspace_id,
     )
-    .await?;
-    ticket_rest_unit(result)
+    .map_err(Error::from)
+    .map_err(Into::into)
+}
+
+async fn scoped_show_merge_request(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+) -> ApiResult<Json<merge_request::MergeRequest>> {
+    let workspace_id = parse_workspace_id(&workspace_id)?;
+    let store = merge_request_store(&api, &workspace_id)?;
+    let value = store
+        .show_for_ticket(&ticket_id)?
+        .ok_or_else(|| Error::from(merge_request::MergeRequestError::NotFound(ticket_id)))?;
+    Ok(Json(value))
+}
+
+async fn scoped_merge_request_readiness(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+) -> ApiResult<Json<merge_request::MergeRequestReadiness>> {
+    let workspace_id = parse_workspace_id(&workspace_id)?;
+    Ok(Json(
+        merge_request_store(&api, &workspace_id)?.readiness_for_ticket(&ticket_id)?,
+    ))
+}
+
+async fn scoped_open_merge_request(
+    State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    Json(input): Json<OpenMergeRequestRequest>,
+) -> ApiResult<Json<merge_request::MergeRequest>> {
+    let workspace_id = parse_workspace_id(&workspace_id)?;
+    require_workspace_access(&workspace_id, &api)?;
+    let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
+    let assignment = api
+        .store
+        .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
+        .ok_or_else(|| {
+            Error::TicketAssignmentConflict("Ticket has no current assigned Coder".to_string())
+        })?;
+    if assignment.worker.runtime_id != source.runtime_id
+        || assignment.worker.worker_id != source.worker_id
+    {
+        return Err(Error::TicketAssignmentConflict(
+            "authenticated Worker is not the current Ticket assignee".to_string(),
+        )
+        .into());
+    }
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let revision = merge_request::MergeRequestRevision {
+        revision_id: input.revision_id,
+        ordinal: 1,
+        base_commit: input.base_commit,
+        head_commit: input.head_commit,
+        head_tree: input.head_tree,
+        diff_digest: input.diff_digest,
+        changed_paths: input.changed_paths,
+        summary: input.summary,
+        assignment_id: assignment.assignment_id.clone(),
+        created_at: now.clone(),
+    };
+    let mr = merge_request_store(&api, &workspace_id)?.open_merge_request(
+        merge_request::OpenMergeRequest {
+            merge_request_id: format!("mr_{}", Uuid::now_v7().simple()),
+            ticket_id,
+            repository_id: input.repository_id,
+            revision,
+            authenticated_runtime_id: source.runtime_id,
+            authenticated_worker_id: source.worker_id,
+            now,
+        },
+    )?;
+    Ok(Json(mr))
+}
+
+async fn scoped_add_merge_request_revision(
+    State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    Json(input): Json<AddMergeRequestRevisionRequest>,
+) -> ApiResult<Json<merge_request::MergeRequest>> {
+    let workspace_id = parse_workspace_id(&workspace_id)?;
+    require_workspace_access(&workspace_id, &api)?;
+    let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
+    let assignment = api
+        .store
+        .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
+        .ok_or_else(|| {
+            Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
+        })?;
+    if assignment.worker.runtime_id != source.runtime_id
+        || assignment.worker.worker_id != source.worker_id
+    {
+        return Err(Error::TicketAssignmentConflict(
+            "authenticated Worker is not the current Ticket assignee".into(),
+        )
+        .into());
+    }
+    let current = merge_request_store(&api, &workspace_id)?
+        .show_for_ticket(&ticket_id)?
+        .ok_or_else(|| {
+            Error::from(merge_request::MergeRequestError::NotFound(
+                ticket_id.clone(),
+            ))
+        })?;
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let mr =
+        merge_request_store(&api, &workspace_id)?.add_revision(merge_request::AddRevision {
+            ticket_id,
+            expected_current_revision_id: input.expected_current_revision_id,
+            revision: merge_request::MergeRequestRevision {
+                revision_id: input.revision_id,
+                ordinal: current.current_revision.ordinal + 1,
+                base_commit: input.base_commit,
+                head_commit: input.head_commit,
+                head_tree: input.head_tree,
+                diff_digest: input.diff_digest,
+                changed_paths: input.changed_paths,
+                summary: input.summary,
+                assignment_id: assignment.assignment_id,
+                created_at: now.clone(),
+            },
+            authenticated_runtime_id: source.runtime_id,
+            authenticated_worker_id: source.worker_id,
+            now,
+        })?;
+    Ok(Json(mr))
+}
+
+async fn scoped_register_reviewer_child_session(
+    State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
+    AxumPath(workspace_id): AxumPath<String>,
+    Json(input): Json<RegisterReviewerChildSessionRequest>,
+) -> ApiResult<StatusCode> {
+    let workspace_id = parse_workspace_id(&workspace_id)?;
+    require_workspace_access(&workspace_id, &api)?;
+    let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
+    merge_request_store(&api, &workspace_id)?.register_reviewer_child_session(
+        merge_request::RegisterReviewerChildSession {
+            parent_runtime_id: source.runtime_id,
+            parent_worker_id: source.worker_id,
+            child_session_id: input.child_session_id,
+            now: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        },
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn scoped_register_merge_request_review_attempt(
+    State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    Json(input): Json<RegisterMergeRequestReviewAttemptRequest>,
+) -> ApiResult<StatusCode> {
+    let workspace_id = parse_workspace_id(&workspace_id)?;
+    require_workspace_access(&workspace_id, &api)?;
+    let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
+    let assignment = api
+        .store
+        .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
+        .ok_or_else(|| {
+            Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
+        })?;
+    if assignment.worker.runtime_id != source.runtime_id
+        || assignment.worker.worker_id != source.worker_id
+    {
+        return Err(Error::TicketAssignmentConflict(
+            "authenticated Worker is not the current Ticket assignee".into(),
+        )
+        .into());
+    }
+    merge_request_store(&api, &workspace_id)?.register_review_attempt(
+        merge_request::RegisterReviewAttempt {
+            attempt_id: input.attempt_id,
+            ticket_id,
+            revision_id: input.revision_id,
+            parent_assignment_id: assignment.assignment_id,
+            parent_runtime_id: source.runtime_id,
+            parent_worker_id: source.worker_id,
+            child_session_id: input.child_session_id,
+            capability_token: input.capability_token,
+            now: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        },
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn scoped_submit_merge_request_review(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    Json(input): Json<SubmitMergeRequestReviewRequest>,
+) -> ApiResult<Json<merge_request::MergeRequestReview>> {
+    let workspace_id = parse_workspace_id(&workspace_id)?;
+    let review =
+        merge_request_store(&api, &workspace_id)?.submit_review(merge_request::SubmitReview {
+            ticket_id,
+            revision_id: input.revision_id,
+            capability_token: input.capability_token,
+            decision: input.decision,
+            body: input.body,
+            findings: input.findings,
+            now: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        })?;
+    Ok(Json(review))
+}
+
+async fn scoped_complete_merge_request(
+    State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    Json(input): Json<CompleteMergeRequestRequest>,
+) -> ApiResult<Json<merge_request::CompletionOutcome>> {
+    let workspace_id = parse_workspace_id(&workspace_id)?;
+    require_workspace_access(&workspace_id, &api)?;
+    let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
+    let assignment = api
+        .store
+        .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
+        .ok_or_else(|| {
+            Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
+        })?;
+    if assignment.worker.runtime_id != source.runtime_id
+        || assignment.worker.worker_id != source.worker_id
+    {
+        return Err(Error::TicketAssignmentConflict(
+            "authenticated Worker is not the current Ticket assignee".into(),
+        )
+        .into());
+    }
+    let outcome = merge_request_store(&api, &workspace_id)?.complete(
+        merge_request::CompleteMergeRequest {
+            operation_id: input.operation_id,
+            ticket_id,
+            expected_revision_id: input.expected_revision_id,
+            assignment_id: assignment.assignment_id,
+            authenticated_runtime_id: source.runtime_id,
+            authenticated_worker_id: source.worker_id,
+            now: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        },
+    )?;
+    Ok(Json(outcome))
+}
+
+async fn scoped_reopen_merge_request(
+    State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    Json(input): Json<RevisionTransitionRequest>,
+) -> ApiResult<Json<merge_request::MergeRequest>> {
+    let workspace_id = parse_workspace_id(&workspace_id)?;
+    require_workspace_access(&workspace_id, &api)?;
+    reject_non_browser_merge_auth(&headers)
+        .map_err(|_| Error::BrowserReopenConfirmationRequired)?;
+    let _actor = require_actor(&api, &headers).await?;
+    if !input.explicit_confirmation {
+        return Err(Error::BrowserReopenConfirmationRequired.into());
+    }
+    Ok(Json(merge_request_store(&api, &workspace_id)?.reopen(
+        &ticket_id,
+        &input.expected_revision_id,
+        &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+    )?))
+}
+
+fn reject_non_browser_merge_auth(headers: &HeaderMap) -> Result<()> {
+    if headers.contains_key("authorization") {
+        return Err(Error::BrowserMergeConfirmationRequired);
+    }
+    Ok(())
+}
+
+async fn scoped_confirm_merge_request(
+    State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    Json(input): Json<ConfirmMergeRequestRequest>,
+) -> ApiResult<Json<merge_request::MergeRequest>> {
+    let workspace_id = parse_workspace_id(&workspace_id)?;
+    require_workspace_access(&workspace_id, &api)?;
+    reject_non_browser_merge_auth(&headers)?;
+    let actor = require_actor(&api, &headers).await?;
+    let mr = merge_request_store(&api, &workspace_id)?.confirm_merge(
+        merge_request::MergeConfirmation {
+            ticket_id,
+            expected_revision_id: input.expected_revision_id,
+            authenticated_account_id: actor.account_id,
+            actor_kind: "user".to_string(),
+            explicit_confirmation: input.explicit_confirmation,
+            now: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        },
+    )?;
+    Ok(Json(mr))
 }
 
 async fn scoped_close_ticket_record(
@@ -3097,12 +3961,29 @@ fn ticket_mutation_target(operation: &TicketBackendOperation) -> Option<&TicketI
         | TicketBackendOperation::SetWorkflowState { id, .. }
         | TicketBackendOperation::MarkIntakeReady { id, .. }
         | TicketBackendOperation::QueueReady { id, .. }
-        | TicketBackendOperation::Review { id, .. }
         | TicketBackendOperation::Close { id, .. }
         | TicketBackendOperation::AddTicketRelation { id, .. }
         | TicketBackendOperation::AddOrchestrationPlanRecord { id, .. } => Some(id),
         _ => None,
     }
+}
+
+fn validate_ticket_repository_operation(
+    api: &WorkspaceApi,
+    operation: &TicketBackendOperation,
+) -> ApiResult<()> {
+    let repository_id = match operation {
+        TicketBackendOperation::Create { input } => input.repository_id.as_deref(),
+        TicketBackendOperation::EditItem { edit, .. } => match edit.target.as_ref() {
+            Some(TicketTargetEdit::Set { repository_id, .. }) => Some(repository_id.as_str()),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(repository_id) = repository_id {
+        api.require_workspace_repository(repository_id)?;
+    }
+    Ok(())
 }
 
 fn bind_worker_ticket_operation_source(
@@ -3125,7 +4006,6 @@ fn bind_worker_ticket_operation_source(
             change.author = Some(author);
         }
         TicketBackendOperation::QueueReady { queued_by, .. } => *queued_by = author,
-        TicketBackendOperation::Review { review, .. } => review.author = Some(author),
         TicketBackendOperation::AddTicketRelation { relation, .. } => {
             relation.author = Some(author)
         }
@@ -3147,7 +4027,6 @@ fn ticket_mutation_operation_kind(operation: &TicketBackendOperation) -> &'stati
         TicketBackendOperation::SetWorkflowState { .. } => "set_workflow_state",
         TicketBackendOperation::MarkIntakeReady { .. } => "mark_intake_ready",
         TicketBackendOperation::QueueReady { .. } => "queue_ready",
-        TicketBackendOperation::Review { .. } => "review",
         TicketBackendOperation::Close { .. } => "close",
         TicketBackendOperation::AddTicketRelation { .. } => "add_relation",
         TicketBackendOperation::AddOrchestrationPlanRecord { .. } => "add_plan_record",
@@ -4332,6 +5211,176 @@ async fn scoped_workspace_protocol_ws(
         .into_response())
 }
 
+#[derive(Debug, Serialize)]
+struct WorkerRemoveSuccessResponse<'a> {
+    removed: bool,
+    runtime_id: &'a str,
+    worker_id: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkerRemoveErrorResponse<'a> {
+    code: &'a str,
+    message: &'a str,
+}
+
+fn worker_remove_success_response(worker: &RuntimeWorkerRef) -> worker::WorkspaceResponse {
+    let body = serde_json::to_string(&WorkerRemoveSuccessResponse {
+        removed: true,
+        runtime_id: &worker.runtime_id,
+        worker_id: &worker.worker_id,
+    })
+    .unwrap_or_else(|_| r#"{"removed":true}"#.to_string());
+    worker::WorkspaceResponse {
+        status: StatusCode::OK.as_u16(),
+        body,
+    }
+}
+
+fn worker_remove_error_response(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+) -> worker::WorkspaceResponse {
+    let body =
+        serde_json::to_string(&WorkerRemoveErrorResponse { code, message }).unwrap_or_else(|_| {
+            r#"{"code":"worker_remove_failed","message":"Worker removal failed"}"#.to_string()
+        });
+    worker::WorkspaceResponse {
+        status: status.as_u16(),
+        body,
+    }
+}
+
+fn worker_retention_error_response(
+    error: crate::retention::WorkerRetentionError,
+) -> worker::WorkspaceResponse {
+    match error {
+        crate::retention::WorkerRetentionError::WorkerNotFound
+        | crate::retention::WorkerRetentionError::CrossWorkspace => worker_remove_error_response(
+            StatusCode::NOT_FOUND,
+            "worker_not_found",
+            "Worker was not found in this Workspace",
+        ),
+        crate::retention::WorkerRetentionError::WorkerRevisionConflict { .. }
+        | crate::retention::WorkerRetentionError::PolicyRevisionConflict { .. }
+        | crate::retention::WorkerRetentionError::StalePlan { .. }
+        | crate::retention::WorkerRetentionError::OperationFingerprintConflict { .. } => {
+            worker_remove_error_response(
+                StatusCode::CONFLICT,
+                "worker_revision_conflict",
+                "Worker removal state changed; reread the Worker and retry",
+            )
+        }
+        crate::retention::WorkerRetentionError::Blocked(_) => worker_remove_error_response(
+            StatusCode::CONFLICT,
+            "worker_removal_blocked",
+            "Worker removal is blocked by current assignment, hold, or retention policy",
+        ),
+        crate::retention::WorkerRetentionError::Invalid(_) => worker_remove_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_worker_remove",
+            "Worker removal request is invalid",
+        ),
+        crate::retention::WorkerRetentionError::PolicyMissing { .. }
+        | crate::retention::WorkerRetentionError::Store(_) => worker_remove_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "worker_removal_authority_unavailable",
+            "Worker removal authority is unavailable; removal can be retried",
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerRemoveBoundaryRequest {
+    target_runtime_id: String,
+    target_worker_id: String,
+    expected_worker_revision: String,
+    reason: String,
+}
+
+async fn scoped_worker_remove_source_boundary(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    headers: HeaderMap,
+    Json(request): Json<WorkerRemoveBoundaryRequest>,
+) -> Response {
+    if let Err(error) = validate_workspace_scope(&api, &path.workspace_id) {
+        return error.into_response();
+    }
+    let proof = match crate::worker_source::presented_worker_remove_source(&headers, None) {
+        Ok(proof) => proof,
+        Err(error) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    match crate::worker_source::verify_worker_remove_source(
+        &api,
+        proof,
+        &request.target_runtime_id,
+        &request.target_worker_id,
+    )
+    .await
+    {
+        Ok(source) => {
+            let executor = WorkspaceWorkerRemoveExecutor::new(&api);
+            match executor
+                .execute_async(
+                    source,
+                    &request.target_runtime_id,
+                    &request.target_worker_id,
+                    &request.expected_worker_revision,
+                    &request.reason,
+                )
+                .await
+            {
+                Ok(response) => (
+                    StatusCode::from_u16(response.status)
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    [(CONTENT_TYPE, "application/json")],
+                    response.body,
+                )
+                    .into_response(),
+                Err(_) => {
+                    let response = worker_remove_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "worker_remove_failed",
+                        "Worker removal failed before lifecycle execution",
+                    );
+                    (
+                        StatusCode::from_u16(response.status)
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                        [(CONTENT_TYPE, "application/json")],
+                        response.body,
+                    )
+                        .into_response()
+                }
+            }
+        }
+        Err(error) => {
+            let status = match error {
+                crate::worker_source::WorkerMutationSourceProofError::Replay => {
+                    StatusCode::CONFLICT
+                }
+                crate::worker_source::WorkerMutationSourceProofError::Authority(_) => {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+                _ => StatusCode::FORBIDDEN,
+            };
+            (
+                status,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn scoped_list_workers(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
@@ -5453,7 +6502,7 @@ async fn scoped_check_runtime_config_bundle(
 async fn scoped_get_runtime_worker(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
-) -> ApiResult<Json<WorkerSummary>> {
+) -> ApiResult<Json<WorkerShowProjection>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     get_runtime_worker(
         State(api),
@@ -6818,19 +7867,22 @@ fn working_directory_request_from_repository(
 }
 
 fn configured_working_directory_request(
-    config: &ServerConfig,
+    api: &WorkspaceApi,
     request: &WorkerSpawnWorkingDirectoryRequest,
 ) -> Result<WorkingDirectoryRequest> {
-    let repository = config
+    if api
+        .store
+        .get_repository(&api.config.workspace_id, &request.repository_id)?
+        .is_none()
+    {
+        return Err(Error::UnknownRepository(request.repository_id.clone()));
+    }
+    let repository = api
+        .config
         .repositories
         .iter()
         .find(|repository| repository.id == request.repository_id)
-        .ok_or_else(|| {
-            Error::Config(format!(
-                "unknown repository id `{}` for Worker working directory",
-                request.repository_id
-            ))
-        })?;
+        .ok_or_else(|| Error::UnknownRepository(request.repository_id.clone()))?;
     Ok(working_directory_request_from_repository(
         repository,
         request.selector.as_deref(),
@@ -7156,10 +8208,17 @@ async fn post_companion_cancel(
     Ok(Json(api.companion.cancel(request)))
 }
 
+#[derive(Debug, Serialize)]
+struct WorkerShowProjection {
+    #[serde(flatten)]
+    worker: WorkerSummary,
+    updated_at: String,
+}
+
 async fn get_runtime_worker(
     State(api): State<WorkspaceApi>,
     AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
-) -> ApiResult<Json<WorkerSummary>> {
+) -> ApiResult<Json<WorkerShowProjection>> {
     let worker_ref = RuntimeWorkerRef::new(runtime_id, worker_id);
     let worker = api
         .runtime
@@ -7172,12 +8231,11 @@ async fn get_runtime_worker(
     let workdirs = api
         .store
         .list_workdir_registry(&api.config.workspace_id, 500)?;
-    Ok(Json(merge_worker_registry_projection(
-        Some(&worker),
-        &record,
-        links,
-        &workdirs,
-    )))
+    let updated_at = record.updated_at.clone();
+    Ok(Json(WorkerShowProjection {
+        worker: merge_worker_registry_projection(Some(&worker), &record, links, &workdirs),
+        updated_at,
+    }))
 }
 
 async fn restore_runtime_worker(
@@ -7218,10 +8276,7 @@ struct RuntimeConfigBundleAvailabilityQuery {
     digest: String,
 }
 
-fn reject_workdir_for_embedded_runtime(
-    runtime_id: &str,
-    has_workdir: bool,
-) -> std::result::Result<(), ApiError> {
+fn reject_workdir_for_embedded_runtime(runtime_id: &str, has_workdir: bool) -> ApiResult<()> {
     if runtime_id != EMBEDDED_WORKER_RUNTIME_ID || !has_workdir {
         return Ok(());
     }
@@ -7239,9 +8294,7 @@ fn reject_workdir_for_embedded_runtime(
     ))
 }
 
-fn reject_no_workdir_for_non_embedded_runtime(
-    runtime_id: &str,
-) -> std::result::Result<(), ApiError> {
+fn reject_no_workdir_for_non_embedded_runtime(runtime_id: &str) -> ApiResult<()> {
     if runtime_id == EMBEDDED_WORKER_RUNTIME_ID {
         return Ok(());
     }
@@ -7634,9 +8687,7 @@ async fn create_runtime_worker(
     request.resolved_working_directory_request = request
         .working_directory_request
         .as_ref()
-        .map(|working_directory| {
-            configured_working_directory_request(&api.config, working_directory)
-        })
+        .map(|working_directory| configured_working_directory_request(&api, working_directory))
         .transpose()?;
     let prepared_workdir_id = if let Some(working_directory_request) =
         request.resolved_working_directory_request.as_mut()
@@ -9567,12 +10618,7 @@ fn working_directory_request_for_browser(
     api: &WorkspaceApi,
     request: BrowserWorkingDirectoryCreateRequest,
 ) -> ApiResult<WorkingDirectoryRequest> {
-    let repository = api
-        .config
-        .repositories
-        .iter()
-        .find(|repository| repository.id == request.repository_id)
-        .ok_or_else(|| Error::UnknownRepository(request.repository_id.clone()))?;
+    let repository = api.require_configured_workspace_repository(&request.repository_id)?;
     let selector = request
         .selector
         .or_else(|| repository.default_selector.clone())
@@ -9900,6 +10946,12 @@ struct ApiErrorLog {
     diagnostics: Vec<RuntimeDiagnostic>,
 }
 
+impl From<merge_request::MergeRequestError> for ApiError {
+    fn from(error: merge_request::MergeRequestError) -> Self {
+        Error::MergeRequest(error).into()
+    }
+}
+
 impl From<Error> for ApiError {
     fn from(error: Error) -> Self {
         let diagnostics = match &error {
@@ -9939,6 +10991,9 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.error {
+            Error::BrowserMergeConfirmationRequired | Error::BrowserReopenConfirmationRequired => {
+                StatusCode::FORBIDDEN
+            }
             Error::TicketAssignmentConflict(_) | Error::WorkdirAttachmentConflict(_) => {
                 StatusCode::CONFLICT
             }
@@ -9946,7 +11001,14 @@ impl IntoResponse for ApiError {
             Error::InvalidRuntimeIdentifier { .. } | Error::ReservedWorkerName(_) => {
                 StatusCode::BAD_REQUEST
             }
-            Error::Ticket(ticket::TicketError::NotFound(_)) => StatusCode::NOT_FOUND,
+            Error::Ticket(ticket::TicketError::NotFound(_))
+            | Error::MergeRequest(merge_request::MergeRequestError::NotFound(_)) => {
+                StatusCode::NOT_FOUND
+            }
+            Error::MergeRequest(merge_request::MergeRequestError::Empty(_)) => {
+                StatusCode::BAD_REQUEST
+            }
+            Error::MergeRequest(_) => StatusCode::CONFLICT,
             Error::Ticket(
                 ticket::TicketError::Ambiguous { .. }
                 | ticket::TicketError::Locked { .. }
@@ -10075,17 +11137,50 @@ mod tests {
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message;
     use tower::ServiceExt;
+    use worker_runtime::auth::{
+        RuntimeIdentityMaterial, RuntimeWorkerMutationSourceSigner, WORKER_REMOVE_PERMISSION,
+        decode_worker_mutation_source_claims,
+    };
     use worker_runtime::resource::BackendResourceClient;
+    use worker_runtime::worker_source::{
+        RuntimeOwnedWorkerMutationProof, RuntimeWorkerMutationSourceAuthority,
+    };
     use worker_runtime::working_directory::WorkingDirectoryMaterializer;
 
     use crate::hosts::{
-        TicketWorkerRole, WorkerInputKind, WorkerOperationState, WorkerSpawnAcceptanceRequirement,
-        WorkerSpawnIntent,
+        RemoteRuntimeAuthConfig, RuntimeCapabilitySummary, TicketWorkerRole, WorkerInputKind,
+        WorkerOperationState, WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent,
     };
     use crate::store::{
         MemoryDocumentRecord, MemoryStagingRecord, ObjectiveRecord, ObjectiveResourceRecord,
         ObjectiveTicketLinkRecord, SqliteWorkspaceStore, WorkspaceRecord,
     };
+
+    #[test]
+    fn merge_confirmation_rejects_api_token_actor_before_session_resolution() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer api-token".parse().unwrap());
+        assert!(matches!(
+            reject_non_browser_merge_auth(&headers),
+            Err(Error::BrowserMergeConfirmationRequired)
+        ));
+        assert!(reject_non_browser_merge_auth(&HeaderMap::new()).is_ok());
+    }
+
+    #[test]
+    fn flow_or_generic_worker_state_change_is_not_ticket_completion_authority() {
+        let operation = TicketBackendOperation::SetWorkflowState {
+            id: TicketIdOrSlug::Query("T1".to_string()),
+            change: TicketStateChange::new(
+                "inprogress",
+                "done",
+                "flow reached terminal state",
+                "terminal flow state",
+            ),
+        };
+        let error = reject_unguarded_ticket_completion(&operation).unwrap_err();
+        assert!(error.to_string().contains("MergeRequestComplete"));
+    }
 
     #[test]
     fn failed_api_log_is_structured_and_omits_query_values() {
@@ -10131,11 +11226,10 @@ mod tests {
     const TEST_REPOSITORY_ID: &str = "main";
     const TEST_CREATED_AT: &str = "2026-06-23T06:43:28Z";
 
-    fn test_worker_workspace_api(runtime_id: &str) -> WorkspaceApiRef {
+    fn test_worker_workspace_api(_runtime_id: &str) -> WorkspaceApiRef {
         WorkspaceApiRef {
             workspace_id: TEST_WORKSPACE_ID.to_string(),
             base_url: "http://127.0.0.1:8787".to_string(),
-            runtime_id: Some(runtime_id.to_string()),
         }
     }
 
@@ -10332,6 +11426,111 @@ mod tests {
                 "working_directory": { "kind": "without_workspace" }
             }))
             .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_bound_ticket_flow_and_workdir_launches_fail_closed_across_workspaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let other_workspace = WorkspaceRecord {
+            workspace_id: "other-workspace".to_string(),
+            owner_account_id: None,
+            display_name: "Other Workspace".to_string(),
+            state: "active".to_string(),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+        api.store.upsert_workspace(&other_workspace).await.unwrap();
+        api.store
+            .upsert_repository(&RepositoryRecord {
+                workspace_id: other_workspace.workspace_id.clone(),
+                repository_id: "foreign".to_string(),
+                name: "Foreign".to_string(),
+                kind: "git".to_string(),
+                provider: Some("git".to_string()),
+                uri: dir.path().join("foreign").display().to_string(),
+                default_ref: Some("HEAD".to_string()),
+                auth_ref_kind: None,
+                auth_ref_key: None,
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+            })
+            .unwrap();
+
+        let mut create_input = ticket::NewTicket::new("Foreign repository target");
+        create_input.repository_id = Some("foreign".to_string());
+        assert!(
+            validate_ticket_repository_operation(
+                &api,
+                &TicketBackendOperation::Create {
+                    input: create_input.clone(),
+                },
+            )
+            .is_err()
+        );
+
+        let ticket = browser_ticket_backend(&api)
+            .unwrap()
+            .create(create_input)
+            .unwrap();
+        let flow_ticket_launch = WorkerSpawnRequest {
+            requested_worker_name: Some("cross-workspace-ticket".to_string()),
+            intent: WorkerSpawnIntent::TicketRole {
+                ticket_id: ticket.id,
+                role: TicketWorkerRole::Coder,
+            },
+            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                expected_segments: 2,
+            },
+            profile: ProfileSelector::Builtin("builtin:coder".to_string()),
+            ticket_assignment: None,
+            initial_submit: vec![
+                Segment::Flow {
+                    selector: "builtin:coder-review".to_string(),
+                },
+                Segment::text("Implement the Ticket"),
+            ],
+            working_directory_request: None,
+            resolved_working_directory_request: None,
+            resolved_working_directory: None,
+            resolved_config_bundle: None,
+            resolved_worker_observation_enabled: false,
+            resolved_worker_observation_grants: Vec::new(),
+            resolved_workspace_api: None,
+        };
+        assert!(
+            api.validate_worker_spawn_repository_scope(&flow_ticket_launch)
+                .is_err()
+        );
+
+        let mut foreign_repository = api.config.repositories[0].clone();
+        foreign_repository.id = "foreign".to_string();
+        let workdir_flow_launch = WorkerSpawnRequest {
+            requested_worker_name: Some("cross-workspace-workdir".to_string()),
+            intent: WorkerSpawnIntent::WorkspaceCoding,
+            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                expected_segments: 1,
+            },
+            profile: ProfileSelector::Builtin("builtin:coder".to_string()),
+            ticket_assignment: None,
+            initial_submit: vec![Segment::Flow {
+                selector: "builtin:coder-review".to_string(),
+            }],
+            working_directory_request: None,
+            resolved_working_directory_request: Some(working_directory_request_from_repository(
+                &foreign_repository,
+                Some("HEAD"),
+            )),
+            resolved_working_directory: None,
+            resolved_config_bundle: None,
+            resolved_worker_observation_enabled: false,
+            resolved_worker_observation_grants: Vec::new(),
+            resolved_workspace_api: None,
+        };
+        assert!(
+            api.validate_worker_spawn_repository_scope(&workdir_flow_launch)
+                .is_err()
         );
     }
 
@@ -10677,6 +11876,7 @@ mod tests {
     async fn workspace_workdir_summaries_include_runtime_observed_rows() {
         let dir = tempfile::tempdir().unwrap();
         let api = test_api(dir.path()).await;
+        seed_test_repository(&api, "repo");
         api.store
             .upsert_workdir_registry(&WorkdirRegistryRecord {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
@@ -12416,21 +13616,6 @@ mod tests {
         .unwrap();
         assert_eq!(queued.state, "queued");
         assert_eq!(queued.queued_by.as_deref(), Some("browser-user"));
-        let Json(reviewed) = scoped_review_ticket(
-            State(api.clone()),
-            AxumPath(path()),
-            Json(BrowserReviewTicketRequest {
-                result: TicketReviewResult::Approve,
-                body: "API review".to_string(),
-                author: Some("reviewer".to_string()),
-            }),
-        )
-        .await
-        .unwrap();
-        assert!(reviewed.events.iter().any(|event| {
-            event.kind == "review" && event.body.as_deref() == Some("API review")
-        }));
-
         let Json(closed) = scoped_close_ticket(
             State(api),
             AxumPath(path()),
@@ -12538,6 +13723,586 @@ mod tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn destructive_worker_remove_rejects_browser_and_legacy_source_headers() {
+        let headers = HeaderMap::new();
+        assert!(matches!(
+            crate::worker_source::presented_worker_remove_source(&headers, None),
+            Err(crate::worker_source::WorkerMutationSourceProofError::Missing)
+        ));
+
+        let mut spoofed = HeaderMap::new();
+        spoofed.insert("x-yoi-runtime-id", "runtime-spoofed".parse().unwrap());
+        spoofed.insert("x-yoi-worker-id", "worker-spoofed".parse().unwrap());
+        assert!(matches!(
+            crate::worker_source::presented_worker_remove_source(&spoofed, None),
+            Err(crate::worker_source::WorkerMutationSourceProofError::Missing)
+        ));
+
+        let temp = tempfile::tempdir().unwrap();
+        let app = build_router(test_api(temp.path()).await);
+        let body = r#"{"target_runtime_id":"runtime-target","target_worker_id":"target-worker","expected_worker_revision":"revision-1","reason":"retire target Worker"}"#;
+        let browser = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/w/{TEST_WORKSPACE_ID}/workers/remove"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(browser.status(), StatusCode::UNAUTHORIZED);
+        let legacy = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/w/{TEST_WORKSPACE_ID}/workers/remove"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("x-yoi-runtime-id", "runtime-spoofed")
+                    .header("x-yoi-worker-id", "worker-spoofed")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy.status(), StatusCode::UNAUTHORIZED);
+        let body_spoof = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/w/{TEST_WORKSPACE_ID}/workers/remove"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"target_runtime_id":"runtime-target","target_worker_id":"target-worker","expected_worker_revision":"revision-1","reason":"retire target Worker","source_proof":"browser-controlled","actor":"orchestrator","policy":"purge"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_spoof.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn embedded_worker_remove_proof_derives_source_and_rejects_replay_and_wrong_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        seed_worker_source_member(&api, EMBEDDED_RUNTIME_ID, "7");
+        let scope = worker_runtime::RuntimeWorkspaceScope::new(
+            api.config.workspace_id.clone(),
+            "server-unused-for-embedded",
+        );
+        let authority = RuntimeWorkerMutationSourceAuthority::embedded(
+            EMBEDDED_RUNTIME_ID,
+            &api.config.workspace_id,
+        );
+        let RuntimeOwnedWorkerMutationProof::InProcess(proof) = authority
+            .issue_worker_remove(&scope, "7", "runtime-target", "target-worker")
+            .unwrap()
+        else {
+            panic!("embedded Runtime must produce in-process claims");
+        };
+
+        let wrong_target = crate::worker_source::verify_worker_remove_source(
+            &api,
+            crate::worker_source::PresentedWorkerMutationSourceProof::InProcess(proof.clone()),
+            "runtime-target",
+            "different-worker",
+        )
+        .await;
+        assert!(matches!(
+            wrong_target,
+            Err(crate::worker_source::WorkerMutationSourceProofError::Invalid)
+        ));
+
+        let verified = crate::worker_source::verify_worker_remove_source(
+            &api,
+            crate::worker_source::PresentedWorkerMutationSourceProof::InProcess(proof.clone()),
+            "runtime-target",
+            "target-worker",
+        )
+        .await
+        .unwrap();
+        assert_eq!(verified.runtime_id, EMBEDDED_RUNTIME_ID);
+        assert_eq!(verified.worker_id, "7");
+        assert_eq!(verified.permission, WORKER_REMOVE_PERMISSION);
+
+        let replay = crate::worker_source::verify_worker_remove_source(
+            &api,
+            crate::worker_source::PresentedWorkerMutationSourceProof::InProcess(proof),
+            "runtime-target",
+            "target-worker",
+        )
+        .await;
+        assert!(matches!(
+            replay,
+            Err(crate::worker_source::WorkerMutationSourceProofError::Replay)
+        ));
+
+        let RuntimeOwnedWorkerMutationProof::InProcess(fresh_proof) = authority
+            .issue_worker_remove(&scope, "7", "runtime-target", "target-worker")
+            .unwrap()
+        else {
+            panic!("embedded Runtime must produce in-process claims");
+        };
+        let dispatcher = crate::worker_source::EmbeddedServerWorkerMutationDispatcher::new(
+            api.config.clone(),
+            api.store.clone(),
+        );
+        let error =
+            worker_runtime::worker_source::EmbeddedWorkerMutationDispatcher::execute_worker_remove(
+                &dispatcher,
+                fresh_proof,
+                "runtime-target",
+                "target-worker",
+                "revision-1",
+                "retire target Worker",
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("executor is unavailable"));
+    }
+
+    #[tokio::test]
+    async fn worker_remove_rejects_self_running_and_stale_revision_at_caller_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        let Json(orchestrator) = scoped_start_workspace_orchestrator(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let source = orchestrator.worker.unwrap().worker;
+        let verified_source = || crate::worker_source::VerifiedWorkerMutationSource {
+            runtime_id: source.runtime_id.clone(),
+            worker_id: source.worker_id.clone(),
+            actor_kind: worker_runtime::auth::WorkerMutationActorKind::Worker,
+            permission: worker_runtime::auth::WORKER_REMOVE_PERMISSION.to_string(),
+            jti: "caller-guard-proof".to_string(),
+        };
+        let executor = WorkspaceWorkerRemoveExecutor::new(&api);
+        let self_response = executor
+            .execute_async(
+                verified_source(),
+                &source.runtime_id,
+                &source.worker_id,
+                "irrelevant",
+                "must reject self",
+            )
+            .await
+            .unwrap();
+        assert_eq!(self_response.status, StatusCode::CONFLICT.as_u16());
+        assert!(self_response.body.contains("self_removal_forbidden"));
+
+        let spawned = api
+            .spawn_workspace_worker(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                WorkerSpawnRequest {
+                    intent: WorkerSpawnIntent::WorkspaceCompanion,
+                    requested_worker_name: Some("guard-target".to_string()),
+                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                        expected_segments: 0,
+                    },
+                    profile: worker_runtime::catalog::ProfileSelector::Builtin(
+                        "builtin:companion".to_string(),
+                    ),
+                    ticket_assignment: None,
+                    initial_submit: Vec::new(),
+                    working_directory_request: None,
+                    resolved_working_directory_request: None,
+                    resolved_working_directory: None,
+                    resolved_config_bundle: Some(runtime_test_bundle()),
+                    resolved_worker_observation_enabled: false,
+                    resolved_worker_observation_grants: Vec::new(),
+                    resolved_workspace_api: None,
+                },
+            )
+            .unwrap();
+        let target = spawned.worker.unwrap().worker;
+        let running_response = executor
+            .execute_async(
+                verified_source(),
+                &target.runtime_id,
+                &target.worker_id,
+                "irrelevant",
+                "must reject a live Worker",
+            )
+            .await
+            .unwrap();
+        assert_eq!(running_response.status, StatusCode::CONFLICT.as_u16());
+        assert!(running_response.body.contains("worker_not_stopped"));
+
+        api.runtime
+            .stop_worker(
+                &target,
+                WorkerLifecycleRequest {
+                    reason: Some("prepare stale revision guard".to_string()),
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        let summary = api.runtime.worker(&target).unwrap();
+        let record = sync_worker_observation(&api, &summary).unwrap();
+        let stale_response = executor
+            .execute_async(
+                verified_source(),
+                &target.runtime_id,
+                &target.worker_id,
+                &format!("{}-stale", record.updated_at),
+                "must reject stale revision",
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_response.status, StatusCode::CONFLICT.as_u16());
+        assert!(stale_response.body.contains("worker_revision_conflict"));
+    }
+
+    #[tokio::test]
+    async fn embedded_worker_remove_executes_retention_and_returns_bounded_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        let Json(orchestrator) = scoped_start_workspace_orchestrator(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let source = orchestrator.worker.unwrap().worker;
+
+        let spawned = api
+            .spawn_workspace_worker(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                WorkerSpawnRequest {
+                    intent: WorkerSpawnIntent::WorkspaceCompanion,
+                    requested_worker_name: Some("remove-target".to_string()),
+                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                        expected_segments: 0,
+                    },
+                    profile: worker_runtime::catalog::ProfileSelector::Builtin(
+                        "builtin:companion".to_string(),
+                    ),
+                    ticket_assignment: None,
+                    initial_submit: Vec::new(),
+                    working_directory_request: None,
+                    resolved_working_directory_request: None,
+                    resolved_working_directory: None,
+                    resolved_config_bundle: Some(runtime_test_bundle()),
+                    resolved_worker_observation_enabled: false,
+                    resolved_worker_observation_grants: Vec::new(),
+                    resolved_workspace_api: None,
+                },
+            )
+            .unwrap();
+        let target = spawned.worker.unwrap().worker;
+        let stopped = api
+            .runtime
+            .stop_worker(
+                &target,
+                WorkerLifecycleRequest {
+                    reason: Some("prepare WorkerRemove regression".to_string()),
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(stopped.state, WorkerOperationState::Accepted);
+        let worker_root = temp
+            .path()
+            .join(".test-embedded-runtime-store/workers")
+            .join(&target.worker_id);
+        fs::create_dir_all(worker_root.join("session/segments")).unwrap();
+        fs::write(
+            worker_root.join("session/session.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": 1,
+                "session_id": "worker-remove-session"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            worker_root.join("session/segments/segment-a.jsonl"),
+            b"retained evidence\n",
+        )
+        .unwrap();
+        let summary = api.runtime.worker(&target).unwrap();
+        let record = sync_worker_observation(&api, &summary).unwrap();
+
+        let response = WorkspaceWorkerRemoveExecutor::new(&api)
+            .execute_async(
+                crate::worker_source::VerifiedWorkerMutationSource {
+                    runtime_id: source.runtime_id,
+                    worker_id: source.worker_id,
+                    actor_kind: worker_runtime::auth::WorkerMutationActorKind::Worker,
+                    permission: worker_runtime::auth::WORKER_REMOVE_PERMISSION.to_string(),
+                    jti: "embedded-valid-proof".to_string(),
+                },
+                &target.runtime_id,
+                &target.worker_id,
+                &record.updated_at,
+                "retire completed Worker",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status,
+            StatusCode::OK.as_u16(),
+            "{}",
+            response.body
+        );
+        assert!(response.body.contains("\"removed\":true"));
+        assert!(!response.body.contains("disposition"));
+        assert!(!response.body.contains("stage"));
+        assert!(!response.body.contains("path"));
+        assert!(
+            api.store
+                .get_worker_registry(TEST_WORKSPACE_ID, &target)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_worker_remove_proof_requires_current_runtime_trust_scope_and_catalog_member() {
+        let temp = tempfile::tempdir().unwrap();
+        let identity = RuntimeIdentityMaterial::generate("runtime-remote").unwrap();
+        let mut config = test_server_config(temp.path());
+        config.remote_runtime_sources.push(RemoteRuntimeConfig {
+            runtime_id: "runtime-remote".to_string(),
+            display_name: "Remote Runtime".to_string(),
+            base_url: "https://runtime.invalid".to_string(),
+            bearer_token: None,
+            auth: Some(RemoteRuntimeAuthConfig {
+                server_id: "server-main".to_string(),
+                server_private_key: identity.private_key.clone(),
+            }),
+            cached_capabilities: RuntimeCapabilitySummary {
+                can_list_hosts: true,
+                can_list_workers: true,
+                can_get_worker: true,
+                can_spawn_worker: true,
+                can_stop_worker: true,
+                has_workspace_fs: false,
+                has_shell: false,
+                has_git: false,
+                supports_worktrees: false,
+                supports_backend_internal_tools: false,
+                workspace_scope: TEST_WORKSPACE_ID.to_string(),
+                max_workers: 1,
+                os: "test".to_string(),
+                arch: "test".to_string(),
+            },
+            cached_status: "connected".to_string(),
+            timeout: std::time::Duration::from_secs(1),
+        });
+        let store = SqliteWorkspaceStore::open(config.database_path.clone()).unwrap();
+        let trust = crate::store::TrustedRuntimeRecord {
+            runtime_id: "runtime-remote".to_string(),
+            display_name: "Remote Runtime".to_string(),
+            base_url: "https://runtime.invalid".to_string(),
+            public_key: identity.public_key.clone(),
+            created_at: "2026-08-11T00:00:00Z".to_string(),
+            updated_at: "2026-08-11T00:00:00Z".to_string(),
+            revoked_at: None,
+        };
+        store.upsert_trusted_runtime(&trust).unwrap();
+        let api = WorkspaceApi::new_with_execution_backend(
+            config,
+            Arc::new(store),
+            Arc::new(DeterministicExecutionBackend::default()),
+        )
+        .await
+        .unwrap();
+        seed_worker_source_member(&api, "runtime-remote", "7");
+
+        let signer = RuntimeWorkerMutationSourceSigner::from_identity(&identity);
+        let token = signer
+            .issue_worker_remove(
+                "server-main",
+                &api.config.workspace_id,
+                "7",
+                "runtime-target",
+                "target-worker",
+                60,
+            )
+            .unwrap();
+        let verified = crate::worker_source::verify_worker_remove_source(
+            &api,
+            crate::worker_source::PresentedWorkerMutationSourceProof::Remote(&token),
+            "runtime-target",
+            "target-worker",
+        )
+        .await
+        .unwrap();
+        assert_eq!(verified.runtime_id, "runtime-remote");
+        assert_eq!(verified.worker_id, "7");
+
+        let wrong_scope = signer
+            .issue_worker_remove(
+                "server-wrong",
+                &api.config.workspace_id,
+                "7",
+                "runtime-target",
+                "target-worker",
+                60,
+            )
+            .unwrap();
+        assert!(matches!(
+            crate::worker_source::verify_worker_remove_source(
+                &api,
+                crate::worker_source::PresentedWorkerMutationSourceProof::Remote(&wrong_scope),
+                "runtime-target",
+                "target-worker",
+            )
+            .await,
+            Err(crate::worker_source::WorkerMutationSourceProofError::WrongAudience)
+        ));
+
+        let wrong_workspace = signer
+            .issue_worker_remove(
+                "server-main",
+                "workspace-other",
+                "7",
+                "runtime-target",
+                "target-worker",
+                60,
+            )
+            .unwrap();
+        assert!(matches!(
+            crate::worker_source::verify_worker_remove_source(
+                &api,
+                crate::worker_source::PresentedWorkerMutationSourceProof::Remote(&wrong_workspace),
+                "runtime-target",
+                "target-worker",
+            )
+            .await,
+            Err(crate::worker_source::WorkerMutationSourceProofError::WrongWorkspace)
+        ));
+
+        let missing_worker = signer
+            .issue_worker_remove(
+                "server-main",
+                &api.config.workspace_id,
+                "999",
+                "runtime-target",
+                "target-worker",
+                60,
+            )
+            .unwrap();
+        assert!(matches!(
+            crate::worker_source::verify_worker_remove_source(
+                &api,
+                crate::worker_source::PresentedWorkerMutationSourceProof::Remote(&missing_worker),
+                "runtime-target",
+                "target-worker",
+            )
+            .await,
+            Err(crate::worker_source::WorkerMutationSourceProofError::WorkerCatalogMembership)
+        ));
+
+        let mut expired_claims = decode_worker_mutation_source_claims(&token).unwrap();
+        expired_claims.iat = 1;
+        expired_claims.exp = 2;
+        expired_claims.jti = "expired-proof".to_string();
+        let expired = signer.sign(&expired_claims).unwrap();
+        assert!(matches!(
+            crate::worker_source::verify_worker_remove_source(
+                &api,
+                crate::worker_source::PresentedWorkerMutationSourceProof::Remote(&expired),
+                "runtime-target",
+                "target-worker",
+            )
+            .await,
+            Err(crate::worker_source::WorkerMutationSourceProofError::Expired)
+        ));
+
+        let route_token = signer
+            .issue_worker_remove(
+                "server-main",
+                &api.config.workspace_id,
+                "7",
+                "runtime-target",
+                "target-worker",
+                60,
+            )
+            .unwrap();
+        let route_response = build_router(api.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/w/{TEST_WORKSPACE_ID}/workers/remove"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(
+                        worker_runtime::auth::WORKER_MUTATION_SOURCE_PROOF_HEADER,
+                        route_token,
+                    )
+                    .body(Body::from(
+                        r#"{"target_runtime_id":"runtime-target","target_worker_id":"target-worker","expected_worker_revision":"revision-1","reason":"retire target Worker"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(route_response.status(), StatusCode::FORBIDDEN);
+        let route_body = axum::body::to_bytes(route_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let route_body = String::from_utf8(route_body.to_vec()).unwrap();
+        assert!(route_body.contains("orchestrator_required"));
+        assert!(!route_body.contains("source"));
+        assert!(!route_body.contains("proof"));
+
+        let mut revoked = trust;
+        revoked.revoked_at = Some("2026-08-11T00:01:00Z".to_string());
+        let authority = SqliteWorkspaceStore::open(api.config.database_path.clone()).unwrap();
+        authority.upsert_trusted_runtime(&revoked).unwrap();
+        let revoked_token = signer
+            .issue_worker_remove(
+                "server-main",
+                &api.config.workspace_id,
+                "7",
+                "runtime-target",
+                "target-worker",
+                60,
+            )
+            .unwrap();
+        assert!(matches!(
+            crate::worker_source::verify_worker_remove_source(
+                &api,
+                crate::worker_source::PresentedWorkerMutationSourceProof::Remote(&revoked_token),
+                "runtime-target",
+                "target-worker",
+            )
+            .await,
+            Err(crate::worker_source::WorkerMutationSourceProofError::RevokedRuntimeTrust)
+        ));
+    }
+
+    fn seed_worker_source_member(api: &WorkspaceApi, runtime_id: &str, worker_id: &str) {
+        let now = now_registry_timestamp();
+        api.store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: api.config.workspace_id.clone(),
+                worker: RuntimeWorkerRef::new(runtime_id, worker_id),
+                display_name: worker_id.to_string(),
+                profile: None,
+                retention_state: "normal".to_string(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .unwrap();
+    }
+
     fn seed_cleanup_worker(
         api: &WorkspaceApi,
         runtime_worker_id: u64,
@@ -12562,7 +14327,34 @@ mod tests {
         runtime_worker_id.to_string()
     }
 
+    fn seed_test_repository(api: &WorkspaceApi, repository_id: &str) {
+        if api
+            .store
+            .get_repository(&api.config.workspace_id, repository_id)
+            .unwrap()
+            .is_some()
+        {
+            return;
+        }
+        api.store
+            .upsert_repository(&RepositoryRecord {
+                workspace_id: api.config.workspace_id.clone(),
+                repository_id: repository_id.to_string(),
+                name: repository_id.to_string(),
+                kind: "git".to_string(),
+                provider: Some("git".to_string()),
+                uri: api.config.workspace_root.display().to_string(),
+                default_ref: Some("HEAD".to_string()),
+                auth_ref_kind: None,
+                auth_ref_key: None,
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+            })
+            .unwrap();
+    }
+
     fn seed_cleanup_workdir(api: &WorkspaceApi, workdir_id: &str, status: &str, cleanliness: &str) {
+        seed_test_repository(api, "repo-test");
         let now = now_registry_timestamp();
         api.store
             .upsert_workdir_registry(&WorkdirRegistryRecord {
@@ -14448,9 +16240,7 @@ mod tests {
             "/api/runtimes/embedded-worker-runtime/workers",
             json!({
                 "intent": {
-                    "kind": "ticket_role",
-                    "ticket_id": "00001KVZSGT0Q",
-                    "role": "coder"
+                    "kind": "workspace_coding"
                 },
                 "requested_worker_name": "api-friendly-name",
                 "acceptance": {
@@ -15225,7 +17015,7 @@ mod tests {
     ) {
         use ticket::TicketBackend as _;
 
-        let backend = ticket::SqliteTicketBackend::new(database_path, workspace_id);
+        let backend = ticket::SqliteTicketBackend::open(database_path, workspace_id).unwrap();
         let mut input = ticket::NewTicket::new(title);
         input.workflow_state = Some(state);
         backend.create(input).unwrap();
