@@ -2428,11 +2428,13 @@ impl SqliteTicketBackend {
                  LEFT JOIN typed_tickets AS target
                    ON target.workspace_id = relation.workspace_id
                   AND target.ticket_id = relation.target
-                 JOIN json_each(?2) AS listed
-                   ON listed.value = relation.ticket_id
-                   OR listed.value = relation.target
                  WHERE relation.workspace_id = ?1
-                   AND relation.kind IN ('depends_on', 'blocks')",
+                   AND relation.kind IN ('depends_on', 'blocks')
+                   AND EXISTS (
+                       SELECT 1 FROM json_each(?2) AS listed
+                       WHERE listed.value = relation.ticket_id
+                          OR listed.value = relation.target
+                   )",
             )
             .map_err(sqlite_err)?;
         let listed_ids_json = serde_json::to_string(
@@ -6535,6 +6537,19 @@ state: planning
         drop(connection);
 
         let full_loads_before = backend.full_ticket_load_count.load(Ordering::SeqCst);
+        let all_projection = backend.list_workspace_projection(3).unwrap();
+        let blocked_with_both_relation_ends_listed = all_projection
+            .items
+            .iter()
+            .find(|item| item.summary.id == blocked.id)
+            .expect("blocked Ticket is listed");
+        assert_eq!(
+            blocked_with_both_relation_ends_listed
+                .relation_blockers
+                .len(),
+            1,
+            "a relation must not duplicate when both endpoints are listed",
+        );
         let projection = backend.list_workspace_projection(2).unwrap();
         assert_eq!(
             backend.full_ticket_load_count.load(Ordering::SeqCst),
