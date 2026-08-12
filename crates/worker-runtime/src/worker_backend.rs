@@ -1831,21 +1831,25 @@ mod tests {
 
         let before_restart =
             backend.worker_context(&worker_ref, Some(&scope), Some(&identity), None);
-        let after_restore =
-            backend.worker_context(&worker_ref, Some(&scope), Some(&identity), None);
+        let adapter = WorkerRuntimeExecutionBackend::new(FailingFactory).unwrap();
+        let (after_restore_kind, after_restore_workspace_id) = adapter
+            .run_on_adapter_runtime(async move {
+                let after_restore =
+                    backend.worker_context(&worker_ref, Some(&scope), Some(&identity), None);
+                let client = after_restore.client_handle();
+                Ok((
+                    client.kind().to_string(),
+                    client.workspace_id().map(str::to_string),
+                ))
+            })
+            .expect("restore must reconstruct its Workspace client inside the adapter Runtime");
 
         assert_eq!(
             before_restart.client_handle().kind(),
             "runtime-owned-workspace-client"
         );
-        assert_eq!(
-            after_restore.client_handle().kind(),
-            "runtime-owned-workspace-client"
-        );
-        assert_eq!(
-            after_restore.client_handle().workspace_id(),
-            Some("workspace-a")
-        );
+        assert_eq!(after_restore_kind, "runtime-owned-workspace-client");
+        assert_eq!(after_restore_workspace_id.as_deref(), Some("workspace-a"));
     }
 
     #[test]
@@ -2388,14 +2392,18 @@ mod tests {
             workspace_id: "workspace-restore".to_string(),
             base_url: "http://workspace.invalid".to_string(),
         });
+        let identity = RuntimeIdentityMaterial::generate("runtime-restore").unwrap();
         let controller = ProfileRuntimeWorkerFactory::new(root.path())
-            .with_runtime_id("runtime-restore")
+            .with_remote_worker_mutation_identity(identity)
             .with_runtime_store_dir(&runtime_store_dir)
             .restore_controller(WorkerExecutionRestoreRequest {
                 worker_ref: worker_ref.clone(),
                 run_generation: 1,
                 request,
-                workspace_scope: None,
+                workspace_scope: Some(crate::runtime::RuntimeWorkspaceScope::new(
+                    "workspace-restore",
+                    "server-main",
+                )),
                 context: test_execution_context(worker_ref),
                 previous_working_directory: None,
                 working_directory: None,

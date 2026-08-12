@@ -709,23 +709,6 @@ impl WorkspaceApi {
             .await?;
         import_configured_repositories(store.as_ref(), &config)?;
         config.repositories = load_configured_repositories_from_store(store.as_ref(), &config)?;
-        let default_embedded_root =
-            ServerConfig::default_embedded_runtime_store_root(&config.workspace_id);
-        if config.embedded_runtime_store_root == default_embedded_root
-            && let (Some(legacy_sessions), Some(data_dir)) =
-                (manifest::paths::sessions_dir(), manifest::paths::data_dir())
-        {
-            worker_runtime::fs_store::FsRuntimeStore::migrate_legacy_worker_aggregates(
-                &config.embedded_runtime_store_root,
-                legacy_sessions,
-                data_dir.join("workers"),
-            )
-            .map_err(|error| {
-                crate::Error::Store(format!(
-                    "failed to migrate embedded Runtime Worker aggregates: {error}"
-                ))
-            })?;
-        }
         let embedded_runtime = EmbeddedWorkerRuntime::new_fs_store_with_execution_backend(
             config.workspace_id.clone(),
             config.embedded_runtime_store_root.clone(),

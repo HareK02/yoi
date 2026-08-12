@@ -133,7 +133,6 @@ pub trait EmbeddedWorkerMutationDispatcher: Send + Sync {
 enum RuntimeWorkerMutationTransport {
     Remote {
         base_url: String,
-        client: reqwest::blocking::Client,
     },
     Embedded {
         dispatcher: Arc<dyn EmbeddedWorkerMutationDispatcher>,
@@ -161,7 +160,6 @@ impl RuntimeWorkerMutationForwarder {
             source_worker_id: source_worker_id.into(),
             transport: RuntimeWorkerMutationTransport::Remote {
                 base_url: base_url.into().trim_end_matches('/').to_string(),
-                client: reqwest::blocking::Client::new(),
             },
         }
     }
@@ -199,33 +197,17 @@ impl RuntimeWorkerMutationForwarder {
         )?;
         match (&self.transport, proof) {
             (
-                RuntimeWorkerMutationTransport::Remote { base_url, client },
+                RuntimeWorkerMutationTransport::Remote { base_url },
                 RuntimeOwnedWorkerMutationProof::Remote(token),
-            ) => {
-                let url = format!(
-                    "{base_url}/api/w/{}/workers/remove",
-                    self.scope.workspace_id
-                );
-                let body = serde_json::json!({
-                    "target_runtime_id": target_runtime_id,
-                    "target_worker_id": target_worker_id,
-                    "expected_worker_revision": expected_worker_revision,
-                    "reason": reason,
-                });
-                let response = client
-                    .post(url)
-                    .header(crate::auth::WORKER_MUTATION_SOURCE_PROOF_HEADER, token)
-                    .json(&body)
-                    .send()
-                    .map_err(|error| {
-                        RuntimeWorkerMutationForwardError::Transport(error.to_string())
-                    })?;
-                let status = response.status().as_u16();
-                let body = response.text().map_err(|error| {
-                    RuntimeWorkerMutationForwardError::Transport(error.to_string())
-                })?;
-                Ok(WorkspaceResponse { status, body })
-            }
+            ) => execute_remote_worker_remove_http(RemoteWorkerRemoveHttpRequest {
+                base_url: base_url.clone(),
+                workspace_id: self.scope.workspace_id.clone(),
+                token,
+                target_runtime_id: target_runtime_id.to_string(),
+                target_worker_id: target_worker_id.to_string(),
+                expected_worker_revision: expected_worker_revision.to_string(),
+                reason: reason.to_string(),
+            }),
             (
                 RuntimeWorkerMutationTransport::Embedded { dispatcher },
                 RuntimeOwnedWorkerMutationProof::InProcess(claims),
@@ -239,6 +221,69 @@ impl RuntimeWorkerMutationForwarder {
             _ => Err(RuntimeWorkerMutationForwardError::AuthorityTransportMismatch),
         }
     }
+}
+
+struct RemoteWorkerRemoveHttpRequest {
+    base_url: String,
+    workspace_id: String,
+    token: String,
+    target_runtime_id: String,
+    target_worker_id: String,
+    expected_worker_revision: String,
+    reason: String,
+}
+
+fn execute_remote_worker_remove_http(
+    request: RemoteWorkerRemoveHttpRequest,
+) -> Result<WorkspaceResponse, RuntimeWorkerMutationForwardError> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return std::thread::Builder::new()
+            .name("yoi-worker-mutation-http".to_string())
+            .spawn(move || execute_remote_worker_remove_http_blocking(request))
+            .map_err(|error| {
+                RuntimeWorkerMutationForwardError::Transport(format!(
+                    "failed to start Worker mutation HTTP thread: {error}"
+                ))
+            })?
+            .join()
+            .map_err(|_| {
+                RuntimeWorkerMutationForwardError::Transport(
+                    "Worker mutation HTTP thread panicked".to_string(),
+                )
+            })?;
+    }
+
+    execute_remote_worker_remove_http_blocking(request)
+}
+
+fn execute_remote_worker_remove_http_blocking(
+    request: RemoteWorkerRemoveHttpRequest,
+) -> Result<WorkspaceResponse, RuntimeWorkerMutationForwardError> {
+    let url = format!(
+        "{}/api/w/{}/workers/remove",
+        request.base_url, request.workspace_id
+    );
+    let body = serde_json::json!({
+        "target_runtime_id": request.target_runtime_id,
+        "target_worker_id": request.target_worker_id,
+        "expected_worker_revision": request.expected_worker_revision,
+        "reason": request.reason,
+    });
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .post(url)
+        .header(
+            crate::auth::WORKER_MUTATION_SOURCE_PROOF_HEADER,
+            request.token,
+        )
+        .json(&body)
+        .send()
+        .map_err(|error| RuntimeWorkerMutationForwardError::Transport(error.to_string()))?;
+    let status = response.status().as_u16();
+    let body = response
+        .text()
+        .map_err(|error| RuntimeWorkerMutationForwardError::Transport(error.to_string()))?;
+    Ok(WorkspaceResponse { status, body })
 }
 
 pub struct RuntimeOwnedWorkspaceClient {
@@ -489,8 +534,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn remote_forwarder_stamps_signed_proof_inside_runtime_before_http_delivery() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_forwarder_is_safe_in_async_runtime_and_stamps_signed_proof() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::sync::Mutex;

@@ -18,7 +18,7 @@ use worker_runtime::auth::{
     RuntimeHttpAuthConfig, RuntimeIdentityMaterial, TrustedServerKey, decode_public_key,
 };
 use worker_runtime::error::RuntimeError;
-use worker_runtime::fs_store::{FsRuntimeStore, FsRuntimeStoreOptions};
+use worker_runtime::fs_store::FsRuntimeStoreOptions;
 use worker_runtime::http_server::{
     RuntimeHttpServerConfig, RuntimeHttpServerError, RuntimeHttpStoreSelection,
 };
@@ -112,12 +112,6 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
                 .map_err(ProcessError::Runtime)
         }
         RuntimeHttpStoreSelection::Fs { root } => {
-            FsRuntimeStore::migrate_legacy_worker_aggregates(
-                root,
-                fs_paths.worker_dir.join("sessions"),
-                fs_paths.worker_dir.join("metadata"),
-            )
-            .map_err(ProcessError::Runtime)?;
             let mut options = FsRuntimeStoreOptions::new(root.clone());
             options.display_name = config.http.display_name.clone();
             Runtime::with_fs_store_and_execution_backend(options, backend)
