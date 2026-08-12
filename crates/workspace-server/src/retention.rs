@@ -345,7 +345,7 @@ impl SqliteWorkspaceStore {
                 return Err(stale_error(&plan,"current assignment added"));
             }
             let now=Utc::now().to_rfc3339();
-            tx.execute("UPDATE worker_removal_operations SET state='executing',failure_category=NULL,updated_at=?1 WHERE operation_id=?2",params![now,plan.operation_id])?;
+            tx.execute("UPDATE worker_removal_operations SET state='executing',updated_at=?1 WHERE operation_id=?2",params![now,plan.operation_id])?;
             plan.state=WorkerRemovalPlanState::Executing;plan.updated_at=now;tx.commit()?;Ok(plan)
         }).map_err(map_error)
     }
@@ -1163,6 +1163,43 @@ mod tests {
             Err(WorkerRetentionError::StalePlan { .. })
         ));
     }
+    #[test]
+    fn failed_retry_keeps_cleanup_stage_durable() {
+        let s = setup();
+        let p = s.plan_worker_removal(&req(), &inv()).unwrap();
+        s.prepare_worker_removal_execution("w", &p.plan_id, &p.input_fingerprint)
+            .unwrap();
+        s.fail_worker_removal(
+            "w",
+            &p.operation_id,
+            &p.input_fingerprint,
+            "workdir_attachment_release_failed",
+        )
+        .unwrap();
+        let retry = s
+            .prepare_worker_removal_execution("w", &p.plan_id, &p.input_fingerprint)
+            .unwrap();
+        assert_eq!(retry.plan.state, WorkerRemovalPlanState::Executing);
+        assert_eq!(
+            retry.prior_failure_category.as_deref(),
+            Some("workdir_attachment_release_failed")
+        );
+        let persisted: Option<String> = s
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT failure_category FROM worker_removal_operations WHERE operation_id=?1",
+                    params![p.operation_id],
+                    |row| row.get(0),
+                )
+                .map_err(StoreError::from)
+            })
+            .unwrap();
+        assert_eq!(
+            persisted.as_deref(),
+            Some("workdir_attachment_release_failed")
+        );
+    }
+
     #[test]
     fn prepared_execution_is_derived_from_pinned_plan_generation() {
         let s = setup();
