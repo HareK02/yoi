@@ -19,12 +19,6 @@ Workerの状態から純粋に再現可能で、且つ揮発性の無い操作�
 
 ---
 
-## 実際のセッションを読んでデバッグする
-
-`~/.yoi/sessions`にすべてのセッションがある。jsonlなので、いい感じにBashで読むこと。
-
----
-
 ## 検証
 
 開発中は、変更した契約を証明する最小の target / filter から実行する。
@@ -50,7 +44,6 @@ workspace全体、E2E、Nix/Docker buildなどの重い検証は、変更した�
 
 Yoi Worker で作業する場合、Ticket の authority・ライフサイクル・操作方法は Yoi
 system instructions と、その Worker に提供された typed Ticket tools に従うこと。
-backend や CLI の具体的な手順はこのリポジトリの `AGENTS.md` では重複して定義しない。
 
 Codex など typed Ticket tools が提供されていないクライアントでは、`yoi ticket`
 CLI や保存先の直接操作で Ticket tools を代替しないこと。Ticket の作成・更新は
@@ -59,3 +52,8 @@ Yoi Worker に委ねる。
 ---
 
 YoiでYoiを開発している際、AI自身のフィードバックを元に改善を回すために `docs/report/`ディレクトリに感じた障壁や改善案等を書き残す形にした。 明確に力不足な点/ツールの問題があった場合や、ユーザーからの指示があった際に作ること。
+
+---
+
+絶対に自身が動作しているプロセスを止めないこと。
+マージ後のドッグフーディング環境の更新は必ずユーザーの操作で行う。

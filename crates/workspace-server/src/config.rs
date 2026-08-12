@@ -451,6 +451,11 @@ impl ResolvedWorkspaceBackendConfig {
         self
     }
 
+    pub fn with_backend_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.server.backend_base_url = Some(base_url.into().trim_end_matches('/').to_string());
+        self
+    }
+
     pub fn with_listen(mut self, listen: SocketAddr) -> Self {
         self.listen = listen;
         self
@@ -576,6 +581,24 @@ mod tests {
                 .server
                 .embedded_runtime_store_root
                 .ends_with("embedded-runtime")
+        );
+    }
+
+    #[test]
+    fn backend_base_url_is_explicit_and_normalized() {
+        let dir = tempfile::tempdir().unwrap();
+        let listen = "127.0.0.1:48787".parse().unwrap();
+        let resolved = WorkspaceBackendConfigFile::load_for_workspace(dir.path())
+            .unwrap()
+            .resolve(dir.path(), identity())
+            .unwrap()
+            .with_listen(listen)
+            .with_backend_base_url("http://127.0.0.1:48787/");
+
+        assert_eq!(resolved.listen, listen);
+        assert_eq!(
+            resolved.server.backend_base_url.as_deref(),
+            Some("http://127.0.0.1:48787")
         );
     }
 

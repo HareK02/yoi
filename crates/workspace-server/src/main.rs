@@ -571,11 +571,15 @@ async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Erro
     }
 
     let listener = TcpListener::bind(resolved.listen).await?;
+    let local_addr = listener.local_addr()?;
+    if resolved.server.backend_base_url.is_none() {
+        resolved = resolved.with_backend_base_url(format!("http://{local_addr}"));
+    }
     eprintln!(
         "yoi-server: serving workspace `{}` from server DB `{}` on http://{}",
         workspace.workspace_id,
         database_path.display(),
-        listener.local_addr()?
+        local_addr
     );
     serve(resolved.server, store, listener).await?;
     Ok(())
