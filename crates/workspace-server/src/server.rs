@@ -396,6 +396,11 @@ impl WorkspaceWorkerRemoveExecutor {
             if prepared.plan.state == crate::retention::WorkerRemovalPlanState::Succeeded {
                 return Ok(worker_remove_success_response(&target));
             }
+            let must_close_session =
+                prepared.prior_failure_category.as_deref() == Some("workdir_session_close_failed");
+            let must_release_attachment = must_close_session
+                || prepared.prior_failure_category.as_deref()
+                    == Some("workdir_attachment_release_failed");
             let prepared =
                 if prepared.plan.state == crate::retention::WorkerRemovalPlanState::Failed {
                     match self.store.prepare_worker_removal_execution(
@@ -409,6 +414,57 @@ impl WorkspaceWorkerRemoveExecutor {
                 } else {
                     prepared
                 };
+            if must_close_session {
+                let session = {
+                    self.workdir_sessions
+                        .lock()
+                        .map_err(|_| "Workdir session registry was poisoned".to_string())?
+                        .get(&target)
+                        .cloned()
+                };
+                if let Some(session) = session {
+                    if session.close().await.is_err() {
+                        let _ = self.store.fail_worker_removal(
+                            &self.workspace_id,
+                            &prepared.plan.operation_id,
+                            &prepared.plan.input_fingerprint,
+                            "workdir_session_close_failed",
+                        );
+                        return Ok(worker_remove_error_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "attachment_close_failed",
+                            "Worker Workdir session could not be closed; removal can be retried",
+                        ));
+                    }
+                    self.workdir_sessions
+                        .lock()
+                        .map_err(|_| "Workdir session registry was poisoned".to_string())?
+                        .remove(&target);
+                }
+            }
+            if must_release_attachment
+                && self
+                    .store
+                    .detach_worker_workdir(
+                        &self.workspace_id,
+                        &target,
+                        None,
+                        &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                    )
+                    .is_err()
+            {
+                let _ = self.store.fail_worker_removal(
+                    &self.workspace_id,
+                    &prepared.plan.operation_id,
+                    &prepared.plan.input_fingerprint,
+                    "workdir_attachment_release_failed",
+                );
+                return Ok(worker_remove_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "attachment_release_failed",
+                    "Worker Workdir attachment could not be released; removal can be retried",
+                ));
+            }
             return self
                 .resume_worker_retention(&runtime, &target, prepared)
                 .await;
