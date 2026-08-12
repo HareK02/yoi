@@ -1,3 +1,4 @@
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::HeaderMap;
@@ -168,18 +169,43 @@ async fn verify_worker_remove_source_with(
     })
 }
 
+pub(crate) trait VerifiedWorkerRemoveExecutor: Send + Sync {
+    fn execute(
+        &self,
+        source: VerifiedWorkerMutationSource,
+        target_runtime_id: &str,
+        target_worker_id: &str,
+        expected_worker_revision: &str,
+        reason: &str,
+    ) -> Result<worker::WorkspaceResponse, String>;
+}
+
 #[derive(Clone)]
 pub(crate) struct EmbeddedServerWorkerMutationDispatcher {
     config: crate::server::ServerConfig,
-    store: std::sync::Arc<dyn crate::store::ControlPlaneStore>,
+    store: Arc<dyn crate::store::ControlPlaneStore>,
+    executor: Arc<OnceLock<Arc<dyn VerifiedWorkerRemoveExecutor>>>,
 }
 
 impl EmbeddedServerWorkerMutationDispatcher {
     pub(crate) fn new(
         config: crate::server::ServerConfig,
-        store: std::sync::Arc<dyn crate::store::ControlPlaneStore>,
+        store: Arc<dyn crate::store::ControlPlaneStore>,
     ) -> Self {
-        Self { config, store }
+        Self {
+            config,
+            store,
+            executor: Arc::new(OnceLock::new()),
+        }
+    }
+
+    pub(crate) fn install_executor(
+        &self,
+        executor: Arc<dyn VerifiedWorkerRemoveExecutor>,
+    ) -> Result<(), &'static str> {
+        self.executor
+            .set(executor)
+            .map_err(|_| "WorkerRemove executor is already installed")
     }
 }
 
@@ -191,11 +217,13 @@ impl worker_runtime::worker_source::EmbeddedWorkerMutationDispatcher
         proof: InProcessWorkerMutationProof,
         target_runtime_id: &str,
         target_worker_id: &str,
+        expected_worker_revision: &str,
+        reason: &str,
     ) -> Result<
         worker::WorkspaceResponse,
         worker_runtime::worker_source::RuntimeWorkerMutationForwardError,
     > {
-        futures::executor::block_on(verify_worker_remove_source_with(
+        let source = futures::executor::block_on(verify_worker_remove_source_with(
             &self.config,
             &self.store,
             PresentedWorkerMutationSourceProof::InProcess(proof),
@@ -207,11 +235,20 @@ impl worker_runtime::worker_source::EmbeddedWorkerMutationDispatcher
                 error.to_string(),
             )
         })?;
-        Ok(worker::WorkspaceResponse {
-            status: 501,
-            body: "WorkerRemove lifecycle is not implemented by this operation boundary"
-                .to_string(),
-        })
+        let executor = self.executor.get().ok_or_else(|| {
+            worker_runtime::worker_source::RuntimeWorkerMutationForwardError::Embedded(
+                "WorkerRemove executor is unavailable".to_string(),
+            )
+        })?;
+        executor
+            .execute(
+                source,
+                target_runtime_id,
+                target_worker_id,
+                expected_worker_revision,
+                reason,
+            )
+            .map_err(worker_runtime::worker_source::RuntimeWorkerMutationForwardError::Embedded)
     }
 }
 

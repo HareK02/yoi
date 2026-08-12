@@ -117,6 +117,7 @@ pub struct WorkerRetentionExecutionRequest {
     pub workspace_id: String,
     pub source_runtime_id: String,
     pub worker_id: WorkerId,
+    pub expected_worker_revision: String,
     pub expected_run_generation: u64,
     pub source_created_at: String,
     pub removed_at: String,
@@ -155,6 +156,7 @@ pub struct WorkerSessionArchiveManifest {
 pub struct WorkerRetentionExecutionResult {
     pub operation_id: String,
     pub input_fingerprint: String,
+    pub expected_worker_revision: String,
     pub worker_id: WorkerId,
     pub session_disposition: SessionDisposition,
     pub diagnostics_disposition: DiagnosticsDisposition,
@@ -521,6 +523,7 @@ impl WorkerRetentionProvider for FsWorkerRetentionProvider {
         let mut result = WorkerRetentionExecutionResult {
             operation_id: request.operation_id.clone(),
             input_fingerprint: request.input_fingerprint.clone(),
+            expected_worker_revision: request.expected_worker_revision.clone(),
             worker_id: request.worker_id,
             session_disposition: request.session_disposition,
             diagnostics_disposition: request.diagnostics_disposition,
@@ -1291,6 +1294,7 @@ mod tests {
         WorkerRetentionExecutionRequest {
             operation_id: "operation-a".to_string(),
             input_fingerprint: "fingerprint-a".to_string(),
+            expected_worker_revision: "revision-a".to_string(),
             archive_id: (disposition == SessionDisposition::Archive)
                 .then(|| "archive-a".to_string()),
             workspace_id: "workspace-a".to_string(),

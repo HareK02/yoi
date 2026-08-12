@@ -54,6 +54,9 @@ use worker_runtime::interaction::{
 };
 use worker_runtime::management::{RuntimeOptions as EmbeddedRuntimeOptions, RuntimeStatus};
 use worker_runtime::profile_archive::{ProfileSourceArchive, ProfileSourceArchiveInput};
+use worker_runtime::retention::{
+    WorkerRetentionExecutionRequest, WorkerRetentionExecutionResult, WorkerRetentionInventory,
+};
 
 pub(crate) const EMBEDDED_RUNTIME_ID: &str = "embedded-worker-runtime";
 const EMBEDDED_HOST_KIND: &str = "embedded-worker-runtime-host";
@@ -856,6 +859,25 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         }
     }
 
+    fn worker_retention_inventory(
+        &self,
+        worker_id: &str,
+    ) -> Result<WorkerRetentionInventory, String> {
+        Err(format!(
+            "runtime does not implement retention inventory for '{worker_id}'"
+        ))
+    }
+
+    fn execute_worker_retention(
+        &self,
+        request: WorkerRetentionExecutionRequest,
+    ) -> Result<WorkerRetentionExecutionResult, String> {
+        Err(format!(
+            "runtime does not implement retention execution for '{}'",
+            request.worker_id
+        ))
+    }
+
     fn observation_source(
         &self,
         _worker_id: &str,
@@ -1399,6 +1421,44 @@ impl RuntimeRegistry {
         Ok(runtime.delete_worker(worker_id))
     }
 
+    pub fn worker_retention_inventory(
+        &self,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<WorkerRetentionInventory, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", &worker.runtime_id)?;
+        validate_backend_identifier("worker_id", &worker.worker_id)?;
+        self.runtime(&worker.runtime_id)?
+            .worker_retention_inventory(&worker.worker_id)
+            .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: worker.runtime_id.clone(),
+                code: "worker_retention_inventory_failed".to_string(),
+                message,
+            })
+    }
+
+    pub fn execute_worker_retention(
+        &self,
+        worker: &RuntimeWorkerRef,
+        request: WorkerRetentionExecutionRequest,
+    ) -> Result<WorkerRetentionExecutionResult, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", &worker.runtime_id)?;
+        validate_backend_identifier("worker_id", &worker.worker_id)?;
+        if request.worker_id.to_string() != worker.worker_id {
+            return Err(RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: worker.runtime_id.clone(),
+                code: "worker_id_mismatch".to_string(),
+                message: "retention request worker_id does not match target".to_string(),
+            });
+        }
+        self.runtime(&worker.runtime_id)?
+            .execute_worker_retention(request)
+            .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: worker.runtime_id.clone(),
+                code: "worker_retention_execution_failed".to_string(),
+                message,
+            })
+    }
+
     pub fn observation_source(
         &self,
         worker: &RuntimeWorkerRef,
@@ -1438,6 +1498,7 @@ impl RuntimeRegistry {
 
 #[derive(Clone)]
 pub struct EmbeddedWorkerRuntime {
+    workspace_id: String,
     runtime_id: String,
     host_id: String,
     runtime: worker_runtime::Runtime,
@@ -1501,8 +1562,9 @@ impl EmbeddedWorkerRuntime {
             .bind_runtime_identity(EMBEDDED_RUNTIME_ID)
             .expect("fresh embedded Runtime must accept its Backend-owned identity");
         Self {
-            runtime_id: EMBEDDED_RUNTIME_ID.to_string(),
             host_id: host_id_for_embedded_workspace(&workspace_id),
+            workspace_id,
+            runtime_id: EMBEDDED_RUNTIME_ID.to_string(),
             runtime,
             execution_enabled: false,
             resource_broker: BackendResourceBroker::default(),
@@ -2104,6 +2166,30 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 diagnostics: vec![embedded_runtime_diagnostic(&error)],
             },
         }
+    }
+
+    fn worker_retention_inventory(
+        &self,
+        worker_id: &str,
+    ) -> Result<WorkerRetentionInventory, String> {
+        let worker_ref = self
+            .worker_ref(worker_id)
+            .ok_or_else(|| format!("invalid embedded Worker id '{worker_id}'"))?;
+        self.runtime
+            .worker_retention_inventory(&self.workspace_id, &worker_ref)
+            .map_err(|error| error.to_string())
+    }
+
+    fn execute_worker_retention(
+        &self,
+        request: WorkerRetentionExecutionRequest,
+    ) -> Result<WorkerRetentionExecutionResult, String> {
+        if request.workspace_id != self.workspace_id {
+            return Err("retention request Workspace does not match embedded Runtime".to_string());
+        }
+        self.runtime
+            .execute_worker_retention(&request)
+            .map_err(|error| error.to_string())
     }
 
     fn observation_source(
@@ -3126,6 +3212,28 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 diagnostics: vec![diagnostic],
             },
         }
+    }
+
+    fn worker_retention_inventory(
+        &self,
+        worker_id: &str,
+    ) -> Result<WorkerRetentionInventory, String> {
+        self.get_json::<WorkerRetentionInventory>(&format!(
+            "/v1/workers/{worker_id}/retention/inventory"
+        ))
+        .map_err(|diagnostic| diagnostic.message)
+    }
+
+    fn execute_worker_retention(
+        &self,
+        request: WorkerRetentionExecutionRequest,
+    ) -> Result<WorkerRetentionExecutionResult, String> {
+        let worker_id = request.worker_id.to_string();
+        self.post_json::<_, WorkerRetentionExecutionResult>(
+            &format!("/v1/workers/{worker_id}/retention/execute"),
+            &request,
+        )
+        .map_err(|diagnostic| diagnostic.message)
     }
 
     fn observation_source(

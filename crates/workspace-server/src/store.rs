@@ -474,6 +474,73 @@ pub trait ControlPlaneStore: Send + Sync {
         now_seconds: u64,
         consumed_at: &str,
     ) -> Result<bool>;
+    fn plan_worker_removal(
+        &self,
+        request: &crate::retention::WorkerRemovalPlanRequest,
+        inventory: &worker_runtime::retention::WorkerRetentionInventory,
+    ) -> std::result::Result<
+        crate::retention::WorkerRemovalPlan,
+        crate::retention::WorkerRetentionError,
+    > {
+        let _ = (request, inventory);
+        Err(crate::retention::WorkerRetentionError::Invalid(
+            "Worker retention authority is unavailable".to_string(),
+        ))
+    }
+    fn prepare_worker_removal_execution(
+        &self,
+        workspace_id: &str,
+        plan_id: &str,
+        input_fingerprint: &str,
+    ) -> std::result::Result<
+        crate::retention::PreparedWorkerRemoval,
+        crate::retention::WorkerRetentionError,
+    > {
+        let _ = (workspace_id, plan_id, input_fingerprint);
+        Err(crate::retention::WorkerRetentionError::Invalid(
+            "Worker retention authority is unavailable".to_string(),
+        ))
+    }
+    fn recover_worker_removal_execution(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        expected_worker_revision: &str,
+        reason: &str,
+    ) -> std::result::Result<
+        Option<crate::retention::PreparedWorkerRemoval>,
+        crate::retention::WorkerRetentionError,
+    > {
+        let _ = (workspace_id, worker, expected_worker_revision, reason);
+        Ok(None)
+    }
+    fn fail_worker_removal(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+        input_fingerprint: &str,
+        category: &str,
+    ) -> std::result::Result<(), crate::retention::WorkerRetentionError> {
+        let _ = (workspace_id, operation_id, input_fingerprint, category);
+        Err(crate::retention::WorkerRetentionError::Invalid(
+            "Worker retention authority is unavailable".to_string(),
+        ))
+    }
+    fn commit_worker_removal(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+        input_fingerprint: &str,
+        result: &worker_runtime::retention::WorkerRetentionExecutionResult,
+    ) -> std::result::Result<
+        crate::retention::WorkerRemovalPlan,
+        crate::retention::WorkerRetentionError,
+    > {
+        let _ = (workspace_id, operation_id, input_fingerprint, result);
+        Err(crate::retention::WorkerRetentionError::Invalid(
+            "Worker retention authority is unavailable".to_string(),
+        ))
+    }
     fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>>;
     fn upsert_repository(&self, record: &RepositoryRecord) -> Result<()>;
     fn get_repository(
@@ -946,6 +1013,88 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             transaction.commit()?;
             Ok(inserted == 1)
         })
+    }
+
+    fn plan_worker_removal(
+        &self,
+        request: &crate::retention::WorkerRemovalPlanRequest,
+        inventory: &worker_runtime::retention::WorkerRetentionInventory,
+    ) -> std::result::Result<
+        crate::retention::WorkerRemovalPlan,
+        crate::retention::WorkerRetentionError,
+    > {
+        SqliteWorkspaceStore::plan_worker_removal(self, request, inventory)
+    }
+
+    fn prepare_worker_removal_execution(
+        &self,
+        workspace_id: &str,
+        plan_id: &str,
+        input_fingerprint: &str,
+    ) -> std::result::Result<
+        crate::retention::PreparedWorkerRemoval,
+        crate::retention::WorkerRetentionError,
+    > {
+        SqliteWorkspaceStore::prepare_worker_removal_execution(
+            self,
+            workspace_id,
+            plan_id,
+            input_fingerprint,
+        )
+    }
+
+    fn recover_worker_removal_execution(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        expected_worker_revision: &str,
+        reason: &str,
+    ) -> std::result::Result<
+        Option<crate::retention::PreparedWorkerRemoval>,
+        crate::retention::WorkerRetentionError,
+    > {
+        SqliteWorkspaceStore::recover_worker_removal_execution(
+            self,
+            workspace_id,
+            worker,
+            expected_worker_revision,
+            reason,
+        )
+    }
+
+    fn fail_worker_removal(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+        input_fingerprint: &str,
+        category: &str,
+    ) -> std::result::Result<(), crate::retention::WorkerRetentionError> {
+        SqliteWorkspaceStore::fail_worker_removal(
+            self,
+            workspace_id,
+            operation_id,
+            input_fingerprint,
+            category,
+        )
+    }
+
+    fn commit_worker_removal(
+        &self,
+        workspace_id: &str,
+        operation_id: &str,
+        input_fingerprint: &str,
+        result: &worker_runtime::retention::WorkerRetentionExecutionResult,
+    ) -> std::result::Result<
+        crate::retention::WorkerRemovalPlan,
+        crate::retention::WorkerRetentionError,
+    > {
+        SqliteWorkspaceStore::commit_worker_removal(
+            self,
+            workspace_id,
+            operation_id,
+            input_fingerprint,
+            result,
+        )
     }
 
     fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>> {

@@ -377,6 +377,7 @@ impl SqliteWorkspaceStore {
                 workspace_id: plan.workspace_id.clone(),
                 source_runtime_id: plan.worker.runtime_id.clone(),
                 worker_id: worker_runtime::identity::WorkerId::new(worker_number),
+                expected_worker_revision: plan.worker_revision.clone(),
                 expected_run_generation: plan.run_generation,
                 source_created_at: worker.created_at,
                 removed_at,
@@ -389,6 +390,85 @@ impl SqliteWorkspaceStore {
             },
             plan,
         })
+    }
+
+    pub fn recover_worker_removal_execution(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        expected_worker_revision: &str,
+        reason: &str,
+    ) -> Result<Option<PreparedWorkerRemoval>, WorkerRetentionError> {
+        bounded("workspace", workspace_id, 160)?;
+        bounded("revision", expected_worker_revision, 256)?;
+        bounded("reason", reason, 512)?;
+        let plan = self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT plan_id FROM worker_removal_operations
+                 WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3
+                   AND worker_revision=?4 AND reason=?5
+                   AND state IN ('executing','failed','succeeded')
+                 ORDER BY CASE state WHEN 'succeeded' THEN 0 ELSE 1 END,
+                          created_at DESC LIMIT 1",
+                params![
+                    workspace_id,
+                    worker.runtime_id,
+                    worker.worker_id,
+                    expected_worker_revision,
+                    reason,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+            .and_then(|plan_id| match plan_id {
+                Some(plan_id) => load_plan(conn, &plan_id),
+                None => Ok(None),
+            })
+        })?;
+        let Some(plan) = plan else {
+            return Ok(None);
+        };
+        let worker_number = plan.worker.worker_id.parse::<u64>().map_err(|_| {
+            WorkerRetentionError::Invalid(
+                "Runtime Worker id is not a canonical unsigned integer".to_string(),
+            )
+        })?;
+        let worker = if plan.state == WorkerRemovalPlanState::Succeeded {
+            None
+        } else {
+            Some(
+                self.with_conn(|conn| load_worker(conn, workspace_id, &plan.worker))?
+                    .ok_or(WorkerRetentionError::WorkerNotFound)?,
+            )
+        };
+        Ok(Some(PreparedWorkerRemoval {
+            runtime_request: WorkerRetentionExecutionRequest {
+                operation_id: plan.operation_id.clone(),
+                input_fingerprint: plan.input_fingerprint.clone(),
+                archive_id: plan.archive_id.clone(),
+                workspace_id: plan.workspace_id.clone(),
+                source_runtime_id: plan.worker.runtime_id.clone(),
+                worker_id: worker_runtime::identity::WorkerId::new(worker_number),
+                expected_worker_revision: plan.worker_revision.clone(),
+                expected_run_generation: plan.run_generation,
+                source_created_at: worker
+                    .as_ref()
+                    .map(|worker| worker.created_at.clone())
+                    .unwrap_or_else(|| plan.created_at.clone()),
+                removed_at: plan.created_at.clone(),
+                effective_profile: worker
+                    .as_ref()
+                    .map(|worker| worker.profile.clone())
+                    .unwrap_or_else(|| Some("removed".to_string())),
+                retention_class: None,
+                policy_id: plan.policy_id.clone(),
+                policy_revision: plan.policy_revision,
+                session_disposition: plan.session_disposition,
+                diagnostics_disposition: plan.diagnostics_disposition,
+            },
+            plan,
+        }))
     }
 
     pub fn fail_worker_removal(
@@ -424,7 +504,8 @@ impl SqliteWorkspaceStore {
             if plan.state != WorkerRemovalPlanState::Executing {
                 return Err(StoreError::InvalidInput(format!("stale:{}:plan state {} is not committable", plan.plan_id, state_s(plan.state))));
             }
-            if result.worker_id.to_string() != plan.worker.worker_id
+            if result.expected_worker_revision != plan.worker_revision
+                || result.worker_id.to_string() != plan.worker.worker_id
                 || result.session_disposition != plan.session_disposition
                 || result.diagnostics_disposition != plan.diagnostics_disposition
             {
@@ -1107,6 +1188,7 @@ mod tests {
         let result = WorkerRetentionExecutionResult {
             operation_id: p.operation_id.clone(),
             input_fingerprint: p.input_fingerprint.clone(),
+            expected_worker_revision: p.worker_revision.clone(),
             worker_id: WorkerId::new(1),
             session_disposition: p.session_disposition,
             diagnostics_disposition: p.diagnostics_disposition,
@@ -1247,6 +1329,7 @@ mod tests {
         let r = WorkerRetentionExecutionResult {
             operation_id: p.operation_id.clone(),
             input_fingerprint: p.input_fingerprint.clone(),
+            expected_worker_revision: p.worker_revision.clone(),
             worker_id: WorkerId::new(1),
             session_disposition: SessionDisposition::Purge,
             diagnostics_disposition: DiagnosticsDisposition::Purge,
@@ -1265,6 +1348,7 @@ mod tests {
         let mut result = WorkerRetentionExecutionResult {
             operation_id: plan.operation_id.clone(),
             input_fingerprint: plan.input_fingerprint.clone(),
+            expected_worker_revision: plan.worker_revision.clone(),
             worker_id: WorkerId::new(1),
             session_disposition: plan.session_disposition,
             diagnostics_disposition: plan.diagnostics_disposition,
@@ -1345,6 +1429,106 @@ mod tests {
                     false,
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn runtime_result_must_match_prepared_worker_revision() {
+        let s = setup();
+        let plan = s.plan_worker_removal(&req(), &inv()).unwrap();
+        let prepared = s
+            .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
+            .unwrap();
+        let mut runtime_result = WorkerRetentionExecutionResult {
+            operation_id: prepared.plan.operation_id.clone(),
+            input_fingerprint: prepared.plan.input_fingerprint.clone(),
+            expected_worker_revision: prepared.plan.worker_revision.clone(),
+            worker_id: WorkerId::new(1),
+            session_disposition: prepared.plan.session_disposition,
+            diagnostics_disposition: prepared.plan.diagnostics_disposition,
+            archive: None,
+            source_removed: true,
+            diagnostics_retained: false,
+        };
+        runtime_result.expected_worker_revision = "stale-revision".to_string();
+        let error = s
+            .commit_worker_removal(
+                "w",
+                &plan.operation_id,
+                &plan.input_fingerprint,
+                &runtime_result,
+            )
+            .unwrap_err();
+        assert!(
+            !error.to_string().is_empty(),
+            "mismatched Runtime revision must be rejected"
+        );
+    }
+
+    #[test]
+    fn succeeded_worker_removal_recovers_after_registry_purge() {
+        let s = setup();
+        let request = req();
+        let plan = s.plan_worker_removal(&request, &inv()).unwrap();
+        let prepared = s
+            .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
+            .unwrap();
+        let runtime_result = WorkerRetentionExecutionResult {
+            operation_id: prepared.plan.operation_id.clone(),
+            input_fingerprint: prepared.plan.input_fingerprint.clone(),
+            expected_worker_revision: prepared.plan.worker_revision.clone(),
+            worker_id: WorkerId::new(1),
+            session_disposition: prepared.plan.session_disposition,
+            diagnostics_disposition: prepared.plan.diagnostics_disposition,
+            archive: Some(worker_runtime::retention::WorkerSessionArchiveManifest {
+                schema_version: 1,
+                archive_id: prepared.plan.archive_id.clone().unwrap(),
+                workspace_id: "w".into(),
+                source_runtime_id: "r".into(),
+                source_worker_id: WorkerId::new(1),
+                source_session_id: "s".into(),
+                segment_ids: vec!["a".into()],
+                source_created_at: "created".into(),
+                removed_at: "removed".into(),
+                archived_at_unix_seconds: 1,
+                effective_profile: None,
+                retention_class: None,
+                content_checksum_sha256: "sum".into(),
+                content_bytes: 1,
+                content_file_count: 1,
+                policy_id: prepared.plan.policy_id.clone(),
+                policy_revision: prepared.plan.policy_revision,
+                operation_id: prepared.plan.operation_id.clone(),
+                input_fingerprint: prepared.plan.input_fingerprint.clone(),
+            }),
+            source_removed: true,
+            diagnostics_retained: false,
+        };
+        s.commit_worker_removal(
+            "w",
+            &plan.operation_id,
+            &plan.input_fingerprint,
+            &runtime_result,
+        )
+        .unwrap();
+        assert!(
+            s.get_worker_registry("w", &request.worker)
+                .unwrap()
+                .is_none()
+        );
+        let recovered = s
+            .recover_worker_removal_execution(
+                "w",
+                &request.worker,
+                &request.expected_worker_revision,
+                &request.reason,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.plan.state, WorkerRemovalPlanState::Succeeded);
+        assert_eq!(
+            recovered.runtime_request.expected_worker_revision,
+            request.expected_worker_revision
         );
     }
 
