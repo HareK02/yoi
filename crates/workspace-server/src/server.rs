@@ -396,6 +396,19 @@ impl WorkspaceWorkerRemoveExecutor {
             if prepared.plan.state == crate::retention::WorkerRemovalPlanState::Succeeded {
                 return Ok(worker_remove_success_response(&target));
             }
+            let prepared =
+                if prepared.plan.state == crate::retention::WorkerRemovalPlanState::Failed {
+                    match self.store.prepare_worker_removal_execution(
+                        &self.workspace_id,
+                        &prepared.plan.plan_id,
+                        &prepared.plan.input_fingerprint,
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(error) => return Ok(worker_retention_error_response(error)),
+                    }
+                } else {
+                    prepared
+                };
             return self
                 .resume_worker_retention(&runtime, &target, prepared)
                 .await;
