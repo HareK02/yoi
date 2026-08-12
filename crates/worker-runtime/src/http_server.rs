@@ -21,6 +21,9 @@ use crate::interaction::{WorkerInput, WorkerInteractionAck};
 use crate::management::{RuntimeSummary, WorkerDeleteResult};
 #[cfg(feature = "ws-server")]
 use crate::observation::WorkerObservationCursor;
+use crate::retention::{
+    WorkerRetentionExecutionRequest, WorkerRetentionExecutionResult, WorkerRetentionInventory,
+};
 #[cfg(feature = "ws-server")]
 use crate::runtime::RuntimeSubscriptionRecvError;
 use crate::{Runtime, RuntimeWorkspaceScope};
@@ -216,6 +219,14 @@ fn runtime_http_router_with_optional_auth(
         .route(
             "/v1/workers/{worker_id}",
             get(get_worker).delete(delete_worker),
+        )
+        .route(
+            "/v1/workers/{worker_id}/retention/inventory",
+            get(worker_retention_inventory),
+        )
+        .route(
+            "/v1/workers/{worker_id}/retention/execute",
+            post(execute_worker_retention),
         )
         .route("/v1/workers/{worker_id}/input", post(send_worker_input))
         .route("/v1/workers/{worker_id}/restore", post(restore_worker))
@@ -1220,6 +1231,61 @@ fn protocol_error_event(message: impl Into<String>) -> protocol::Event {
     }
 }
 
+async fn worker_retention_inventory(
+    State(state): State<RuntimeHttpState>,
+    auth: Option<Extension<RuntimeAuthContext>>,
+    Path(worker_id): Path<String>,
+) -> RestResult<WorkerRetentionInventory> {
+    let scope = auth_workspace_scope(&state, auth.as_ref())?.ok_or_else(|| {
+        RuntimeHttpRestError::new(
+            StatusCode::FORBIDDEN,
+            "workspace_scope_required",
+            "Worker retention inventory requires workspace-scoped authorization",
+        )
+    })?;
+    let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
+    state
+        .runtime
+        .worker_retention_inventory(&scope.workspace_id, &worker_ref)
+        .map(Json)
+        .map_err(RuntimeHttpRestError::runtime)
+}
+
+async fn execute_worker_retention(
+    State(state): State<RuntimeHttpState>,
+    auth: Option<Extension<RuntimeAuthContext>>,
+    Path(worker_id): Path<String>,
+    body: Result<Json<WorkerRetentionExecutionRequest>, JsonRejection>,
+) -> RestResult<WorkerRetentionExecutionResult> {
+    let Json(request) = body.map_err(RuntimeHttpRestError::json_rejection)?;
+    if request.worker_id.to_string() != worker_id {
+        return Err(RuntimeHttpRestError::new(
+            StatusCode::BAD_REQUEST,
+            "worker_id_mismatch",
+            "Retention request worker_id does not match the route",
+        ));
+    }
+    let scope = auth_workspace_scope(&state, auth.as_ref())?.ok_or_else(|| {
+        RuntimeHttpRestError::new(
+            StatusCode::FORBIDDEN,
+            "workspace_scope_required",
+            "Worker retention execution requires workspace-scoped authorization",
+        )
+    })?;
+    if request.workspace_id != scope.workspace_id {
+        return Err(RuntimeHttpRestError::new(
+            StatusCode::NOT_FOUND,
+            "worker_not_found",
+            "Worker was not found in the authenticated Workspace",
+        ));
+    }
+    state
+        .runtime
+        .execute_worker_retention(&request)
+        .map(Json)
+        .map_err(RuntimeHttpRestError::runtime)
+}
+
 async fn send_worker_input(
     State(state): State<RuntimeHttpState>,
     auth: Option<Extension<RuntimeAuthContext>>,
@@ -1472,6 +1538,9 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     }
     if path.ends_with("/completions") {
         return Some("workers:read");
+    }
+    if path.contains("/retention/") {
+        return Some("workers:delete");
     }
     if path.starts_with("/v1/workers/") && *method == Method::DELETE {
         return Some("workers:delete");
@@ -2064,6 +2133,18 @@ mod tests {
             worker_observation_grants: Vec::new(),
             workspace_api: None,
         }
+    }
+
+    #[test]
+    fn retention_routes_require_worker_delete_permission() {
+        assert_eq!(
+            required_runtime_permission(&Method::GET, "/v1/workers/worker-1/retention/inventory",),
+            Some("workers:delete")
+        );
+        assert_eq!(
+            required_runtime_permission(&Method::POST, "/v1/workers/worker-1/retention/execute",),
+            Some("workers:delete")
+        );
     }
 
     #[test]

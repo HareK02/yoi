@@ -230,6 +230,8 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
         &self,
         _target_runtime_id: &str,
         _target_worker_id: &str,
+        _expected_worker_revision: &str,
+        _reason: &str,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         Err(WorkspaceClientError::Unavailable(
             "Runtime-owned WorkerRemove forwarding is unavailable".to_string(),
