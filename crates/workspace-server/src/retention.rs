@@ -106,12 +106,15 @@ pub struct WorkerRemovalPlan {
     pub reason: String,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_category: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedWorkerRemoval {
     pub plan: WorkerRemovalPlan,
     pub runtime_request: WorkerRetentionExecutionRequest,
+    pub prior_failure_category: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,7 +345,7 @@ impl SqliteWorkspaceStore {
                 return Err(stale_error(&plan,"current assignment added"));
             }
             let now=Utc::now().to_rfc3339();
-            tx.execute("UPDATE worker_removal_operations SET state='executing',failure_category=NULL,updated_at=?1 WHERE operation_id=?2",params![now,plan.operation_id])?;
+            tx.execute("UPDATE worker_removal_operations SET state='executing',updated_at=?1 WHERE operation_id=?2",params![now,plan.operation_id])?;
             plan.state=WorkerRemovalPlanState::Executing;plan.updated_at=now;tx.commit()?;Ok(plan)
         }).map_err(map_error)
     }
@@ -369,6 +372,7 @@ impl SqliteWorkspaceStore {
             )
         })?;
         let removed_at = plan.created_at.clone();
+        let prior_failure_category = plan.failure_category.clone();
         Ok(PreparedWorkerRemoval {
             runtime_request: WorkerRetentionExecutionRequest {
                 operation_id: plan.operation_id.clone(),
@@ -389,6 +393,7 @@ impl SqliteWorkspaceStore {
                 diagnostics_disposition: plan.diagnostics_disposition,
             },
             plan,
+            prior_failure_category,
         })
     }
 
@@ -429,6 +434,7 @@ impl SqliteWorkspaceStore {
         let Some(plan) = plan else {
             return Ok(None);
         };
+        let prior_failure_category = plan.failure_category.clone();
         let worker_number = plan.worker.worker_id.parse::<u64>().map_err(|_| {
             WorkerRetentionError::Invalid(
                 "Runtime Worker id is not a canonical unsigned integer".to_string(),
@@ -468,6 +474,7 @@ impl SqliteWorkspaceStore {
                 diagnostics_disposition: plan.diagnostics_disposition,
             },
             plan,
+            prior_failure_category,
         }))
     }
 
@@ -758,7 +765,7 @@ fn load_plan_q(c: &Connection, key: &str, id: &str) -> crate::Result<Option<Work
                 worker_revision,run_generation,policy_id,policy_revision,session_disposition,
                 metadata_disposition,archive_retention_kind,archive_retention_seconds,
                 diagnostics_disposition,diagnostics_retention_seconds,archive_id,blockers_json,
-                state,reason,created_at,updated_at
+                state,reason,created_at,updated_at,failure_category
          FROM worker_removal_operations WHERE {key}=?1"
     );
     c.query_row(&query, params![id], |row| {
@@ -799,6 +806,7 @@ fn load_plan_q(c: &Connection, key: &str, id: &str) -> crate::Result<Option<Work
             reason: row.get(19)?,
             created_at: row.get(20)?,
             updated_at: row.get(21)?,
+            failure_category: row.get(22)?,
         })
     })
     .optional()
@@ -1155,6 +1163,43 @@ mod tests {
             Err(WorkerRetentionError::StalePlan { .. })
         ));
     }
+    #[test]
+    fn failed_retry_keeps_cleanup_stage_durable() {
+        let s = setup();
+        let p = s.plan_worker_removal(&req(), &inv()).unwrap();
+        s.prepare_worker_removal_execution("w", &p.plan_id, &p.input_fingerprint)
+            .unwrap();
+        s.fail_worker_removal(
+            "w",
+            &p.operation_id,
+            &p.input_fingerprint,
+            "workdir_attachment_release_failed",
+        )
+        .unwrap();
+        let retry = s
+            .prepare_worker_removal_execution("w", &p.plan_id, &p.input_fingerprint)
+            .unwrap();
+        assert_eq!(retry.plan.state, WorkerRemovalPlanState::Executing);
+        assert_eq!(
+            retry.prior_failure_category.as_deref(),
+            Some("workdir_attachment_release_failed")
+        );
+        let persisted: Option<String> = s
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT failure_category FROM worker_removal_operations WHERE operation_id=?1",
+                    params![p.operation_id],
+                    |row| row.get(0),
+                )
+                .map_err(StoreError::from)
+            })
+            .unwrap();
+        assert_eq!(
+            persisted.as_deref(),
+            Some("workdir_attachment_release_failed")
+        );
+    }
+
     #[test]
     fn prepared_execution_is_derived_from_pinned_plan_generation() {
         let s = setup();
@@ -1530,6 +1575,36 @@ mod tests {
             recovered.runtime_request.expected_worker_revision,
             request.expected_worker_revision
         );
+    }
+
+    #[test]
+    fn recovery_preserves_attachment_failure_stage_for_retry_ordering() {
+        let s = setup();
+        let request = req();
+        let plan = s.plan_worker_removal(&request, &inv()).unwrap();
+        s.prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
+            .unwrap();
+        s.fail_worker_removal(
+            "w",
+            &plan.operation_id,
+            &plan.input_fingerprint,
+            "workdir_attachment_release_failed",
+        )
+        .unwrap();
+        let recovered = s
+            .recover_worker_removal_execution(
+                "w",
+                &request.worker,
+                &request.expected_worker_revision,
+                &request.reason,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovered.prior_failure_category.as_deref(),
+            Some("workdir_attachment_release_failed")
+        );
+        assert_eq!(recovered.plan.state, WorkerRemovalPlanState::Failed);
     }
 
     #[test]
