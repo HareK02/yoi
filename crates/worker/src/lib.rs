@@ -23,7 +23,7 @@ mod permission;
 mod worker;
 
 pub use compact::token_counter::{EstimateSource, SplitPoint, TokenEstimate};
-pub use controller::{ShutdownReceiver, WorkerController, WorkerHandle};
+pub use controller::{ShutdownReceiver, WorkerController, WorkerControllerTransport, WorkerHandle};
 pub use hook::{Hook, HookEventKind, HookRegistryBuilder};
 pub use ipc::alerter::Alerter;
 pub use ipc::server::SocketServer;

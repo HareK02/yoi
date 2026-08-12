@@ -119,6 +119,51 @@ Server and Runtime externally. Post-restart checks confirmed:
 The reusable regression gate is `scripts/isolated-startup-smoke.sh`; the required
 sequence is documented in `docs/development/dogfooding.md`.
 
+### Follow-up: embedded singleton restore failure
+
+The external restart recovered the remote Runtime Workers, but it did not recover
+the two persisted embedded singleton executions. Workspace Memory Consolidation
+(`embedded-worker-runtime/3`) and Workspace Orchestrator
+(`embedded-worker-runtime/6`) are projected as `stopped` without a user stop.
+The embedded Runtime diagnostics record `worker_execution_restore_failed` for
+both with `path must be shorter than SUN_LEN`. Their persisted records still
+contain execution bindings and session files, so this is a failed automatic
+restore after Server restart, not a graceful terminal stop. Follow-up Ticket:
+`00001KZVFQPSK`.
+
+The isolated pre-dogfood gate originally covered remote Runtime persistence reopen
+but not persisted embedded singleton restoration; that missing scenario allowed
+this failure through even after the remote smoke passed.
+
+### Embedded IPC resolution
+
+The embedded Runtime retained every controller's `WorkerHandle` in the Server
+process, but `WorkerController` still unconditionally bound `worker.sock` below
+its persistent `runs/<generation>` directory. The workspace-owned embedded store
+path plus Worker/run components exceeded Linux `sockaddr_un.sun_path`, so restore
+failed before the in-process handle could be registered.
+
+The controller now has an explicit transport policy. Standalone and remote
+Runtime factories keep the default Unix-socket transport for external attach
+clients; the Server-owned embedded factory selects `InProcess` and drives the
+same controller exclusively through `WorkerHandle` channels. Persistent run
+logs and artifact directories remain unchanged, but embedded spawn and restore
+no longer create a socket file.
+
+Regression coverage now includes both direct restore and complete fs-store
+reopen under a path longer than `SUN_LEN`, with assertions that the Worker
+returns to `idle`, no `worker_execution_restore_failed` diagnostic exists, and
+neither run generation contains `worker.sock`. The existing isolated
+production-binary smoke remains the remote Runtime restart gate; embedding the
+Server-owned Runtime into that script requires a separate clean embedded spawn
+fixture because the normal product singleton lifecycle is not a generic smoke
+fixture.
+
+Memory Consolidation also has an earlier independent session failure:
+`memory tools require Backend Workspace API authority and an authenticated
+workspace id`. That authority problem is not the cause of the `SUN_LEN` restore
+failure and should remain separate.
+
 ## Current state observed during diagnosis
 
 - `yoi-server` is not running. Legacy `target/debug/worker-runtime` PID `1820761` remains listening on `127.0.0.1:38800`; it uses the separate standalone Runtime catalog containing Workers 43, 57, 58, 59, 60, 61, 62, and 63.

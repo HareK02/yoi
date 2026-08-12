@@ -54,8 +54,8 @@ use worker::feature::builtin::{
 use worker::ipc::protocol_session::{live_log_entry_event, subscribe_worker_protocol_session};
 use worker::{
     PromptLoader, SegmentLogSink, WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN, Worker,
-    WorkerController, WorkerError, WorkerFilesystemAuthority, WorkerHandle, WorkerSharedState,
-    WorkerWorkspaceContext, WorkspaceClient, WorkspaceId,
+    WorkerController, WorkerControllerTransport, WorkerError, WorkerFilesystemAuthority,
+    WorkerHandle, WorkerSharedState, WorkerWorkspaceContext, WorkspaceClient, WorkspaceId,
 };
 
 const DEFAULT_BACKEND_ID: &str = "worker-crate";
@@ -221,6 +221,7 @@ pub struct ProfileRuntimeWorkerFactory {
     runtime_id: Option<String>,
     worker_mutation_identity: Option<RuntimeIdentityMaterial>,
     embedded_worker_mutation_dispatcher: Option<Arc<dyn EmbeddedWorkerMutationDispatcher>>,
+    controller_transport: WorkerControllerTransport,
 }
 
 impl ProfileRuntimeWorkerFactory {
@@ -235,6 +236,7 @@ impl ProfileRuntimeWorkerFactory {
             runtime_id: None,
             worker_mutation_identity: None,
             embedded_worker_mutation_dispatcher: None,
+            controller_transport: WorkerControllerTransport::UnixSocket,
         }
     }
 
@@ -261,6 +263,14 @@ impl ProfileRuntimeWorkerFactory {
         self.runtime_id = Some(runtime_id.into());
         self.worker_mutation_identity = None;
         self.embedded_worker_mutation_dispatcher = Some(dispatcher);
+        self
+    }
+
+    pub fn with_controller_transport(
+        mut self,
+        controller_transport: WorkerControllerTransport,
+    ) -> Self {
+        self.controller_transport = controller_transport;
         self
     }
 
@@ -649,14 +659,18 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         let run_dir = worker_aggregate_dir
             .join("runs")
             .join(request.run_generation.to_string());
-        let (handle, shutdown_rx) = WorkerController::spawn_runtime_managed_run(worker, &run_dir)
-            .await
-            .map_err(|err| {
-                format!(
-                    "failed to spawn Worker controller in {}: {err}",
-                    run_dir.display()
-                )
-            })?;
+        let (handle, shutdown_rx) = WorkerController::spawn_runtime_managed_run_with_transport(
+            worker,
+            &run_dir,
+            self.controller_transport,
+        )
+        .await
+        .map_err(|err| {
+            format!(
+                "failed to spawn Worker controller in {}: {err}",
+                run_dir.display()
+            )
+        })?;
         if flow_transition_enabled {
             handle.shared_state.enable_flow_transition();
         }
@@ -799,14 +813,18 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         let run_dir = worker_aggregate_dir
             .join("runs")
             .join(request.run_generation.to_string());
-        let (handle, shutdown_rx) = WorkerController::spawn_runtime_managed_run(worker, &run_dir)
-            .await
-            .map_err(|err| {
-                format!(
-                    "failed to spawn restored Worker controller in {}: {err}",
-                    run_dir.display()
-                )
-            })?;
+        let (handle, shutdown_rx) = WorkerController::spawn_runtime_managed_run_with_transport(
+            worker,
+            &run_dir,
+            self.controller_transport,
+        )
+        .await
+        .map_err(|err| {
+            format!(
+                "failed to spawn restored Worker controller in {}: {err}",
+                run_dir.display()
+            )
+        })?;
         if flow_transition_enabled {
             handle.shared_state.enable_flow_transition();
         }
@@ -2079,14 +2097,29 @@ mod tests {
     }
 
     fn sample_profile_archive() -> crate::profile_archive::ProfileSourceArchive {
-        let entrypoints =
-            BTreeMap::from([("default".to_string(), "profiles/default.dcdl".to_string())]);
+        let entrypoints = BTreeMap::from([
+            ("default".to_string(), "profiles/default.dcdl".to_string()),
+            (
+                "builtin:default".to_string(),
+                "profiles/default.dcdl".to_string(),
+            ),
+            (
+                "builtin:companion".to_string(),
+                "profiles/default.dcdl".to_string(),
+            ),
+        ]);
         let sources = BTreeMap::from([(
             "profiles/default.dcdl".to_string(),
             r#"{
                 slug = "default";
                 description = "Default";
                 scope = "workspace_read";
+                model = {
+                    scheme = "anthropic";
+                    model_id = "test-model";
+                    auth = { kind = "none"; };
+                };
+                engine = { max_tokens = 100; };
             }"#
             .to_string(),
         )]);
@@ -2343,6 +2376,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(worker_allocation)]
     async fn restore_pending_worker_uses_saved_manifest_snapshot() {
         let root = tempfile::tempdir().unwrap();
         let runtime_store_dir = root.path().join("runtime");
@@ -2429,6 +2463,180 @@ mod tests {
             "run evidence remains until a separate retention policy disposes it"
         );
         assert!(!run_dir.join("worker.sock").exists());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(worker_allocation)]
+    async fn in_process_restore_does_not_bind_unix_socket_under_overlong_store_path() {
+        let root = tempfile::tempdir().unwrap();
+        let long_component = "embedded-workspace-store-segment".repeat(4);
+        let runtime_store_dir = root.path().join(long_component);
+        let worker_ref = WorkerRef::new(crate::identity::WorkerId::new(1));
+        let worker_aggregate_dir = runtime_store_dir.join("workers/1");
+        let worker_name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&worker_ref);
+        let session_id = session_store::new_session_id();
+        let manifest = manifest::WorkerManifest::from_toml(&format!(
+            r#"
+                [worker]
+                name = "{}"
+                pwd = "{}"
+
+                [model]
+                scheme = "anthropic"
+                model_id = "test-model"
+                auth = {{ kind = "none" }}
+
+                [engine]
+                max_tokens = 100
+
+                [[scope.allow]]
+                target = "{}"
+                permission = "write"
+            "#,
+            worker_name,
+            root.path().display(),
+            root.path().display(),
+        ))
+        .unwrap();
+        WorkerAggregateStore::new(&worker_aggregate_dir, &worker_name)
+            .unwrap()
+            .set_active(
+                &worker_name,
+                Some(session_store::WorkerActiveSegmentRef::pending_segment(
+                    session_id,
+                )),
+                Some(serde_json::to_value(&manifest).unwrap()),
+            )
+            .unwrap();
+
+        let run_dir = runtime_store_dir.join("workers/1/runs/2");
+        let socket_path = run_dir.join("worker.sock");
+        assert!(
+            socket_path.as_os_str().as_encoded_bytes().len() > 107,
+            "test path must exceed Linux sockaddr_un.sun_path capacity: {}",
+            socket_path.display()
+        );
+
+        let controller = ProfileRuntimeWorkerFactory::new(root.path())
+            .with_runtime_store_dir(&runtime_store_dir)
+            .with_controller_transport(WorkerControllerTransport::InProcess)
+            .restore_controller(WorkerExecutionRestoreRequest {
+                worker_ref: worker_ref.clone(),
+                run_generation: 2,
+                request: create_request("embedded restore"),
+                workspace_scope: None,
+                context: test_execution_context(worker_ref),
+                previous_working_directory: None,
+                working_directory: None,
+                config_bundle: None,
+            })
+            .await
+            .expect("in-process restore must not bind the overlong Unix socket path");
+
+        assert_eq!(
+            controller.handle.shared_state.get_status(),
+            WorkerStatus::Idle
+        );
+        assert!(!socket_path.exists());
+        assert!(run_dir.join("worker.out.log").is_file());
+        assert!(run_dir.join("worker.err.log").is_file());
+        controller.handle.send(Method::Shutdown).await.unwrap();
+        if let Some(receiver) = controller.shutdown.lock().await.take() {
+            receiver.await.unwrap();
+        }
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    #[serial_test::serial(worker_allocation)]
+    fn in_process_runtime_reopens_persisted_worker_without_overlong_unix_socket() {
+        let root = tempfile::tempdir().unwrap();
+        let long_component = "embedded-workspace-store-segment".repeat(4);
+        let runtime_store_dir = root.path().join(long_component);
+        let runtime_options = crate::fs_store::FsRuntimeStoreOptions {
+            root: runtime_store_dir.clone(),
+            display_name: Some("embedded".to_string()),
+        };
+
+        let backend = Arc::new(
+            WorkerRuntimeExecutionBackend::new(
+                ProfileRuntimeWorkerFactory::new(root.path())
+                    .with_runtime_store_dir(&runtime_store_dir)
+                    .with_controller_transport(WorkerControllerTransport::InProcess),
+            )
+            .unwrap(),
+        );
+        let runtime = EmbeddedRuntime::with_fs_store_and_execution_backend(
+            runtime_options.clone(),
+            backend.clone(),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let mut request = create_request("embedded singleton");
+        request.profile = ProfileSelector::Builtin("default".to_string());
+        let worker = runtime.create_worker(request).unwrap();
+        let first_run_socket = runtime_store_dir.join("workers/1/runs/1/worker.sock");
+        assert!(
+            first_run_socket.as_os_str().as_encoded_bytes().len() > 107,
+            "test path must exceed Linux sockaddr_un.sun_path capacity: {}",
+            first_run_socket.display()
+        );
+        assert!(!first_run_socket.exists());
+
+        let (handle, shutdown) = {
+            let workers = backend.workers.lock().unwrap();
+            let execution = workers.get(&worker.worker_ref).unwrap();
+            (execution.handle.clone(), execution.shutdown.clone())
+        };
+        backend
+            .run_on_adapter_runtime(async move {
+                handle
+                    .send(Method::Shutdown)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if let Some(receiver) = shutdown.lock().await.take() {
+                    receiver.await.map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        drop(runtime);
+        drop(backend);
+
+        let restored_backend = Arc::new(
+            WorkerRuntimeExecutionBackend::new(
+                ProfileRuntimeWorkerFactory::new(root.path())
+                    .with_runtime_store_dir(&runtime_store_dir)
+                    .with_controller_transport(WorkerControllerTransport::InProcess),
+            )
+            .unwrap(),
+        );
+        let restored = EmbeddedRuntime::with_fs_store_and_execution_backend(
+            runtime_options,
+            restored_backend.clone(),
+        )
+        .expect("persisted in-process Worker must restore without binding its run path");
+        let restored_worker = restored.worker_detail(&worker.worker_ref).unwrap();
+        let diagnostics = restored.diagnostics().unwrap();
+        assert_eq!(
+            restored_worker.status,
+            crate::catalog::WorkerStatus::Idle,
+            "restore diagnostics: {diagnostics:#?}"
+        );
+        assert!(!diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "worker_execution_restore_failed"
+                && diagnostic.worker_ref.as_ref() == Some(&worker.worker_ref)
+        }));
+        let restored_run = runtime_store_dir.join("workers/1/runs/2");
+        assert!(!restored_run.join("worker.sock").exists());
+        assert!(restored_run.join("worker.out.log").is_file());
+        assert!(restored_run.join("worker.err.log").is_file());
+
+        restored
+            .stop_worker(&worker.worker_ref, Some("test cleanup".to_string()))
+            .unwrap();
+        drop(restored);
+        drop(restored_backend);
     }
 
     #[test]

@@ -655,6 +655,7 @@ impl WorkspaceApi {
                     worker_remove_dispatcher.clone(),
                 )
                 .with_runtime_store_dir(config.embedded_runtime_store_root.clone())
+                .with_controller_transport(worker::WorkerControllerTransport::InProcess)
                 .with_resource_client(Arc::new(resource_broker.clone())),
         )
         .map_err(|err| {

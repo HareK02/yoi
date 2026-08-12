@@ -200,6 +200,18 @@ fn should_auto_run_notification(status: WorkerStatus, auto_run: bool) -> bool {
 
 pub type ShutdownReceiver = oneshot::Receiver<()>;
 
+/// Client transport exposed by a Worker controller.
+///
+/// Process-hosted Workers use a Unix socket for external attach clients. Runtimes
+/// that retain the returned [`WorkerHandle`] in the same process can disable that
+/// redundant listener and drive the controller directly through its channels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorkerControllerTransport {
+    #[default]
+    UnixSocket,
+    InProcess,
+}
+
 pub struct WorkerController;
 
 impl WorkerController {
@@ -211,7 +223,14 @@ impl WorkerController {
         C: LlmClient + Clone + 'static,
         St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
     {
-        Self::spawn_inner(worker, runtime_base, false, None).await
+        Self::spawn_inner(
+            worker,
+            runtime_base,
+            false,
+            None,
+            WorkerControllerTransport::UnixSocket,
+        )
+        .await
     }
 
     /// Spawn a Worker owned by `worker-runtime`.
@@ -227,7 +246,14 @@ impl WorkerController {
         C: LlmClient + Clone + 'static,
         St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
     {
-        Self::spawn_inner(worker, runtime_base, true, None).await
+        Self::spawn_inner(
+            worker,
+            runtime_base,
+            true,
+            None,
+            WorkerControllerTransport::UnixSocket,
+        )
+        .await
     }
 
     /// Spawn into an exact persistent `runs/<generation>` directory.
@@ -239,10 +265,29 @@ impl WorkerController {
         C: LlmClient + Clone + 'static,
         St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
     {
+        Self::spawn_runtime_managed_run_with_transport(
+            worker,
+            run_dir,
+            WorkerControllerTransport::UnixSocket,
+        )
+        .await
+    }
+
+    /// Spawn into an exact persistent `runs/<generation>` directory using the
+    /// requested client transport.
+    pub async fn spawn_runtime_managed_run_with_transport<C, St>(
+        worker: Worker<C, St>,
+        run_dir: &Path,
+        transport: WorkerControllerTransport,
+    ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
+    where
+        C: LlmClient + Clone + 'static,
+        St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+    {
         let parent = run_dir
             .parent()
             .ok_or_else(|| std::io::Error::other("run path has no parent"))?;
-        Self::spawn_inner(worker, parent, true, Some(run_dir)).await
+        Self::spawn_inner(worker, parent, true, Some(run_dir), transport).await
     }
 
     async fn spawn_inner<C, St>(
@@ -250,14 +295,21 @@ impl WorkerController {
         runtime_base: &Path,
         runtime_managed: bool,
         runtime_run: Option<&Path>,
+        transport: WorkerControllerTransport,
     ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
     where
         C: LlmClient + Clone + 'static,
         St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
     {
         let session = worker.workdir_session().cloned();
-        let result =
-            Self::spawn_initialized(worker, runtime_base, runtime_managed, runtime_run).await;
+        let result = Self::spawn_initialized(
+            worker,
+            runtime_base,
+            runtime_managed,
+            runtime_run,
+            transport,
+        )
+        .await;
         if result.is_err()
             && let Some(session) = session
             && let Err(error) = session.close().await
@@ -272,6 +324,7 @@ impl WorkerController {
         runtime_base: &Path,
         runtime_managed: bool,
         runtime_run: Option<&Path>,
+        transport: WorkerControllerTransport,
     ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
     where
         C: LlmClient + Clone + 'static,
@@ -287,10 +340,9 @@ impl WorkerController {
         let in_flight = InFlightEvents::new(event_tx.clone());
         worker.attach_in_flight_events(in_flight.clone());
 
-        // Runtime directory is created before tool registration because
-        // the spawn-tool factories need its socket path, and before the
-        // initial status/history writes consume the greeting we build
-        // after registration is complete.
+        // Runtime directory is created before tool registration because it owns
+        // bounded tool artifacts, and before initial status/history writes consume
+        // the greeting we build after registration is complete.
         let runtime_dir = Arc::new(if let Some(run_dir) = runtime_run {
             RuntimeDir::create_worker_run(run_dir).await?
         } else if runtime_managed {
@@ -411,7 +463,10 @@ impl WorkerController {
             sink: worker.sink(),
         };
 
-        let socket_server = SocketServer::start(&handle).await?;
+        let socket_server = match transport {
+            WorkerControllerTransport::UnixSocket => Some(SocketServer::start(&handle).await?),
+            WorkerControllerTransport::InProcess => None,
+        };
 
         // === 5. controller_loop ===
         // Clone cancel sender and notification buffer before moving worker
@@ -908,13 +963,14 @@ async fn controller_loop<C, St>(
     spawner_name: String,
     spawned_registry: Arc<SpawnedWorkerRegistry>,
     shutdown_tx: oneshot::Sender<()>,
-    socket_server: SocketServer,
+    socket_server: Option<SocketServer>,
     shutdown_after_idle: ShutdownAfterIdleRequest,
 ) where
     C: LlmClient + Clone + 'static,
     St: Store + WorkerMetadataStore + Clone + 'static,
 {
-    // Hold socket server alive for the lifetime of the controller task.
+    // Hold an optional external attach server alive for the controller lifetime.
+    // In-process runtimes retain and drive the WorkerHandle directly.
     let _socket_server = socket_server;
 
     let discovery_runtime_base = runtime_dir
