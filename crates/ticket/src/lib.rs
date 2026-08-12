@@ -10,6 +10,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use chrono::Utc;
 use fs4::fs_std::FileExt;
@@ -1387,6 +1389,21 @@ pub struct TicketSummary {
     pub updated_at: Option<String>,
 }
 
+/// Bounded SQLite list projection used by Workspace list surfaces.
+///
+/// This intentionally contains only summary fields and relation blockers. Full Ticket bodies,
+/// events, references, and artifacts remain exclusive to [`TicketBackend::show`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqliteTicketListItem {
+    pub summary: TicketSummary,
+    pub relation_blockers: Vec<TicketRelationBlocker>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SqliteTicketListProjection {
+    pub items: Vec<SqliteTicketListItem>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketInvalidRecord {
     pub label: String,
@@ -2214,6 +2231,8 @@ pub struct SqliteTicketBackend {
     record_language: Option<String>,
     event_attributes: BTreeMap<String, String>,
     mutation_hook: Option<Arc<SqliteTicketMutationHook>>,
+    #[cfg(test)]
+    full_ticket_load_count: Arc<AtomicUsize>,
 }
 
 impl fmt::Debug for SqliteTicketBackend {
@@ -2240,6 +2259,8 @@ impl SqliteTicketBackend {
             record_language: None,
             event_attributes: BTreeMap::new(),
             mutation_hook: None,
+            #[cfg(test)]
+            full_ticket_load_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -2287,6 +2308,202 @@ impl SqliteTicketBackend {
     }
     pub fn record_language(&self) -> Option<&str> {
         self.record_language.as_deref()
+    }
+
+    /// Lists a bounded Workspace projection in one verified SQLite read.
+    ///
+    /// The summary query applies `updated_at DESC, ticket_id ASC` and `limit` before relation
+    /// enrichment. A second bulk query loads only relations touching those returned Tickets,
+    /// including the blocking Ticket states needed to preserve relation blocker semantics.
+    pub fn list_workspace_projection(&self, limit: usize) -> Result<SqliteTicketListProjection> {
+        self.with_read(|conn| {
+            let summaries = self.list_workspace_summaries(conn, limit)?;
+            if summaries.is_empty() {
+                return Ok(SqliteTicketListProjection::default());
+            }
+            let blockers = self.list_workspace_blockers(conn, &summaries)?;
+            Ok(SqliteTicketListProjection {
+                items: summaries
+                    .into_iter()
+                    .map(|summary| {
+                        let relation_blockers =
+                            blockers.get(&summary.id).cloned().unwrap_or_default();
+                        SqliteTicketListItem {
+                            summary,
+                            relation_blockers,
+                        }
+                    })
+                    .collect(),
+            })
+        })
+    }
+
+    fn list_workspace_summaries(
+        &self,
+        conn: &Connection,
+        limit: usize,
+    ) -> Result<Vec<TicketSummary>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = conn
+            .prepare(
+                "SELECT ticket_id, slug, title, status, kind, priority, readiness,
+                        workflow_state, workflow_state_explicit, queued_by, queued_at, updated_at
+                 FROM typed_tickets
+                 WHERE workspace_id = ?1
+                 ORDER BY updated_at DESC, ticket_id ASC
+                 LIMIT ?2",
+            )
+            .map_err(sqlite_err)?;
+        let rows = statement
+            .query_map(params![self.workspace_id, limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)? != 0,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                ))
+            })
+            .map_err(sqlite_err)?;
+        let mut summaries = Vec::new();
+        for row in rows {
+            let (
+                id,
+                slug,
+                title,
+                status,
+                kind,
+                priority,
+                readiness,
+                workflow_state,
+                workflow_state_explicit,
+                queued_by,
+                queued_at,
+                updated_at,
+            ) = row.map_err(sqlite_err)?;
+            summaries.push(TicketSummary {
+                id,
+                slug,
+                title,
+                status: ExtensibleTicketStatus::from(status.as_str()),
+                kind,
+                priority,
+                labels: Vec::new(),
+                readiness,
+                workflow_state: TicketWorkflowState::parse(&workflow_state)
+                    .unwrap_or(TicketWorkflowState::Planning),
+                workflow_state_explicit,
+                queued_by,
+                queued_at,
+                updated_at,
+            });
+        }
+        Ok(summaries)
+    }
+
+    fn list_workspace_blockers(
+        &self,
+        conn: &Connection,
+        summaries: &[TicketSummary],
+    ) -> Result<HashMap<String, Vec<TicketRelationBlocker>>> {
+        let listed_ids = summaries
+            .iter()
+            .map(|summary| summary.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut statement = conn
+            .prepare(
+                "SELECT relation.ticket_id, relation.kind, relation.target, relation.note,
+                        source.workflow_state, target.workflow_state
+                 FROM typed_ticket_relations AS relation
+                 LEFT JOIN typed_tickets AS source
+                   ON source.workspace_id = relation.workspace_id
+                  AND source.ticket_id = relation.ticket_id
+                 LEFT JOIN typed_tickets AS target
+                   ON target.workspace_id = relation.workspace_id
+                  AND target.ticket_id = relation.target
+                 WHERE relation.workspace_id = ?1
+                   AND relation.kind IN ('depends_on', 'blocks')
+                   AND EXISTS (
+                       SELECT 1 FROM json_each(?2) AS listed
+                       WHERE listed.value = relation.ticket_id
+                          OR listed.value = relation.target
+                   )",
+            )
+            .map_err(sqlite_err)?;
+        let listed_ids_json = serde_json::to_string(
+            &summaries
+                .iter()
+                .map(|summary| summary.id.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| TicketError::Sqlite(error.to_string()))?;
+        let rows = statement
+            .query_map(params![self.workspace_id, listed_ids_json], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })
+            .map_err(sqlite_err)?;
+        let mut blockers = HashMap::<String, Vec<TicketRelationBlocker>>::new();
+        for row in rows {
+            let (source, kind, target, note, source_state, target_state) =
+                row.map_err(sqlite_err)?;
+            let (listed_ticket, blocking_ticket, reason_kind, relation_kind, blocking_state) =
+                match kind.as_str() {
+                    "depends_on" if listed_ids.contains(source.as_str()) => (
+                        source,
+                        target,
+                        "depends_on",
+                        TicketRelationKind::DependsOn,
+                        target_state,
+                    ),
+                    "blocks" if listed_ids.contains(target.as_str()) => (
+                        target,
+                        source,
+                        "blocked_by",
+                        TicketRelationKind::Blocks,
+                        source_state,
+                    ),
+                    _ => continue,
+                };
+            let blocking_state = blocking_state
+                .as_deref()
+                .and_then(TicketWorkflowState::parse)
+                .unwrap_or(TicketWorkflowState::Planning);
+            if ticket_state_resolved(blocking_state) {
+                continue;
+            }
+            blockers
+                .entry(listed_ticket)
+                .or_default()
+                .push(TicketRelationBlocker {
+                    blocking_ticket,
+                    reason_kind: reason_kind.to_string(),
+                    relation_kind,
+                    note,
+                    blocking_state,
+                });
+        }
+        for ticket_blockers in blockers.values_mut() {
+            ticket_blockers.sort_by(|a, b| {
+                a.reason_kind
+                    .cmp(&b.reason_kind)
+                    .then_with(|| a.blocking_ticket.cmp(&b.blocking_ticket))
+            });
+        }
+        Ok(blockers)
     }
 
     pub fn import_from_local_backend(&self, local: &LocalTicketBackend) -> Result<()> {
@@ -2533,6 +2750,8 @@ impl SqliteTicketBackend {
     }
 
     fn load_ticket(&self, conn: &Connection, ticket_id: &str) -> Result<Ticket> {
+        #[cfg(test)]
+        self.full_ticket_load_count.fetch_add(1, Ordering::SeqCst);
         let (mut meta, body, resolution): (TicketMeta, String, Option<String>) = conn.query_row(r#"SELECT ticket_id, slug, title, status, kind, priority, created_at, updated_at, assignee, readiness, body, resolution, workflow_state, workflow_state_explicit, queued_by, queued_at, repository_id, ref_selector FROM typed_tickets WHERE workspace_id = ?1 AND ticket_id = ?2"#,
             params![self.workspace_id, ticket_id], |row| Ok((Self::ticket_meta_from_row(row)?, row.get(10)?, row.get(11)?))).optional().map_err(sqlite_err)?.ok_or_else(|| TicketError::NotFound(ticket_id.to_string()))?;
         meta.labels = self.load_ordered_values(conn, "typed_ticket_labels", "label", ticket_id)?;
@@ -6261,6 +6480,129 @@ state: planning
                 .iter()
                 .all(|event| event.body.as_str() != "must roll back")
         );
+    }
+
+    #[test]
+    fn sqlite_workspace_projection_preserves_order_limit_and_blockers_without_full_loads() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("workspace.db");
+        let backend = SqliteTicketBackend::open(&db_path, "workspace-test").unwrap();
+        let mut blocker_input = NewTicket::new("Blocker");
+        blocker_input.workflow_state = Some(TicketWorkflowState::InProgress);
+        let blocker = backend.create(blocker_input).unwrap();
+        let mut blocked_input = NewTicket::new("Blocked");
+        blocked_input.workflow_state = Some(TicketWorkflowState::Ready);
+        let blocked = backend.create(blocked_input).unwrap();
+        let mut newest_input = NewTicket::new("Newest");
+        newest_input.workflow_state = Some(TicketWorkflowState::Ready);
+        let newest = backend.create(newest_input).unwrap();
+        backend
+            .add_ticket_relation(
+                TicketIdOrSlug::Id(blocked.id.clone()),
+                NewTicketRelation {
+                    kind: TicketRelationKind::DependsOn,
+                    target: blocker.id.clone(),
+                    note: Some("wait".to_string()),
+                    author: Some("test".to_string()),
+                },
+            )
+            .unwrap();
+        let connection = Connection::open(&db_path).unwrap();
+        connection
+            .execute(
+                "UPDATE typed_tickets SET updated_at = CASE ticket_id
+                    WHEN ?2 THEN '2026-08-12T03:00:00Z'
+                    WHEN ?3 THEN '2026-08-12T02:00:00Z'
+                    ELSE '2026-08-12T01:00:00Z' END
+                 WHERE workspace_id = ?1",
+                params!["workspace-test", newest.id, blocked.id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO typed_ticket_events
+                    (workspace_id, ticket_id, event_index, kind, author, at, body)
+                 VALUES (?1, ?2, 99, 'comment', 'test', '2026-08-12T00:00:00Z', ?3)",
+                params!["workspace-test", blocked.id, "full-event-marker"],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO typed_ticket_artifacts
+                    (workspace_id, ticket_id, relative_path, content)
+                 VALUES (?1, ?2, 'full-artifact-marker', X'01')",
+                params!["workspace-test", blocked.id],
+            )
+            .unwrap();
+        drop(connection);
+
+        let full_loads_before = backend.full_ticket_load_count.load(Ordering::SeqCst);
+        let all_projection = backend.list_workspace_projection(3).unwrap();
+        let blocked_with_both_relation_ends_listed = all_projection
+            .items
+            .iter()
+            .find(|item| item.summary.id == blocked.id)
+            .expect("blocked Ticket is listed");
+        assert_eq!(
+            blocked_with_both_relation_ends_listed
+                .relation_blockers
+                .len(),
+            1,
+            "a relation must not duplicate when both endpoints are listed",
+        );
+        let projection = backend.list_workspace_projection(2).unwrap();
+        assert_eq!(
+            backend.full_ticket_load_count.load(Ordering::SeqCst),
+            full_loads_before,
+            "bulk projection must not run a full Ticket load per listed item",
+        );
+        assert_eq!(
+            projection
+                .items
+                .iter()
+                .map(|item| item.summary.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![newest.id.as_str(), blocked.id.as_str()]
+        );
+        let blocked_item = &projection.items[1];
+        assert_eq!(blocked_item.relation_blockers.len(), 1);
+        assert_eq!(
+            blocked_item.relation_blockers[0].blocking_ticket,
+            blocker.id
+        );
+        assert_eq!(
+            blocked_item.relation_blockers[0].blocking_state,
+            TicketWorkflowState::InProgress
+        );
+        assert_eq!(blocked_item.relation_blockers[0].reason_kind, "depends_on");
+        let debug = format!("{projection:?}");
+        assert!(!debug.contains("full-event-marker"));
+        assert!(!debug.contains("full-artifact-marker"));
+    }
+
+    #[test]
+    fn sqlite_workspace_projection_sql_shape_is_constant_for_ticket_count() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("pub fn list_workspace_projection")
+            .expect("projection method");
+        let end = source[start..]
+            .find("pub fn import_from_local_backend")
+            .map(|offset| start + offset)
+            .expect("following method");
+        let projection_source = &source[start..end];
+        assert_eq!(projection_source.matches("self.with_read(").count(), 1);
+        assert_eq!(projection_source.matches(".prepare(").count(), 2);
+        let item_loop = projection_source
+            .split("items: summaries")
+            .nth(1)
+            .expect("summary projection loop");
+        assert!(!item_loop.contains("open_connection("));
+        assert!(!item_loop.contains("verify_sqlite_ticket_schema("));
+        assert!(!item_loop.contains("self.load_ticket("));
+        assert!(!projection_source.contains("typed_ticket_events"));
+        assert!(!projection_source.contains("typed_ticket_event_references"));
+        assert!(!projection_source.contains("typed_ticket_artifacts"));
     }
 
     #[test]

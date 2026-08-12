@@ -4,8 +4,8 @@ use chrono::Utc;
 use project_record::{allocate_record_id, unix_epoch_millis_now};
 
 use ticket::{
-    SqliteTicketBackend, TicketBackend, TicketIdOrSlug, TicketListQuery,
-    TicketWorkspaceActionPriority, project_ticket_workspace_item,
+    SqliteTicketBackend, TicketBackend, TicketIdOrSlug, TicketWorkspaceActionPriority,
+    project_ticket_workspace_item,
 };
 
 use crate::records::{
@@ -207,31 +207,27 @@ impl SqliteWorkspaceAuthority {
 
 impl TicketAuthority for SqliteWorkspaceAuthority {
     fn list_tickets(&self, limit: usize) -> Result<ProjectRecordList<TicketSummary>> {
-        let mut items = Vec::new();
-        for item in self.ticket_backend.list(TicketListQuery::all())? {
-            let ticket = self
-                .ticket_backend
-                .show(TicketIdOrSlug::Id(item.id.clone()))?;
-            let projection = project_ticket_workspace_item(&item, &ticket.relations.blockers, None);
-            items.push(TicketSummary {
-                id: item.id,
-                title: item.title,
-                state: item.workflow_state.as_str().to_string(),
-                priority: item.priority,
-                updated_at: item.updated_at,
-                queued_by: item.queued_by,
-                queued_at: item.queued_at,
-                workspace_action_priority: workspace_action_priority_name(projection.priority)
-                    .to_string(),
-                record_source: "sqlite_yoi_ticket".to_string(),
-            });
-        }
-        items.sort_by(|a, b| {
-            b.updated_at
-                .cmp(&a.updated_at)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        items.truncate(limit);
+        let projection = self.ticket_backend.list_workspace_projection(limit)?;
+        let items = projection
+            .items
+            .into_iter()
+            .map(|item| {
+                let projection =
+                    project_ticket_workspace_item(&item.summary, &item.relation_blockers, None);
+                TicketSummary {
+                    id: item.summary.id,
+                    title: item.summary.title,
+                    state: item.summary.workflow_state.as_str().to_string(),
+                    priority: item.summary.priority,
+                    updated_at: item.summary.updated_at,
+                    queued_by: item.summary.queued_by,
+                    queued_at: item.summary.queued_at,
+                    workspace_action_priority: workspace_action_priority_name(projection.priority)
+                        .to_string(),
+                    record_source: "sqlite_yoi_ticket".to_string(),
+                }
+            })
+            .collect();
         Ok(ProjectRecordList {
             items,
             invalid_records: Vec::new(),
