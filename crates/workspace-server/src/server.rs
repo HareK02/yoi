@@ -1152,6 +1152,10 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             post(scoped_commit_workspace_config_tree),
         )
         .route(
+            "/api/w/{workspace_id}/config/source-tree/revisions/{revision}",
+            get(scoped_get_workspace_config_revision),
+        )
+        .route(
             "/api/w/{workspace_id}/config/source-tree/entries/{*path}",
             get(scoped_get_workspace_config_entry),
         )
@@ -2439,6 +2443,24 @@ async fn scoped_update_workspace_settings(
             }],
         },
     ))
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceConfigRevisionPath {
+    workspace_id: String,
+    revision: u64,
+}
+
+async fn scoped_get_workspace_config_revision(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<WorkspaceConfigRevisionPath>,
+) -> ApiResult<Json<ConfigTreeSnapshot>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let snapshot = api
+        .config_store
+        .load_workspace_config_revision(&path.workspace_id, path.revision)?
+        .ok_or_else(|| ApiError::from(Error::InvalidRecordId(path.revision.to_string())))?;
+    Ok(Json(snapshot))
 }
 
 #[derive(Debug, Deserialize)]

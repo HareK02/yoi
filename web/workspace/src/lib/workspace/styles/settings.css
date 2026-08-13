@@ -631,6 +631,22 @@
     color: var(--text-muted);
     font-size: 0.8rem;
   }
+  .config-source-conflict {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    padding: var(--space-3);
+    border-top: 1px solid var(--danger);
+    background: color-mix(in srgb, var(--danger) 8%, transparent);
+  }
+  .config-source-conflict button {
+    border: 1px solid var(--danger);
+    border-radius: 0.45rem;
+    background: var(--bg-raised);
+    color: var(--danger);
+    padding: 0.4rem 0.6rem;
+    cursor: pointer;
+  }
   .config-source-diagnostics {
     display: grid;
     gap: var(--space-2);

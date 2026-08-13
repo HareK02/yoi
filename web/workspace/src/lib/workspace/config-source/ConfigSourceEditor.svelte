@@ -27,6 +27,8 @@
   let renamePath = $state("");
   let baseSnapshot = $state<WorkspaceConfigTreeResponse["snapshot"] | null>(null);
   let preflightDigest = $state("");
+  let conflict = $state(false);
+  let candidateContract = $state<WorkspaceConfigTreeResponse["contract"] | null>(null);
   let toolchain: ConfigSourceToolchain | null = null;
 
   const paths = $derived(
@@ -58,6 +60,8 @@
       draftChanges = [];
       renamePath = selectedPath;
       diagnostics = [];
+      conflict = false;
+      candidateContract = null;
       status = treeState.snapshot.revision === 0
         ? "No committed sources yet. Create workspace.dcdl to begin."
         : `Revision ${treeState.snapshot.revision} · ${treeState.snapshot.digest.slice(0, 20)}…`;
@@ -73,6 +77,8 @@
     if (treeState) treeState = { ...treeState, snapshot: candidate };
     if (baseSnapshot) draftChanges = await toolchain.changesBetween(baseSnapshot, candidate);
     preflightDigest = "";
+    candidateContract = null;
+    conflict = false;
   }
 
   async function select(path: string) {
@@ -142,13 +148,16 @@
       const candidate = await previewConfigTree(workspaceId, {
         changes: draftChanges,
         entrypoints: entrypoints(),
-        toolchain_fingerprint: treeState.contract.fingerprint,
       });
+      await toolchain?.evaluate(candidate.contract);
       diagnostics = [];
+      candidateContract = candidate.contract;
       preflightDigest = candidate.snapshot.digest;
       status = `Preview valid · projection ${candidate.evaluation.projection_digest.slice(0, 20)}…`;
     } catch (error) {
-      status = String(error);
+      const message = String(error);
+      conflict = message.includes("conflict") || message.includes("base revision/digest mismatch");
+      status = conflict ? `${message} Reload the authoritative tree before editing again.` : message;
     } finally {
       busy = false;
     }
@@ -161,7 +170,7 @@
       status = "No draft changes to commit.";
       return;
     }
-    if (preflightDigest !== treeState.snapshot.digest) {
+    if (preflightDigest !== treeState.snapshot.digest || !candidateContract) {
       status = "Preview the complete candidate successfully before Commit.";
       return;
     }
@@ -171,11 +180,13 @@
         base_revision: baseRevision,
         base_digest: baseDigest,
         changes: draftChanges,
-        entrypoints: entrypoints(),
-        toolchain_fingerprint: treeState.contract.fingerprint,
+        entrypoints: candidateContract.entrypoints,
+        toolchain_fingerprint: candidateContract.fingerprint,
       });
       draftChanges = [];
       preflightDigest = "";
+    candidateContract = null;
+    conflict = false;
       baseSnapshot = structuredClone(treeState.snapshot);
       baseRevision = treeState.snapshot.revision;
       baseDigest = treeState.snapshot.digest;
@@ -184,10 +195,37 @@
       diagnostics = [];
       status = `Committed revision ${treeState.snapshot.revision}.`;
     } catch (error) {
-      status = String(error);
+      const message = String(error);
+      conflict = message.includes("conflict") || message.includes("base revision/digest mismatch");
+      status = conflict ? `${message} Reload the authoritative tree before editing again.` : message;
     } finally {
       busy = false;
     }
+  }
+
+  async function discardAndReload() {
+    draftChanges = [];
+    source = "";
+    await reload();
+  }
+
+  async function reloadAndReapply() {
+    if (!toolchain || !treeState) return;
+    const localCandidate = structuredClone(treeState.snapshot);
+    const remote = await fetchConfigTree(workspaceId);
+    baseSnapshot = structuredClone(remote.snapshot);
+    baseRevision = remote.snapshot.revision;
+    baseDigest = remote.snapshot.digest;
+    await toolchain.setSnapshot(remote.snapshot);
+    draftChanges = await toolchain.changesBetween(remote.snapshot, localCandidate);
+    const candidate = await toolchain.applyChanges(draftChanges);
+    treeState = { ...remote, snapshot: candidate };
+    selectedPath = candidate.entries[selectedPath] ? selectedPath : Object.keys(candidate.entries).toSorted()[0] ?? "";
+    source = selectedPath ? candidate.entries[selectedPath].content : "";
+    conflict = false;
+    preflightDigest = "";
+    candidateContract = null;
+    status = "Local candidate reapplied to the latest revision. Preview again before Commit.";
   }
 
   function createEntry() {
@@ -210,6 +248,8 @@
     treeState = { ...treeState, snapshot: candidate };
     if (baseSnapshot) draftChanges = await toolchain.changesBetween(baseSnapshot, candidate);
     preflightDigest = "";
+    candidateContract = null;
+    conflict = false;
     selectedPath = Object.keys(candidate.entries).toSorted()[0] ?? "";
     source = selectedPath ? candidate.entries[selectedPath].content : "";
     renamePath = selectedPath;
@@ -231,6 +271,8 @@
     treeState = { ...treeState, snapshot: candidate };
     if (baseSnapshot) draftChanges = await toolchain.changesBetween(baseSnapshot, candidate);
     preflightDigest = "";
+    candidateContract = null;
+    conflict = false;
     selectedPath = to;
     source = candidate.entries[to]?.content ?? "";
     status = `Rename to ${to} staged. Preview and Commit to persist.`;
@@ -282,6 +324,12 @@
       onComplete={(value, offset, explicit) => toolchain?.complete(selectedPath, value, offset, explicit) ?? Promise.resolve(null)}
     />
     <p class="config-source-status" aria-live="polite">{status}</p>
+    {#if conflict}
+      <div class="config-source-conflict" role="alert">
+        <button type="button" onclick={discardAndReload}>Discard local candidate and reload</button>
+        <button type="button" onclick={reloadAndReapply}>Reload and reapply local candidate</button>
+      </div>
+    {/if}
     {#if diagnostics.length > 0}
       <ol class="config-source-diagnostics">
         {#each diagnostics as diagnostic}

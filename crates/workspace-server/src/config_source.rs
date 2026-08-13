@@ -56,6 +56,36 @@ impl SqliteWorkspaceStore {
         self.with_conn(|conn| load_state(conn, workspace_id))
     }
 
+    pub fn load_workspace_config_revision(
+        &self,
+        workspace_id: &str,
+        revision: u64,
+    ) -> Result<Option<ConfigTreeSnapshot>> {
+        self.with_conn(|conn| {
+            let manifest = conn
+                .query_row(
+                    "SELECT tree_digest, manifest_json FROM workspace_config_tree_revisions WHERE workspace_id = ?1 AND revision = ?2",
+                    params![workspace_id, revision as i64],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let Some((stored_digest, manifest_json)) = manifest else {
+                return Ok(None);
+            };
+            let entries: std::collections::BTreeMap<VirtualPath, ConfigEntry> =
+                serde_json::from_str(&manifest_json)
+                    .map_err(|error| Error::RegistryInconsistency(error.to_string()))?;
+            let snapshot = ConfigTreeSnapshot::from_entries(revision, entries.into_values())
+                .map_err(config_error)?;
+            if snapshot.digest != stored_digest {
+                return Err(Error::RegistryInconsistency(format!(
+                    "virtual config revision digest mismatch for Workspace {workspace_id} revision {revision}"
+                )));
+            }
+            Ok(Some(snapshot))
+        })
+    }
+
     pub fn evaluate_workspace_config_candidate(
         &self,
         workspace_id: &str,
@@ -473,6 +503,59 @@ mod tests {
             .commit_evaluated_workspace_config("w-config", &candidate)
             .unwrap_err();
         assert!(matches!(error, Error::WorkspaceConfigConflict(_)));
+    }
+
+    #[tokio::test]
+    async fn committed_revision_remains_retrievable_after_later_commit() {
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        store.upsert_workspace(&workspace()).await.unwrap();
+        let empty = ConfigTreeSnapshot::empty();
+        let contract = ToolchainContract::new(
+            DEFAULT_SCHEMA_VERSION,
+            vec![path(DEFAULT_CONFIG_ENTRYPOINT)],
+            DEFAULT_IMPORT_POLICY_VERSION,
+        );
+        let first = store
+            .evaluate_and_commit_workspace_config(
+                "w-config",
+                &ConfigCommitRequest {
+                    base_revision: 0,
+                    base_digest: empty.digest,
+                    changes: vec![ConfigTreeChange::Create {
+                        path: path(DEFAULT_CONFIG_ENTRYPOINT),
+                        content_type: ConfigContentType::Decodal,
+                        content: "{ answer = 1; }".into(),
+                    }],
+                    entrypoints: contract.entrypoints.clone(),
+                    toolchain_fingerprint: contract.fingerprint.clone(),
+                },
+            )
+            .unwrap();
+        let entry = first
+            .snapshot
+            .get(&path(DEFAULT_CONFIG_ENTRYPOINT))
+            .unwrap();
+        store
+            .evaluate_and_commit_workspace_config(
+                "w-config",
+                &ConfigCommitRequest {
+                    base_revision: first.snapshot.revision,
+                    base_digest: first.snapshot.digest.clone(),
+                    changes: vec![ConfigTreeChange::Update {
+                        path: path(DEFAULT_CONFIG_ENTRYPOINT),
+                        expected_digest: entry.content_digest.clone(),
+                        content: "{ answer = 2; }".into(),
+                    }],
+                    entrypoints: contract.entrypoints,
+                    toolchain_fingerprint: contract.fingerprint,
+                },
+            )
+            .unwrap();
+        let revision = store
+            .load_workspace_config_revision("w-config", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(revision, first.snapshot);
     }
 
     #[tokio::test]

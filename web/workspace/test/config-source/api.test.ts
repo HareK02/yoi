@@ -4,6 +4,7 @@ import { assert, assertEquals } from "jsr:@std/assert";
 import {
   commitConfigTree,
   fetchConfigEntry,
+  fetchConfigRevision,
   fetchConfigTree,
   previewConfigTree,
 } from "../../src/lib/workspace/config-source/api.ts";
@@ -23,8 +24,9 @@ Deno.test("config source API stays workspace-scoped and separates preview from c
   }) as typeof fetch;
 
   await fetchConfigTree("w/one", fetcher);
+  await fetchConfigRevision("w/one", 7, fetcher);
   await fetchConfigEntry("w/one", "profiles/main.dcdl", fetcher);
-  await previewConfigTree("w/one", { changes: [], entrypoints: [], toolchain_fingerprint: "sha256:toolchain" }, fetcher);
+  await previewConfigTree("w/one", { changes: [], entrypoints: [] }, fetcher);
   await commitConfigTree("w/one", {
     base_revision: 4,
     base_digest: "sha256:base",
@@ -35,14 +37,15 @@ Deno.test("config source API stays workspace-scoped and separates preview from c
 
   assertEquals(calls.map((call) => call.url), [
     "/api/w/w%2Fone/config/source-tree",
+    "/api/w/w%2Fone/config/source-tree/revisions/7",
     "/api/w/w%2Fone/config/source-tree/entries/profiles%2Fmain.dcdl",
     "/api/w/w%2Fone/config/source-tree/preview",
     "/api/w/w%2Fone/config/source-tree/commit",
   ]);
-  assertEquals(calls[2].init?.method, "POST");
   assertEquals(calls[3].init?.method, "POST");
+  assertEquals(calls[4].init?.method, "POST");
   assert(
-    String(calls[3].init?.body).includes('"base_digest":"sha256:base"'),
+    String(calls[4].init?.body).includes('"base_digest":"sha256:base"'),
   );
 });
 
@@ -53,7 +56,7 @@ Deno.test("config source API surfaces failed evaluation instead of treating it a
     )) as typeof fetch;
   let message = "";
   try {
-    await previewConfigTree("w", { changes: [], entrypoints: [], toolchain_fingerprint: "sha256:toolchain" }, fetcher);
+    await previewConfigTree("w", { changes: [], entrypoints: [] }, fetcher);
   } catch (error) {
     message = String(error);
   }

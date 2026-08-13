@@ -1,6 +1,8 @@
 import type {
   ConfigCommitRequest,
   ConfigEntry,
+  ConfigPreviewRequest,
+  ConfigTreeSnapshot,
   EvaluatedConfigCandidate,
   WorkspaceConfigTreeResponse,
 } from "./types.ts";
@@ -41,9 +43,21 @@ export async function fetchConfigEntry(
   );
 }
 
+export async function fetchConfigRevision(
+  workspaceId: string,
+  revision: number,
+  fetcher: typeof fetch = fetch,
+): Promise<ConfigTreeSnapshot> {
+  return await readJson(
+    await fetcher(`${sourceTreeUrl(workspaceId)}/revisions/${revision}`, {
+      headers: { accept: "application/json" },
+    }),
+  );
+}
+
 export async function previewConfigTree(
   workspaceId: string,
-  request: Omit<ConfigCommitRequest, "base_revision" | "base_digest">,
+  request: ConfigPreviewRequest,
   fetcher: typeof fetch = fetch,
 ): Promise<EvaluatedConfigCandidate> {
   return await readJson(
