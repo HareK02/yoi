@@ -1,8 +1,8 @@
 use chrono::{SecondsFormat, Utc};
 use config_source::{
-    ConfigContentType, ConfigEntry, ConfigTreeChange, ConfigTreeSnapshot, DECODAL_VERSION,
-    DEFAULT_IMPORT_POLICY_VERSION, DEFAULT_SCHEMA_VERSION, EvaluationResult, SnapshotEnvironment,
-    ToolchainContract, VirtualPath,
+    ConfigContentType, ConfigEntry, ConfigSchemaContribution, ConfigTreeChange, ConfigTreeSnapshot,
+    DECODAL_VERSION, DEFAULT_IMPORT_POLICY_VERSION, DEFAULT_SCHEMA_VERSION, EvaluationResult,
+    SnapshotEnvironment, ToolchainContract, VirtualPath, WorkspaceConfigSchemaBundle,
 };
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -16,12 +16,48 @@ fn main_config_path() -> VirtualPath {
     VirtualPath::parse(MAIN_CONFIG_ENTRYPOINT).expect("main config entrypoint is a valid path")
 }
 
-fn main_config_contract() -> ToolchainContract {
-    ToolchainContract::new(
+pub trait WorkspaceConfigSchemaProvider: Send + Sync {
+    fn contribution(&self) -> Result<ConfigSchemaContribution>;
+}
+
+#[derive(Clone, Default)]
+pub struct WorkspaceConfigSchemaRegistry {
+    providers: Vec<std::sync::Arc<dyn WorkspaceConfigSchemaProvider>>,
+}
+
+impl WorkspaceConfigSchemaRegistry {
+    pub fn with_provider(
+        mut self,
+        provider: std::sync::Arc<dyn WorkspaceConfigSchemaProvider>,
+    ) -> Self {
+        self.providers.push(provider);
+        self
+    }
+
+    pub fn compose(&self) -> Result<WorkspaceConfigSchemaBundle> {
+        WorkspaceConfigSchemaBundle::compose(
+            self.providers
+                .iter()
+                .map(|provider| provider.contribution())
+                .collect::<Result<Vec<_>>>()?,
+        )
+        .map_err(config_error)
+    }
+}
+
+fn main_config_contract_with_schema(
+    schema_bundle: WorkspaceConfigSchemaBundle,
+) -> ToolchainContract {
+    ToolchainContract::with_schema_bundle(
         DEFAULT_SCHEMA_VERSION,
         vec![main_config_path()],
         DEFAULT_IMPORT_POLICY_VERSION,
+        schema_bundle,
     )
+}
+
+fn main_config_contract() -> ToolchainContract {
+    main_config_contract_with_schema(WorkspaceConfigSchemaBundle::empty())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
@@ -127,10 +163,11 @@ impl SqliteWorkspaceStore {
         })
     }
 
-    pub fn evaluate_workspace_config_candidate(
+    pub fn evaluate_workspace_config_candidate_with_schema(
         &self,
         workspace_id: &str,
         request: &ConfigCommitRequest,
+        schema_bundle: WorkspaceConfigSchemaBundle,
     ) -> Result<EvaluatedConfigCandidate> {
         let current = self
             .load_workspace_config(workspace_id)?
@@ -144,14 +181,39 @@ impl SqliteWorkspaceStore {
                 current.snapshot.revision
             )));
         }
-        let expected_contract = main_config_contract();
+        let expected_contract = main_config_contract_with_schema(schema_bundle.clone());
         if expected_contract.fingerprint != request.toolchain_fingerprint {
             return Err(config_conflict(format!(
                 "toolchain fingerprint mismatch; current fingerprint is {}",
                 expected_contract.fingerprint
             )));
         }
-        evaluate_candidate(current, &request.changes)
+        evaluate_candidate(current, &request.changes, schema_bundle)
+    }
+
+    pub fn evaluate_workspace_config_candidate(
+        &self,
+        workspace_id: &str,
+        request: &ConfigCommitRequest,
+    ) -> Result<EvaluatedConfigCandidate> {
+        self.evaluate_workspace_config_candidate_with_schema(
+            workspace_id,
+            request,
+            WorkspaceConfigSchemaBundle::empty(),
+        )
+    }
+
+    pub fn preview_workspace_config_with_schema(
+        &self,
+        workspace_id: &str,
+        request: &ConfigPreviewRequest,
+        schema_bundle: WorkspaceConfigSchemaBundle,
+    ) -> Result<EvaluatedConfigCandidate> {
+        validate_entrypoint_request(&request.entrypoints)?;
+        let current = self
+            .load_workspace_config(workspace_id)?
+            .ok_or_else(config_not_materialized)?;
+        evaluate_candidate(current, &request.changes, schema_bundle)
     }
 
     pub fn preview_workspace_config(
@@ -159,11 +221,11 @@ impl SqliteWorkspaceStore {
         workspace_id: &str,
         request: &ConfigPreviewRequest,
     ) -> Result<EvaluatedConfigCandidate> {
-        validate_entrypoint_request(&request.entrypoints)?;
-        let current = self
-            .load_workspace_config(workspace_id)?
-            .ok_or_else(config_not_materialized)?;
-        evaluate_candidate(current, &request.changes)
+        self.preview_workspace_config_with_schema(
+            workspace_id,
+            request,
+            WorkspaceConfigSchemaBundle::empty(),
+        )
     }
 
     pub fn commit_evaluated_workspace_config(
@@ -197,9 +259,9 @@ impl SqliteWorkspaceStore {
             tx.execute(
                 r#"INSERT INTO workspace_config_trees (
                     workspace_id, revision, tree_digest, schema_version, entrypoints_json,
-                    decodal_version, import_policy_version, toolchain_fingerprint,
-                    projection_digest, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    decodal_version, import_policy_version, schema_bundle_json,
+                    toolchain_fingerprint, projection_digest, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                 ON CONFLICT(workspace_id) DO UPDATE SET
                     revision = excluded.revision,
                     tree_digest = excluded.tree_digest,
@@ -207,6 +269,7 @@ impl SqliteWorkspaceStore {
                     entrypoints_json = excluded.entrypoints_json,
                     decodal_version = excluded.decodal_version,
                     import_policy_version = excluded.import_policy_version,
+                    schema_bundle_json = excluded.schema_bundle_json,
                     toolchain_fingerprint = excluded.toolchain_fingerprint,
                     projection_digest = excluded.projection_digest,
                     updated_at = excluded.updated_at"#,
@@ -219,6 +282,8 @@ impl SqliteWorkspaceStore {
                         .map_err(|error| Error::Store(error.to_string()))?,
                     candidate.contract.decodal_version,
                     candidate.contract.import_policy_version,
+                    serde_json::to_string(&candidate.contract.schema_bundle)
+                        .map_err(|error| Error::Store(error.to_string()))?,
                     candidate.contract.fingerprint,
                     candidate.evaluation.projection_digest,
                     now,
@@ -247,13 +312,15 @@ impl SqliteWorkspaceStore {
             tx.execute(
                 r#"INSERT INTO workspace_config_tree_revisions (
                     workspace_id, revision, tree_digest, toolchain_fingerprint,
-                    projection_digest, manifest_json, created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+                    schema_bundle_json, projection_digest, manifest_json, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
                 params![
                     workspace_id,
                     next_revision as i64,
                     snapshot.digest,
                     candidate.contract.fingerprint,
+                    serde_json::to_string(&candidate.contract.schema_bundle)
+                        .map_err(|error| Error::Store(error.to_string()))?,
                     candidate.evaluation.projection_digest,
                     manifest_json,
                     now,
@@ -281,11 +348,12 @@ impl SqliteWorkspaceStore {
 fn evaluate_candidate(
     current: WorkspaceConfigState,
     changes: &[ConfigTreeChange],
+    schema_bundle: WorkspaceConfigSchemaBundle,
 ) -> Result<EvaluatedConfigCandidate> {
     reject_main_entrypoint_mutation(changes)?;
     let snapshot = current.snapshot.apply(changes).map_err(config_error)?;
     ensure_main_entrypoint(&snapshot)?;
-    let contract = main_config_contract();
+    let contract = main_config_contract_with_schema(schema_bundle);
     let evaluation = SnapshotEnvironment::new(snapshot.clone())
         .evaluate_contract(&contract)
         .map_err(|diagnostics| {
@@ -307,10 +375,19 @@ pub(crate) fn load_state(
     conn: &rusqlite::Connection,
     workspace_id: &str,
 ) -> Result<Option<WorkspaceConfigState>> {
-    let header = conn
-        .query_row(
+    let has_schema_bundle: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_table_info('workspace_config_trees')
+            WHERE name = 'schema_bundle_json'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    let header = if has_schema_bundle {
+        conn.query_row(
             r#"SELECT revision, tree_digest, schema_version, entrypoints_json,
-                      decodal_version, import_policy_version, toolchain_fingerprint, projection_digest
+                      decodal_version, import_policy_version, schema_bundle_json,
+                      toolchain_fingerprint, projection_digest
                FROM workspace_config_trees WHERE workspace_id = ?1"#,
             [workspace_id],
             |row| {
@@ -321,12 +398,36 @@ pub(crate) fn load_state(
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, u32>(5)?,
+                    Some(row.get::<_, String>(6)?),
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            },
+        )
+        .optional()?
+    } else {
+        conn.query_row(
+            r#"SELECT revision, tree_digest, schema_version, entrypoints_json,
+                      decodal_version, import_policy_version,
+                      toolchain_fingerprint, projection_digest
+               FROM workspace_config_trees WHERE workspace_id = ?1"#,
+            [workspace_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u32>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, u32>(5)?,
+                    None,
                     row.get::<_, String>(6)?,
                     row.get::<_, String>(7)?,
                 ))
             },
         )
-        .optional()?;
+        .optional()?
+    };
     let Some((
         revision,
         stored_digest,
@@ -334,6 +435,7 @@ pub(crate) fn load_state(
         entrypoints_json,
         decodal_version,
         import_policy_version,
+        schema_bundle_json,
         fingerprint,
         projection_digest,
     )) = header
@@ -376,7 +478,17 @@ pub(crate) fn load_state(
     }
     let entrypoints: Vec<VirtualPath> = serde_json::from_str(&entrypoints_json)
         .map_err(|error| Error::RegistryInconsistency(error.to_string()))?;
-    let contract = ToolchainContract::new(schema_version, entrypoints, import_policy_version);
+    let schema_bundle = match schema_bundle_json {
+        Some(schema_bundle_json) => serde_json::from_str(&schema_bundle_json)
+            .map_err(|error| Error::RegistryInconsistency(error.to_string()))?,
+        None => WorkspaceConfigSchemaBundle::empty(),
+    };
+    let contract = ToolchainContract::with_schema_bundle(
+        schema_version,
+        entrypoints,
+        import_policy_version,
+        schema_bundle,
+    );
     if decodal_version != DECODAL_VERSION || contract.fingerprint != fingerprint {
         return Err(Error::RegistryInconsistency(format!(
             "virtual config toolchain metadata mismatch for Workspace {workspace_id}"
@@ -425,35 +537,79 @@ pub(crate) fn insert_materialized_state(
         .map_err(|error| Error::Store(error.to_string()))?;
     let manifest_json = serde_json::to_string(&state.snapshot.entries)
         .map_err(|error| Error::Store(error.to_string()))?;
-    tx.execute(
-        "INSERT INTO workspace_config_trees (
-            workspace_id, revision, tree_digest, schema_version, entrypoints_json,
-            decodal_version, import_policy_version, toolchain_fingerprint,
-            projection_digest, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-         ON CONFLICT(workspace_id) DO UPDATE SET
-            revision = excluded.revision,
-            tree_digest = excluded.tree_digest,
-            schema_version = excluded.schema_version,
-            entrypoints_json = excluded.entrypoints_json,
-            decodal_version = excluded.decodal_version,
-            import_policy_version = excluded.import_policy_version,
-            toolchain_fingerprint = excluded.toolchain_fingerprint,
-            projection_digest = excluded.projection_digest,
-            updated_at = excluded.updated_at",
-        rusqlite::params![
-            workspace_id,
-            state.snapshot.revision,
-            state.snapshot.digest,
-            state.contract.schema_version,
-            entrypoints_json,
-            DECODAL_VERSION,
-            state.contract.import_policy_version,
-            state.contract.fingerprint,
-            state.projection_digest,
-            materialized_at,
-        ],
+    let has_schema_bundle: bool = tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_table_info('workspace_config_trees')
+            WHERE name = 'schema_bundle_json'
+         )",
+        [],
+        |row| row.get(0),
     )?;
+    let schema_bundle_json = serde_json::to_string(&state.contract.schema_bundle)
+        .map_err(|error| Error::Store(error.to_string()))?;
+    if has_schema_bundle {
+        tx.execute(
+            "INSERT INTO workspace_config_trees (
+                workspace_id, revision, tree_digest, schema_version, entrypoints_json,
+                decodal_version, import_policy_version, schema_bundle_json,
+                toolchain_fingerprint, projection_digest, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(workspace_id) DO UPDATE SET
+                revision = excluded.revision,
+                tree_digest = excluded.tree_digest,
+                schema_version = excluded.schema_version,
+                entrypoints_json = excluded.entrypoints_json,
+                decodal_version = excluded.decodal_version,
+                import_policy_version = excluded.import_policy_version,
+                schema_bundle_json = excluded.schema_bundle_json,
+                toolchain_fingerprint = excluded.toolchain_fingerprint,
+                projection_digest = excluded.projection_digest,
+                updated_at = excluded.updated_at",
+            rusqlite::params![
+                workspace_id,
+                state.snapshot.revision,
+                state.snapshot.digest,
+                state.contract.schema_version,
+                entrypoints_json,
+                DECODAL_VERSION,
+                state.contract.import_policy_version,
+                schema_bundle_json,
+                state.contract.fingerprint,
+                state.projection_digest,
+                materialized_at,
+            ],
+        )?;
+    } else {
+        tx.execute(
+            "INSERT INTO workspace_config_trees (
+                workspace_id, revision, tree_digest, schema_version, entrypoints_json,
+                decodal_version, import_policy_version, toolchain_fingerprint,
+                projection_digest, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(workspace_id) DO UPDATE SET
+                revision = excluded.revision,
+                tree_digest = excluded.tree_digest,
+                schema_version = excluded.schema_version,
+                entrypoints_json = excluded.entrypoints_json,
+                decodal_version = excluded.decodal_version,
+                import_policy_version = excluded.import_policy_version,
+                toolchain_fingerprint = excluded.toolchain_fingerprint,
+                projection_digest = excluded.projection_digest,
+                updated_at = excluded.updated_at",
+            rusqlite::params![
+                workspace_id,
+                state.snapshot.revision,
+                state.snapshot.digest,
+                state.contract.schema_version,
+                entrypoints_json,
+                DECODAL_VERSION,
+                state.contract.import_policy_version,
+                state.contract.fingerprint,
+                state.projection_digest,
+                materialized_at,
+            ],
+        )?;
+    }
     for entry in state.snapshot.entries.values() {
         tx.execute(
             "INSERT INTO workspace_config_entries (
@@ -468,21 +624,40 @@ pub(crate) fn insert_materialized_state(
             ],
         )?;
     }
-    tx.execute(
-        "INSERT INTO workspace_config_tree_revisions (
-            workspace_id, revision, tree_digest, toolchain_fingerprint,
-            projection_digest, manifest_json, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        rusqlite::params![
-            workspace_id,
-            state.snapshot.revision,
-            state.snapshot.digest,
-            state.contract.fingerprint,
-            state.projection_digest,
-            manifest_json,
-            materialized_at,
-        ],
-    )?;
+    if has_schema_bundle {
+        tx.execute(
+            "INSERT INTO workspace_config_tree_revisions (
+                workspace_id, revision, tree_digest, toolchain_fingerprint,
+                schema_bundle_json, projection_digest, manifest_json, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                workspace_id,
+                state.snapshot.revision,
+                state.snapshot.digest,
+                state.contract.fingerprint,
+                schema_bundle_json,
+                state.projection_digest,
+                manifest_json,
+                materialized_at,
+            ],
+        )?;
+    } else {
+        tx.execute(
+            "INSERT INTO workspace_config_tree_revisions (
+                workspace_id, revision, tree_digest, toolchain_fingerprint,
+                projection_digest, manifest_json, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                workspace_id,
+                state.snapshot.revision,
+                state.snapshot.digest,
+                state.contract.fingerprint,
+                state.projection_digest,
+                manifest_json,
+                materialized_at,
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -606,6 +781,96 @@ mod tests {
             expected_digest: main.content_digest.clone(),
             content: content.to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn schema_registry_applies_normal_decodal_composition() {
+        struct WebSchema;
+
+        impl WorkspaceConfigSchemaProvider for WebSchema {
+            fn contribution(&self) -> Result<ConfigSchemaContribution> {
+                ConfigSchemaContribution::new(
+                    "builtin:web",
+                    "web",
+                    "1",
+                    "{ web = { enabled = Bool default false; }; }",
+                )
+                .map_err(config_error)
+            }
+        }
+
+        let store = open_store().await;
+        let current = store.load_workspace_config("w-config").unwrap().unwrap();
+        let main = current.snapshot.get(&path(MAIN_CONFIG_ENTRYPOINT)).unwrap();
+        let registry =
+            WorkspaceConfigSchemaRegistry::default().with_provider(std::sync::Arc::new(WebSchema));
+        let schema = registry.compose().unwrap();
+        let expected_contract = main_config_contract_with_schema(schema.clone());
+        let candidate = store
+            .evaluate_workspace_config_candidate_with_schema(
+                "w-config",
+                &ConfigCommitRequest {
+                    base_revision: current.snapshot.revision,
+                    base_digest: current.snapshot.digest.clone(),
+                    changes: vec![ConfigTreeChange::Update {
+                        path: path(MAIN_CONFIG_ENTRYPOINT),
+                        expected_digest: main.content_digest.clone(),
+                        content: "{ web = {}; }".to_string(),
+                    }],
+                    entrypoints: vec![path(MAIN_CONFIG_ENTRYPOINT)],
+                    toolchain_fingerprint: expected_contract.fingerprint.clone(),
+                },
+                schema,
+            )
+            .unwrap();
+        assert_eq!(
+            candidate.evaluation.projections[0].data_json["web"]["enabled"],
+            false
+        );
+        assert_eq!(
+            candidate.contract.fingerprint,
+            expected_contract.fingerprint
+        );
+        store
+            .commit_evaluated_workspace_config("w-config", &candidate)
+            .unwrap();
+        assert_eq!(
+            store
+                .load_workspace_config("w-config")
+                .unwrap()
+                .unwrap()
+                .contract
+                .schema_bundle,
+            expected_contract.schema_bundle
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_stale_schema_bundle_fingerprint() {
+        let store = open_store().await;
+        let current = store.load_workspace_config("w-config").unwrap().unwrap();
+        let schema = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+            "builtin:web",
+            "web",
+            "1",
+            "{ web = {}; }",
+        )
+        .unwrap()])
+        .unwrap();
+        let error = store
+            .evaluate_workspace_config_candidate_with_schema(
+                "w-config",
+                &ConfigCommitRequest {
+                    base_revision: current.snapshot.revision,
+                    base_digest: current.snapshot.digest,
+                    changes: Vec::new(),
+                    entrypoints: vec![path(MAIN_CONFIG_ENTRYPOINT)],
+                    toolchain_fingerprint: current.contract.fingerprint,
+                },
+                schema,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("toolchain fingerprint mismatch"));
     }
 
     #[tokio::test]
@@ -806,6 +1071,7 @@ mod tests {
             [],
         )
         .unwrap();
+        crate::store::persist_workspace_config_schema_bundles(&conn).unwrap();
         crate::store::materialize_main_config_entrypoint(&conn).unwrap();
         let state = load_state(&conn, "legacy").unwrap().unwrap();
         assert!(

@@ -9,10 +9,14 @@ use decodal_language_service::{CompletionResult, LanguageService};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const CONFIG_SOURCE_CONTRACT_VERSION: u32 = 1;
+pub const CONFIG_SOURCE_CONTRACT_VERSION: u32 = 2;
 pub const DECODAL_VERSION: &str = "0.2.0";
 pub const DEFAULT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_IMPORT_POLICY_VERSION: u32 = 1;
+pub const WORKSPACE_CONFIG_SCHEMA_GLOBAL: &str = "WorkspaceConfigSchema";
+pub const WORKSPACE_CONFIG_SCHEMA_SOURCE: &str = "workspace-config-schema.dcdl";
+pub const WORKSPACE_CONFIG_EVALUATION_SOURCE: &str =
+    "WorkspaceConfigSchema & import \"__MAIN_ENTRYPOINT__\"";
 pub const MAX_ENTRY_COUNT: usize = 256;
 pub const MAX_CHANGE_COUNT: usize = 256;
 pub const MAX_ENTRY_BYTES: usize = 256 * 1024;
@@ -322,20 +326,180 @@ impl ConfigTreeChange {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+pub struct ConfigSchemaContribution {
+    pub provider_id: String,
+    pub namespace: String,
+    pub version: String,
+    pub source: String,
+    pub source_digest: String,
+}
+
+impl ConfigSchemaContribution {
+    pub fn new(
+        provider_id: impl Into<String>,
+        namespace: impl Into<String>,
+        version: impl Into<String>,
+        source: impl Into<String>,
+    ) -> Result<Self, ConfigTreeError> {
+        let provider_id = provider_id.into();
+        let namespace = namespace.into();
+        let version = version.into();
+        let source = source.into();
+        if provider_id.trim().is_empty() {
+            return Err(ConfigTreeError::InvalidSchemaContribution(
+                "provider_id must not be empty".to_string(),
+            ));
+        }
+        if namespace.trim().is_empty() {
+            return Err(ConfigTreeError::InvalidSchemaContribution(
+                "namespace must not be empty".to_string(),
+            ));
+        }
+        if version.trim().is_empty() {
+            return Err(ConfigTreeError::InvalidSchemaContribution(
+                "version must not be empty".to_string(),
+            ));
+        }
+        if source.trim().is_empty() {
+            return Err(ConfigTreeError::InvalidSchemaContribution(
+                "schema source must not be empty".to_string(),
+            ));
+        }
+        Ok(Self {
+            provider_id,
+            namespace,
+            version,
+            source_digest: digest_bytes(source.as_bytes()),
+            source,
+        })
+    }
+
+    fn validate(&self) -> Result<(), ConfigTreeError> {
+        let expected = digest_bytes(self.source.as_bytes());
+        if self.source_digest != expected {
+            return Err(ConfigTreeError::InvalidSchemaContribution(format!(
+                "schema contribution {} digest mismatch",
+                self.provider_id
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+pub struct WorkspaceConfigSchemaBundle {
+    pub contributions: Vec<ConfigSchemaContribution>,
+    pub source: String,
+    pub fingerprint: String,
+}
+
+impl WorkspaceConfigSchemaBundle {
+    pub fn compose(
+        contributions: impl IntoIterator<Item = ConfigSchemaContribution>,
+    ) -> Result<Self, ConfigTreeError> {
+        let mut contributions = contributions.into_iter().collect::<Vec<_>>();
+        contributions.sort_by(|left, right| left.provider_id.cmp(&right.provider_id));
+        for contribution in &contributions {
+            contribution.validate()?;
+        }
+        for pair in contributions.windows(2) {
+            if pair[0].provider_id == pair[1].provider_id {
+                return Err(ConfigTreeError::DuplicateSchemaProvider(
+                    pair[0].provider_id.clone(),
+                ));
+            }
+        }
+        let mut namespaces = std::collections::BTreeSet::new();
+        for contribution in &contributions {
+            if !namespaces.insert(contribution.namespace.clone()) {
+                return Err(ConfigTreeError::DuplicateSchemaNamespace(
+                    contribution.namespace.clone(),
+                ));
+            }
+        }
+        let source = if contributions.is_empty() {
+            "{}".to_string()
+        } else {
+            contributions
+                .iter()
+                .map(|contribution| format!("({})", contribution.source))
+                .collect::<Vec<_>>()
+                .join(" & ")
+        };
+        let fingerprint = digest_bytes(
+            serde_json::to_vec(&(
+                CONFIG_SOURCE_CONTRACT_VERSION,
+                DECODAL_VERSION,
+                contributions
+                    .iter()
+                    .map(|contribution| {
+                        (
+                            contribution.provider_id.as_str(),
+                            contribution.namespace.as_str(),
+                            contribution.version.as_str(),
+                            contribution.source_digest.as_str(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                digest_bytes(source.as_bytes()),
+            ))
+            .expect("schema bundle fingerprint input serializes")
+            .as_slice(),
+        );
+        Ok(Self {
+            contributions,
+            source,
+            fingerprint,
+        })
+    }
+
+    pub fn empty() -> Self {
+        Self::compose(Vec::new()).expect("empty schema bundle is valid")
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigTreeError> {
+        let recomposed = Self::compose(self.contributions.clone())?;
+        if recomposed.source != self.source || recomposed.fingerprint != self.fingerprint {
+            return Err(ConfigTreeError::InvalidSchemaContribution(
+                "workspace config schema bundle fingerprint mismatch".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 pub struct ToolchainContract {
     pub contract_version: u32,
     pub decodal_version: String,
     pub schema_version: u32,
     pub entrypoints: Vec<VirtualPath>,
     pub import_policy_version: u32,
+    pub schema_bundle: WorkspaceConfigSchemaBundle,
     pub fingerprint: String,
 }
 
 impl ToolchainContract {
     pub fn new(
         schema_version: u32,
+        entrypoints: Vec<VirtualPath>,
+        import_policy_version: u32,
+    ) -> Self {
+        Self::with_schema_bundle(
+            schema_version,
+            entrypoints,
+            import_policy_version,
+            WorkspaceConfigSchemaBundle::empty(),
+        )
+    }
+
+    pub fn with_schema_bundle(
+        schema_version: u32,
         mut entrypoints: Vec<VirtualPath>,
         import_policy_version: u32,
+        schema_bundle: WorkspaceConfigSchemaBundle,
     ) -> Self {
         entrypoints.sort();
         entrypoints.dedup();
@@ -345,6 +509,7 @@ impl ToolchainContract {
             schema_version,
             entrypoints,
             import_policy_version,
+            schema_bundle,
             fingerprint: String::new(),
         };
         contract.fingerprint = digest_bytes(
@@ -354,11 +519,31 @@ impl ToolchainContract {
                 contract.schema_version,
                 &contract.entrypoints,
                 contract.import_policy_version,
+                &contract.schema_bundle.fingerprint,
             ))
             .expect("toolchain contract serializes")
             .as_slice(),
         );
         contract
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigTreeError> {
+        self.schema_bundle.validate()?;
+        let expected = Self::with_schema_bundle(
+            self.schema_version,
+            self.entrypoints.clone(),
+            self.import_policy_version,
+            self.schema_bundle.clone(),
+        );
+        if self.contract_version != expected.contract_version
+            || self.decodal_version != expected.decodal_version
+            || self.fingerprint != expected.fingerprint
+        {
+            return Err(ConfigTreeError::InvalidSchemaContribution(
+                "toolchain contract fingerprint mismatch".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -420,6 +605,13 @@ impl SnapshotEnvironment {
         &self,
         contract: &ToolchainContract,
     ) -> Result<EvaluationResult, Vec<ConfigDiagnostic>> {
+        if let Err(error) = contract.validate() {
+            return Err(vec![self.config_error(
+                VirtualPath::parse(WORKSPACE_CONFIG_SCHEMA_SOURCE).expect("schema path is valid"),
+                "schema_contract",
+                &error.to_string(),
+            )]);
+        }
         let service = LanguageService::new(self);
         let diagnostics = self
             .snapshot
@@ -440,45 +632,105 @@ impl SnapshotEnvironment {
         if !diagnostics.is_empty() {
             return Err(diagnostics);
         }
-        let mut projections = Vec::new();
-        for entrypoint in &contract.entrypoints {
-            let Some(entry) = self.snapshot.get(entrypoint) else {
-                return Err(vec![self.config_error(
-                    entrypoint.clone(),
-                    "entrypoint_missing",
-                    "configured entrypoint is missing",
-                )]);
-            };
-            if entry.content_type != ConfigContentType::Decodal {
-                return Err(vec![self.config_error(
-                    entrypoint.clone(),
-                    "entrypoint_not_decodal",
-                    "configured entrypoint is not Decodal source",
-                )]);
-            }
-            match service.evaluate(entrypoint.as_str(), entrypoint.as_str(), &entry.content) {
-                Ok(data) => {
-                    let data_json = decodal_data_to_json(&data);
-                    let projection_digest = digest_bytes(
-                        serde_json::to_vec(&data_json)
-                            .expect("Decodal projection serializes")
-                            .as_slice(),
-                    );
-                    projections.push(EvaluatedProjection {
-                        entrypoint: entrypoint.clone(),
-                        data_json,
-                        projection_digest,
-                    });
-                }
-                Err(diagnostic) => {
-                    return Err(vec![project_diagnostic(
-                        &self.snapshot,
-                        entrypoint.clone(),
-                        &diagnostic,
-                    )]);
-                }
-            }
+        let Some(entrypoint) = contract.entrypoints.first() else {
+            return Ok(EvaluationResult {
+                projections: Vec::new(),
+                projection_digest: digest_bytes(b"[]"),
+            });
+        };
+        if contract.entrypoints.len() != 1 {
+            return Err(vec![self.config_error(
+                entrypoint.clone(),
+                "entrypoint_count",
+                "Workspace config evaluation requires exactly one entrypoint",
+            )]);
         }
+        let Some(entry) = self.snapshot.get(entrypoint) else {
+            return Err(vec![self.config_error(
+                entrypoint.clone(),
+                "entrypoint_missing",
+                "configured entrypoint is missing",
+            )]);
+        };
+        if entry.content_type != ConfigContentType::Decodal {
+            return Err(vec![self.config_error(
+                entrypoint.clone(),
+                "entrypoint_not_decodal",
+                "configured entrypoint is not Decodal source",
+            )]);
+        }
+        let mut engine = decodal::Engine::new(SnapshotImportLoader {
+            snapshot: self.snapshot.clone(),
+        });
+        let schema_module = engine
+            .add_root_source(
+                WORKSPACE_CONFIG_SCHEMA_SOURCE,
+                WORKSPACE_CONFIG_SCHEMA_SOURCE,
+                &contract.schema_bundle.source,
+            )
+            .map_err(|diagnostic| {
+                vec![project_engine_diagnostic(
+                    &engine,
+                    &self.snapshot,
+                    VirtualPath::parse(WORKSPACE_CONFIG_SCHEMA_SOURCE)
+                        .expect("schema path is valid"),
+                    &diagnostic,
+                )]
+            })?;
+        let schema = engine.eval_module(schema_module).map_err(|diagnostic| {
+            vec![project_engine_diagnostic(
+                &engine,
+                &self.snapshot,
+                VirtualPath::parse(WORKSPACE_CONFIG_SCHEMA_SOURCE).expect("schema path is valid"),
+                &diagnostic,
+            )]
+        })?;
+        engine.bind_global_runtime(WORKSPACE_CONFIG_SCHEMA_GLOBAL, schema);
+        let evaluation_source =
+            WORKSPACE_CONFIG_EVALUATION_SOURCE.replace("__MAIN_ENTRYPOINT__", entrypoint.as_str());
+        let evaluation_module = engine
+            .add_root_source(
+                "workspace-config-evaluation.dcdl",
+                "workspace-config-evaluation.dcdl",
+                &evaluation_source,
+            )
+            .map_err(|diagnostic| {
+                vec![project_engine_diagnostic(
+                    &engine,
+                    &self.snapshot,
+                    entrypoint.clone(),
+                    &diagnostic,
+                )]
+            })?;
+        let value = engine
+            .eval_module(evaluation_module)
+            .map_err(|diagnostic| {
+                vec![project_engine_diagnostic(
+                    &engine,
+                    &self.snapshot,
+                    entrypoint.clone(),
+                    &diagnostic,
+                )]
+            })?;
+        let data = engine.materialize(&value).map_err(|diagnostic| {
+            vec![project_engine_diagnostic(
+                &engine,
+                &self.snapshot,
+                entrypoint.clone(),
+                &diagnostic,
+            )]
+        })?;
+        let data_json = decodal_data_to_json(&data);
+        let projection_digest = digest_bytes(
+            serde_json::to_vec(&data_json)
+                .expect("Decodal projection serializes")
+                .as_slice(),
+        );
+        let projections = vec![EvaluatedProjection {
+            entrypoint: entrypoint.clone(),
+            data_json,
+            projection_digest,
+        }];
         let projection_digest = digest_bytes(
             serde_json::to_vec(&projections)
                 .expect("projection set serializes")
@@ -692,6 +944,42 @@ pub fn import_completions(
     candidates.into_iter().collect()
 }
 
+fn project_engine_diagnostic(
+    engine: &decodal::Engine<SnapshotImportLoader>,
+    snapshot: &ConfigTreeSnapshot,
+    fallback_path: VirtualPath,
+    diagnostic: &Diagnostic,
+) -> ConfigDiagnostic {
+    let path = engine
+        .source_name(diagnostic.span.source)
+        .and_then(|name| VirtualPath::parse(name).ok())
+        .filter(|path| snapshot.entries.contains_key(path))
+        .unwrap_or(fallback_path);
+    ConfigDiagnostic {
+        path,
+        revision: snapshot.revision,
+        tree_digest: snapshot.digest.clone(),
+        span: ConfigSpan {
+            start_byte: diagnostic.span.start,
+            end_byte: diagnostic.span.end,
+        },
+        kind: format!("{:?}", diagnostic.kind).to_ascii_lowercase(),
+        message: diagnostic.message.clone(),
+        labels: diagnostic
+            .labels
+            .iter()
+            .map(|label| ConfigDiagnosticLabel {
+                span: ConfigSpan {
+                    start_byte: label.span.start,
+                    end_byte: label.span.end,
+                },
+                message: label.message.clone(),
+            })
+            .collect(),
+        notes: diagnostic.notes.clone(),
+    }
+}
+
 fn project_diagnostic(
     snapshot: &ConfigTreeSnapshot,
     fallback_path: VirtualPath,
@@ -807,6 +1095,12 @@ pub enum ConfigTreeError {
     PathChangedMoreThanOnce(VirtualPath),
     #[error("duplicate virtual config path")]
     DuplicatePath,
+    #[error("duplicate Workspace config schema provider: {0}")]
+    DuplicateSchemaProvider(String),
+    #[error("duplicate Workspace config schema namespace owner: {0}")]
+    DuplicateSchemaNamespace(String),
+    #[error("invalid Workspace config schema contribution: {0}")]
+    InvalidSchemaContribution(String),
     #[error("virtual config limit exceeded: {0}")]
     LimitExceeded(&'static str),
 }
@@ -832,6 +1126,8 @@ mod tests {
         export!(ConfigEntry);
         export!(ConfigTreeSnapshot);
         export!(ConfigTreeChange);
+        export!(ConfigSchemaContribution);
+        export!(WorkspaceConfigSchemaBundle);
         export!(ToolchainContract);
         export!(ConfigSpan);
         export!(ConfigDiagnosticLabel);
@@ -935,6 +1231,106 @@ mod tests {
             import_completions(&snapshot, Some(&path("profiles/main.dcdl")), "../sh"),
             ["../shared/value.dcdl"]
         );
+    }
+
+    #[test]
+    fn schema_bundle_is_order_independent_and_rejects_duplicate_provider() {
+        let web = ConfigSchemaContribution::new(
+            "builtin:web",
+            "web",
+            "1",
+            "{ web = { enabled = Bool default false; }; }",
+        )
+        .unwrap();
+        let tickets = ConfigSchemaContribution::new(
+            "builtin:tickets",
+            "tickets",
+            "1",
+            "{ tickets = { enabled = Bool default true; }; }",
+        )
+        .unwrap();
+        let left = WorkspaceConfigSchemaBundle::compose([web.clone(), tickets.clone()]).unwrap();
+        let right = WorkspaceConfigSchemaBundle::compose([tickets, web.clone()]).unwrap();
+        assert_eq!(left, right);
+        assert!(matches!(
+            WorkspaceConfigSchemaBundle::compose([web.clone(), web.clone()]),
+            Err(ConfigTreeError::DuplicateSchemaProvider(provider)) if provider == "builtin:web"
+        ));
+        let conflicting_namespace = ConfigSchemaContribution::new(
+            "project:web-extension",
+            "web",
+            "1",
+            "{ web = { extension = true; }; }",
+        )
+        .unwrap();
+        assert!(matches!(
+            WorkspaceConfigSchemaBundle::compose([web.clone(), conflicting_namespace]),
+            Err(ConfigTreeError::DuplicateSchemaNamespace(namespace)) if namespace == "web"
+        ));
+    }
+
+    #[test]
+    fn workspace_schema_is_applied_with_normal_decodal_composition() {
+        let snapshot =
+            ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", "{ web = {}; custom = 42; }")])
+                .unwrap();
+        let schema = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+            "builtin:web",
+            "web",
+            "1",
+            "{ web = { enabled = Bool default false; }; }",
+        )
+        .unwrap()])
+        .unwrap();
+        let contract = ToolchainContract::with_schema_bundle(1, vec![path("main.dcdl")], 1, schema);
+        let result = SnapshotEnvironment::new(snapshot)
+            .evaluate_contract(&contract)
+            .unwrap();
+        assert_eq!(result.projections[0].data_json["web"]["enabled"], false);
+        assert_eq!(result.projections[0].data_json["custom"], 42);
+    }
+
+    #[test]
+    fn workspace_schema_type_mismatch_is_a_decodal_diagnostic() {
+        let snapshot = ConfigTreeSnapshot::from_entries(
+            1,
+            [entry("main.dcdl", "{ web = { enabled = 1; }; }")],
+        )
+        .unwrap();
+        let schema = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+            "builtin:web",
+            "web",
+            "1",
+            "{ web = { enabled = Bool default false; }; }",
+        )
+        .unwrap()])
+        .unwrap();
+        let diagnostics = SnapshotEnvironment::new(snapshot)
+            .evaluate_contract(&ToolchainContract::with_schema_bundle(
+                1,
+                vec![path("main.dcdl")],
+                1,
+                schema,
+            ))
+            .unwrap_err();
+        assert_eq!(diagnostics[0].kind, "constraintviolation");
+        assert!(!diagnostics[0].message.is_empty());
+    }
+
+    #[test]
+    fn schema_bundle_changes_toolchain_fingerprint() {
+        let empty = ToolchainContract::new(1, vec![path("main.dcdl")], 1);
+        let schema = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+            "builtin:web",
+            "web",
+            "1",
+            "{ web = {}; }",
+        )
+        .unwrap()])
+        .unwrap();
+        let configured =
+            ToolchainContract::with_schema_bundle(1, vec![path("main.dcdl")], 1, schema);
+        assert_ne!(empty.fingerprint, configured.fingerprint);
     }
 
     #[test]

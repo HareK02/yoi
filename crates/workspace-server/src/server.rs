@@ -255,6 +255,7 @@ pub struct WorkspaceApi {
     pub(crate) config: ServerConfig,
     pub(crate) store: Arc<dyn ControlPlaneStore>,
     config_store: Arc<crate::SqliteWorkspaceStore>,
+    config_schema_registry: crate::config_source::WorkspaceConfigSchemaRegistry,
     authority: SqliteWorkspaceAuthority,
     runtime: Arc<RuntimeRegistry>,
     companion: Arc<CompanionConsole>,
@@ -643,6 +644,14 @@ impl crate::worker_source::VerifiedWorkerRemoveExecutor for WorkspaceWorkerRemov
 }
 
 impl WorkspaceApi {
+    pub fn with_config_schema_provider(
+        mut self,
+        provider: Arc<dyn crate::config_source::WorkspaceConfigSchemaProvider>,
+    ) -> Self {
+        self.config_schema_registry = self.config_schema_registry.with_provider(provider);
+        self
+    }
+
     pub async fn new(config: ServerConfig, store: Arc<dyn ControlPlaneStore>) -> Result<Self> {
         let resource_broker = BackendResourceBroker::default();
         let worker_remove_dispatcher = Arc::new(
@@ -749,6 +758,7 @@ impl WorkspaceApi {
         )?);
         let api = Self {
             config_store,
+            config_schema_registry: crate::config_source::WorkspaceConfigSchemaRegistry::default(),
             authority: SqliteWorkspaceAuthority::new(
                 config.database_path.clone(),
                 config.workspace_id.clone(),
@@ -2528,8 +2538,11 @@ async fn scoped_preview_workspace_config_tree(
 ) -> ApiResult<Json<crate::config_source::EvaluatedConfigCandidate>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     Ok(Json(
-        api.config_store
-            .preview_workspace_config(&path.workspace_id, &request)?,
+        api.config_store.preview_workspace_config_with_schema(
+            &path.workspace_id,
+            &request,
+            api.config_schema_registry.compose()?,
+        )?,
     ))
 }
 
@@ -2539,9 +2552,16 @@ async fn scoped_commit_workspace_config_tree(
     Json(request): Json<ConfigCommitRequest>,
 ) -> ApiResult<(StatusCode, Json<WorkspaceConfigTreeResponse>)> {
     validate_workspace_scope(&api, &path.workspace_id)?;
+    let candidate = api
+        .config_store
+        .evaluate_workspace_config_candidate_with_schema(
+            &path.workspace_id,
+            &request,
+            api.config_schema_registry.compose()?,
+        )?;
     let state = api
         .config_store
-        .evaluate_and_commit_workspace_config(&path.workspace_id, &request)?;
+        .commit_evaluated_workspace_config(&path.workspace_id, &candidate)?;
     Ok((
         StatusCode::CREATED,
         Json(WorkspaceConfigTreeResponse {

@@ -1,6 +1,6 @@
 use config_source::{
-    ConfigTreeChange, ConfigTreeSnapshot, EvaluationResult, SnapshotEnvironment, ToolchainContract,
-    VirtualPath,
+    ConfigSchemaContribution, ConfigTreeChange, ConfigTreeSnapshot, EvaluationResult,
+    SnapshotEnvironment, ToolchainContract, VirtualPath, WorkspaceConfigSchemaBundle,
 };
 use serde_wasm_bindgen::{Serializer, from_value};
 use std::cell::RefCell;
@@ -8,6 +8,12 @@ use wasm_bindgen::prelude::*;
 
 thread_local! {
     static SESSION: RefCell<Option<ConfigTreeSnapshot>> = const { RefCell::new(None) };
+}
+
+#[wasm_bindgen]
+pub fn compose_schema_bundle(contributions: JsValue) -> Result<JsValue, JsValue> {
+    let contributions: Vec<ConfigSchemaContribution> = decode(contributions)?;
+    encode(WorkspaceConfigSchemaBundle::compose(contributions).map_err(js_error)?)
 }
 
 #[wasm_bindgen]

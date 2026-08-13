@@ -5,6 +5,8 @@ export type { ConfigDiagnosticLabel } from "./generated/types/ConfigDiagnosticLa
 export type { ConfigEntry } from "./generated/types/ConfigEntry.ts";
 export type { ConfigSpan } from "./generated/types/ConfigSpan.ts";
 export type { ConfigTreeChange } from "./generated/types/ConfigTreeChange.ts";
+export type { ConfigSchemaContribution } from "./generated/types/ConfigSchemaContribution.ts";
+export type { WorkspaceConfigSchemaBundle } from "./generated/types/WorkspaceConfigSchemaBundle.ts";
 export type { ConfigTreeSnapshot } from "./generated/types/ConfigTreeSnapshot.ts";
 export type { EvaluatedProjection } from "./generated/types/EvaluatedProjection.ts";
 export type { EvaluationResult } from "./generated/types/EvaluationResult.ts";

@@ -176,6 +176,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "materialize required main.dcdl Workspace config entrypoint",
         apply: materialize_main_config_entrypoint,
     },
+    Migration {
+        version: 32,
+        name: "persist Workspace config schema contribution bundles",
+        apply: persist_workspace_config_schema_bundles,
+    },
 ];
 
 struct Migration {
@@ -4598,6 +4603,42 @@ fn create_workspace_config_source_authority(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn persist_workspace_config_schema_bundles(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        ALTER TABLE workspace_config_trees
+            ADD COLUMN schema_bundle_json TEXT NOT NULL DEFAULT '{"contributions":[],"source":"{}","fingerprint":""}';
+        ALTER TABLE workspace_config_tree_revisions
+            ADD COLUMN schema_bundle_json TEXT NOT NULL DEFAULT '{"contributions":[],"source":"{}","fingerprint":""}';
+        "#,
+    )?;
+    let bundle = config_source::WorkspaceConfigSchemaBundle::empty();
+    let bundle_json =
+        serde_json::to_string(&bundle).map_err(|error| Error::Store(error.to_string()))?;
+    let contract = config_source::ToolchainContract::with_schema_bundle(
+        config_source::DEFAULT_SCHEMA_VERSION,
+        vec![
+            config_source::VirtualPath::parse(crate::config_source::MAIN_CONFIG_ENTRYPOINT)
+                .map_err(|error| Error::Store(error.to_string()))?,
+        ],
+        config_source::DEFAULT_IMPORT_POLICY_VERSION,
+        bundle,
+    );
+    conn.execute(
+        "UPDATE workspace_config_trees
+         SET schema_bundle_json = ?1,
+             toolchain_fingerprint = ?2",
+        params![bundle_json, contract.fingerprint],
+    )?;
+    conn.execute(
+        "UPDATE workspace_config_tree_revisions
+         SET schema_bundle_json = ?1,
+             toolchain_fingerprint = ?2",
+        params![bundle_json, contract.fingerprint],
+    )?;
+    Ok(())
+}
+
 fn create_worker_mutation_source_proof_replay_guard(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -5271,7 +5312,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 31);
+        assert_eq!(current_schema_version(&conn).unwrap(), 32);
         assert!(table_exists(&conn, "worker_workdir_attachment_reservations").unwrap());
     }
 
@@ -5304,7 +5345,7 @@ CREATE TABLE flow_events (event_id TEXT PRIMARY KEY);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 31);
+        assert_eq!(current_schema_version(&conn).unwrap(), 32);
         assert!(table_exists(&conn, "flow_sources").unwrap());
         assert!(table_exists(&conn, "flow_source_revisions").unwrap());
         assert!(!table_exists(&conn, "flow_instances").unwrap());
@@ -5371,7 +5412,7 @@ INSERT INTO worker_workdir_attachment_reservations (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 31);
+        assert_eq!(current_schema_version(&conn).unwrap(), 32);
         let repositories_sql: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'repositories'",
@@ -5551,7 +5592,7 @@ INSERT INTO workdir_registry (
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 31);
+        assert_eq!(store.schema_version().await.unwrap(), 32);
         assert!(
             !store
                 .with_conn(|conn| table_exists(conn, "worker_workspace_credentials"))
@@ -5568,7 +5609,7 @@ INSERT INTO workdir_registry (
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 31);
+        assert_eq!(reopened.schema_version().await.unwrap(), 32);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -5661,8 +5702,8 @@ INSERT INTO workdir_registry (
                 owner_account_id: None,
                 display_name: "Workspace A".to_string(),
                 state: "active".to_string(),
-                created_at: "2026-07-31T00:00:00Z".to_string(),
-                updated_at: "2026-07-31T00:00:00Z".to_string(),
+                created_at: "2026-07-32T00:00:00Z".to_string(),
+                updated_at: "2026-07-32T00:00:00Z".to_string(),
             })
             .await
             .unwrap();
@@ -5673,7 +5714,7 @@ INSERT INTO workdir_registry (
             assignment_id: "assignment-1".to_string(),
             worker: RuntimeWorkerRef::new("runtime-1", "worker-1"),
             assigned_by: "user-1".to_string(),
-            assigned_at: "2026-07-31T00:00:01Z".to_string(),
+            assigned_at: "2026-07-32T00:00:01Z".to_string(),
         };
         let created = store
             .set_current_ticket_worker_assignment(&first, None, "event-1", "operation-1", false)
@@ -5740,7 +5781,7 @@ INSERT INTO workdir_registry (
             assignment_id: "assignment-2".to_string(),
             worker: RuntimeWorkerRef::new("runtime-2", "worker-2"),
             assigned_by: "user-2".to_string(),
-            assigned_at: "2026-07-31T00:00:02Z".to_string(),
+            assigned_at: "2026-07-32T00:00:02Z".to_string(),
             ..first.clone()
         };
         let replaced = store
@@ -5779,7 +5820,7 @@ INSERT INTO workdir_registry (
                 "unassign-operation-stale",
                 "event-stale",
                 "user-1",
-                "2026-07-31T00:00:03Z",
+                "2026-07-32T00:00:03Z",
             )
             .unwrap_err();
         assert!(matches!(stale, Error::TicketAssignmentConflict(_)));
@@ -5792,7 +5833,7 @@ INSERT INTO workdir_registry (
                 "unassign-operation-2",
                 "event-3",
                 "user-2",
-                "2026-07-31T00:00:03Z",
+                "2026-07-32T00:00:03Z",
             )
             .unwrap();
         assert_eq!(cleared, Some(second.clone()));
@@ -5804,7 +5845,7 @@ INSERT INTO workdir_registry (
                 "unassign-operation-2",
                 "ignored-clear-event",
                 "user-2",
-                "2026-07-31T00:00:04Z",
+                "2026-07-32T00:00:04Z",
             )
             .unwrap();
         assert_eq!(retried_clear, Some(second));
@@ -5816,7 +5857,7 @@ INSERT INTO workdir_registry (
                 "runtime-3",
                 None,
                 "sha256:reserved",
-                "2026-07-31T00:00:05Z",
+                "2026-07-32T00:00:05Z",
             )
             .unwrap();
         drop(store);
@@ -5843,7 +5884,7 @@ INSERT INTO workdir_registry (
             assignment_id: "assignment-3".to_string(),
             worker: RuntimeWorkerRef::new("runtime-3", "worker-3"),
             assigned_by: "runtime".to_string(),
-            assigned_at: "2026-07-31T00:00:06Z".to_string(),
+            assigned_at: "2026-07-32T00:00:06Z".to_string(),
         };
         let completed_reservation = store
             .set_current_ticket_worker_assignment(
@@ -6115,7 +6156,7 @@ INSERT INTO workdir_registry (
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 31);
+        assert_eq!(store.schema_version().await.unwrap(), 32);
 
         store
             .with_conn(|conn| {
@@ -6304,7 +6345,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 31);
+        assert_eq!(store.schema_version().await.unwrap(), 32);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -6370,7 +6411,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 31);
+        assert_eq!(store.schema_version().await.unwrap(), 32);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -6633,7 +6674,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 31);
+        assert_eq!(store.schema_version().await.unwrap(), 32);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),
