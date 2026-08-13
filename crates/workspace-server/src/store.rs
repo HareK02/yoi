@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use flow::{CompiledFlowDefinition, FlowSourceKind, compile_flow_source};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -170,6 +170,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 30,
         name: "create Workspace virtual config source authority",
         apply: create_workspace_config_source_authority,
+    },
+    Migration {
+        version: 31,
+        name: "materialize required main.dcdl Workspace config entrypoint",
+        apply: materialize_main_config_entrypoint,
     },
 ];
 
@@ -882,6 +887,23 @@ impl SqliteWorkspaceStore {
         f(&mut conn)
     }
 
+    fn materialize_workspace_config(&self, workspace_id: &str, created_at: &str) -> Result<()> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if crate::config_source::load_state(&tx, workspace_id)?.is_none() {
+                let state = crate::config_source::initial_state()?;
+                crate::config_source::insert_materialized_state(
+                    &tx,
+                    workspace_id,
+                    &state,
+                    created_at,
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     pub fn upsert_trusted_runtime(&self, record: &TrustedRuntimeRecord) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute(
@@ -966,7 +988,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 ],
             )?;
             Ok(())
-        })
+        })?;
+        self.materialize_workspace_config(&record.workspace_id, &record.created_at)
     }
 
     async fn get_workspace(&self, workspace_id: &str) -> Result<Option<WorkspaceRecord>> {
@@ -4261,7 +4284,7 @@ CREATE INDEX IF NOT EXISTS idx_device_login_user_code ON device_login_flows(user
     Ok(())
 }
 
-fn configure_sqlite(conn: &Connection) -> Result<()> {
+pub(crate) fn configure_sqlite(conn: &Connection) -> Result<()> {
     conn.busy_timeout(Duration::from_millis(5_000))?;
     conn.execute_batch(
         r#"
@@ -4535,7 +4558,7 @@ fn current_schema_version(conn: &Connection) -> Result<i64> {
 fn create_workspace_config_source_authority(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
-        CREATE TABLE workspace_config_trees (
+        CREATE TABLE IF NOT EXISTS workspace_config_trees (
             workspace_id TEXT PRIMARY KEY,
             revision INTEGER NOT NULL CHECK (revision >= 0),
             tree_digest TEXT NOT NULL,
@@ -4548,7 +4571,7 @@ fn create_workspace_config_source_authority(conn: &Connection) -> Result<()> {
             updated_at TEXT NOT NULL,
             FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
         );
-        CREATE TABLE workspace_config_entries (
+        CREATE TABLE IF NOT EXISTS workspace_config_entries (
             workspace_id TEXT NOT NULL,
             path TEXT NOT NULL,
             content_type TEXT NOT NULL,
@@ -4557,9 +4580,9 @@ fn create_workspace_config_source_authority(conn: &Connection) -> Result<()> {
             PRIMARY KEY (workspace_id, path),
             FOREIGN KEY (workspace_id) REFERENCES workspace_config_trees(workspace_id) ON DELETE CASCADE
         );
-        CREATE INDEX idx_workspace_config_entries_prefix
+        CREATE INDEX IF NOT EXISTS idx_workspace_config_entries_prefix
             ON workspace_config_entries(workspace_id, path);
-        CREATE TABLE workspace_config_tree_revisions (
+        CREATE TABLE IF NOT EXISTS workspace_config_tree_revisions (
             workspace_id TEXT NOT NULL,
             revision INTEGER NOT NULL,
             tree_digest TEXT NOT NULL,
@@ -4592,12 +4615,75 @@ fn create_worker_mutation_source_proof_replay_guard(conn: &Connection) -> Result
     Ok(())
 }
 
-fn apply_migrations(conn: &Connection) -> Result<()> {
+pub(crate) fn materialize_main_config_entrypoint(conn: &Connection) -> Result<()> {
+    let mut statement =
+        conn.prepare("SELECT workspace_id, created_at FROM workspaces ORDER BY workspace_id")?;
+    let workspaces = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    for (workspace_id, created_at) in workspaces {
+        let existing = crate::config_source::load_state(conn, &workspace_id)?;
+        let state = match existing {
+            None => crate::config_source::initial_state()?,
+            Some(existing) => {
+                let main =
+                    config_source::VirtualPath::parse(crate::config_source::MAIN_CONFIG_ENTRYPOINT)
+                        .map_err(|error| Error::Store(error.to_string()))?;
+                let snapshot = if existing.snapshot.entries.contains_key(&main) {
+                    existing.snapshot
+                } else {
+                    existing
+                        .snapshot
+                        .apply(&[config_source::ConfigTreeChange::Create {
+                            path: main.clone(),
+                            content_type: config_source::ConfigContentType::Decodal,
+                            content: crate::config_source::DEFAULT_MAIN_CONFIG_SOURCE.to_string(),
+                        }])
+                        .map_err(|error| Error::Store(error.to_string()))?
+                };
+                let contract = config_source::ToolchainContract::new(
+                    config_source::DEFAULT_SCHEMA_VERSION,
+                    vec![main],
+                    config_source::DEFAULT_IMPORT_POLICY_VERSION,
+                );
+                let evaluation = config_source::SnapshotEnvironment::new(snapshot.clone())
+                    .evaluate_contract(&contract)
+                    .map_err(|diagnostics| {
+                        Error::Store(format!(
+                            "cannot materialize main.dcdl for Workspace {workspace_id}: {}",
+                            serde_json::to_string(&diagnostics)
+                                .unwrap_or_else(|_| "config evaluation failed".to_string())
+                        ))
+                    })?;
+                crate::config_source::WorkspaceConfigState {
+                    snapshot,
+                    contract,
+                    projection_digest: evaluation.projection_digest,
+                }
+            }
+        };
+        conn.execute(
+            "DELETE FROM workspace_config_tree_revisions WHERE workspace_id = ?1",
+            [&workspace_id],
+        )?;
+        conn.execute(
+            "DELETE FROM workspace_config_entries WHERE workspace_id = ?1",
+            [&workspace_id],
+        )?;
+        crate::config_source::insert_materialized_state(conn, &workspace_id, &state, &created_at)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn apply_migrations_through(conn: &Connection, through_version: i64) -> Result<()> {
     let current = current_schema_version(conn)?;
-    for migration in MIGRATIONS
-        .iter()
-        .filter(|migration| migration.version > current)
-    {
+    for migration in MIGRATIONS.iter().filter(|migration| {
+        i64::from(migration.version) > current && i64::from(migration.version) <= through_version
+    }) {
         let tx = conn.unchecked_transaction()?;
         (migration.apply)(&tx)?;
         tx.execute(
@@ -4607,6 +4693,10 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
         tx.commit()?;
     }
     Ok(())
+}
+
+fn apply_migrations(conn: &Connection) -> Result<()> {
+    apply_migrations_through(conn, i64::MAX)
 }
 
 fn align_legacy_bootstrap_schema(conn: &Connection) -> Result<()> {
@@ -5181,7 +5271,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 30);
+        assert_eq!(current_schema_version(&conn).unwrap(), 31);
         assert!(table_exists(&conn, "worker_workdir_attachment_reservations").unwrap());
     }
 
@@ -5214,7 +5304,7 @@ CREATE TABLE flow_events (event_id TEXT PRIMARY KEY);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 30);
+        assert_eq!(current_schema_version(&conn).unwrap(), 31);
         assert!(table_exists(&conn, "flow_sources").unwrap());
         assert!(table_exists(&conn, "flow_source_revisions").unwrap());
         assert!(!table_exists(&conn, "flow_instances").unwrap());
@@ -5281,7 +5371,7 @@ INSERT INTO worker_workdir_attachment_reservations (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 30);
+        assert_eq!(current_schema_version(&conn).unwrap(), 31);
         let repositories_sql: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'repositories'",
@@ -5461,7 +5551,7 @@ INSERT INTO workdir_registry (
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 29);
+        assert_eq!(store.schema_version().await.unwrap(), 31);
         assert!(
             !store
                 .with_conn(|conn| table_exists(conn, "worker_workspace_credentials"))
@@ -5478,7 +5568,7 @@ INSERT INTO workdir_registry (
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 29);
+        assert_eq!(reopened.schema_version().await.unwrap(), 31);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -6025,7 +6115,7 @@ INSERT INTO workdir_registry (
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 29);
+        assert_eq!(store.schema_version().await.unwrap(), 31);
 
         store
             .with_conn(|conn| {
@@ -6214,7 +6304,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 29);
+        assert_eq!(store.schema_version().await.unwrap(), 31);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -6280,7 +6370,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 29);
+        assert_eq!(store.schema_version().await.unwrap(), 31);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -6543,7 +6633,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 29);
+        assert_eq!(store.schema_version().await.unwrap(), 31);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),

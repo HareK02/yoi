@@ -546,6 +546,10 @@
     padding: var(--space-2);
   }
   .config-source-tree nav button {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
     border: 0;
     border-radius: 0.45rem;
     background: transparent;
@@ -555,6 +559,12 @@
     font-family: var(--font-mono);
     text-align: left;
     cursor: pointer;
+  }
+  .config-source-tree nav button small {
+    color: var(--text-muted);
+    font-size: 0.65rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
   }
   .config-source-tree nav button.active,
   .config-source-tree nav button:hover {

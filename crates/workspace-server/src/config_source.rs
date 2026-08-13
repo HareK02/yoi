@@ -9,7 +9,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result, SqliteWorkspaceStore};
 
-pub const DEFAULT_CONFIG_ENTRYPOINT: &str = "workspace.dcdl";
+pub const MAIN_CONFIG_ENTRYPOINT: &str = "main.dcdl";
+pub const DEFAULT_MAIN_CONFIG_SOURCE: &str = "{}\n";
+
+fn main_config_path() -> VirtualPath {
+    VirtualPath::parse(MAIN_CONFIG_ENTRYPOINT).expect("main config entrypoint is a valid path")
+}
+
+fn main_config_contract() -> ToolchainContract {
+    ToolchainContract::new(
+        DEFAULT_SCHEMA_VERSION,
+        vec![main_config_path()],
+        DEFAULT_IMPORT_POLICY_VERSION,
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[ts(export)]
@@ -49,6 +62,34 @@ pub struct ConfigPreviewRequest {
 }
 
 impl SqliteWorkspaceStore {
+    pub fn ensure_workspace_config_materialized(
+        &self,
+        workspace_id: &str,
+        materialized_at: &str,
+    ) -> Result<WorkspaceConfigState> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let workspace_exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workspaces WHERE workspace_id = ?1)",
+                [workspace_id],
+                |row| row.get(0),
+            )?;
+            if !workspace_exists {
+                return Err(Error::WorkspaceIdMismatch);
+            }
+            let state = match load_state(&tx, workspace_id)? {
+                Some(state) => state,
+                None => {
+                    let state = initial_state()?;
+                    insert_materialized_state(&tx, workspace_id, &state, materialized_at)?;
+                    state
+                }
+            };
+            tx.commit()?;
+            Ok(state)
+        })
+    }
+
     pub fn load_workspace_config(
         &self,
         workspace_id: &str,
@@ -93,7 +134,8 @@ impl SqliteWorkspaceStore {
     ) -> Result<EvaluatedConfigCandidate> {
         let current = self
             .load_workspace_config(workspace_id)?
-            .unwrap_or_else(empty_state);
+            .ok_or_else(config_not_materialized)?;
+        validate_entrypoint_request(&request.entrypoints)?;
         if current.snapshot.revision != request.base_revision
             || current.snapshot.digest != request.base_digest
         {
@@ -102,18 +144,14 @@ impl SqliteWorkspaceStore {
                 current.snapshot.revision
             )));
         }
-        let expected_contract = ToolchainContract::new(
-            DEFAULT_SCHEMA_VERSION,
-            request.entrypoints.clone(),
-            DEFAULT_IMPORT_POLICY_VERSION,
-        );
+        let expected_contract = main_config_contract();
         if expected_contract.fingerprint != request.toolchain_fingerprint {
             return Err(config_conflict(format!(
                 "toolchain fingerprint mismatch; current fingerprint is {}",
                 expected_contract.fingerprint
             )));
         }
-        evaluate_candidate(current, &request.changes, request.entrypoints.clone())
+        evaluate_candidate(current, &request.changes)
     }
 
     pub fn preview_workspace_config(
@@ -121,10 +159,11 @@ impl SqliteWorkspaceStore {
         workspace_id: &str,
         request: &ConfigPreviewRequest,
     ) -> Result<EvaluatedConfigCandidate> {
+        validate_entrypoint_request(&request.entrypoints)?;
         let current = self
             .load_workspace_config(workspace_id)?
-            .unwrap_or_else(empty_state);
-        evaluate_candidate(current, &request.changes, request.entrypoints.clone())
+            .ok_or_else(config_not_materialized)?;
+        evaluate_candidate(current, &request.changes)
     }
 
     pub fn commit_evaluated_workspace_config(
@@ -142,7 +181,7 @@ impl SqliteWorkspaceStore {
             if !workspace_exists {
                 return Err(Error::WorkspaceIdMismatch);
             }
-            let current = load_state(&tx, workspace_id)?.unwrap_or_else(empty_state);
+            let current = load_state(&tx, workspace_id)?.ok_or_else(config_not_materialized)?;
             if current.snapshot.revision != candidate.base_revision
                 || current.snapshot.digest != candidate.base_digest
             {
@@ -165,6 +204,7 @@ impl SqliteWorkspaceStore {
                     revision = excluded.revision,
                     tree_digest = excluded.tree_digest,
                     schema_version = excluded.schema_version,
+                    entrypoints_json = excluded.entrypoints_json,
                     decodal_version = excluded.decodal_version,
                     import_policy_version = excluded.import_policy_version,
                     toolchain_fingerprint = excluded.toolchain_fingerprint,
@@ -241,14 +281,11 @@ impl SqliteWorkspaceStore {
 fn evaluate_candidate(
     current: WorkspaceConfigState,
     changes: &[ConfigTreeChange],
-    entrypoints: Vec<VirtualPath>,
 ) -> Result<EvaluatedConfigCandidate> {
+    reject_main_entrypoint_mutation(changes)?;
     let snapshot = current.snapshot.apply(changes).map_err(config_error)?;
-    let contract = ToolchainContract::new(
-        DEFAULT_SCHEMA_VERSION,
-        entrypoints,
-        DEFAULT_IMPORT_POLICY_VERSION,
-    );
+    ensure_main_entrypoint(&snapshot)?;
+    let contract = main_config_contract();
     let evaluation = SnapshotEnvironment::new(snapshot.clone())
         .evaluate_contract(&contract)
         .map_err(|diagnostics| {
@@ -266,7 +303,7 @@ fn evaluate_candidate(
     })
 }
 
-fn load_state(
+pub(crate) fn load_state(
     conn: &rusqlite::Connection,
     workspace_id: &str,
 ) -> Result<Option<WorkspaceConfigState>> {
@@ -352,15 +389,149 @@ fn load_state(
     }))
 }
 
-fn empty_state() -> WorkspaceConfigState {
-    WorkspaceConfigState {
-        snapshot: ConfigTreeSnapshot::empty(),
-        contract: ToolchainContract::new(
-            DEFAULT_SCHEMA_VERSION,
-            Vec::new(),
-            DEFAULT_IMPORT_POLICY_VERSION,
-        ),
-        projection_digest: config_source::digest_bytes(b"[]"),
+pub(crate) fn initial_state() -> Result<WorkspaceConfigState> {
+    let path = main_config_path();
+    let snapshot = ConfigTreeSnapshot::empty()
+        .apply(&[ConfigTreeChange::Create {
+            path,
+            content_type: ConfigContentType::Decodal,
+            content: DEFAULT_MAIN_CONFIG_SOURCE.to_string(),
+        }])
+        .map_err(config_error)?;
+    let contract = main_config_contract();
+    let projection_digest = SnapshotEnvironment::new(snapshot.clone())
+        .evaluate_contract(&contract)
+        .map_err(|diagnostics| {
+            Error::InvalidInput(
+                serde_json::to_string(&diagnostics)
+                    .unwrap_or_else(|_| "virtual config evaluation failed".to_string()),
+            )
+        })?
+        .projection_digest;
+    Ok(WorkspaceConfigState {
+        snapshot,
+        contract,
+        projection_digest,
+    })
+}
+
+pub(crate) fn insert_materialized_state(
+    tx: &rusqlite::Connection,
+    workspace_id: &str,
+    state: &WorkspaceConfigState,
+    materialized_at: &str,
+) -> Result<()> {
+    let entrypoints_json = serde_json::to_string(&state.contract.entrypoints)
+        .map_err(|error| Error::Store(error.to_string()))?;
+    let manifest_json = serde_json::to_string(&state.snapshot.entries)
+        .map_err(|error| Error::Store(error.to_string()))?;
+    tx.execute(
+        "INSERT INTO workspace_config_trees (
+            workspace_id, revision, tree_digest, schema_version, entrypoints_json,
+            decodal_version, import_policy_version, toolchain_fingerprint,
+            projection_digest, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(workspace_id) DO UPDATE SET
+            revision = excluded.revision,
+            tree_digest = excluded.tree_digest,
+            schema_version = excluded.schema_version,
+            entrypoints_json = excluded.entrypoints_json,
+            decodal_version = excluded.decodal_version,
+            import_policy_version = excluded.import_policy_version,
+            toolchain_fingerprint = excluded.toolchain_fingerprint,
+            projection_digest = excluded.projection_digest,
+            updated_at = excluded.updated_at",
+        rusqlite::params![
+            workspace_id,
+            state.snapshot.revision,
+            state.snapshot.digest,
+            state.contract.schema_version,
+            entrypoints_json,
+            DECODAL_VERSION,
+            state.contract.import_policy_version,
+            state.contract.fingerprint,
+            state.projection_digest,
+            materialized_at,
+        ],
+    )?;
+    for entry in state.snapshot.entries.values() {
+        tx.execute(
+            "INSERT INTO workspace_config_entries (
+                workspace_id, path, content_type, content, content_digest
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                workspace_id,
+                entry.path.as_str(),
+                content_type_label(entry.content_type),
+                entry.content,
+                entry.content_digest,
+            ],
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO workspace_config_tree_revisions (
+            workspace_id, revision, tree_digest, toolchain_fingerprint,
+            projection_digest, manifest_json, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            workspace_id,
+            state.snapshot.revision,
+            state.snapshot.digest,
+            state.contract.fingerprint,
+            state.projection_digest,
+            manifest_json,
+            materialized_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn config_not_materialized() -> Error {
+    Error::RegistryInconsistency("workspace config tree is not materialized".to_string())
+}
+
+fn validate_entrypoint_request(entrypoints: &[VirtualPath]) -> Result<()> {
+    if entrypoints == [main_config_path()] {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput(format!(
+            "workspace config entrypoints must be exactly [{MAIN_CONFIG_ENTRYPOINT}]"
+        )))
+    }
+}
+
+fn reject_main_entrypoint_mutation(changes: &[ConfigTreeChange]) -> Result<()> {
+    let main = main_config_path();
+    for change in changes {
+        match change {
+            ConfigTreeChange::Delete { path, .. } if path == &main => {
+                return Err(Error::InvalidInput(format!(
+                    "{MAIN_CONFIG_ENTRYPOINT} is the required Workspace entrypoint and cannot be deleted"
+                )));
+            }
+            ConfigTreeChange::Rename { from, to, .. } if from == &main || to == &main => {
+                return Err(Error::InvalidInput(format!(
+                    "{MAIN_CONFIG_ENTRYPOINT} is the required Workspace entrypoint and cannot be renamed"
+                )));
+            }
+            ConfigTreeChange::Create { path, .. } if path == &main => {
+                return Err(Error::WorkspaceConfigConflict(format!(
+                    "{MAIN_CONFIG_ENTRYPOINT} is already materialized"
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn ensure_main_entrypoint(snapshot: &ConfigTreeSnapshot) -> Result<()> {
+    if snapshot.entries.contains_key(&main_config_path()) {
+        Ok(())
+    } else {
+        Err(Error::RegistryInconsistency(format!(
+            "workspace config tree is missing required entrypoint {MAIN_CONFIG_ENTRYPOINT}"
+        )))
     }
 }
 
@@ -405,30 +576,122 @@ mod tests {
         }
     }
 
+    async fn open_store() -> SqliteWorkspaceStore {
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        store.upsert_workspace(&workspace()).await.unwrap();
+        store
+    }
+
     fn path(value: &str) -> VirtualPath {
         VirtualPath::parse(value).unwrap()
+    }
+
+    fn commit_request(
+        current: &WorkspaceConfigState,
+        changes: Vec<ConfigTreeChange>,
+    ) -> ConfigCommitRequest {
+        ConfigCommitRequest {
+            base_revision: current.snapshot.revision,
+            base_digest: current.snapshot.digest.clone(),
+            changes,
+            entrypoints: vec![path(MAIN_CONFIG_ENTRYPOINT)],
+            toolchain_fingerprint: current.contract.fingerprint.clone(),
+        }
+    }
+
+    fn update_main(current: &WorkspaceConfigState, content: &str) -> ConfigTreeChange {
+        let main = current.snapshot.get(&path(MAIN_CONFIG_ENTRYPOINT)).unwrap();
+        ConfigTreeChange::Update {
+            path: path(MAIN_CONFIG_ENTRYPOINT),
+            expected_digest: main.content_digest.clone(),
+            content: content.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_materializes_main_entrypoint() {
+        let store = open_store().await;
+        let current = store.load_workspace_config("w-config").unwrap().unwrap();
+        assert_eq!(current.snapshot.revision, 0);
+        assert_eq!(
+            current.contract.entrypoints,
+            vec![path(MAIN_CONFIG_ENTRYPOINT)]
+        );
+        assert_eq!(
+            current
+                .snapshot
+                .get(&path(MAIN_CONFIG_ENTRYPOINT))
+                .unwrap()
+                .content,
+            DEFAULT_MAIN_CONFIG_SOURCE
+        );
+    }
+
+    #[tokio::test]
+    async fn required_main_entrypoint_cannot_be_deleted_or_renamed() {
+        let store = open_store().await;
+        let current = store.load_workspace_config("w-config").unwrap().unwrap();
+        let main = current.snapshot.get(&path(MAIN_CONFIG_ENTRYPOINT)).unwrap();
+        for change in [
+            ConfigTreeChange::Delete {
+                path: path(MAIN_CONFIG_ENTRYPOINT),
+                expected_digest: main.content_digest.clone(),
+            },
+            ConfigTreeChange::Rename {
+                from: path(MAIN_CONFIG_ENTRYPOINT),
+                to: path("other.dcdl"),
+                expected_digest: main.content_digest.clone(),
+            },
+        ] {
+            let error = store
+                .preview_workspace_config(
+                    "w-config",
+                    &ConfigPreviewRequest {
+                        changes: vec![change],
+                        entrypoints: vec![path(MAIN_CONFIG_ENTRYPOINT)],
+                    },
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("cannot be"));
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_cannot_replace_server_owned_entrypoint_contract() {
+        let store = open_store().await;
+        let error = store
+            .preview_workspace_config(
+                "w-config",
+                &ConfigPreviewRequest {
+                    changes: Vec::new(),
+                    entrypoints: vec![path("other.dcdl")],
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("must be exactly [main.dcdl]"));
     }
 
     #[tokio::test]
     async fn invalid_candidate_is_never_persisted() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
         store.upsert_workspace(&workspace()).await.unwrap();
-        let current = ConfigTreeSnapshot::empty();
+        let current = store.load_workspace_config("w-config").unwrap().unwrap();
+        let main = current.snapshot.get(&path(MAIN_CONFIG_ENTRYPOINT)).unwrap();
         let error = store
             .evaluate_and_commit_workspace_config(
                 "w-config",
                 &ConfigCommitRequest {
-                    base_revision: 0,
-                    base_digest: current.digest,
-                    changes: vec![ConfigTreeChange::Create {
-                        path: path(DEFAULT_CONFIG_ENTRYPOINT),
-                        content_type: ConfigContentType::Decodal,
+                    base_revision: current.snapshot.revision,
+                    base_digest: current.snapshot.digest.clone(),
+                    changes: vec![ConfigTreeChange::Update {
+                        path: path(MAIN_CONFIG_ENTRYPOINT),
+                        expected_digest: main.content_digest.clone(),
                         content: "{ broken = ; }".into(),
                     }],
-                    entrypoints: vec![path(DEFAULT_CONFIG_ENTRYPOINT)],
+                    entrypoints: vec![path(MAIN_CONFIG_ENTRYPOINT)],
                     toolchain_fingerprint: ToolchainContract::new(
                         DEFAULT_SCHEMA_VERSION,
-                        vec![path(DEFAULT_CONFIG_ENTRYPOINT)],
+                        vec![path(MAIN_CONFIG_ENTRYPOINT)],
                         DEFAULT_IMPORT_POLICY_VERSION,
                     )
                     .fingerprint,
@@ -436,33 +699,18 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(error, Error::InvalidInput(_)));
-        assert!(store.load_workspace_config("w-config").unwrap().is_none());
+        assert!(store.load_workspace_config("w-config").unwrap().is_some());
     }
 
     #[tokio::test]
     async fn valid_candidate_commits_snapshot_revision_and_provenance_atomically() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
         store.upsert_workspace(&workspace()).await.unwrap();
-        let empty = ConfigTreeSnapshot::empty();
+        let current = store.load_workspace_config("w-config").unwrap().unwrap();
         let committed = store
             .evaluate_and_commit_workspace_config(
                 "w-config",
-                &ConfigCommitRequest {
-                    base_revision: 0,
-                    base_digest: empty.digest,
-                    changes: vec![ConfigTreeChange::Create {
-                        path: path(DEFAULT_CONFIG_ENTRYPOINT),
-                        content_type: ConfigContentType::Decodal,
-                        content: "{ answer = 42; }".into(),
-                    }],
-                    entrypoints: vec![path(DEFAULT_CONFIG_ENTRYPOINT)],
-                    toolchain_fingerprint: ToolchainContract::new(
-                        DEFAULT_SCHEMA_VERSION,
-                        vec![path(DEFAULT_CONFIG_ENTRYPOINT)],
-                        DEFAULT_IMPORT_POLICY_VERSION,
-                    )
-                    .fingerprint,
-                },
+                &commit_request(&current, vec![update_main(&current, "{ answer = 42; }")]),
             )
             .unwrap();
         assert_eq!(committed.snapshot.revision, 1);
@@ -476,23 +724,8 @@ mod tests {
     async fn stale_cas_cannot_overwrite_newer_tree() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
         store.upsert_workspace(&workspace()).await.unwrap();
-        let empty = ConfigTreeSnapshot::empty();
-        let request = ConfigCommitRequest {
-            base_revision: 0,
-            base_digest: empty.digest,
-            changes: vec![ConfigTreeChange::Create {
-                path: path(DEFAULT_CONFIG_ENTRYPOINT),
-                content_type: ConfigContentType::Decodal,
-                content: "{ answer = 42; }".into(),
-            }],
-            entrypoints: vec![path(DEFAULT_CONFIG_ENTRYPOINT)],
-            toolchain_fingerprint: ToolchainContract::new(
-                DEFAULT_SCHEMA_VERSION,
-                vec![path(DEFAULT_CONFIG_ENTRYPOINT)],
-                DEFAULT_IMPORT_POLICY_VERSION,
-            )
-            .fingerprint,
-        };
+        let current = store.load_workspace_config("w-config").unwrap().unwrap();
+        let request = commit_request(&current, vec![update_main(&current, "{ answer = 42; }")]);
         let candidate = store
             .evaluate_workspace_config_candidate("w-config", &request)
             .unwrap();
@@ -509,32 +742,14 @@ mod tests {
     async fn committed_revision_remains_retrievable_after_later_commit() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
         store.upsert_workspace(&workspace()).await.unwrap();
-        let empty = ConfigTreeSnapshot::empty();
-        let contract = ToolchainContract::new(
-            DEFAULT_SCHEMA_VERSION,
-            vec![path(DEFAULT_CONFIG_ENTRYPOINT)],
-            DEFAULT_IMPORT_POLICY_VERSION,
-        );
+        let current = store.load_workspace_config("w-config").unwrap().unwrap();
         let first = store
             .evaluate_and_commit_workspace_config(
                 "w-config",
-                &ConfigCommitRequest {
-                    base_revision: 0,
-                    base_digest: empty.digest,
-                    changes: vec![ConfigTreeChange::Create {
-                        path: path(DEFAULT_CONFIG_ENTRYPOINT),
-                        content_type: ConfigContentType::Decodal,
-                        content: "{ answer = 1; }".into(),
-                    }],
-                    entrypoints: contract.entrypoints.clone(),
-                    toolchain_fingerprint: contract.fingerprint.clone(),
-                },
+                &commit_request(&current, vec![update_main(&current, "{ answer = 1; }")]),
             )
             .unwrap();
-        let entry = first
-            .snapshot
-            .get(&path(DEFAULT_CONFIG_ENTRYPOINT))
-            .unwrap();
+        let entry = first.snapshot.get(&path(MAIN_CONFIG_ENTRYPOINT)).unwrap();
         store
             .evaluate_and_commit_workspace_config(
                 "w-config",
@@ -542,12 +757,12 @@ mod tests {
                     base_revision: first.snapshot.revision,
                     base_digest: first.snapshot.digest.clone(),
                     changes: vec![ConfigTreeChange::Update {
-                        path: path(DEFAULT_CONFIG_ENTRYPOINT),
+                        path: path(MAIN_CONFIG_ENTRYPOINT),
                         expected_digest: entry.content_digest.clone(),
                         content: "{ answer = 2; }".into(),
                     }],
-                    entrypoints: contract.entrypoints,
-                    toolchain_fingerprint: contract.fingerprint,
+                    entrypoints: first.contract.entrypoints.clone(),
+                    toolchain_fingerprint: first.contract.fingerprint.clone(),
                 },
             )
             .unwrap();
@@ -562,25 +777,47 @@ mod tests {
     async fn commit_rejects_mismatched_toolchain_fingerprint() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
         store.upsert_workspace(&workspace()).await.unwrap();
-        let empty = ConfigTreeSnapshot::empty();
+        let current = store.load_workspace_config("w-config").unwrap().unwrap();
         let error = store
             .evaluate_and_commit_workspace_config(
                 "w-config",
                 &ConfigCommitRequest {
-                    base_revision: 0,
-                    base_digest: empty.digest,
-                    changes: vec![ConfigTreeChange::Create {
-                        path: path(DEFAULT_CONFIG_ENTRYPOINT),
-                        content_type: ConfigContentType::Decodal,
-                        content: "{ answer = 42; }".into(),
-                    }],
-                    entrypoints: vec![path(DEFAULT_CONFIG_ENTRYPOINT)],
+                    base_revision: current.snapshot.revision,
+                    base_digest: current.snapshot.digest.clone(),
+                    changes: vec![update_main(&current, "{ answer = 42; }")],
+                    entrypoints: vec![path(MAIN_CONFIG_ENTRYPOINT)],
                     toolchain_fingerprint: "sha256:stale-toolchain".into(),
                 },
             )
             .unwrap_err();
         assert!(matches!(error, Error::WorkspaceConfigConflict(_)));
-        assert!(store.load_workspace_config("w-config").unwrap().is_none());
+        assert!(store.load_workspace_config("w-config").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn migration_materializes_main_for_existing_workspace_without_config() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::configure_sqlite(&conn).unwrap();
+        crate::store::apply_migrations_through(&conn, 30).unwrap();
+        conn.execute(
+            "INSERT INTO workspaces (
+                workspace_id, display_name, state, created_at, updated_at
+             ) VALUES ('legacy', 'Legacy', 'active', '2026-08-06T00:00:00Z', '2026-08-06T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        crate::store::materialize_main_config_entrypoint(&conn).unwrap();
+        let state = load_state(&conn, "legacy").unwrap().unwrap();
+        assert!(
+            state
+                .snapshot
+                .entries
+                .contains_key(&path(MAIN_CONFIG_ENTRYPOINT))
+        );
+        assert_eq!(
+            state.contract.entrypoints,
+            vec![path(MAIN_CONFIG_ENTRYPOINT)]
+        );
     }
 
     #[test]
@@ -596,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_creates_config_authority_without_changing_applied_migrations() {
+    fn migration_creates_config_authority_tables() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
         store
             .with_conn(|conn| {

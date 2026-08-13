@@ -13,11 +13,13 @@
     WorkspaceConfigTreeResponse,
   } from "./types.ts";
 
+  const MAIN_ENTRYPOINT = "main.dcdl";
+
   let { workspaceId }: { workspaceId: string } = $props();
   let treeState = $state<WorkspaceConfigTreeResponse | null>(null);
   let selectedPath = $state("");
   let source = $state("");
-  let newPath = $state("workspace.dcdl");
+  let newPath = $state("module.dcdl");
   let diagnostics = $state<ConfigDiagnostic[]>([]);
   let status = $state("Loading source tree…");
   let busy = $state(false);
@@ -37,6 +39,7 @@
   const selected = $derived(
     treeState && selectedPath ? treeState.snapshot.entries[selectedPath] : undefined,
   );
+  const mainSelected = $derived(selectedPath === MAIN_ENTRYPOINT);
   const dirty = $derived(draftChanges.length > 0 || (selected ? source !== selected.content : source.length > 0));
   const commitReady = $derived(dirty && preflightDigest === treeState?.snapshot.digest);
 
@@ -62,9 +65,7 @@
       diagnostics = [];
       conflict = false;
       candidateContract = null;
-      status = treeState.snapshot.revision === 0
-        ? "No committed sources yet. Create workspace.dcdl to begin."
-        : `Revision ${treeState.snapshot.revision} · ${treeState.snapshot.digest.slice(0, 20)}…`;
+      status = `Revision ${treeState.snapshot.revision} · ${treeState.snapshot.digest.slice(0, 20)}…`;
     } catch (error) {
       status = String(error);
     }
@@ -110,14 +111,7 @@
   }
 
   function entrypoints(): string[] {
-    if (!treeState) return [];
-    const known = new Set(Object.keys(treeState.snapshot.entries));
-    const configured = treeState.contract.entrypoints.filter((path) => known.has(path));
-    if (configured.length > 0) return configured;
-    if (treeState.snapshot.entries["workspace.dcdl"] || selectedPath === "workspace.dcdl") {
-      return ["workspace.dcdl"];
-    }
-    return selectedPath ? [selectedPath] : [];
+    return [MAIN_ENTRYPOINT];
   }
 
   async function analyze() {
@@ -296,12 +290,15 @@
           type="button"
           class:active={path === selectedPath}
           onclick={() => select(path)}
-        >{path}</button>
+        >
+          <span>{path}</span>
+          {#if path === MAIN_ENTRYPOINT}<small>entrypoint</small>{/if}
+        </button>
       {/each}
     </nav>
     <form class="config-source-create" onsubmit={(event) => { event.preventDefault(); createEntry(); }}>
       <label for="new-config-path">New path</label>
-      <input id="new-config-path" bind:value={newPath} placeholder="workspace.dcdl" />
+      <input id="new-config-path" bind:value={newPath} placeholder="module.dcdl" />
       <button type="submit">Create draft</button>
     </form>
   </aside>
@@ -313,13 +310,13 @@
         <strong>{selectedPath || "Select or create a source"}</strong>
       </div>
       <div class="config-source-actions">
-        <input aria-label="Rename path" bind:value={renamePath} disabled={!selected || busy} />
-        <button type="button" onclick={renameEntry} disabled={!selected || renamePath === selectedPath || busy}>Rename</button>
+        <input aria-label="Rename path" bind:value={renamePath} disabled={!selected || mainSelected || busy} />
+        <button type="button" onclick={renameEntry} disabled={!selected || mainSelected || renamePath === selectedPath || busy}>Rename</button>
         <button type="button" onclick={format} disabled={!selectedPath || busy}>Format</button>
         <button type="button" onclick={analyze} disabled={!selectedPath || busy}>Analyze</button>
         <button type="button" onclick={preview} disabled={!dirty || busy}>Preview</button>
         <button class="primary" type="button" onclick={commit} disabled={!commitReady || busy}>Commit</button>
-        <button class="danger" type="button" onclick={deleteEntry} disabled={!selected || busy}>Delete</button>
+        <button class="danger" type="button" onclick={deleteEntry} disabled={!selected || mainSelected || busy}>Delete</button>
       </div>
     </header>
     <DecodalSourceEditor
