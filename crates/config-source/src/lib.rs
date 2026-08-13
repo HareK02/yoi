@@ -385,6 +385,25 @@ impl SnapshotEnvironment {
         contract: &ToolchainContract,
     ) -> Result<EvaluationResult, Vec<ConfigDiagnostic>> {
         let service = LanguageService::new(self);
+        let diagnostics = self
+            .snapshot
+            .entries
+            .values()
+            .filter(|entry| entry.content_type == ConfigContentType::Decodal)
+            .flat_map(|entry| {
+                service
+                    .analyze(entry.path.as_str(), entry.path.as_str(), &entry.content)
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| {
+                        project_diagnostic(&self.snapshot, entry.path.clone(), diagnostic)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        if !diagnostics.is_empty() {
+            return Err(diagnostics);
+        }
         let mut projections = Vec::new();
         for entrypoint in &contract.entrypoints {
             let Some(entry) = self.snapshot.get(entrypoint) else {
@@ -877,6 +896,23 @@ mod tests {
             .evaluate_contract(&contract)
             .unwrap();
         assert_eq!(result.projections[0].data_json["answer"], 42);
+    }
+
+    #[test]
+    fn candidate_evaluation_rejects_invalid_unreferenced_decodal_source() {
+        let snapshot = ConfigTreeSnapshot::from_entries(
+            1,
+            [
+                entry("workspace.dcdl", "{ answer = 42; }"),
+                entry("unused.dcdl", "{ broken = ; }"),
+            ],
+        )
+        .unwrap();
+        let diagnostics = SnapshotEnvironment::new(snapshot)
+            .evaluate_contract(&ToolchainContract::new(1, vec![path("workspace.dcdl")], 1))
+            .unwrap_err();
+        assert_eq!(diagnostics[0].path, path("unused.dcdl"));
+        assert_eq!(diagnostics[0].kind, "syntax");
     }
 
     #[test]
