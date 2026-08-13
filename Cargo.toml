@@ -19,6 +19,8 @@ members = [
     "crates/tools",
     "crates/fs-operation",
     "crates/flow",
+    "crates/config-source",
+    "crates/config-source-wasm",
     "crates/workdir",
     "crates/tui",
     "crates/memory",
@@ -47,6 +49,8 @@ default-members = [
     "crates/tools",
     "crates/fs-operation",
     "crates/flow",
+    "crates/config-source",
+    "crates/config-source-wasm",
     "crates/workdir",
     "crates/tui",
     "crates/memory",
@@ -82,6 +86,7 @@ session-analytics = { path = "crates/session-analytics" }
 session-store = { path = "crates/session-store" }
 secrets = { path = "crates/secrets" }
 tools = { path = "crates/tools" }
+config-source = { path = "crates/config-source" }
 fs-operation = { path = "crates/fs-operation" }
 workdir = { path = "crates/workdir" }
 tui = { path = "crates/tui" }
@@ -93,7 +98,9 @@ yoi-workspace-server = { path = "crates/workspace-server" }
 async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22.1"
-decodal = "0.1.1"
+decodal = "0.2.0"
+decodal-language-service = "0.2.0"
+decodal-language-tools = "0.2.0"
 fs4 = "0.13"
 futures = "0.3"
 libc = "0.2"

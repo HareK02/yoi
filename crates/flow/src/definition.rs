@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::fmt::Write as _;
 
-use decodal::{Engine, LoadedSource, SourceLoader};
+use decodal::{Engine, ImportLoader, LoadedImport};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -527,12 +527,12 @@ fn content_digest(content: &str) -> String {
 
 struct RejectImports;
 
-impl SourceLoader for RejectImports {
+impl ImportLoader for RejectImports {
     fn load(
         &mut self,
         _current_key: Option<&str>,
         specifier: &str,
-    ) -> decodal::Result<LoadedSource> {
+    ) -> decodal::Result<LoadedImport> {
         Err(decodal::Diagnostic::new(
             decodal::DiagnosticKind::Import,
             decodal::Span::default(),

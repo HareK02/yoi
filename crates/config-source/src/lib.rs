@@ -1,0 +1,906 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+
+use decodal::{
+    Data, Diagnostic, DiagnosticKind, Engine, HostEnvironment, ImportCandidate, ImportLoader,
+    LoadedImport, Span,
+};
+use decodal_language_service::{CompletionResult, LanguageService};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+pub const CONFIG_SOURCE_CONTRACT_VERSION: u32 = 1;
+pub const DECODAL_VERSION: &str = "0.2.0";
+pub const DEFAULT_SCHEMA_VERSION: u32 = 1;
+pub const DEFAULT_IMPORT_POLICY_VERSION: u32 = 1;
+pub const MAX_ENTRY_COUNT: usize = 256;
+pub const MAX_CHANGE_COUNT: usize = 256;
+pub const MAX_ENTRY_BYTES: usize = 256 * 1024;
+pub const MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_PATH_BYTES: usize = 512;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct VirtualPath(String);
+
+impl VirtualPath {
+    pub fn parse(value: impl AsRef<str>) -> Result<Self, ConfigTreeError> {
+        let value = value.as_ref();
+        if value.is_empty() {
+            return Err(ConfigTreeError::InvalidPath(
+                "path must not be empty".into(),
+            ));
+        }
+        if value.len() > MAX_PATH_BYTES {
+            return Err(ConfigTreeError::LimitExceeded("path bytes"));
+        }
+        if value.starts_with('/')
+            || value.contains('\\')
+            || value.contains('\0')
+            || value.contains("://")
+        {
+            return Err(ConfigTreeError::InvalidPath(value.into()));
+        }
+        let mut normalized = Vec::new();
+        for component in value.split('/') {
+            if component.is_empty() || component == "." || component == ".." {
+                return Err(ConfigTreeError::InvalidPath(value.into()));
+            }
+            if component.chars().any(char::is_control) {
+                return Err(ConfigTreeError::InvalidPath(value.into()));
+            }
+            normalized.push(component);
+        }
+        Ok(Self(normalized.join("/")))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn parent_components(&self) -> Vec<&str> {
+        let mut components = self.0.split('/').collect::<Vec<_>>();
+        components.pop();
+        components
+    }
+}
+
+impl fmt::Display for VirtualPath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigContentType {
+    Decodal,
+    Text,
+}
+
+impl ConfigContentType {
+    pub fn media_type(self) -> &'static str {
+        match self {
+            Self::Decodal => "text/x-decodal",
+            Self::Text => "text/plain",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigEntry {
+    pub path: VirtualPath,
+    pub content_type: ConfigContentType,
+    pub content: String,
+    pub content_digest: String,
+}
+
+impl ConfigEntry {
+    pub fn new(
+        path: VirtualPath,
+        content_type: ConfigContentType,
+        content: impl Into<String>,
+    ) -> Result<Self, ConfigTreeError> {
+        let content = content.into();
+        if content.len() > MAX_ENTRY_BYTES {
+            return Err(ConfigTreeError::LimitExceeded("entry bytes"));
+        }
+        Ok(Self {
+            path,
+            content_type,
+            content_digest: digest_bytes(content.as_bytes()),
+            content,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigTreeSnapshot {
+    pub revision: u64,
+    pub digest: String,
+    pub entries: BTreeMap<VirtualPath, ConfigEntry>,
+}
+
+impl ConfigTreeSnapshot {
+    pub fn empty() -> Self {
+        Self::from_entries(0, Vec::new()).expect("empty config snapshot is valid")
+    }
+
+    pub fn from_entries(
+        revision: u64,
+        entries: impl IntoIterator<Item = ConfigEntry>,
+    ) -> Result<Self, ConfigTreeError> {
+        let mut ordered = BTreeMap::new();
+        let mut total = 0usize;
+        for entry in entries {
+            total = total
+                .checked_add(entry.content.len())
+                .ok_or(ConfigTreeError::LimitExceeded("total bytes"))?;
+            if total > MAX_TOTAL_BYTES {
+                return Err(ConfigTreeError::LimitExceeded("total bytes"));
+            }
+            if ordered.insert(entry.path.clone(), entry).is_some() {
+                return Err(ConfigTreeError::DuplicatePath);
+            }
+        }
+        if ordered.len() > MAX_ENTRY_COUNT {
+            return Err(ConfigTreeError::LimitExceeded("entry count"));
+        }
+        let digest = snapshot_digest(&ordered);
+        Ok(Self {
+            revision,
+            digest,
+            entries: ordered,
+        })
+    }
+
+    pub fn list_prefix(&self, prefix: Option<&VirtualPath>) -> Vec<&ConfigEntry> {
+        self.entries
+            .values()
+            .filter(|entry| {
+                prefix.is_none_or(|prefix| {
+                    entry.path == *prefix
+                        || entry
+                            .path
+                            .as_str()
+                            .strip_prefix(prefix.as_str())
+                            .is_some_and(|rest| rest.starts_with('/'))
+                })
+            })
+            .collect()
+    }
+
+    pub fn get(&self, path: &VirtualPath) -> Option<&ConfigEntry> {
+        self.entries.get(path)
+    }
+
+    pub fn apply(&self, changes: &[ConfigTreeChange]) -> Result<Self, ConfigTreeError> {
+        if changes.len() > MAX_CHANGE_COUNT {
+            return Err(ConfigTreeError::LimitExceeded("change count"));
+        }
+        let mut entries = self.entries.clone();
+        let mut touched = BTreeSet::new();
+        for change in changes {
+            for path in change.paths() {
+                if !touched.insert(path.clone()) {
+                    return Err(ConfigTreeError::PathChangedMoreThanOnce(path.clone()));
+                }
+            }
+            match change {
+                ConfigTreeChange::Create {
+                    path,
+                    content_type,
+                    content,
+                } => {
+                    if entries.contains_key(path) {
+                        return Err(ConfigTreeError::AlreadyExists(path.clone()));
+                    }
+                    entries.insert(
+                        path.clone(),
+                        ConfigEntry::new(path.clone(), *content_type, content.clone())?,
+                    );
+                }
+                ConfigTreeChange::Update {
+                    path,
+                    expected_digest,
+                    content,
+                } => {
+                    let current = entries
+                        .get(path)
+                        .ok_or_else(|| ConfigTreeError::NotFound(path.clone()))?;
+                    if &current.content_digest != expected_digest {
+                        return Err(ConfigTreeError::EntryConflict(path.clone()));
+                    }
+                    entries.insert(
+                        path.clone(),
+                        ConfigEntry::new(path.clone(), current.content_type, content.clone())?,
+                    );
+                }
+                ConfigTreeChange::Rename {
+                    from,
+                    to,
+                    expected_digest,
+                } => {
+                    if entries.contains_key(to) {
+                        return Err(ConfigTreeError::AlreadyExists(to.clone()));
+                    }
+                    let current = entries
+                        .remove(from)
+                        .ok_or_else(|| ConfigTreeError::NotFound(from.clone()))?;
+                    if &current.content_digest != expected_digest {
+                        return Err(ConfigTreeError::EntryConflict(from.clone()));
+                    }
+                    entries.insert(
+                        to.clone(),
+                        ConfigEntry::new(to.clone(), current.content_type, current.content)?,
+                    );
+                }
+                ConfigTreeChange::Delete {
+                    path,
+                    expected_digest,
+                } => {
+                    let current = entries
+                        .get(path)
+                        .ok_or_else(|| ConfigTreeError::NotFound(path.clone()))?;
+                    if &current.content_digest != expected_digest {
+                        return Err(ConfigTreeError::EntryConflict(path.clone()));
+                    }
+                    entries.remove(path);
+                }
+            }
+        }
+        Self::from_entries(self.revision, entries.into_values())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConfigTreeChange {
+    Create {
+        path: VirtualPath,
+        content_type: ConfigContentType,
+        content: String,
+    },
+    Update {
+        path: VirtualPath,
+        expected_digest: String,
+        content: String,
+    },
+    Rename {
+        from: VirtualPath,
+        to: VirtualPath,
+        expected_digest: String,
+    },
+    Delete {
+        path: VirtualPath,
+        expected_digest: String,
+    },
+}
+
+impl ConfigTreeChange {
+    fn paths(&self) -> Vec<&VirtualPath> {
+        match self {
+            Self::Create { path, .. } | Self::Update { path, .. } | Self::Delete { path, .. } => {
+                vec![path]
+            }
+            Self::Rename { from, to, .. } => vec![from, to],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolchainContract {
+    pub contract_version: u32,
+    pub decodal_version: String,
+    pub schema_version: u32,
+    pub entrypoints: Vec<VirtualPath>,
+    pub import_policy_version: u32,
+    pub fingerprint: String,
+}
+
+impl ToolchainContract {
+    pub fn new(
+        schema_version: u32,
+        mut entrypoints: Vec<VirtualPath>,
+        import_policy_version: u32,
+    ) -> Self {
+        entrypoints.sort();
+        entrypoints.dedup();
+        let mut contract = Self {
+            contract_version: CONFIG_SOURCE_CONTRACT_VERSION,
+            decodal_version: DECODAL_VERSION.to_string(),
+            schema_version,
+            entrypoints,
+            import_policy_version,
+            fingerprint: String::new(),
+        };
+        contract.fingerprint = digest_bytes(
+            serde_json::to_vec(&(
+                contract.contract_version,
+                &contract.decodal_version,
+                contract.schema_version,
+                &contract.entrypoints,
+                contract.import_policy_version,
+            ))
+            .expect("toolchain contract serializes")
+            .as_slice(),
+        );
+        contract
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigSpan {
+    pub start_byte: u32,
+    pub end_byte: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigDiagnosticLabel {
+    pub span: ConfigSpan,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigDiagnostic {
+    pub path: VirtualPath,
+    pub revision: u64,
+    pub tree_digest: String,
+    pub kind: String,
+    pub span: ConfigSpan,
+    pub message: String,
+    pub labels: Vec<ConfigDiagnosticLabel>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvaluatedProjection {
+    pub entrypoint: VirtualPath,
+    pub data_json: serde_json::Value,
+    pub projection_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvaluationResult {
+    pub projections: Vec<EvaluatedProjection>,
+    pub projection_digest: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SnapshotEnvironment {
+    snapshot: ConfigTreeSnapshot,
+}
+
+impl SnapshotEnvironment {
+    pub fn new(snapshot: ConfigTreeSnapshot) -> Self {
+        Self { snapshot }
+    }
+
+    pub fn snapshot(&self) -> &ConfigTreeSnapshot {
+        &self.snapshot
+    }
+
+    pub fn evaluate_contract(
+        &self,
+        contract: &ToolchainContract,
+    ) -> Result<EvaluationResult, Vec<ConfigDiagnostic>> {
+        let service = LanguageService::new(self);
+        let mut projections = Vec::new();
+        for entrypoint in &contract.entrypoints {
+            let Some(entry) = self.snapshot.get(entrypoint) else {
+                return Err(vec![self.config_error(
+                    entrypoint.clone(),
+                    "entrypoint_missing",
+                    "configured entrypoint is missing",
+                )]);
+            };
+            if entry.content_type != ConfigContentType::Decodal {
+                return Err(vec![self.config_error(
+                    entrypoint.clone(),
+                    "entrypoint_not_decodal",
+                    "configured entrypoint is not Decodal source",
+                )]);
+            }
+            match service.evaluate(entrypoint.as_str(), entrypoint.as_str(), &entry.content) {
+                Ok(data) => {
+                    let data_json = decodal_data_to_json(&data);
+                    let projection_digest = digest_bytes(
+                        serde_json::to_vec(&data_json)
+                            .expect("Decodal projection serializes")
+                            .as_slice(),
+                    );
+                    projections.push(EvaluatedProjection {
+                        entrypoint: entrypoint.clone(),
+                        data_json,
+                        projection_digest,
+                    });
+                }
+                Err(diagnostic) => {
+                    return Err(vec![project_diagnostic(
+                        &self.snapshot,
+                        entrypoint.clone(),
+                        &diagnostic,
+                    )]);
+                }
+            }
+        }
+        let projection_digest = digest_bytes(
+            serde_json::to_vec(&projections)
+                .expect("projection set serializes")
+                .as_slice(),
+        );
+        Ok(EvaluationResult {
+            projections,
+            projection_digest,
+        })
+    }
+
+    pub fn analyze(
+        &self,
+        entrypoint: &VirtualPath,
+        source_override: Option<&str>,
+    ) -> Vec<ConfigDiagnostic> {
+        let Some(entry) = self.snapshot.get(entrypoint) else {
+            return vec![self.config_error(
+                entrypoint.clone(),
+                "entrypoint_missing",
+                "configured entrypoint is missing",
+            )];
+        };
+        let service = LanguageService::new(self);
+        service
+            .analyze(
+                entrypoint.as_str(),
+                entrypoint.as_str(),
+                source_override.unwrap_or(&entry.content),
+            )
+            .diagnostics
+            .iter()
+            .map(|diagnostic| project_diagnostic(&self.snapshot, entrypoint.clone(), diagnostic))
+            .collect()
+    }
+
+    pub fn complete(
+        &self,
+        entrypoint: &VirtualPath,
+        source: &str,
+        utf8_byte_offset: usize,
+        explicit: bool,
+    ) -> decodal::Result<Option<CompletionResult>> {
+        LanguageService::new(self).complete(entrypoint.as_str(), source, utf8_byte_offset, explicit)
+    }
+
+    pub fn format(&self, source: &str) -> Result<String, String> {
+        decodal_language_tools::format_source(source).map_err(|error| error.to_string())
+    }
+
+    fn config_error(
+        &self,
+        path: VirtualPath,
+        kind: impl Into<String>,
+        message: impl Into<String>,
+    ) -> ConfigDiagnostic {
+        ConfigDiagnostic {
+            path,
+            revision: self.snapshot.revision,
+            tree_digest: self.snapshot.digest.clone(),
+            kind: kind.into(),
+            span: ConfigSpan {
+                start_byte: 0,
+                end_byte: 0,
+            },
+            message: message.into(),
+            labels: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+}
+
+impl HostEnvironment for &SnapshotEnvironment {
+    type Loader = SnapshotImportLoader;
+
+    fn create_loader(&self) -> Self::Loader {
+        SnapshotImportLoader {
+            snapshot: self.snapshot.clone(),
+        }
+    }
+
+    fn configure_engine(&self, _engine: &mut Engine<Self::Loader>) -> decodal::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SnapshotImportLoader {
+    snapshot: ConfigTreeSnapshot,
+}
+
+impl SnapshotImportLoader {
+    pub fn resolve(
+        &self,
+        current_key: Option<&str>,
+        specifier: &str,
+    ) -> Result<VirtualPath, ConfigTreeError> {
+        let current = current_key
+            .map(VirtualPath::parse)
+            .transpose()?
+            .ok_or_else(|| ConfigTreeError::InvalidImport(specifier.into()))?;
+        resolve_import(&current, specifier)
+    }
+}
+
+impl ImportLoader for SnapshotImportLoader {
+    fn load(
+        &mut self,
+        current_key: Option<&str>,
+        specifier: &str,
+    ) -> decodal::Result<LoadedImport> {
+        let path = self.resolve(current_key, specifier).map_err(import_error)?;
+        let entry = self.snapshot.get(&path).ok_or_else(|| {
+            Diagnostic::new(
+                DiagnosticKind::Import,
+                Span::default(),
+                format!("virtual config import is missing: {path}"),
+            )
+        })?;
+        Ok(LoadedImport::source(
+            path.as_str(),
+            path.as_str(),
+            entry.content.clone(),
+        ))
+    }
+
+    fn complete_import(
+        &mut self,
+        current_key: Option<&str>,
+        prefix: &str,
+    ) -> decodal::Result<Vec<ImportCandidate>> {
+        let current = current_key
+            .map(VirtualPath::parse)
+            .transpose()
+            .map_err(import_error)?;
+        Ok(import_completions(&self.snapshot, current.as_ref(), prefix)
+            .into_iter()
+            .map(|specifier| ImportCandidate::new(specifier).with_detail("virtual config source"))
+            .collect())
+    }
+}
+
+pub fn resolve_import(
+    current: &VirtualPath,
+    specifier: &str,
+) -> Result<VirtualPath, ConfigTreeError> {
+    if specifier.is_empty()
+        || specifier.starts_with('/')
+        || specifier.contains('\\')
+        || specifier.contains('\0')
+        || specifier.contains("://")
+        || specifier.contains(':')
+    {
+        return Err(ConfigTreeError::InvalidImport(specifier.into()));
+    }
+    let mut components = if specifier.starts_with("./") || specifier.starts_with("../") {
+        current.parent_components()
+    } else {
+        Vec::new()
+    };
+    for component in specifier.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components
+                    .pop()
+                    .ok_or_else(|| ConfigTreeError::ImportEscape(specifier.into()))?;
+            }
+            value => components.push(value),
+        }
+    }
+    VirtualPath::parse(components.join("/"))
+}
+
+pub fn import_completions(
+    snapshot: &ConfigTreeSnapshot,
+    current: Option<&VirtualPath>,
+    prefix: &str,
+) -> Vec<String> {
+    let mut candidates = BTreeSet::new();
+    for path in snapshot.entries.keys() {
+        if current == Some(path) {
+            continue;
+        }
+        let absolute = path.as_str().to_string();
+        if absolute.starts_with(prefix) {
+            candidates.insert(absolute);
+        }
+        if let Some(current) = current {
+            let current_parent = current.parent_components();
+            let target = path.as_str().split('/').collect::<Vec<_>>();
+            let mut common = 0usize;
+            while common < current_parent.len()
+                && common < target.len()
+                && current_parent[common] == target[common]
+            {
+                common += 1;
+            }
+            let mut relative = vec![".."; current_parent.len().saturating_sub(common)];
+            relative.extend_from_slice(&target[common..]);
+            let specifier = if relative.first().is_some_and(|item| *item == "..") {
+                relative.join("/")
+            } else {
+                format!("./{}", relative.join("/"))
+            };
+            if specifier.starts_with(prefix) {
+                candidates.insert(specifier);
+            }
+        }
+    }
+    candidates.into_iter().collect()
+}
+
+fn project_diagnostic(
+    snapshot: &ConfigTreeSnapshot,
+    fallback_path: VirtualPath,
+    diagnostic: &Diagnostic,
+) -> ConfigDiagnostic {
+    ConfigDiagnostic {
+        path: fallback_path,
+        revision: snapshot.revision,
+        tree_digest: snapshot.digest.clone(),
+        kind: diagnostic_kind(diagnostic.kind).to_string(),
+        span: ConfigSpan {
+            start_byte: diagnostic.span.start,
+            end_byte: diagnostic.span.end,
+        },
+        message: diagnostic.message.clone(),
+        labels: diagnostic
+            .labels
+            .iter()
+            .map(|label| ConfigDiagnosticLabel {
+                span: ConfigSpan {
+                    start_byte: label.span.start,
+                    end_byte: label.span.end,
+                },
+                message: label.message.clone(),
+            })
+            .collect(),
+        notes: diagnostic.notes.clone(),
+    }
+}
+
+fn diagnostic_kind(kind: DiagnosticKind) -> &'static str {
+    match kind {
+        DiagnosticKind::Syntax => "syntax",
+        DiagnosticKind::UnresolvedIdentifier => "unresolved_identifier",
+        DiagnosticKind::TypeMismatch => "type_mismatch",
+        DiagnosticKind::ConstraintViolation => "constraint_violation",
+        DiagnosticKind::Conflict => "conflict",
+        DiagnosticKind::DefaultConflict => "default_conflict",
+        DiagnosticKind::Cycle => "cycle",
+        DiagnosticKind::Import => "import",
+        DiagnosticKind::MatchFailure => "match_failure",
+        DiagnosticKind::Materialize => "materialize",
+        DiagnosticKind::UnsupportedFeature => "unsupported_feature",
+    }
+}
+
+fn import_error(error: ConfigTreeError) -> Diagnostic {
+    Diagnostic::new(DiagnosticKind::Import, Span::default(), error.to_string())
+}
+
+fn decodal_data_to_json(data: &Data) -> serde_json::Value {
+    match data {
+        Data::Bool(value) => serde_json::Value::Bool(*value),
+        Data::Int(value) => serde_json::Value::Number((*value).into()),
+        Data::Float(value) => serde_json::Number::from_f64(*value)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Data::String(value) => serde_json::Value::String(value.clone()),
+        Data::Array(values) => {
+            serde_json::Value::Array(values.iter().map(decodal_data_to_json).collect())
+        }
+        Data::Object(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|field| (field.name.clone(), decodal_data_to_json(&field.value)))
+                .collect(),
+        ),
+    }
+}
+
+fn snapshot_digest(entries: &BTreeMap<VirtualPath, ConfigEntry>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"yoi-config-tree-v1\0");
+    for (path, entry) in entries {
+        hasher.update(path.as_str().as_bytes());
+        hasher.update([0]);
+        hasher.update(entry.content_type.media_type().as_bytes());
+        hasher.update([0]);
+        hasher.update(entry.content.as_bytes());
+        hasher.update([0]);
+    }
+    format_digest(hasher.finalize().as_slice())
+}
+
+pub fn digest_bytes(bytes: &[u8]) -> String {
+    format_digest(Sha256::digest(bytes).as_slice())
+}
+
+fn format_digest(bytes: &[u8]) -> String {
+    let mut output = String::from("sha256:");
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum ConfigTreeError {
+    #[error("invalid virtual config path: {0}")]
+    InvalidPath(String),
+    #[error("invalid virtual config import: {0}")]
+    InvalidImport(String),
+    #[error("virtual config import escapes the tree: {0}")]
+    ImportEscape(String),
+    #[error("virtual config path already exists: {0}")]
+    AlreadyExists(VirtualPath),
+    #[error("virtual config path was not found: {0}")]
+    NotFound(VirtualPath),
+    #[error("virtual config entry changed: {0}")]
+    EntryConflict(VirtualPath),
+    #[error("virtual config path changed more than once in one candidate: {0}")]
+    PathChangedMoreThanOnce(VirtualPath),
+    #[error("duplicate virtual config path")]
+    DuplicatePath,
+    #[error("virtual config limit exceeded: {0}")]
+    LimitExceeded(&'static str),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    fn path(value: &str) -> VirtualPath {
+        VirtualPath::parse(value).unwrap()
+    }
+
+    fn entry(path_value: &str, content: &str) -> ConfigEntry {
+        ConfigEntry::new(path(path_value), ConfigContentType::Decodal, content).unwrap()
+    }
+
+    #[test]
+    fn virtual_paths_reject_ambiguous_or_escaping_forms() {
+        for invalid in ["", "/root.dcdl", "a//b", "a/./b", "a/../b", "a\\b", "a\0b"] {
+            assert!(VirtualPath::parse(invalid).is_err(), "{invalid:?}");
+        }
+        assert_eq!(path("profiles/main.dcdl").as_str(), "profiles/main.dcdl");
+    }
+
+    #[test]
+    fn candidate_changes_are_atomic_ordered_and_conflict_checked() {
+        let base = ConfigTreeSnapshot::from_entries(
+            7,
+            [
+                entry("profiles/a.dcdl", "{ a = 1; }"),
+                entry("shared.dcdl", "{}"),
+            ],
+        )
+        .unwrap();
+        let updated = base
+            .apply(&[
+                ConfigTreeChange::Update {
+                    path: path("profiles/a.dcdl"),
+                    expected_digest: base.entries[&path("profiles/a.dcdl")]
+                        .content_digest
+                        .clone(),
+                    content: "{ a = 2; }".into(),
+                },
+                ConfigTreeChange::Rename {
+                    from: path("shared.dcdl"),
+                    to: path("lib/shared.dcdl"),
+                    expected_digest: base.entries[&path("shared.dcdl")].content_digest.clone(),
+                },
+            ])
+            .unwrap();
+        assert_eq!(
+            updated
+                .entries
+                .keys()
+                .map(VirtualPath::as_str)
+                .collect::<Vec<_>>(),
+            ["lib/shared.dcdl", "profiles/a.dcdl"]
+        );
+        assert_ne!(updated.digest, base.digest);
+        assert!(matches!(
+            base.apply(&[ConfigTreeChange::Delete {
+                path: path("shared.dcdl"),
+                expected_digest: "sha256:stale".into(),
+            }]),
+            Err(ConfigTreeError::EntryConflict(_))
+        ));
+    }
+
+    #[test]
+    fn snapshot_digest_is_deterministic() {
+        let left = ConfigTreeSnapshot::from_entries(
+            1,
+            [entry("z.dcdl", "{}"), entry("a.dcdl", "{ x = 1; }")],
+        )
+        .unwrap();
+        let right = ConfigTreeSnapshot::from_entries(
+            99,
+            [entry("a.dcdl", "{ x = 1; }"), entry("z.dcdl", "{}")],
+        )
+        .unwrap();
+        assert_eq!(left.digest, right.digest);
+    }
+
+    #[test]
+    fn relative_imports_and_completion_share_the_snapshot_namespace() {
+        let snapshot = ConfigTreeSnapshot::from_entries(
+            1,
+            [
+                entry("profiles/main.dcdl", r#"import "../shared/value.dcdl""#),
+                entry("shared/value.dcdl", "{ answer = 42; }"),
+                entry("other.dcdl", "{}"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_import(&path("profiles/main.dcdl"), "../shared/value.dcdl").unwrap(),
+            path("shared/value.dcdl")
+        );
+        assert!(resolve_import(&path("main.dcdl"), "../escape.dcdl").is_err());
+        assert_eq!(
+            import_completions(&snapshot, Some(&path("profiles/main.dcdl")), "../sh"),
+            ["../shared/value.dcdl"]
+        );
+    }
+
+    #[test]
+    fn host_environment_evaluation_uses_only_snapshot_imports() {
+        let snapshot = ConfigTreeSnapshot::from_entries(
+            3,
+            [
+                entry("profiles/main.dcdl", r#"import "./shared.dcdl""#),
+                entry("profiles/shared.dcdl", "{ answer = 42; }"),
+            ],
+        )
+        .unwrap();
+        let contract = ToolchainContract::new(
+            DEFAULT_SCHEMA_VERSION,
+            vec![path("profiles/main.dcdl")],
+            DEFAULT_IMPORT_POLICY_VERSION,
+        );
+        let result = SnapshotEnvironment::new(snapshot)
+            .evaluate_contract(&contract)
+            .unwrap();
+        assert_eq!(result.projections[0].data_json["answer"], 42);
+    }
+
+    #[test]
+    fn missing_import_and_cycles_are_structured_failures() {
+        let missing =
+            ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", r#"import "./missing.dcdl""#)])
+                .unwrap();
+        let contract = ToolchainContract::new(1, vec![path("main.dcdl")], 1);
+        let diagnostics = SnapshotEnvironment::new(missing)
+            .evaluate_contract(&contract)
+            .unwrap_err();
+        assert_eq!(diagnostics[0].kind, "import");
+
+        let cycle = ConfigTreeSnapshot::from_entries(
+            1,
+            [
+                entry("a.dcdl", r#"import "./b.dcdl""#),
+                entry("b.dcdl", r#"import "./a.dcdl""#),
+            ],
+        )
+        .unwrap();
+        let diagnostics = SnapshotEnvironment::new(cycle)
+            .evaluate_contract(&ToolchainContract::new(1, vec![path("a.dcdl")], 1))
+            .unwrap_err();
+        assert_eq!(diagnostics[0].kind, "cycle");
+    }
+}

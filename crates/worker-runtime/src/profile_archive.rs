@@ -1,4 +1,4 @@
-use decodal::{Engine, LoadedSource, SourceLoader};
+use decodal::{Engine, ImportLoader, LoadedImport};
 use manifest::{ProfileSource, WorkerManifest, resolve_profile_artifact_value};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -424,12 +424,12 @@ impl<'a> ArchiveSourceLoader<'a> {
     }
 }
 
-impl SourceLoader for ArchiveSourceLoader<'_> {
+impl ImportLoader for ArchiveSourceLoader<'_> {
     fn load(
         &mut self,
         current_key: Option<&str>,
         specifier: &str,
-    ) -> decodal::Result<LoadedSource> {
+    ) -> decodal::Result<LoadedImport> {
         let path =
             archive_import_map_lookup(&self.archive.manifest.imports, current_key, specifier)
                 .map_err(import_diagnostic)?;
@@ -453,11 +453,7 @@ impl SourceLoader for ArchiveSourceLoader<'_> {
                 format!("archive source missing: {path}"),
             )
         })?;
-        Ok(LoadedSource {
-            key: path.clone(),
-            name: path.clone(),
-            source: source.clone(),
-        })
+        Ok(LoadedImport::source(path.clone(), path, source.clone()))
     }
 }
 
