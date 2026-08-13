@@ -166,6 +166,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create Worker mutation source proof replay guard",
         apply: create_worker_mutation_source_proof_replay_guard,
     },
+    Migration {
+        version: 30,
+        name: "create Workspace virtual config source authority",
+        apply: create_workspace_config_source_authority,
+    },
 ];
 
 struct Migration {
@@ -4527,6 +4532,49 @@ fn current_schema_version(conn: &Connection) -> Result<i64> {
     .map_err(Error::from)
 }
 
+fn create_workspace_config_source_authority(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE workspace_config_trees (
+            workspace_id TEXT PRIMARY KEY,
+            revision INTEGER NOT NULL CHECK (revision >= 0),
+            tree_digest TEXT NOT NULL,
+            schema_version INTEGER NOT NULL,
+            entrypoints_json TEXT NOT NULL,
+            decodal_version TEXT NOT NULL,
+            import_policy_version INTEGER NOT NULL,
+            toolchain_fingerprint TEXT NOT NULL,
+            projection_digest TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+        );
+        CREATE TABLE workspace_config_entries (
+            workspace_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            content_type TEXT NOT NULL,
+            content TEXT NOT NULL,
+            content_digest TEXT NOT NULL,
+            PRIMARY KEY (workspace_id, path),
+            FOREIGN KEY (workspace_id) REFERENCES workspace_config_trees(workspace_id) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_workspace_config_entries_prefix
+            ON workspace_config_entries(workspace_id, path);
+        CREATE TABLE workspace_config_tree_revisions (
+            workspace_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            tree_digest TEXT NOT NULL,
+            toolchain_fingerprint TEXT NOT NULL,
+            projection_digest TEXT NOT NULL,
+            manifest_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (workspace_id, revision),
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
 fn create_worker_mutation_source_proof_replay_guard(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -5133,7 +5181,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 29);
+        assert_eq!(current_schema_version(&conn).unwrap(), 30);
         assert!(table_exists(&conn, "worker_workdir_attachment_reservations").unwrap());
     }
 
@@ -5166,7 +5214,7 @@ CREATE TABLE flow_events (event_id TEXT PRIMARY KEY);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 29);
+        assert_eq!(current_schema_version(&conn).unwrap(), 30);
         assert!(table_exists(&conn, "flow_sources").unwrap());
         assert!(table_exists(&conn, "flow_source_revisions").unwrap());
         assert!(!table_exists(&conn, "flow_instances").unwrap());
@@ -5233,7 +5281,7 @@ INSERT INTO worker_workdir_attachment_reservations (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 29);
+        assert_eq!(current_schema_version(&conn).unwrap(), 30);
         let repositories_sql: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'repositories'",

@@ -19,6 +19,7 @@ async-trait.workspace = true
 axum = { workspace = true, features = ["ws"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 futures.workspace = true
+config-source.workspace = true
 flow = { path = "../flow" }
 manifest.workspace = true
 protocol = { workspace = true }

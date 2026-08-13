@@ -12,6 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use chrono::{Duration, SecondsFormat, Utc};
+use config_source::ConfigTreeSnapshot;
 use flow::{FlowSourceKind, FlowSourceResolveRequest, ResolvedFlowSource};
 use futures::{SinkExt, StreamExt};
 use memory::backend::{
@@ -61,6 +62,7 @@ use crate::companion::{
     CompanionStatusResponse, CompanionTranscriptProjection,
 };
 use crate::config::{BackendRuntimesConfigFile, RemoteRuntimeConfigFile, resolve_remote_runtime};
+use crate::config_source::{ConfigCommitRequest, ConfigPreviewRequest};
 use crate::hosts::{
     ConfigBundleCheckResult, ConfigBundleSyncResult, DiagnosticSeverity, EMBEDDED_RUNTIME_ID,
     EmbeddedWorkerRuntime, HostSummary, RemoteRuntimeConfig, RemoteWorkerRuntime,
@@ -252,6 +254,7 @@ const ORCHESTRATOR_ATTENTION_PROMPT: &str = include_str!(concat!(
 pub struct WorkspaceApi {
     pub(crate) config: ServerConfig,
     pub(crate) store: Arc<dyn ControlPlaneStore>,
+    config_store: Arc<crate::SqliteWorkspaceStore>,
     authority: SqliteWorkspaceAuthority,
     runtime: Arc<RuntimeRegistry>,
     companion: Arc<CompanionConsole>,
@@ -741,7 +744,11 @@ impl WorkspaceApi {
         let runtime = Arc::new(runtime);
         let companion = Arc::new(CompanionConsole::disabled());
         let observation_proxy = BackendObservationProxy::new(config.runtime_event_sources.clone());
+        let config_store = Arc::new(crate::SqliteWorkspaceStore::open(
+            config.database_path.clone(),
+        )?);
         let api = Self {
+            config_store,
             authority: SqliteWorkspaceAuthority::new(
                 config.database_path.clone(),
                 config.workspace_id.clone(),
@@ -1131,6 +1138,26 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/settings/workspace",
             get(scoped_get_workspace_settings).put(scoped_update_workspace_settings),
+        )
+        .route(
+            "/api/w/{workspace_id}/config/source-tree",
+            get(scoped_get_workspace_config_tree),
+        )
+        .route(
+            "/api/w/{workspace_id}/config/source-tree/preview",
+            post(scoped_preview_workspace_config_tree),
+        )
+        .route(
+            "/api/w/{workspace_id}/config/source-tree/commit",
+            post(scoped_commit_workspace_config_tree),
+        )
+        .route(
+            "/api/w/{workspace_id}/config/source-tree/revisions/{revision}",
+            get(scoped_get_workspace_config_revision),
+        )
+        .route(
+            "/api/w/{workspace_id}/config/source-tree/entries/{*path}",
+            get(scoped_get_workspace_config_entry),
         )
         .route(
             "/api/w/{workspace_id}/settings/profiles",
@@ -2415,6 +2442,113 @@ async fn scoped_update_workspace_settings(
                 message: "Workspace display metadata was updated.".to_string(),
             }],
         },
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceConfigRevisionPath {
+    workspace_id: String,
+    revision: u64,
+}
+
+async fn scoped_get_workspace_config_revision(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<WorkspaceConfigRevisionPath>,
+) -> ApiResult<Json<ConfigTreeSnapshot>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let snapshot = api
+        .config_store
+        .load_workspace_config_revision(&path.workspace_id, path.revision)?
+        .ok_or_else(|| ApiError::from(Error::InvalidRecordId(path.revision.to_string())))?;
+    Ok(Json(snapshot))
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceConfigEntryPath {
+    workspace_id: String,
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceConfigTreeResponse {
+    snapshot: ConfigTreeSnapshot,
+    contract: config_source::ToolchainContract,
+    projection_digest: String,
+}
+
+async fn scoped_get_workspace_config_tree(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+) -> ApiResult<Json<WorkspaceConfigTreeResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let state = api
+        .config_store
+        .load_workspace_config(&path.workspace_id)?
+        .unwrap_or_else(|| crate::config_source::WorkspaceConfigState {
+            snapshot: ConfigTreeSnapshot::empty(),
+            contract: config_source::ToolchainContract::new(
+                config_source::DEFAULT_SCHEMA_VERSION,
+                Vec::new(),
+                config_source::DEFAULT_IMPORT_POLICY_VERSION,
+            ),
+            projection_digest: config_source::digest_bytes(b"[]"),
+        });
+    Ok(Json(WorkspaceConfigTreeResponse {
+        snapshot: state.snapshot,
+        contract: state.contract,
+        projection_digest: state.projection_digest,
+    }))
+}
+
+async fn scoped_get_workspace_config_entry(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<WorkspaceConfigEntryPath>,
+) -> ApiResult<Json<config_source::ConfigEntry>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let virtual_path = config_source::VirtualPath::parse(&path.path)
+        .map_err(|error| ApiError::from(Error::InvalidInput(error.to_string())))?;
+    let state = api
+        .config_store
+        .load_workspace_config(&path.workspace_id)?
+        .ok_or_else(|| {
+            ApiError::from(Error::InvalidRecordId("virtual config source tree".into()))
+        })?;
+    let entry = state
+        .snapshot
+        .get(&virtual_path)
+        .cloned()
+        .ok_or_else(|| ApiError::from(Error::InvalidRecordId(path.path)))?;
+    Ok(Json(entry))
+}
+
+async fn scoped_preview_workspace_config_tree(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Json(request): Json<ConfigPreviewRequest>,
+) -> ApiResult<Json<crate::config_source::EvaluatedConfigCandidate>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    Ok(Json(
+        api.config_store
+            .preview_workspace_config(&path.workspace_id, &request)?,
+    ))
+}
+
+async fn scoped_commit_workspace_config_tree(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Json(request): Json<ConfigCommitRequest>,
+) -> ApiResult<(StatusCode, Json<WorkspaceConfigTreeResponse>)> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let state = api
+        .config_store
+        .evaluate_and_commit_workspace_config(&path.workspace_id, &request)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(WorkspaceConfigTreeResponse {
+            snapshot: state.snapshot,
+            contract: state.contract,
+            projection_digest: state.projection_digest,
+        }),
     ))
 }
 
@@ -11273,9 +11407,9 @@ impl IntoResponse for ApiError {
             Error::BrowserMergeConfirmationRequired | Error::BrowserReopenConfirmationRequired => {
                 StatusCode::FORBIDDEN
             }
-            Error::TicketAssignmentConflict(_) | Error::WorkdirAttachmentConflict(_) => {
-                StatusCode::CONFLICT
-            }
+            Error::TicketAssignmentConflict(_)
+            | Error::WorkdirAttachmentConflict(_)
+            | Error::WorkspaceConfigConflict(_) => StatusCode::CONFLICT,
             Error::WorkerSourceIdentity(_) | Error::InvalidInput(_) => StatusCode::BAD_REQUEST,
             Error::InvalidRuntimeIdentifier { .. } | Error::ReservedWorkerName(_) => {
                 StatusCode::BAD_REQUEST

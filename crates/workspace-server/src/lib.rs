@@ -8,6 +8,7 @@ pub mod auth;
 pub mod authority;
 pub mod companion;
 pub mod config;
+pub mod config_source;
 pub mod hosts;
 pub mod identity;
 pub mod memory_backend;
@@ -106,6 +107,8 @@ pub enum Error {
     TicketAssignmentConflict(String),
     #[error("Workdir attachment conflict: {0}")]
     WorkdirAttachmentConflict(String),
+    #[error("Workspace config update conflict: {0}")]
+    WorkspaceConfigConflict(String),
     #[error("Registry inconsistency: {0}")]
     RegistryInconsistency(String),
     #[error("Worker source identity is invalid: {0}")]

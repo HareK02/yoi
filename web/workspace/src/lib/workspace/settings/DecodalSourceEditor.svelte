@@ -1,5 +1,6 @@
 <script lang="ts">
   import { untrack } from 'svelte';
+  import { autocompletion, type CompletionContext, type CompletionResult } from '@codemirror/autocomplete';
   import { EditorState } from '@codemirror/state';
   import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection } from '@codemirror/view';
   import { decodal } from 'decodal-codemirror';
@@ -9,11 +10,13 @@
     readonly = false,
     ariaLabel = 'Decodal source',
     onChange = (_value: string) => {},
+    onComplete = undefined,
   }: {
     value?: string;
     readonly?: boolean;
     ariaLabel?: string;
     onChange?: (value: string) => void;
+    onComplete?: (source: string, utf16Offset: number, explicit: boolean) => Promise<CompletionResult | null>;
   } = $props();
 
   let host = $state<HTMLDivElement | null>(null);
@@ -39,6 +42,7 @@
     const initialValue = untrack(() => value);
     const initialReadonly = untrack(() => readonly);
     const handleChange = untrack(() => onChange);
+    const handleComplete = untrack(() => onComplete);
     const editor = new EditorView({
       parent: host,
       state: EditorState.create({
@@ -48,6 +52,10 @@
           drawSelection(),
           highlightActiveLine(),
           decodal(),
+          ...(handleComplete ? [autocompletion({ override: [async (context: CompletionContext) => {
+            const doc = context.state.doc.toString();
+            return await handleComplete(doc, context.pos, context.explicit);
+          }] })] : []),
           keymap.of([]),
           EditorState.readOnly.of(initialReadonly),
           EditorView.editable.of(!initialReadonly),

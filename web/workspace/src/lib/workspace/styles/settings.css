@@ -515,6 +515,174 @@
     font-weight: 800;
     text-transform: uppercase;
   }
+  .config-source-shell {
+    display: grid;
+    grid-template-columns: minmax(12rem, 18rem) minmax(0, 1fr);
+    min-height: 40rem;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-panel);
+    background: var(--bg-raised);
+  }
+  .config-source-tree {
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    border-right: 1px solid var(--line);
+    background: var(--bg-subtle);
+  }
+  .config-source-tree__header,
+  .config-source-workbench__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    padding: var(--space-3);
+    border-bottom: 1px solid var(--line);
+  }
+  .config-source-tree nav {
+    display: grid;
+    align-content: start;
+    overflow: auto;
+    padding: var(--space-2);
+  }
+  .config-source-tree nav button {
+    border: 0;
+    border-radius: 0.45rem;
+    background: transparent;
+    color: var(--text-muted);
+    padding: 0.45rem 0.55rem;
+    font: inherit;
+    font-family: var(--font-mono);
+    text-align: left;
+    cursor: pointer;
+  }
+  .config-source-tree nav button.active,
+  .config-source-tree nav button:hover {
+    background: var(--interactive-hover);
+    color: var(--text-strong);
+  }
+  .config-source-create {
+    display: grid;
+    gap: var(--space-2);
+    padding: var(--space-3);
+    border-top: 1px solid var(--line);
+  }
+  .config-source-create label,
+  .config-source-workbench__header span {
+    color: var(--text-muted);
+    font-size: 0.75rem;
+  }
+  .config-source-create input,
+  .config-source-actions input {
+    min-width: 0;
+    border: 1px solid var(--line);
+    border-radius: 0.45rem;
+    background: var(--bg-raised);
+    color: var(--text-strong);
+    padding: 0.45rem;
+    font: inherit;
+    font-family: var(--font-mono);
+  }
+  .config-source-create button,
+  .config-source-actions button {
+    border: 1px solid var(--line);
+    border-radius: 0.45rem;
+    background: var(--bg-subtle);
+    color: var(--text-strong);
+    padding: 0.4rem 0.6rem;
+    cursor: pointer;
+  }
+  .config-source-actions button.primary {
+    border-color: transparent;
+    background: var(--accent);
+    color: var(--bg);
+  }
+  .config-source-actions button.danger {
+    color: var(--danger);
+  }
+  .config-source-actions button:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
+  .config-source-workbench {
+    display: grid;
+    grid-template-rows: auto minmax(20rem, 1fr) auto auto;
+    min-width: 0;
+  }
+  .config-source-workbench__header > div:first-child {
+    display: grid;
+    min-width: 0;
+  }
+  .config-source-workbench__header strong {
+    overflow: hidden;
+    font-family: var(--font-mono);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .config-source-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+  .config-source-status {
+    margin: 0;
+    padding: var(--space-2) var(--space-3);
+    border-top: 1px solid var(--line);
+    color: var(--text-muted);
+    font-size: 0.8rem;
+  }
+  .config-source-conflict {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    padding: var(--space-3);
+    border-top: 1px solid var(--danger);
+    background: color-mix(in srgb, var(--danger) 8%, transparent);
+  }
+  .config-source-conflict button {
+    border: 1px solid var(--danger);
+    border-radius: 0.45rem;
+    background: var(--bg-raised);
+    color: var(--danger);
+    padding: 0.4rem 0.6rem;
+    cursor: pointer;
+  }
+  .config-source-diagnostics {
+    display: grid;
+    gap: var(--space-2);
+    max-height: 12rem;
+    overflow: auto;
+    margin: 0;
+    padding: var(--space-3);
+    border-top: 1px solid var(--line);
+  }
+  .config-source-diagnostics li {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    gap: var(--space-2);
+    color: var(--text-muted);
+  }
+  .config-source-diagnostics strong {
+    color: var(--danger);
+  }
+  @media (max-width: 48rem) {
+    .config-source-shell {
+      grid-template-columns: 1fr;
+    }
+    .config-source-tree {
+      grid-template-rows: auto auto auto;
+      border-right: 0;
+      border-bottom: 1px solid var(--line);
+    }
+    .config-source-tree nav {
+      max-height: 12rem;
+    }
+    .config-source-workbench__header {
+      align-items: stretch;
+      flex-direction: column;
+    }
+  }
+
   .status-message.error {
     color: var(--danger);
   }

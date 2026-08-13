@@ -590,6 +590,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "config-source"
+version = "0.1.0"
+dependencies = [
+ "decodal",
+ "decodal-language-service",
+ "decodal-language-tools",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "ts-rs",
+]
+
+[[package]]
+name = "config-source-wasm"
+version = "0.1.0"
+dependencies = [
+ "config-source",
+ "serde",
+ "serde-wasm-bindgen",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -961,9 +986,29 @@ checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
 
 [[package]]
 name = "decodal"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4291c87ce887fafc0acf9f40f4bc17e111457e9d62f1b1530113be6b7a7f1a21"
+checksum = "2b6e47d6bc66cd3cd42c8df8ff77a994a7743e889045c6b762a6dbc360ad8494"
+
+[[package]]
+name = "decodal-language-service"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f25e462dce7c86743bd229ba91b831daf7928d524de9cef4ef861257ca156aa8"
+dependencies = [
+ "decodal",
+]
+
+[[package]]
+name = "decodal-language-tools"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08d8e3eb978cb1c2259df838ba2a8102bc45553d7b415216c80fc5b6a3f378c6"
+dependencies = [
+ "decodal",
+ "serde_json",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "deltae"
@@ -3749,6 +3794,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde-wasm-bindgen"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8302e169f0eddcc139c70f139d19d6467353af16f9fce27e8c30158036a1e16b"
+dependencies = [
+ "js-sys",
+ "serde",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "serde_cbor_2"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6172,6 +6228,7 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "config-source",
  "flow",
  "futures",
  "manifest",
