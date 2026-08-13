@@ -742,7 +742,12 @@ mod tests {
         let loaded = loader
             .load(Some("profiles/main.dcdl"), "./shared.dcdl")
             .unwrap();
-        assert_eq!(loaded.key, "profiles/shared.dcdl");
+        match loaded {
+            LoadedImport::Source(source) => {
+                assert_eq!(source.key, "profiles/shared.dcdl");
+            }
+            LoadedImport::Value(_) => panic!("expected source import"),
+        }
     }
 
     #[test]
