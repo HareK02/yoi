@@ -7,6 +7,7 @@ export type Diagnostic = {
 export type SettingsSectionId =
   | "runtime-connections"
   | "runtime-inventory"
+  | "configuration-sources"
   | "profile-sources"
   | "backend-config"
   | "workspace-identity";
@@ -99,6 +100,18 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
     ],
   },
   {
+    id: "configuration-sources",
+    label: "Configuration Sources",
+    status: "editable",
+    summary:
+      "Edit the Server-owned virtual Decodal source tree through one native/WASM toolchain contract.",
+    bullets: [
+      "Virtual paths and imports resolve inside the committed Workspace tree, never from browser or Server host paths.",
+      "Browser analysis is advisory; Server evaluation is required before an atomic revision commit.",
+      "Profile, Skill, Prompt, and Plugin consumers remain on their existing authorities until their follow-up cutovers.",
+    ],
+  },
+  {
     id: "profile-sources",
     label: "Profile Sources",
     status: "editable",
@@ -160,6 +173,8 @@ export function settingsSectionHref(id: SettingsSectionId): string {
       return `${SETTINGS_ROUTE}/runtime-connections`;
     case "runtime-inventory":
       return `${SETTINGS_ROUTE}/runtimes`;
+    case "configuration-sources":
+      return `${SETTINGS_ROUTE}/configuration`;
     case "profile-sources":
       return `${SETTINGS_ROUTE}/profiles`;
     case "workspace-identity":
