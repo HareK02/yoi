@@ -3,19 +3,31 @@
 
 export function analyze_snapshot(snapshot: any, entrypoint: string, source_override?: string | null): any;
 
+export function apply_changes(changes: any): any;
+
+export function complete_current(entrypoint: string, source: string, utf8_byte_offset: number, explicit: boolean): any;
+
+export function evaluate_current(contract: any): any;
+
 export function evaluate_snapshot(snapshot: any, contract: any): any;
 
 export function formatSource(source: string): string;
 
 export function format_source(source: string): string;
 
+export function set_snapshot(snapshot: any): void;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly analyze_snapshot: (a: any, b: number, c: number, d: number, e: number) => [number, number, number];
+    readonly apply_changes: (a: any) => [number, number, number];
+    readonly complete_current: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number];
+    readonly evaluate_current: (a: any) => [number, number, number];
     readonly evaluate_snapshot: (a: any, b: any) => [number, number, number];
     readonly format_source: (a: number, b: number) => [number, number, number, number];
+    readonly set_snapshot: (a: any) => [number, number];
     readonly formatSource: (a: number, b: number) => [number, number];
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;

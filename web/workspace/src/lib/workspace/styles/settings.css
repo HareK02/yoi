@@ -572,7 +572,8 @@
     color: var(--text-muted);
     font-size: 0.75rem;
   }
-  .config-source-create input {
+  .config-source-create input,
+  .config-source-actions input {
     min-width: 0;
     border: 1px solid var(--line);
     border-radius: 0.45rem;

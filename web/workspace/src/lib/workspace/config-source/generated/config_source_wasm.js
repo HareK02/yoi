@@ -19,6 +19,49 @@ export function analyze_snapshot(snapshot, entrypoint, source_override) {
 }
 
 /**
+ * @param {any} changes
+ * @returns {any}
+ */
+export function apply_changes(changes) {
+    const ret = wasm.apply_changes(changes);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+/**
+ * @param {string} entrypoint
+ * @param {string} source
+ * @param {number} utf8_byte_offset
+ * @param {boolean} explicit
+ * @returns {any}
+ */
+export function complete_current(entrypoint, source, utf8_byte_offset, explicit) {
+    const ptr0 = passStringToWasm0(entrypoint, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(source, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.complete_current(ptr0, len0, ptr1, len1, utf8_byte_offset, explicit);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+/**
+ * @param {any} contract
+ * @returns {any}
+ */
+export function evaluate_current(contract) {
+    const ret = wasm.evaluate_current(contract);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+/**
  * @param {any} snapshot
  * @param {any} contract
  * @returns {any}
@@ -72,6 +115,16 @@ export function format_source(source) {
         return getStringFromWasm0(ptr2, len2);
     } finally {
         wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+    }
+}
+
+/**
+ * @param {any} snapshot
+ */
+export function set_snapshot(snapshot) {
+    const ret = wasm.set_snapshot(snapshot);
+    if (ret[1]) {
+        throw takeFromExternrefTable0(ret[0]);
     }
 }
 
@@ -193,6 +246,16 @@ function __wbg_get_imports() {
             let result;
             try {
                 result = arg0 instanceof ArrayBuffer;
+            } catch (_) {
+                result = false;
+            }
+            const ret = result;
+            return ret;
+        },
+        __wbg_instanceof_Map_a10a2795ef4bfe97: function(arg0) {
+            let result;
+            try {
+                result = arg0 instanceof Map;
             } catch (_) {
                 result = false;
             }

@@ -1,28 +1,19 @@
 import init, {
   analyze_snapshot,
-  evaluate_snapshot,
+  apply_changes,
+  complete_current,
+  evaluate_current,
   format_source,
+  set_snapshot,
 } from "./generated/config_source_wasm.js";
-import type {
-  ConfigDiagnostic,
-  ConfigTreeSnapshot,
-  ToolchainContract,
-} from "./types.ts";
+import type { ConfigTreeChange } from "./types.ts";
 
 export type ConfigSourceWorkerRequest =
-  | {
-    id: number;
-    kind: "analyze";
-    snapshot: ConfigTreeSnapshot;
-    path: string;
-    source?: string;
-  }
-  | {
-    id: number;
-    kind: "evaluate";
-    snapshot: ConfigTreeSnapshot;
-    contract: ToolchainContract;
-  }
+  | { id: number; kind: "set_snapshot"; snapshot: unknown }
+  | { id: number; kind: "apply_changes"; changes: ConfigTreeChange[] }
+  | { id: number; kind: "analyze"; path: string; source?: string }
+  | { id: number; kind: "evaluate"; contract: unknown }
+  | { id: number; kind: "complete"; path: string; source: string; utf8ByteOffset: number; explicit: boolean }
   | { id: number; kind: "format"; source: string };
 
 export type ConfigSourceWorkerResponse =
@@ -30,24 +21,32 @@ export type ConfigSourceWorkerResponse =
   | { id: number; ok: false; error: unknown };
 
 const ready = init();
+let snapshot: unknown = null;
 
-self.onmessage = async (
-  event: MessageEvent<ConfigSourceWorkerRequest>,
-): Promise<void> => {
+self.onmessage = async (event: MessageEvent<ConfigSourceWorkerRequest>): Promise<void> => {
   const request = event.data;
   try {
     await ready;
     let result: unknown;
     switch (request.kind) {
+      case "set_snapshot":
+        snapshot = request.snapshot;
+        set_snapshot(request.snapshot);
+        result = null;
+        break;
+      case "apply_changes":
+        snapshot = apply_changes(request.changes);
+        result = snapshot;
+        break;
       case "analyze":
-        result = analyze_snapshot(
-          request.snapshot,
-          request.path,
-          request.source,
-        ) as ConfigDiagnostic[];
+        if (!snapshot) throw new Error("config source snapshot is not initialized");
+        result = analyze_snapshot(snapshot, request.path, request.source);
         break;
       case "evaluate":
-        result = evaluate_snapshot(request.snapshot, request.contract);
+        result = evaluate_current(request.contract);
+        break;
+      case "complete":
+        result = complete_current(request.path, request.source, request.utf8ByteOffset, request.explicit);
         break;
       case "format":
         result = format_source(request.source);
@@ -55,15 +54,6 @@ self.onmessage = async (
     }
     self.postMessage({ id: request.id, ok: true, result });
   } catch (error) {
-    self.postMessage({
-      id: request.id,
-      ok: false,
-      error: normalizeError(error),
-    });
+    self.postMessage({ id: request.id, ok: false, error: error instanceof Error ? error.message : error });
   }
 };
-
-function normalizeError(error: unknown): unknown {
-  if (error instanceof Error) return error.message;
-  return error;
-}

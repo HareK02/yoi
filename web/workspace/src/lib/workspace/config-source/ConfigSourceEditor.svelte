@@ -21,6 +21,10 @@
   let diagnostics = $state<ConfigDiagnostic[]>([]);
   let status = $state("Loading source tree…");
   let busy = $state(false);
+  let draftChanges = $state<ConfigTreeChange[]>([]);
+  let baseRevision = $state(0);
+  let baseDigest = $state("");
+  let renamePath = $state("");
   let toolchain: ConfigSourceToolchain | null = null;
 
   const paths = $derived(
@@ -29,7 +33,7 @@
   const selected = $derived(
     treeState && selectedPath ? treeState.snapshot.entries[selectedPath] : undefined,
   );
-  const dirty = $derived(selected ? source !== selected.content : source.length > 0);
+  const dirty = $derived(draftChanges.length > 0 || (selected ? source !== selected.content : source.length > 0));
 
   onMount(() => {
     toolchain = new ConfigSourceToolchain();
@@ -44,6 +48,11 @@
         selectedPath = Object.keys(treeState.snapshot.entries).toSorted()[0] ?? "";
       }
       source = selectedPath ? treeState.snapshot.entries[selectedPath].content : "";
+      baseRevision = treeState.snapshot.revision;
+      baseDigest = treeState.snapshot.digest;
+      await toolchain?.setSnapshot(treeState.snapshot);
+      draftChanges = [];
+      renamePath = selectedPath;
       diagnostics = [];
       status = treeState.snapshot.revision === 0
         ? "No committed sources yet. Create workspace.dcdl to begin."
@@ -53,9 +62,23 @@
     }
   }
 
-  function select(path: string) {
+  async function stageCurrent() {
+    const change = currentChange();
+    if (!change || !toolchain) return;
+    draftChanges = [...draftChanges.filter((item) => !changeTouches(item, selectedPath)), change];
+    const candidate = await toolchain.applyChanges([change]);
+    if (treeState) treeState = { ...treeState, snapshot: candidate };
+  }
+
+  function changeTouches(change: ConfigTreeChange, path: string): boolean {
+    return change.kind === "rename" ? change.from === path || change.to === path : change.path === path;
+  }
+
+  async function select(path: string) {
+    await stageCurrent();
     selectedPath = path;
     source = treeState?.snapshot.entries[path]?.content ?? "";
+    renamePath = path;
     diagnostics = [];
   }
 
@@ -81,7 +104,9 @@
 
   function entrypoints(): string[] {
     if (!treeState) return [];
-    if (treeState.contract.entrypoints.length > 0) return treeState.contract.entrypoints;
+    const known = new Set(Object.keys(treeState.snapshot.entries));
+    const configured = treeState.contract.entrypoints.filter((path) => known.has(path));
+    if (configured.length > 0) return configured;
     if (treeState.snapshot.entries["workspace.dcdl"] || selectedPath === "workspace.dcdl") {
       return ["workspace.dcdl"];
     }
@@ -90,7 +115,7 @@
 
   async function analyze() {
     if (!toolchain || !treeState || !selectedPath) return;
-    diagnostics = await toolchain.analyze(treeState.snapshot, selectedPath, source);
+    diagnostics = await toolchain.analyze(selectedPath, source);
     status = diagnostics.length === 0 ? "No diagnostics." : `${diagnostics.length} diagnostic(s).`;
   }
 
@@ -106,16 +131,17 @@
 
   async function preview() {
     if (!treeState) return;
-    const change = currentChange();
-    if (!change) {
+    await stageCurrent();
+    if (draftChanges.length === 0) {
       status = "No draft changes to preview.";
       return;
     }
     busy = true;
     try {
       const candidate = await previewConfigTree(workspaceId, {
-        changes: [change],
+        changes: draftChanges,
         entrypoints: entrypoints(),
+        toolchain_fingerprint: treeState.contract.fingerprint,
       });
       diagnostics = [];
       status = `Preview valid · projection ${candidate.evaluation.projection_digest.slice(0, 20)}…`;
@@ -128,19 +154,24 @@
 
   async function commit() {
     if (!treeState) return;
-    const change = currentChange();
-    if (!change) {
+    await stageCurrent();
+    if (draftChanges.length === 0) {
       status = "No draft changes to commit.";
       return;
     }
     busy = true;
     try {
       treeState = await commitConfigTree(workspaceId, {
-        base_revision: treeState.snapshot.revision,
-        base_digest: treeState.snapshot.digest,
-        changes: [change],
+        base_revision: baseRevision,
+        base_digest: baseDigest,
+        changes: draftChanges,
         entrypoints: entrypoints(),
+        toolchain_fingerprint: treeState.contract.fingerprint,
       });
+      draftChanges = [];
+      baseRevision = treeState.snapshot.revision;
+      baseDigest = treeState.snapshot.digest;
+      await toolchain?.setSnapshot(treeState.snapshot);
       source = treeState.snapshot.entries[selectedPath]?.content ?? "";
       diagnostics = [];
       status = `Committed revision ${treeState.snapshot.revision}.`;
@@ -161,29 +192,38 @@
   }
 
   async function deleteEntry() {
-    if (!treeState || !selected) return;
-    busy = true;
-    try {
-      const remainingEntrypoints = treeState.contract.entrypoints.filter((path) => path !== selectedPath);
-      treeState = await commitConfigTree(workspaceId, {
-        base_revision: treeState.snapshot.revision,
-        base_digest: treeState.snapshot.digest,
-        changes: [{
-          kind: "delete",
-          path: selectedPath,
-          expected_digest: selected.content_digest,
-        }],
-        entrypoints: remainingEntrypoints,
-      });
-      selectedPath = Object.keys(treeState.snapshot.entries).toSorted()[0] ?? "";
-      source = selectedPath ? treeState.snapshot.entries[selectedPath].content : "";
-      diagnostics = [];
-      status = `Committed revision ${treeState.snapshot.revision}.`;
-    } catch (error) {
-      status = String(error);
-    } finally {
-      busy = false;
-    }
+    if (!treeState || !selected || !toolchain) return;
+    const change: ConfigTreeChange = {
+      kind: "delete",
+      path: selectedPath,
+      expected_digest: selected.content_digest,
+    };
+    draftChanges = [...draftChanges.filter((item) => !changeTouches(item, selectedPath)), change];
+    const candidate = await toolchain.applyChanges([change]);
+    treeState = { ...treeState, snapshot: candidate };
+    selectedPath = Object.keys(candidate.entries).toSorted()[0] ?? "";
+    source = selectedPath ? candidate.entries[selectedPath].content : "";
+    renamePath = selectedPath;
+    status = "Delete staged. Preview and Commit to persist the candidate tree.";
+  }
+
+  async function renameEntry() {
+    if (!treeState || !selected || !toolchain) return;
+    const to = renamePath.trim();
+    if (!to || to === selectedPath) return;
+    await stageCurrent();
+    const change: ConfigTreeChange = {
+      kind: "rename",
+      from: selectedPath,
+      to,
+      expected_digest: selected.content_digest,
+    };
+    draftChanges = [...draftChanges.filter((item) => !changeTouches(item, selectedPath)), change];
+    const candidate = await toolchain.applyChanges([change]);
+    treeState = { ...treeState, snapshot: candidate };
+    selectedPath = to;
+    source = candidate.entries[to]?.content ?? "";
+    status = `Rename to ${to} staged. Preview and Commit to persist.`;
   }
 </script>
 
@@ -216,6 +256,8 @@
         <strong>{selectedPath || "Select or create a source"}</strong>
       </div>
       <div class="config-source-actions">
+        <input aria-label="Rename path" bind:value={renamePath} disabled={!selected || busy} />
+        <button type="button" onclick={renameEntry} disabled={!selected || renamePath === selectedPath || busy}>Rename</button>
         <button type="button" onclick={format} disabled={!selectedPath || busy}>Format</button>
         <button type="button" onclick={analyze} disabled={!selectedPath || busy}>Analyze</button>
         <button type="button" onclick={preview} disabled={!dirty || busy}>Preview</button>
@@ -223,7 +265,12 @@
         <button class="danger" type="button" onclick={deleteEntry} disabled={!selected || busy}>Delete</button>
       </div>
     </header>
-    <DecodalSourceEditor value={source} readonly={!selectedPath || busy} onChange={(value) => source = value} />
+    <DecodalSourceEditor
+      value={source}
+      readonly={!selectedPath || busy}
+      onChange={(value) => source = value}
+      onComplete={(value, offset, explicit) => toolchain?.complete(selectedPath, value, offset, explicit) ?? Promise.resolve(null)}
+    />
     <p class="config-source-status" aria-live="polite">{status}</p>
     {#if diagnostics.length > 0}
       <ol class="config-source-diagnostics">

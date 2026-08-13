@@ -33,6 +33,7 @@ pub struct ConfigCommitRequest {
     pub base_digest: String,
     pub changes: Vec<ConfigTreeChange>,
     pub entrypoints: Vec<VirtualPath>,
+    pub toolchain_fingerprint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -63,6 +64,17 @@ impl SqliteWorkspaceStore {
             return Err(config_conflict(format!(
                 "base revision/digest mismatch; current revision is {}",
                 current.snapshot.revision
+            )));
+        }
+        let expected_contract = ToolchainContract::new(
+            DEFAULT_SCHEMA_VERSION,
+            request.entrypoints.clone(),
+            DEFAULT_IMPORT_POLICY_VERSION,
+        );
+        if expected_contract.fingerprint != request.toolchain_fingerprint {
+            return Err(config_conflict(format!(
+                "toolchain fingerprint mismatch; current fingerprint is {}",
+                expected_contract.fingerprint
             )));
         }
         evaluate_candidate(current, &request.changes, request.entrypoints.clone())
@@ -378,6 +390,12 @@ mod tests {
                         content: "{ broken = ; }".into(),
                     }],
                     entrypoints: vec![path(DEFAULT_CONFIG_ENTRYPOINT)],
+                    toolchain_fingerprint: ToolchainContract::new(
+                        DEFAULT_SCHEMA_VERSION,
+                        vec![path(DEFAULT_CONFIG_ENTRYPOINT)],
+                        DEFAULT_IMPORT_POLICY_VERSION,
+                    )
+                    .fingerprint,
                 },
             )
             .unwrap_err();
@@ -402,6 +420,12 @@ mod tests {
                         content: "{ answer = 42; }".into(),
                     }],
                     entrypoints: vec![path(DEFAULT_CONFIG_ENTRYPOINT)],
+                    toolchain_fingerprint: ToolchainContract::new(
+                        DEFAULT_SCHEMA_VERSION,
+                        vec![path(DEFAULT_CONFIG_ENTRYPOINT)],
+                        DEFAULT_IMPORT_POLICY_VERSION,
+                    )
+                    .fingerprint,
                 },
             )
             .unwrap();
@@ -426,6 +450,12 @@ mod tests {
                 content: "{ answer = 42; }".into(),
             }],
             entrypoints: vec![path(DEFAULT_CONFIG_ENTRYPOINT)],
+            toolchain_fingerprint: ToolchainContract::new(
+                DEFAULT_SCHEMA_VERSION,
+                vec![path(DEFAULT_CONFIG_ENTRYPOINT)],
+                DEFAULT_IMPORT_POLICY_VERSION,
+            )
+            .fingerprint,
         };
         let candidate = store
             .evaluate_workspace_config_candidate("w-config", &request)
@@ -437,6 +467,31 @@ mod tests {
             .commit_evaluated_workspace_config("w-config", &candidate)
             .unwrap_err();
         assert!(matches!(error, Error::WorkspaceConfigConflict(_)));
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_mismatched_toolchain_fingerprint() {
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        store.upsert_workspace(&workspace()).await.unwrap();
+        let empty = ConfigTreeSnapshot::empty();
+        let error = store
+            .evaluate_and_commit_workspace_config(
+                "w-config",
+                &ConfigCommitRequest {
+                    base_revision: 0,
+                    base_digest: empty.digest,
+                    changes: vec![ConfigTreeChange::Create {
+                        path: path(DEFAULT_CONFIG_ENTRYPOINT),
+                        content_type: ConfigContentType::Decodal,
+                        content: "{ answer = 42; }".into(),
+                    }],
+                    entrypoints: vec![path(DEFAULT_CONFIG_ENTRYPOINT)],
+                    toolchain_fingerprint: "sha256:stale-toolchain".into(),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::WorkspaceConfigConflict(_)));
+        assert!(store.load_workspace_config("w-config").unwrap().is_none());
     }
 
     #[test]

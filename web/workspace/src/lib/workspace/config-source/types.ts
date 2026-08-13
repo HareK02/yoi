@@ -89,4 +89,5 @@ export interface ConfigCommitRequest {
   base_digest: string;
   changes: ConfigTreeChange[];
   entrypoints: VirtualPath[];
+  toolchain_fingerprint: string;
 }

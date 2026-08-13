@@ -24,12 +24,13 @@ Deno.test("config source API stays workspace-scoped and separates preview from c
 
   await fetchConfigTree("w/one", fetcher);
   await fetchConfigEntry("w/one", "profiles/main.dcdl", fetcher);
-  await previewConfigTree("w/one", { changes: [], entrypoints: [] }, fetcher);
+  await previewConfigTree("w/one", { changes: [], entrypoints: [], toolchain_fingerprint: "sha256:toolchain" }, fetcher);
   await commitConfigTree("w/one", {
     base_revision: 4,
     base_digest: "sha256:base",
     changes: [],
     entrypoints: [],
+    toolchain_fingerprint: "sha256:toolchain",
   }, fetcher);
 
   assertEquals(calls.map((call) => call.url), [
@@ -52,7 +53,7 @@ Deno.test("config source API surfaces failed evaluation instead of treating it a
     )) as typeof fetch;
   let message = "";
   try {
-    await previewConfigTree("w", { changes: [], entrypoints: [] }, fetcher);
+    await previewConfigTree("w", { changes: [], entrypoints: [], toolchain_fingerprint: "sha256:toolchain" }, fetcher);
   } catch (error) {
     message = String(error);
   }
