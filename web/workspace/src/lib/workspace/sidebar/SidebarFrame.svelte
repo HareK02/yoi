@@ -15,6 +15,12 @@
 </script>
 
 <aside class="sidebar-frame" class:folded aria-label="Sidebar">
+  {#if !folded}
+    <div class="sidebar-frame-content">
+      {@render children()}
+    </div>
+  {/if}
+
   <div class="sidebar-control-row">
     <button
       class="sidebar-fold-button"
@@ -37,10 +43,4 @@
       {/if}
     </button>
   </div>
-
-  {#if !folded}
-    <div class="sidebar-frame-content">
-      {@render children()}
-    </div>
-  {/if}
 </aside>

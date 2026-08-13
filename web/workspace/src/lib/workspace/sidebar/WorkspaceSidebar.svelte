@@ -78,9 +78,9 @@
 
   <nav class="sidebar-sections" aria-label="Workspace sections">
     <RepositoriesNavSection {repositories} {repositoriesError} {currentPath} {workspaceId} />
+    <TicketsNavSection {currentPath} {workspaceId} />
     <ObjectivesNavSection {currentPath} {workspaceId} />
     <MemoryNavSection {currentPath} {workspaceId} />
-    <TicketsNavSection {currentPath} {workspaceId} />
     <WorkersNavSection {currentPath} {workspaceId} />
   </nav>
 </div>

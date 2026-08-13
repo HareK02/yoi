@@ -11,12 +11,10 @@
 </script>
 
 <section class="nav-section">
-  <header class="section-header">
-    <span>Tickets</span>
-  </header>
-
-  <a class="objective-link" class:active={currentPath.startsWith(ticketsHref)} href={ticketsHref}>
-    <span class="item-title">Open Tickets</span>
-    <span class="item-meta">workspace tickets</span>
-  </a>
+  <a
+    class="primary-nav-link"
+    class:active={currentPath.startsWith(ticketsHref)}
+    href={ticketsHref}
+    aria-current={currentPath.startsWith(ticketsHref) ? 'page' : undefined}
+  >Tickets</a>
 </section>

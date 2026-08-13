@@ -11,12 +11,10 @@
 </script>
 
 <section class="nav-section">
-  <header class="section-header">
-    <span>Objectives</span>
-  </header>
-
-  <a class="objective-link" class:active={currentPath.startsWith(objectivesHref)} href={objectivesHref}>
-    <span class="item-title">Open Objectives</span>
-    <span class="item-meta">workspace objectives</span>
-  </a>
+  <a
+    class="primary-nav-link"
+    class:active={currentPath.startsWith(objectivesHref)}
+    href={objectivesHref}
+    aria-current={currentPath.startsWith(objectivesHref) ? 'page' : undefined}
+  >Objectives</a>
 </section>

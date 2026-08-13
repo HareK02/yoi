@@ -33,8 +33,8 @@
     min-width: 0;
     align-items: center;
     gap: 0.55rem;
-    color: var(--workspace-muted, #53606e);
-    font-family: var(--workspace-font-mono, monospace);
+    color: var(--text-muted);
+    font-family: var(--font-mono);
     font-size: 0.84rem;
     line-height: 1;
   }
@@ -53,7 +53,7 @@
   }
 
   .workspace-breadcrumbs a:hover {
-    color: var(--workspace-ink, #151b23);
+    color: var(--text-strong);
     text-decoration: underline;
     text-underline-offset: 0.22rem;
   }
@@ -68,7 +68,7 @@
   }
 
   .workspace-breadcrumbs span[aria-current='page'] {
-    color: var(--workspace-ink, #151b23);
+    color: var(--text-strong);
     font-weight: 600;
   }
 </style>

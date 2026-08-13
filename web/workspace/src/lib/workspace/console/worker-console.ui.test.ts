@@ -159,6 +159,9 @@ Deno.test("workspace Tickets surface provides Kanban and lifecycle controls", as
   const ticketsNav = await Deno.readTextFile(
     new URL("../sidebar/TicketsNavSection.svelte", import.meta.url),
   );
+  const objectivesNav = await Deno.readTextFile(
+    new URL("../sidebar/ObjectivesNavSection.svelte", import.meta.url),
+  );
   const ticketsLoad = await Deno.readTextFile(
     new URL(
       "./../../../routes/w/[workspaceId]/tickets/+page.ts",
@@ -204,8 +207,15 @@ Deno.test("workspace Tickets surface provides Kanban and lifecycle controls", as
 
   assert(
     ticketsNav.includes("workspaceRoute(workspaceId, '/tickets')") &&
-      ticketsNav.includes("Open Tickets"),
-    "Tickets sidebar section should link to the workspace Tickets surface",
+      ticketsNav.includes('class="primary-nav-link"') &&
+      ticketsNav.includes(">Tickets</a>") &&
+      !ticketsNav.includes("Open Tickets") &&
+      !ticketsNav.includes("workspace tickets") &&
+      objectivesNav.includes('class="primary-nav-link"') &&
+      objectivesNav.includes(">Objectives</a>") &&
+      !objectivesNav.includes("Open Objectives") &&
+      !objectivesNav.includes("workspace objectives"),
+    "Tickets and Objectives should each be a single sidebar link",
   );
   assert(
     ticketsLoad.includes("?limit=1000") &&
