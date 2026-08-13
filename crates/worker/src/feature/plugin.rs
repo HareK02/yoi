@@ -724,11 +724,14 @@ impl FeatureModule for PluginToolFeature {
                 if instance.is_none() {
                     instance = Some(self.ensure_instance()?);
                 }
-                context.services().provide(ServiceDeclaration::new(
-                    plugin_service_id(&self.record, &service.name),
-                    self.record.manifest.version.clone(),
-                    service.description.clone(),
-                ))?;
+                context.services().provide(
+                    ServiceDeclaration::new(
+                        plugin_service_id(&self.record, &service.name),
+                        self.record.manifest.version.clone(),
+                        service.description.clone(),
+                    ),
+                    Arc::new(instance.as_ref().expect("instance initialized").clone()),
+                )?;
                 exposed += 1;
             }
         }

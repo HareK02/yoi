@@ -117,13 +117,15 @@ pub struct FeatureConfig {
     #[serde(default)]
     pub flow: FeatureFlagConfig,
     #[serde(default)]
-    pub worker: FeatureFlagConfig,
+    pub worker: WorkerFeatureConfig,
     #[serde(default)]
     pub objective: FeatureFlagConfig,
     #[serde(default)]
     pub manage_workdir: FeatureFlagConfig,
     #[serde(default)]
     pub ticket: TicketFeatureConfig,
+    #[serde(default)]
+    pub orchestration: FeatureFlagConfig,
     #[serde(default)]
     pub plugins: FeatureFlagConfig,
 }
@@ -137,10 +139,11 @@ impl Default for FeatureConfig {
             image: FeatureFlagConfig::disabled(),
             sub_worker: FeatureFlagConfig::disabled(),
             flow: FeatureFlagConfig::disabled(),
-            worker: FeatureFlagConfig::disabled(),
+            worker: WorkerFeatureConfig::disabled(),
             objective: FeatureFlagConfig::disabled(),
             manage_workdir: FeatureFlagConfig::disabled(),
             ticket: TicketFeatureConfig::default(),
+            orchestration: FeatureFlagConfig::disabled(),
             plugins: FeatureFlagConfig::disabled(),
         }
     }
@@ -166,6 +169,42 @@ impl Default for FeatureFlagConfig {
     fn default() -> Self {
         Self::disabled()
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerFeatureConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Exposes the generic WorkerSpawn tool. Stateful lifecycle services remain
+    /// available to dependent semantic features when this is false.
+    #[serde(default = "default_true")]
+    pub direct_spawn: bool,
+}
+
+impl WorkerFeatureConfig {
+    pub const fn disabled() -> Self {
+        Self {
+            enabled: false,
+            direct_spawn: true,
+        }
+    }
+
+    pub const fn enabled() -> Self {
+        Self {
+            enabled: true,
+            direct_spawn: true,
+        }
+    }
+}
+
+impl Default for WorkerFeatureConfig {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -210,7 +249,7 @@ pub struct TicketFeatureConfig {
     #[serde(default)]
     pub intake: bool,
     #[serde(default)]
-    pub orchestration_control: bool,
+    pub workflow: bool,
 }
 
 /// External Agent Skills (`SKILL.md`) ingest configuration. Skills are

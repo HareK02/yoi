@@ -1002,16 +1002,19 @@ fn apply_role_profile(
     value["feature"]["image"] = serde_json::json!({ "enabled": true });
     value["feature"]["sub_worker"] = serde_json::json!({ "enabled": sub_worker });
     value["feature"]["flow"] = serde_json::json!({ "enabled": slug == "coder" });
-    value["feature"]["worker"] =
-        serde_json::json!({ "enabled": matches!(slug, "companion" | "orchestrator") });
+    value["feature"]["worker"] = serde_json::json!({
+        "enabled": matches!(slug, "companion" | "orchestrator"),
+        "direct_spawn": slug != "orchestrator"
+    });
     value["feature"]["manage_workdir"] = serde_json::json!({ "enabled": slug == "orchestrator" });
+    value["feature"]["orchestration"] = serde_json::json!({ "enabled": slug == "orchestrator" });
     let ticket = match slug {
         "companion" => serde_json::json!({ "enabled": true, "authoring": true, "thread": true }),
         "intake" => {
             serde_json::json!({ "enabled": true, "authoring": true, "thread": true, "intake": true })
         }
         "orchestrator" => {
-            serde_json::json!({ "enabled": true, "thread": true, "orchestration_control": true })
+            serde_json::json!({ "enabled": true, "thread": true, "workflow": true })
         }
         "coder" => serde_json::json!({ "enabled": true, "thread": true }),
         "reviewer" => serde_json::json!({ "enabled": true, "thread": true }),
@@ -1474,7 +1477,7 @@ mod tests {
         assert!(companion.feature.ticket.thread);
         assert!(companion.feature.objective.enabled);
         assert!(!companion.feature.ticket.intake);
-        assert!(!companion.feature.ticket.orchestration_control);
+        assert!(!companion.feature.orchestration.enabled);
         assert_eq!(
             companion.compaction.as_ref().unwrap().threshold,
             Some(240000)
@@ -1503,7 +1506,7 @@ mod tests {
         assert!(intake.feature.objective.enabled);
         assert!(!intake.feature.manage_workdir.enabled);
         assert!(intake.feature.ticket.intake);
-        assert!(!intake.feature.ticket.orchestration_control);
+        assert!(!intake.feature.orchestration.enabled);
         assert!(intake.scope.allow.is_empty());
         assert!(intake.delegation_scope.allow.is_empty());
         assert_eq!(intake.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
@@ -1514,6 +1517,7 @@ mod tests {
         assert!(orchestrator.feature.task.enabled);
         assert!(!orchestrator.feature.sub_worker.enabled);
         assert!(orchestrator.feature.worker.enabled);
+        assert!(!orchestrator.feature.worker.direct_spawn);
         assert!(orchestrator.feature.ticket.enabled);
         assert!(orchestrator.feature.ticket.enabled);
         assert!(!orchestrator.feature.ticket.authoring);
@@ -1521,7 +1525,8 @@ mod tests {
         assert!(orchestrator.feature.objective.enabled);
         assert!(orchestrator.feature.manage_workdir.enabled);
         assert!(!orchestrator.feature.ticket.intake);
-        assert!(orchestrator.feature.ticket.orchestration_control);
+        assert!(orchestrator.feature.ticket.workflow);
+        assert!(orchestrator.feature.orchestration.enabled);
         assert!(orchestrator.scope.allow.is_empty());
         assert!(orchestrator.delegation_scope.allow.is_empty());
         assert_eq!(
@@ -1548,7 +1553,7 @@ mod tests {
         assert!(coder.feature.objective.enabled);
         assert!(!coder.feature.manage_workdir.enabled);
         assert!(!coder.feature.ticket.intake);
-        assert!(!coder.feature.ticket.orchestration_control);
+        assert!(!coder.feature.orchestration.enabled);
         let reviewer = resolve("reviewer");
         assert!(reviewer.feature.task.enabled);
         assert!(!reviewer.feature.sub_worker.enabled);
@@ -1561,7 +1566,7 @@ mod tests {
         assert!(reviewer.feature.objective.enabled);
         assert!(!reviewer.feature.manage_workdir.enabled);
         assert!(!reviewer.feature.ticket.intake);
-        assert!(!reviewer.feature.ticket.orchestration_control);
+        assert!(!reviewer.feature.orchestration.enabled);
         assert!(reviewer.scope.allow.is_empty());
         assert!(reviewer.delegation_scope.allow.is_empty());
         assert_eq!(reviewer.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
@@ -1574,7 +1579,7 @@ mod tests {
         let prompt = include_str!("../../../resources/prompts/role/orchestrator.md");
 
         assert!(prompt.contains("assigned Coder owns its review/fix loop"));
-        assert!(prompt.contains("spawn the implementation Coder with `WorkerSpawn.ticket_id`"));
+        assert!(prompt.contains("then use `SpawnTicketCoder`"));
         assert!(prompt.contains("verify its current assignment names that Coder"));
         assert!(prompt.contains("never route implementation to an unassigned Coder"));
         assert!(prompt.contains(
@@ -1728,7 +1733,8 @@ enabled = true
 authoring = false
 thread = false
 intake = false
-orchestration_control = false
+[feature.orchestration]
+enabled = false
 "#,
         );
         let workspace = tmp.path().join("workspace");
@@ -1749,7 +1755,7 @@ orchestration_control = false
         assert!(!resolved.manifest.feature.ticket.authoring);
         assert!(!resolved.manifest.feature.ticket.thread);
         assert!(!resolved.manifest.feature.ticket.intake);
-        assert!(!resolved.manifest.feature.ticket.orchestration_control);
+        assert!(!resolved.manifest.feature.orchestration.enabled);
         assert_eq!(
             resolved.manifest.delegation_scope.allow[0].target,
             workspace
@@ -1836,7 +1842,7 @@ worker_context_max_tokens = 68000
         assert!(resolved.manifest.feature.ticket.authoring);
         assert!(resolved.manifest.feature.ticket.thread);
         assert!(!resolved.manifest.feature.ticket.intake);
-        assert!(!resolved.manifest.feature.ticket.orchestration_control);
+        assert!(!resolved.manifest.feature.orchestration.enabled);
         assert_eq!(
             resolved.profile.as_ref().unwrap().name.as_deref(),
             Some("companion")

@@ -20,7 +20,7 @@ use crate::{
     CompactionConfig, EngineManifest, FeatureConfig, FeatureFlagConfig, FileUploadLimits,
     McpConfig, McpEnvValue, McpStdioCwdPolicy, MemoryConfig, MemoryFeatureConfig, ScopeConfig,
     SessionConfig, SkillsConfig, TicketFeatureConfig, ToolOutputLimits, ToolPermissionConfig,
-    ToolPermissionRule, WebConfig, WorkerManifest, WorkerMeta,
+    ToolPermissionRule, WebConfig, WorkerFeatureConfig, WorkerManifest, WorkerMeta,
 };
 
 /// Partial-form Worker manifest. Every field is optional; one or more
@@ -89,13 +89,15 @@ pub struct FeatureConfigPartial {
     #[serde(default)]
     pub flow: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
-    pub worker: Option<FeatureFlagConfigPartial>,
+    pub worker: Option<WorkerFeatureConfigPartial>,
     #[serde(default)]
     pub objective: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
     pub manage_workdir: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
     pub ticket: Option<TicketFeatureConfigPartial>,
+    #[serde(default)]
+    pub orchestration: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
     pub plugins: Option<FeatureFlagConfigPartial>,
 }
@@ -113,7 +115,7 @@ impl FeatureConfigPartial {
                 FeatureFlagConfigPartial::merge,
             ),
             flow: merge_option(self.flow, other.flow, FeatureFlagConfigPartial::merge),
-            worker: merge_option(self.worker, other.worker, FeatureFlagConfigPartial::merge),
+            worker: merge_option(self.worker, other.worker, WorkerFeatureConfigPartial::merge),
             objective: merge_option(
                 self.objective,
                 other.objective,
@@ -125,6 +127,11 @@ impl FeatureConfigPartial {
                 FeatureFlagConfigPartial::merge,
             ),
             ticket: merge_option(self.ticket, other.ticket, TicketFeatureConfigPartial::merge),
+            orchestration: merge_option(
+                self.orchestration,
+                other.orchestration,
+                FeatureFlagConfigPartial::merge,
+            ),
             plugins: merge_option(self.plugins, other.plugins, FeatureFlagConfigPartial::merge),
         }
     }
@@ -140,6 +147,32 @@ impl FeatureFlagConfigPartial {
     fn merge(self, other: Self) -> Self {
         Self {
             enabled: other.enabled.or(self.enabled),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkerFeatureConfigPartial {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub direct_spawn: Option<bool>,
+}
+
+impl WorkerFeatureConfigPartial {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            enabled: other.enabled.or(self.enabled),
+            direct_spawn: other.direct_spawn.or(self.direct_spawn),
+        }
+    }
+}
+
+impl From<WorkerFeatureConfigPartial> for WorkerFeatureConfig {
+    fn from(value: WorkerFeatureConfigPartial) -> Self {
+        Self {
+            enabled: value.enabled.unwrap_or(false),
+            direct_spawn: value.direct_spawn.unwrap_or(true),
         }
     }
 }
@@ -168,7 +201,7 @@ pub struct TicketFeatureConfigPartial {
     pub authoring: Option<bool>,
     pub thread: Option<bool>,
     pub intake: Option<bool>,
-    pub orchestration_control: Option<bool>,
+    pub workflow: Option<bool>,
 }
 
 impl TicketFeatureConfigPartial {
@@ -178,7 +211,7 @@ impl TicketFeatureConfigPartial {
             authoring: other.authoring.or(self.authoring),
             thread: other.thread.or(self.thread),
             intake: other.intake.or(self.intake),
-            orchestration_control: other.orchestration_control.or(self.orchestration_control),
+            workflow: other.workflow.or(self.workflow),
         }
     }
 }
@@ -200,7 +233,7 @@ impl From<FeatureConfigPartial> for FeatureConfig {
             flow: value.flow.map(FeatureFlagConfig::from).unwrap_or_default(),
             worker: value
                 .worker
-                .map(FeatureFlagConfig::from)
+                .map(WorkerFeatureConfig::from)
                 .unwrap_or_default(),
             objective: value
                 .objective
@@ -213,6 +246,10 @@ impl From<FeatureConfigPartial> for FeatureConfig {
             ticket: value
                 .ticket
                 .map(TicketFeatureConfig::from)
+                .unwrap_or_default(),
+            orchestration: value
+                .orchestration
+                .map(FeatureFlagConfig::from)
                 .unwrap_or_default(),
             plugins: value
                 .plugins
@@ -234,6 +271,15 @@ impl From<FeatureFlagConfig> for FeatureFlagConfigPartial {
     fn from(value: FeatureFlagConfig) -> Self {
         Self {
             enabled: Some(value.enabled),
+        }
+    }
+}
+
+impl From<WorkerFeatureConfig> for WorkerFeatureConfigPartial {
+    fn from(value: WorkerFeatureConfig) -> Self {
+        Self {
+            enabled: Some(value.enabled),
+            direct_spawn: Some(value.direct_spawn),
         }
     }
 }
@@ -263,7 +309,7 @@ impl From<TicketFeatureConfigPartial> for TicketFeatureConfig {
             authoring: value.authoring.unwrap_or_default(),
             thread: value.thread.unwrap_or_default(),
             intake: value.intake.unwrap_or_default(),
-            orchestration_control: value.orchestration_control.unwrap_or_default(),
+            workflow: value.workflow.unwrap_or_default(),
         }
     }
 }
@@ -275,7 +321,7 @@ impl From<TicketFeatureConfig> for TicketFeatureConfigPartial {
             authoring: Some(value.authoring),
             thread: Some(value.thread),
             intake: Some(value.intake),
-            orchestration_control: Some(value.orchestration_control),
+            workflow: Some(value.workflow),
         }
     }
 }
@@ -293,6 +339,7 @@ impl From<FeatureConfig> for FeatureConfigPartial {
             objective: Some(value.objective.into()),
             manage_workdir: Some(value.manage_workdir.into()),
             ticket: Some(value.ticket.into()),
+            orchestration: Some(value.orchestration.into()),
             plugins: Some(value.plugins.into()),
         }
     }
@@ -1866,7 +1913,10 @@ enabled = true
 authoring = false
 thread = false
 intake = false
-orchestration_control = false
+workflow = false
+
+[feature.orchestration]
+enabled = false
 "#,
         )
         .unwrap();
@@ -1900,7 +1950,8 @@ orchestration_control = false
         assert!(!manifest.feature.ticket.authoring);
         assert!(!manifest.feature.ticket.thread);
         assert!(!manifest.feature.ticket.intake);
-        assert!(!manifest.feature.ticket.orchestration_control);
+        assert!(!manifest.feature.ticket.workflow);
+        assert!(!manifest.feature.orchestration.enabled);
         assert!(!manifest.feature.memory.enabled);
         assert!(!manifest.feature.memory.staging);
         assert!(!manifest.feature.objective.enabled);
@@ -1921,7 +1972,10 @@ enabled = true
 authoring = false
 thread = false
 intake = false
-orchestration_control = false
+workflow = false
+
+[feature.orchestration]
+enabled = false
 "#,
         )
         .unwrap();
@@ -1929,7 +1983,10 @@ orchestration_control = false
             r#"
 [feature.ticket]
 thread = true
-orchestration_control = true
+workflow = true
+
+[feature.orchestration]
+enabled = true
 
 [feature.memory]
 staging = true
@@ -1977,7 +2034,8 @@ enabled = true
         assert!(!manifest.feature.ticket.authoring);
         assert!(manifest.feature.ticket.thread);
         assert!(!manifest.feature.ticket.intake);
-        assert!(manifest.feature.ticket.orchestration_control);
+        assert!(manifest.feature.ticket.workflow);
+        assert!(manifest.feature.orchestration.enabled);
         assert!(manifest.feature.objective.enabled);
         assert!(manifest.feature.web.enabled);
         assert!(!manifest.feature.sub_worker.enabled);

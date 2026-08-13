@@ -12,34 +12,116 @@ use serde::{Deserialize, Serialize};
 use protocol::Segment;
 
 use crate::feature::{
-    FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureModule, ToolContribution,
-    ToolDeclaration,
+    FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureModule,
+    ServiceDeclaration, ServiceId, ToolContribution, ToolDeclaration,
 };
-use crate::worker::{WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod};
+use crate::worker::{
+    WorkspaceClient, WorkspaceClientError, WorkspaceRequest, WorkspaceRequestMethod,
+    WorkspaceResponse,
+};
 
 const FEATURE_ID: &str = "worker";
 const FEATURE_NAME: &str = "Worker";
 const FEATURE_DESCRIPTION: &str =
     "Workspace-authority tools for managing Workdir-bound Backend/Runtime Worker sessions.";
+pub const WORKER_LIFECYCLE_SERVICE_ID: &str = "worker.lifecycle";
+const WORKER_LIFECYCLE_SERVICE_VERSION: &str = "1";
+
+#[async_trait]
+pub trait WorkerLifecycleService: Send + Sync {
+    async fn spawn(
+        &self,
+        request: WorkerLifecycleSpawnRequest,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkerLifecycleSpawnRequest {
+    pub runtime_id: String,
+    pub working_directory_id: String,
+    pub relative_cwd: Option<String>,
+    pub profile: String,
+    pub ticket_id: Option<String>,
+    pub operation_id: Option<String>,
+    pub display_name: String,
+    pub initial_submit: Vec<Segment>,
+}
+
+struct WorkspaceWorkerLifecycleService {
+    client: Arc<dyn WorkspaceClient>,
+    workspace_id: String,
+}
+
+#[async_trait]
+impl WorkerLifecycleService for WorkspaceWorkerLifecycleService {
+    async fn spawn(
+        &self,
+        request: WorkerLifecycleSpawnRequest,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        let ticket_assignment = match (request.ticket_id, request.operation_id) {
+            (Some(ticket_id), Some(operation_id)) => Some(WorkerSpawnTicketAssignmentRequest {
+                ticket_id,
+                operation_id,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(WorkspaceClientError::Request(
+                    "ticket_id and operation_id must be provided together".to_string(),
+                ));
+            }
+        };
+        let body = WorkerSpawnRequest {
+            runtime_id: request.runtime_id,
+            display_name: request.display_name,
+            profile: request.profile,
+            ticket_assignment,
+            initial_submit: request.initial_submit,
+            working_directory: WorkerWorkingDirectorySelection {
+                working_directory_id: request.working_directory_id,
+                relative_cwd: request.relative_cwd,
+            },
+        };
+        self.client.execute(WorkspaceRequest::json(
+            WorkspaceRequestMethod::Post,
+            format!("/api/w/{}/workers", self.workspace_id),
+            serde_json::to_string(&body)
+                .map_err(|error| WorkspaceClientError::Request(error.to_string()))?,
+        ))
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ManageWorkerFeature {
     client: Arc<dyn WorkspaceClient>,
+    direct_spawn: bool,
 }
 
-pub fn manage_worker_feature(client: Arc<dyn WorkspaceClient>) -> ManageWorkerFeature {
-    ManageWorkerFeature { client }
+pub fn manage_worker_feature(
+    client: Arc<dyn WorkspaceClient>,
+    direct_spawn: bool,
+) -> ManageWorkerFeature {
+    ManageWorkerFeature {
+        client,
+        direct_spawn,
+    }
 }
 
 impl FeatureModule for ManageWorkerFeature {
     fn descriptor(&self) -> FeatureDescriptor {
         let mut descriptor = FeatureDescriptor::builtin(FEATURE_ID, FEATURE_NAME)
-            .with_description(FEATURE_DESCRIPTION);
-        for operation in WorkerOperation::ALL {
-            descriptor = descriptor.with_tool(ToolDeclaration::new(
-                operation.tool_name(),
-                operation.description(),
+            .with_description(FEATURE_DESCRIPTION)
+            .with_provided_service(ServiceDeclaration::new(
+                ServiceId::builtin(WORKER_LIFECYCLE_SERVICE_ID),
+                WORKER_LIFECYCLE_SERVICE_VERSION,
+                "Workspace-authoritative Worker lifecycle operations",
             ));
+        for operation in WorkerOperation::ALL {
+            if operation != WorkerOperation::Spawn || self.direct_spawn {
+                descriptor = descriptor.with_tool(ToolDeclaration::new(
+                    operation.tool_name(),
+                    operation.description(),
+                ));
+            }
         }
         descriptor
     }
@@ -55,7 +137,23 @@ impl FeatureModule for ManageWorkerFeature {
                 )
             })?
             .to_string();
+        let lifecycle: Arc<dyn WorkerLifecycleService> =
+            Arc::new(WorkspaceWorkerLifecycleService {
+                client: self.client.clone(),
+                workspace_id: workspace_id.clone(),
+            });
+        context.services().provide(
+            ServiceDeclaration::new(
+                ServiceId::builtin(WORKER_LIFECYCLE_SERVICE_ID),
+                WORKER_LIFECYCLE_SERVICE_VERSION,
+                "Workspace-authoritative Worker lifecycle operations",
+            ),
+            lifecycle,
+        )?;
         for operation in WorkerOperation::ALL {
+            if operation == WorkerOperation::Spawn && !self.direct_spawn {
+                continue;
+            }
             let definition = match operation {
                 WorkerOperation::List => definition::<WorkerListInput>(
                     operation,
@@ -170,7 +268,7 @@ struct WorkspaceWorkerTool {
     workspace_id: String,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerOperation {
     List,
     Spawn,
@@ -254,27 +352,24 @@ impl Tool for WorkspaceWorkerTool {
                     }
                     WorkerOperation::Spawn => {
                         let input = parse::<WorkerSpawnInput>(input_json, "WorkerSpawn")?;
-                        let ticket_assignment = input
+                        let ticket_id = input
                             .ticket_id
+                            .map(|ticket_id| authority_id(&ticket_id, "ticket_id"))
+                            .transpose()?;
+                        let operation_id = ticket_id
+                            .as_ref()
                             .map(|ticket_id| {
-                                let ticket_id = authority_id(&ticket_id, "ticket_id")?;
                                 let call_id = non_empty(ctx.call_id.clone(), "tool call_id")?;
-                                Ok::<_, ToolError>(WorkerSpawnTicketAssignmentRequest {
-                                    operation_id: format!("worker-spawn:{ticket_id}:{call_id}"),
-                                    ticket_id,
-                                })
+                                Ok::<_, ToolError>(format!("worker-spawn:{ticket_id}:{call_id}"))
                             })
                             .transpose()?;
-                        let request = WorkerSpawnRequest {
-                            runtime_id: authority_id(&input.runtime_id, "runtime_id")?,
-                            display_name: input
-                                .display_name
-                                .filter(|value| !value.trim().is_empty())
-                                .unwrap_or_else(|| "Workspace Worker".to_string()),
-                            profile: non_empty(input.profile, "profile")?,
-                            ticket_assignment,
-                            initial_submit: input.initial_submit,
-                            working_directory: WorkerWorkingDirectorySelection {
+                        let lifecycle = WorkspaceWorkerLifecycleService {
+                            client: self.client.clone(),
+                            workspace_id: self.workspace_id.clone(),
+                        };
+                        let response = lifecycle
+                            .spawn(WorkerLifecycleSpawnRequest {
+                                runtime_id: authority_id(&input.runtime_id, "runtime_id")?,
                                 working_directory_id: authority_id(
                                     &input.working_directory_id,
                                     "working_directory_id",
@@ -283,14 +378,18 @@ impl Tool for WorkspaceWorkerTool {
                                     .relative_cwd
                                     .map(|value| validate_relative_cwd(&value))
                                     .transpose()?,
-                            },
-                        };
-                        WorkspaceRequest::json(
-                            WorkspaceRequestMethod::Post,
-                            format!("/api/w/{}/workers", self.workspace_id),
-                            serde_json::to_string(&request)
-                                .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?,
-                        )
+                                profile: non_empty(input.profile, "profile")?,
+                                ticket_id,
+                                operation_id,
+                                display_name: input
+                                    .display_name
+                                    .filter(|value| !value.trim().is_empty())
+                                    .unwrap_or_else(|| "Workspace Worker".to_string()),
+                                initial_submit: input.initial_submit,
+                            })
+                            .await
+                            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+                        return tool_output(self.operation, response);
                     }
                     WorkerOperation::Stop => {
                         let input = parse::<WorkerStopInput>(input_json, "WorkerStop")?;
@@ -325,18 +424,25 @@ impl Tool for WorkspaceWorkerTool {
                     .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?
             }
         };
-        if !response.is_success() {
-            return Err(ToolError::ExecutionFailed(format!(
-                "Workspace Worker operation returned HTTP {}: {}",
-                response.status, response.body
-            )));
-        }
-        Ok(ToolOutput {
-            summary: format!("{} completed", self.operation.tool_name()),
-            content: Some(response.body),
-            attachments: Vec::new(),
-        })
+        tool_output(self.operation, response)
     }
+}
+
+fn tool_output(
+    operation: WorkerOperation,
+    response: WorkspaceResponse,
+) -> Result<ToolOutput, ToolError> {
+    if !response.is_success() {
+        return Err(ToolError::ExecutionFailed(format!(
+            "Workspace Worker operation returned HTTP {}: {}",
+            response.status, response.body
+        )));
+    }
+    Ok(ToolOutput {
+        summary: format!("{} completed", operation.tool_name()),
+        content: Some(response.body),
+        attachments: Vec::new(),
+    })
 }
 
 fn definition<I: JsonSchema + 'static>(
@@ -498,6 +604,23 @@ mod tests {
             })
         );
         assert!(body.get("initial_text").is_none());
+    }
+
+    #[test]
+    fn worker_service_can_remain_enabled_without_direct_spawn_surface() {
+        let client = Arc::new(RecordingWorkspaceClient::default());
+        let descriptor = manage_worker_feature(client, false).descriptor();
+        let tools: Vec<_> = descriptor
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert!(!tools.contains(&"WorkerSpawn"));
+        assert!(tools.contains(&"WorkerList"));
+        assert_eq!(
+            descriptor.provides_services[0].id,
+            ServiceId::builtin(WORKER_LIFECYCLE_SERVICE_ID)
+        );
     }
 
     #[test]

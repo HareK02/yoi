@@ -11,6 +11,7 @@
 //! [`crate::hook::HookRegistryBuilder`], and provider output is represented as
 //! ordinary feature reports/diagnostics instead of a separate authority layer.
 
+use std::any::{Any, type_name};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -497,8 +498,8 @@ impl ServiceRequirement {
     }
 }
 
-/// Contribution service registry skeleton used during feature installation.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Typed concrete services installed by stateful Feature modules.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FeatureServiceRegistry {
     providers: HashMap<ServiceId, FeatureServiceProvider>,
 }
@@ -512,11 +513,32 @@ impl FeatureServiceRegistry {
         self.providers.contains_key(id)
     }
 
-    fn register_provider(
+    pub fn service<T>(&self, id: &ServiceId) -> Result<Arc<T>, FeatureInstallError>
+    where
+        T: ?Sized + Send + Sync + 'static,
+    {
+        let provider = self.providers.get(id).ok_or_else(|| {
+            FeatureInstallError::InvalidDescriptor(format!(
+                "feature service provider is unavailable: {id}"
+            ))
+        })?;
+        provider.service::<T>().ok_or_else(|| {
+            FeatureInstallError::InvalidDescriptor(format!(
+                "feature service {id} has incompatible concrete type; requested {}",
+                type_name::<T>()
+            ))
+        })
+    }
+
+    fn register_provider<T>(
         &mut self,
         feature_id: FeatureId,
         declaration: ServiceDeclaration,
-    ) -> Result<(), FeatureInstallError> {
+        instance: Arc<T>,
+    ) -> Result<(), FeatureInstallError>
+    where
+        T: ?Sized + Send + Sync + 'static,
+    {
         if let Some(existing) = self.providers.get(&declaration.id) {
             return Err(FeatureInstallError::DuplicateService {
                 service: declaration.id.to_string(),
@@ -529,18 +551,37 @@ impl FeatureServiceRegistry {
             FeatureServiceProvider {
                 feature_id,
                 declaration,
+                instance: Arc::new(instance),
             },
         );
         Ok(())
     }
 }
 
-/// Provider metadata for one service declaration.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Provider metadata and concrete instance for one service declaration.
+#[derive(Clone, Debug)]
 pub struct FeatureServiceProvider {
     pub feature_id: FeatureId,
     pub declaration: ServiceDeclaration,
+    instance: Arc<dyn Any + Send + Sync>,
 }
+
+impl FeatureServiceProvider {
+    fn service<T>(&self) -> Option<Arc<T>>
+    where
+        T: ?Sized + Send + Sync + 'static,
+    {
+        self.instance.downcast_ref::<Arc<T>>().map(Arc::clone)
+    }
+}
+
+impl PartialEq for FeatureServiceProvider {
+    fn eq(&self, other: &Self) -> bool {
+        self.feature_id == other.feature_id && self.declaration == other.declaration
+    }
+}
+
+impl Eq for FeatureServiceProvider {}
 
 /// Feature descriptor advertised before installation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -742,6 +783,7 @@ struct FeatureContributionDeclarations {
     instructions: HashSet<FeatureInstructionId>,
     background_tasks: HashSet<String>,
     provided_services: HashSet<(ServiceId, String)>,
+    required_services: HashSet<ServiceId>,
     protocol_providers: HashSet<ProviderId>,
 }
 
@@ -772,6 +814,11 @@ impl FeatureContributionDeclarations {
                 .provides_services
                 .iter()
                 .map(|service| (service.id.clone(), service.version.clone()))
+                .collect(),
+            required_services: descriptor
+                .requires_services
+                .iter()
+                .map(|service| service.id.clone())
                 .collect(),
             protocol_providers: descriptor
                 .protocol_providers
@@ -1099,7 +1146,7 @@ impl BackgroundTaskRegistrar<'_> {
     }
 }
 
-/// Service registrar for descriptor/report-only provider metadata.
+/// Service registrar for concrete typed Feature state.
 pub struct FeatureServiceRegistrar<'a> {
     feature_id: &'a FeatureId,
     declarations: &'a FeatureContributionDeclarations,
@@ -1108,7 +1155,14 @@ pub struct FeatureServiceRegistrar<'a> {
 }
 
 impl FeatureServiceRegistrar<'_> {
-    pub fn provide(&mut self, declaration: ServiceDeclaration) -> Result<(), FeatureInstallError> {
+    pub fn provide<T>(
+        &mut self,
+        declaration: ServiceDeclaration,
+        instance: Arc<T>,
+    ) -> Result<(), FeatureInstallError>
+    where
+        T: ?Sized + Send + Sync + 'static,
+    {
         if !self.declarations.contains_provided_service(&declaration) {
             return Err(reject_undeclared_contribution(
                 self.feature_id,
@@ -1117,18 +1171,27 @@ impl FeatureServiceRegistrar<'_> {
                 declaration.id.to_string(),
             ));
         }
-        if self
-            .report
-            .provided_services
-            .iter()
-            .any(|service| service.id == declaration.id && service.version == declaration.version)
-        {
-            return Ok(());
-        }
-        self.service_registry
-            .register_provider(self.feature_id.clone(), declaration.clone())?;
+        self.service_registry.register_provider(
+            self.feature_id.clone(),
+            declaration.clone(),
+            instance,
+        )?;
         self.report.provided_services.push(declaration);
         Ok(())
+    }
+
+    pub fn require<T>(&self, service: &ServiceId) -> Result<Arc<T>, FeatureInstallError>
+    where
+        T: ?Sized + Send + Sync + 'static,
+    {
+        if !self.declarations.required_services.contains(service) {
+            return Err(FeatureInstallError::UndeclaredContribution {
+                kind: FeatureContributionKind::Service,
+                name: service.to_string(),
+                feature: self.feature_id.to_string(),
+            });
+        }
+        self.service_registry.service(service)
     }
 }
 
@@ -1248,8 +1311,11 @@ impl ProtocolProviderRegistrar<'_> {
                 .iter()
                 .any(|provided| provided.id == service.id && provided.version == service.version)
             {
-                self.service_registry
-                    .register_provider(self.feature_id.clone(), service.clone())?;
+                self.service_registry.register_provider(
+                    self.feature_id.clone(),
+                    service.clone(),
+                    Arc::new(()),
+                )?;
                 self.report.provided_services.push(service);
             }
         }
@@ -1360,13 +1426,36 @@ impl FeatureInstallContext<'_> {
 }
 
 /// Aggregate install output for a registry installation.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FeatureRegistryInstallReport {
     pub reports: Vec<FeatureInstallReport>,
     pub services: FeatureServiceRegistry,
 }
 
 impl FeatureRegistryInstallReport {
+    pub fn has_errors(&self) -> bool {
+        self.reports.iter().any(|report| {
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity == FeatureDiagnosticSeverity::Error)
+        })
+    }
+
+    pub fn error_message(&self) -> String {
+        self.reports
+            .iter()
+            .flat_map(|report| {
+                report
+                    .diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.severity == FeatureDiagnosticSeverity::Error)
+                    .map(move |diagnostic| format!("{}: {}", report.feature_id, diagnostic.message))
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
     pub fn installed_tool_names(&self) -> Vec<String> {
         self.reports
             .iter()
@@ -1453,7 +1542,9 @@ impl FeatureRegistryBuilder {
             hook_builder,
             registered_tool_names,
         );
-        worker.register_tools(pending_tools);
+        if !report.has_errors() {
+            worker.register_tools(pending_tools);
+        }
         report
     }
 
@@ -1481,7 +1572,32 @@ impl FeatureRegistryBuilder {
         let mut reports = Vec::with_capacity(self.modules.len());
         let mut seen_features = HashSet::new();
 
-        for (module, descriptor) in self.modules.into_iter().zip(descriptors.into_iter()) {
+        let mut pending_modules: Vec<_> = self.modules.into_iter().zip(descriptors).collect();
+        let mut ordered_modules = Vec::with_capacity(pending_modules.len());
+        let mut declared_services = HashSet::new();
+        while !pending_modules.is_empty() {
+            let next = pending_modules
+                .iter()
+                .position(|(_, descriptor)| {
+                    descriptor
+                        .requires_services
+                        .iter()
+                        .filter(|requirement| requirement.required)
+                        .all(|requirement| declared_services.contains(&requirement.id))
+                })
+                .unwrap_or(0);
+            let entry = pending_modules.remove(next);
+            declared_services.extend(
+                entry
+                    .1
+                    .provides_services
+                    .iter()
+                    .map(|service| service.id.clone()),
+            );
+            ordered_modules.push(entry);
+        }
+
+        for (module, descriptor) in ordered_modules {
             let declarations = FeatureContributionDeclarations::from_descriptor(&descriptor);
             let mut report = FeatureInstallReport::new(&descriptor);
 
@@ -1536,22 +1652,6 @@ impl FeatureRegistryBuilder {
 
             for background_task in descriptor.background_tasks.iter().cloned() {
                 report.declared_background_tasks.push(background_task);
-            }
-
-            for service in descriptor.provides_services.iter().cloned() {
-                match service_registry.register_provider(descriptor.id.clone(), service.clone()) {
-                    Ok(()) => report.provided_services.push(service),
-                    Err(error) => {
-                        report
-                            .diagnostics
-                            .push(FeatureDiagnostic::error(error.to_string()));
-                        report.mark_skipped(
-                            FeatureContributionKind::Service,
-                            service.id.to_string(),
-                            error.to_string(),
-                        );
-                    }
-                }
             }
 
             let install_result = {
@@ -2096,8 +2196,11 @@ mod tests {
 
         fn install(
             &self,
-            _context: &mut FeatureInstallContext<'_>,
+            context: &mut FeatureInstallContext<'_>,
         ) -> Result<(), FeatureInstallError> {
+            for service in self.descriptor.provides_services.iter().cloned() {
+                context.services().provide(service, Arc::new(()))?;
+            }
             Ok(())
         }
     }
@@ -2171,11 +2274,10 @@ mod tests {
             &self,
             context: &mut FeatureInstallContext<'_>,
         ) -> Result<(), FeatureInstallError> {
-            context.services().provide(ServiceDeclaration::new(
-                self.service.clone(),
-                "1",
-                "runtime service provider",
-            ))
+            context.services().provide(
+                ServiceDeclaration::new(self.service.clone(), "1", "runtime service provider"),
+                Arc::new(()),
+            )
         }
     }
 
@@ -2311,16 +2413,26 @@ mod tests {
             report.reports[1].resolved_service_requirements[0].id,
             service
         );
-        assert!(!report.reports[2].installed);
+        let missing_report = report
+            .reports
+            .iter()
+            .find(|feature| feature.feature_id == FeatureId::builtin("missing"))
+            .unwrap();
+        assert!(!missing_report.installed);
         assert!(
-            report.reports[2]
+            missing_report
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.message.contains("required service requirement"))
         );
-        assert!(report.reports[3].installed);
+        let optional_report = report
+            .reports
+            .iter()
+            .find(|feature| feature.feature_id == FeatureId::builtin("optional"))
+            .unwrap();
+        assert!(optional_report.installed);
         assert_eq!(
-            report.reports[3].skipped[0].kind,
+            optional_report.skipped[0].kind,
             FeatureContributionKind::Service
         );
     }
@@ -2362,6 +2474,80 @@ mod tests {
         assert!(report.services.provides(&service));
         assert_eq!(report.reports[0].provided_services[0].id, service);
         assert!(report.reports[0].skipped.is_empty());
+    }
+
+    #[test]
+    fn service_registry_keeps_typed_concrete_instance() {
+        trait CounterService: Send + Sync {
+            fn value(&self) -> usize;
+        }
+        struct Counter(usize);
+        impl CounterService for Counter {
+            fn value(&self) -> usize {
+                self.0
+            }
+        }
+        let mut registry = FeatureServiceRegistry::default();
+        let service_id = ServiceId::builtin("typed-counter");
+        let service: Arc<dyn CounterService> = Arc::new(Counter(7));
+        registry
+            .register_provider(
+                FeatureId::builtin("provider"),
+                ServiceDeclaration::new(service_id.clone(), "1", "typed counter"),
+                service,
+            )
+            .unwrap();
+        assert_eq!(
+            registry
+                .service::<dyn CounterService>(&service_id)
+                .unwrap()
+                .value(),
+            7
+        );
+    }
+
+    #[test]
+    fn service_dependencies_install_in_provider_order() {
+        let service = ServiceId::builtin("ordered-service");
+        let provider = FeatureDescriptor::builtin("provider", "Provider").with_provided_service(
+            ServiceDeclaration::new(service.clone(), "1", "ordered service"),
+        );
+        let consumer = FeatureDescriptor::builtin("consumer", "Consumer").with_service_requirement(
+            ServiceRequirement::required(service, "consumer depends on provider"),
+        );
+        let mut hook_builder = HookRegistryBuilder::default();
+        let mut pending_tools = Vec::new();
+        let report = FeatureRegistryBuilder::new()
+            .with_module(ServiceFeature {
+                descriptor: consumer,
+            })
+            .with_module(ServiceFeature {
+                descriptor: provider,
+            })
+            .install_into_pending(&mut pending_tools, &mut hook_builder);
+        assert!(!report.has_errors(), "{}", report.error_message());
+        assert_eq!(report.reports[0].feature_id, FeatureId::builtin("provider"));
+        assert_eq!(report.reports[1].feature_id, FeatureId::builtin("consumer"));
+    }
+
+    #[test]
+    fn missing_required_service_is_fatal() {
+        let descriptor = FeatureDescriptor::builtin("consumer", "Consumer")
+            .with_service_requirement(ServiceRequirement::required(
+                ServiceId::builtin("missing-service"),
+                "must fail closed",
+            ));
+        let mut hook_builder = HookRegistryBuilder::default();
+        let mut pending_tools = Vec::new();
+        let report = FeatureRegistryBuilder::new()
+            .with_module(ServiceFeature { descriptor })
+            .install_into_pending(&mut pending_tools, &mut hook_builder);
+        assert!(report.has_errors());
+        assert!(
+            report
+                .error_message()
+                .contains("required service requirement")
+        );
     }
 
     #[test]

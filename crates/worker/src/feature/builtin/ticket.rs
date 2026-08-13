@@ -15,7 +15,7 @@ use ticket::{
     Ticket, TicketBackend, TicketBackendOperation, TicketBackendOperationResult,
     TicketDoctorReport, TicketError, TicketIdOrSlug, TicketIntakeSummary, TicketListQuery,
     TicketRef, TicketRelation, TicketRelationKind, TicketRelationView, TicketStateChange,
-    TicketSummary,
+    TicketSummary, TicketWorkflowState,
     config::{DEFAULT_TICKET_BACKEND_RELATIVE_PATH, TicketConfig},
     tool::{TICKET_TOOL_NAMES, TicketToolBackend, ticket_tool_description, ticket_tools},
 };
@@ -24,7 +24,7 @@ use super::merge_request;
 use crate::feature::{
     FeatureDescriptor, FeatureDiagnostic, FeatureInstallContext, FeatureInstallError,
     FeatureInstructionContribution, FeatureInstructionDeclaration, FeatureInstructionId,
-    FeatureModule, ToolContribution, ToolDeclaration,
+    FeatureModule, ServiceDeclaration, ServiceId, ToolContribution, ToolDeclaration,
 };
 use crate::worker::{WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod};
 
@@ -34,6 +34,24 @@ const FEATURE_DESCRIPTION: &str = "Typed local Ticket work-item operations over 
 The tools operate through the ticket crate backend and do not grant generic filesystem write scope.";
 const TICKET_WORKFLOW_INSTRUCTION_ID: &str = "ticket.workflow";
 const TICKET_WORKFLOW_PROMPT_REF: &str = "$yoi/common/tickets";
+pub const TICKET_SERVICE_ID: &str = "ticket.authority";
+const TICKET_SERVICE_VERSION: &str = "1";
+
+pub trait TicketService: Send + Sync {
+    fn workflow_state(&self, ticket_id: &str) -> Result<TicketWorkflowState, TicketError>;
+}
+
+struct BackendTicketService {
+    backend: TicketToolBackend,
+}
+
+impl TicketService for BackendTicketService {
+    fn workflow_state(&self, ticket_id: &str) -> Result<TicketWorkflowState, TicketError> {
+        self.backend
+            .show(ticket_id.into())
+            .map(|ticket| ticket.meta.workflow_state)
+    }
+}
 
 fn ticket_workflow_instruction() -> FeatureInstructionDeclaration {
     FeatureInstructionDeclaration::new(
@@ -49,7 +67,7 @@ pub struct TicketFeatureAccess {
     pub authoring: bool,
     pub thread: bool,
     pub intake: bool,
-    pub orchestration_control: bool,
+    pub workflow: bool,
 }
 
 impl TicketFeatureAccess {
@@ -58,7 +76,7 @@ impl TicketFeatureAccess {
             authoring: false,
             thread: false,
             intake: false,
-            orchestration_control: false,
+            workflow: false,
         }
     }
 
@@ -67,7 +85,7 @@ impl TicketFeatureAccess {
             authoring: true,
             thread: true,
             intake: false,
-            orchestration_control: false,
+            workflow: false,
         }
     }
 
@@ -76,16 +94,16 @@ impl TicketFeatureAccess {
             authoring: true,
             thread: true,
             intake: true,
-            orchestration_control: false,
+            workflow: false,
         }
     }
 
-    pub const fn orchestration_control() -> Self {
+    pub const fn workflow() -> Self {
         Self {
             authoring: false,
             thread: true,
             intake: false,
-            orchestration_control: true,
+            workflow: true,
         }
     }
 
@@ -94,7 +112,7 @@ impl TicketFeatureAccess {
             authoring: false,
             thread: true,
             intake: false,
-            orchestration_control: false,
+            workflow: false,
         }
     }
 
@@ -103,7 +121,7 @@ impl TicketFeatureAccess {
             authoring: false,
             thread: false,
             intake: false,
-            orchestration_control: false,
+            workflow: false,
         }
     }
 
@@ -120,8 +138,7 @@ impl TicketFeatureAccess {
             || (self.authoring && AUTHORING_TOOL_NAMES.contains(&name))
             || (self.thread && THREAD_TOOL_NAMES.contains(&name))
             || (self.intake && INTAKE_TOOL_NAMES.contains(&name))
-            || (self.orchestration_control
-                && ORCHESTRATION_CONTROL_ADDITIONAL_TOOL_NAMES.contains(&name))
+            || (self.workflow && WORKFLOW_ADDITIONAL_TOOL_NAMES.contains(&name))
     }
 }
 
@@ -163,7 +180,7 @@ const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
 ];
 
 #[cfg(test)]
-const ORCHESTRATION_CONTROL_TOOL_NAMES: &[&str] = &[
+const WORKFLOW_TOOL_NAMES: &[&str] = &[
     "TicketList",
     "TicketShow",
     "TicketComment",
@@ -177,7 +194,7 @@ const ORCHESTRATION_CONTROL_TOOL_NAMES: &[&str] = &[
     "TicketOrchestrationPlanQuery",
 ];
 
-const ORCHESTRATION_CONTROL_ADDITIONAL_TOOL_NAMES: &[&str] = &[
+const WORKFLOW_ADDITIONAL_TOOL_NAMES: &[&str] = &[
     "TicketWorkflowState",
     "TicketClose",
     "TicketRelationRecord",
@@ -331,7 +348,12 @@ impl FeatureModule for TicketFeature {
     fn descriptor(&self) -> FeatureDescriptor {
         let mut descriptor = FeatureDescriptor::builtin(FEATURE_ID, FEATURE_NAME)
             .with_description(FEATURE_DESCRIPTION)
-            .with_instruction(ticket_workflow_instruction());
+            .with_instruction(ticket_workflow_instruction())
+            .with_provided_service(ServiceDeclaration::new(
+                ServiceId::builtin(TICKET_SERVICE_ID),
+                TICKET_SERVICE_VERSION,
+                "Current typed Ticket authority",
+            ));
         let enabled_tool_names = self.enabled_tool_names();
         for name in enabled_tool_names {
             descriptor = descriptor.with_tool(ToolDeclaration::new(
@@ -370,6 +392,17 @@ impl FeatureModule for TicketFeature {
         let Some(backend) = self.tool_backend(context) else {
             return Ok(());
         };
+        let ticket_service: Arc<dyn TicketService> = Arc::new(BackendTicketService {
+            backend: backend.clone(),
+        });
+        context.services().provide(
+            ServiceDeclaration::new(
+                ServiceId::builtin(TICKET_SERVICE_ID),
+                TICKET_SERVICE_VERSION,
+                "Current typed Ticket authority",
+            ),
+            ticket_service,
+        )?;
         context
             .instructions()
             .register(FeatureInstructionContribution::new(
@@ -1018,24 +1051,19 @@ mod tests {
     }
 
     #[test]
-    fn orchestration_control_descriptor_declares_orchestration_tools() {
+    fn workflow_descriptor_declares_workflow_tools() {
         let temp = TempDir::new().unwrap();
-        let feature = ticket_tools_feature_with_access(
-            temp.path(),
-            TicketFeatureAccess::orchestration_control(),
-        );
+        let feature =
+            ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::workflow());
         let descriptor = feature.descriptor();
-        assert_eq!(
-            feature.access(),
-            TicketFeatureAccess::orchestration_control()
-        );
+        assert_eq!(feature.access(), TicketFeatureAccess::workflow());
         assert_eq!(
             descriptor
                 .tools
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect::<Vec<_>>(),
-            ORCHESTRATION_CONTROL_TOOL_NAMES
+            WORKFLOW_TOOL_NAMES
         );
     }
 
@@ -1058,10 +1086,8 @@ mod tests {
         assert!(workspace_tools.contains(&"TicketQueue"));
         assert!(!workspace_tools.contains(&"TicketWorkflowState"));
 
-        let orchestration = ticket_tools_feature_with_access(
-            temp.path(),
-            TicketFeatureAccess::orchestration_control(),
-        );
+        let orchestration =
+            ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::workflow());
         let orchestration_descriptor = orchestration.descriptor();
         let orchestration_tools = orchestration_descriptor
             .tools

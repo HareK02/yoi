@@ -748,7 +748,7 @@ where
             authoring: feature_config.ticket.authoring,
             thread: feature_config.ticket.thread,
             intake: feature_config.ticket.intake,
-            orchestration_control: feature_config.ticket.orchestration_control,
+            workflow: feature_config.ticket.workflow,
         };
         // Ticket tools are typed operations over the current workspace Ticket backend.
         // Workspace access must be authority-bound to the Backend Workspace API; the
@@ -800,8 +800,15 @@ where
             ));
         }
         feature_registry.add_module(
-            crate::feature::builtin::manage_worker::manage_worker_feature(workspace_client),
+            crate::feature::builtin::manage_worker::manage_worker_feature(
+                workspace_client,
+                feature_config.worker.direct_spawn,
+            ),
         );
+    }
+    if feature_config.orchestration.enabled {
+        feature_registry
+            .add_module(crate::feature::builtin::orchestration::orchestration_feature());
     }
     for module in crate::feature::plugin::plugin_tool_features_if_enabled(
         feature_config.plugins.enabled,
@@ -937,7 +944,16 @@ where
             );
         }
     }
-    let _feature_install_report = worker.install_features(feature_registry);
+    let feature_install_report = worker.install_features(feature_registry);
+    if feature_install_report.has_errors() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Worker feature installation failed: {}",
+                feature_install_report.error_message()
+            ),
+        ));
+    }
     if let Some(tracker) = tracker {
         worker.attach_tracker(tracker);
     }
