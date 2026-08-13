@@ -193,6 +193,51 @@ fn rejected_v6_schema_missing_diff_digest_is_archived_before_fresh_v7() {
 }
 
 #[test]
+fn v7_completion_operations_are_preserved_as_legacy_assigned_coder_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v7.db");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE merge_request_schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);\
+         INSERT INTO merge_request_schema_migrations(version,name) VALUES(7,'fresh_bounded_context_authority');\
+         CREATE TABLE repositories(workspace_id TEXT NOT NULL,repository_id TEXT NOT NULL,PRIMARY KEY(workspace_id,repository_id));\
+         CREATE TABLE typed_tickets(workspace_id TEXT NOT NULL,ticket_id TEXT NOT NULL,workflow_state TEXT NOT NULL,workflow_state_explicit INTEGER NOT NULL DEFAULT 1,updated_at TEXT NOT NULL,PRIMARY KEY(workspace_id,ticket_id));\
+         INSERT INTO typed_tickets VALUES('ws-a','T1','done',1,'t');\
+         CREATE TABLE merge_request_completion_operations(workspace_id TEXT NOT NULL,operation_id TEXT NOT NULL,ticket_id TEXT NOT NULL,revision_id TEXT NOT NULL,assignment_id TEXT NOT NULL,fingerprint TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('pending','completed')),result_ticket_state TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(workspace_id,operation_id),FOREIGN KEY(workspace_id,ticket_id) REFERENCES typed_tickets(workspace_id,ticket_id));\
+         INSERT INTO merge_request_completion_operations VALUES('ws-a','legacy-op','T1','V1','A1','legacy-fingerprint','completed','done','t','t');",
+    ).unwrap();
+    drop(conn);
+
+    SqliteMergeRequestStore::open(&path, "ws-a").unwrap();
+    let conn = Connection::open(&path).unwrap();
+    let row: (String, String, Option<String>, Option<String>, String) = conn
+        .query_row(
+            "SELECT authority_kind,implementation_assignment_id,completion_actor_runtime_id,completion_actor_worker_id,fingerprint FROM merge_request_completion_operations WHERE operation_id='legacy-op'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        row,
+        (
+            "legacy_assigned_coder".into(),
+            "A1".into(),
+            None,
+            None,
+            "legacy-fingerprint".into()
+        )
+    );
+    let version: i64 = conn
+        .query_row(
+            "SELECT MAX(version) FROM merge_request_schema_migrations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, 8);
+}
+
+#[test]
 fn request_changes_new_revision_resets_and_exact_completion_replay_converges() {
     let (_dir, store) = setup();
     open(&store);
@@ -223,9 +268,9 @@ fn request_changes_new_revision_resets_and_exact_completion_replay_converges() {
         operation_id: "OP1".into(),
         ticket_id: "T1".into(),
         expected_revision_id: "V2".into(),
-        assignment_id: "A1".into(),
-        authenticated_runtime_id: "R1".into(),
-        authenticated_worker_id: "W1".into(),
+        implementation_assignment_id: "A1".into(),
+        completion_actor_runtime_id: "OR".into(),
+        completion_actor_worker_id: "OW".into(),
         now: "tc".into(),
     };
     let first = store.complete(input.clone()).unwrap();
@@ -273,6 +318,32 @@ fn request_changes_new_revision_resets_and_exact_completion_replay_converges() {
         .unwrap(),
         1
     );
+    assert_eq!(
+        conn.query_row(
+            "SELECT authority_kind || ':' || implementation_assignment_id || ':' || completion_actor_runtime_id || ':' || completion_actor_worker_id FROM merge_request_completion_operations WHERE workspace_id='ws-a' AND operation_id='OP1'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "workspace_orchestrator:A1:OR:OW"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT author FROM typed_ticket_events WHERE workspace_id='ws-a' AND ticket_id='T1' AND kind='state_changed'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "worker:OR:OW"
+    );
+    let authority: String = conn
+        .query_row(
+            "SELECT value FROM typed_ticket_event_attributes WHERE workspace_id='ws-a' AND ticket_id='T1' AND key='completion_authority'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(authority, "workspace_orchestrator");
 }
 
 #[test]
@@ -340,9 +411,9 @@ fn concurrent_exact_completion_replays_commit_one_ticket_side_effect() {
         operation_id: "OP-concurrent".into(),
         ticket_id: "T1".into(),
         expected_revision_id: "V1".into(),
-        assignment_id: "A1".into(),
-        authenticated_runtime_id: "R1".into(),
-        authenticated_worker_id: "W1".into(),
+        implementation_assignment_id: "A1".into(),
+        completion_actor_runtime_id: "OR".into(),
+        completion_actor_worker_id: "OW".into(),
         now: "t".into(),
     };
     let left_store = store.clone();
@@ -374,7 +445,7 @@ fn concurrent_exact_completion_replays_commit_one_ticket_side_effect() {
 }
 
 #[test]
-fn operation_key_mismatch_and_assignment_takeover_are_fenced() {
+fn operation_key_mismatch_and_actor_or_assignment_change_are_fenced() {
     let (_dir, store) = setup();
     open(&store);
     attempt(&store, "AT", "V1", "token", "child");
@@ -383,19 +454,39 @@ fn operation_key_mismatch_and_assignment_takeover_are_fenced() {
         operation_id: "OP".into(),
         ticket_id: "T1".into(),
         expected_revision_id: "V1".into(),
-        assignment_id: "A1".into(),
-        authenticated_runtime_id: "R1".into(),
-        authenticated_worker_id: "W1".into(),
+        implementation_assignment_id: "A1".into(),
+        completion_actor_runtime_id: "OR".into(),
+        completion_actor_worker_id: "OW".into(),
         now: "t".into(),
     };
     let conn = Connection::open(store.db_path()).unwrap();
-    conn.execute("UPDATE ticket_current_worker_assignments SET assignment_id='A2',runtime_id='R2',worker_id='W2' WHERE workspace_id='ws-a' AND ticket_id='T1'",[]).unwrap();
+    conn.execute(
+        "UPDATE ticket_current_worker_assignments SET assignment_id='A2',runtime_id='R2',worker_id='W2' WHERE workspace_id='ws-a' AND ticket_id='T1'",
+        [],
+    )
+    .unwrap();
     assert!(matches!(
         store.complete(input.clone()),
         Err(MergeRequestError::AssignmentMismatch)
     ));
-    conn.execute("UPDATE ticket_current_worker_assignments SET assignment_id='A1',runtime_id='R1',worker_id='W1' WHERE workspace_id='ws-a' AND ticket_id='T1'",[]).unwrap();
+    conn.execute(
+        "UPDATE ticket_current_worker_assignments SET assignment_id='A1',runtime_id='R1',worker_id='W1' WHERE workspace_id='ws-a' AND ticket_id='T1'",
+        [],
+    )
+    .unwrap();
     store.complete(input.clone()).unwrap();
+    input.completion_actor_worker_id = "other".into();
+    assert!(matches!(
+        store.complete(input.clone()),
+        Err(MergeRequestError::OperationConflict)
+    ));
+    input.completion_actor_worker_id = "OW".into();
+    input.implementation_assignment_id = "A2".into();
+    assert!(matches!(
+        store.complete(input.clone()),
+        Err(MergeRequestError::OperationConflict)
+    ));
+    input.implementation_assignment_id = "A1".into();
     input.expected_revision_id = "other".into();
     assert!(matches!(
         store.complete(input),

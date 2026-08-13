@@ -3844,28 +3844,21 @@ async fn scoped_complete_merge_request(
     let workspace_id = parse_workspace_id(&workspace_id)?;
     require_workspace_access(&workspace_id, &api)?;
     let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
+    require_online_workspace_orchestrator_source(&api, &source)?;
     let assignment = api
         .store
         .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
         .ok_or_else(|| {
             Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
         })?;
-    if assignment.worker.runtime_id != source.runtime_id
-        || assignment.worker.worker_id != source.worker_id
-    {
-        return Err(Error::TicketAssignmentConflict(
-            "authenticated Worker is not the current Ticket assignee".into(),
-        )
-        .into());
-    }
     let outcome = merge_request_store(&api, &workspace_id)?.complete(
         merge_request::CompleteMergeRequest {
             operation_id: input.operation_id,
             ticket_id,
             expected_revision_id: input.expected_revision_id,
-            assignment_id: assignment.assignment_id,
-            authenticated_runtime_id: source.runtime_id,
-            authenticated_worker_id: source.worker_id,
+            implementation_assignment_id: assignment.assignment_id,
+            completion_actor_runtime_id: source.runtime_id,
+            completion_actor_worker_id: source.worker_id,
             now: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         },
     )?;
@@ -4826,17 +4819,42 @@ fn bounded_orchestrator_attention_text(input: &str, max_chars: usize) -> String 
     output
 }
 
+fn require_online_workspace_orchestrator_source(
+    api: &WorkspaceApi,
+    source: &WorkerMutationSource,
+) -> Result<()> {
+    let orchestrator = find_online_workspace_orchestrator(api).ok_or_else(|| {
+        Error::TicketAssignmentConflict(
+            "Workspace has no current online Workspace Orchestrator".into(),
+        )
+    })?;
+    if orchestrator.worker != *source {
+        return Err(Error::TicketAssignmentConflict(
+            "Merge Request completion requires the current online Workspace Orchestrator".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn find_online_workspace_orchestrator(api: &WorkspaceApi) -> Option<WorkerSummary> {
+    api.runtime
+        .list_workers(1000)
+        .items
+        .into_iter()
+        .find(|worker| {
+            worker.singleton_key.as_deref()
+                == Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY)
+                && worker.workspace.workspace_id.as_deref()
+                    == Some(api.config.workspace_id.as_str())
+                && matches!(worker.state.as_str(), "idle" | "running" | "paused")
+        })
+}
+
 fn find_workspace_orchestrator(api: &WorkspaceApi) -> Option<WorkerSummary> {
     let is_orchestrator = |worker: &WorkerSummary| {
         worker.singleton_key.as_deref() == Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY)
     };
-    if let Some(worker) = api
-        .runtime
-        .list_workers(1000)
-        .items
-        .into_iter()
-        .find(is_orchestrator)
-    {
+    if let Some(worker) = find_online_workspace_orchestrator(api) {
         return Some(worker);
     }
     for runtime in api.runtime.list_runtimes(1000).items {
@@ -12010,6 +12028,226 @@ mod tests {
         let error =
             authenticate_worker_mutation_source(&api, "other-workspace", &headers).unwrap_err();
         assert!(matches!(error, Error::WorkerSourceIdentity(_)));
+    }
+
+    #[tokio::test]
+    async fn merge_request_completion_authority_requires_current_online_orchestrator() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let workspace_id = api.config.workspace_id.clone();
+        let Json(generic) = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(CreateWorkspaceWorkerRequest {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                display_name: "Generic Worker".to_string(),
+                profile: Some("builtin:coder".to_string()),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                working_directory: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            require_online_workspace_orchestrator_source(&api, &generic.worker_ref),
+            Err(Error::TicketAssignmentConflict(_))
+        ));
+
+        let Json(started) = scoped_start_workspace_orchestrator(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: workspace_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        let orchestrator = started.worker.unwrap().worker;
+        require_online_workspace_orchestrator_source(&api, &orchestrator).unwrap();
+        assert!(matches!(
+            require_online_workspace_orchestrator_source(&api, &generic.worker_ref),
+            Err(Error::TicketAssignmentConflict(_))
+        ));
+
+        api.runtime
+            .stop_worker(
+                &orchestrator,
+                WorkerLifecycleRequest {
+                    reason: Some("completion authority regression test".into()),
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        assert!(find_workspace_orchestrator(&api).is_some());
+        assert!(find_online_workspace_orchestrator(&api).is_none());
+        assert!(matches!(
+            require_online_workspace_orchestrator_source(&api, &orchestrator),
+            Err(Error::TicketAssignmentConflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn merge_request_completion_endpoint_rejects_coder_and_accepts_orchestrator() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let workspace_id = api.config.workspace_id.clone();
+        let backend = browser_ticket_backend(&api).unwrap();
+        let mut input = ticket::NewTicket::new("Orchestrator completion authority");
+        input.workflow_state = Some(TicketWorkflowState::InProgress);
+        let ticket = backend.create(input).unwrap();
+        let Json(coder) = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(CreateWorkspaceWorkerRequest {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                display_name: "Assigned Coder".to_string(),
+                profile: Some("builtin:coder".to_string()),
+                ticket_assignment: Some(CreateWorkspaceWorkerTicketAssignmentRequest {
+                    ticket_id: ticket.id.clone(),
+                    operation_id: "completion-coder-assignment".to_string(),
+                }),
+                initial_submit: vec![Segment::Flow {
+                    selector: "builtin:coder-review".to_string(),
+                }],
+                working_directory: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let assignment = api
+            .store
+            .get_current_ticket_worker_assignment(&workspace_id, &ticket.id)
+            .unwrap()
+            .unwrap();
+        let mr_store = merge_request_store(&api, &workspace_id).unwrap();
+        mr_store
+            .open_merge_request(merge_request::OpenMergeRequest {
+                merge_request_id: "MR-server-completion".into(),
+                ticket_id: ticket.id.clone(),
+                repository_id: TEST_REPOSITORY_ID.into(),
+                revision: merge_request::MergeRequestRevision {
+                    revision_id: "V1".into(),
+                    ordinal: 1,
+                    base_commit: "base".into(),
+                    head_commit: "head".into(),
+                    head_tree: "tree".into(),
+                    diff_digest: "sha256:diff".into(),
+                    changed_paths: vec!["src/lib.rs".into()],
+                    summary: "approved revision".into(),
+                    assignment_id: assignment.assignment_id.clone(),
+                    created_at: "t1".into(),
+                },
+                authenticated_runtime_id: coder.worker_ref.runtime_id.clone(),
+                authenticated_worker_id: coder.worker_ref.worker_id.clone(),
+                now: "t1".into(),
+            })
+            .unwrap();
+        mr_store
+            .register_reviewer_child_session(merge_request::RegisterReviewerChildSession {
+                parent_runtime_id: coder.worker_ref.runtime_id.clone(),
+                parent_worker_id: coder.worker_ref.worker_id.clone(),
+                child_session_id: "reviewer-child".into(),
+                now: "t2".into(),
+            })
+            .unwrap();
+        mr_store
+            .register_review_attempt(merge_request::RegisterReviewAttempt {
+                attempt_id: "attempt".into(),
+                ticket_id: ticket.id.clone(),
+                revision_id: "V1".into(),
+                parent_assignment_id: assignment.assignment_id.clone(),
+                parent_runtime_id: coder.worker_ref.runtime_id.clone(),
+                parent_worker_id: coder.worker_ref.worker_id.clone(),
+                child_session_id: "reviewer-child".into(),
+                capability_token: "review-token".into(),
+                now: "t2".into(),
+            })
+            .unwrap();
+        mr_store
+            .submit_review(merge_request::SubmitReview {
+                ticket_id: ticket.id.clone(),
+                revision_id: "V1".into(),
+                capability_token: "review-token".into(),
+                decision: merge_request::ReviewDecision::Approve,
+                body: "approved".into(),
+                findings: Vec::new(),
+                now: "t3".into(),
+            })
+            .unwrap();
+
+        let worker_headers = |worker: &RuntimeWorkerRef| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-yoi-runtime-id",
+                axum::http::HeaderValue::from_str(&worker.runtime_id).unwrap(),
+            );
+            headers.insert(
+                "x-yoi-worker-id",
+                axum::http::HeaderValue::from_str(&worker.worker_id).unwrap(),
+            );
+            headers
+        };
+        let request = || CompleteMergeRequestRequest {
+            operation_id: "complete-operation".into(),
+            expected_revision_id: "V1".into(),
+        };
+        let coder_error = scoped_complete_merge_request(
+            State(api.clone()),
+            worker_headers(&coder.worker_ref),
+            AxumPath((workspace_id.clone(), ticket.id.clone())),
+            Json(request()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            coder_error.error,
+            Error::TicketAssignmentConflict(_)
+        ));
+
+        let Json(started) = scoped_start_workspace_orchestrator(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: workspace_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        let orchestrator = started.worker.unwrap().worker;
+        let Json(completed) = scoped_complete_merge_request(
+            State(api.clone()),
+            worker_headers(&orchestrator),
+            AxumPath((workspace_id, ticket.id.clone())),
+            Json(request()),
+        )
+        .await
+        .unwrap();
+        assert!(!completed.replayed);
+        assert_eq!(
+            backend
+                .show(ticket.id.clone().into())
+                .unwrap()
+                .meta
+                .workflow_state,
+            TicketWorkflowState::Done
+        );
+        let conn = rusqlite::Connection::open(&api.config.database_path).unwrap();
+        let actor: String = conn
+            .query_row(
+                "SELECT author FROM typed_ticket_events WHERE workspace_id=?1 AND ticket_id=?2 AND kind='state_changed'",
+                rusqlite::params![api.config.workspace_id, ticket.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            actor,
+            format!(
+                "worker:{}:{}",
+                orchestrator.runtime_id, orchestrator.worker_id
+            )
+        );
     }
 
     #[tokio::test]

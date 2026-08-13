@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const REVIEWER_PROFILE: &str = "builtin:reviewer";
 const MAX_SUMMARY_BYTES: usize = 16 * 1024;
 const MAX_REVIEW_BODY_BYTES: usize = 64 * 1024;
@@ -231,9 +231,9 @@ pub struct CompleteMergeRequest {
     pub operation_id: String,
     pub ticket_id: String,
     pub expected_revision_id: String,
-    pub assignment_id: String,
-    pub authenticated_runtime_id: String,
-    pub authenticated_worker_id: String,
+    pub implementation_assignment_id: String,
+    pub completion_actor_runtime_id: String,
+    pub completion_actor_worker_id: String,
     pub now: String,
 }
 
@@ -550,6 +550,18 @@ impl SqliteMergeRequestStore {
             ("operation_id", input.operation_id.as_str()),
             ("ticket_id", input.ticket_id.as_str()),
             ("revision_id", input.expected_revision_id.as_str()),
+            (
+                "implementation_assignment_id",
+                input.implementation_assignment_id.as_str(),
+            ),
+            (
+                "completion_actor_runtime_id",
+                input.completion_actor_runtime_id.as_str(),
+            ),
+            (
+                "completion_actor_worker_id",
+                input.completion_actor_worker_id.as_str(),
+            ),
         ] {
             nonempty(name, value)?;
         }
@@ -566,17 +578,22 @@ impl SqliteMergeRequestStore {
                 }
             } else {
                 conn.execute(
-                    "INSERT INTO merge_request_completion_operations (workspace_id, operation_id, ticket_id, revision_id, assignment_id, fingerprint, status, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,'pending',?7,?7)",
-                    params![self.workspace_id, input.operation_id, input.ticket_id, input.expected_revision_id, input.assignment_id, fingerprint, input.now],
+                    "INSERT INTO merge_request_completion_operations (workspace_id, operation_id, ticket_id, revision_id, authority_kind, implementation_assignment_id, completion_actor_runtime_id, completion_actor_worker_id, fingerprint, status, created_at, updated_at) VALUES (?1,?2,?3,?4,'workspace_orchestrator',?5,?6,?7,?8,'pending',?9,?9)",
+                    params![self.workspace_id, input.operation_id, input.ticket_id, input.expected_revision_id, input.implementation_assignment_id, input.completion_actor_runtime_id, input.completion_actor_worker_id, fingerprint, input.now],
                 ).map_err(db)?;
             }
             let mr = load_merge_request(conn, &self.workspace_id, &input.ticket_id)?
                 .ok_or_else(|| MergeRequestError::NotFound(input.ticket_id.clone()))?;
+            validate_current_implementation_assignment(
+                conn,
+                &self.workspace_id,
+                &input.ticket_id,
+                &input.implementation_assignment_id,
+            )?;
             ensure_open(&mr)?;
             if mr.current_revision.revision_id != input.expected_revision_id {
                 return Err(MergeRequestError::StaleRevision { expected: input.expected_revision_id.clone(), current: mr.current_revision.revision_id });
             }
-            validate_current_assignment(conn, &self.workspace_id, &input.ticket_id, &input.assignment_id, &input.authenticated_runtime_id, &input.authenticated_worker_id)?;
             if mr.review_status != ReviewStatus::Approved { return Err(MergeRequestError::NotApproved); }
             let current_state: String = conn.query_row(
                 "SELECT workflow_state FROM typed_tickets WHERE workspace_id=?1 AND ticket_id=?2",
@@ -671,6 +688,11 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         .map_err(db)?;
     archive_incompatible_legacy_tables(conn, version)?;
     conn.execute_batch(SCHEMA_V1).map_err(db)?;
+    if version < SCHEMA_VERSION
+        && column_exists(conn, "merge_request_completion_operations", "assignment_id")?
+    {
+        migrate_completion_authority_v8(conn)?;
+    }
     if version < 1 {
         conn.execute(
             "INSERT INTO merge_request_schema_migrations(version) VALUES (1)",
@@ -684,7 +706,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         // preserved and revalidated by the current typed store rather than rewritten.
         if column_exists(conn, "merge_request_schema_migrations", "name")? {
             conn.execute(
-                "INSERT OR IGNORE INTO merge_request_schema_migrations(version,name) VALUES (?1,'fresh_bounded_context_authority')",
+                "INSERT OR IGNORE INTO merge_request_schema_migrations(version,name) VALUES (?1,'separate_completion_authority')",
                 params![SCHEMA_VERSION],
             ).map_err(db)?;
         } else {
@@ -696,6 +718,29 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         }
     }
     verify(conn)
+}
+
+fn migrate_completion_authority_v8(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "ALTER TABLE merge_request_completion_operations RENAME TO merge_request_completion_operations_v7;
+         CREATE TABLE merge_request_completion_operations (
+          workspace_id TEXT NOT NULL, operation_id TEXT NOT NULL, ticket_id TEXT NOT NULL, revision_id TEXT NOT NULL,
+          authority_kind TEXT NOT NULL CHECK(authority_kind IN ('workspace_orchestrator','legacy_assigned_coder')),
+          implementation_assignment_id TEXT NOT NULL, completion_actor_runtime_id TEXT, completion_actor_worker_id TEXT,
+          fingerprint TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','completed')),
+          result_ticket_state TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          PRIMARY KEY(workspace_id,operation_id),
+          FOREIGN KEY(workspace_id,ticket_id) REFERENCES typed_tickets(workspace_id,ticket_id)
+         );
+         INSERT INTO merge_request_completion_operations(
+          workspace_id,operation_id,ticket_id,revision_id,authority_kind,implementation_assignment_id,
+          completion_actor_runtime_id,completion_actor_worker_id,fingerprint,status,result_ticket_state,created_at,updated_at
+         ) SELECT workspace_id,operation_id,ticket_id,revision_id,'legacy_assigned_coder',assignment_id,
+          NULL,NULL,fingerprint,status,result_ticket_state,created_at,updated_at
+         FROM merge_request_completion_operations_v7;
+         DROP TABLE merge_request_completion_operations_v7;",
+    )
+    .map_err(db)
 }
 
 pub fn verify(conn: &Connection) -> Result<()> {
@@ -817,7 +862,10 @@ pub fn verify(conn: &Connection) -> Result<()> {
                 "operation_id",
                 "ticket_id",
                 "revision_id",
-                "assignment_id",
+                "authority_kind",
+                "implementation_assignment_id",
+                "completion_actor_runtime_id",
+                "completion_actor_worker_id",
                 "fingerprint",
                 "status",
                 "result_ticket_state",
@@ -901,7 +949,9 @@ CREATE TABLE IF NOT EXISTS merge_request_review_findings (
 );
 CREATE TABLE IF NOT EXISTS merge_request_completion_operations (
  workspace_id TEXT NOT NULL, operation_id TEXT NOT NULL, ticket_id TEXT NOT NULL, revision_id TEXT NOT NULL,
- assignment_id TEXT NOT NULL, fingerprint TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','completed')),
+ authority_kind TEXT NOT NULL CHECK(authority_kind IN ('workspace_orchestrator','legacy_assigned_coder')),
+ implementation_assignment_id TEXT NOT NULL, completion_actor_runtime_id TEXT, completion_actor_worker_id TEXT,
+ fingerprint TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','completed')),
  result_ticket_state TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
  PRIMARY KEY(workspace_id,operation_id),
  FOREIGN KEY(workspace_id,ticket_id) REFERENCES typed_tickets(workspace_id,ticket_id)
@@ -1166,6 +1216,26 @@ fn load_review(
     }))
 }
 
+fn validate_current_implementation_assignment(
+    conn: &Connection,
+    workspace_id: &str,
+    ticket_id: &str,
+    assignment_id: &str,
+) -> Result<()> {
+    let current: Option<String> = conn
+        .query_row(
+            "SELECT assignment_id FROM ticket_current_worker_assignments WHERE workspace_id=?1 AND ticket_id=?2",
+            params![workspace_id, ticket_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db)?;
+    if current.as_deref() != Some(assignment_id) {
+        return Err(MergeRequestError::AssignmentMismatch);
+    }
+    Ok(())
+}
+
 fn validate_current_assignment(
     conn: &Connection,
     workspace_id: &str,
@@ -1187,16 +1257,20 @@ fn append_completion_event(
     input: &CompleteMergeRequest,
 ) -> Result<()> {
     let index:i64=conn.query_row("SELECT COALESCE(MAX(event_index),-1)+1 FROM typed_ticket_events WHERE workspace_id=?1 AND ticket_id=?2",params![workspace_id,input.ticket_id],|r|r.get(0)).map_err(db)?;
-    conn.execute("INSERT INTO typed_ticket_events (workspace_id,ticket_id,event_index,kind,author,at,from_state,to_state,heading,body) VALUES (?1,?2,?3,'state_changed',?4,?5,'inprogress','done','Merge Request completed',?6)",params![workspace_id,input.ticket_id,index,format!("worker:{}:{}",input.authenticated_runtime_id,input.authenticated_worker_id),input.now,format!("Approved immutable revision `{}` completed implementation.",input.expected_revision_id)]).map_err(db)?;
+    conn.execute("INSERT INTO typed_ticket_events (workspace_id,ticket_id,event_index,kind,author,at,from_state,to_state,heading,body) VALUES (?1,?2,?3,'state_changed',?4,?5,'inprogress','done','Merge Request completed',?6)",params![workspace_id,input.ticket_id,index,format!("worker:{}:{}",input.completion_actor_runtime_id,input.completion_actor_worker_id),input.now,format!("Approved immutable revision `{}` completed implementation.",input.expected_revision_id)]).map_err(db)?;
     for (key, value) in [
-        ("assignment_id", input.assignment_id.as_str()),
+        (
+            "implementation_assignment_id",
+            input.implementation_assignment_id.as_str(),
+        ),
         (
             "merge_request_revision_id",
             input.expected_revision_id.as_str(),
         ),
         ("operation_id", input.operation_id.as_str()),
-        ("runtime_id", input.authenticated_runtime_id.as_str()),
-        ("worker_id", input.authenticated_worker_id.as_str()),
+        ("completion_authority", "workspace_orchestrator"),
+        ("runtime_id", input.completion_actor_runtime_id.as_str()),
+        ("worker_id", input.completion_actor_worker_id.as_str()),
     ] {
         conn.execute("INSERT INTO typed_ticket_event_attributes (workspace_id,ticket_id,event_index,key,value) VALUES (?1,?2,?3,?4,?5)",params![workspace_id,input.ticket_id,index,key,value]).map_err(db)?;
     }
@@ -1299,12 +1373,12 @@ fn token_hash(token: &str) -> String {
 }
 fn completion_fingerprint(input: &CompleteMergeRequest) -> String {
     token_hash(&format!(
-        "{}\0{}\0{}\0{}\0{}",
+        "workspace_orchestrator\0{}\0{}\0{}\0{}\0{}",
         input.ticket_id,
         input.expected_revision_id,
-        input.assignment_id,
-        input.authenticated_runtime_id,
-        input.authenticated_worker_id
+        input.implementation_assignment_id,
+        input.completion_actor_runtime_id,
+        input.completion_actor_worker_id
     ))
 }
 fn db(error: rusqlite::Error) -> MergeRequestError {
