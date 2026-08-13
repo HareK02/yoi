@@ -211,21 +211,26 @@
 
   async function reloadAndReapply() {
     if (!toolchain || !treeState) return;
-    const localCandidate = structuredClone(treeState.snapshot);
+    const localChanges = [...draftChanges];
     const remote = await fetchConfigTree(workspaceId);
     baseSnapshot = structuredClone(remote.snapshot);
     baseRevision = remote.snapshot.revision;
     baseDigest = remote.snapshot.digest;
     await toolchain.setSnapshot(remote.snapshot);
-    draftChanges = await toolchain.changesBetween(remote.snapshot, localCandidate);
-    const candidate = await toolchain.applyChanges(draftChanges);
-    treeState = { ...remote, snapshot: candidate };
-    selectedPath = candidate.entries[selectedPath] ? selectedPath : Object.keys(candidate.entries).toSorted()[0] ?? "";
-    source = selectedPath ? candidate.entries[selectedPath].content : "";
-    conflict = false;
-    preflightDigest = "";
-    candidateContract = null;
-    status = "Local candidate reapplied to the latest revision. Preview again before Commit.";
+    try {
+      const candidate = await toolchain.applyChanges(localChanges);
+      draftChanges = localChanges;
+      treeState = { ...remote, snapshot: candidate };
+      selectedPath = candidate.entries[selectedPath] ? selectedPath : Object.keys(candidate.entries).toSorted()[0] ?? "";
+      source = selectedPath ? candidate.entries[selectedPath].content : "";
+      conflict = false;
+      preflightDigest = "";
+      candidateContract = null;
+      status = "Local changes reapplied to the latest revision. Preview again before Commit.";
+    } catch (error) {
+      conflict = true;
+      status = `Local changes conflict with the latest revision: ${String(error)}. Discard local changes or resolve against a fresh reload.`;
+    }
   }
 
   function createEntry() {
