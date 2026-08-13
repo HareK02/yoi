@@ -1,93 +1,16 @@
-export type VirtualPath = string;
-
-export type ConfigContentType = "decodal" | "text";
-
-export interface ConfigEntry {
-  path: VirtualPath;
-  content_type: ConfigContentType;
-  content: string;
-  content_digest: string;
-}
-
-export interface ConfigTreeSnapshot {
-  revision: number;
-  digest: string;
-  entries: Record<VirtualPath, ConfigEntry>;
-}
-
-export type ConfigTreeChange =
-  | {
-    kind: "create";
-    path: VirtualPath;
-    content_type: ConfigContentType;
-    content: string;
-  }
-  | {
-    kind: "update";
-    path: VirtualPath;
-    expected_digest: string;
-    content: string;
-  }
-  | {
-    kind: "rename";
-    from: VirtualPath;
-    to: VirtualPath;
-    expected_digest: string;
-  }
-  | {
-    kind: "delete";
-    path: VirtualPath;
-    expected_digest: string;
-  };
-
-export interface ToolchainContract {
-  contract_version: number;
-  decodal_version: string;
-  schema_version: number;
-  entrypoints: VirtualPath[];
-  import_policy_version: number;
-  fingerprint: string;
-}
-
-export interface ConfigDiagnostic {
-  path: VirtualPath;
-  revision: number;
-  tree_digest: string;
-  kind: string;
-  span: { start_byte: number; end_byte: number };
-  message: string;
-  labels: Array<{
-    span: { start_byte: number; end_byte: number };
-    message: string;
-  }>;
-  notes: string[];
-}
-
-export interface WorkspaceConfigTreeResponse {
-  snapshot: ConfigTreeSnapshot;
-  contract: ToolchainContract;
-  projection_digest: string;
-}
-
-export interface EvaluatedConfigCandidate {
-  base_revision: number;
-  base_digest: string;
-  snapshot: ConfigTreeSnapshot;
-  contract: ToolchainContract;
-  evaluation: {
-    projections: Array<{
-      entrypoint: VirtualPath;
-      data_json: unknown;
-      projection_digest: string;
-    }>;
-    projection_digest: string;
-  };
-}
-
-export interface ConfigCommitRequest {
-  base_revision: number;
-  base_digest: string;
-  changes: ConfigTreeChange[];
-  entrypoints: VirtualPath[];
-  toolchain_fingerprint: string;
-}
+// Core and HTTP DTOs are generated from Rust with ts-rs.
+export type { ConfigContentType } from "./generated/types/ConfigContentType.ts";
+export type { ConfigDiagnostic } from "./generated/types/ConfigDiagnostic.ts";
+export type { ConfigDiagnosticLabel } from "./generated/types/ConfigDiagnosticLabel.ts";
+export type { ConfigEntry } from "./generated/types/ConfigEntry.ts";
+export type { ConfigSpan } from "./generated/types/ConfigSpan.ts";
+export type { ConfigTreeChange } from "./generated/types/ConfigTreeChange.ts";
+export type { ConfigTreeSnapshot } from "./generated/types/ConfigTreeSnapshot.ts";
+export type { EvaluatedProjection } from "./generated/types/EvaluatedProjection.ts";
+export type { EvaluationResult } from "./generated/types/EvaluationResult.ts";
+export type { ToolchainContract } from "./generated/types/ToolchainContract.ts";
+export type { VirtualPath } from "./generated/types/VirtualPath.ts";
+export type { ConfigCommitRequest } from "./generated/types/ConfigCommitRequest.ts";
+export type { ConfigPreviewRequest } from "./generated/types/ConfigPreviewRequest.ts";
+export type { EvaluatedConfigCandidate } from "./generated/types/EvaluatedConfigCandidate.ts";
+export type { WorkspaceConfigState as WorkspaceConfigTreeResponse } from "./generated/types/WorkspaceConfigState.ts";

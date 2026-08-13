@@ -3,6 +3,7 @@
 export const memory: WebAssembly.Memory;
 export const analyze_snapshot: (a: any, b: number, c: number, d: number, e: number) => [number, number, number];
 export const apply_changes: (a: any) => [number, number, number];
+export const changes_between: (a: any, b: any) => [number, number, number];
 export const complete_current: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number];
 export const evaluate_current: (a: any) => [number, number, number];
 export const evaluate_snapshot: (a: any, b: any) => [number, number, number];

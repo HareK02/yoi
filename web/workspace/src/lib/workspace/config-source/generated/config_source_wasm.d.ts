@@ -5,7 +5,9 @@ export function analyze_snapshot(snapshot: any, entrypoint: string, source_overr
 
 export function apply_changes(changes: any): any;
 
-export function complete_current(entrypoint: string, source: string, utf8_byte_offset: number, explicit: boolean): any;
+export function changes_between(base: any, candidate: any): any;
+
+export function complete_current(entrypoint: string, source: string, utf16_offset: number, explicit: boolean): any;
 
 export function evaluate_current(contract: any): any;
 
@@ -23,6 +25,7 @@ export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly analyze_snapshot: (a: any, b: number, c: number, d: number, e: number) => [number, number, number];
     readonly apply_changes: (a: any) => [number, number, number];
+    readonly changes_between: (a: any, b: any) => [number, number, number];
     readonly complete_current: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number];
     readonly evaluate_current: (a: any) => [number, number, number];
     readonly evaluate_snapshot: (a: any, b: any) => [number, number, number];

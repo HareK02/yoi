@@ -25,6 +25,8 @@
   let baseRevision = $state(0);
   let baseDigest = $state("");
   let renamePath = $state("");
+  let baseSnapshot = $state<WorkspaceConfigTreeResponse["snapshot"] | null>(null);
+  let preflightDigest = $state("");
   let toolchain: ConfigSourceToolchain | null = null;
 
   const paths = $derived(
@@ -34,6 +36,7 @@
     treeState && selectedPath ? treeState.snapshot.entries[selectedPath] : undefined,
   );
   const dirty = $derived(draftChanges.length > 0 || (selected ? source !== selected.content : source.length > 0));
+  const commitReady = $derived(dirty && preflightDigest === treeState?.snapshot.digest);
 
   onMount(() => {
     toolchain = new ConfigSourceToolchain();
@@ -48,6 +51,7 @@
         selectedPath = Object.keys(treeState.snapshot.entries).toSorted()[0] ?? "";
       }
       source = selectedPath ? treeState.snapshot.entries[selectedPath].content : "";
+      baseSnapshot = structuredClone(treeState.snapshot);
       baseRevision = treeState.snapshot.revision;
       baseDigest = treeState.snapshot.digest;
       await toolchain?.setSnapshot(treeState.snapshot);
@@ -65,13 +69,10 @@
   async function stageCurrent() {
     const change = currentChange();
     if (!change || !toolchain) return;
-    draftChanges = [...draftChanges.filter((item) => !changeTouches(item, selectedPath)), change];
     const candidate = await toolchain.applyChanges([change]);
     if (treeState) treeState = { ...treeState, snapshot: candidate };
-  }
-
-  function changeTouches(change: ConfigTreeChange, path: string): boolean {
-    return change.kind === "rename" ? change.from === path || change.to === path : change.path === path;
+    if (baseSnapshot) draftChanges = await toolchain.changesBetween(baseSnapshot, candidate);
+    preflightDigest = "";
   }
 
   async function select(path: string) {
@@ -144,6 +145,7 @@
         toolchain_fingerprint: treeState.contract.fingerprint,
       });
       diagnostics = [];
+      preflightDigest = candidate.snapshot.digest;
       status = `Preview valid · projection ${candidate.evaluation.projection_digest.slice(0, 20)}…`;
     } catch (error) {
       status = String(error);
@@ -159,6 +161,10 @@
       status = "No draft changes to commit.";
       return;
     }
+    if (preflightDigest !== treeState.snapshot.digest) {
+      status = "Preview the complete candidate successfully before Commit.";
+      return;
+    }
     busy = true;
     try {
       treeState = await commitConfigTree(workspaceId, {
@@ -169,6 +175,8 @@
         toolchain_fingerprint: treeState.contract.fingerprint,
       });
       draftChanges = [];
+      preflightDigest = "";
+      baseSnapshot = structuredClone(treeState.snapshot);
       baseRevision = treeState.snapshot.revision;
       baseDigest = treeState.snapshot.digest;
       await toolchain?.setSnapshot(treeState.snapshot);
@@ -198,9 +206,10 @@
       path: selectedPath,
       expected_digest: selected.content_digest,
     };
-    draftChanges = [...draftChanges.filter((item) => !changeTouches(item, selectedPath)), change];
     const candidate = await toolchain.applyChanges([change]);
     treeState = { ...treeState, snapshot: candidate };
+    if (baseSnapshot) draftChanges = await toolchain.changesBetween(baseSnapshot, candidate);
+    preflightDigest = "";
     selectedPath = Object.keys(candidate.entries).toSorted()[0] ?? "";
     source = selectedPath ? candidate.entries[selectedPath].content : "";
     renamePath = selectedPath;
@@ -218,9 +227,10 @@
       to,
       expected_digest: selected.content_digest,
     };
-    draftChanges = [...draftChanges.filter((item) => !changeTouches(item, selectedPath)), change];
     const candidate = await toolchain.applyChanges([change]);
     treeState = { ...treeState, snapshot: candidate };
+    if (baseSnapshot) draftChanges = await toolchain.changesBetween(baseSnapshot, candidate);
+    preflightDigest = "";
     selectedPath = to;
     source = candidate.entries[to]?.content ?? "";
     status = `Rename to ${to} staged. Preview and Commit to persist.`;
@@ -261,7 +271,7 @@
         <button type="button" onclick={format} disabled={!selectedPath || busy}>Format</button>
         <button type="button" onclick={analyze} disabled={!selectedPath || busy}>Analyze</button>
         <button type="button" onclick={preview} disabled={!dirty || busy}>Preview</button>
-        <button class="primary" type="button" onclick={commit} disabled={!dirty || busy}>Commit</button>
+        <button class="primary" type="button" onclick={commit} disabled={!commitReady || busy}>Commit</button>
         <button class="danger" type="button" onclick={deleteEntry} disabled={!selected || busy}>Delete</button>
       </div>
     </header>

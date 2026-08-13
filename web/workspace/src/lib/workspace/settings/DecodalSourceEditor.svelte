@@ -16,7 +16,7 @@
     readonly?: boolean;
     ariaLabel?: string;
     onChange?: (value: string) => void;
-    onComplete?: (source: string, utf8ByteOffset: number, explicit: boolean) => Promise<CompletionResult | null>;
+    onComplete?: (source: string, utf16Offset: number, explicit: boolean) => Promise<CompletionResult | null>;
   } = $props();
 
   let host = $state<HTMLDivElement | null>(null);
@@ -54,8 +54,7 @@
           decodal(),
           ...(handleComplete ? [autocompletion({ override: [async (context: CompletionContext) => {
             const doc = context.state.doc.toString();
-            const utf8ByteOffset = new TextEncoder().encode(doc.slice(0, context.pos)).byteLength;
-            return await handleComplete(doc, utf8ByteOffset, context.explicit);
+            return await handleComplete(doc, context.pos, context.explicit);
           }] })] : []),
           keymap.of([]),
           EditorState.readOnly.of(initialReadonly),

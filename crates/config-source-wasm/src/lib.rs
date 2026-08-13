@@ -33,6 +33,13 @@ pub fn apply_changes(changes: JsValue) -> Result<JsValue, JsValue> {
 }
 
 #[wasm_bindgen]
+pub fn changes_between(base: JsValue, candidate: JsValue) -> Result<JsValue, JsValue> {
+    let base: ConfigTreeSnapshot = decode(base)?;
+    let candidate: ConfigTreeSnapshot = decode(candidate)?;
+    encode(base.changes_to(&candidate))
+}
+
+#[wasm_bindgen]
 pub fn evaluate_current(contract: JsValue) -> Result<JsValue, JsValue> {
     let contract: ToolchainContract = decode(contract)?;
     SESSION.with(|session| {
@@ -68,7 +75,7 @@ struct WasmCompletionItem {
 pub fn complete_current(
     entrypoint: String,
     source: String,
-    utf8_byte_offset: usize,
+    utf16_offset: usize,
     explicit: bool,
 ) -> Result<JsValue, JsValue> {
     let entrypoint = VirtualPath::parse(entrypoint).map_err(js_error)?;
@@ -77,6 +84,7 @@ pub fn complete_current(
         let snapshot = session
             .as_ref()
             .ok_or_else(|| JsValue::from_str("config source snapshot is not initialized"))?;
+        let utf8_byte_offset = utf16_to_utf8_offset(&source, utf16_offset)?;
         let result = SnapshotEnvironment::new(snapshot.clone())
             .complete(&entrypoint, &source, utf8_byte_offset, explicit)
             .map_err(|error| JsValue::from_str(&format!("{error:?}")))?
@@ -126,6 +134,24 @@ pub fn format_source(source: String) -> Result<String, JsValue> {
     SnapshotEnvironment::new(ConfigTreeSnapshot::empty())
         .format(&source)
         .map_err(|error| JsValue::from_str(&error))
+}
+
+fn utf16_to_utf8_offset(source: &str, utf16_offset: usize) -> Result<usize, JsValue> {
+    let mut units = 0usize;
+    for (byte_offset, character) in source.char_indices() {
+        if units == utf16_offset {
+            return Ok(byte_offset);
+        }
+        units += character.len_utf16();
+        if units > utf16_offset {
+            return Err(JsValue::from_str("UTF-16 offset splits a surrogate pair"));
+        }
+    }
+    if units == utf16_offset {
+        Ok(source.len())
+    } else {
+        Err(JsValue::from_str("UTF-16 offset is outside the source"))
+    }
 }
 
 fn decode<T: serde::de::DeserializeOwned>(value: JsValue) -> Result<T, JsValue> {

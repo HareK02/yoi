@@ -11,15 +11,18 @@ use crate::{Error, Result, SqliteWorkspaceStore};
 
 pub const DEFAULT_CONFIG_ENTRYPOINT: &str = "workspace.dcdl";
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct WorkspaceConfigState {
     pub snapshot: ConfigTreeSnapshot,
     pub contract: ToolchainContract,
     pub projection_digest: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct EvaluatedConfigCandidate {
+    #[ts(type = "number")]
     pub base_revision: u64,
     pub base_digest: String,
     pub snapshot: ConfigTreeSnapshot,
@@ -27,8 +30,10 @@ pub struct EvaluatedConfigCandidate {
     pub evaluation: EvaluationResult,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct ConfigCommitRequest {
+    #[ts(type = "number")]
     pub base_revision: u64,
     pub base_digest: String,
     pub changes: Vec<ConfigTreeChange>,
@@ -36,7 +41,8 @@ pub struct ConfigCommitRequest {
     pub toolchain_fingerprint: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct ConfigPreviewRequest {
     pub changes: Vec<ConfigTreeChange>,
     pub entrypoints: Vec<VirtualPath>,
@@ -492,6 +498,18 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::WorkspaceConfigConflict(_)));
         assert!(store.load_workspace_config("w-config").unwrap().is_none());
+    }
+
+    #[test]
+    fn exports_typescript_transport_contract() {
+        use ts_rs::TS;
+        let output = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../web/workspace/src/lib/workspace/config-source/generated/types");
+        let config = ts_rs::Config::default().with_out_dir(&output);
+        WorkspaceConfigState::export_all(&config).unwrap();
+        EvaluatedConfigCandidate::export_all(&config).unwrap();
+        ConfigCommitRequest::export_all(&config).unwrap();
+        ConfigPreviewRequest::export_all(&config).unwrap();
     }
 
     #[test]

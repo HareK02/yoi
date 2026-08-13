@@ -19,7 +19,7 @@ pub const MAX_ENTRY_BYTES: usize = 256 * 1024;
 pub const MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_PATH_BYTES: usize = 512;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, ts_rs::TS)]
 #[serde(transparent)]
 pub struct VirtualPath(String);
 
@@ -71,7 +71,7 @@ impl fmt::Display for VirtualPath {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigContentType {
     Decodal,
@@ -87,7 +87,7 @@ impl ConfigContentType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 pub struct ConfigEntry {
     pub path: VirtualPath,
     pub content_type: ConfigContentType,
@@ -114,8 +114,9 @@ impl ConfigEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 pub struct ConfigTreeSnapshot {
+    #[ts(type = "number")]
     pub revision: u64,
     pub digest: String,
     pub entries: BTreeMap<VirtualPath, ConfigEntry>,
@@ -172,6 +173,38 @@ impl ConfigTreeSnapshot {
 
     pub fn get(&self, path: &VirtualPath) -> Option<&ConfigEntry> {
         self.entries.get(path)
+    }
+
+    pub fn changes_to(&self, candidate: &Self) -> Vec<ConfigTreeChange> {
+        let mut changes = Vec::new();
+        for (path, base_entry) in &self.entries {
+            match candidate.entries.get(path) {
+                None => changes.push(ConfigTreeChange::Delete {
+                    path: path.clone(),
+                    expected_digest: base_entry.content_digest.clone(),
+                }),
+                Some(candidate_entry)
+                    if candidate_entry.content_digest != base_entry.content_digest =>
+                {
+                    changes.push(ConfigTreeChange::Update {
+                        path: path.clone(),
+                        expected_digest: base_entry.content_digest.clone(),
+                        content: candidate_entry.content.clone(),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        for (path, entry) in &candidate.entries {
+            if !self.entries.contains_key(path) {
+                changes.push(ConfigTreeChange::Create {
+                    path: path.clone(),
+                    content_type: entry.content_type,
+                    content: entry.content.clone(),
+                });
+            }
+        }
+        changes
     }
 
     pub fn apply(&self, changes: &[ConfigTreeChange]) -> Result<Self, ConfigTreeError> {
@@ -253,7 +286,7 @@ impl ConfigTreeSnapshot {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConfigTreeChange {
     Create {
@@ -288,7 +321,7 @@ impl ConfigTreeChange {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 pub struct ToolchainContract {
     pub contract_version: u32,
     pub decodal_version: String,
@@ -329,21 +362,22 @@ impl ToolchainContract {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 pub struct ConfigSpan {
     pub start_byte: u32,
     pub end_byte: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 pub struct ConfigDiagnosticLabel {
     pub span: ConfigSpan,
     pub message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 pub struct ConfigDiagnostic {
     pub path: VirtualPath,
+    #[ts(type = "number")]
     pub revision: u64,
     pub tree_digest: String,
     pub kind: String,
@@ -353,14 +387,16 @@ pub struct ConfigDiagnostic {
     pub notes: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct EvaluatedProjection {
     pub entrypoint: VirtualPath,
+    #[ts(type = "unknown")]
     pub data_json: serde_json::Value,
     pub projection_digest: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 pub struct EvaluationResult {
     pub projections: Vec<EvaluatedProjection>,
     pub projection_digest: String,
@@ -779,6 +815,30 @@ pub enum ConfigTreeError {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use ts_rs::TS;
+
+    #[test]
+    fn exports_typescript_contract() {
+        let output = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../web/workspace/src/lib/workspace/config-source/generated/types");
+        std::fs::create_dir_all(&output).unwrap();
+        macro_rules! export {
+            ($type:ty) => {
+                <$type>::export_all(&ts_rs::Config::default().with_out_dir(&output)).unwrap();
+            };
+        }
+        export!(VirtualPath);
+        export!(ConfigContentType);
+        export!(ConfigEntry);
+        export!(ConfigTreeSnapshot);
+        export!(ConfigTreeChange);
+        export!(ToolchainContract);
+        export!(ConfigSpan);
+        export!(ConfigDiagnosticLabel);
+        export!(ConfigDiagnostic);
+        export!(EvaluatedProjection);
+        export!(EvaluationResult);
+    }
 
     fn path(value: &str) -> VirtualPath {
         VirtualPath::parse(value).unwrap()

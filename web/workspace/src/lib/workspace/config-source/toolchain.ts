@@ -4,6 +4,7 @@ import type { ConfigSourceWorkerRequest, ConfigSourceWorkerResponse } from "./to
 type Command =
   | Omit<Extract<ConfigSourceWorkerRequest, { kind: "set_snapshot" }>, "id">
   | Omit<Extract<ConfigSourceWorkerRequest, { kind: "apply_changes" }>, "id">
+  | Omit<Extract<ConfigSourceWorkerRequest, { kind: "changes_between" }>, "id">
   | Omit<Extract<ConfigSourceWorkerRequest, { kind: "analyze" }>, "id">
   | Omit<Extract<ConfigSourceWorkerRequest, { kind: "evaluate" }>, "id">
   | Omit<Extract<ConfigSourceWorkerRequest, { kind: "complete" }>, "id">
@@ -31,14 +32,17 @@ export class ConfigSourceToolchain {
   applyChanges(changes: ConfigTreeChange[]): Promise<ConfigTreeSnapshot> {
     return this.#request({ kind: "apply_changes", changes });
   }
+  changesBetween(base: ConfigTreeSnapshot, candidate: ConfigTreeSnapshot): Promise<ConfigTreeChange[]> {
+    return this.#request({ kind: "changes_between", base, candidate });
+  }
   analyze(path: string, source?: string): Promise<ConfigDiagnostic[]> {
     return this.#request({ kind: "analyze", path, source });
   }
   evaluate(contract: ToolchainContract) {
     return this.#request({ kind: "evaluate", contract });
   }
-  complete(path: string, source: string, utf8ByteOffset: number, explicit = false): Promise<import("@codemirror/autocomplete").CompletionResult | null> {
-    return this.#request({ kind: "complete", path, source, utf8ByteOffset, explicit });
+  complete(path: string, source: string, utf16Offset: number, explicit = false): Promise<import("@codemirror/autocomplete").CompletionResult | null> {
+    return this.#request({ kind: "complete", path, source, utf16Offset, explicit });
   }
   format(source: string): Promise<string> {
     return this.#request({ kind: "format", source });

@@ -31,18 +31,31 @@ export function apply_changes(changes) {
 }
 
 /**
+ * @param {any} base
+ * @param {any} candidate
+ * @returns {any}
+ */
+export function changes_between(base, candidate) {
+    const ret = wasm.changes_between(base, candidate);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+/**
  * @param {string} entrypoint
  * @param {string} source
- * @param {number} utf8_byte_offset
+ * @param {number} utf16_offset
  * @param {boolean} explicit
  * @returns {any}
  */
-export function complete_current(entrypoint, source, utf8_byte_offset, explicit) {
+export function complete_current(entrypoint, source, utf16_offset, explicit) {
     const ptr0 = passStringToWasm0(entrypoint, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passStringToWasm0(source, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len1 = WASM_VECTOR_LEN;
-    const ret = wasm.complete_current(ptr0, len0, ptr1, len1, utf8_byte_offset, explicit);
+    const ret = wasm.complete_current(ptr0, len0, ptr1, len1, utf16_offset, explicit);
     if (ret[2]) {
         throw takeFromExternrefTable0(ret[1]);
     }

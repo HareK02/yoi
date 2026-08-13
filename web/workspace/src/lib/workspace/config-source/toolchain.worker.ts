@@ -1,6 +1,7 @@
 import init, {
   analyze_snapshot,
   apply_changes,
+  changes_between,
   complete_current,
   evaluate_current,
   format_source,
@@ -11,9 +12,10 @@ import type { ConfigTreeChange } from "./types.ts";
 export type ConfigSourceWorkerRequest =
   | { id: number; kind: "set_snapshot"; snapshot: unknown }
   | { id: number; kind: "apply_changes"; changes: ConfigTreeChange[] }
+  | { id: number; kind: "changes_between"; base: unknown; candidate: unknown }
   | { id: number; kind: "analyze"; path: string; source?: string }
   | { id: number; kind: "evaluate"; contract: unknown }
-  | { id: number; kind: "complete"; path: string; source: string; utf8ByteOffset: number; explicit: boolean }
+  | { id: number; kind: "complete"; path: string; source: string; utf16Offset: number; explicit: boolean }
   | { id: number; kind: "format"; source: string };
 
 export type ConfigSourceWorkerResponse =
@@ -38,6 +40,9 @@ self.onmessage = async (event: MessageEvent<ConfigSourceWorkerRequest>): Promise
         snapshot = apply_changes(request.changes);
         result = snapshot;
         break;
+      case "changes_between":
+        result = changes_between(request.base, request.candidate);
+        break;
       case "analyze":
         if (!snapshot) throw new Error("config source snapshot is not initialized");
         result = analyze_snapshot(snapshot, request.path, request.source);
@@ -46,7 +51,7 @@ self.onmessage = async (event: MessageEvent<ConfigSourceWorkerRequest>): Promise
         result = evaluate_current(request.contract);
         break;
       case "complete":
-        result = complete_current(request.path, request.source, request.utf8ByteOffset, request.explicit);
+        result = complete_current(request.path, request.source, request.utf16Offset, request.explicit);
         break;
       case "format":
         result = format_source(request.source);
