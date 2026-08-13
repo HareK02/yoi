@@ -101,7 +101,8 @@ struct WorkerSpawnInput {
     runtime_id: String,
     working_directory_id: String,
     profile: String,
-    /// Optional queued Ticket to assign atomically to the new Coder Worker.
+    /// Optional inprogress Ticket already accepted by the Orchestrator. Set
+    /// this with one Flow segment to assign the new Coder atomically.
     #[serde(default)]
     ticket_id: Option<String>,
     #[serde(default)]
@@ -203,7 +204,7 @@ impl WorkerOperation {
                 "List Backend/Runtime Worker sessions in the current Workspace. SubWorkers are excluded."
             }
             Self::Spawn => {
-                "Spawn a Backend/Runtime Worker session in an existing Workspace Workdir. The Workdir id is authority; filesystem paths and Runtime URLs are not accepted. `initial_submit` carries the normal typed user submission. Set `ticket_id` with a Flow segment in `initial_submit` to atomically assign a queued Ticket to the new Coder Worker; the operation id is derived from the durable tool call rather than model input."
+                "Spawn a Backend/Runtime Worker session in an existing Workspace Workdir. The Workdir id is authority; filesystem paths and Runtime URLs are not accepted. `initial_submit` carries the normal typed user submission. After the Orchestrator has committed a Ticket to `inprogress`, set `ticket_id` with a Flow segment in `initial_submit` to atomically assign the new Coder Worker; the operation id is derived from the durable tool call rather than model input."
             }
             Self::Stop => "Stop a Backend/Runtime Worker session in the current Workspace.",
             Self::Restore => {

@@ -1574,6 +1574,9 @@ mod tests {
         let prompt = include_str!("../../../resources/prompts/role/orchestrator.md");
 
         assert!(prompt.contains("assigned Coder owns its review/fix loop"));
+        assert!(prompt.contains("spawn the implementation Coder with `WorkerSpawn.ticket_id`"));
+        assert!(prompt.contains("verify its current assignment names that Coder"));
+        assert!(prompt.contains("never route implementation to an unassigned Coder"));
         assert!(prompt.contains(
             "Do not spawn, restore, assign, or route work to Backend/Runtime Reviewer Workers"
         ));

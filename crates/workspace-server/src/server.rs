@@ -2725,6 +2725,130 @@ async fn scoped_clear_ticket_worker_assignment(
     }))
 }
 
+fn validate_ticket_assignment_state(
+    api: &WorkspaceApi,
+    assignment: &WorkerTicketAssignmentRequest,
+) -> Result<()> {
+    let ticket = api.authority.ticket(&assignment.ticket_id)?;
+    if ticket.state != TicketWorkflowState::InProgress.as_str() {
+        return Err(Error::TicketAssignmentConflict(format!(
+            "Ticket {} must be inprogress before assigning an implementation Coder; current state is {}",
+            ticket.id, ticket.state
+        )));
+    }
+    Ok(())
+}
+
+fn validate_ticket_assignment_spawn(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+    request: &WorkerSpawnRequest,
+) -> Result<()> {
+    let Some(assignment) = request.ticket_assignment.as_ref() else {
+        return Ok(());
+    };
+
+    match &request.intent {
+        WorkerSpawnIntent::TicketRole {
+            ticket_id,
+            role: TicketWorkerRole::Coder,
+        } if ticket_id == &assignment.ticket_id => {}
+        WorkerSpawnIntent::TicketRole {
+            ticket_id,
+            role: TicketWorkerRole::Coder,
+        } => {
+            return Err(Error::TicketAssignmentConflict(format!(
+                "spawn intent Ticket {ticket_id} does not match assignment Ticket {}",
+                assignment.ticket_id
+            )));
+        }
+        _ => {
+            return Err(Error::TicketAssignmentConflict(
+                "ticket_assignment is accepted only for a Ticket-role Coder spawn".to_string(),
+            ));
+        }
+    }
+    if !request
+        .initial_submit
+        .iter()
+        .any(|segment| matches!(segment, Segment::Flow { .. }))
+    {
+        return Err(Error::TicketAssignmentConflict(
+            "Ticket-assigned Coder spawn requires one Flow segment in initial_submit".to_string(),
+        ));
+    }
+    validate_ticket_assignment_state(api, assignment)?;
+
+    if let Some(current) = api
+        .store
+        .get_current_ticket_worker_assignment(&api.config.workspace_id, &assignment.ticket_id)?
+    {
+        let replay_matches = api
+            .store
+            .get_ticket_assignment_operation(&api.config.workspace_id, &assignment.operation_id)?
+            .is_some_and(|operation| {
+                operation.action == "assign"
+                    && operation.ticket_id == assignment.ticket_id
+                    && operation.runtime_id.as_deref() == Some(runtime_id)
+                    && operation.assignment_id.as_deref() == Some(current.assignment_id.as_str())
+                    && operation.worker.as_ref() == Some(&current.worker)
+            });
+        if !replay_matches {
+            return Err(Error::TicketAssignmentConflict(format!(
+                "Ticket {} is already assigned; use the explicit reassign operation",
+                assignment.ticket_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn optional_worker_mutation_source(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    headers: &HeaderMap,
+) -> Result<Option<WorkerMutationSource>> {
+    let has_runtime = headers.contains_key("x-yoi-runtime-id");
+    let has_worker = headers.contains_key("x-yoi-worker-id");
+    if !has_runtime && !has_worker {
+        return Ok(None);
+    }
+    authenticate_worker_mutation_source(api, workspace_id, headers).map(Some)
+}
+
+fn reject_orchestrator_generic_flow_spawn(
+    api: &WorkspaceApi,
+    source: Option<&WorkerMutationSource>,
+    initial_submit: &[Segment],
+    has_ticket_assignment: bool,
+) -> Result<()> {
+    let is_current_orchestrator = source.is_some_and(|source| {
+        find_workspace_orchestrator(api).is_some_and(|orchestrator| orchestrator.worker == *source)
+    });
+    reject_orchestrator_generic_flow_spawn_for_source(
+        is_current_orchestrator,
+        initial_submit,
+        has_ticket_assignment,
+    )
+}
+
+fn reject_orchestrator_generic_flow_spawn_for_source(
+    is_current_orchestrator: bool,
+    initial_submit: &[Segment],
+    has_ticket_assignment: bool,
+) -> Result<()> {
+    let has_flow = initial_submit
+        .iter()
+        .any(|segment| matches!(segment, Segment::Flow { .. }));
+    if is_current_orchestrator && has_flow && !has_ticket_assignment {
+        return Err(Error::TicketAssignmentConflict(
+            "Workspace Orchestrator Flow spawn requires typed Ticket assignment; Ticket identity in initial text is not assignment authority"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn assign_ticket_worker_from_lifecycle(
     api: &WorkspaceApi,
     assignment: &crate::hosts::WorkerTicketAssignmentRequest,
@@ -2732,12 +2856,35 @@ fn assign_ticket_worker_from_lifecycle(
     worker_id: &str,
 ) -> Result<TicketWorkerAssignmentRecord> {
     let ticket = api.authority.ticket(&assignment.ticket_id)?;
+    let worker = RuntimeWorkerRef::new(runtime_id, worker_id);
+    if let Some(operation) = api
+        .store
+        .get_ticket_assignment_operation(&api.config.workspace_id, &assignment.operation_id)?
+        && let Some(assignment_id) = operation.assignment_id.as_ref()
+    {
+        if operation.action == "assign"
+            && operation.ticket_id == assignment.ticket_id
+            && operation.worker.as_ref() == Some(&worker)
+            && let Some(current) = api.store.get_current_ticket_worker_assignment(
+                &api.config.workspace_id,
+                &assignment.ticket_id,
+            )?
+            && current.assignment_id == *assignment_id
+            && current.worker == worker
+        {
+            return Ok(current);
+        }
+        return Err(Error::TicketAssignmentConflict(format!(
+            "assignment operation {} is already bound to another assignment",
+            assignment.operation_id
+        )));
+    }
     let assigned_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let record = TicketWorkerAssignmentRecord {
         workspace_id: api.config.workspace_id.clone(),
         ticket_id: ticket.id,
         assignment_id: new_id("tasg"),
-        worker: RuntimeWorkerRef::new(runtime_id, worker_id),
+        worker,
         assigned_by: "worker-lifecycle".to_string(),
         assigned_at,
     };
@@ -5612,10 +5759,11 @@ fn workspace_orchestrator_is_online(worker: &WorkerSummary) -> bool {
 async fn scoped_create_workspace_worker(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    headers: HeaderMap,
     Json(request): Json<CreateWorkspaceWorkerRequest>,
 ) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    create_workspace_worker(State(api), Json(request)).await
+    create_workspace_worker(State(api), headers, Json(request)).await
 }
 
 async fn scoped_get_worker_launch_options(
@@ -7946,16 +8094,28 @@ fn browser_worker_spawn_policy(
                 }),
             ))
         }
-        None => Ok((
-            WorkerSpawnIntent::WorkspaceCoding,
-            WorkerSpawnAcceptanceRequirement::RunAccepted { expected_segments },
-            None,
-        )),
+        None => {
+            if initial_submit
+                .iter()
+                .any(|segment| matches!(segment, Segment::Flow { .. }))
+            {
+                return Err(Error::InvalidInput(
+                    "Workspace Worker Flow spawn requires ticket_assignment; use a typed Ticket-assigned Coder spawn"
+                        .to_string(),
+                ));
+            }
+            Ok((
+                WorkerSpawnIntent::WorkspaceCoding,
+                WorkerSpawnAcceptanceRequirement::RunAccepted { expected_segments },
+                None,
+            ))
+        }
     }
 }
 
 async fn create_workspace_worker(
     State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
     Json(request): Json<CreateWorkspaceWorkerRequest>,
 ) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
     let CreateWorkspaceWorkerRequest {
@@ -8013,6 +8173,13 @@ async fn create_workspace_worker(
         return Err(Error::ReservedWorkerName(display_name).into());
     }
     validate_worker_initial_submit(&initial_submit)?;
+    let source = optional_worker_mutation_source(&api, &api.config.workspace_id, &headers)?;
+    reject_orchestrator_generic_flow_spawn(
+        &api,
+        source.as_ref(),
+        &initial_submit,
+        ticket_assignment.is_some(),
+    )?;
     let selected_working_directory_id = working_directory
         .as_ref()
         .map(|selection| selection.working_directory_id.clone());
@@ -8026,30 +8193,76 @@ async fn create_workspace_worker(
     }
     let (intent, acceptance, ticket_assignment) =
         browser_worker_spawn_policy(ticket_assignment, &initial_submit)?;
-    let result = api.spawn_workspace_worker(
-        &runtime_id,
-        WorkerSpawnRequest {
-            requested_worker_name: Some(display_name.clone()),
-            intent,
-            acceptance,
-            profile: profile_selector,
-            ticket_assignment,
-            initial_submit,
-            working_directory_request: None,
-            resolved_working_directory_request: None,
-            resolved_working_directory,
-            resolved_config_bundle,
-            resolved_worker_observation_enabled: false,
-            resolved_worker_observation_grants: Vec::new(),
-            resolved_workspace_api: None,
-        },
-    )?;
+    let request = WorkerSpawnRequest {
+        requested_worker_name: Some(display_name.clone()),
+        intent,
+        acceptance,
+        profile: profile_selector,
+        ticket_assignment,
+        initial_submit,
+        working_directory_request: None,
+        resolved_working_directory_request: None,
+        resolved_working_directory,
+        resolved_config_bundle,
+        resolved_worker_observation_enabled: false,
+        resolved_worker_observation_grants: Vec::new(),
+        resolved_workspace_api: None,
+    };
+    validate_ticket_assignment_spawn(&api, &runtime_id, &request)?;
+    let assignment = request.ticket_assignment.clone();
+    let assignment_fingerprint = crate::hosts::worker_spawn_idempotency(&request)
+        .map_err(Error::Config)?
+        .map(|(_, fingerprint)| fingerprint);
+    if let (Some(assignment), Some(fingerprint)) =
+        (assignment.as_ref(), assignment_fingerprint.as_deref())
+    {
+        api.store.reserve_ticket_assignment_operation(
+            &api.config.workspace_id,
+            &assignment.operation_id,
+            &assignment.ticket_id,
+            &runtime_id,
+            None,
+            fingerprint,
+            &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        )?;
+        let operation = api
+            .store
+            .get_ticket_assignment_operation(&api.config.workspace_id, &assignment.operation_id)?
+            .ok_or_else(|| {
+                Error::TicketAssignmentConflict(format!(
+                    "assignment operation {} disappeared after reservation",
+                    assignment.operation_id
+                ))
+            })?;
+        if let Some(worker) = existing_lifecycle_assignment_worker(&api, assignment, &runtime_id)? {
+            return Ok(Json(browser_worker_response_from_summary(
+                &api,
+                worker,
+                display_name,
+                selected_working_directory_id.as_deref(),
+                Vec::new(),
+                Some(assignment),
+            )?));
+        }
+        if operation.assignment_id.is_some() {
+            return Err(Error::TicketAssignmentConflict(format!(
+                "completed operation {} has no recoverable Worker",
+                assignment.operation_id
+            ))
+            .into());
+        }
+    }
+    let result = match api.spawn_workspace_worker(&runtime_id, request) {
+        Ok(result) => result,
+        Err(error) => return Err(error.into()),
+    };
     Ok(Json(record_browser_worker_spawn(
         &api,
         runtime_id,
         display_name,
         selected_working_directory_id,
         result,
+        assignment.as_ref(),
     )?))
 }
 
@@ -8059,6 +8272,7 @@ fn record_browser_worker_spawn(
     display_name: String,
     selected_working_directory_id: Option<String>,
     result: WorkerSpawnResult,
+    assignment: Option<&WorkerTicketAssignmentRequest>,
 ) -> ApiResult<BrowserCreateWorkerResponse> {
     if result.state != WorkerOperationState::Accepted {
         return Err(worker_create_not_accepted_error(
@@ -8071,13 +8285,73 @@ fn record_browser_worker_spawn(
         code: "workspace_worker_create_missing_summary".to_string(),
         message: "Runtime completed worker creation without returning a Worker summary".to_string(),
     })?;
-    let worker_record = record_worker_summary(
+    browser_worker_response_from_summary(
+        api,
+        worker,
+        display_name,
+        selected_working_directory_id.as_deref(),
+        result.diagnostics,
+        assignment,
+    )
+}
+
+fn browser_worker_response_from_summary(
+    api: &WorkspaceApi,
+    worker: WorkerSummary,
+    display_name: String,
+    selected_working_directory_id: Option<&str>,
+    diagnostics: Vec<RuntimeDiagnostic>,
+    assignment: Option<&WorkerTicketAssignmentRequest>,
+) -> ApiResult<BrowserCreateWorkerResponse> {
+    let worker_record = match record_worker_summary(
         api,
         &worker,
         display_name.as_str(),
         worker.profile.clone(),
         WorkerRegistryDisplayNamePolicy::UseProvided,
-    )?;
+    ) {
+        Ok(record) => record,
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(assignment) = assignment {
+        if let Err(error) = api.store.bind_ticket_assignment_operation_worker(
+            &api.config.workspace_id,
+            &assignment.operation_id,
+            &worker.worker.worker_id,
+        ) {
+            let context = WorkerSpawnCompensationContext {
+                assignment: Some(assignment),
+                prepared_workdir_id: selected_working_directory_id,
+                cleanup_spawned_workdir: false,
+            };
+            return finalize_worker_spawn_stage(
+                api,
+                &worker,
+                &context,
+                WorkerSpawnFinalizeStage::TicketAssignmentBind,
+                Err(error.into()),
+            );
+        }
+        if let Err(error) = assign_ticket_worker_from_lifecycle(
+            api,
+            assignment,
+            &worker.worker.runtime_id,
+            &worker.worker.worker_id,
+        ) {
+            let context = WorkerSpawnCompensationContext {
+                assignment: Some(assignment),
+                prepared_workdir_id: selected_working_directory_id,
+                cleanup_spawned_workdir: false,
+            };
+            return finalize_worker_spawn_stage(
+                api,
+                &worker,
+                &context,
+                WorkerSpawnFinalizeStage::TicketAssignmentBind,
+                Err(error.into()),
+            );
+        }
+    }
     if let Some(working_directory) = worker.working_directory.as_ref() {
         let workdir_record =
             workdir_record_from_summary(api, worker.worker.runtime_id.as_str(), working_directory);
@@ -8089,7 +8363,7 @@ fn record_browser_worker_spawn(
             None,
         )?;
     }
-    if let Some(workdir_id) = selected_working_directory_id.as_deref() {
+    if let Some(workdir_id) = selected_working_directory_id {
         if api
             .store
             .get_workdir_registry(&api.config.workspace_id, workdir_id)?
@@ -8132,7 +8406,7 @@ fn record_browser_worker_spawn(
         worker_ref: RuntimeWorkerRef::new(&runtime_id, &worker_id),
         console_href,
         worker,
-        diagnostics: result.diagnostics,
+        diagnostics,
     })
 }
 
@@ -8644,23 +8918,26 @@ async fn create_runtime_worker(
     AxumPath(runtime_id): AxumPath<String>,
     Json(mut request): Json<WorkerSpawnRequest>,
 ) -> ApiResult<Json<WorkerSpawnResult>> {
-    if let Some(assignment) = request.ticket_assignment.as_ref() {
-        if let Some(worker) = existing_lifecycle_assignment_worker(&api, assignment, &runtime_id)? {
-            assign_ticket_worker_from_lifecycle(
-                &api,
-                assignment,
-                &runtime_id,
-                &worker.worker.worker_id,
-            )?;
-            return Ok(Json(WorkerSpawnResult {
-                state: WorkerOperationState::Accepted,
-                worker: Some(worker),
-                acceptance_evidence: Vec::new(),
-                diagnostics: Vec::new(),
-            }));
-        }
+    validate_worker_initial_submit(&request.initial_submit)?;
+    if let Some(assignment) = request.ticket_assignment.as_ref()
+        && let Some(worker) = existing_lifecycle_assignment_worker(&api, assignment, &runtime_id)?
+    {
+        validate_ticket_assignment_spawn(&api, &runtime_id, &request)?;
+        assign_ticket_worker_from_lifecycle(
+            &api,
+            assignment,
+            &runtime_id,
+            &worker.worker.worker_id,
+        )?;
+        return Ok(Json(WorkerSpawnResult {
+            state: WorkerOperationState::Accepted,
+            worker: Some(worker),
+            acceptance_evidence: Vec::new(),
+            diagnostics: Vec::new(),
+        }));
     }
     let lifecycle_assignment = request.ticket_assignment.clone();
+    validate_ticket_assignment_spawn(&api, &runtime_id, &request)?;
     reject_workdir_for_embedded_runtime(
         &runtime_id,
         request.working_directory_request.is_some() || request.resolved_working_directory.is_some(),
@@ -11570,6 +11847,136 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            browser_worker_spawn_policy(
+                None,
+                &[Segment::Flow {
+                    selector: "builtin:coder-review".to_string(),
+                }],
+            )
+            .is_err()
+        );
+        assert!(
+            reject_orchestrator_generic_flow_spawn_for_source(
+                true,
+                &[Segment::Flow {
+                    selector: "builtin:coder-review".to_string(),
+                }],
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            reject_orchestrator_generic_flow_spawn_for_source(
+                false,
+                &[Segment::Flow {
+                    selector: "builtin:coder-review".to_string(),
+                }],
+                false,
+            )
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn ticket_assignment_spawn_requires_inprogress_before_runtime_side_effects() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let backend = browser_ticket_backend(&api).unwrap();
+        let ticket = backend
+            .create(ticket::NewTicket::new("Planning Ticket"))
+            .unwrap();
+        let request = WorkerSpawnRequest {
+            requested_worker_name: Some("Rejected Coder".to_string()),
+            intent: WorkerSpawnIntent::TicketRole {
+                ticket_id: ticket.id.clone(),
+                role: TicketWorkerRole::Coder,
+            },
+            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                expected_segments: 1,
+            },
+            profile: ProfileSelector::Builtin("builtin:coder".to_string()),
+            ticket_assignment: Some(WorkerTicketAssignmentRequest {
+                ticket_id: ticket.id,
+                operation_id: "planning-spawn".to_string(),
+            }),
+            initial_submit: vec![Segment::Flow {
+                selector: "builtin:coder-review".to_string(),
+            }],
+            working_directory_request: None,
+            resolved_working_directory_request: None,
+            resolved_working_directory: None,
+            resolved_config_bundle: None,
+            resolved_worker_observation_enabled: false,
+            resolved_worker_observation_grants: Vec::new(),
+            resolved_workspace_api: None,
+        };
+
+        assert!(
+            validate_ticket_assignment_spawn(&api, EMBEDDED_WORKER_RUNTIME_ID, &request).is_err()
+        );
+        assert!(
+            api.store
+                .get_ticket_assignment_operation(&api.config.workspace_id, "planning-spawn")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            api.runtime
+                .list_workers_for_runtime(EMBEDDED_WORKER_RUNTIME_ID, 20)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_worker_endpoint_finalizes_ticket_assignment() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let backend = browser_ticket_backend(&api).unwrap();
+        let mut input = ticket::NewTicket::new("Assigned Ticket");
+        input.workflow_state = Some(TicketWorkflowState::InProgress);
+        let ticket = backend.create(input).unwrap();
+        let response = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(CreateWorkspaceWorkerRequest {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                display_name: "Assigned Coder".to_string(),
+                profile: Some("builtin:coder".to_string()),
+                ticket_assignment: Some(CreateWorkspaceWorkerTicketAssignmentRequest {
+                    ticket_id: ticket.id.clone(),
+                    operation_id: "workspace-endpoint-assignment".to_string(),
+                }),
+                initial_submit: vec![Segment::Flow {
+                    selector: "builtin:coder-review".to_string(),
+                }],
+                working_directory: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let current = api
+            .store
+            .get_current_ticket_worker_assignment(&api.config.workspace_id, &ticket.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.worker, response.worker_ref);
+        let operation = api
+            .store
+            .get_ticket_assignment_operation(
+                &api.config.workspace_id,
+                "workspace-endpoint-assignment",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.assignment_id, Some(current.assignment_id));
+        assert_eq!(operation.worker, Some(response.worker_ref));
     }
 
     #[tokio::test]
@@ -11579,6 +11986,7 @@ mod tests {
         let api = test_api(workspace.path()).await;
         let Json(created) = create_workspace_worker(
             State(api.clone()),
+            HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: "Scoped Worker".to_string(),
@@ -11722,6 +12130,7 @@ mod tests {
 
         let Json(generic) = create_workspace_worker(
             State(api.clone()),
+            HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: "Generic Orchestrator Profile Worker".to_string(),
@@ -11737,6 +12146,7 @@ mod tests {
         assert!(find_workspace_orchestrator(&api).is_none());
         let reserved = create_workspace_worker(
             State(api.clone()),
+            HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string(),
@@ -13146,9 +13556,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let api = test_api(dir.path()).await;
         let backend = browser_ticket_backend(&api).unwrap();
-        let first_ticket = backend
-            .create(ticket::NewTicket::new("Spawn assignment"))
-            .unwrap();
+        let mut first_ticket_input = ticket::NewTicket::new("Spawn assignment");
+        first_ticket_input.workflow_state = Some(TicketWorkflowState::InProgress);
+        let first_ticket = backend.create(first_ticket_input).unwrap();
         let request = WorkerSpawnRequest {
             requested_worker_name: Some("assigned-spawn".to_string()),
             intent: WorkerSpawnIntent::TicketRole {
@@ -13156,14 +13566,16 @@ mod tests {
                 role: TicketWorkerRole::Coder,
             },
             acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                expected_segments: 0,
+                expected_segments: 1,
             },
             profile: ProfileSelector::Builtin("builtin:coder".to_string()),
             ticket_assignment: Some(crate::hosts::WorkerTicketAssignmentRequest {
                 ticket_id: first_ticket.id.clone(),
                 operation_id: "spawn-assignment-operation".to_string(),
             }),
-            initial_submit: Vec::new(),
+            initial_submit: vec![Segment::Flow {
+                selector: "builtin:coder-review".to_string(),
+            }],
             working_directory_request: None,
             resolved_working_directory_request: None,
             resolved_working_directory: None,
@@ -13246,9 +13658,9 @@ mod tests {
                 },
             )
             .unwrap();
-        let second_ticket = backend
-            .create(ticket::NewTicket::new("Restore assignment"))
-            .unwrap();
+        let mut second_ticket_input = ticket::NewTicket::new("Restore assignment");
+        second_ticket_input.workflow_state = Some(TicketWorkflowState::InProgress);
+        let second_ticket = backend.create(second_ticket_input).unwrap();
         let _ = scoped_restore_runtime_worker(
             State(api.clone()),
             AxumPath(ScopedRuntimeWorkerPath {
@@ -13308,6 +13720,10 @@ mod tests {
             )
             .unwrap();
         let mut pending_request = WorkerSpawnRequest {
+            intent: WorkerSpawnIntent::TicketRole {
+                ticket_id: second_ticket.id.clone(),
+                role: TicketWorkerRole::Coder,
+            },
             ticket_assignment: Some(crate::hosts::WorkerTicketAssignmentRequest {
                 ticket_id: second_ticket.id.clone(),
                 operation_id: "pending-spawn-operation".to_string(),
@@ -13375,9 +13791,11 @@ mod tests {
     async fn worker_spawn_finalize_failure_reports_stage_and_compensation_outcomes() {
         let dir = tempfile::tempdir().unwrap();
         let api = test_api(dir.path()).await;
+        let mut ticket_input = ticket::NewTicket::new("Compensation test Ticket");
+        ticket_input.workflow_state = Some(TicketWorkflowState::InProgress);
         let ticket_id = browser_ticket_backend(&api)
             .unwrap()
-            .create(ticket::NewTicket::new("Compensation test Ticket"))
+            .create(ticket_input)
             .unwrap()
             .id;
         let assignment = crate::hosts::WorkerTicketAssignmentRequest {
@@ -13391,11 +13809,13 @@ mod tests {
             },
             requested_worker_name: Some("Compensation test Worker".to_string()),
             acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                expected_segments: 0,
+                expected_segments: 1,
             },
             profile: ProfileSelector::Builtin("builtin:coder".to_string()),
             ticket_assignment: Some(assignment.clone()),
-            initial_submit: Vec::new(),
+            initial_submit: vec![Segment::Flow {
+                selector: "builtin:coder-review".to_string(),
+            }],
             working_directory_request: None,
             resolved_working_directory_request: None,
             resolved_working_directory: None,
