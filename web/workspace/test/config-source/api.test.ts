@@ -6,7 +6,7 @@ import {
   fetchConfigEntry,
   fetchConfigTree,
   previewConfigTree,
-} from "./api.ts";
+} from "../../src/lib/workspace/config-source/api.ts";
 
 function response(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {

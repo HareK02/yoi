@@ -1,7 +1,7 @@
 use config_source::{
     ConfigTreeSnapshot, EvaluationResult, SnapshotEnvironment, ToolchainContract, VirtualPath,
 };
-use serde_wasm_bindgen::{from_value, to_value};
+use serde_wasm_bindgen::{Serializer, from_value};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -12,7 +12,7 @@ pub fn evaluate_snapshot(snapshot: JsValue, contract: JsValue) -> Result<JsValue
         SnapshotEnvironment::new(snapshot)
             .evaluate_contract(&contract)
             .map_err(|diagnostics| {
-                to_value(&diagnostics).unwrap_or_else(|_| JsValue::from_str("evaluation failed"))
+                encode(&diagnostics).unwrap_or_else(|_| JsValue::from_str("evaluation failed"))
             })?,
     )
 }
@@ -40,7 +40,9 @@ fn decode<T: serde::de::DeserializeOwned>(value: JsValue) -> Result<T, JsValue> 
 }
 
 fn encode<T: serde::Serialize>(value: T) -> Result<JsValue, JsValue> {
-    to_value(&value).map_err(|error| JsValue::from_str(&error.to_string()))
+    value
+        .serialize(&Serializer::json_compatible())
+        .map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
 fn js_error(error: impl std::fmt::Display) -> JsValue {
