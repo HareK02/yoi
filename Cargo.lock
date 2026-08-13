@@ -6227,6 +6227,7 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "config-source",
  "flow",
  "futures",
  "manifest",
