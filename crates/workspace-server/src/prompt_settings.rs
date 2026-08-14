@@ -130,8 +130,8 @@ mod tests {
             .unwrap()])
         .unwrap();
         for source in [
-            r#"{ prompts = { common = { language = "{% include target %}"; }; }; }"#,
-            r#"{ prompts = { common = { language = "{% include \"missing\" %}"; }; }; }"#,
+            r#"{ prompts = { common = { language = "{%- include target -%}"; }; }; }"#,
+            r#"{ prompts = { common = { language = "{%- include \"missing\" -%}"; }; }; }"#,
             r#"{ prompts = { common = { language = "{% include \"common.workspace\" %}"; workspace = "{% include \"common.language\" %}"; }; }; }"#,
         ] {
             let snapshot = ConfigTreeSnapshot::from_entries(

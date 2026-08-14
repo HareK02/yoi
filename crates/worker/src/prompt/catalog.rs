@@ -230,6 +230,14 @@ impl PromptCatalog {
         self.projection.templates.contains_key(key)
     }
 
+    pub fn render_serializable<T: Serialize + ?Sized>(
+        &self,
+        key: &str,
+        context: &T,
+    ) -> Result<String, CatalogError> {
+        self.render_name(key, Value::from_serialize(context))
+    }
+
     pub fn render_name(&self, key: &str, ctx: Value) -> Result<String, CatalogError> {
         let template = self
             .env
@@ -538,7 +546,7 @@ mod tests {
     #[test]
     fn graph_rejects_dynamic_legacy_missing_and_cycles() {
         let invalid = BTreeMap::from([
-            ("a".into(), "{% include target %}".into()),
+            ("a".into(), "{%- include target -%}".into()),
             ("target".into(), "ok".into()),
         ]);
         assert!(validate_prompt_templates(&invalid).is_err());
@@ -546,7 +554,7 @@ mod tests {
         let legacy = BTreeMap::from([("a".into(), "{% include \"legacy/default\" %}".into())]);
         assert!(validate_prompt_templates(&legacy).is_err());
 
-        let missing = BTreeMap::from([("a".into(), "{% include \"missing\" %}".into())]);
+        let missing = BTreeMap::from([("a".into(), "{%- include \"missing\" -%}".into())]);
         assert!(validate_prompt_templates(&missing).is_err());
 
         let cycle = BTreeMap::from([

@@ -240,10 +240,7 @@ impl ServerConfig {
 }
 
 const ORCHESTRATOR_ATTENTION_TICKET_LIMIT: usize = 20;
-const ORCHESTRATOR_ATTENTION_PROMPT: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../resources/prompts/internal/workspace_orchestrator_queue_attention.md"
-));
+const ORCHESTRATOR_ATTENTION_PROMPT_NAME: &str = "internal.workspace_orchestrator_queue_attention";
 
 #[derive(Clone)]
 pub struct WorkspaceApi {
@@ -4811,10 +4808,31 @@ fn dispatch_orchestrator_queue_attention(api: &WorkspaceApi) {
     } else {
         format!("Additional queued Tickets omitted from this notice: {omitted}\n")
     };
-    let content = ORCHESTRATOR_ATTENTION_PROMPT
-        .replace("{{omitted_line}}", &omitted_line)
-        .replace("{{workspace_id}}", &api.config.workspace_id)
-        .replace("{{ticket_lines}}", &shown);
+    let Ok(Some(config_state)) = api
+        .config_store
+        .load_workspace_config(&api.config.workspace_id)
+    else {
+        return;
+    };
+    let Ok(projection) =
+        crate::prompt_settings::project_prompts_from_workspace_config(&config_state)
+    else {
+        return;
+    };
+    let Ok(catalog) = worker::PromptCatalog::from_projection(projection) else {
+        return;
+    };
+    let content = match catalog.render_serializable(
+        ORCHESTRATOR_ATTENTION_PROMPT_NAME,
+        &BTreeMap::from([
+            ("omitted_line", omitted_line.as_str()),
+            ("workspace_id", api.config.workspace_id.as_str()),
+            ("ticket_lines", shown.as_str()),
+        ]),
+    ) {
+        Ok(content) => content,
+        Err(_) => return,
+    };
     let accepted = api
         .runtime
         .send_input(

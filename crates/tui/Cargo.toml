@@ -25,7 +25,7 @@ session-store = { workspace = true }
 fs4 = { workspace = true }
 ticket = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-minijinja = "2.19.0"
+worker = { path = "../worker" }
 pulldown-cmark = { version = "0.13.3", default-features = false }
 llm-engine.workspace = true
 

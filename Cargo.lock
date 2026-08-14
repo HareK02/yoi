@@ -4795,7 +4795,6 @@ dependencies = [
  "fs4",
  "llm-engine",
  "manifest",
- "minijinja",
  "protocol",
  "pulldown-cmark",
  "ratatui",
@@ -4809,6 +4808,7 @@ dependencies = [
  "toml",
  "unicode-width",
  "uuid",
+ "worker",
 ]
 
 [[package]]

@@ -1372,6 +1372,8 @@ fn parse_static_template_includes(template: &str, source: &str) -> Result<Vec<St
             break;
         };
         let body = after_open[..close].trim();
+        let body = body.strip_prefix('-').unwrap_or(body).trim_start();
+        let body = body.strip_suffix('-').unwrap_or(body).trim_end();
         if body.starts_with("include") {
             let argument = body["include".len()..].trim();
             let bytes = argument.as_bytes();

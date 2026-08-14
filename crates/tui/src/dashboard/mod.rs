@@ -69,8 +69,7 @@ use render::{PanelListRow, row_hit_boxes};
 
 const MAX_ENTRIES: usize = 50;
 const CLOSED_VISIBLE_ROWS: usize = 3;
-const ORCHESTRATOR_IDLE_QUEUE_NOTICE_TEMPLATE: &str =
-    include_str!("../../../../resources/prompts/panel/orchestrator_idle_queue_notice.md");
+const ORCHESTRATOR_IDLE_QUEUE_NOTICE_PROMPT: &str = "panel.orchestrator_idle_queue_notice";
 const ORCHESTRATOR_QUEUE_ATTENTION_MAX_TICKETS: usize = 6;
 const ORCHESTRATOR_QUEUE_ATTENTION_MAX_TEXT_CHARS: usize = 120;
 const ORCHESTRATOR_QUEUE_ATTENTION_MAX_MESSAGE_CHARS: usize = 2_400;
@@ -3791,15 +3790,9 @@ fn orchestrator_queue_template_ticket(
 
 fn render_orchestrator_queue_attention_template(
     context: &OrchestratorQueueTemplateContext,
-) -> Result<String, minijinja::Error> {
-    let mut env = minijinja::Environment::new();
-    env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
-    env.add_template(
-        "orchestrator_idle_queue_notice",
-        ORCHESTRATOR_IDLE_QUEUE_NOTICE_TEMPLATE,
-    )?;
-    env.get_template("orchestrator_idle_queue_notice")?
-        .render(context)
+) -> Result<String, worker::CatalogError> {
+    worker::PromptCatalog::builtins_only()?
+        .render_serializable(ORCHESTRATOR_IDLE_QUEUE_NOTICE_PROMPT, context)
 }
 
 fn orchestrator_work_set_detail(
