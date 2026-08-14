@@ -751,14 +751,15 @@ impl WorkspaceApi {
         let config_store = Arc::new(crate::SqliteWorkspaceStore::open(
             config.database_path.clone(),
         )?);
-        config_store.ensure_workspace_config_materialized(
-            &config.workspace_id,
-            &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-        )?;
         let config_schema_registry = crate::config_source::WorkspaceConfigSchemaRegistry::default()
             .with_provider(Arc::new(
                 crate::profile_settings::ProfileConfigSchemaProvider,
             ));
+        config_store.ensure_workspace_config_materialized_with_schema(
+            &config.workspace_id,
+            &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            config_schema_registry.compose()?,
+        )?;
         let api = Self {
             config_store,
             config_schema_registry,
@@ -17291,7 +17292,7 @@ mod tests {
         let path = format!("/api/w/{TEST_WORKSPACE_ID}/settings/profiles");
         let settings = get_json(app.clone(), &path).await;
         assert_eq!(settings["default_profile"], "builtin:companion");
-        assert_eq!(settings["config_revision"], 0);
+        assert_eq!(settings["config_revision"], 1);
         assert!(settings["tree_digest"].as_str().is_some());
         assert!(settings["projection_digest"].as_str().is_some());
         assert!(

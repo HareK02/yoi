@@ -80,10 +80,6 @@ fn main_config_contract_with_schema(
     )
 }
 
-fn main_config_contract() -> ToolchainContract {
-    main_config_contract_with_schema(WorkspaceConfigSchemaBundle::empty())
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[ts(export)]
 pub struct WorkspaceConfigState {
@@ -122,12 +118,14 @@ pub struct ConfigPreviewRequest {
 }
 
 impl SqliteWorkspaceStore {
-    pub fn ensure_workspace_config_materialized(
+    pub fn ensure_workspace_config_materialized_with_schema(
         &self,
         workspace_id: &str,
         materialized_at: &str,
+        schema_bundle: WorkspaceConfigSchemaBundle,
     ) -> Result<WorkspaceConfigState> {
-        self.with_conn_mut(|conn| {
+        let desired_schema = schema_bundle.clone();
+        let state = self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let workspace_exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM workspaces WHERE workspace_id = ?1)",
@@ -140,14 +138,21 @@ impl SqliteWorkspaceStore {
             let state = match load_state(&tx, workspace_id)? {
                 Some(state) => state,
                 None => {
-                    let state = initial_state()?;
+                    let state = initial_state_with_schema(schema_bundle.clone())?;
                     insert_materialized_state(&tx, workspace_id, &state, materialized_at)?;
                     state
                 }
             };
             tx.commit()?;
             Ok(state)
-        })
+        })?;
+        if state.contract.schema_bundle.contributions.is_empty()
+            && !desired_schema.contributions.is_empty()
+        {
+            let candidate = evaluate_candidate(state, &[], desired_schema)?;
+            return self.commit_evaluated_workspace_config(workspace_id, &candidate);
+        }
+        Ok(state)
     }
 
     pub fn load_workspace_config(
@@ -526,6 +531,12 @@ pub(crate) fn load_state(
 }
 
 pub(crate) fn initial_state() -> Result<WorkspaceConfigState> {
+    initial_state_with_schema(WorkspaceConfigSchemaBundle::empty())
+}
+
+pub(crate) fn initial_state_with_schema(
+    schema_bundle: WorkspaceConfigSchemaBundle,
+) -> Result<WorkspaceConfigState> {
     let path = main_config_path();
     let snapshot = ConfigTreeSnapshot::empty()
         .apply(&[ConfigTreeChange::Create {
@@ -534,7 +545,7 @@ pub(crate) fn initial_state() -> Result<WorkspaceConfigState> {
             content: DEFAULT_MAIN_CONFIG_SOURCE.to_string(),
         }])
         .map_err(config_error)?;
-    let contract = main_config_contract();
+    let contract = main_config_contract_with_schema(schema_bundle);
     let projection_digest = SnapshotEnvironment::new(snapshot.clone())
         .evaluate_contract(&contract)
         .map_err(|diagnostics| {
@@ -933,6 +944,36 @@ mod tests {
         .unwrap();
         let error = evaluate_workspace_config_state(&state, changed_bundle).unwrap_err();
         assert!(error.to_string().contains("schema fingerprint"));
+    }
+
+    #[tokio::test]
+    async fn initial_materialization_persists_composed_schema_contract() {
+        let store = open_store().await;
+        let schema_bundle = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+            "builtin:test",
+            "test",
+            "1",
+            r#"{ test = { value = String default "initial"; }; }"#,
+        )
+        .unwrap()])
+        .unwrap();
+        let expected = initial_state_with_schema(schema_bundle.clone()).unwrap();
+        let state = store
+            .ensure_workspace_config_materialized_with_schema(
+                "w-config",
+                "2026-08-13T00:00:00Z",
+                schema_bundle,
+            )
+            .unwrap();
+        assert_eq!(state.contract.fingerprint, expected.contract.fingerprint);
+        assert_eq!(
+            state.contract.schema_bundle,
+            expected.contract.schema_bundle
+        );
+        assert_eq!(state.projection_digest, expected.projection_digest);
+        let reloaded = store.load_workspace_config("w-config").unwrap().unwrap();
+        assert_eq!(reloaded.contract, state.contract);
+        assert_eq!(reloaded.projection_digest, state.projection_digest);
     }
 
     #[tokio::test]
