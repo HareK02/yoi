@@ -2,7 +2,6 @@ import type {
   ConfigDiagnostic,
   ConfigTreeChange,
   ConfigTreeSnapshot,
-  ToolchainContract,
   WorkspaceConfigSchemaBundle,
 } from "./types.ts";
 import { jsonWorkerMessage } from "./toolchain-message.ts";
@@ -20,7 +19,6 @@ type Command =
   | Omit<Extract<ConfigSourceWorkerRequest, { kind: "apply_changes" }>, "id">
   | Omit<Extract<ConfigSourceWorkerRequest, { kind: "changes_between" }>, "id">
   | Omit<Extract<ConfigSourceWorkerRequest, { kind: "analyze" }>, "id">
-  | Omit<Extract<ConfigSourceWorkerRequest, { kind: "evaluate" }>, "id">
   | Omit<Extract<ConfigSourceWorkerRequest, { kind: "complete" }>, "id">
   | Omit<Extract<ConfigSourceWorkerRequest, { kind: "format" }>, "id">;
 
@@ -67,9 +65,6 @@ export class ConfigSourceToolchain {
   }
   analyze(path: string, source?: string): Promise<ConfigDiagnostic[]> {
     return this.#request({ kind: "analyze", path, source });
-  }
-  evaluate(contract: ToolchainContract) {
-    return this.#request({ kind: "evaluate", contract });
   }
   async complete(
     path: string,

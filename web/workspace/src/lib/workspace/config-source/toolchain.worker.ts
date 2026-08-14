@@ -3,7 +3,6 @@ import init, {
   apply_changes,
   changes_between,
   complete_current,
-  evaluate_current,
   format_source,
   set_schema_bundle,
   set_snapshot,
@@ -20,7 +19,6 @@ export type ConfigSourceWorkerRequest =
   | { id: number; kind: "apply_changes"; changes: ConfigTreeChange[] }
   | { id: number; kind: "changes_between"; base: unknown; candidate: unknown }
   | { id: number; kind: "analyze"; path: string; source?: string }
-  | { id: number; kind: "evaluate"; contract: unknown }
   | {
     id: number;
     kind: "complete";
@@ -64,9 +62,6 @@ self.onmessage = async (
           throw new Error("config source snapshot is not initialized");
         }
         result = analyze_snapshot(snapshot, request.path, request.source);
-        break;
-      case "evaluate":
-        result = evaluate_current(request.contract);
         break;
       case "complete":
         result = complete_current(

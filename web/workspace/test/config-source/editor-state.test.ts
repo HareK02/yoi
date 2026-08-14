@@ -99,7 +99,7 @@ Deno.test("main entrypoint always enables the fixed schema wrapper", async () =>
   );
 });
 
-Deno.test("preview and commit format every draft Decodal source", async () => {
+Deno.test("commit formats every working Decodal source without a preview roundtrip", async () => {
   const source = await Deno.readTextFile(
     new URL(
       "../../src/lib/workspace/config-source/ConfigSourceEditor.svelte",
@@ -108,7 +108,7 @@ Deno.test("preview and commit format every draft Decodal source", async () => {
   );
 
   assert(
-    source.includes("async function formatDraftSources()") &&
+    source.includes("async function formatWorkingSources()") &&
       source.includes('change.kind === "create" || change.kind === "update"') &&
       source.includes('change.kind === "rename"') &&
       source.includes('entry.content_type !== "decodal"') &&
@@ -116,15 +116,39 @@ Deno.test("preview and commit format every draft Decodal source", async () => {
     "all changed Decodal entries should be formatted rather than only the selected source",
   );
   assert(
-    source.includes("await formatDraftSources();") &&
-      source.includes("await requestCandidatePreview();") &&
+    source.includes("await formatWorkingSources();") &&
+      source.includes("entrypoints: entrypoints()") &&
       source.includes("Committed formatted revision"),
-    "preview and commit should format first and refresh stale preflight before persistence",
+    "commit should format first and send the working changes directly to Backend authority",
   );
   assert(
-    !source.includes(
-      "Preview the complete candidate successfully before Commit.",
+    !source.includes("previewConfigTree") &&
+      !source.includes("requestCandidatePreview") &&
+      !source.includes("toolchain_fingerprint"),
+    "normal commit must not depend on a separate preview or client-echoed toolchain fingerprint",
+  );
+});
+
+Deno.test("config diagnostics analyze continuously with debounce and generation fencing", async () => {
+  const source = await Deno.readTextFile(
+    new URL(
+      "../../src/lib/workspace/config-source/ConfigSourceEditor.svelte",
+      import.meta.url,
     ),
-    "format-driven candidate changes should trigger automatic preflight instead of a dead-end error",
+  );
+
+  assert(
+    source.includes("setTimeout(() =>") &&
+      source.includes("}, 250)") &&
+      source.includes("analyzer.analyze(path, value)") &&
+      source.includes("generation === analysisGeneration") &&
+      source.includes("analysisReady"),
+    "source changes should trigger only the latest debounced analysis after snapshot initialization",
+  );
+  assert(
+    !source.includes("onclick={analyze}") &&
+      !source.includes(">Analyze</button>") &&
+      !source.includes(">Preview</button>"),
+    "manual Analyze and Preview controls should be removed",
   );
 });

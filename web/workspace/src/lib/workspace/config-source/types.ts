@@ -13,6 +13,4 @@ export type { EvaluationResult } from "./generated/types/EvaluationResult.ts";
 export type { ToolchainContract } from "./generated/types/ToolchainContract.ts";
 export type { VirtualPath } from "./generated/types/VirtualPath.ts";
 export type { ConfigCommitRequest } from "./generated/types/ConfigCommitRequest.ts";
-export type { ConfigPreviewRequest } from "./generated/types/ConfigPreviewRequest.ts";
-export type { EvaluatedConfigCandidate } from "./generated/types/EvaluatedConfigCandidate.ts";
 export type { WorkspaceConfigState as WorkspaceConfigTreeResponse } from "./generated/types/WorkspaceConfigState.ts";

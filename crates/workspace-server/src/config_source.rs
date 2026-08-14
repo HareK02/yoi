@@ -108,10 +108,8 @@ pub struct WorkspaceConfigState {
     pub projection_digest: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
-#[ts(export)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvaluatedConfigCandidate {
-    #[ts(type = "number")]
     pub base_revision: u64,
     pub base_digest: String,
     pub snapshot: ConfigTreeSnapshot,
@@ -125,14 +123,6 @@ pub struct ConfigCommitRequest {
     #[ts(type = "number")]
     pub base_revision: u64,
     pub base_digest: String,
-    pub changes: Vec<ConfigTreeChange>,
-    pub entrypoints: Vec<VirtualPath>,
-    pub toolchain_fingerprint: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
-#[ts(export)]
-pub struct ConfigPreviewRequest {
     pub changes: Vec<ConfigTreeChange>,
     pub entrypoints: Vec<VirtualPath>,
 }
@@ -245,13 +235,6 @@ impl SqliteWorkspaceStore {
                 current.snapshot.revision
             )));
         }
-        let expected_contract = main_config_contract_with_schema(schema_bundle.clone());
-        if expected_contract.fingerprint != request.toolchain_fingerprint {
-            return Err(config_conflict(format!(
-                "toolchain fingerprint mismatch; current fingerprint is {}",
-                expected_contract.fingerprint
-            )));
-        }
         evaluate_candidate(current, &request.changes, schema_bundle)
     }
 
@@ -261,31 +244,6 @@ impl SqliteWorkspaceStore {
         request: &ConfigCommitRequest,
     ) -> Result<EvaluatedConfigCandidate> {
         self.evaluate_workspace_config_candidate_with_schema(
-            workspace_id,
-            request,
-            WorkspaceConfigSchemaBundle::empty(),
-        )
-    }
-
-    pub fn preview_workspace_config_with_schema(
-        &self,
-        workspace_id: &str,
-        request: &ConfigPreviewRequest,
-        schema_bundle: WorkspaceConfigSchemaBundle,
-    ) -> Result<EvaluatedConfigCandidate> {
-        validate_entrypoint_request(&request.entrypoints)?;
-        let current = self
-            .load_workspace_config(workspace_id)?
-            .ok_or_else(config_not_materialized)?;
-        evaluate_candidate(current, &request.changes, schema_bundle)
-    }
-
-    pub fn preview_workspace_config(
-        &self,
-        workspace_id: &str,
-        request: &ConfigPreviewRequest,
-    ) -> Result<EvaluatedConfigCandidate> {
-        self.preview_workspace_config_with_schema(
             workspace_id,
             request,
             WorkspaceConfigSchemaBundle::empty(),
@@ -943,7 +901,6 @@ mod tests {
             base_digest: current.snapshot.digest.clone(),
             changes,
             entrypoints: vec![path(MAIN_CONFIG_ENTRYPOINT)],
-            toolchain_fingerprint: current.contract.fingerprint.clone(),
         }
     }
 
@@ -991,7 +948,6 @@ mod tests {
                         content: "{ web = {}; }".to_string(),
                     }],
                     entrypoints: vec![path(MAIN_CONFIG_ENTRYPOINT)],
-                    toolchain_fingerprint: expected_contract.fingerprint.clone(),
                 },
                 schema,
             )
@@ -1016,34 +972,6 @@ mod tests {
                 .schema_bundle,
             expected_contract.schema_bundle
         );
-    }
-
-    #[tokio::test]
-    async fn commit_rejects_stale_schema_bundle_fingerprint() {
-        let store = open_store().await;
-        let current = store.load_workspace_config("w-config").unwrap().unwrap();
-        let schema = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
-            "builtin:web",
-            "web",
-            "1",
-            "{ web = {}; }",
-        )
-        .unwrap()])
-        .unwrap();
-        let error = store
-            .evaluate_workspace_config_candidate_with_schema(
-                "w-config",
-                &ConfigCommitRequest {
-                    base_revision: current.snapshot.revision,
-                    base_digest: current.snapshot.digest,
-                    changes: Vec::new(),
-                    entrypoints: vec![path(MAIN_CONFIG_ENTRYPOINT)],
-                    toolchain_fingerprint: current.contract.fingerprint,
-                },
-                schema,
-            )
-            .unwrap_err();
-        assert!(error.to_string().contains("toolchain fingerprint mismatch"));
     }
 
     #[test]
@@ -1361,10 +1289,11 @@ mod tests {
         let store = open_store().await;
         let current = store.load_workspace_config("w-config").unwrap().unwrap();
         let candidate = store
-            .preview_workspace_config(
+            .evaluate_workspace_config_candidate(
                 "w-config",
-                &ConfigPreviewRequest {
-                    changes: vec![
+                &commit_request(
+                    &current,
+                    vec![
                         update_main(&current, "{}"),
                         ConfigTreeChange::Create {
                             path: path("module.dcdl"),
@@ -1372,8 +1301,7 @@ mod tests {
                             content: "{}".into(),
                         },
                     ],
-                    entrypoints: vec![path(MAIN_CONFIG_ENTRYPOINT)],
-                },
+                ),
             )
             .unwrap();
 
@@ -1469,12 +1397,9 @@ mod tests {
             },
         ] {
             let error = store
-                .preview_workspace_config(
+                .evaluate_workspace_config_candidate(
                     "w-config",
-                    &ConfigPreviewRequest {
-                        changes: vec![change],
-                        entrypoints: vec![path(MAIN_CONFIG_ENTRYPOINT)],
-                    },
+                    &commit_request(&current, vec![change]),
                 )
                 .unwrap_err();
             assert!(error.to_string().contains("cannot be"));
@@ -1484,14 +1409,11 @@ mod tests {
     #[tokio::test]
     async fn browser_cannot_replace_server_owned_entrypoint_contract() {
         let store = open_store().await;
+        let current = store.load_workspace_config("w-config").unwrap().unwrap();
+        let mut request = commit_request(&current, Vec::new());
+        request.entrypoints = vec![path("other.dcdl")];
         let error = store
-            .preview_workspace_config(
-                "w-config",
-                &ConfigPreviewRequest {
-                    changes: Vec::new(),
-                    entrypoints: vec![path("other.dcdl")],
-                },
-            )
+            .evaluate_workspace_config_candidate("w-config", &request)
             .unwrap_err();
         assert!(error.to_string().contains("must be exactly [main.dcdl]"));
     }
@@ -1514,12 +1436,6 @@ mod tests {
                         content: "{ broken = ; }".into(),
                     }],
                     entrypoints: vec![path(MAIN_CONFIG_ENTRYPOINT)],
-                    toolchain_fingerprint: ToolchainContract::new(
-                        DEFAULT_SCHEMA_VERSION,
-                        vec![path(MAIN_CONFIG_ENTRYPOINT)],
-                        DEFAULT_IMPORT_POLICY_VERSION,
-                    )
-                    .fingerprint,
                 },
             )
             .unwrap_err();
@@ -1587,7 +1503,6 @@ mod tests {
                         content: "{ answer = 2; }".into(),
                     }],
                     entrypoints: first.contract.entrypoints.clone(),
-                    toolchain_fingerprint: first.contract.fingerprint.clone(),
                 },
             )
             .unwrap();
@@ -1596,27 +1511,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(revision, first.snapshot);
-    }
-
-    #[tokio::test]
-    async fn commit_rejects_mismatched_toolchain_fingerprint() {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
-        store.upsert_workspace(&workspace()).await.unwrap();
-        let current = store.load_workspace_config("w-config").unwrap().unwrap();
-        let error = store
-            .evaluate_and_commit_workspace_config(
-                "w-config",
-                &ConfigCommitRequest {
-                    base_revision: current.snapshot.revision,
-                    base_digest: current.snapshot.digest.clone(),
-                    changes: vec![update_main(&current, "{ answer = 42; }")],
-                    entrypoints: vec![path(MAIN_CONFIG_ENTRYPOINT)],
-                    toolchain_fingerprint: "sha256:stale-toolchain".into(),
-                },
-            )
-            .unwrap_err();
-        assert!(matches!(error, Error::WorkspaceConfigConflict(_)));
-        assert!(store.load_workspace_config("w-config").unwrap().is_some());
     }
 
     #[tokio::test]
@@ -1653,9 +1547,7 @@ mod tests {
             .join("../../web/workspace/src/lib/workspace/config-source/generated/types");
         let config = ts_rs::Config::default().with_out_dir(&output);
         WorkspaceConfigState::export_all(&config).unwrap();
-        EvaluatedConfigCandidate::export_all(&config).unwrap();
         ConfigCommitRequest::export_all(&config).unwrap();
-        ConfigPreviewRequest::export_all(&config).unwrap();
     }
 
     #[test]

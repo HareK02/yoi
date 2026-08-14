@@ -2,4 +2,4 @@
 import type { ConfigTreeChange } from "./ConfigTreeChange";
 import type { VirtualPath } from "./VirtualPath";
 
-export type ConfigCommitRequest = { base_revision: number, base_digest: string, changes: Array<ConfigTreeChange>, entrypoints: Array<VirtualPath>, toolchain_fingerprint: string, };
+export type ConfigCommitRequest = { base_revision: number, base_digest: string, changes: Array<ConfigTreeChange>, entrypoints: Array<VirtualPath>, };

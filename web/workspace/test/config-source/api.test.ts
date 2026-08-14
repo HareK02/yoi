@@ -6,7 +6,6 @@ import {
   fetchConfigEntry,
   fetchConfigRevision,
   fetchConfigTree,
-  previewConfigTree,
 } from "../../src/lib/workspace/config-source/api.ts";
 
 function response(body: unknown, status = 200): Response {
@@ -16,7 +15,7 @@ function response(body: unknown, status = 200): Response {
   });
 }
 
-Deno.test("config source API stays workspace-scoped and separates preview from commit", async () => {
+Deno.test("config source API commits directly through the workspace scope", async () => {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   const fetcher = ((input: string | URL | Request, init?: RequestInit) => {
     calls.push({ url: String(input), init });
@@ -26,37 +25,38 @@ Deno.test("config source API stays workspace-scoped and separates preview from c
   await fetchConfigTree("w/one", fetcher);
   await fetchConfigRevision("w/one", 7, fetcher);
   await fetchConfigEntry("w/one", "profiles/main.dcdl", fetcher);
-  await previewConfigTree("w/one", { changes: [], entrypoints: [] }, fetcher);
   await commitConfigTree("w/one", {
     base_revision: 4,
     base_digest: "sha256:base",
     changes: [],
     entrypoints: [],
-    toolchain_fingerprint: "sha256:toolchain",
   }, fetcher);
 
   assertEquals(calls.map((call) => call.url), [
     "/api/w/w%2Fone/config/source-tree",
     "/api/w/w%2Fone/config/source-tree/revisions/7",
     "/api/w/w%2Fone/config/source-tree/entries/profiles%2Fmain.dcdl",
-    "/api/w/w%2Fone/config/source-tree/preview",
     "/api/w/w%2Fone/config/source-tree/commit",
   ]);
   assertEquals(calls[3].init?.method, "POST");
-  assertEquals(calls[4].init?.method, "POST");
   assert(
-    String(calls[4].init?.body).includes('"base_digest":"sha256:base"'),
+    String(calls[3].init?.body).includes('"base_digest":"sha256:base"'),
   );
 });
 
-Deno.test("config source API surfaces failed evaluation instead of treating it as a draft write", async () => {
+Deno.test("config source API surfaces failed evaluation instead of treating it as a successful commit", async () => {
   const fetcher = (() =>
     Promise.resolve(
       new Response("structured diagnostics", { status: 422 }),
     )) as typeof fetch;
   let message = "";
   try {
-    await previewConfigTree("w", { changes: [], entrypoints: [] }, fetcher);
+    await commitConfigTree("w", {
+      base_revision: 1,
+      base_digest: "sha256:base",
+      changes: [],
+      entrypoints: [],
+    }, fetcher);
   } catch (error) {
     message = String(error);
   }

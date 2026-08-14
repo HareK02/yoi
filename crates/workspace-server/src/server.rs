@@ -62,7 +62,7 @@ use crate::companion::{
     CompanionStatusResponse, CompanionTranscriptProjection,
 };
 use crate::config::{BackendRuntimesConfigFile, RemoteRuntimeConfigFile, resolve_remote_runtime};
-use crate::config_source::{ConfigCommitRequest, ConfigPreviewRequest};
+use crate::config_source::ConfigCommitRequest;
 use crate::hosts::{
     ConfigBundleCheckResult, ConfigBundleSyncResult, DiagnosticSeverity, EMBEDDED_RUNTIME_ID,
     EmbeddedWorkerRuntime, HostSummary, RemoteRuntimeConfig, RemoteWorkerRuntime,
@@ -1155,10 +1155,6 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/config/source-tree",
             get(scoped_get_workspace_config_tree),
-        )
-        .route(
-            "/api/w/{workspace_id}/config/source-tree/preview",
-            post(scoped_preview_workspace_config_tree),
         )
         .route(
             "/api/w/{workspace_id}/config/source-tree/commit",
@@ -2512,21 +2508,6 @@ async fn scoped_get_workspace_config_entry(
         .cloned()
         .ok_or_else(|| ApiError::from(Error::InvalidRecordId(path.path)))?;
     Ok(Json(entry))
-}
-
-async fn scoped_preview_workspace_config_tree(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedWorkspacePath>,
-    Json(request): Json<ConfigPreviewRequest>,
-) -> ApiResult<Json<crate::config_source::EvaluatedConfigCandidate>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    let candidate = api.config_store.preview_workspace_config_with_schema(
-        &path.workspace_id,
-        &request,
-        api.config_schema_registry.compose()?,
-    )?;
-    crate::prompt_settings::validate_evaluated_prompt_catalog(&candidate.evaluation)?;
-    Ok(Json(candidate))
 }
 
 async fn scoped_commit_workspace_config_tree(
@@ -14114,7 +14095,6 @@ mod tests {
                 },
             ],
             entrypoints: current.contract.entrypoints.clone(),
-            toolchain_fingerprint: current.contract.fingerprint.clone(),
         };
         let candidate = api
             .config_store

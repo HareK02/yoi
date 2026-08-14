@@ -4,7 +4,6 @@
   import {
     commitConfigTree,
     fetchConfigTree,
-    previewConfigTree,
   } from "./api.ts";
   import { ConfigSourceToolchain } from "./toolchain.ts";
   import type {
@@ -23,15 +22,15 @@
   let diagnostics = $state<ConfigDiagnostic[]>([]);
   let status = $state("Loading source tree…");
   let busy = $state(false);
-  let draftChanges = $state<ConfigTreeChange[]>([]);
+  let workingChanges = $state<ConfigTreeChange[]>([]);
   let baseRevision = $state(0);
   let baseDigest = $state("");
   let renamePath = $state("");
   let baseSnapshot = $state.raw<WorkspaceConfigTreeResponse["snapshot"] | null>(null);
-  let preflightDigest = $state("");
   let conflict = $state(false);
-  let candidateContract = $state<WorkspaceConfigTreeResponse["contract"] | null>(null);
-  let toolchain: ConfigSourceToolchain | null = null;
+  let toolchain = $state.raw<ConfigSourceToolchain | null>(null);
+  let analysisReady = $state(false);
+  let analysisGeneration = 0;
 
   const paths = $derived(
     treeState ? Object.keys(treeState.snapshot.entries).toSorted() : [],
@@ -40,8 +39,7 @@
     treeState && selectedPath ? treeState.snapshot.entries[selectedPath] : undefined,
   );
   const mainSelected = $derived(selectedPath === MAIN_ENTRYPOINT);
-  const dirty = $derived(draftChanges.length > 0 || (selected ? source !== selected.content : source.length > 0));
-  const commitReady = $derived(dirty && preflightDigest === treeState?.snapshot.digest);
+  const dirty = $derived(workingChanges.length > 0 || (selected ? source !== selected.content : source.length > 0));
 
   onMount(() => {
     toolchain = new ConfigSourceToolchain();
@@ -49,7 +47,30 @@
     return () => toolchain?.close();
   });
 
+  $effect(() => {
+    const analyzer = toolchain;
+    const path = selectedPath;
+    const value = source;
+    const ready = analysisReady;
+    const generation = ++analysisGeneration;
+    diagnostics = [];
+    if (!analyzer || !path || !ready) return;
+
+    const timer = setTimeout(() => {
+      void analyzer.analyze(path, value).then((result) => {
+        if (generation === analysisGeneration) diagnostics = result;
+      }).catch((error) => {
+        if (generation === analysisGeneration) status = `Analyze failed: ${String(error)}`;
+      });
+    }, 250);
+    return () => {
+      clearTimeout(timer);
+      if (generation === analysisGeneration) analysisGeneration += 1;
+    };
+  });
+
   async function reload() {
+    analysisReady = false;
     try {
       treeState = await fetchConfigTree(workspaceId);
       if (!selectedPath || !treeState.snapshot.entries[selectedPath]) {
@@ -60,11 +81,11 @@
       baseRevision = treeState.snapshot.revision;
       baseDigest = treeState.snapshot.digest;
       await toolchain?.setSnapshot(treeState.snapshot, treeState.contract.schema_bundle);
-      draftChanges = [];
+      analysisReady = true;
+      workingChanges = [];
       renamePath = selectedPath;
       diagnostics = [];
       conflict = false;
-      candidateContract = null;
       status = `Revision ${treeState.snapshot.revision} · ${treeState.snapshot.digest.slice(0, 20)}…`;
     } catch (error) {
       status = String(error);
@@ -76,9 +97,7 @@
     if (!change || !toolchain) return;
     const candidate = await toolchain.applyChanges([change]);
     if (treeState) treeState = { ...treeState, snapshot: candidate };
-    if (baseSnapshot) draftChanges = await toolchain.changesBetween(baseSnapshot, candidate);
-    preflightDigest = "";
-    candidateContract = null;
+    if (baseSnapshot) workingChanges = await toolchain.changesBetween(baseSnapshot, candidate);
     conflict = false;
   }
 
@@ -114,27 +133,21 @@
     return [MAIN_ENTRYPOINT];
   }
 
-  async function analyze() {
-    if (!toolchain || !treeState || !selectedPath) return;
-    diagnostics = await toolchain.analyze(selectedPath, source);
-    status = diagnostics.length === 0 ? "No diagnostics." : `${diagnostics.length} diagnostic(s).`;
-  }
-
   async function format() {
     if (!toolchain) return;
     try {
       source = await toolchain.format(source);
-      await analyze();
+      status = "Formatted source. Changes remain local until Commit succeeds.";
     } catch (error) {
       status = String(error);
     }
   }
 
-  async function formatDraftSources() {
+  async function formatWorkingSources() {
     if (!toolchain || !treeState || !baseSnapshot) return;
     await stageCurrent();
     const paths = new Set<string>();
-    for (const change of draftChanges) {
+    for (const change of workingChanges) {
       if (change.kind === "create" || change.kind === "update") paths.add(change.path);
       if (change.kind === "rename") paths.add(change.to);
     }
@@ -157,74 +170,33 @@
     if (!formattedAny) return;
 
     treeState = { ...treeState, snapshot: candidate };
-    draftChanges = await toolchain.changesBetween(baseSnapshot, candidate);
+    workingChanges = await toolchain.changesBetween(baseSnapshot, candidate);
     source = candidate.entries[selectedPath]?.content ?? source;
-    preflightDigest = "";
-    candidateContract = null;
     conflict = false;
   }
 
-  async function requestCandidatePreview() {
-    if (!toolchain) throw new Error("config source toolchain is unavailable");
-    const candidate = await previewConfigTree(workspaceId, {
-      changes: draftChanges,
-      entrypoints: entrypoints(),
-    });
-    await toolchain.evaluate(candidate.contract);
-    diagnostics = [];
-    candidateContract = candidate.contract;
-    preflightDigest = candidate.snapshot.digest;
-    return candidate;
-  }
-
-  function recordCandidateError(error: unknown) {
+  function recordCommitError(error: unknown) {
     const message = String(error);
     conflict = message.includes("conflict") || message.includes("base revision/digest mismatch");
     status = conflict ? `${message} Reload the authoritative tree before editing again.` : message;
-  }
-
-  async function preview() {
-    if (!treeState) return;
-    busy = true;
-    try {
-      await formatDraftSources();
-      if (draftChanges.length === 0) {
-        status = "No draft changes to preview.";
-        return;
-      }
-      const candidate = await requestCandidatePreview();
-      status = `Preview valid · projection ${candidate.evaluation.projection_digest.slice(0, 20)}…`;
-    } catch (error) {
-      recordCandidateError(error);
-    } finally {
-      busy = false;
-    }
   }
 
   async function commit() {
     if (!treeState) return;
     busy = true;
     try {
-      await formatDraftSources();
-      if (draftChanges.length === 0) {
-        status = "No draft changes to commit.";
+      await formatWorkingSources();
+      if (workingChanges.length === 0) {
+        status = "No working changes to commit.";
         return;
       }
-      if (preflightDigest !== treeState.snapshot.digest || !candidateContract) {
-        await requestCandidatePreview();
-      }
-      const contract = candidateContract;
-      if (!contract) throw new Error("candidate preview did not return a toolchain contract");
       treeState = await commitConfigTree(workspaceId, {
         base_revision: baseRevision,
         base_digest: baseDigest,
-        changes: draftChanges,
-        entrypoints: contract.entrypoints,
-        toolchain_fingerprint: contract.fingerprint,
+        changes: workingChanges,
+        entrypoints: entrypoints(),
       });
-      draftChanges = [];
-      preflightDigest = "";
-      candidateContract = null;
+      workingChanges = [];
       conflict = false;
       baseSnapshot = $state.snapshot(treeState.snapshot);
       baseRevision = treeState.snapshot.revision;
@@ -234,21 +206,21 @@
       diagnostics = [];
       status = `Committed formatted revision ${treeState.snapshot.revision}.`;
     } catch (error) {
-      recordCandidateError(error);
+      recordCommitError(error);
     } finally {
       busy = false;
     }
   }
 
   async function discardAndReload() {
-    draftChanges = [];
+    workingChanges = [];
     source = "";
     await reload();
   }
 
   async function reloadAndReapply() {
     if (!toolchain || !treeState) return;
-    const localChanges = [...draftChanges];
+    const localChanges = [...workingChanges];
     const remote = await fetchConfigTree(workspaceId);
     baseSnapshot = structuredClone(remote.snapshot);
     baseRevision = remote.snapshot.revision;
@@ -256,14 +228,12 @@
     await toolchain.setSnapshot(remote.snapshot, remote.contract.schema_bundle);
     try {
       const candidate = await toolchain.applyChanges(localChanges);
-      draftChanges = localChanges;
+      workingChanges = localChanges;
       treeState = { ...remote, snapshot: candidate };
       selectedPath = candidate.entries[selectedPath] ? selectedPath : Object.keys(candidate.entries).toSorted()[0] ?? "";
       source = selectedPath ? candidate.entries[selectedPath].content : "";
       conflict = false;
-      preflightDigest = "";
-      candidateContract = null;
-      status = "Local changes reapplied to the latest revision. Preview again before Commit.";
+      status = "Local changes reapplied to the latest revision. Commit to persist them.";
     } catch (error) {
       conflict = true;
       status = `Local changes conflict with the latest revision: ${String(error)}. Discard local changes or resolve against a fresh reload.`;
@@ -276,7 +246,7 @@
     selectedPath = path;
     source = "{}\n";
     diagnostics = [];
-    status = `Drafting new source ${path}. It is not persisted until Commit succeeds.`;
+    status = `Creating local source ${path}. It is not persisted until Commit succeeds.`;
   }
 
   async function deleteEntry() {
@@ -288,14 +258,12 @@
     };
     const candidate = await toolchain.applyChanges([change]);
     treeState = { ...treeState, snapshot: candidate };
-    if (baseSnapshot) draftChanges = await toolchain.changesBetween(baseSnapshot, candidate);
-    preflightDigest = "";
-    candidateContract = null;
+    if (baseSnapshot) workingChanges = await toolchain.changesBetween(baseSnapshot, candidate);
     conflict = false;
     selectedPath = Object.keys(candidate.entries).toSorted()[0] ?? "";
     source = selectedPath ? candidate.entries[selectedPath].content : "";
     renamePath = selectedPath;
-    status = "Delete staged. Preview and Commit to persist the candidate tree.";
+    status = "Delete staged locally. Commit to persist the working tree.";
   }
 
   async function renameEntry() {
@@ -311,13 +279,11 @@
     };
     const candidate = await toolchain.applyChanges([change]);
     treeState = { ...treeState, snapshot: candidate };
-    if (baseSnapshot) draftChanges = await toolchain.changesBetween(baseSnapshot, candidate);
-    preflightDigest = "";
-    candidateContract = null;
+    if (baseSnapshot) workingChanges = await toolchain.changesBetween(baseSnapshot, candidate);
     conflict = false;
     selectedPath = to;
     source = candidate.entries[to]?.content ?? "";
-    status = `Rename to ${to} staged. Preview and Commit to persist.`;
+    status = `Rename to ${to} staged locally. Commit to persist it.`;
   }
 </script>
 
@@ -342,7 +308,7 @@
     <form class="config-source-create" onsubmit={(event) => { event.preventDefault(); createEntry(); }}>
       <label for="new-config-path">New path</label>
       <input id="new-config-path" bind:value={newPath} placeholder="module.dcdl" />
-      <button type="submit">Create draft</button>
+      <button type="submit">Create local source</button>
     </form>
   </aside>
 
@@ -356,9 +322,7 @@
         <input aria-label="Rename path" bind:value={renamePath} disabled={!selected || mainSelected || busy} />
         <button type="button" onclick={renameEntry} disabled={!selected || mainSelected || renamePath === selectedPath || busy}>Rename</button>
         <button type="button" onclick={format} disabled={!selectedPath || busy}>Format</button>
-        <button type="button" onclick={analyze} disabled={!selectedPath || busy}>Analyze</button>
-        <button type="button" onclick={preview} disabled={!dirty || busy}>Preview</button>
-        <button class="primary" type="button" onclick={commit} disabled={!commitReady || busy}>Commit</button>
+        <button class="primary" type="button" onclick={commit} disabled={!dirty || busy}>Commit</button>
         <button class="danger" type="button" onclick={deleteEntry} disabled={!selected || mainSelected || busy}>Delete</button>
       </div>
     </header>
