@@ -3539,7 +3539,9 @@ mod completion_flow_tests {
                 arguments: args.into(),
             });
         }
-        assert!(app.task_store.tasks().is_empty());
+        let tasks = app.task_store.tasks();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].status, crate::task::TaskStatus::Completed);
     }
 
     #[test]

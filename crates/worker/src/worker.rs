@@ -3347,7 +3347,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         }
         let task_snapshot_message = Item::system_message(format!(
             "[Session TaskStore snapshot]\n\n{task_snapshot_text}\n\n\
-             This is the active session task list preserved across compaction. \
+             This is the retained session task list preserved across compaction. \
              The following TaskList tool result presents the same state through the tool lane."
         ));
         compact_introduced_system_messages.push(task_snapshot_message.clone());

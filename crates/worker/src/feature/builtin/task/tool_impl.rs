@@ -18,7 +18,7 @@ struct TaskCreateParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TaskListParams {
-    /// Maximum number of active tasks to return. Defaults to 20.
+    /// Maximum number of retained tasks to return. Defaults to 20.
     #[serde(default)]
     limit: Option<usize>,
 }
@@ -55,23 +55,28 @@ struct TaskUpdateTool {
     store: TaskStore,
 }
 
-const CREATE_DESCRIPTION: &str = "Create a session-lifetime task only when user-visible \
-progress tracking is genuinely useful: multiple active tasks must be remembered, or the work \
-will involve long edits, long-running commands, extended investigation, or interruption-prone \
-coordination. Do not create a task just because a request has several steps, and do not create \
-one for short questions, quick checks, single reviews, or one-off commands. Prefer updating an \
-existing active task over creating a duplicate. Input only `subject` and `description`; `taskid` \
-is assigned automatically and initial `status` is `pending`.";
-const LIST_DESCRIPTION: &str = "List active session-lifetime tasks. Completed and deleted tasks are forgotten and omitted. Defaults to 20 tasks unless `limit` is provided.";
+const CREATE_DESCRIPTION: &str = "Before beginning nontrivial work, decompose the predictable \
+portion into a small ordered set of natural, user-visible steps and create one session-lifetime task \
+per step. A natural step has a distinct verifiable outcome, such as investigation, implementation, \
+or validation; do not create a task for every command or mechanical substep. Do not collapse several \
+predictable steps into one umbrella task. Keep future steps pending, mark the current step inprogress, \
+and add or revise tasks when new information changes the plan. Skip task tracking for short questions, \
+quick checks, and one-off commands. Input only `subject` and `description`; `taskid` is assigned \
+automatically and initial `status` is `pending`.";
+const LIST_DESCRIPTION: &str = "List retained session-lifetime tasks, including completed steps that \
+have not yet been deleted. Deleted tasks are forgotten and omitted. Defaults to 20 tasks unless \
+`limit` is provided.";
 const GET_DESCRIPTION: &str = "Get one session-lifetime task by `taskid`. Tasks are \
 user-visible real-time status for short-term current-work tracking. Returns an error if the task \
 does not exist.";
-const UPDATE_DESCRIPTION: &str = "Update an existing session-lifetime task when meaningful \
-progress changes between substantial steps. Tasks are user-visible real-time status, so avoid \
-churn for trivial substeps. Keep status current with `pending`, `inprogress`, `completed`, or \
-`deleted`. Provide `taskid` and at least one of `status`, `subject`, or `description`; deletion is \
-logical (`status = deleted`). If an unexpected problem blocks progress, do not force the next \
-step: leave the task as-is, summarize the problem to the user, and end the turn.";
+const UPDATE_DESCRIPTION: &str = "Update task status at each natural step boundary. Mark the \
+finished current step completed before advancing the next pending step to inprogress. Completed tasks \
+remain visible as recent workflow context; at a later natural boundary, delete older completed tasks \
+whose result is no longer useful. Do not jump directly from active to deleted merely to hide progress, \
+and avoid churn for mechanical substeps. Keep status current with `pending`, `inprogress`, `completed`, \
+or `deleted`. Provide `taskid` and at least one of `status`, `subject`, or `description`; deletion is \
+logical (`status = deleted`). If an unexpected problem blocks progress, do not force the next step: \
+leave the task as-is, summarize the problem to the user, and end the turn.";
 
 #[async_trait]
 impl Tool for TaskCreateTool {
@@ -83,7 +88,7 @@ impl Tool for TaskCreateTool {
         let params: TaskCreateParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid TaskCreate input: {e}")))?;
         let created = self.store.create(params.subject, params.description);
-        let tasks = self.store.list_active();
+        let tasks = self.store.list();
         Ok(task_output(
             format!(
                 "Created task {} ({})\n{}",
@@ -106,10 +111,10 @@ impl Tool for TaskListTool {
         let params: TaskListParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid TaskList input: {e}")))?;
         let limit = params.limit.unwrap_or(DEFAULT_TASK_LIST_LIMIT);
-        let active_tasks = self.store.list_active();
-        let tasks: Vec<_> = active_tasks.iter().take(limit).cloned().collect();
+        let retained_tasks = self.store.list();
+        let tasks: Vec<_> = retained_tasks.iter().take(limit).cloned().collect();
         Ok(ToolOutput {
-            summary: list_overview(active_tasks.len(), tasks.len()),
+            summary: list_overview(retained_tasks.len(), tasks.len()),
             content: Some(render_task_list(&tasks)),
 
             attachments: Vec::new(),
@@ -157,7 +162,7 @@ impl Tool for TaskUpdateTool {
                 params.description,
             )
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-        let tasks = self.store.list_active();
+        let tasks = self.store.list();
         Ok(task_output(
             format!(
                 "Updated task {} ({})\n{}",
@@ -179,14 +184,14 @@ fn task_output(summary: String, task: &TaskEntry) -> ToolOutput {
     }
 }
 
-fn list_overview(total_active: usize, returned: usize) -> String {
-    if returned < total_active {
+fn list_overview(total: usize, returned: usize) -> String {
+    if returned < total {
         format!(
-            "TaskStore: {returned} active task(s) shown; {} omitted.",
-            total_active - returned
+            "TaskStore: {returned} task(s) shown; {} omitted.",
+            total - returned
         )
     } else {
-        format!("TaskStore: {returned} active task(s)")
+        format!("TaskStore: {returned} task(s)")
     }
 }
 
@@ -310,7 +315,7 @@ mod tests {
         assert!(out.content.unwrap().contains("implement tasks"));
 
         let out = list.execute("{}", Default::default()).await.unwrap();
-        assert!(out.summary.contains("1 active task(s)"));
+        assert!(out.summary.contains("1 task(s)"));
         let content = out.content.unwrap();
         assert!(content.contains("\"taskid\": 1"));
         assert!(!content.contains("\"limit\""));
@@ -318,7 +323,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_list_omits_completed_deleted_and_defaults_to_twenty() {
+    async fn task_list_retains_completed_omits_deleted_and_defaults_to_twenty() {
         let store = TaskStore::new();
         let create = tool(task_create_tool(store.clone()));
         let update = tool(task_update_tool(store.clone()));
@@ -343,10 +348,7 @@ mod tests {
             .unwrap();
 
         let out = list.execute("{}", Default::default()).await.unwrap();
-        assert_eq!(
-            out.summary,
-            "TaskStore: 20 active task(s) shown; 3 omitted."
-        );
+        assert_eq!(out.summary, "TaskStore: 20 task(s) shown; 4 omitted.");
         let content = out.content.unwrap();
         let json: serde_json::Value = serde_json::from_str(&content).unwrap();
         let tasks = json.as_array().unwrap();
@@ -355,7 +357,7 @@ mod tests {
             .iter()
             .map(|task| task["taskid"].as_u64().unwrap())
             .collect();
-        assert!(!ids.contains(&1));
+        assert!(ids.contains(&1));
         assert!(!ids.contains(&2));
         assert!(!content.contains("\"limit\""));
         assert!(!content.contains("\"total_active\""));
@@ -365,10 +367,7 @@ mod tests {
             .execute(r#"{"limit":3}"#, Default::default())
             .await
             .unwrap();
-        assert_eq!(
-            out.summary,
-            "TaskStore: 3 active task(s) shown; 20 omitted."
-        );
+        assert_eq!(out.summary, "TaskStore: 3 task(s) shown; 21 omitted.");
         let content = out.content.unwrap();
         let json: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(json.as_array().unwrap().len(), 3);
@@ -410,6 +409,16 @@ mod tests {
         assert!(json.get("snapshot").is_none());
         assert!(!content.contains("\"taskid\": 1"));
         assert!(!content.contains("completed task"));
+    }
+
+    #[test]
+    fn task_descriptions_require_natural_steps_and_completed_cleanup() {
+        assert!(CREATE_DESCRIPTION.contains("Before beginning nontrivial work"));
+        assert!(CREATE_DESCRIPTION.contains("one session-lifetime task per step"));
+        assert!(CREATE_DESCRIPTION.contains("Do not collapse several predictable steps"));
+        assert!(UPDATE_DESCRIPTION.contains("each natural step boundary"));
+        assert!(UPDATE_DESCRIPTION.contains("remain visible"));
+        assert!(UPDATE_DESCRIPTION.contains("delete older completed tasks"));
     }
 
     #[tokio::test]

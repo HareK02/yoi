@@ -62,6 +62,13 @@ export function applyTaskToolCall(
 
   const current = state.tasks[index];
   const status = update.status ?? current.status;
+  if (status === "deleted") {
+    return {
+      tasks: state.tasks.filter((_, taskIndex) => taskIndex !== index),
+      nextTaskId: state.nextTaskId,
+    };
+  }
+
   const tasks = [...state.tasks];
   tasks[index] = {
     taskid: current.taskid,
@@ -78,9 +85,10 @@ export function applyTaskSnapshotText(
 ): ConsoleTaskState {
   const tasks = parseTaskSnapshotText(text);
   if (!tasks) return state;
+  const retained = tasks.filter((task) => task.status !== "deleted");
   return {
-    tasks,
-    nextTaskId: Math.max(1, ...tasks.map((task) => task.taskid + 1)),
+    tasks: retained,
+    nextTaskId: Math.max(1, ...retained.map((task) => task.taskid + 1)),
   };
 }
 
@@ -105,7 +113,9 @@ export function parseTaskSnapshotText(text: string): ConsoleTask[] | null {
   for (const candidate of value.tasks) {
     const task = taskEntry(candidate);
     if (!task) return null;
-    tasks.push(task);
+    if (task.status !== "deleted") {
+      tasks.push(task);
+    }
   }
   return tasks;
 }

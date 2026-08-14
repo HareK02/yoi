@@ -53,7 +53,7 @@ Deno.test("TaskCreate and TaskUpdate mirror the active TUI task store", () => {
   assert(counts.inprogress === 1, "one task should be in progress");
 });
 
-Deno.test("completed and deleted tasks remain in the TUI-style store", () => {
+Deno.test("completed tasks remain visible until explicitly deleted", () => {
   let state = emptyConsoleTaskState();
   for (const subject of ["complete", "delete"]) {
     state = applyTaskToolCall(
@@ -72,14 +72,11 @@ Deno.test("completed and deleted tasks remain in the TUI-style store", () => {
     "TaskUpdate",
     JSON.stringify({ taskid: 2, status: "deleted" }),
   );
-  assert(
-    state.tasks.length === 2,
-    "the full TaskStore should retain inactive tasks",
-  );
+  assert(state.tasks.length === 1, "only deleted tasks should be forgotten");
   const counts = taskCounts(state.tasks);
   assert(counts.completed === 1, "completed tasks should remain counted");
-  assert(counts.deleted === 1, "deleted tasks should remain counted");
-  assert(counts.active === 0, "inactive tasks should not be shown as active");
+  assert(counts.deleted === 0, "deleted tasks should be forgotten");
+  assert(counts.active === 0, "completed tasks should not be shown as active");
 });
 
 Deno.test("session TaskStore snapshot replaces stale state and advances ids", () => {
@@ -102,13 +99,13 @@ TaskStore: 1 active task(s) (pending: 0, inprogress: 1)
 \`\`\`
 `;
   state = applyTaskSnapshotText(state, snapshot);
+  assert(state.tasks.length === 2, "snapshot should restore retained tasks");
+  assert(state.tasks[0].taskid === 4, "the completed task should be restored");
+  assert(state.tasks[1].taskid === 7, "the active task should be restored");
   assert(
-    state.tasks.length === 2,
-    "snapshot should restore the full TaskStore",
+    state.nextTaskId === 8,
+    "next id should follow the highest retained task id",
   );
-  assert(state.tasks[0].taskid === 4, "completed tasks should remain restored");
-  assert(state.tasks[1].taskid === 7, "active tasks should remain restored");
-  assert(state.nextTaskId === 8, "next id should follow the highest task id");
   state = applyTaskToolCall(
     state,
     "TaskCreate",

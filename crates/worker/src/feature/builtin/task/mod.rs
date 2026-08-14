@@ -15,8 +15,10 @@ mod store;
 mod tool_impl;
 
 pub(crate) use self::tool_impl::task_tools;
+#[cfg(test)]
+pub(crate) use store::TaskStatus;
 use store::snapshot_overview;
-pub(crate) use store::{TaskEntry, TaskStatus, TaskStore};
+pub(crate) use store::{TaskEntry, TaskStore};
 
 use crate::feature::{
     FeatureDescriptor, FeatureHookPoint, FeatureInstallContext, FeatureInstallError, FeatureModule,
@@ -76,7 +78,7 @@ impl TaskFeature {
     /// pointing at the same feature-owned store after rewind.
     pub fn restore_from_history(&self, history: &[Item]) {
         let restored = TaskStore::from_history(history);
-        self.state.task_store.replace_with(restored.list_active());
+        self.state.task_store.replace_with(restored.list());
     }
 
     /// Feature-owned snapshot text used by compaction to preserve Task state.
@@ -86,7 +88,7 @@ impl TaskFeature {
 
     /// Feature-owned compact summary used for the synthetic TaskList result.
     pub fn snapshot_overview(&self) -> String {
-        snapshot_overview(&self.state.task_store.list_active())
+        snapshot_overview(&self.state.task_store.list())
     }
 
     #[cfg(test)]
@@ -208,14 +210,8 @@ struct TaskReminderPreRequestHook {
 #[async_trait]
 impl Hook<PreLlmRequest> for TaskReminderPreRequestHook {
     async fn call(&self, input: &PreRequestContext) -> HookPreRequestAction {
-        let active_tasks: Vec<TaskEntry> = self
-            .state
-            .task_store
-            .list()
-            .into_iter()
-            .filter(|task| matches!(task.status, TaskStatus::Pending | TaskStatus::Inprogress))
-            .collect();
-        if active_tasks.is_empty() {
+        let tasks = self.state.task_store.list();
+        if tasks.is_empty() {
             return HookPreRequestAction::Continue;
         }
 
@@ -228,7 +224,7 @@ impl Hook<PreLlmRequest> for TaskReminderPreRequestHook {
 
         if let Some(system_items) = input.system_items() {
             self.state.reminder_state.note_reminder();
-            system_items.append_task_reminder(render_task_reminder_body(&active_tasks));
+            system_items.append_task_reminder(render_task_reminder_body(&tasks));
         }
         HookPreRequestAction::Continue
     }
@@ -252,11 +248,11 @@ fn is_task_management_tool(name: &str) -> bool {
     TASK_MANAGEMENT_TOOL_NAMES.contains(&name)
 }
 
-fn render_task_reminder_body(active_tasks: &[TaskEntry]) -> String {
+fn render_task_reminder_body(tasks: &[TaskEntry]) -> String {
     let mut body = String::from(
-        "Active session tasks are still open. If progress changed, call TaskUpdate.\n",
+        "Current session steps are listed below. Call TaskUpdate at each natural boundary: keep the current step inprogress, mark it completed when finished, and delete older completed steps once their result is no longer useful context.\n",
     );
-    for task in active_tasks {
+    for task in tasks {
         body.push_str(&format!(
             "- taskid {} ({}) {}\n",
             task.taskid, task.status, task.subject
@@ -433,7 +429,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_reminder_is_silent_when_no_active_tasks_exist() {
+    async fn task_reminder_includes_completed_tasks_until_deleted() {
         let feature = TaskFeature::new();
         let done = feature
             .task_store()
@@ -448,10 +444,16 @@ mod tests {
         };
         let pending = Arc::new(Mutex::new(Vec::new()));
 
-        for _ in 0..TASK_REMINDER_REQUEST_THRESHOLD * 2 {
+        for _ in 0..TASK_REMINDER_REQUEST_THRESHOLD {
             let _ = hook.call(&pre_request_context(Arc::clone(&pending))).await;
-            assert!(pending.lock().expect("pending queue poisoned").is_empty());
         }
+        let queued = pending.lock().expect("pending queue poisoned");
+        assert_eq!(queued.len(), 1);
+        let SystemItem::TaskReminder { body, .. } = &queued[0] else {
+            panic!("unexpected system item: {:?}", queued[0]);
+        };
+        assert!(body.contains("taskid 1 (completed) done"));
+        assert!(body.contains("delete older completed steps"));
     }
 
     #[tokio::test]
