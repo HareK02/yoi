@@ -98,3 +98,33 @@ Deno.test("main entrypoint always enables the fixed schema wrapper", async () =>
     "the authoritative main source should not require an optional client-side conversion",
   );
 });
+
+Deno.test("preview and commit format every draft Decodal source", async () => {
+  const source = await Deno.readTextFile(
+    new URL(
+      "../../src/lib/workspace/config-source/ConfigSourceEditor.svelte",
+      import.meta.url,
+    ),
+  );
+
+  assert(
+    source.includes("async function formatDraftSources()") &&
+      source.includes('change.kind === "create" || change.kind === "update"') &&
+      source.includes('change.kind === "rename"') &&
+      source.includes('entry.content_type !== "decodal"') &&
+      source.includes("await toolchain.format(entry.content)"),
+    "all changed Decodal entries should be formatted rather than only the selected source",
+  );
+  assert(
+    source.includes("await formatDraftSources();") &&
+      source.includes("await requestCandidatePreview();") &&
+      source.includes("Committed formatted revision"),
+    "preview and commit should format first and refresh stale preflight before persistence",
+  );
+  assert(
+    !source.includes(
+      "Preview the complete candidate successfully before Commit.",
+    ),
+    "format-driven candidate changes should trigger automatic preflight instead of a dead-end error",
+  );
+});

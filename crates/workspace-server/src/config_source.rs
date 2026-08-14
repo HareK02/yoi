@@ -456,6 +456,40 @@ fn normalize_main_config_schema_assertion(
     ConfigTreeSnapshot::from_entries(revision, entries).map_err(config_error)
 }
 
+fn format_candidate_sources(
+    snapshot: ConfigTreeSnapshot,
+    changes: &[ConfigTreeChange],
+) -> Result<ConfigTreeSnapshot> {
+    let mut paths = std::collections::BTreeSet::from([main_config_path()]);
+    for change in changes {
+        match change {
+            ConfigTreeChange::Create { path, .. } | ConfigTreeChange::Update { path, .. } => {
+                paths.insert(path.clone());
+            }
+            ConfigTreeChange::Rename { to, .. } => {
+                paths.insert(to.clone());
+            }
+            ConfigTreeChange::Delete { .. } => {}
+        }
+    }
+
+    let environment = SnapshotEnvironment::new(snapshot.clone());
+    let revision = snapshot.revision;
+    let mut entries = Vec::with_capacity(snapshot.entries.len());
+    for entry in snapshot.entries.into_values() {
+        if paths.contains(&entry.path) && entry.content_type == ConfigContentType::Decodal {
+            let formatted = environment.format(&entry.content).map_err(config_error)?;
+            entries.push(
+                ConfigEntry::new(entry.path, entry.content_type, formatted)
+                    .map_err(config_error)?,
+            );
+        } else {
+            entries.push(entry);
+        }
+    }
+    ConfigTreeSnapshot::from_entries(revision, entries).map_err(config_error)
+}
+
 fn evaluate_candidate(
     current: WorkspaceConfigState,
     changes: &[ConfigTreeChange],
@@ -465,6 +499,7 @@ fn evaluate_candidate(
     let snapshot = current.snapshot.apply(changes).map_err(config_error)?;
     ensure_main_entrypoint(&snapshot)?;
     let snapshot = normalize_main_config_schema_assertion(snapshot)?;
+    let snapshot = format_candidate_sources(snapshot, changes)?;
     let contract = main_config_contract_with_schema(schema_bundle);
     let evaluation = SnapshotEnvironment::new(snapshot.clone())
         .evaluate_contract(&contract)
@@ -1322,7 +1357,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn candidate_normalizes_main_schema_assertion_only_for_entrypoint() {
+    async fn candidate_normalizes_main_and_formats_changed_decodal_sources() {
         let store = open_store().await;
         let current = store.load_workspace_config("w-config").unwrap().unwrap();
         let candidate = store
@@ -1356,7 +1391,7 @@ mod tests {
                 .get(&path("module.dcdl"))
                 .unwrap()
                 .content,
-            "{}"
+            "{}\n"
         );
     }
 

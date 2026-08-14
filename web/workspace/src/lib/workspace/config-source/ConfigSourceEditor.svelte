@@ -130,28 +130,72 @@
     }
   }
 
+  async function formatDraftSources() {
+    if (!toolchain || !treeState || !baseSnapshot) return;
+    await stageCurrent();
+    const paths = new Set<string>();
+    for (const change of draftChanges) {
+      if (change.kind === "create" || change.kind === "update") paths.add(change.path);
+      if (change.kind === "rename") paths.add(change.to);
+    }
+
+    let candidate = treeState.snapshot;
+    let formattedAny = false;
+    for (const path of paths) {
+      const entry = candidate.entries[path];
+      if (!entry || entry.content_type !== "decodal") continue;
+      const formatted = await toolchain.format(entry.content);
+      if (formatted === entry.content) continue;
+      candidate = await toolchain.applyChanges([{
+        kind: "update",
+        path,
+        expected_digest: entry.content_digest,
+        content: formatted,
+      }]);
+      formattedAny = true;
+    }
+    if (!formattedAny) return;
+
+    treeState = { ...treeState, snapshot: candidate };
+    draftChanges = await toolchain.changesBetween(baseSnapshot, candidate);
+    source = candidate.entries[selectedPath]?.content ?? source;
+    preflightDigest = "";
+    candidateContract = null;
+    conflict = false;
+  }
+
+  async function requestCandidatePreview() {
+    if (!toolchain) throw new Error("config source toolchain is unavailable");
+    const candidate = await previewConfigTree(workspaceId, {
+      changes: draftChanges,
+      entrypoints: entrypoints(),
+    });
+    await toolchain.evaluate(candidate.contract);
+    diagnostics = [];
+    candidateContract = candidate.contract;
+    preflightDigest = candidate.snapshot.digest;
+    return candidate;
+  }
+
+  function recordCandidateError(error: unknown) {
+    const message = String(error);
+    conflict = message.includes("conflict") || message.includes("base revision/digest mismatch");
+    status = conflict ? `${message} Reload the authoritative tree before editing again.` : message;
+  }
+
   async function preview() {
     if (!treeState) return;
-    await stageCurrent();
-    if (draftChanges.length === 0) {
-      status = "No draft changes to preview.";
-      return;
-    }
     busy = true;
     try {
-      const candidate = await previewConfigTree(workspaceId, {
-        changes: draftChanges,
-        entrypoints: entrypoints(),
-      });
-      await toolchain?.evaluate(candidate.contract);
-      diagnostics = [];
-      candidateContract = candidate.contract;
-      preflightDigest = candidate.snapshot.digest;
+      await formatDraftSources();
+      if (draftChanges.length === 0) {
+        status = "No draft changes to preview.";
+        return;
+      }
+      const candidate = await requestCandidatePreview();
       status = `Preview valid · projection ${candidate.evaluation.projection_digest.slice(0, 20)}…`;
     } catch (error) {
-      const message = String(error);
-      conflict = message.includes("conflict") || message.includes("base revision/digest mismatch");
-      status = conflict ? `${message} Reload the authoritative tree before editing again.` : message;
+      recordCandidateError(error);
     } finally {
       busy = false;
     }
@@ -159,39 +203,38 @@
 
   async function commit() {
     if (!treeState) return;
-    await stageCurrent();
-    if (draftChanges.length === 0) {
-      status = "No draft changes to commit.";
-      return;
-    }
-    if (preflightDigest !== treeState.snapshot.digest || !candidateContract) {
-      status = "Preview the complete candidate successfully before Commit.";
-      return;
-    }
     busy = true;
     try {
+      await formatDraftSources();
+      if (draftChanges.length === 0) {
+        status = "No draft changes to commit.";
+        return;
+      }
+      if (preflightDigest !== treeState.snapshot.digest || !candidateContract) {
+        await requestCandidatePreview();
+      }
+      const contract = candidateContract;
+      if (!contract) throw new Error("candidate preview did not return a toolchain contract");
       treeState = await commitConfigTree(workspaceId, {
         base_revision: baseRevision,
         base_digest: baseDigest,
         changes: draftChanges,
-        entrypoints: candidateContract.entrypoints,
-        toolchain_fingerprint: candidateContract.fingerprint,
+        entrypoints: contract.entrypoints,
+        toolchain_fingerprint: contract.fingerprint,
       });
       draftChanges = [];
       preflightDigest = "";
-    candidateContract = null;
-    conflict = false;
+      candidateContract = null;
+      conflict = false;
       baseSnapshot = $state.snapshot(treeState.snapshot);
       baseRevision = treeState.snapshot.revision;
       baseDigest = treeState.snapshot.digest;
       await toolchain?.setSnapshot(treeState.snapshot, treeState.contract.schema_bundle);
       source = treeState.snapshot.entries[selectedPath]?.content ?? "";
       diagnostics = [];
-      status = `Committed revision ${treeState.snapshot.revision}.`;
+      status = `Committed formatted revision ${treeState.snapshot.revision}.`;
     } catch (error) {
-      const message = String(error);
-      conflict = message.includes("conflict") || message.includes("base revision/digest mismatch");
-      status = conflict ? `${message} Reload the authoritative tree before editing again.` : message;
+      recordCandidateError(error);
     } finally {
       busy = false;
     }
