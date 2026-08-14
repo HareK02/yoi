@@ -154,7 +154,7 @@ impl WorkerObservationProvider for RuntimeGrantedWorkerObservationProvider {
             if grant.runtime_id != self.runtime_id {
                 continue;
             }
-            let Ok(worker_ref) = grant.local_worker_ref() else {
+            let Ok(worker_ref) = WorkerRef::try_from(grant) else {
                 continue;
             };
             let Some((workspace_id, state, _)) = self.hub.get(&worker_ref) else {
@@ -192,9 +192,8 @@ impl WorkerObservationProvider for RuntimeGrantedWorkerObservationProvider {
         if !self.grants.contains(&grant) || runtime_id != &self.runtime_id {
             return Err(WorkerObservationError::NotFound);
         }
-        let worker_ref = grant
-            .local_worker_ref()
-            .map_err(|_| WorkerObservationError::NotFound)?;
+        let worker_ref =
+            WorkerRef::try_from(&grant).map_err(|_| WorkerObservationError::NotFound)?;
         let (workspace_id, _, sink) = self
             .hub
             .get(&worker_ref)

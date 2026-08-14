@@ -44,6 +44,13 @@ use webauthn_rs::prelude::{
 };
 use workdir::WorkdirSessionHandle;
 use workdir::http::{WorkdirSessionOperation, WorkdirSessionOperationResult};
+use workdir::workspace::{
+    MaterializerKind, WorkingDirectoryCleanupTarget,
+    WorkingDirectoryDetailResponse as BrowserWorkingDirectoryDetailResponse,
+    WorkingDirectoryDiagnostic, WorkingDirectoryDiagnosticSeverity,
+    WorkingDirectoryListResponse as BrowserWorkingDirectoryListResponse, WorkingDirectoryOccupancy,
+    WorkingDirectoryStatusKind, WorkingDirectorySummary,
+};
 use worker::feature::builtin::{WorkerObservationSubject, WorkerObservationSubjectRef};
 use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest};
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
@@ -101,10 +108,8 @@ use crate::store::{
 };
 use crate::{Error, Result};
 use worker_runtime::catalog::{
-    ConfigBundleRef, MaterializerKind, ProfileSelector,
-    RepositorySelector as RuntimeRepositorySelector, WorkingDirectoryClaim,
-    WorkingDirectoryOccupancy, WorkingDirectoryRepository, WorkingDirectoryRequest,
-    WorkingDirectoryStatusKind, WorkingDirectorySummary, WorkspaceApiRef,
+    ConfigBundleRef, ProfileSelector, RepositorySelector as RuntimeRepositorySelector,
+    WorkingDirectoryClaim, WorkingDirectoryRepository, WorkingDirectoryRequest, WorkspaceApiRef,
 };
 use worker_runtime::config_bundle::ConfigBundle;
 use worker_runtime::http_server::{
@@ -2025,20 +2030,6 @@ pub struct BrowserWorkingDirectoryCreateRequest {
     pub repository_id: String,
     #[serde(default)]
     pub selector: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BrowserWorkingDirectoryListResponse {
-    pub workspace_id: String,
-    pub items: Vec<WorkingDirectorySummary>,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BrowserWorkingDirectoryDetailResponse {
-    pub workspace_id: String,
-    pub item: WorkingDirectorySummary,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5834,6 +5825,23 @@ async fn scoped_get_worker_launch_options(
     get_worker_launch_options(State(api)).await
 }
 
+fn working_directory_diagnostics(
+    diagnostics: Vec<RuntimeDiagnostic>,
+) -> Vec<WorkingDirectoryDiagnostic> {
+    diagnostics
+        .into_iter()
+        .map(|diagnostic| WorkingDirectoryDiagnostic {
+            code: diagnostic.code,
+            severity: match diagnostic.severity {
+                DiagnosticSeverity::Info => WorkingDirectoryDiagnosticSeverity::Info,
+                DiagnosticSeverity::Warning => WorkingDirectoryDiagnosticSeverity::Warning,
+                DiagnosticSeverity::Error => WorkingDirectoryDiagnosticSeverity::Error,
+            },
+            message: diagnostic.message,
+        })
+        .collect()
+}
+
 async fn scoped_list_runtime_working_directories(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimePath>,
@@ -5843,7 +5851,7 @@ async fn scoped_list_runtime_working_directories(
     Ok(Json(BrowserWorkingDirectoryListResponse {
         workspace_id: api.config.workspace_id.clone(),
         items,
-        diagnostics,
+        diagnostics: working_directory_diagnostics(diagnostics),
     }))
 }
 
@@ -5995,7 +6003,7 @@ fn create_working_directory_for_runtime(
     Ok(Json(BrowserWorkingDirectoryDetailResponse {
         workspace_id: api.config.workspace_id.clone(),
         item: summary,
-        diagnostics: result.diagnostics,
+        diagnostics: working_directory_diagnostics(result.diagnostics),
     }))
 }
 
@@ -6016,7 +6024,7 @@ fn working_directory_detail_for_runtime(
         return Ok(Json(BrowserWorkingDirectoryDetailResponse {
             workspace_id: api.config.workspace_id.clone(),
             item: summary,
-            diagnostics: result.diagnostics,
+            diagnostics: working_directory_diagnostics(result.diagnostics),
         }));
     }
     if let Some(record) = api
@@ -6026,7 +6034,7 @@ fn working_directory_detail_for_runtime(
         return Ok(Json(BrowserWorkingDirectoryDetailResponse {
             workspace_id: api.config.workspace_id.clone(),
             item: projected_workdir_summary_from_record(&api, &record)?,
-            diagnostics: result.diagnostics,
+            diagnostics: working_directory_diagnostics(result.diagnostics),
         }));
     }
     Err(ApiError::with_diagnostics(
@@ -6085,7 +6093,7 @@ fn cleanup_working_directory_for_runtime(
     Ok(Json(BrowserWorkingDirectoryDetailResponse {
         workspace_id: api.config.workspace_id.clone(),
         item: summary,
-        diagnostics: result.diagnostics,
+        diagnostics: working_directory_diagnostics(result.diagnostics),
     }))
 }
 
@@ -10834,7 +10842,7 @@ fn workdir_summary_from_record(record: &WorkdirRegistryRecord) -> WorkingDirecto
         current_selector: record.current_selector.clone(),
         current_ref: record.current_ref.clone(),
         materializer_kind: MaterializerKind::LocalGitWorktree,
-        cleanup_target: Some(worker_runtime::catalog::WorkingDirectoryCleanupTarget {
+        cleanup_target: Some(WorkingDirectoryCleanupTarget {
             kind: "local_git_worktree".to_string(),
             working_directory_id: record.workdir_id.clone(),
             repository_id: record.repository_id.clone(),
@@ -17567,6 +17575,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mutation.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[test]
+    fn workspace_workdir_response_serializes_shared_occupied_contract() {
+        let response = BrowserWorkingDirectoryListResponse {
+            workspace_id: TEST_WORKSPACE_ID.to_string(),
+            items: vec![WorkingDirectorySummary {
+                working_directory_id: "wd-1".to_string(),
+                repository_id: "main".to_string(),
+                creation_selector: None,
+                creation_ref: None,
+                current_selector: Some("work/ticket".to_string()),
+                current_ref: Some("abc123".to_string()),
+                materializer_kind: MaterializerKind::LocalGitWorktree,
+                cleanup_target: None,
+                status: WorkingDirectoryStatusKind::Active,
+                cleanliness: Some("clean".to_string()),
+                primary_worker_id: None,
+                occupied_by: Some(WorkingDirectoryOccupancy {
+                    worker: RuntimeWorkerRef::new("arcadia", "worker-opaque-64"),
+                    display_name: "Coder".to_string(),
+                    linked_at: "2026-08-12T00:00:00Z".to_string(),
+                }),
+            }],
+            diagnostics: vec![],
+        };
+
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(
+            value["items"][0]["occupied_by"]["worker_id"],
+            "worker-opaque-64"
+        );
+        assert!(
+            value["items"][0]["occupied_by"]
+                .get("runtime_worker_id")
+                .is_none()
+        );
     }
 
     async fn get_json(app: Router, uri: &str) -> Value {

@@ -8,6 +8,7 @@
 pub mod http;
 mod local;
 mod operation;
+pub mod workspace;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

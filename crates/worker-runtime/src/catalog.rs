@@ -92,12 +92,11 @@ pub struct WorkingDirectoryRepository {
     pub selector: Option<RepositorySelector>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MaterializerKind {
-    #[default]
-    LocalGitWorktree,
-}
+pub use workdir::workspace::{
+    MaterializerKind, WorkingDirectoryCleanupTarget, WorkingDirectoryCurrentObservation,
+    WorkingDirectoryOccupancy, WorkingDirectoryProvenance, WorkingDirectoryStatusKind,
+    WorkingDirectorySummary,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkingDirectoryRequest {
@@ -115,59 +114,6 @@ pub struct WorkingDirectoryClaim {
     pub working_directory_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relative_cwd: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkingDirectoryStatusKind {
-    Active,
-    CleanupPending,
-    Corrupted,
-    NotFound,
-    Unknown,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkingDirectoryCleanupTarget {
-    pub kind: String,
-    pub working_directory_id: String,
-    pub repository_id: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkingDirectoryOccupancy {
-    #[serde(flatten)]
-    pub worker: RuntimeWorkerRef,
-    pub display_name: String,
-    pub linked_at: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkingDirectorySummary {
-    pub working_directory_id: String,
-    pub repository_id: String,
-    /// Selector used to create this Workdir, retained as immutable materialization evidence.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub creation_selector: Option<String>,
-    /// Provider-specific immutable ref resolved when this Workdir was created.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub creation_ref: Option<String>,
-    /// Selector currently observed from the materialized Workdir, when one exists.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub current_selector: Option<String>,
-    /// Provider-specific immutable ref currently observed from the materialized Workdir.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub current_ref: Option<String>,
-    pub materializer_kind: MaterializerKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cleanup_target: Option<WorkingDirectoryCleanupTarget>,
-    pub status: WorkingDirectoryStatusKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cleanliness: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub primary_worker_id: Option<WorkerId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub occupied_by: Option<WorkingDirectoryOccupancy>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

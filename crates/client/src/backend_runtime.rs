@@ -7,6 +7,7 @@ use std::fmt;
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
+pub use workdir::workspace::WorkingDirectorySummary as BackendWorkingDirectorySummary;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendRuntimeTarget {
@@ -96,46 +97,6 @@ pub struct BackendWorkerImplementationSummary {
 pub struct BackendWorkerCapabilitySummary {
     pub can_stop: bool,
     pub can_spawn_followup: bool,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct BackendWorkingDirectoryCleanupTarget {
-    pub kind: String,
-    pub working_directory_id: String,
-    pub repository_id: String,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct BackendWorkingDirectoryOccupancy {
-    pub runtime_id: String,
-    pub runtime_worker_id: u64,
-    pub worker_id: String,
-    pub display_name: String,
-    pub linked_at: String,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct BackendWorkingDirectorySummary {
-    pub working_directory_id: String,
-    pub repository_id: String,
-    #[serde(default)]
-    pub creation_selector: Option<String>,
-    #[serde(default)]
-    pub creation_ref: Option<String>,
-    #[serde(default)]
-    pub current_selector: Option<String>,
-    #[serde(default)]
-    pub current_ref: Option<String>,
-    pub materializer_kind: String,
-    #[serde(default)]
-    pub cleanup_target: Option<BackendWorkingDirectoryCleanupTarget>,
-    pub status: String,
-    #[serde(default)]
-    pub cleanliness: Option<String>,
-    #[serde(default)]
-    pub primary_worker_id: Option<u64>,
-    #[serde(default)]
-    pub occupied_by: Option<BackendWorkingDirectoryOccupancy>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -616,6 +577,46 @@ mod tests {
             protocol_ws_url(&target),
             "ws://127.0.0.1:8787/api/runtimes/runtime%2Fone/workers/worker%20one/protocol/ws"
         );
+    }
+
+    #[test]
+    fn backend_worker_summary_decodes_current_occupied_workdir_contract() {
+        let payload = serde_json::json!({
+            "runtime_id": "arcadia",
+            "worker_id": "worker-opaque-64",
+            "host_id": "host",
+            "display_name": "Coder",
+            "label": "Coder",
+            "workspace": {"visibility": "workspace", "identity": "workspace"},
+            "state": "idle",
+            "implementation": {"kind": "worker", "display_hint": "Coder"},
+            "capabilities": {"can_stop": true, "can_spawn_followup": false},
+            "working_directory": {
+                "working_directory_id": "wd-1",
+                "repository_id": "main",
+                "materializer_kind": "local_git_worktree",
+                "status": "active",
+                "occupied_by": {
+                    "runtime_id": "arcadia",
+                    "worker_id": "worker-opaque-64",
+                    "display_name": "Coder",
+                    "linked_at": "2026-08-12T00:00:00Z"
+                }
+            }
+        });
+
+        let worker: BackendWorkerSummary = serde_json::from_value(payload.clone()).unwrap();
+        let occupied_by = worker
+            .working_directory
+            .unwrap()
+            .occupied_by
+            .expect("occupied Workdir");
+        assert_eq!(occupied_by.worker.runtime_id, "arcadia");
+        assert_eq!(occupied_by.worker.worker_id, "worker-opaque-64");
+
+        let mut stale = payload;
+        stale["working_directory"]["occupied_by"]["runtime_worker_id"] = serde_json::json!(64);
+        assert!(serde_json::from_value::<BackendWorkerSummary>(stale).is_err());
     }
 
     #[test]

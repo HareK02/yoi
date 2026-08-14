@@ -467,8 +467,9 @@ impl Runtime {
         mut status: CatalogWorkingDirectoryStatus,
     ) -> Result<CatalogWorkingDirectoryStatus, RuntimeError> {
         let state = self.lock()?;
-        status.summary.primary_worker_id =
-            state.primary_worker_id_for_workdir(status.summary.working_directory_id.as_str());
+        status.summary.primary_worker_id = state
+            .primary_worker_id_for_workdir(status.summary.working_directory_id.as_str())
+            .map(|worker_id| worker_id.as_u64());
         Ok(status)
     }
 
