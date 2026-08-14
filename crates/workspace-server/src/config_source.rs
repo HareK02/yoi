@@ -176,8 +176,7 @@ impl SqliteWorkspaceStore {
             Ok((state, requires_toolchain_refresh))
         })?;
         if requires_toolchain_refresh
-            || (state.contract.schema_bundle.contributions.is_empty()
-                && !desired_schema.contributions.is_empty())
+            || state.contract.schema_bundle.fingerprint != desired_schema.fingerprint
         {
             let candidate = evaluate_candidate(state, &[], desired_schema)?;
             return self.commit_evaluated_workspace_config(workspace_id, &candidate);
@@ -1091,6 +1090,64 @@ mod tests {
             })
             .unwrap();
         assert_eq!(prior_fingerprint, "sha256:legacy");
+    }
+
+    #[tokio::test]
+    async fn schema_provider_addition_re_evaluates_and_pins_a_new_revision() {
+        let store = open_store().await;
+        let initial = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+            "builtin:profile-test",
+            "profile",
+            "1",
+            r#"{ profile = { enabled = Bool default true; }; }"#,
+        )
+        .unwrap()])
+        .unwrap();
+        let current = store
+            .ensure_workspace_config_materialized_with_schema(
+                "w-config",
+                "2026-08-13T00:00:00Z",
+                initial,
+            )
+            .unwrap();
+        let extended = WorkspaceConfigSchemaBundle::compose([
+            ConfigSchemaContribution::new(
+                "builtin:profile-test",
+                "profile",
+                "1",
+                r#"{ profile = { enabled = Bool default true; }; }"#,
+            )
+            .unwrap(),
+            ConfigSchemaContribution::new(
+                "builtin:skill-test",
+                "skills",
+                "1",
+                r#"{ skills = {...String} default {}; }"#,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+
+        let refreshed = store
+            .ensure_workspace_config_materialized_with_schema(
+                "w-config",
+                "2026-08-14T00:00:00Z",
+                extended.clone(),
+            )
+            .unwrap();
+        assert_eq!(refreshed.snapshot.revision, current.snapshot.revision + 1);
+        assert_eq!(refreshed.snapshot.digest, current.snapshot.digest);
+        assert_eq!(refreshed.contract.schema_bundle, extended);
+        assert_ne!(
+            refreshed.projection_digest, current.projection_digest,
+            "the newly defaulted namespace changes the evaluated projection"
+        );
+        assert!(
+            store
+                .load_workspace_config_revision("w-config", current.snapshot.revision)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

@@ -15,6 +15,10 @@ export type SkillDiagnostic = {
 export type SkillProvenance = {
   kind: "builtin" | "workspace";
   id: string;
+  virtual_path?: string;
+  revision?: number;
+  source_digest?: string;
+  tree_digest?: string;
 };
 
 export type SkillCatalogEntry = {

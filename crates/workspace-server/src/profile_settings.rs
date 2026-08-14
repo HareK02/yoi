@@ -40,7 +40,6 @@ impl WorkspaceConfigSchemaProvider for ProfileConfigSchemaProvider {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct VirtualProfileConfig {
     profile: VirtualProfileSection,
 }
@@ -72,9 +71,14 @@ pub fn project_profiles_from_workspace_config(
     workspace_id: &str,
     state: &WorkspaceConfigState,
 ) -> Result<ProfileConfigProjection> {
-    let schema = ProfileConfigSchemaProvider.contribution()?;
-    let bundle = config_source::WorkspaceConfigSchemaBundle::compose([schema])
-        .map_err(|error| Error::Config(error.to_string()))?;
+    let bundle = if state.contract.schema_bundle.contributions.is_empty() {
+        config_source::WorkspaceConfigSchemaBundle::compose([
+            ProfileConfigSchemaProvider.contribution()?
+        ])
+        .map_err(|error| Error::Config(error.to_string()))?
+    } else {
+        state.contract.schema_bundle.clone()
+    };
     let evaluation = evaluate_workspace_config_state(state, bundle)?;
     if evaluation.projection_digest != state.projection_digest
         && state

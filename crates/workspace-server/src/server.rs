@@ -754,7 +754,8 @@ impl WorkspaceApi {
         let config_schema_registry = crate::config_source::WorkspaceConfigSchemaRegistry::default()
             .with_provider(Arc::new(
                 crate::profile_settings::ProfileConfigSchemaProvider,
-            ));
+            ))
+            .with_provider(Arc::new(skills::SkillConfigSchemaProvider));
         config_store.ensure_workspace_config_materialized_with_schema(
             &config.workspace_id,
             &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
@@ -5168,7 +5169,16 @@ async fn scoped_list_skills(
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
 ) -> ApiResult<Json<worker::skill::SkillCatalogResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    Ok(Json(skills::catalog(&api.config.workspace_root)))
+    let state = api
+        .config_store
+        .load_workspace_config(&path.workspace_id)?
+        .ok_or_else(|| {
+            Error::RegistryInconsistency(format!(
+                "Workspace {} has no active config revision",
+                path.workspace_id
+            ))
+        })?;
+    skills::catalog(&state).map(Json).map_err(skill_api_error)
 }
 
 async fn scoped_lint_skills(
@@ -5176,7 +5186,16 @@ async fn scoped_lint_skills(
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
 ) -> ApiResult<Json<worker::skill::SkillCatalogResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    Ok(Json(skills::lint(&api.config.workspace_root)))
+    let state = api
+        .config_store
+        .load_workspace_config(&path.workspace_id)?
+        .ok_or_else(|| {
+            Error::RegistryInconsistency(format!(
+                "Workspace {} has no active config revision",
+                path.workspace_id
+            ))
+        })?;
+    skills::lint(&state).map(Json).map_err(skill_api_error)
 }
 
 async fn scoped_get_skill(
@@ -5184,7 +5203,16 @@ async fn scoped_get_skill(
     AxumPath(path): AxumPath<ScopedSkillPath>,
 ) -> ApiResult<Json<worker::skill::SkillDetailResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    skills::detail(&api.config.workspace_root, &path.name)
+    let state = api
+        .config_store
+        .load_workspace_config(&path.workspace_id)?
+        .ok_or_else(|| {
+            Error::RegistryInconsistency(format!(
+                "Workspace {} has no active config revision",
+                path.workspace_id
+            ))
+        })?;
+    skills::detail(&state, &path.name)
         .map(Json)
         .map_err(skill_api_error)
 }
@@ -5194,7 +5222,16 @@ async fn scoped_activate_skill(
     AxumPath(path): AxumPath<ScopedSkillPath>,
 ) -> ApiResult<Json<worker::skill::SkillActivationResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    skills::activation(&api.config.workspace_root, &path.name)
+    let state = api
+        .config_store
+        .load_workspace_config(&path.workspace_id)?
+        .ok_or_else(|| {
+            Error::RegistryInconsistency(format!(
+                "Workspace {} has no active config revision",
+                path.workspace_id
+            ))
+        })?;
+    skills::activation(&state, &path.name)
         .map(Json)
         .map_err(skill_api_error)
 }
@@ -5213,7 +5250,14 @@ fn skill_api_error(error: skills::SkillError) -> ApiError {
                 message: format!("unknown Skill `{name}`"),
             }],
         ),
-        skills::SkillError::Io(error) => ApiError::from(Error::Io(error)),
+        skills::SkillError::InvalidSkill(name) => ApiError::from(Error::InvalidInput(format!(
+            "Skill `{name}` has blocking diagnostics"
+        ))),
+        error => ApiError::from(Error::RuntimeOperationFailed {
+            runtime_id: "workspace".to_string(),
+            code: "skill_projection_failed".to_string(),
+            message: error.to_string(),
+        }),
     }
 }
 
@@ -14009,16 +14053,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skills_endpoints_use_workspace_backend_catalog_and_progressive_detail() {
+    async fn skills_endpoints_use_active_virtual_config_and_ignore_repository_yoi() {
         let dir = tempfile::tempdir().unwrap();
         let skill_dir = dir.path().join(".yoi/skills/triage-errors");
         fs::create_dir_all(&skill_dir).unwrap();
         fs::write(
             skill_dir.join("SKILL.md"),
-            "---\nname: triage-errors\ndescription: Use when triaging backend errors and choosing safe diagnostics.\n---\n\n# Triage Errors\n\nInspect logs before changing code.",
+            "---\nname: triage-errors\ndescription: stale filesystem authority\n---\nfilesystem body",
         )
         .unwrap();
         let api = test_api(dir.path()).await;
+        let current = api
+            .config_store
+            .load_workspace_config(TEST_WORKSPACE_ID)
+            .unwrap()
+            .unwrap();
+        let main_path = config_source::VirtualPath::parse("main.dcdl").unwrap();
+        let skill_path =
+            config_source::VirtualPath::parse("skills/triage-errors/SKILL.md").unwrap();
+        let main = format!(
+            r#"{{ skills = {{ triage_errors = import "./skills/triage-errors/SKILL.md" as {}; }}; }}"#,
+            skills::SKILL_DOCUMENT_SCHEMA_SOURCE
+        );
+        let request = crate::config_source::ConfigCommitRequest {
+            base_revision: current.snapshot.revision,
+            base_digest: current.snapshot.digest.clone(),
+            changes: vec![
+                config_source::ConfigTreeChange::Update {
+                    path: main_path.clone(),
+                    expected_digest: current.snapshot.entries[&main_path]
+                        .content_digest
+                        .clone(),
+                    content: main,
+                },
+                config_source::ConfigTreeChange::Create {
+                    path: skill_path,
+                    content_type: config_source::ConfigContentType::Text,
+                    content: "---\nname: triage-errors\ndescription: Use the active DB-backed virtual config when triaging errors.\n---\n# Triage Errors\n\nInspect logs before changing code."
+                        .to_string(),
+                },
+            ],
+            entrypoints: current.contract.entrypoints.clone(),
+            toolchain_fingerprint: current.contract.fingerprint.clone(),
+        };
+        let candidate = api
+            .config_store
+            .evaluate_workspace_config_candidate_with_schema(
+                TEST_WORKSPACE_ID,
+                &request,
+                api.config_schema_registry.compose().unwrap(),
+            )
+            .unwrap();
+        api.config_store
+            .commit_evaluated_workspace_config(TEST_WORKSPACE_ID, &candidate)
+            .unwrap();
 
         let Json(catalog) = scoped_list_skills(
             State(api.clone()),
@@ -14034,6 +14122,13 @@ mod tests {
             .find(|entry| entry.name == "triage-errors")
             .expect("workspace Skill catalog entry");
         assert_eq!(entry.provenance.id, "workspace:triage-errors");
+        assert_eq!(
+            entry.provenance.virtual_path.as_deref(),
+            Some("skills/triage-errors/SKILL.md")
+        );
+        assert!(entry.provenance.revision.is_some());
+        assert!(entry.provenance.source_digest.is_some());
+        assert_ne!(entry.description, "stale filesystem authority");
         assert!(
             !serde_json::to_string(&catalog)
                 .unwrap()
