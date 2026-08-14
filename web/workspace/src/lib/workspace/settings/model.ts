@@ -108,7 +108,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
     bullets: [
       "Virtual paths and imports resolve inside the committed Workspace tree, never from browser or Server host paths.",
       "Browser analysis is advisory; Server evaluation is required before an atomic revision commit.",
-      "Profile, Skill, Prompt, and Plugin consumers remain on their existing authorities until their follow-up cutovers.",
+      "Profile launch data is projected from this active revision; remaining Skill, Prompt, and Plugin consumers migrate in their follow-up cutovers.",
     ],
   },
   {
@@ -116,11 +116,11 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
     label: "Profile Sources",
     status: "editable",
     summary:
-      "Manage the workspace-scoped Decodal Profile registry and source files used by Backend-published launch profile discovery.",
+      "Inspect the Profile launch projection derived from the active Workspace configuration revision.",
     bullets: [
       "Selectors are source-qualified (builtin:* or project:*); raw profile source paths, archive content, archive digests, resource handles, and runtime tokens are not exposed.",
-      "Profile source edits are validated through the Backend ProfileSourceArchive/Decodal boundary before they are persisted.",
-      "Launch profile candidates refresh from the same Backend projection after registry or source updates.",
+      "Profile declarations and sources are edited only through the shared Workspace configuration editor and evaluate-before-commit contract.",
+      "Launch candidates and Profile archives carry the same active config revision, tree digest, and projection digest.",
     ],
   },
   {
