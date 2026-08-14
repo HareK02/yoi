@@ -42,10 +42,9 @@ pub const COMPACT_OVERVIEW_WARNING_TOKENS: u64 = 16_000;
 /// See [`crate::CompactionConfig::overview_deadline_tokens`].
 pub const COMPACT_OVERVIEW_DEADLINE_TOKENS: u64 = 40_000;
 
-/// Default instruction asset reference used when `worker.instruction`
-/// is omitted. See the `PromptLoader` prefix addressing scheme for the
-/// `$yoi/` / `$user/` / `$workspace/` namespaces.
-pub const DEFAULT_INSTRUCTION: &str = "$yoi/default";
+/// Default exact catalog-root dotted Prompt name used when
+/// `worker.instruction` is omitted.
+pub const DEFAULT_INSTRUCTION: &str = "default";
 
 /// Default language policy used by the main worker for normal prose
 /// responses. See [`crate::EngineManifest::language`].

@@ -24,6 +24,8 @@ pub struct ConfigBundle {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declarations: Vec<ConfigDeclaration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_catalog: Option<worker::EffectivePromptCatalog>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_source_archive: Option<ProfileSourceArchive>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_source_archive_handle: Option<BackendResourceHandle>,
@@ -66,6 +68,16 @@ impl ConfigBundle {
                 declaration.kind.canonical_name(),
                 declaration.name,
                 declaration.reference
+            ));
+        }
+
+        if let Some(prompt_catalog) = &self.prompt_catalog {
+            lines.push(format!(
+                "prompt_catalog\0{}\0{}\0{}\0{}",
+                prompt_catalog.config_revision,
+                prompt_catalog.schema_fingerprint,
+                prompt_catalog.toolchain_fingerprint,
+                prompt_catalog.catalog_digest
             ));
         }
 
@@ -272,6 +284,12 @@ pub(crate) fn validate_config_bundle(bundle: &ConfigBundle) -> Result<(), Runtim
             });
         }
         validate_declaration_reference(&bundle.metadata.id, declaration)?;
+    }
+
+    if let Some(prompt_catalog) = &bundle.prompt_catalog {
+        prompt_catalog.verify_digest().map_err(|error| {
+            RuntimeError::InvalidRequest(format!("invalid Prompt catalog projection: {error}"))
+        })?;
     }
 
     if let Some(archive) = &bundle.profile_source_archive {
@@ -582,6 +600,7 @@ mod tests {
                 name: "credential".to_string(),
                 reference: reference.to_string(),
             }],
+            prompt_catalog: None,
             profile_source_archive: None,
             profile_source_archive_handle: None,
         }
@@ -613,6 +632,32 @@ mod tests {
     fn accepts_typed_secret_refs() {
         validate_config_bundle(&bundle_with_declaration("secret:github-token")).unwrap();
         validate_config_bundle(&bundle_with_declaration("vault:team.api-key")).unwrap();
+    }
+
+    #[test]
+    fn validates_immutable_prompt_catalog_projection() {
+        let mut bundle = bundle_with_declaration("secret:github-token");
+        bundle.prompt_catalog = Some(
+            worker::EffectivePromptCatalog::new(
+                std::collections::BTreeMap::from([("default".to_string(), "hello".to_string())]),
+                7,
+                "schema",
+                "toolchain",
+            )
+            .unwrap(),
+        );
+        bundle = bundle.with_computed_digest();
+        validate_config_bundle(&bundle).unwrap();
+
+        bundle
+            .prompt_catalog
+            .as_mut()
+            .unwrap()
+            .templates
+            .insert("default".into(), "tampered".into());
+        bundle = bundle.with_computed_digest();
+        let error = validate_config_bundle(&bundle).unwrap_err();
+        assert!(error.to_string().contains("catalog digest mismatch"));
     }
 
     #[test]

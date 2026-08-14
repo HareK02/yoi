@@ -743,10 +743,10 @@ mod tests {
             .load(Some("profiles/main.dcdl"), "./shared.dcdl")
             .unwrap();
         match loaded {
-            LoadedImport::Source(source) => {
-                assert_eq!(source.key, "profiles/shared.dcdl");
+            LoadedImport::Source { key, .. } => {
+                assert_eq!(key, "profiles/shared.dcdl");
             }
-            LoadedImport::Value(_) => panic!("expected source import"),
+            LoadedImport::Value { .. } => panic!("expected source import"),
         }
     }
 

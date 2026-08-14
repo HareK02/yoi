@@ -30,12 +30,6 @@
 # 必須。Worker の表示名 (ResolveError::MissingField("worker.name") の対象)。
 name = "example-agent"
 
-# 任意。デフォルト: なし。
-# PromptCatalog の 4 つ目の overlay 層として読み込む TOML pack のパス。
-# 相対パスは manifest base 起点で解決。`worker.instruction` (`$prefix/...`)
-# とは別系統の単なるファイルパス。
-# prompt_pack = "./prompts.local.toml"
-
 
 # ===== [model] ==============================================================
 # LLM モデル設定。次の 3 形態を受ける:
@@ -95,10 +89,9 @@ ref = "anthropic/claude-sonnet-4-6"
 # ワーカーの生成パラメータ等。セクション自体省略可 (全フィールド任意)。
 [engine]
 
-# 任意。デフォルト: "$yoi/default" (`defaults::DEFAULT_INSTRUCTION`)。
-# システムプロンプト本体の `PromptLoader` 参照。
-# プレフィクス: "$yoi/..." | "$user/..." | "$workspace/..."
-# instruction = "$yoi/default"
+# 任意。デフォルト: "default" (`defaults::DEFAULT_INSTRUCTION`)。
+# effective Prompt catalog の exact dotted name を選択する。
+# instruction = "default"
 
 # 任意。デフォルト: なし (プロバイダ任せ)。
 # 1 レスポンスあたりの出力 token 上限。

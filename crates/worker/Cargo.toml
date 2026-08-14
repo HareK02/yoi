@@ -29,6 +29,7 @@ tools = { workspace = true }
 workdir = { workspace = true }
 minijinja = "2.19.0"
 chrono = "0.4"
+config-source = { path = "../config-source" }
 include_dir = "0.7.4"
 fs4 = { workspace = true, features = ["sync"] }
 flow = { path = "../flow" }
@@ -51,6 +52,3 @@ serial_test = "3.4.0"
 tempfile = { workspace = true }
 wat = "1.241.2"
 yoi-plugin-pdk = { workspace = true }
-
-[build-dependencies]
-toml = { workspace = true }

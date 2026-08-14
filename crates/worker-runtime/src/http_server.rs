@@ -1811,6 +1811,7 @@ mod tests {
                 label: Some("test".to_string()),
             }],
             declarations: Vec::new(),
+            prompt_catalog: None,
             profile_source_archive: None,
             profile_source_archive_handle: None,
         }
@@ -2648,6 +2649,7 @@ mod ws_tests {
                 label: Some("ws".to_string()),
             }],
             declarations: Vec::new(),
+            prompt_catalog: None,
             profile_source_archive: None,
             profile_source_archive_handle: None,
         }

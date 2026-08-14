@@ -20,7 +20,7 @@ use manifest::{
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
-use crate::PromptLoader;
+use crate::PromptCatalogSource;
 use crate::controller::register_worker_tools;
 use crate::internal_worker::{
     EphemeralSessionStore, InternalWorkerSessionStatus, prepare_internal_worker_session,
@@ -44,7 +44,7 @@ struct SubWorkerSpawnInput {
     /// unambiguous profile slug. Raw/path selectors are rejected.
     #[serde(default)]
     profile: Option<String>,
-    /// Instruction-file reference (e.g. `$yoi/default`, `$user/my-agent`).
+    /// Exact catalog-root dotted Prompt name (for example `default` or `role.coder`).
     #[serde(default)]
     instruction: Option<String>,
     /// Child process/tool working directory. This is not the runtime workspace
@@ -276,7 +276,7 @@ pub struct SubWorkerSpawnTool {
     /// child config from reusable fields here, and selected profiles are
     /// merged into the same internal handoff shape before launch.
     spawner_manifest: WorkerManifest,
-    prompt_loader: PromptLoader,
+    prompt_loader: PromptCatalogSource,
     /// Compact selector list shared by tool description and diagnostics.
     available_profiles: AvailableProfiles,
     /// Spawner's runtime scope. After a successful spawn, the
@@ -310,7 +310,7 @@ impl SubWorkerSpawnTool {
         spawner_cwd: PathBuf,
         registry: Arc<SpawnedWorkerRegistry>,
         spawner_manifest: WorkerManifest,
-        prompt_loader: PromptLoader,
+        prompt_loader: PromptCatalogSource,
         available_profiles: AvailableProfiles,
         spawner_scope: SharedScope,
         delegation_scope: DelegationScope,
@@ -827,7 +827,6 @@ fn build_spawn_config_json(
     let config = WorkerManifestConfig {
         worker: WorkerMetaConfig {
             name: Some(name.to_string()),
-            prompt_pack: None,
         },
         model: model.clone(),
         engine: EngineManifestConfig {
@@ -870,7 +869,6 @@ fn manifest_to_reusable_config(manifest: &WorkerManifest) -> WorkerManifestConfi
     WorkerManifestConfig {
         worker: WorkerMetaConfig {
             name: Some(manifest.worker.name.clone()),
-            prompt_pack: manifest.worker.prompt_pack.clone(),
         },
         model: manifest.model.clone(),
         engine: EngineManifestConfig {
@@ -1010,7 +1008,7 @@ fn sub_worker_spawn_tool_impl(
             spawner_cwd.clone(),
             registry.clone(),
             spawner_manifest.clone(),
-            prompts.loader(),
+            prompts.source(),
             available_profiles,
             spawner_scope.clone(),
             DelegationScope::from_config(&spawner_manifest.delegation_scope)
@@ -1086,7 +1084,7 @@ model_id = "reviewer-model"
 kind = "none"
 
 [engine]
-instruction = "$yoi/reviewer"
+instruction = "role.reviewer"
 language = "Reviewerish"
 max_tokens = 3333
 
@@ -1136,14 +1134,7 @@ extract_threshold = 4000
         let observed_parent_write_revoked = Arc::new(AtomicBool::new(false));
         let observed_instruction_override = Arc::new(AtomicBool::new(false));
         let fail_requests = Arc::new(AtomicBool::new(false));
-        let workspace_prompts = runtime.path().join("workspace-prompts");
-        std::fs::create_dir_all(&workspace_prompts).unwrap();
-        std::fs::write(
-            workspace_prompts.join("custom-reviewer.md"),
-            "WORKSPACE REVIEWER OVERRIDE",
-        )
-        .unwrap();
-        let prompt_loader = PromptLoader::new(None, Some(workspace_prompts));
+        let prompt_loader = PromptCatalogSource::builtins_only();
         let (parent_method_tx, mut parent_method_rx) = mpsc::channel(8);
         let tool = SubWorkerSpawnTool::new(
             "parent".into(),
@@ -1170,7 +1161,7 @@ extract_threshold = 4000
         let input = serde_json::json!({
             "name": "reviewer-child",
             "profile": "project:reviewer",
-            "instruction": "$workspace/custom-reviewer",
+            "instruction": "role.reviewer",
             "task": "review immutable commit",
             "scope": [{
                 "target": workspace_root.clone(),
@@ -1468,7 +1459,7 @@ extract_threshold = 4000
                 request
                     .system_prompt
                     .as_deref()
-                    .is_some_and(|prompt| prompt.contains("WORKSPACE REVIEWER OVERRIDE")),
+                    .is_some_and(|prompt| prompt.contains("review")),
                 Ordering::SeqCst,
             );
             if self.fail_requests.load(Ordering::SeqCst) {
@@ -1515,7 +1506,6 @@ extract_threshold = 4000
         WorkerManifestConfig {
             worker: WorkerMetaConfig {
                 name: Some("parent".into()),
-                prompt_pack: None,
             },
             model: ModelManifest {
                 scheme: Some(SchemeKind::Anthropic),
@@ -1524,7 +1514,7 @@ extract_threshold = 4000
                 ..Default::default()
             },
             engine: EngineManifestConfig {
-                instruction: Some("$yoi/parent".into()),
+                instruction: Some("default".into()),
                 language: Some("Parentish".into()),
                 max_tokens: Some(1234),
                 stop_sequences: Some(vec!["STOP".into()]),
@@ -1604,7 +1594,7 @@ scheme = "anthropic"
 model_id = "coder-model"
 
 [engine]
-instruction = "$yoi/coder"
+instruction = "role.coder"
 language = "Coderish"
 max_tokens = 2222
 "#;
@@ -1618,7 +1608,7 @@ scheme = "anthropic"
 model_id = "reviewer-model"
 
 [engine]
-instruction = "$yoi/reviewer"
+instruction = "role.reviewer"
 language = "Reviewerish"
 max_tokens = 3333
 "#;
@@ -1635,8 +1625,7 @@ max_tokens = 3333
             ..Default::default()
         };
 
-        let config_json =
-            build_spawn_config_json("child", "$yoi/default", &[], &model, false).unwrap();
+        let config_json = build_spawn_config_json("child", "default", &[], &model, false).unwrap();
         let parsed: WorkerManifestConfig = serde_json::from_str(&config_json).unwrap();
 
         assert_eq!(parsed.model.scheme, Some(SchemeKind::Anthropic));
@@ -1658,8 +1647,7 @@ max_tokens = 3333
             ref_: Some("anthropic/claude-sonnet-4-6".into()),
             ..Default::default()
         };
-        let config_json =
-            build_spawn_config_json("child", "$yoi/default", &[], &model, false).unwrap();
+        let config_json = build_spawn_config_json("child", "default", &[], &model, false).unwrap();
         let parsed: WorkerManifestConfig = serde_json::from_str(&config_json).unwrap();
         assert_eq!(
             parsed.model.ref_.as_deref(),
@@ -1680,7 +1668,7 @@ max_tokens = 3333
         }];
 
         let config_json =
-            build_spawn_config_json("child", "$yoi/default", &scope, &model, true).unwrap();
+            build_spawn_config_json("child", "default", &scope, &model, true).unwrap();
         let parsed: WorkerManifestConfig = serde_json::from_str(&config_json).unwrap();
         assert_eq!(
             parsed.session.as_ref().and_then(|s| s.record_event_trace),
@@ -1700,8 +1688,7 @@ max_tokens = 3333
             ref_: Some("anthropic/claude-sonnet-4-6".into()),
             ..Default::default()
         };
-        let config_json =
-            build_spawn_config_json("child", "$yoi/default", &[], &model, false).unwrap();
+        let config_json = build_spawn_config_json("child", "default", &[], &model, false).unwrap();
         let parsed: WorkerManifestConfig = serde_json::from_str(&config_json).unwrap();
 
         assert!(parsed.session.is_none());
@@ -1737,7 +1724,7 @@ max_tokens = 3333
 
         assert_eq!(config.worker.name.as_deref(), Some("child-default"));
         assert_eq!(config.model.model_id.as_deref(), Some("reviewer-model"));
-        assert_eq!(config.engine.instruction.as_deref(), Some("$yoi/reviewer"));
+        assert_eq!(config.engine.instruction.as_deref(), Some("role.reviewer"));
         assert_eq!(config.engine.language.as_deref(), Some("Reviewerish"));
         assert_eq!(config.scope.allow, scope);
         assert!(config.scope.deny.is_empty());
@@ -1776,7 +1763,7 @@ max_tokens = 3333
 
         assert_eq!(config.worker.name.as_deref(), Some("review-child"));
         assert_eq!(config.model.model_id.as_deref(), Some("reviewer-model"));
-        assert_eq!(config.engine.instruction.as_deref(), Some("$yoi/reviewer"));
+        assert_eq!(config.engine.instruction.as_deref(), Some("role.reviewer"));
         assert_eq!(config.engine.language.as_deref(), Some("Reviewerish"));
         assert_eq!(config.engine.max_tokens, Some(3333));
         assert_eq!(config.scope.allow, scope);
@@ -1810,7 +1797,7 @@ max_tokens = 3333
 
         assert_eq!(config.worker.name.as_deref(), Some("inherited-child"));
         assert_eq!(config.model.model_id.as_deref(), Some("parent-model"));
-        assert_eq!(config.engine.instruction.as_deref(), Some("$yoi/parent"));
+        assert_eq!(config.engine.instruction.as_deref(), Some("default"));
         assert_eq!(config.engine.language.as_deref(), Some("Parentish"));
         assert_eq!(config.engine.max_tokens, Some(1234));
         assert_eq!(
@@ -1845,15 +1832,12 @@ max_tokens = 3333
             &available,
             &project,
             "override-child",
-            Some("$user/custom-reviewer"),
+            Some("role.reviewer"),
             &scope,
             SpawnProfileSelector::Default,
         );
 
-        assert_eq!(
-            config.engine.instruction.as_deref(),
-            Some("$user/custom-reviewer")
-        );
+        assert_eq!(config.engine.instruction.as_deref(), Some("role.reviewer"));
         assert_eq!(config.model.model_id.as_deref(), Some("reviewer-model"));
         assert_eq!(config.engine.language.as_deref(), Some("Reviewerish"));
         assert_eq!(config.engine.max_tokens, Some(3333));

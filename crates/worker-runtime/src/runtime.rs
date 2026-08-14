@@ -2832,6 +2832,7 @@ mod tests {
                 name: "read".to_string(),
                 reference: "capability:read".to_string(),
             }],
+            prompt_catalog: None,
             profile_source_archive: None,
             profile_source_archive_handle: None,
         }

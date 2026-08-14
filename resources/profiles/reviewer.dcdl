@@ -2,6 +2,7 @@ import "./base.dcdl" // {
     slug = "reviewer";
     description = "Ticket review profile.";
     scope = "workspace_read";
+    engine = { instruction = "role.reviewer"; };
 
     feature = {
         task = { enabled = true; };

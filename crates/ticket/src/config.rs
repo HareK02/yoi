@@ -1047,19 +1047,19 @@ worktree_name = "custom-orchestrator"
 
 [ticket.roles.intake]
 profile = "project:intake"
-launch_prompt = "$workspace/ticket/intake/launch"
+launch_prompt = "ticket.intake.launch"
 
 [ticket.roles.orchestrator]
 profile = "project:orchestrator"
-launch_prompt = "$workspace/ticket/orchestrator/launch"
+launch_prompt = "ticket.orchestrator.launch"
 
 [ticket.roles.coder]
 profile = "inherit"
-launch_prompt = "$workspace/ticket/coder/launch"
+launch_prompt = "ticket.coder.launch"
 
 [ticket.roles.reviewer]
 profile = "project:reviewer"
-launch_prompt = "$workspace/ticket/reviewer/launch"
+launch_prompt = "ticket.reviewer.launch"
 "#,
         );
 
@@ -1095,7 +1095,7 @@ launch_prompt = "$workspace/ticket/reviewer/launch"
                 .launch_prompt_for(TicketRole::Reviewer)
                 .unwrap()
                 .as_str(),
-            "$workspace/ticket/reviewer/launch"
+            "ticket.reviewer.launch"
         );
     }
 
@@ -1338,7 +1338,7 @@ profile = "builtin:companion"
             r#"
 [roles.coder]
 profile = "inherit"
-system_instruction = "$workspace/not-supported"
+system_instruction = "unsupported"
 "#,
         );
 

@@ -2,6 +2,7 @@ import "./base.dcdl" // {
     slug = "intake";
     description = "Ticket intake profile.";
     scope = "workspace_write";
+    engine = { instruction = "role.intake"; };
 
     feature = {
         task = { enabled = true; };

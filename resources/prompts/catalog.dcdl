@@ -1,0 +1,71 @@
+# Deterministic builtin Prompt source tree. Markdown imports use the shared
+# { frontmatter, content } contract; every leaf below selects only .content.
+# `default_prompt` is the DCDL source alias for the effective catalog's
+# reserved dotted name `default`.
+let
+defaultDocument = import "./default.md";
+commonLanguage = import "./common/language.md";
+commonTickets = import "./common/tickets.md";
+commonToolUsage = import "./common/tool-usage.md";
+commonWorkerObservation = import "./common/worker-observation.md";
+commonWorkerOrchestration = import "./common/worker-orchestration.md";
+commonWorkspace = import "./common/workspace.md";
+commonWriting = import "./common/writing.md";
+roleCoder = import "./role/coder.md";
+roleIntake = import "./role/intake.md";
+roleOrchestrator = import "./role/orchestrator.md";
+roleReviewer = import "./role/reviewer.md";
+internalCompactSystem = import "./internal/compact_system.md";
+internalFlowVerifierSystem = import "./internal/flow_verifier_system.md";
+internalMemoryConsolidationSystem = import "./internal/memory_consolidation_system.md";
+internalMemoryExtractSystem = import "./internal/memory_extract_system.md";
+internalWorkspaceOrchestratorQueueAttention = import "./internal/workspace_orchestrator_queue_attention.md";
+internalNotifyWrapper = import "./internal/notify_wrapper.md";
+internalInterruptToolResultSummary = import "./internal/interrupt_tool_result_summary.md";
+internalInterruptSystemNote = import "./internal/interrupt_system_note.md";
+internalWorkingBoundariesSection = import "./internal/working_boundaries_section.md";
+internalAgentsMdSection = import "./internal/agents_md_section.md";
+internalResidentMemorySummarySection = import "./internal/resident_memory_summary_section.md";
+internalSubWorkerSpawnToolDescription = import "./internal/sub_worker_spawn_tool_description.md";
+panelOrchestratorIdleQueueNotice = import "./panel/orchestrator_idle_queue_notice.md";
+workerTicketEventCompanionNotice = import "./worker/ticket_event_companion_notice.md";
+in
+{
+    default_prompt = defaultDocument.content;
+    common = {
+        language = commonLanguage.content;
+        tickets = commonTickets.content;
+        tool_usage = commonToolUsage.content;
+        worker_observation = commonWorkerObservation.content;
+        worker_orchestration = commonWorkerOrchestration.content;
+        workspace = commonWorkspace.content;
+        writing = commonWriting.content;
+    };
+    role = {
+        coder = roleCoder.content;
+        intake = roleIntake.content;
+        orchestrator = roleOrchestrator.content;
+        reviewer = roleReviewer.content;
+    };
+    internal = {
+        compact_system = internalCompactSystem.content;
+        flow_verifier_system = internalFlowVerifierSystem.content;
+        memory_consolidation_system = internalMemoryConsolidationSystem.content;
+        memory_extract_system = internalMemoryExtractSystem.content;
+        workspace_orchestrator_queue_attention = internalWorkspaceOrchestratorQueueAttention.content;
+        notify_wrapper = internalNotifyWrapper.content;
+        interrupt_tool_result_summary = internalInterruptToolResultSummary.content;
+        interrupt_system_note = internalInterruptSystemNote.content;
+        working_boundaries_section = internalWorkingBoundariesSection.content;
+        agents_md_section = internalAgentsMdSection.content;
+        resident_memory_summary_section = internalResidentMemorySummarySection.content;
+        worker_orchestration_guidance_section = commonWorkerOrchestration.content;
+        sub_worker_spawn_tool_description = internalSubWorkerSpawnToolDescription.content;
+    };
+    panel = {
+        orchestrator_idle_queue_notice = panelOrchestratorIdleQueueNotice.content;
+    };
+    worker = {
+        ticket_event_companion_notice = workerTicketEventCompanionNotice.content;
+    };
+}

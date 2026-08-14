@@ -500,29 +500,13 @@ pub struct MemoryConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerMeta {
     pub name: String,
-    /// Optional path to a TOML override file read as the top layer of
-    /// `worker::PromptCatalog`. Subject to the same relative-path
-    /// resolution as other manifest paths (joined against the
-    /// manifest's base directory). `None` leaves the 4th overlay layer
-    /// empty; auto-discovered user and workspace packs still apply.
-    ///
-    /// Note: unlike `worker.instruction`, this is a plain filesystem
-    /// path — not a `$prefix/` prompt reference. Pack files carry
-    /// structured TOML data, while `worker.instruction` points at a
-    /// minijinja `.md` template; the two use different addressing
-    /// conventions on purpose.
-    #[serde(default)]
-    pub prompt_pack: Option<PathBuf>,
 }
 
 /// Worker-level configuration embedded in the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineManifest {
-    /// Reference to the instruction prompt asset used as the body of
-    /// the worker's system prompt. Uses the `PromptLoader` prefix
-    /// addressing scheme (`$yoi/...`, `$user/...`,
-    /// `$workspace/...`) and is always populated after resolution —
-    /// unset manifests fall through to [`defaults::DEFAULT_INSTRUCTION`].
+    /// Exact catalog-root dotted Prompt name (for example `default` or
+    /// `role.coder`).
     #[serde(default = "default_instruction")]
     pub instruction: String,
     /// Language policy used by the main worker for normal prose responses.
@@ -959,7 +943,7 @@ model_id = "claude-sonnet-4-20250514"
 auth = { kind = "api_key", file = "/abs/keys/anthropic" }
 
 [engine]
-instruction = "$user/reviewer"
+instruction = "role.reviewer"
 max_tokens = 4096
 temperature = 0.3
 top_p = 0.9
@@ -995,7 +979,7 @@ permission = "write"
             _ => panic!("expected ApiKey"),
         };
         assert_eq!(file, Some(std::path::Path::new("/abs/keys/anthropic")));
-        assert_eq!(manifest.engine.instruction, "$user/reviewer");
+        assert_eq!(manifest.engine.instruction, "role.reviewer");
         assert_eq!(manifest.engine.max_tokens, Some(4096));
         assert_eq!(manifest.engine.temperature, Some(0.3));
         assert_eq!(manifest.engine.top_p, Some(0.9));

@@ -11,7 +11,10 @@ use llm_engine::llm_client::{ClientError, LlmClient, Request};
 use session_store::{CombinedStore, FsWorkerStore};
 use session_store::{FsStore, LogEntry, Store};
 
-use worker::{PromptLoader, SystemPromptTemplate, Worker, WorkerError};
+use worker::{
+    EffectivePromptCatalog, PromptCatalog, PromptCatalogSource, SystemPromptTemplate, Worker,
+    WorkerError,
+};
 
 type TestStore = CombinedStore<FsStore, FsWorkerStore>;
 
@@ -96,9 +99,9 @@ permission = "write"
 
 /// Build a Worker with a synthetic instruction template.
 ///
-/// Writes `body` to a temp user-prompts dir under `$user/test`, builds a
-/// PromptLoader pointing at it, parses the template, and installs it on
-/// a Worker constructed directly via `Worker::new`.
+/// Builds an immutable effective catalog with `body` at the exact `test`
+/// Prompt name and installs that parsed template on a directly constructed
+/// Worker.
 async fn make_worker_with_body(
     body: &str,
     client: MockClient,
@@ -117,10 +120,15 @@ async fn make_worker_with_body(
     let scope = worker::Scope::writable(&pwd).unwrap();
     std::mem::forget(pwd_tmp);
 
-    let user_prompts_tmp = tempfile::tempdir().unwrap();
-    std::fs::write(user_prompts_tmp.path().join("test.md"), body).unwrap();
-    let loader = PromptLoader::new(Some(user_prompts_tmp.path().to_path_buf()), None);
-    std::mem::forget(user_prompts_tmp);
+    let mut templates = PromptCatalog::builtins_only()
+        .unwrap()
+        .projection()
+        .templates
+        .clone();
+    templates.insert("test".to_string(), body.to_string());
+    let projection =
+        EffectivePromptCatalog::new(templates, 1, "test-schema", "test-toolchain").unwrap();
+    let loader = PromptCatalogSource::builtins_only().with_effective_catalog(projection);
 
     let worker = Engine::new(client);
     let mut worker = Worker::new(
@@ -133,7 +141,7 @@ async fn make_worker_with_body(
     )
     .await?;
 
-    let template = SystemPromptTemplate::parse("$user/test", loader)
+    let template = SystemPromptTemplate::parse("test", loader)
         .map_err(|source| WorkerError::InvalidSystemPromptTemplate { source })?;
     worker.set_system_prompt_template(template);
 
@@ -146,15 +154,15 @@ async fn make_worker_with_body(
 
 #[tokio::test]
 async fn template_parse_rejects_invalid_syntax() {
-    let user_prompts_tmp = tempfile::tempdir().unwrap();
-    std::fs::write(user_prompts_tmp.path().join("broken.md"), "{{ unclosed").unwrap();
-    let loader = PromptLoader::new(Some(user_prompts_tmp.path().to_path_buf()), None);
-    let err = SystemPromptTemplate::parse("$user/broken", loader).unwrap_err();
-    let worker_err: WorkerError = WorkerError::InvalidSystemPromptTemplate { source: err };
-    assert!(matches!(
-        worker_err,
-        WorkerError::InvalidSystemPromptTemplate { .. }
-    ));
+    let mut templates = PromptCatalog::builtins_only()
+        .unwrap()
+        .projection()
+        .templates
+        .clone();
+    templates.insert("broken".to_string(), "{{ unclosed".to_string());
+    let error =
+        EffectivePromptCatalog::new(templates, 1, "test-schema", "test-toolchain").unwrap_err();
+    assert!(error.to_string().contains("does not compile"));
 }
 
 #[tokio::test]

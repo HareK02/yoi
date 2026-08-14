@@ -23,7 +23,7 @@ const DEFAULT_PAGE_LIMIT: usize = 20;
 const MAX_PAGE_LIMIT: usize = 100;
 const MAX_READ_BYTES: usize = 16 * 1024;
 const OBSERVATION_INSTRUCTION_ID: &str = "worker-observation.policy";
-const OBSERVATION_PROMPT_REF: &str = "$yoi/common/worker-observation";
+const OBSERVATION_PROMPT_REF: &str = "common.worker_observation";
 #[cfg(test)]
 const OBSERVATION_PROMPT_SOURCE: &str =
     include_str!("../../../../../resources/prompts/common/worker-observation.md");

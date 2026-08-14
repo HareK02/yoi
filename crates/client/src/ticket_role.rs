@@ -1028,7 +1028,7 @@ profile = "builtin:companion"
             r#"
 [ticket.roles.reviewer]
 profile = "builtin:companion"
-launch_prompt = "$workspace/ticket/reviewer/launch"
+launch_prompt = "ticket.reviewer.launch"
 "#,
         );
         let mut context = TicketRoleLaunchContext::new(temp.path(), TicketRole::Reviewer);
@@ -1043,11 +1043,11 @@ launch_prompt = "$workspace/ticket/reviewer/launch"
         assert_eq!(plan.profile, "builtin:companion");
         assert_eq!(
             plan.launch_prompt_ref.as_deref(),
-            Some("$workspace/ticket/reviewer/launch")
+            Some("ticket.reviewer.launch")
         );
         assert!(matches!(&plan.run_segments[0], Segment::Text { .. }));
         assert!(!text.contains("Configured launch_prompt"));
-        assert!(!text.contains("$workspace/ticket/reviewer/launch"));
+        assert!(!text.contains("ticket.reviewer.launch"));
         assert!(!text.contains("Profile selector: builtin:companion"));
         assert!(!text.contains("Role: reviewer"));
         assert!(!text.contains("system_instruction"));
@@ -1228,7 +1228,7 @@ profile = "./coder.toml"
             r#"
 [ticket.roles.coder]
 profile = "inherit"
-system_instruction = "$workspace/not-supported"
+system_instruction = "unsupported"
 "#,
         );
         let context = TicketRoleLaunchContext::new(temp.path(), TicketRole::Coder);

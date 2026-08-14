@@ -32,8 +32,10 @@ pub use manifest::{
     WorkerMetaConfig,
 };
 pub use model_client::{ProviderError, build_client};
-pub use prompt::catalog::{CatalogError, PromptCatalog, WorkerPrompt};
-pub use prompt::loader::PromptLoader;
+pub use prompt::catalog::{
+    CatalogError, EffectivePromptCatalog, PromptCatalog, WorkerPrompt, prompt_schema_source,
+};
+pub use prompt::source::PromptCatalogSource;
 pub use prompt::system::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
 pub use protocol::{ErrorCode, Event, Method, TurnResult, WorkerStatus};
 pub use runtime::dir::RuntimeDir;

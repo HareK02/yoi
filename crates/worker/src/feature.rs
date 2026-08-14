@@ -1858,8 +1858,8 @@ mod tests {
 
     #[test]
     fn instruction_contributions_are_deduped_in_registration_order() {
-        let workflow = instruction("workflow", "$yoi/common/tickets");
-        let orchestration = instruction("orchestration", "$yoi/common/worker-orchestration");
+        let workflow = instruction("workflow", "common.tickets");
+        let orchestration = instruction("orchestration", "common.worker_orchestration");
         let contributions = dedupe_instruction_contributions([
             workflow.clone(),
             orchestration.clone(),
@@ -1871,8 +1871,8 @@ mod tests {
 
     #[test]
     fn undeclared_instruction_contribution_is_rejected() {
-        let declared = instruction("declared", "$yoi/common/tickets");
-        let undeclared = instruction("undeclared", "$yoi/common/tickets");
+        let declared = instruction("declared", "common.tickets");
+        let undeclared = instruction("undeclared", "common.tickets");
         let descriptor =
             FeatureDescriptor::builtin("instruction", "Instruction").with_instruction(declared);
         let mut hook_builder = HookRegistryBuilder::default();

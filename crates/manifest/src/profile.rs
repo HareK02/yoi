@@ -547,7 +547,6 @@ fn resolve_profile_value(
     let config = WorkerManifestConfig {
         worker: WorkerMetaConfig {
             name: Some(worker_name),
-            prompt_pack: None,
         },
         model: profile.model.unwrap_or_default(),
         engine: profile.engine.unwrap_or_default(),

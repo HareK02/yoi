@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::{
-    PromptLoader, Worker, WorkerController, WorkerFilesystemAuthority, WorkerWorkspaceContext,
+    PromptCatalogSource, Worker, WorkerController, WorkerFilesystemAuthority,
+    WorkerWorkspaceContext,
 };
 use clap::{CommandFactory, FromArgMatches, Parser};
 use manifest::{Permission, ScopeConfig, ScopeRule, WorkerManifest, WorkerManifestConfig, paths};
@@ -137,7 +138,7 @@ fn sanitise_worker_name(raw: &str) -> String {
     }
 }
 
-fn resolve_manifest(cli: &Cli) -> Result<(WorkerManifest, PromptLoader), String> {
+fn resolve_manifest(cli: &Cli) -> Result<(WorkerManifest, PromptCatalogSource), String> {
     let process_root = runtime_workspace_root(cli)?;
     let runtime_worker_name = runtime_worker_name(cli, &process_root);
     let ((mut manifest, loader), apply_direct_launch_policy) = if let Some(config_json) =
@@ -178,29 +179,31 @@ fn apply_session_restore_overrides(manifest: &mut WorkerManifest, cli: &Cli) -> 
     Ok(())
 }
 
-fn load_spawn_config_json(config_json: &str) -> Result<(WorkerManifest, PromptLoader), String> {
+fn load_spawn_config_json(
+    config_json: &str,
+) -> Result<(WorkerManifest, PromptCatalogSource), String> {
     let config = serde_json::from_str::<WorkerManifestConfig>(config_json)
         .map_err(|e| format!("failed to parse --spawn-config-json: {e}"))?;
     let manifest = WorkerManifest::try_from(WorkerManifestConfig::builtin_defaults().merge(config))
         .map_err(|e| format!("failed to resolve --spawn-config-json: {e}"))?;
-    Ok((manifest, PromptLoader::builtins_only()))
+    Ok((manifest, PromptCatalogSource::builtins_only()))
 }
 
 fn load_builtin_default_manifest(
     worker_name: &str,
-) -> Result<(WorkerManifest, PromptLoader), String> {
+) -> Result<(WorkerManifest, PromptCatalogSource), String> {
     let mut config = WorkerManifestConfig::builtin_defaults();
     config.worker.name = Some(worker_name.to_string());
     let manifest = WorkerManifest::try_from(config)
         .map_err(|e| format!("failed to resolve builtin worker defaults: {e}"))?;
-    Ok((manifest, PromptLoader::builtins_only()))
+    Ok((manifest, PromptCatalogSource::builtins_only()))
 }
 
 pub fn resolve_runtime_profile_manifest(
     _profile: Option<&str>,
     _workspace_root: &Path,
     _worker_name: &str,
-) -> Result<(WorkerManifest, PromptLoader), String> {
+) -> Result<(WorkerManifest, PromptCatalogSource), String> {
     Err(
         "runtime profile resolution requires a pre-resolved manifest/profile archive from Backend authority"
             .to_string(),
@@ -211,7 +214,7 @@ pub fn resolve_runtime_profile_manifest_from_manifest(
     mut manifest: WorkerManifest,
     workspace_root: &Path,
     worker_name: &str,
-) -> Result<(WorkerManifest, PromptLoader), String> {
+) -> Result<(WorkerManifest, PromptCatalogSource), String> {
     if manifest.worker.name.is_empty() {
         manifest.worker.name = worker_name.to_string();
     }
@@ -219,28 +222,28 @@ pub fn resolve_runtime_profile_manifest_from_manifest(
     // Do not run plugin discovery here: runtime-created Workers receive their
     // resolved manifest/profile archive from Backend authority, not by scanning
     // materialized workdir-local plugin stores.
-    Ok((manifest, PromptLoader::builtins_only()))
+    Ok((manifest, PromptCatalogSource::builtins_only()))
 }
 
 pub fn resolve_runtime_profile_manifest_from_manifest_without_filesystem(
     mut manifest: WorkerManifest,
     _workspace_root: &Path,
     worker_name: &str,
-) -> Result<(WorkerManifest, PromptLoader), String> {
+) -> Result<(WorkerManifest, PromptCatalogSource), String> {
     if manifest.worker.name.is_empty() {
         manifest.worker.name = worker_name.to_string();
     }
     manifest.scope = ScopeConfig::default();
     manifest.delegation_scope = ScopeConfig::default();
     // Same as the filesystem-capable runtime path: no local discovery.
-    Ok((manifest, PromptLoader::builtins_only()))
+    Ok((manifest, PromptCatalogSource::builtins_only()))
 }
 
 fn load_single_manifest(
     path: &Path,
     explicit_worker_name: Option<&str>,
     default_worker_name: &str,
-) -> Result<(WorkerManifest, PromptLoader), String> {
+) -> Result<(WorkerManifest, PromptCatalogSource), String> {
     let toml = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read manifest {}: {e}", path.display()))?;
     let absolute_path = if path.is_absolute() {
@@ -274,7 +277,7 @@ fn load_single_manifest(
             path.display()
         ));
     }
-    Ok((manifest, PromptLoader::builtins_only()))
+    Ok((manifest, PromptCatalogSource::builtins_only()))
 }
 
 fn read_rule(target: PathBuf) -> ScopeRule {
@@ -751,11 +754,9 @@ permission = "write"
         let cli =
             Cli::try_parse_from(["yoi worker", "--manifest", manifest.to_str().unwrap()]).unwrap();
 
-        let (manifest, loader) = resolve_manifest(&cli).unwrap();
+        let (manifest, _loader) = resolve_manifest(&cli).unwrap();
 
         assert_eq!(manifest.worker.name, "single");
-        assert!(loader.user_dir().is_none());
-        assert!(loader.workspace_dir().is_none());
     }
 
     #[test]
@@ -834,12 +835,10 @@ language = "override"
         let cli = Cli::try_parse_from(["yoi worker", "--workspace", workspace.to_str().unwrap()])
             .unwrap();
 
-        let (manifest, loader) = resolve_manifest(&cli).unwrap();
+        let (manifest, _loader) = resolve_manifest(&cli).unwrap();
 
         assert_eq!(manifest.worker.name, "runtime-workspace");
         assert_ne!(manifest.engine.language, "override");
-        assert!(loader.user_dir().is_none());
-        assert!(loader.workspace_dir().is_none());
         assert_scope_contains(&manifest.scope.allow, &workspace, Permission::Write);
     }
 
@@ -1031,12 +1030,8 @@ permission = "write"
         ])
         .unwrap();
 
-        let (manifest, loader) = resolve_manifest(&cli).unwrap();
+        let (manifest, _loader) = resolve_manifest(&cli).unwrap();
 
         assert_eq!(manifest.worker.name, "single-file");
-        assert!(loader.user_dir().is_none());
-        assert!(loader.workspace_dir().is_none());
-        assert!(loader.user_pack_file().is_none());
-        assert!(loader.workspace_pack_file().is_none());
     }
 }
