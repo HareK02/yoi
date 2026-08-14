@@ -63,6 +63,18 @@ export function complete_current(entrypoint, source, utf16_offset, explicit) {
 }
 
 /**
+ * @param {any} contributions
+ * @returns {any}
+ */
+export function compose_schema_bundle(contributions) {
+    const ret = wasm.compose_schema_bundle(contributions);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+/**
  * @param {any} contract
  * @returns {any}
  */

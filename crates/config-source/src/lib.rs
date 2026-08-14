@@ -10,13 +10,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const CONFIG_SOURCE_CONTRACT_VERSION: u32 = 2;
-pub const DECODAL_VERSION: &str = "0.2.0";
+pub const DECODAL_VERSION: &str = "0.4.0";
 pub const DEFAULT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_IMPORT_POLICY_VERSION: u32 = 1;
 pub const WORKSPACE_CONFIG_SCHEMA_GLOBAL: &str = "WorkspaceConfigSchema";
 pub const WORKSPACE_CONFIG_SCHEMA_SOURCE: &str = "workspace-config-schema.dcdl";
 pub const WORKSPACE_CONFIG_EVALUATION_SOURCE: &str =
-    "WorkspaceConfigSchema & import \"__MAIN_ENTRYPOINT__\"";
+    "import \"__MAIN_ENTRYPOINT__\" as WorkspaceConfigSchema";
 pub const MAX_ENTRY_COUNT: usize = 256;
 pub const MAX_CHANGE_COUNT: usize = 256;
 pub const MAX_ENTRY_BYTES: usize = 256 * 1024;
@@ -686,8 +686,11 @@ impl SnapshotEnvironment {
             )]
         })?;
         engine.bind_global_runtime(WORKSPACE_CONFIG_SCHEMA_GLOBAL, schema);
-        let evaluation_source =
-            WORKSPACE_CONFIG_EVALUATION_SOURCE.replace("__MAIN_ENTRYPOINT__", entrypoint.as_str());
+        let evaluation_source = if contract.schema_bundle.contributions.is_empty() {
+            format!("import \"{}\"", entrypoint.as_str())
+        } else {
+            WORKSPACE_CONFIG_EVALUATION_SOURCE.replace("__MAIN_ENTRYPOINT__", entrypoint.as_str())
+        };
         let evaluation_module = engine
             .add_root_source(
                 "workspace-config-evaluation.dcdl",
@@ -1270,10 +1273,9 @@ mod tests {
     }
 
     #[test]
-    fn workspace_schema_is_applied_with_normal_decodal_composition() {
+    fn workspace_schema_applies_defaults_with_asymmetric_decodal_validation() {
         let snapshot =
-            ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", "{ web = {}; custom = 42; }")])
-                .unwrap();
+            ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", "{ web = {}; }")]).unwrap();
         let schema = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
             "builtin:web",
             "web",
@@ -1287,7 +1289,118 @@ mod tests {
             .evaluate_contract(&contract)
             .unwrap();
         assert_eq!(result.projections[0].data_json["web"]["enabled"], false);
-        assert_eq!(result.projections[0].data_json["custom"], 42);
+    }
+
+    #[test]
+    fn workspace_schema_rejects_unknown_root_and_nested_fields() {
+        let schema = || {
+            WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+                "builtin:web",
+                "web",
+                "1",
+                "{ web = { enabled = Bool default false; }; }",
+            )
+            .unwrap()])
+            .unwrap()
+        };
+        for (source, unknown_field) in [
+            ("{ web = {}; custom = 42; }", "custom"),
+            ("{ web = { typo = true; }; }", "typo"),
+        ] {
+            let snapshot =
+                ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", source)]).unwrap();
+            let diagnostics = SnapshotEnvironment::new(snapshot)
+                .evaluate_contract(&ToolchainContract::with_schema_bundle(
+                    1,
+                    vec![path("main.dcdl")],
+                    1,
+                    schema(),
+                ))
+                .unwrap_err();
+            assert_eq!(diagnostics[0].path, path("main.dcdl"));
+            assert_eq!(diagnostics[0].kind, "constraintviolation");
+            assert!(diagnostics[0].message.contains(unknown_field));
+            assert!(diagnostics[0].span.end_byte > diagnostics[0].span.start_byte);
+        }
+    }
+
+    #[test]
+    fn workspace_schema_supports_typed_associative_collections() {
+        let snapshot = ConfigTreeSnapshot::from_entries(
+            1,
+            [entry(
+                "main.dcdl",
+                "{ features = { web = { enabled = true; }; tickets = { enabled = false; }; }; }",
+            )],
+        )
+        .unwrap();
+        let schema = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+            "builtin:features",
+            "features",
+            "1",
+            "{ features = {...{ enabled = Bool; }}; }",
+        )
+        .unwrap()])
+        .unwrap();
+        let result = SnapshotEnvironment::new(snapshot)
+            .evaluate_contract(&ToolchainContract::with_schema_bundle(
+                1,
+                vec![path("main.dcdl")],
+                1,
+                schema,
+            ))
+            .unwrap();
+        assert_eq!(
+            result.projections[0].data_json["features"]["web"]["enabled"],
+            true
+        );
+        assert_eq!(
+            result.projections[0].data_json["features"]["tickets"]["enabled"],
+            false
+        );
+    }
+
+    #[test]
+    fn workspace_schema_preserves_fields_only_where_rest_is_explicit() {
+        let snapshot = ConfigTreeSnapshot::from_entries(
+            1,
+            [entry(
+                "main.dcdl",
+                "{ web = { enabled = true; extension_value = 42; }; }",
+            )],
+        )
+        .unwrap();
+        let schema = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+            "builtin:web",
+            "web",
+            "1",
+            "{ web = { enabled = Bool; ...Unknown }; }",
+        )
+        .unwrap()])
+        .unwrap();
+        let result = SnapshotEnvironment::new(snapshot)
+            .evaluate_contract(&ToolchainContract::with_schema_bundle(
+                1,
+                vec![path("main.dcdl")],
+                1,
+                schema,
+            ))
+            .unwrap();
+        assert_eq!(
+            result.projections[0].data_json["web"]["extension_value"],
+            42
+        );
+    }
+
+    #[test]
+    fn unresolved_unknown_cannot_be_materialized() {
+        let snapshot =
+            ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", "Unknown")]).unwrap();
+        let diagnostics = SnapshotEnvironment::new(snapshot)
+            .evaluate_contract(&ToolchainContract::new(1, vec![path("main.dcdl")], 1))
+            .unwrap_err();
+        assert_eq!(diagnostics[0].path, path("main.dcdl"));
+        assert!(!diagnostics[0].message.is_empty());
     }
 
     #[test]

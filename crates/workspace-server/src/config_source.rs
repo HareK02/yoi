@@ -1,8 +1,9 @@
 use chrono::{SecondsFormat, Utc};
 use config_source::{
-    ConfigContentType, ConfigEntry, ConfigSchemaContribution, ConfigTreeChange, ConfigTreeSnapshot,
-    DECODAL_VERSION, DEFAULT_IMPORT_POLICY_VERSION, DEFAULT_SCHEMA_VERSION, EvaluationResult,
-    SnapshotEnvironment, ToolchainContract, VirtualPath, WorkspaceConfigSchemaBundle,
+    ConfigContentType, ConfigDiagnostic, ConfigEntry, ConfigSchemaContribution, ConfigTreeChange,
+    ConfigTreeSnapshot, DECODAL_VERSION, DEFAULT_IMPORT_POLICY_VERSION, DEFAULT_SCHEMA_VERSION,
+    EvaluationResult, SnapshotEnvironment, ToolchainContract, VirtualPath,
+    WorkspaceConfigSchemaBundle,
 };
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,24 @@ use crate::{Error, Result, SqliteWorkspaceStore};
 
 pub const MAIN_CONFIG_ENTRYPOINT: &str = "main.dcdl";
 pub const DEFAULT_MAIN_CONFIG_SOURCE: &str = "{}\n";
+const MAX_TOOLCHAIN_UPGRADE_DIAGNOSTICS: usize = 20;
+
+fn toolchain_upgrade_diagnostics(mut diagnostics: Vec<ConfigDiagnostic>) -> Error {
+    let omitted = diagnostics
+        .len()
+        .saturating_sub(MAX_TOOLCHAIN_UPGRADE_DIAGNOSTICS);
+    diagnostics.truncate(MAX_TOOLCHAIN_UPGRADE_DIAGNOSTICS);
+    let rendered = serde_json::to_string(&diagnostics)
+        .unwrap_or_else(|_| "[diagnostics could not be serialized]".to_string());
+    let suffix = if omitted == 0 {
+        String::new()
+    } else {
+        format!("; {omitted} additional diagnostic(s) omitted")
+    };
+    Error::InvalidInput(format!(
+        "workspace configuration is invalid under Decodal {DECODAL_VERSION}: {rendered}{suffix}"
+    ))
+}
 
 fn main_config_path() -> VirtualPath {
     VirtualPath::parse(MAIN_CONFIG_ENTRYPOINT).expect("main config entrypoint is a valid path")
@@ -125,7 +144,7 @@ impl SqliteWorkspaceStore {
         schema_bundle: WorkspaceConfigSchemaBundle,
     ) -> Result<WorkspaceConfigState> {
         let desired_schema = schema_bundle.clone();
-        let state = self.with_conn_mut(|conn| {
+        let (state, requires_toolchain_refresh) = self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let workspace_exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM workspaces WHERE workspace_id = ?1)",
@@ -135,6 +154,16 @@ impl SqliteWorkspaceStore {
             if !workspace_exists {
                 return Err(Error::WorkspaceIdMismatch);
             }
+            let stored_decodal_version = tx
+                .query_row(
+                    "SELECT decodal_version FROM workspace_config_trees WHERE workspace_id = ?1",
+                    [workspace_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let requires_toolchain_refresh = stored_decodal_version
+                .as_deref()
+                .is_some_and(|version| version != DECODAL_VERSION);
             let state = match load_state(&tx, workspace_id)? {
                 Some(state) => state,
                 None => {
@@ -144,10 +173,11 @@ impl SqliteWorkspaceStore {
                 }
             };
             tx.commit()?;
-            Ok(state)
+            Ok((state, requires_toolchain_refresh))
         })?;
-        if state.contract.schema_bundle.contributions.is_empty()
-            && !desired_schema.contributions.is_empty()
+        if requires_toolchain_refresh
+            || (state.contract.schema_bundle.contributions.is_empty()
+                && !desired_schema.contributions.is_empty())
         {
             let candidate = evaluate_candidate(state, &[], desired_schema)?;
             return self.commit_evaluated_workspace_config(workspace_id, &candidate);
@@ -507,10 +537,22 @@ pub(crate) fn load_state(
     }
     let entrypoints: Vec<VirtualPath> = serde_json::from_str(&entrypoints_json)
         .map_err(|error| Error::RegistryInconsistency(error.to_string()))?;
-    let schema_bundle = match schema_bundle_json {
+    let stored_schema_bundle: WorkspaceConfigSchemaBundle = match schema_bundle_json {
         Some(schema_bundle_json) => serde_json::from_str(&schema_bundle_json)
             .map_err(|error| Error::RegistryInconsistency(error.to_string()))?,
         None => WorkspaceConfigSchemaBundle::empty(),
+    };
+    let requires_toolchain_refresh = decodal_version != DECODAL_VERSION;
+    if requires_toolchain_refresh && !matches!(decodal_version.as_str(), "0.2.0" | "0.3.0") {
+        return Err(Error::RegistryInconsistency(format!(
+            "unsupported virtual config Decodal version {decodal_version} for Workspace {workspace_id}"
+        )));
+    }
+    let schema_bundle = if requires_toolchain_refresh {
+        WorkspaceConfigSchemaBundle::compose(stored_schema_bundle.contributions)
+            .map_err(config_error)?
+    } else {
+        stored_schema_bundle
     };
     let contract = ToolchainContract::with_schema_bundle(
         schema_version,
@@ -518,11 +560,19 @@ pub(crate) fn load_state(
         import_policy_version,
         schema_bundle,
     );
-    if decodal_version != DECODAL_VERSION || contract.fingerprint != fingerprint {
+    if !requires_toolchain_refresh && contract.fingerprint != fingerprint {
         return Err(Error::RegistryInconsistency(format!(
             "virtual config toolchain metadata mismatch for Workspace {workspace_id}"
         )));
     }
+    let projection_digest = if requires_toolchain_refresh {
+        SnapshotEnvironment::new(snapshot.clone())
+            .evaluate_contract(&contract)
+            .map_err(toolchain_upgrade_diagnostics)?
+            .projection_digest
+    } else {
+        projection_digest
+    };
     Ok(Some(WorkspaceConfigState {
         snapshot,
         contract,
@@ -974,6 +1024,170 @@ mod tests {
         let reloaded = store.load_workspace_config("w-config").unwrap().unwrap();
         assert_eq!(reloaded.contract, state.contract);
         assert_eq!(reloaded.projection_digest, state.projection_digest);
+    }
+
+    #[tokio::test]
+    async fn toolchain_upgrade_re_evaluates_current_tree_and_preserves_prior_revision() {
+        let store = open_store().await;
+        let schema_bundle = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+            "builtin:test",
+            "test",
+            "1",
+            r#"{ test = { value = String default "initial"; }; }"#,
+        )
+        .unwrap()])
+        .unwrap();
+        let current = store
+            .ensure_workspace_config_materialized_with_schema(
+                "w-config",
+                "2026-08-13T00:00:00Z",
+                schema_bundle.clone(),
+            )
+            .unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE workspace_config_trees
+                     SET decodal_version = '0.2.0', toolchain_fingerprint = 'sha256:legacy'
+                     WHERE workspace_id = 'w-config'",
+                    [],
+                )?;
+                conn.execute(
+                    "UPDATE workspace_config_tree_revisions
+                     SET toolchain_fingerprint = 'sha256:legacy'
+                     WHERE workspace_id = 'w-config' AND revision = ?1",
+                    [current.snapshot.revision],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let refreshed = store
+            .ensure_workspace_config_materialized_with_schema(
+                "w-config",
+                "2026-08-14T00:00:00Z",
+                schema_bundle,
+            )
+            .unwrap();
+        assert_eq!(refreshed.snapshot.revision, current.snapshot.revision + 1);
+        assert_eq!(refreshed.snapshot.digest, current.snapshot.digest);
+        assert_eq!(refreshed.contract.decodal_version, DECODAL_VERSION);
+        assert_ne!(refreshed.contract.fingerprint, "sha256:legacy");
+        let prior = store
+            .load_workspace_config_revision("w-config", current.snapshot.revision)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prior, current.snapshot);
+        let prior_fingerprint = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT toolchain_fingerprint
+                     FROM workspace_config_tree_revisions
+                     WHERE workspace_id = 'w-config' AND revision = ?1",
+                    [current.snapshot.revision],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(Error::from)
+            })
+            .unwrap();
+        assert_eq!(prior_fingerprint, "sha256:legacy");
+    }
+
+    #[tokio::test]
+    async fn invalid_toolchain_upgrade_returns_diagnostics_without_mutating_authority() {
+        let store = open_store().await;
+        let schema_bundle = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+            "builtin:test",
+            "test",
+            "1",
+            r#"{ test = { value = String default "initial"; }; }"#,
+        )
+        .unwrap()])
+        .unwrap();
+        let current = store
+            .ensure_workspace_config_materialized_with_schema(
+                "w-config",
+                "2026-08-13T00:00:00Z",
+                schema_bundle.clone(),
+            )
+            .unwrap();
+        let legacy_entry = ConfigEntry::new(
+            path(MAIN_CONFIG_ENTRYPOINT),
+            ConfigContentType::Decodal,
+            "{ test = {}; custom = 42; }\n",
+        )
+        .unwrap();
+        let legacy_snapshot =
+            ConfigTreeSnapshot::from_entries(current.snapshot.revision, [legacy_entry.clone()])
+                .unwrap();
+        let manifest_json = serde_json::to_string(&legacy_snapshot.entries).unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE workspace_config_entries
+                     SET content = ?1, content_digest = ?2
+                     WHERE workspace_id = 'w-config' AND path = 'main.dcdl'",
+                    rusqlite::params![legacy_entry.content, legacy_entry.content_digest],
+                )?;
+                conn.execute(
+                    "UPDATE workspace_config_trees
+                     SET tree_digest = ?1, decodal_version = '0.2.0',
+                         toolchain_fingerprint = 'sha256:legacy',
+                         projection_digest = 'sha256:legacy-projection'
+                     WHERE workspace_id = 'w-config'",
+                    [legacy_snapshot.digest.as_str()],
+                )?;
+                conn.execute(
+                    "UPDATE workspace_config_tree_revisions
+                     SET tree_digest = ?1, toolchain_fingerprint = 'sha256:legacy',
+                         projection_digest = 'sha256:legacy-projection', manifest_json = ?2
+                     WHERE workspace_id = 'w-config' AND revision = ?3",
+                    rusqlite::params![
+                        legacy_snapshot.digest,
+                        manifest_json,
+                        current.snapshot.revision
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let error = store
+            .ensure_workspace_config_materialized_with_schema(
+                "w-config",
+                "2026-08-14T00:00:00Z",
+                schema_bundle,
+            )
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("Decodal 0.4.0"));
+        assert!(message.contains("main.dcdl"));
+        assert!(message.contains("constraintviolation"));
+        let persisted = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT revision, decodal_version, toolchain_fingerprint
+                     FROM workspace_config_trees WHERE workspace_id = 'w-config'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, u64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .map_err(Error::from)
+            })
+            .unwrap();
+        assert_eq!(
+            persisted,
+            (
+                current.snapshot.revision,
+                "0.2.0".into(),
+                "sha256:legacy".into()
+            )
+        );
     }
 
     #[tokio::test]

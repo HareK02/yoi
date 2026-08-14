@@ -12,7 +12,7 @@
     "npm:@sveltejs/vite-plugin-svelte@6.2.1": "6.2.1_svelte@5.45.6_vite@7.2.7",
     "npm:clsx@2.1.1": "2.1.1",
     "npm:cookie@0.6.0": "0.6.0",
-    "npm:decodal-codemirror@0.1.6": "0.1.6_@codemirror+view@6.43.8",
+    "npm:decodal-codemirror@0.3.0": "0.3.0_@codemirror+language@6.12.4_@codemirror+view@6.43.8_@lezer+highlight@1.2.3_@lezer+lr@1.4.10",
     "npm:devalue@5.6.4": "5.6.4",
     "npm:gen-interface-jp@0.8.0": "0.8.0",
     "npm:set-cookie-parser@2.7.2": "2.7.2",
@@ -554,8 +554,8 @@
         "ms"
       ]
     },
-    "decodal-codemirror@0.1.6_@codemirror+view@6.43.8": {
-      "integrity": "sha512-XTS5vAY+vTb/yEg5n+1yORtBPuhozG4KO0YGbYEFR8oZX0KghZuHyFEsq/CJMXF223YMC/FQt3SC19NVYGWKMw==",
+    "decodal-codemirror@0.3.0_@codemirror+language@6.12.4_@codemirror+view@6.43.8_@lezer+highlight@1.2.3_@lezer+lr@1.4.10": {
+      "integrity": "sha512-M+Iod3UAZigpt46TmuLJIlSEBhL6KOOksyVxUOGGdlfKYCMN9oN6YG5G9tjkr3/r+Eq8ig1RipC7VZX5iiACTQ==",
       "dependencies": [
         "@codemirror/language",
         "@codemirror/view",
@@ -1007,7 +1007,7 @@
       "npm:@sveltejs/vite-plugin-svelte@6.2.1",
       "npm:clsx@2.1.1",
       "npm:cookie@0.6.0",
-      "npm:decodal-codemirror@0.1.6",
+      "npm:decodal-codemirror@0.3.0",
       "npm:devalue@5.6.4",
       "npm:set-cookie-parser@2.7.2",
       "npm:shiki@3.13.0",
