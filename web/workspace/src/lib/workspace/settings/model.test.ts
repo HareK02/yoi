@@ -20,6 +20,11 @@ function assert(condition: unknown, message: string): asserts condition {
 Deno.test("settings section navigation stays under the settings route", () => {
   assert(SETTINGS_ROUTE === "/settings", "settings route should be stable");
 
+  assert(
+    settingsSectionHref("configuration-sources") === "/settings/configuration",
+    "shared configuration editor route should stay canonical",
+  );
+
   for (const section of SETTINGS_SECTIONS) {
     const href = settingsSectionHref(section.id);
     assert(

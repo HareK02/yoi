@@ -1,5 +1,6 @@
 <script lang="ts">
   import DiagnosticsList from "$lib/workspace/settings/DiagnosticsList.svelte";
+  import { settingsSectionHref } from "$lib/workspace/settings/model";
   import { fetchProfileSettings } from "$lib/workspace/settings/profile-api";
   import type { ProfileSettingsResponse } from "$lib/workspace/settings/profile-types";
   import type { PageProps } from "./$types";
@@ -44,7 +45,7 @@
       <p class="eyebrow">Workspace configuration projection</p>
       <h2 id="profiles-title">Profiles</h2>
     </div>
-    <a class="badge" href={`/w/${encodeURIComponent(workspaceId)}/settings/configuration-sources`}>
+    <a class="badge" href={`/w/${encodeURIComponent(workspaceId)}${settingsSectionHref("configuration-sources")}`}>
       Edit configuration
     </a>
   </header>
