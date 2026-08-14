@@ -146,6 +146,48 @@ const schemaContract: ToolchainContract = {
   fingerprint: await toolchainFingerprint(["main.dcdl"], schemaBundle),
 };
 
+const markdownSnapshot: ConfigTreeSnapshot = {
+  revision: 8,
+  digest: "sha256:markdown-tree",
+  entries: {
+    "main.dcdl": {
+      path: "main.dcdl",
+      content_type: "decodal",
+      content:
+        `{ skill = import "./skills/debug-rust/SKILL.md" as { frontmatter = { name = String; description = String; ...Unknown }; content = String; }; }`,
+      content_digest: "sha256:markdown-main",
+    },
+    "skills/debug-rust/SKILL.md": {
+      path: "skills/debug-rust/SKILL.md",
+      content_type: "text",
+      content:
+        "---\nname: debug-rust\ndescription: Debug Rust\ncustom-authority: no\n---\n# Debug Rust\n",
+      content_digest: "sha256:markdown-skill",
+    },
+  },
+};
+const markdownContract: ToolchainContract = {
+  ...contract,
+  entrypoints: ["main.dcdl"],
+  fingerprint: await toolchainFingerprint(["main.dcdl"], emptySchemaBundle),
+};
+
+Deno.test("generated WASM evaluates Markdown with the shared Skill projection", () => {
+  const result = evaluate_snapshot(markdownSnapshot, markdownContract) as {
+    projections: Array<{ data_json: Record<string, unknown> }>;
+  };
+  assertEquals(result.projections[0].data_json, {
+    skill: {
+      frontmatter: {
+        "custom-authority": "no",
+        description: "Debug Rust",
+        name: "debug-rust",
+      },
+      content: "# Debug Rust\n",
+    },
+  });
+});
+
 Deno.test("generated WASM applies Decodal 0.4 typed maps and explicit object rest", () => {
   const result = evaluate_snapshot(
     schemaSnapshot(
