@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
+pub use workdir::workspace::RuntimeWorkerRef;
 
 /// Runtime-local Worker identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -30,29 +31,16 @@ impl fmt::Display for WorkerId {
     }
 }
 
-/// Backend-visible Worker identity, namespaced by the Runtime that owns the Worker record.
-///
-/// This is intentionally distinct from [`WorkerRef`], which is meaningful only inside one
-/// Runtime. Do not flatten this reference into a concatenated string for authority decisions.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct RuntimeWorkerRef {
-    pub runtime_id: String,
-    pub worker_id: String,
-}
+/// Convert an opaque Workspace Worker reference only at the Runtime-local boundary.
+impl TryFrom<&RuntimeWorkerRef> for WorkerRef {
+    type Error = std::num::ParseIntError;
 
-impl RuntimeWorkerRef {
-    pub fn new(runtime_id: impl Into<String>, worker_id: impl Into<String>) -> Self {
-        Self {
-            runtime_id: runtime_id.into(),
-            worker_id: worker_id.into(),
-        }
-    }
-
-    pub fn local_worker_ref(&self) -> Result<WorkerRef, std::num::ParseIntError> {
-        self.worker_id
+    fn try_from(value: &RuntimeWorkerRef) -> Result<Self, Self::Error> {
+        value
+            .worker_id
             .parse::<u64>()
             .map(WorkerId::new)
-            .map(WorkerRef::new)
+            .map(Self::new)
     }
 }
 
@@ -78,7 +66,7 @@ mod tests {
         assert_eq!(worker.runtime_id, "arcadia");
         assert_eq!(worker.worker_id, "30");
         assert_eq!(
-            worker.local_worker_ref().unwrap(),
+            WorkerRef::try_from(&worker).unwrap(),
             WorkerRef::new(WorkerId::new(30))
         );
         assert_eq!(
@@ -90,6 +78,6 @@ mod tests {
     #[test]
     fn runtime_worker_ref_does_not_treat_composite_text_as_local_worker_id() {
         let worker = RuntimeWorkerRef::new("arcadia", "embedded-worker-runtime-5");
-        assert!(worker.local_worker_ref().is_err());
+        assert!(WorkerRef::try_from(&worker).is_err());
     }
 }

@@ -14,6 +14,10 @@ use llm_engine::tool::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use workdir::http::{WorkdirSessionOperation, WorkdirSessionOperationResult};
+use workdir::workspace::{
+    WorkingDirectoryDetailResponse as WorkdirDetailResponse,
+    WorkingDirectoryListResponse as WorkdirListResponse,
+};
 use workdir::{
     CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest, CommandStatus, EditRequest,
     EditResult, GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest, ListResult,
@@ -644,71 +648,6 @@ struct WorkdirDeleteInput {
     working_directory_id: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct WorkdirListResponse {
-    workspace_id: String,
-    items: Vec<WorkdirSummary>,
-    diagnostics: Vec<WorkdirDiagnostic>,
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct WorkdirDetailResponse {
-    workspace_id: String,
-    item: WorkdirSummary,
-    diagnostics: Vec<WorkdirDiagnostic>,
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct WorkdirSummary {
-    working_directory_id: String,
-    repository_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    creation_selector: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    creation_ref: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    current_selector: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    current_ref: Option<String>,
-    materializer_kind: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cleanup_target: Option<WorkdirCleanupTarget>,
-    status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cleanliness: Option<String>,
-    #[serde(
-        default,
-        alias = "primary_worker_id",
-        skip_serializing_if = "Option::is_none"
-    )]
-    attached_worker_id: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    occupied_by: Option<WorkdirOccupancy>,
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct WorkdirCleanupTarget {
-    kind: String,
-    working_directory_id: String,
-    repository_id: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct WorkdirOccupancy {
-    runtime_id: String,
-    runtime_worker_id: u64,
-    worker_id: String,
-    display_name: String,
-    linked_at: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct WorkdirDiagnostic {
-    code: String,
-    severity: String,
-    message: String,
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -783,7 +722,13 @@ mod tests {
                 "repository_id": "main"
             },
             "status": "active",
-            "cleanliness": "clean"
+            "cleanliness": "clean",
+            "occupied_by": {
+                "runtime_id": "arcadia",
+                "worker_id": "worker-opaque-64",
+                "display_name": "Coder",
+                "linked_at": "2026-08-12T00:00:00Z"
+            }
         })
     }
 
@@ -890,6 +835,18 @@ mod tests {
     }
 
     #[test]
+    fn legacy_runtime_worker_id_is_rejected_by_workspace_workdir_contract() {
+        let mut response = json!({
+            "workspace_id": "workspace/one",
+            "items": [workdir_json("wd-1")],
+            "diagnostics": []
+        });
+        response["items"][0]["occupied_by"]["runtime_worker_id"] = json!(64);
+
+        assert!(serde_json::from_value::<WorkdirListResponse>(response).is_err());
+    }
+
+    #[test]
     fn list_create_explicit_attach_detach_and_delete_use_scoped_workspace_authority_paths() {
         let client = Arc::new(RecordingWorkspaceClient::new(vec![
             response(json!({
@@ -925,7 +882,18 @@ mod tests {
         ]));
         let backend = WorkspaceHttpWorkdirBackend::new(client.clone());
 
-        backend.list().unwrap();
+        let listed = backend.list().unwrap();
+        let listed: serde_json::Value =
+            serde_json::from_str(listed.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            listed["items"][0]["occupied_by"]["worker_id"],
+            "worker-opaque-64"
+        );
+        assert!(
+            listed["items"][0]["occupied_by"]
+                .get("runtime_worker_id")
+                .is_none()
+        );
         let created = backend
             .create(WorkdirCreateInput {
                 runtime_id: "runtime/one".to_string(),
