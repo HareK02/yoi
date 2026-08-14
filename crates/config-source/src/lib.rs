@@ -998,6 +998,7 @@ impl ImportLoader for SnapshotImportLoader {
                 format!("virtual config import is missing: {path}"),
             )
         })?;
+        let cache_key = snapshot_import_cache_key(entry);
         if path.as_str().ends_with(".md") {
             let projection = project_markdown_document(&entry.content).map_err(|message| {
                 Diagnostic::new(
@@ -1013,10 +1014,10 @@ impl ImportLoader for SnapshotImportLoader {
                     format!("failed to import Markdown `{path}`: {message}"),
                 )
             })?;
-            return Ok(LoadedImport::value(path.as_str(), value));
+            return Ok(LoadedImport::value(cache_key, value));
         }
         Ok(LoadedImport::source(
-            path.as_str(),
+            cache_key,
             path.as_str(),
             entry.content.clone(),
         ))
@@ -1036,6 +1037,13 @@ impl ImportLoader for SnapshotImportLoader {
             .map(|specifier| ImportCandidate::new(specifier).with_detail("virtual config source"))
             .collect())
     }
+}
+
+fn snapshot_import_cache_key(entry: &ConfigEntry) -> String {
+    // The source id remains the virtual path for diagnostics and relative-import
+    // resolution. The cache identity also includes immutable source content so
+    // equal paths from different revisions cannot alias in an Engine cache.
+    format!("{}@{}", entry.path, entry.content_digest)
 }
 
 pub fn resolve_import(
@@ -1686,6 +1694,16 @@ mod tests {
         let configured =
             ToolchainContract::with_schema_bundle(1, vec![path("main.dcdl")], 1, schema);
         assert_ne!(empty.fingerprint, configured.fingerprint);
+    }
+
+    #[test]
+    fn snapshot_import_cache_key_binds_virtual_path_and_content_digest() {
+        let first = text_entry("skills/debug-rust/SKILL.md", "first");
+        let second = text_entry("skills/debug-rust/SKILL.md", "second");
+        let first_key = snapshot_import_cache_key(&first);
+        assert!(first_key.starts_with("skills/debug-rust/SKILL.md@sha256:"));
+        assert!(first_key.ends_with(&first.content_digest));
+        assert_ne!(first_key, snapshot_import_cache_key(&second));
     }
 
     #[test]
