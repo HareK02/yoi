@@ -1,6 +1,7 @@
 <script lang="ts">
     import { tick, untrack } from "svelte";
     import ConsoleLineItem from "$lib/workspace/console/ConsoleLineItem.svelte";
+    import ConsoleTasks from "$lib/workspace/console/ConsoleTasks.svelte";
     import ConsoleTimeline from "$lib/workspace/console/ConsoleTimeline.svelte";
     import { chatSubmit } from "$lib/workspace/console/chat-submit";
     import {
@@ -114,6 +115,7 @@
     } | null = null;
     let streamDiagnostics = $state<Diagnostic[]>([]);
     let workerDetailsOpen = $state(false);
+    let taskPaneOpen = $state(false);
     let timelineOpen = $state(false);
     let consoleBodyElement: HTMLElement | null = null;
     let composerTextareaElement: HTMLTextAreaElement | null = null;
@@ -148,6 +150,7 @@
     const consoleTarget = $derived({ workspaceId, runtimeId, workerId });
 
     const lines = $derived(consoleProjection.lines);
+    const tasks = $derived(consoleProjection.tasks);
     const timelineLayout = $derived(
         buildTimelineLayout(lines, eventObservedAtVersion, consoleScroll),
     );
@@ -1086,6 +1089,7 @@
         const targetWorker = data.worker;
         const targetWorkerError = data.workerError;
         resetObservedEvents();
+        taskPaneOpen = false;
         worker = targetWorker;
         workerError = targetWorkerError;
         liveWorkerState = targetWorker?.state ?? null;
@@ -1158,8 +1162,22 @@
             <button
                 type="button"
                 class="secondary-button"
+                aria-expanded={taskPaneOpen}
+                onclick={() => {
+                    taskPaneOpen = !taskPaneOpen;
+                    if (taskPaneOpen) workerDetailsOpen = false;
+                }}
+            >
+                Tasks{tasks.length > 0 ? ` ${tasks.length}` : ""}
+            </button>
+            <button
+                type="button"
+                class="secondary-button"
                 aria-expanded={workerDetailsOpen}
-                onclick={() => (workerDetailsOpen = !workerDetailsOpen)}
+                onclick={() => {
+                    workerDetailsOpen = !workerDetailsOpen;
+                    if (workerDetailsOpen) taskPaneOpen = false;
+                }}
             >
                 Details
             </button>
@@ -1192,7 +1210,8 @@
         </section>
     {/if}
 
-    <section class:timeline-open={timelineOpen} class="console-body">
+    <div class:with-task-pane={taskPaneOpen} class="console-history">
+        <section class:timeline-open={timelineOpen} class="console-body">
         <div class="console-timeline-spacer" aria-hidden="true"></div>
         <div class="timeline-fold-cell">
             <button
@@ -1227,15 +1246,20 @@
             </article>
         </div>
 
-        <ConsoleTimeline
-            marks={timelineMarks}
-            thumbStyle={timelineThumb}
-            axisStyle={timelineAxisStyle}
-            expanded={timelineOpen}
-            onRailPointerDown={handleTimelineRailPointerDown}
-            onMarkClick={jumpToTimelineMark}
-        />
-    </section>
+            <ConsoleTimeline
+                marks={timelineMarks}
+                thumbStyle={timelineThumb}
+                axisStyle={timelineAxisStyle}
+                expanded={timelineOpen}
+                onRailPointerDown={handleTimelineRailPointerDown}
+                onMarkClick={jumpToTimelineMark}
+            />
+        </section>
+
+        {#if taskPaneOpen}
+            <ConsoleTasks {tasks} mode="pane" />
+        {/if}
+    </div>
 
     {#if workerDetailsOpen}
         <aside class="console-side-panel" aria-label="Worker detail">
@@ -1319,6 +1343,8 @@
             {/if}
         </aside>
     {/if}
+
+    <ConsoleTasks {tasks} mode="mini" />
 
     <form class="console-composer card" onsubmit={sendMessage}>
         <div class="composer-input-shell">
@@ -1406,7 +1432,7 @@
         overflow: hidden;
     }
 
-    .worker-console-shell > .console-body {
+    .worker-console-shell > .console-history {
         flex: 1 1 auto;
         min-height: 0;
         overflow: hidden;
@@ -1476,6 +1502,17 @@
     .rewind-target-list span {
         margin-left: 0.5rem;
         color: var(--text-muted);
+    }
+
+    .console-history {
+        display: grid;
+        min-height: 0;
+        flex: 1;
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .console-history.with-task-pane {
+        grid-template-columns: minmax(0, 2fr) minmax(18rem, 1fr);
     }
 
     .console-body {
@@ -1734,6 +1771,10 @@
     }
 
     @media (max-width: 960px) {
+        .console-history.with-task-pane {
+            grid-template-columns: minmax(0, 1fr);
+        }
+
         .console-header {
             flex-direction: column;
         }

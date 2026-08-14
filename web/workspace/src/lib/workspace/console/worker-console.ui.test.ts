@@ -775,3 +775,41 @@ Deno.test("Workspace Worker list and Console share the multiplexed connection", 
     "A reused Console route should subscribe immediately on the live Workspace socket and install the new route Worker",
   );
 });
+
+Deno.test("Web Console renders the client-projected Worker task store", async () => {
+  const consolePage = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      import.meta.url,
+    ),
+  );
+  const tasksComponent = await Deno.readTextFile(
+    new URL("./ConsoleTasks.svelte", import.meta.url),
+  );
+  const tasksModel = await Deno.readTextFile(
+    new URL("./tasks.ts", import.meta.url),
+  );
+
+  assert(
+    consolePage.includes("ConsoleTasks") &&
+      consolePage.includes("consoleProjection.tasks") &&
+      consolePage.includes("taskPaneOpen"),
+    "Console should expose the projected task store through its existing client model",
+  );
+  assert(
+    tasksComponent.includes("[ ]") &&
+      tasksComponent.includes("[~]") &&
+      tasksComponent.includes("[x]") &&
+      tasksComponent.includes("[-]") &&
+      tasksComponent.includes("task(s) — pending:") &&
+      tasksComponent.includes("task.description"),
+    "Tasks UI should mirror the TUI status marks, summary, and descriptions",
+  );
+  assert(
+    tasksModel.includes('name === "TaskCreate"') &&
+      tasksModel.includes('name !== "TaskUpdate"') &&
+      tasksModel.includes("[Session TaskStore snapshot]") &&
+      !consolePage.includes("fetchTasks"),
+    "Task projection should replay the protocol client-side without adding a task API",
+  );
+});

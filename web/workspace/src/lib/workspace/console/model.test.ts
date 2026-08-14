@@ -1126,3 +1126,68 @@ Deno.test("projectConsole relativizes known tool path displays from snapshot cwd
     "Grep should relativize line-start cwd paths and keep outside paths absolute",
   );
 });
+
+Deno.test("projectConsole mirrors live TaskCreate and TaskUpdate calls", () => {
+  const projection = projectConsole([
+    {
+      eventId: "task-create",
+      event: {
+        event: "tool_call_done",
+        data: {
+          id: "task-create-1",
+          name: "TaskCreate",
+          arguments: JSON.stringify({
+            subject: "Port Tasks",
+            description: "Render active Worker tasks",
+          }),
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "task-update",
+      event: {
+        event: "tool_call_done",
+        data: {
+          id: "task-update-1",
+          name: "TaskUpdate",
+          arguments: JSON.stringify({ taskid: 1, status: "inprogress" }),
+        },
+      } satisfies Event,
+    },
+  ]);
+
+  assertEquals(projection.tasks, [{
+    taskid: 1,
+    status: "inprogress",
+    subject: "Port Tasks",
+    description: "Render active Worker tasks",
+  }]);
+});
+
+Deno.test("snapshot restores TaskStore state from system history", () => {
+  const taskSnapshot =
+    `[Session TaskStore snapshot]\n\n\`\`\`json\n{\n  "tasks": [{"taskid": 3, "status": "pending", "subject": "Restored", "description": "From compaction"}]\n}\n\`\`\``;
+  const event = snapshotEvent("/repo");
+  if (event.event !== "snapshot") throw new Error("snapshot fixture expected");
+  event.data.entries = [{
+    kind: "segment_start",
+    ts: 1,
+    session_id: "00000000-0000-0000-0000-000000000001",
+    system_prompt: null,
+    config: {},
+    history: [{
+      kind: "message",
+      role: "system",
+      content: [{ kind: "text", text: taskSnapshot }],
+    }],
+  }];
+
+  const projection = projectConsole([{ eventId: "task-snapshot", event }]);
+  assertEquals(projection.tasks, [{
+    taskid: 3,
+    status: "pending",
+    subject: "Restored",
+    description: "From compaction",
+  }]);
+  assertEquals(projection.taskNextId, 4);
+});

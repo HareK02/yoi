@@ -6,6 +6,11 @@ import type {
   Segment,
 } from "$lib/generated/protocol";
 import { workspaceRoute } from "$lib/workspace/api/http";
+import {
+  applyTaskSnapshotText,
+  applyTaskToolCall,
+  type ConsoleTask,
+} from "./tasks.ts";
 
 export type ConsoleLineKind =
   | "user"
@@ -60,6 +65,8 @@ export type ConsoleLine = {
 
 export type ConsoleProjection = {
   lines: ConsoleLine[];
+  tasks: ConsoleTask[];
+  taskNextId: number;
   status: string | null;
   usage: string | null;
   cwd: string | null;
@@ -138,6 +145,8 @@ export type ConsoleEventInput = {
 export function emptyConsoleProjection(): ConsoleProjection {
   return {
     lines: [],
+    tasks: [],
+    taskNextId: 1,
     status: null,
     usage: null,
     cwd: null,
@@ -189,6 +198,8 @@ export function applyProtocolEvent(
 ): ConsoleProjection {
   const next: ConsoleProjection = {
     lines: [...projection.lines],
+    tasks: [...projection.tasks],
+    taskNextId: projection.taskNextId,
     status: projection.status,
     usage: projection.usage,
     cwd: projection.cwd,
@@ -209,6 +220,7 @@ export function applyProtocolEvent(
       break;
     case "system_item":
       next.lines.push(systemItemLine(envelope.eventId, event.data.item));
+      applyTaskSystemItem(next, event.data.item);
       break;
     case "text_delta":
       appendStreaming(
@@ -267,6 +279,7 @@ export function applyProtocolEvent(
         argsStream: event.data.arguments,
         state: "running",
       });
+      applyTaskTool(next, event.data.name, event.data.arguments);
       break;
     case "tool_result":
       attachToolResult(next, envelope.eventId, event.data.id, {
@@ -291,26 +304,36 @@ export function applyProtocolEvent(
         ),
       );
       break;
-    case "snapshot":
+    case "snapshot": {
       next.status = event.data.status;
       next.cwd = event.data.greeting.cwd;
-      next.lines = snapshotLinesFromEntries(
+      const snapshot = snapshotProjectionFromEntries(
         envelope.eventId,
         event.data.entries,
         next.cwd,
       );
+      next.lines = snapshot.lines;
+      next.tasks = snapshot.tasks;
+      next.taskNextId = snapshot.taskNextId;
       for (const block of event.data.in_flight?.blocks ?? []) {
         next.lines.push(inFlightLine(envelope.eventId, block, next.cwd));
       }
       break;
+    }
     case "status":
       next.status = event.data.status;
       break;
-    case "segment_rotated":
-      next.lines = snapshotLinesFromEntries(envelope.eventId, [
-        event.data.entry,
-      ], next.cwd);
+    case "segment_rotated": {
+      const segment = snapshotProjectionFromEntries(
+        envelope.eventId,
+        [event.data.entry],
+        next.cwd,
+      );
+      next.lines = segment.lines;
+      next.tasks = segment.tasks;
+      next.taskNextId = segment.taskNextId;
       break;
+    }
     case "invoke_start":
     case "turn_start":
     case "turn_end":
@@ -1111,13 +1134,47 @@ function usageText(
   } · cache ${data.cache_read_input_tokens ?? "unknown"}`;
 }
 
-function snapshotLinesFromEntries(
+function applyTaskTool(
+  projection: ConsoleProjection,
+  name: string,
+  argumentsJson: string,
+): void {
+  const state = applyTaskToolCall(
+    { tasks: projection.tasks, nextTaskId: projection.taskNextId },
+    name,
+    argumentsJson,
+  );
+  projection.tasks = state.tasks;
+  projection.taskNextId = state.nextTaskId;
+}
+
+function applyTaskSnapshot(projection: ConsoleProjection, text: string): void {
+  const state = applyTaskSnapshotText(
+    { tasks: projection.tasks, nextTaskId: projection.taskNextId },
+    text,
+  );
+  projection.tasks = state.tasks;
+  projection.taskNextId = state.nextTaskId;
+}
+
+function applyTaskSystemItem(
+  projection: ConsoleProjection,
+  item: unknown,
+): void {
+  if (!isRecord(item)) return;
+  const body = item["body"];
+  if (typeof body === "string") applyTaskSnapshot(projection, body);
+}
+
+function snapshotProjectionFromEntries(
   eventId: string,
   entries: unknown[],
   cwd: string | null,
-): ConsoleLine[] {
+): ConsoleProjection {
   const projection: ConsoleProjection = {
     lines: [],
+    tasks: [],
+    taskNextId: 1,
     status: null,
     usage: null,
     cwd,
@@ -1126,7 +1183,7 @@ function snapshotLinesFromEntries(
   entries.forEach((entry, index) =>
     applyLogEntry(projection, `${eventId}-snapshot-${index}`, entry)
   );
-  return projection.lines;
+  return projection;
 }
 
 function applyLogEntry(
@@ -1153,6 +1210,7 @@ function applyLogEntry(
       break;
     case "system_item":
       projection.lines.push(systemItemLine(eventId, entry["item"]));
+      applyTaskSystemItem(projection, entry["item"]);
       break;
     case "assistant_item":
     case "tool_result":
@@ -1224,6 +1282,9 @@ function applyLoggedItem(
         case "assistant":
           projection.lines.push(line(eventId, "assistant", "assistant", body));
           break;
+        case "system":
+          applyTaskSnapshot(projection, body);
+          break;
         default:
           break;
       }
@@ -1238,19 +1299,23 @@ function applyLoggedItem(
       }
       break;
     }
-    case "tool_call":
+    case "tool_call": {
+      const name = stringField(item, "name") ?? "Tool";
+      const argumentsJson = stringField(item, "arguments") ?? "";
       upsertToolCall(
         projection,
         eventId,
         stringField(item, "call_id") ?? eventId,
         {
-          name: stringField(item, "name") ?? "Tool",
-          arguments: stringField(item, "arguments") ?? "",
-          argsStream: stringField(item, "arguments") ?? "",
+          name,
+          arguments: argumentsJson,
+          argsStream: argumentsJson,
           state: "running",
         },
       );
+      applyTaskTool(projection, name, argumentsJson);
       break;
+    }
     case "tool_result":
       attachToolResult(
         projection,
