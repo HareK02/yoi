@@ -14,8 +14,6 @@
   } from "./types.ts";
 
   const MAIN_ENTRYPOINT = "main.dcdl";
-  const WORKSPACE_SCHEMA_ASSERTION = "WorkspaceConfigSchema";
-  const WORKSPACE_SCHEMA_SUFFIX = `} as ${WORKSPACE_SCHEMA_ASSERTION}`;
 
   let { workspaceId }: { workspaceId: string } = $props();
   let treeState = $state<WorkspaceConfigTreeResponse | null>(null);
@@ -42,7 +40,6 @@
     treeState && selectedPath ? treeState.snapshot.entries[selectedPath] : undefined,
   );
   const mainSelected = $derived(selectedPath === MAIN_ENTRYPOINT);
-  const mainSchemaWrapped = $derived(mainSelected && hasWorkspaceSchemaWrapper(source));
   const dirty = $derived(draftChanges.length > 0 || (selected ? source !== selected.content : source.length > 0));
   const commitReady = $derived(dirty && preflightDigest === treeState?.snapshot.digest);
 
@@ -115,35 +112,6 @@
 
   function entrypoints(): string[] {
     return [MAIN_ENTRYPOINT];
-  }
-
-  function hasWorkspaceSchemaWrapper(value: string): boolean {
-    const sourceWithoutTrailingWhitespace = value.trimEnd();
-    return value.startsWith("{") && sourceWithoutTrailingWhitespace.endsWith(WORKSPACE_SCHEMA_SUFFIX);
-  }
-
-  async function wrapMainWithWorkspaceSchema() {
-    if (!toolchain || !mainSelected || mainSchemaWrapped || busy) return;
-    const candidate = source.trim();
-    if (!candidate.startsWith("{") || !candidate.endsWith("}")) {
-      status = "WorkspaceConfigSchema can only wrap a top-level object source.";
-      return;
-    }
-    busy = true;
-    try {
-      source = await toolchain.format(`${candidate} as ${WORKSPACE_SCHEMA_ASSERTION}`);
-      diagnostics = await toolchain.analyze(selectedPath, source);
-      preflightDigest = "";
-      candidateContract = null;
-      conflict = false;
-      status = diagnostics.length === 0
-        ? "WorkspaceConfigSchema wrapper staged. Preview and Commit to persist it."
-        : `${diagnostics.length} diagnostic(s) after adding WorkspaceConfigSchema.`;
-    } catch (error) {
-      status = String(error);
-    } finally {
-      busy = false;
-    }
   }
 
   async function analyze() {
@@ -344,9 +312,6 @@
       <div class="config-source-actions">
         <input aria-label="Rename path" bind:value={renamePath} disabled={!selected || mainSelected || busy} />
         <button type="button" onclick={renameEntry} disabled={!selected || mainSelected || renamePath === selectedPath || busy}>Rename</button>
-        {#if mainSelected && !mainSchemaWrapped}
-          <button type="button" onclick={wrapMainWithWorkspaceSchema} disabled={!selected || busy}>Wrap with WorkspaceConfigSchema</button>
-        {/if}
         <button type="button" onclick={format} disabled={!selectedPath || busy}>Format</button>
         <button type="button" onclick={analyze} disabled={!selectedPath || busy}>Analyze</button>
         <button type="button" onclick={preview} disabled={!dirty || busy}>Preview</button>
@@ -357,7 +322,7 @@
     <DecodalSourceEditor
       value={source}
       readonly={!selectedPath || busy}
-      fixedSchemaWrapper={mainSchemaWrapped}
+      fixedSchemaWrapper={mainSelected}
       onChange={(value) => source = value}
       onComplete={(value, offset, explicit) => toolchain?.complete(selectedPath, value, offset, explicit) ?? Promise.resolve(null)}
     />

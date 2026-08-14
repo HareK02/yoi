@@ -584,7 +584,7 @@ impl WorkspaceConfigSchemaBundle {
             }
         }
         let source = if contributions.is_empty() {
-            "{}".to_string()
+            "{ ...Unknown }".to_string()
         } else {
             contributions
                 .iter()
@@ -1012,7 +1012,10 @@ impl SnapshotEnvironment {
                 &error.to_string(),
             )]);
         }
-        let service = LanguageService::new(self);
+        let analysis_environment = self
+            .clone()
+            .with_schema_bundle(contract.schema_bundle.clone());
+        let service = LanguageService::new(&analysis_environment);
         let diagnostics = self
             .snapshot
             .entries
@@ -1845,6 +1848,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(left.digest, right.digest);
+    }
+
+    #[test]
+    fn entrypoint_can_assert_empty_workspace_schema_global() {
+        let snapshot = ConfigTreeSnapshot::from_entries(
+            1,
+            [entry(
+                "main.dcdl",
+                "{ answer = 42; } as WorkspaceConfigSchema",
+            )],
+        )
+        .unwrap();
+        let contract = ToolchainContract::new(1, vec![path("main.dcdl")], 1);
+        SnapshotEnvironment::new(snapshot)
+            .evaluate_contract(&contract)
+            .unwrap();
     }
 
     #[test]

@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::{Error, Result, SqliteWorkspaceStore};
 
 pub const MAIN_CONFIG_ENTRYPOINT: &str = "main.dcdl";
-pub const DEFAULT_MAIN_CONFIG_SOURCE: &str = "{}\n";
+pub const DEFAULT_MAIN_CONFIG_SOURCE: &str = "{} as WorkspaceConfigSchema\n";
+const WORKSPACE_CONFIG_SCHEMA_ASSERTION: &str = "WorkspaceConfigSchema";
 const MAX_TOOLCHAIN_UPGRADE_DIAGNOSTICS: usize = 20;
 
 fn toolchain_upgrade_diagnostics(mut diagnostics: Vec<ConfigDiagnostic>) -> Error {
@@ -175,8 +176,13 @@ impl SqliteWorkspaceStore {
             tx.commit()?;
             Ok((state, requires_toolchain_refresh))
         })?;
+        let main_needs_normalization = state
+            .snapshot
+            .get(&main_config_path())
+            .is_some_and(|entry| !main_config_has_schema_assertion(&entry.content));
         if requires_toolchain_refresh
             || state.contract.schema_bundle.fingerprint != desired_schema.fingerprint
+            || main_needs_normalization
         {
             let candidate = evaluate_candidate(state, &[], desired_schema)?;
             return self.commit_evaluated_workspace_config(workspace_id, &candidate);
@@ -403,6 +409,53 @@ impl SqliteWorkspaceStore {
     }
 }
 
+fn main_config_has_schema_assertion(source: &str) -> bool {
+    source.starts_with('{')
+        && source
+            .trim_end()
+            .ends_with(&format!("}} as {WORKSPACE_CONFIG_SCHEMA_ASSERTION}"))
+}
+
+fn normalize_main_config_schema_assertion(
+    snapshot: ConfigTreeSnapshot,
+) -> Result<ConfigTreeSnapshot> {
+    let main_path = main_config_path();
+    let main = snapshot.get(&main_path).ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "workspace config snapshot must contain {MAIN_CONFIG_ENTRYPOINT}"
+        ))
+    })?;
+    if main_config_has_schema_assertion(&main.content) {
+        return Ok(snapshot);
+    }
+
+    let source = main.content.trim();
+    let normalized = if source.starts_with('{')
+        && source.ends_with(&format!("}} as {WORKSPACE_CONFIG_SCHEMA_ASSERTION}"))
+    {
+        format!("{source}\n")
+    } else if source.starts_with('{') && source.ends_with('}') {
+        format!("{source} as {WORKSPACE_CONFIG_SCHEMA_ASSERTION}\n")
+    } else {
+        return Err(Error::InvalidInput(format!(
+            "{MAIN_CONFIG_ENTRYPOINT} must be a top-level object so it can be asserted as {WORKSPACE_CONFIG_SCHEMA_ASSERTION}"
+        )));
+    };
+    let revision = snapshot.revision;
+    let mut entries = Vec::with_capacity(snapshot.entries.len());
+    for entry in snapshot.entries.into_values() {
+        if entry.path == main_path {
+            entries.push(
+                ConfigEntry::new(entry.path, entry.content_type, normalized.clone())
+                    .map_err(config_error)?,
+            );
+        } else {
+            entries.push(entry);
+        }
+    }
+    ConfigTreeSnapshot::from_entries(revision, entries).map_err(config_error)
+}
+
 fn evaluate_candidate(
     current: WorkspaceConfigState,
     changes: &[ConfigTreeChange],
@@ -411,6 +464,7 @@ fn evaluate_candidate(
     reject_main_entrypoint_mutation(changes)?;
     let snapshot = current.snapshot.apply(changes).map_err(config_error)?;
     ensure_main_entrypoint(&snapshot)?;
+    let snapshot = normalize_main_config_schema_assertion(snapshot)?;
     let contract = main_config_contract_with_schema(schema_bundle);
     let evaluation = SnapshotEnvironment::new(snapshot.clone())
         .evaluate_contract(&contract)
@@ -1263,6 +1317,103 @@ mod tests {
                 .unwrap()
                 .content,
             DEFAULT_MAIN_CONFIG_SOURCE
+        );
+        assert!(main_config_has_schema_assertion(DEFAULT_MAIN_CONFIG_SOURCE));
+    }
+
+    #[tokio::test]
+    async fn candidate_normalizes_main_schema_assertion_only_for_entrypoint() {
+        let store = open_store().await;
+        let current = store.load_workspace_config("w-config").unwrap().unwrap();
+        let candidate = store
+            .preview_workspace_config(
+                "w-config",
+                &ConfigPreviewRequest {
+                    changes: vec![
+                        update_main(&current, "{}"),
+                        ConfigTreeChange::Create {
+                            path: path("module.dcdl"),
+                            content_type: ConfigContentType::Decodal,
+                            content: "{}".into(),
+                        },
+                    ],
+                    entrypoints: vec![path(MAIN_CONFIG_ENTRYPOINT)],
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            candidate
+                .snapshot
+                .get(&path(MAIN_CONFIG_ENTRYPOINT))
+                .unwrap()
+                .content,
+            DEFAULT_MAIN_CONFIG_SOURCE
+        );
+        assert_eq!(
+            candidate
+                .snapshot
+                .get(&path("module.dcdl"))
+                .unwrap()
+                .content,
+            "{}"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialization_upgrades_legacy_main_and_preserves_prior_revision() {
+        let store = open_store().await;
+        let current = store.load_workspace_config("w-config").unwrap().unwrap();
+        let legacy_snapshot = ConfigTreeSnapshot::from_entries(
+            current.snapshot.revision + 1,
+            [ConfigEntry::new(
+                path(MAIN_CONFIG_ENTRYPOINT),
+                ConfigContentType::Decodal,
+                "{}",
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let legacy = WorkspaceConfigState {
+            projection_digest: current.projection_digest.clone(),
+            snapshot: legacy_snapshot,
+            contract: current.contract.clone(),
+        };
+        store
+            .with_conn_mut(|conn| {
+                conn.execute(
+                    "DELETE FROM workspace_config_entries WHERE workspace_id = ?1",
+                    params!["w-config"],
+                )?;
+                insert_materialized_state(conn, "w-config", &legacy, "2026-08-14T00:00:00Z")
+            })
+            .unwrap();
+
+        let upgraded = store
+            .ensure_workspace_config_materialized_with_schema(
+                "w-config",
+                "2026-08-14T00:00:01Z",
+                current.contract.schema_bundle.clone(),
+            )
+            .unwrap();
+        assert_eq!(upgraded.snapshot.revision, legacy.snapshot.revision + 1);
+        assert_eq!(
+            upgraded
+                .snapshot
+                .get(&path(MAIN_CONFIG_ENTRYPOINT))
+                .unwrap()
+                .content,
+            DEFAULT_MAIN_CONFIG_SOURCE
+        );
+        assert_eq!(
+            store
+                .load_workspace_config_revision("w-config", legacy.snapshot.revision)
+                .unwrap()
+                .unwrap()
+                .get(&path(MAIN_CONFIG_ENTRYPOINT))
+                .unwrap()
+                .content,
+            "{}"
         );
     }
 

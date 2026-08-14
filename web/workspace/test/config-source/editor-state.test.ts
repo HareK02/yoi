@@ -80,7 +80,7 @@ Deno.test("Decodal editor follows readonly prop changes after mount", async () =
   );
 });
 
-Deno.test("main config wrapper is an explicit canonical draft conversion", async () => {
+Deno.test("main entrypoint always enables the fixed schema wrapper", async () => {
   const source = await Deno.readTextFile(
     new URL(
       "../../src/lib/workspace/config-source/ConfigSourceEditor.svelte",
@@ -89,15 +89,12 @@ Deno.test("main config wrapper is an explicit canonical draft conversion", async
   );
 
   assert(
-    source.includes("Wrap with WorkspaceConfigSchema") &&
-      source.includes("wrapMainWithWorkspaceSchema") &&
-      source.includes("fixedSchemaWrapper={mainSchemaWrapped}"),
-    "legacy main sources should offer an explicit conversion before fixed wrapper mode is enabled",
+    source.includes("fixedSchemaWrapper={mainSelected}"),
+    "main.dcdl should always enable fixed wrapper behavior",
   );
   assert(
-    source.includes("source.trim()") &&
-      source.includes("toolchain.format") &&
-      source.includes("wrapper staged. Preview and Commit"),
-    "conversion should remain a formatted local draft until the normal commit flow",
+    !source.includes("Wrap with WorkspaceConfigSchema") &&
+      !source.includes("wrapMainWithWorkspaceSchema"),
+    "the authoritative main source should not require an optional client-side conversion",
   );
 });

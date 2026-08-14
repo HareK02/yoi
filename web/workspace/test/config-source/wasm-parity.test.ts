@@ -81,10 +81,37 @@ const contract: ToolchainContract = {
   ),
 };
 
+const mainEntrypointContract: ToolchainContract = {
+  ...contract,
+  entrypoints: ["main.dcdl"],
+  fingerprint: await toolchainFingerprint(["main.dcdl"], emptySchemaBundle),
+};
+
 Deno.test("generated WASM evaluates the same virtual import contract", () => {
   const result = evaluate_snapshot(snapshot, contract) as {
     projections: Array<{ data_json: { answer: number } }>;
   };
+  assertEquals(result.projections[0].data_json, { answer: 42 });
+});
+
+Deno.test("generated WASM accepts the mandatory main schema assertion", () => {
+  const assertedSnapshot: ConfigTreeSnapshot = {
+    revision: 1,
+    digest: "sha256:asserted-main",
+    entries: {
+      "main.dcdl": {
+        path: "main.dcdl",
+        content_type: "decodal",
+        content: "{ answer = 42; } as WorkspaceConfigSchema\n",
+        content_digest: "sha256:asserted-main-entry",
+      },
+    },
+  };
+  const result = evaluate_snapshot(
+    assertedSnapshot,
+    mainEntrypointContract,
+  ) as { projections: Array<{ data_json: { answer: number } }> };
+
   assertEquals(result.projections[0].data_json, { answer: 42 });
 });
 
