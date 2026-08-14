@@ -1160,7 +1160,10 @@ where
                             match event {
                                 Ok(event) => {
                                     let _ = bridge_context.publish_protocol_event(event);
-                                    if bridge_handle.shared_state.get_status() == WorkerStatus::Idle {
+                                    if matches!(
+                                        bridge_handle.shared_state.get_status(),
+                                        WorkerStatus::Idle | WorkerStatus::Paused
+                                    ) {
                                         bridge_busy.store(false, Ordering::SeqCst);
                                     }
                                 }
@@ -1238,6 +1241,13 @@ fn method_starts_turn(method: &Method) -> bool {
             | Method::Resume
             | Method::Compact
     )
+}
+
+fn method_can_start_turn_from_status(method: &Method, status: WorkerStatus) -> bool {
+    match method {
+        Method::Resume => matches!(status, WorkerStatus::Idle | WorkerStatus::Paused),
+        _ => status == WorkerStatus::Idle,
+    }
 }
 
 fn accepted_notify_run_state(status: WorkerStatus, auto_run: bool) -> WorkerExecutionRunState {
@@ -1696,7 +1706,7 @@ where
 
         let starts_turn = method_starts_turn(&method);
         if starts_turn
-            && (worker.shared_state.get_status() != WorkerStatus::Idle
+            && (!method_can_start_turn_from_status(&method, worker.shared_state.get_status())
                 || busy
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                     .is_err())
@@ -1842,7 +1852,7 @@ mod tests {
     use crate::observation::WorkerObservationCursor;
     use crate::working_directory::LocalGitWorktreeMaterializer;
     use async_trait::async_trait;
-    use futures::Stream;
+    use futures::{Stream, StreamExt};
     use llm_engine::Engine;
     use llm_engine::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
     use llm_engine::llm_client::{ClientError, LlmClient, Request};
@@ -1903,17 +1913,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resume_turn_claim_accepts_paused_and_idle_but_not_running_status() {
+        assert!(method_can_start_turn_from_status(
+            &Method::Resume,
+            WorkerStatus::Paused
+        ));
+        assert!(method_can_start_turn_from_status(
+            &Method::Resume,
+            WorkerStatus::Idle
+        ));
+        assert!(!method_can_start_turn_from_status(
+            &Method::Resume,
+            WorkerStatus::Running
+        ));
+        assert!(!method_can_start_turn_from_status(
+            &Method::Compact,
+            WorkerStatus::Paused
+        ));
+    }
+
+    #[derive(Clone)]
+    enum MockResponse {
+        Complete(Vec<LlmEvent>),
+        Hang(Vec<LlmEvent>),
+    }
+
     #[derive(Clone)]
     struct MockClient {
-        responses: Arc<Vec<Vec<LlmEvent>>>,
+        responses: Arc<Vec<MockResponse>>,
         call_count: Arc<AtomicUsize>,
         captured: Arc<Mutex<Vec<Request>>>,
     }
 
     impl MockClient {
         fn new(events: Vec<LlmEvent>) -> Self {
+            Self::sequential(vec![MockResponse::Complete(events)])
+        }
+
+        fn sequential(responses: Vec<MockResponse>) -> Self {
             Self {
-                responses: Arc::new(vec![events]),
+                responses: Arc::new(responses),
                 call_count: Arc::new(AtomicUsize::new(0)),
                 captured: Arc::new(Mutex::new(Vec::new())),
             }
@@ -1933,8 +1973,20 @@ mod tests {
         {
             self.captured.lock().unwrap().push(request);
             let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
-            let events = self.responses.get(idx).cloned().unwrap_or_default();
-            Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+            let response = self
+                .responses
+                .get(idx)
+                .cloned()
+                .unwrap_or_else(|| MockResponse::Complete(Vec::new()));
+            match response {
+                MockResponse::Complete(events) => {
+                    Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+                }
+                MockResponse::Hang(events) => Ok(Box::pin(
+                    futures::stream::iter(events.into_iter().map(Ok))
+                        .chain(futures::stream::pending()),
+                )),
+            }
         }
     }
 
@@ -2071,6 +2123,31 @@ mod tests {
             .iter()
             .map(|tool| tool.name.clone())
             .collect()
+    }
+
+    fn wait_for_adapter_state(
+        backend: &WorkerRuntimeExecutionBackend<MockFactory>,
+        worker_ref: &WorkerRef,
+        expected_status: WorkerStatus,
+        expected_busy: bool,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let matches = {
+                let workers = backend.workers.lock().unwrap();
+                let execution = workers.get(worker_ref).expect("live Worker execution");
+                execution.handle.shared_state.get_status() == expected_status
+                    && execution.busy.load(Ordering::SeqCst) == expected_busy
+            };
+            if matches {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for adapter state {expected_status:?}, busy={expected_busy}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn simple_text_events() -> Vec<LlmEvent> {
@@ -2866,6 +2943,101 @@ mod tests {
             observed_workspace_clients.lock().unwrap().as_slice(),
             &[("unavailable".to_string(), None, false)]
         );
+    }
+
+    #[test]
+    #[cfg(feature = "ws-server")]
+    fn adapter_resumes_paused_turn_once_and_preserves_idle_not_paused_error() {
+        let hanging_events = || simple_text_events().into_iter().take(2).collect::<Vec<_>>();
+        let client = MockClient::sequential(vec![
+            MockResponse::Hang(hanging_events()),
+            MockResponse::Hang(hanging_events()),
+            MockResponse::Complete(simple_text_events()),
+        ]);
+        let call_count = client.call_count.clone();
+        let runtime_base = tempfile::tempdir().unwrap();
+        let repo = create_clean_repo();
+        let store = tempfile::tempdir().unwrap();
+        let factory = MockFactory {
+            client,
+            runtime_base: runtime_base.path().to_path_buf(),
+            cwd: repo.path().to_path_buf(),
+            store_dir: store.path().join("sessions"),
+            worker_metadata_dir: store.path().join("workers"),
+            observed_cwds: Arc::new(Mutex::new(Vec::new())),
+            observed_workspace_clients: Arc::new(Mutex::new(Vec::new())),
+        };
+        let backend = Arc::new(WorkerRuntimeExecutionBackend::new(factory).unwrap());
+        let runtime =
+            EmbeddedRuntime::with_execution_backend(RuntimeOptions::default(), backend.clone())
+                .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let detail = runtime
+            .create_worker(create_request("paused-resume"))
+            .unwrap();
+
+        runtime
+            .send_input(&detail.worker_ref, WorkerInput::user("pause and resume"))
+            .expect("start initial turn");
+        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Running, true);
+
+        let running_resume = runtime
+            .send_protocol_method(&detail.worker_ref, Method::Resume)
+            .expect_err("Resume while Running must be rejected");
+        assert!(
+            running_resume
+                .to_string()
+                .contains("does not queue protocol methods"),
+            "unexpected Running Resume error: {running_resume}"
+        );
+
+        runtime
+            .send_protocol_method(&detail.worker_ref, Method::Pause)
+            .expect("pause initial turn");
+        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Paused, false);
+
+        runtime
+            .send_protocol_method(&detail.worker_ref, Method::Resume)
+            .expect("resume paused turn");
+        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Running, true);
+
+        let duplicate_resume = runtime
+            .send_protocol_method(&detail.worker_ref, Method::Resume)
+            .expect_err("duplicate Resume must be rejected");
+        assert!(
+            duplicate_resume
+                .to_string()
+                .contains("does not queue protocol methods"),
+            "unexpected duplicate Resume error: {duplicate_resume}"
+        );
+
+        runtime
+            .send_protocol_method(&detail.worker_ref, Method::Pause)
+            .expect("pause resumed turn");
+        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Paused, false);
+        runtime
+            .send_protocol_method(&detail.worker_ref, Method::Resume)
+            .expect("resume paused turn a second time");
+        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Idle, false);
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+
+        runtime
+            .send_protocol_method(&detail.worker_ref, Method::Resume)
+            .expect("Idle Resume preserves controller NotPaused semantics");
+        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Idle, false);
+        let events = runtime
+            .read_worker_observation_events(&detail.worker_ref, WorkerObservationCursor::zero())
+            .expect("read protocol events");
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                Event::Error {
+                    code: protocol::ErrorCode::NotPaused,
+                    ..
+                }
+            )
+        }));
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
     }
 
     #[test]
