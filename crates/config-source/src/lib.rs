@@ -471,12 +471,25 @@ impl ConfigTreeChange {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum ConfigProjectionValidator {
+    StaticTemplateCatalog {
+        namespace: String,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        key_aliases: BTreeMap<String, String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[ts(export)]
 pub struct ConfigSchemaContribution {
     pub provider_id: String,
     pub namespace: String,
     pub version: String,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_validator: Option<ConfigProjectionValidator>,
     pub source_digest: String,
 }
 
@@ -517,7 +530,13 @@ impl ConfigSchemaContribution {
             version,
             source_digest: digest_bytes(source.as_bytes()),
             source,
+            projection_validator: None,
         })
+    }
+
+    pub fn with_projection_validator(mut self, validator: ConfigProjectionValidator) -> Self {
+        self.projection_validator = Some(validator);
+        self
     }
 
     fn validate(&self) -> Result<(), ConfigTreeError> {
@@ -585,6 +604,7 @@ impl WorkspaceConfigSchemaBundle {
                             contribution.namespace.as_str(),
                             contribution.version.as_str(),
                             contribution.source_digest.as_str(),
+                            contribution.projection_validator.as_ref(),
                         )
                     })
                     .collect::<Vec<_>>(),
@@ -869,6 +889,15 @@ impl SnapshotEnvironment {
             )]
         })?;
         let data_json = decodal_data_to_json(&data);
+        if let Err(message) =
+            validate_projection_contracts(&data_json, &contract.schema_bundle.contributions)
+        {
+            return Err(vec![self.config_error(
+                entrypoint.clone(),
+                "projection_validation",
+                message,
+            )]);
+        }
         let projection_digest = digest_bytes(
             serde_json::to_vec(&data_json)
                 .expect("Decodal projection serializes")
@@ -1221,6 +1250,163 @@ fn decodal_data_to_json(data: &Data) -> serde_json::Value {
                 .collect(),
         ),
     }
+}
+
+fn validate_projection_contracts(
+    projection: &serde_json::Value,
+    contributions: &[ConfigSchemaContribution],
+) -> Result<(), String> {
+    for contribution in contributions {
+        let Some(ConfigProjectionValidator::StaticTemplateCatalog {
+            namespace,
+            key_aliases,
+        }) = &contribution.projection_validator
+        else {
+            continue;
+        };
+        let value = projection
+            .get(namespace)
+            .ok_or_else(|| format!("projection has no '{namespace}' template namespace"))?;
+        let mut templates = BTreeMap::new();
+        flatten_string_catalog("", value, &mut templates)?;
+        for (source, target) in key_aliases {
+            if let Some(value) = templates.remove(source) {
+                if templates.insert(target.clone(), value).is_some() {
+                    return Err(format!(
+                        "template catalog alias '{source}' collides with '{target}'"
+                    ));
+                }
+            }
+        }
+        validate_static_template_catalog(&templates)?;
+    }
+    Ok(())
+}
+
+fn flatten_string_catalog(
+    prefix: &str,
+    value: &serde_json::Value,
+    output: &mut BTreeMap<String, String>,
+) -> Result<(), String> {
+    match value {
+        serde_json::Value::String(source) if !prefix.is_empty() => {
+            output.insert(prefix.to_string(), source.clone());
+            Ok(())
+        }
+        serde_json::Value::Object(fields) => {
+            for (name, value) in fields {
+                let key = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}.{name}")
+                };
+                flatten_string_catalog(&key, value, output)?;
+            }
+            Ok(())
+        }
+        _ => Err(format!(
+            "template catalog leaf '{}' must be a string",
+            if prefix.is_empty() { "<root>" } else { prefix }
+        )),
+    }
+}
+
+pub fn validate_static_template_catalog(
+    templates: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    if templates.is_empty() {
+        return Err("template catalog is empty".to_string());
+    }
+    let mut environment = minijinja::Environment::new();
+    environment.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+    let mut graph = BTreeMap::new();
+    for (name, source) in templates {
+        environment
+            .add_template_owned(name.clone(), source.clone())
+            .map_err(|error| format!("template '{name}' does not compile: {error}"))?;
+        let includes = parse_static_template_includes(name, source)?;
+        for target in &includes {
+            if !templates.contains_key(target) {
+                return Err(format!(
+                    "template '{name}' includes missing target '{target}'"
+                ));
+            }
+        }
+        graph.insert(name.clone(), includes);
+    }
+    fn visit(
+        node: &str,
+        graph: &BTreeMap<String, Vec<String>>,
+        visiting: &mut Vec<String>,
+        visited: &mut BTreeSet<String>,
+    ) -> Result<(), String> {
+        if let Some(position) = visiting.iter().position(|entry| entry == node) {
+            let mut cycle = visiting[position..].to_vec();
+            cycle.push(node.to_string());
+            return Err(format!("template include cycle: {}", cycle.join(" -> ")));
+        }
+        if visited.contains(node) {
+            return Ok(());
+        }
+        visiting.push(node.to_string());
+        for target in &graph[node] {
+            visit(target, graph, visiting, visited)?;
+        }
+        visiting.pop();
+        visited.insert(node.to_string());
+        Ok(())
+    }
+    let mut visited = BTreeSet::new();
+    for node in graph.keys() {
+        visit(node, &graph, &mut Vec::new(), &mut visited)?;
+    }
+    Ok(())
+}
+
+fn parse_static_template_includes(template: &str, source: &str) -> Result<Vec<String>, String> {
+    let mut includes = Vec::new();
+    let mut rest = source;
+    while let Some(open) = rest.find("{%") {
+        let after_open = &rest[open + 2..];
+        let Some(close) = after_open.find("%}") else {
+            break;
+        };
+        let body = after_open[..close].trim();
+        if body.starts_with("include") {
+            let argument = body["include".len()..].trim();
+            let bytes = argument.as_bytes();
+            if bytes.len() < 2
+                || !matches!(bytes[0], b'\'' | b'"')
+                || bytes[bytes.len() - 1] != bytes[0]
+            {
+                return Err(format!(
+                    "template '{template}' include target must be one exact quoted dotted name"
+                ));
+            }
+            let target = &argument[1..argument.len() - 1];
+            if target.is_empty()
+                || target.contains('/')
+                || target.contains('\\')
+                || target.contains('$')
+                || target.ends_with(".md")
+                || target.split('.').any(|segment| {
+                    segment.is_empty()
+                        || !segment.chars().all(|character| {
+                            character.is_ascii_lowercase()
+                                || character.is_ascii_digit()
+                                || character == '_'
+                        })
+                })
+            {
+                return Err(format!(
+                    "template '{template}' has invalid catalog-root include target '{target}'"
+                ));
+            }
+            includes.push(target.to_string());
+        }
+        rest = &after_open[close + 2..];
+    }
+    Ok(includes)
 }
 
 fn snapshot_digest(entries: &BTreeMap<VirtualPath, ConfigEntry>) -> String {
