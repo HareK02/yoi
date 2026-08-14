@@ -755,6 +755,7 @@ impl WorkspaceApi {
             .with_provider(Arc::new(
                 crate::profile_settings::ProfileConfigSchemaProvider,
             ))
+            .with_provider(Arc::new(crate::prompt_settings::PromptConfigSchemaProvider))
             .with_provider(Arc::new(skills::SkillConfigSchemaProvider));
         config_store.ensure_workspace_config_materialized_with_schema(
             &config.workspace_id,
@@ -2522,13 +2523,13 @@ async fn scoped_preview_workspace_config_tree(
     Json(request): Json<ConfigPreviewRequest>,
 ) -> ApiResult<Json<crate::config_source::EvaluatedConfigCandidate>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    Ok(Json(
-        api.config_store.preview_workspace_config_with_schema(
-            &path.workspace_id,
-            &request,
-            api.config_schema_registry.compose()?,
-        )?,
-    ))
+    let candidate = api.config_store.preview_workspace_config_with_schema(
+        &path.workspace_id,
+        &request,
+        api.config_schema_registry.compose()?,
+    )?;
+    crate::prompt_settings::validate_evaluated_prompt_catalog(&candidate.evaluation)?;
+    Ok(Json(candidate))
 }
 
 async fn scoped_commit_workspace_config_tree(
@@ -2544,6 +2545,7 @@ async fn scoped_commit_workspace_config_tree(
             &request,
             api.config_schema_registry.compose()?,
         )?;
+    crate::prompt_settings::validate_evaluated_prompt_catalog(&candidate.evaluation)?;
     let state = api
         .config_store
         .commit_evaluated_workspace_config(&path.workspace_id, &candidate)?;
@@ -15256,6 +15258,7 @@ mod tests {
                 label: Some("server-test".to_string()),
             }],
             declarations: Vec::new(),
+            prompt_catalog: None,
             profile_source_archive: None,
             profile_source_archive_handle: None,
         }

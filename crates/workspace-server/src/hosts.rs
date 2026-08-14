@@ -3496,6 +3496,7 @@ fn builtin_profile_config_bundle(
             label: embedded_profile_label(profile),
         }],
         declarations: Vec::new(),
+        prompt_catalog: None,
         profile_source_archive,
         profile_source_archive_handle,
     }
@@ -4436,6 +4437,7 @@ mod tests {
                 name: "read".to_string(),
                 reference: "capability:read".to_string(),
             }],
+            prompt_catalog: None,
             profile_source_archive: None,
             profile_source_archive_handle: None,
         }

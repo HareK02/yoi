@@ -254,10 +254,13 @@ pub fn build_virtual_profile_config_bundle(
     workspace_created_at: &str,
     selector: &str,
 ) -> Result<Option<ConfigBundle>> {
-    let Some(entry) = projection.entries.get(selector) else {
-        return Ok(None);
-    };
-    let archive = build_virtual_profile_archive(selector, entry, &projection.sources, state)?;
+    let archive = projection
+        .entries
+        .get(selector)
+        .map(|entry| build_virtual_profile_archive(selector, entry, &projection.sources, state))
+        .transpose()?;
+    let profile_selector = selector_for_builtin_candidate(selector)
+        .unwrap_or_else(|| worker_runtime::catalog::ProfileSelector::Named(selector.to_string()));
     let bundle = ConfigBundle {
         metadata: ConfigBundleMetadata {
             id: format!("workspace-config-profile-r{}", state.snapshot.revision),
@@ -274,11 +277,12 @@ pub fn build_virtual_profile_config_bundle(
             },
         },
         profiles: vec![ConfigProfileDescriptor {
-            selector: worker_runtime::catalog::ProfileSelector::Named(selector.to_string()),
+            selector: profile_selector,
             label: Some(selector.to_string()),
         }],
         declarations: Vec::new(),
-        profile_source_archive: Some(archive),
+        prompt_catalog: Some(crate::prompt_settings::project_prompts_from_workspace_config(state)?),
+        profile_source_archive: archive,
         profile_source_archive_handle: None,
     }
     .with_computed_digest();
@@ -712,13 +716,26 @@ mod tests {
 
     fn virtual_state(entries: Vec<config_source::ConfigEntry>) -> WorkspaceConfigState {
         let snapshot = config_source::ConfigTreeSnapshot::from_entries(7, entries).unwrap();
+        let schema_bundle = config_source::WorkspaceConfigSchemaBundle::compose([
+            ProfileConfigSchemaProvider.contribution().unwrap(),
+            crate::prompt_settings::PromptConfigSchemaProvider
+                .contribution()
+                .unwrap(),
+        ])
+        .unwrap();
+        let contract = config_source::ToolchainContract::with_schema_bundle(
+            config_source::DEFAULT_SCHEMA_VERSION,
+            vec![VirtualPath::parse("main.dcdl").unwrap()],
+            config_source::DEFAULT_IMPORT_POLICY_VERSION,
+            schema_bundle,
+        );
+        let projection_digest = config_source::SnapshotEnvironment::new(snapshot.clone())
+            .evaluate_contract(&contract)
+            .unwrap()
+            .projection_digest;
         WorkspaceConfigState {
-            projection_digest: String::new(),
-            contract: config_source::ToolchainContract::new(
-                config_source::DEFAULT_SCHEMA_VERSION,
-                vec![VirtualPath::parse("main.dcdl").unwrap()],
-                config_source::DEFAULT_IMPORT_POLICY_VERSION,
-            ),
+            projection_digest,
+            contract,
             snapshot,
         }
     }
