@@ -1,5 +1,5 @@
 use crate::catalog::{CreateWorkerRequest, WorkingDirectoryStatus};
-use crate::config_bundle::ConfigBundle;
+use crate::config_bundle::{ConfigBundle, validate_config_bundle};
 use crate::diagnostics::{DiagnosticSeverity, RuntimeDiagnostic};
 use crate::error::RuntimeError;
 use crate::identity::{WorkerId, WorkerRef};
@@ -323,6 +323,13 @@ impl RuntimeSnapshot {
                 path: path.to_path_buf(),
                 message: format!("runtime snapshot backend is {:?}", self.backend),
             });
+        }
+        for bundle in self.config_bundles.values() {
+            validate_config_bundle(bundle).map_err(|error| RuntimeError::StoreCorrupt {
+                operation: "read runtime snapshot",
+                path: path.to_path_buf(),
+                message: format!("invalid config bundle {}: {error}", bundle.metadata.id),
+            })?;
         }
         Ok(())
     }

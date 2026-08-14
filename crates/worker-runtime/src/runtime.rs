@@ -261,6 +261,19 @@ impl Runtime {
             digest: bundle.metadata.digest.clone(),
         };
         let summary = bundle.summary();
+        if let Some(existing) = state.config_bundles.get(&bundle.metadata.id) {
+            if existing.metadata.digest != bundle.metadata.digest {
+                return Err(RuntimeError::ConfigBundleDigestMismatch {
+                    bundle_id: bundle.metadata.id.clone(),
+                    expected_digest: existing.metadata.digest.clone(),
+                    actual_digest: bundle.metadata.digest.clone(),
+                });
+            }
+            return Ok(ConfigBundleAvailability {
+                reference,
+                summary: existing.summary(),
+            });
+        }
         state
             .config_bundles
             .insert(bundle.metadata.id.clone(), bundle);
@@ -526,6 +539,7 @@ impl Runtime {
                     message: "worker creation requires an execution backend".to_string(),
                 }
             })?;
+            let config_bundle = state.resolve_config_bundle_ref(request.config_bundle.as_ref())?;
 
             let worker_id = WorkerId::generated(state.next_worker_sequence);
             state.next_worker_sequence += 1;
@@ -551,7 +565,7 @@ impl Runtime {
                 workspace_scope: scope.cloned(),
                 context: self.execution_context(worker_ref.clone()),
                 working_directory: None,
-                config_bundle: None,
+                config_bundle,
             };
             (backend, worker_ref, spawn_request)
         };
@@ -868,7 +882,7 @@ impl Runtime {
         let (backend, request) = {
             let mut state = self.lock()?;
             state.ensure_running()?;
-            let (worker_request, previous_working_directory, config_bundle, run_generation) = {
+            let (worker_request, previous_working_directory, run_generation) = {
                 let worker = state.worker(worker_ref)?;
                 if worker.execution_handle.is_some() {
                     return Ok(worker.detail());
@@ -879,19 +893,14 @@ impl Runtime {
                         worker_ref.worker_id
                     )));
                 }
-                let config_bundle = worker
-                    .request
-                    .config_bundle
-                    .as_ref()
-                    .and_then(|bundle_ref| state.config_bundles.get(&bundle_ref.id))
-                    .cloned();
                 (
                     worker.request.clone(),
                     worker.working_directory.clone(),
-                    config_bundle,
                     worker.run_generation.saturating_add(1).max(1),
                 )
             };
+            let config_bundle =
+                state.resolve_config_bundle_ref(worker_request.config_bundle.as_ref())?;
             let backend = state.execution_backend.clone().ok_or_else(|| {
                 RuntimeError::WorkerExecutionUnavailable {
                     worker_id: worker_ref.worker_id.clone(),
@@ -1557,31 +1566,20 @@ impl Runtime {
                 .collect::<Vec<_>>();
             let mut candidates = Vec::with_capacity(worker_ids.len());
             for worker_id in worker_ids {
-                let (
-                    worker_ref,
-                    request,
-                    previous_working_directory,
-                    config_bundle,
-                    run_generation,
-                ) = {
+                let (worker_ref, request, previous_working_directory, run_generation) = {
                     let worker = state
                         .workers
                         .get(&worker_id)
                         .expect("collected Worker exists");
-                    let config_bundle = worker
-                        .request
-                        .config_bundle
-                        .as_ref()
-                        .and_then(|bundle_ref| state.config_bundles.get(&bundle_ref.id))
-                        .cloned();
                     (
                         worker.worker_ref.clone(),
                         worker.request.clone(),
                         worker.working_directory.clone(),
-                        config_bundle,
                         worker.run_generation.saturating_add(1).max(1),
                     )
                 };
+                let config_bundle =
+                    state.resolve_config_bundle_ref(request.config_bundle.as_ref())?;
                 state
                     .workers
                     .get_mut(&worker_id)
@@ -2072,6 +2070,17 @@ impl RuntimeState {
             reference: reference.clone(),
             summary: bundle.summary(),
         })
+    }
+
+    fn resolve_config_bundle_ref(
+        &self,
+        reference: Option<&ConfigBundleRef>,
+    ) -> Result<Option<ConfigBundle>, RuntimeError> {
+        let Some(reference) = reference else {
+            return Ok(None);
+        };
+        self.check_config_bundle_ref(reference)?;
+        Ok(self.config_bundles.get(&reference.id).cloned())
     }
 
     fn validate_worker_config_boundary(
@@ -2845,6 +2854,7 @@ mod tests {
         restore_result: Mutex<Option<WorkerExecutionSpawnResult>>,
         restore_count: Mutex<u64>,
         run_generations: Mutex<Vec<u64>>,
+        config_bundles: Mutex<Vec<Option<ConfigBundle>>>,
         contexts: Mutex<BTreeMap<WorkerId, WorkerExecutionContext>>,
         dispatched_inputs: Mutex<Vec<WorkerInput>>,
         preserve_commit_ack_submission_id: AtomicBool,
@@ -2892,6 +2902,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(request.run_generation);
+            self.config_bundles
+                .lock()
+                .unwrap()
+                .push(request.config_bundle.clone());
             self.contexts
                 .lock()
                 .unwrap()
@@ -2915,6 +2929,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(request.run_generation);
+            self.config_bundles
+                .lock()
+                .unwrap()
+                .push(request.config_bundle.clone());
             if let Some(result) = self.restore_result.lock().unwrap().clone() {
                 return result;
             }
@@ -3411,11 +3429,30 @@ mod tests {
 
     #[test]
     fn synced_config_bundle_is_stored_checked_and_used_for_worker_creation() {
-        let runtime = runtime_with_backend();
-        let bundle = test_bundle();
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime =
+            Runtime::with_execution_backend(RuntimeOptions::default(), backend.clone()).unwrap();
+        let mut bundle = test_bundle();
+        bundle.prompt_catalog = Some(
+            worker::EffectivePromptCatalog::new(
+                BTreeMap::from([("default".to_string(), "workspace prompt".to_string())]),
+                7,
+                "schema",
+                "toolchain",
+            )
+            .unwrap(),
+        );
+        bundle = bundle.with_computed_digest();
         let availability = runtime.store_config_bundle(bundle.clone()).unwrap();
         assert_eq!(availability.reference.id, "bundle-1");
         assert_eq!(availability.reference.digest, bundle.metadata.digest);
+        let mut conflicting_bundle = bundle.clone();
+        conflicting_bundle.profiles[0].label = Some("conflicting".to_string());
+        conflicting_bundle = conflicting_bundle.with_computed_digest();
+        assert!(matches!(
+            runtime.store_config_bundle(conflicting_bundle),
+            Err(RuntimeError::ConfigBundleDigestMismatch { .. })
+        ));
 
         let listed = runtime.list_config_bundles().unwrap();
         assert_eq!(listed.len(), 1);
@@ -3430,6 +3467,53 @@ mod tests {
             .create_worker(bundled_task_request("synced", &bundle))
             .unwrap();
         assert_eq!(detail.config_bundle, Some(availability.reference));
+        assert_eq!(
+            backend.config_bundles.lock().unwrap().as_slice(),
+            &[Some(bundle.clone())]
+        );
+
+        runtime.stop_worker(&detail.worker_ref, None).unwrap();
+        runtime.restore_worker(&detail.worker_ref).unwrap();
+        assert_eq!(
+            backend.config_bundles.lock().unwrap().as_slice(),
+            &[Some(bundle.clone()), Some(bundle)]
+        );
+    }
+
+    #[test]
+    fn restore_fails_closed_when_recorded_config_bundle_is_missing_or_mismatched() {
+        let (runtime, backend) = runtime_and_backend();
+        let bundle = test_bundle();
+        let detail = runtime
+            .create_worker(bundled_task_request("missing-on-restore", &bundle))
+            .unwrap();
+        runtime.stop_worker(&detail.worker_ref, None).unwrap();
+        runtime.lock().unwrap().config_bundles.clear();
+        assert!(matches!(
+            runtime.restore_worker(&detail.worker_ref),
+            Err(RuntimeError::ConfigBundleMissing { .. })
+        ));
+        assert_eq!(backend.config_bundles.lock().unwrap().len(), 1);
+
+        let (runtime, backend) = runtime_and_backend();
+        let bundle = test_bundle();
+        let detail = runtime
+            .create_worker(bundled_task_request("mismatch-on-restore", &bundle))
+            .unwrap();
+        runtime.stop_worker(&detail.worker_ref, None).unwrap();
+        let mut replacement = bundle.clone();
+        replacement.profiles[0].label = Some("replacement".to_string());
+        replacement = replacement.with_computed_digest();
+        runtime
+            .lock()
+            .unwrap()
+            .config_bundles
+            .insert(replacement.metadata.id.clone(), replacement);
+        assert!(matches!(
+            runtime.restore_worker(&detail.worker_ref),
+            Err(RuntimeError::ConfigBundleDigestMismatch { .. })
+        ));
+        assert_eq!(backend.config_bundles.lock().unwrap().len(), 1);
     }
 
     #[test]

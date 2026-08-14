@@ -793,6 +793,10 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(projection.settings.config_revision, Some(7));
+        let prompt_catalog = bundle.prompt_catalog.as_ref().unwrap();
+        assert_eq!(prompt_catalog.config_revision, 7);
+        assert!(prompt_catalog.templates.contains_key("default"));
+        assert!(prompt_catalog.templates.contains_key("common.workspace"));
         assert!(
             bundle
                 .metadata
