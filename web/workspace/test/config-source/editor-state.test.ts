@@ -72,4 +72,32 @@ Deno.test("Decodal editor follows readonly prop changes after mount", async () =
       !source.includes("--border-subtle"),
     "CodeMirror theme must use workspace tokens that actually exist",
   );
+  assert(
+    source.includes("fixedSchemaWrapperCompartment.reconfigure") &&
+      source.includes("fixedSchemaWrapperExtension()") &&
+      source.includes("filter: false"),
+    "fixed schema wrapper protection should react to the main source and permit authoritative synchronization",
+  );
+});
+
+Deno.test("main config wrapper is an explicit canonical draft conversion", async () => {
+  const source = await Deno.readTextFile(
+    new URL(
+      "../../src/lib/workspace/config-source/ConfigSourceEditor.svelte",
+      import.meta.url,
+    ),
+  );
+
+  assert(
+    source.includes("Wrap with WorkspaceConfigSchema") &&
+      source.includes("wrapMainWithWorkspaceSchema") &&
+      source.includes("fixedSchemaWrapper={mainSchemaWrapped}"),
+    "legacy main sources should offer an explicit conversion before fixed wrapper mode is enabled",
+  );
+  assert(
+    source.includes("source.trim()") &&
+      source.includes("toolchain.format") &&
+      source.includes("wrapper staged. Preview and Commit"),
+    "conversion should remain a formatted local draft until the normal commit flow",
+  );
 });

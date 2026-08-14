@@ -6,17 +6,23 @@
   import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection } from '@codemirror/view';
   import { tags } from '@lezer/highlight';
   import { decodal } from 'decodal-codemirror';
+  import {
+    fixedSchemaWrapperExtension,
+    moveSelectionIntoFixedWrapper,
+  } from '$lib/workspace/config-source/fixed-schema-wrapper.ts';
 
   let {
     value = '',
     readonly = false,
     ariaLabel = 'Decodal source',
+    fixedSchemaWrapper = false,
     onChange = (_value: string) => {},
     onComplete = undefined,
   }: {
     value?: string;
     readonly?: boolean;
     ariaLabel?: string;
+    fixedSchemaWrapper?: boolean;
     onChange?: (value: string) => void;
     onComplete?: (source: string, utf16Offset: number, explicit: boolean) => Promise<CompletionResult | null>;
   } = $props();
@@ -24,6 +30,7 @@
   let host = $state<HTMLDivElement | null>(null);
   let view = $state.raw<EditorView | null>(null);
   const readonlyCompartment = new Compartment();
+  const fixedSchemaWrapperCompartment = new Compartment();
 
   const syntaxTheme = HighlightStyle.define([
     { tag: tags.keyword, color: 'var(--accent)', fontWeight: '700' },
@@ -47,6 +54,11 @@
     '&.cm-focused': { outline: '1px solid var(--accent-muted)', outlineOffset: '-1px' },
     '.cm-scroller': { fontFamily: 'var(--font-mono)', minHeight: '24rem' },
     '.cm-content': { padding: '0.75rem 0', caretColor: 'var(--text-strong)' },
+    '.cm-fixed-schema-wrapper': {
+      color: 'var(--text-muted)',
+      backgroundColor: 'var(--interactive-muted)',
+      fontWeight: '600',
+    },
     '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--text-strong)', borderLeftWidth: '2px' },
     '&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection': {
       backgroundColor: 'var(--interactive-selected)',
@@ -61,6 +73,7 @@
     if (!host || untrack(() => view)) return;
     const initialValue = untrack(() => value);
     const initialReadonly = untrack(() => readonly);
+    const initialFixedSchemaWrapper = untrack(() => fixedSchemaWrapper);
     const handleChange = untrack(() => onChange);
     const handleComplete = untrack(() => onComplete);
     const editor = new EditorView({
@@ -78,6 +91,9 @@
             return await handleComplete(doc, context.pos, context.explicit);
           }] })] : []),
           keymap.of([]),
+          fixedSchemaWrapperCompartment.of(
+            initialFixedSchemaWrapper ? fixedSchemaWrapperExtension() : [],
+          ),
           readonlyCompartment.of([
             EditorState.readOnly.of(initialReadonly),
             EditorView.editable.of(!initialReadonly),
@@ -90,6 +106,7 @@
       }),
     });
     view = editor;
+    if (initialFixedSchemaWrapper) moveSelectionIntoFixedWrapper(editor);
     return () => {
       editor.destroy();
       view = null;
@@ -109,10 +126,26 @@
   });
 
   $effect(() => {
+    const editor = view;
+    const enabled = fixedSchemaWrapper;
+    if (!editor) return;
+    editor.dispatch({
+      effects: fixedSchemaWrapperCompartment.reconfigure(
+        enabled ? fixedSchemaWrapperExtension() : [],
+      ),
+    });
+    if (enabled) moveSelectionIntoFixedWrapper(editor);
+  });
+
+  $effect(() => {
     if (!view) return;
     const current = view.state.doc.toString();
     if (current !== value) {
-      view.dispatch({ changes: { from: 0, to: current.length, insert: value } });
+      view.dispatch({
+        changes: { from: 0, to: current.length, insert: value },
+        filter: false,
+      });
+      if (fixedSchemaWrapper) moveSelectionIntoFixedWrapper(view);
     }
   });
 </script>
