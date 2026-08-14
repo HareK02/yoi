@@ -3131,17 +3131,6 @@ async fn scoped_queue_ticket(
         &api,
         &path.workspace_id,
         &path.id,
-        ticket
-            .events
-            .last()
-            .map(|event| event.sequence as i64)
-            .unwrap_or_default(),
-        ticket
-            .events
-            .last()
-            .map(|event| event.kind.as_str())
-            .unwrap_or("state_changed"),
-        "queue_ready",
         TicketWorkflowState::Ready.as_str(),
         ticket.state.as_str(),
         None,
@@ -3209,17 +3198,10 @@ async fn execute_worker_ticket_rest_operation(
         && let Some(target) = target
         && let Ok(ticket) = backend.show(target)
     {
-        let event = ticket.events.last();
         notify_ticket_recipients(
             api,
             workspace_id,
             &ticket.meta.id,
-            event
-                .and_then(|event| event.attributes.get("event_sequence"))
-                .and_then(|value| value.parse::<i64>().ok())
-                .unwrap_or(ticket.events.len() as i64),
-            event.map(|event| event.kind.as_str()).unwrap_or("mutation"),
-            operation_kind,
             &previous_state,
             ticket.meta.workflow_state.as_str(),
             Some(source),
@@ -4247,13 +4229,16 @@ fn worker_ticket_source_context(
     }
 }
 
+fn ticket_notification_content(ticket_id: &str, current_state: &str) -> String {
+    format!(
+        "Ticket notification: ticket_id={ticket_id} current_state={current_state}. Reread the Ticket before acting."
+    )
+}
+
 fn notify_ticket_recipients(
     api: &WorkspaceApi,
     workspace_id: &str,
     ticket_id: &str,
-    event_sequence: i64,
-    event_kind: &str,
-    source_operation_kind: &str,
     previous_state: &str,
     current_state: &str,
     source: Option<RuntimeWorkerRef>,
@@ -4276,15 +4261,7 @@ fn notify_ticket_recipients(
     recipients.sort();
     recipients.dedup();
 
-    let source_fields = source
-        .as_ref()
-        .map(|source| {
-            format!(
-                " source_runtime_id={} source_worker_id={}",
-                source.runtime_id, source.worker_id
-            )
-        })
-        .unwrap_or_default();
+    let content = ticket_notification_content(ticket_id, current_state);
     for recipient in recipients {
         if source.as_ref().is_some_and(|source| source == &recipient) {
             continue;
@@ -4293,9 +4270,7 @@ fn notify_ticket_recipients(
             &recipient,
             WorkerInputRequest {
                 kind: WorkerInputKind::Notify,
-                content: format!(
-                    "Ticket notification: workspace_id={workspace_id} ticket_id={ticket_id} event_sequence={event_sequence} event_kind={event_kind} source_operation_kind={source_operation_kind}.{source_fields} Reread the Ticket before acting.",
-                ),
+                content: content.clone(),
                 segments: None,
             },
         );
@@ -12730,6 +12705,7 @@ mod tests {
         >,
         materializer: worker_runtime::working_directory::LocalGitWorktreeMaterializer,
         spawn_failure: std::sync::Mutex<Option<String>>,
+        inputs: std::sync::Mutex<Vec<(worker_runtime::identity::WorkerRef, String)>>,
     }
 
     impl Default for DeterministicExecutionBackend {
@@ -12748,11 +12724,16 @@ mod tests {
                     std::env::temp_dir().join(unique),
                 ),
                 spawn_failure: std::sync::Mutex::new(None),
+                inputs: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
 
     impl DeterministicExecutionBackend {
+        fn take_inputs(&self) -> Vec<(worker_runtime::identity::WorkerRef, String)> {
+            std::mem::take(&mut *self.inputs.lock().expect("inputs lock"))
+        }
+
         fn fail_first_spawn(message: impl Into<String>) -> Self {
             let backend = Self::default();
             *backend.spawn_failure.lock().unwrap() = Some(message.into());
@@ -12871,6 +12852,10 @@ mod tests {
             handle: &worker_runtime::execution::WorkerExecutionHandle,
             input: worker_runtime::interaction::WorkerInput,
         ) -> worker_runtime::execution::WorkerExecutionResult {
+            self.inputs
+                .lock()
+                .expect("inputs lock")
+                .push((handle.worker_ref().clone(), input.content.clone()));
             let context = self
                 .contexts
                 .lock()
@@ -13113,6 +13098,173 @@ mod tests {
         assert_eq!(worker_source_actor_role(false, true), "orchestrator");
         assert_eq!(worker_source_actor_role(false, false), "worker");
         assert_eq!(worker_source_actor_role(true, true), "coder");
+    }
+
+    #[test]
+    fn ticket_notification_projection_exposes_only_ticket_and_current_state() {
+        for current_state in ["queued", "inprogress"] {
+            let content = ticket_notification_content("00001KZ9SR97B", current_state);
+            assert_eq!(
+                content,
+                format!(
+                    "Ticket notification: ticket_id=00001KZ9SR97B current_state={current_state}. Reread the Ticket before acting."
+                )
+            );
+            for forbidden in [
+                "workspace_id",
+                "event_sequence",
+                "event_kind",
+                "source_operation_kind",
+                "source_runtime_id",
+                "source_worker_id",
+                "runtime_id",
+                "worker_id",
+                "operation_id",
+                "assignment_id",
+            ] {
+                assert!(
+                    !content.contains(forbidden),
+                    "notification leaked forbidden field {forbidden}: {content}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_ticket_notifications_project_authoritative_post_mutation_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(dir.path()).await;
+        let source_worker = api
+            .runtime
+            .spawn_worker(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                WorkerSpawnRequest {
+                    requested_worker_name: Some("notification-source".to_string()),
+                    intent: WorkerSpawnIntent::TicketRole {
+                        ticket_id: "notification-source".to_string(),
+                        role: TicketWorkerRole::Coder,
+                    },
+                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                        expected_segments: 0,
+                    },
+                    profile: ProfileSelector::Builtin("builtin:coder".to_string()),
+                    ticket_assignment: None,
+                    initial_submit: Vec::new(),
+                    working_directory_request: None,
+                    resolved_working_directory_request: None,
+                    resolved_working_directory: None,
+                    resolved_config_bundle: None,
+                    resolved_worker_observation_enabled: false,
+                    resolved_worker_observation_grants: Vec::new(),
+                    resolved_workspace_api: Some(test_worker_workspace_api(
+                        EMBEDDED_WORKER_RUNTIME_ID,
+                    )),
+                },
+            )
+            .unwrap()
+            .worker
+            .unwrap();
+        let source =
+            RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, source_worker.worker.worker_id);
+        let source_headers = || {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-yoi-runtime-id",
+                axum::http::HeaderValue::from_str(&source.runtime_id).unwrap(),
+            );
+            headers.insert(
+                "x-yoi-worker-id",
+                axum::http::HeaderValue::from_str(&source.worker_id).unwrap(),
+            );
+            headers
+        };
+        let Json(started) = scoped_start_workspace_orchestrator(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let orchestrator = started.worker.unwrap().worker;
+        execution.take_inputs();
+
+        let ticket = browser_ticket_backend(&api)
+            .unwrap()
+            .create(ticket::NewTicket::new("Bounded notification"))
+            .unwrap();
+        let ticket_id = TicketIdOrSlug::Id(ticket.id.clone());
+        let operations = [
+            TicketBackendOperation::SetWorkflowState {
+                id: ticket_id.clone(),
+                change: TicketStateChange::new(
+                    "planning",
+                    "ready",
+                    "ready for implementation",
+                    "test transition",
+                ),
+            },
+            TicketBackendOperation::SetWorkflowState {
+                id: ticket_id.clone(),
+                change: TicketStateChange::new(
+                    "ready",
+                    "queued",
+                    "queued for implementation",
+                    "test transition",
+                ),
+            },
+            TicketBackendOperation::SetWorkflowState {
+                id: ticket_id.clone(),
+                change: TicketStateChange::new(
+                    "queued",
+                    "inprogress",
+                    "implementation accepted",
+                    "test transition",
+                ),
+            },
+            TicketBackendOperation::AddEvent {
+                id: ticket_id.clone(),
+                event: NewTicketEvent::new(TicketEventKind::Comment, "progress comment"),
+            },
+            TicketBackendOperation::AddEvent {
+                id: ticket_id.clone(),
+                event: NewTicketEvent::new(
+                    TicketEventKind::ImplementationReport,
+                    "implementation report",
+                ),
+            },
+            TicketBackendOperation::AddEvent {
+                id: ticket_id,
+                event: NewTicketEvent::new(TicketEventKind::Decision, "review update"),
+            },
+        ];
+        for operation in operations {
+            execute_worker_ticket_rest_operation(
+                &api,
+                TEST_WORKSPACE_ID,
+                source_headers(),
+                operation,
+            )
+            .await
+            .unwrap();
+        }
+
+        let inputs = execution.take_inputs();
+        let expected_states = [
+            "queued",
+            "inprogress",
+            "inprogress",
+            "inprogress",
+            "inprogress",
+        ];
+        assert_eq!(inputs.len(), expected_states.len());
+        for ((recipient, content), current_state) in inputs.iter().zip(expected_states) {
+            assert_eq!(recipient.worker_id.to_string(), orchestrator.worker_id);
+            assert_eq!(
+                content,
+                &ticket_notification_content(&ticket.id, current_state)
+            );
+        }
     }
 
     #[tokio::test]
@@ -14148,16 +14300,21 @@ mod tests {
         assert_eq!(detail.provenance.id, "workspace:triage-errors");
     }
 
-    async fn test_api(workspace_root: impl Into<PathBuf>) -> WorkspaceApi {
+    async fn test_api_with_recording_backend(
+        workspace_root: impl Into<PathBuf>,
+    ) -> (WorkspaceApi, Arc<DeterministicExecutionBackend>) {
         let config = test_server_config(workspace_root);
         let store = SqliteWorkspaceStore::open(config.database_path.clone()).unwrap();
-        WorkspaceApi::new_with_execution_backend(
-            config,
-            Arc::new(store),
-            Arc::new(DeterministicExecutionBackend::default()),
-        )
-        .await
-        .unwrap()
+        let execution = Arc::new(DeterministicExecutionBackend::default());
+        let api =
+            WorkspaceApi::new_with_execution_backend(config, Arc::new(store), execution.clone())
+                .await
+                .unwrap();
+        (api, execution)
+    }
+
+    async fn test_api(workspace_root: impl Into<PathBuf>) -> WorkspaceApi {
+        test_api_with_recording_backend(workspace_root).await.0
     }
 
     #[tokio::test]
