@@ -9,6 +9,7 @@ export const compose_schema_bundle: (a: any) => [number, number, number];
 export const evaluate_current: (a: any) => [number, number, number];
 export const evaluate_snapshot: (a: any, b: any) => [number, number, number];
 export const format_source: (a: number, b: number) => [number, number, number, number];
+export const set_schema_bundle: (a: any) => [number, number];
 export const set_snapshot: (a: any) => [number, number];
 export const formatSource: (a: number, b: number) => [number, number];
 export const __wbindgen_malloc: (a: number, b: number) => number;

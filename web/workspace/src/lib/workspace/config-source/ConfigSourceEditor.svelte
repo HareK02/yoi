@@ -27,7 +27,7 @@
   let baseRevision = $state(0);
   let baseDigest = $state("");
   let renamePath = $state("");
-  let baseSnapshot = $state<WorkspaceConfigTreeResponse["snapshot"] | null>(null);
+  let baseSnapshot = $state.raw<WorkspaceConfigTreeResponse["snapshot"] | null>(null);
   let preflightDigest = $state("");
   let conflict = $state(false);
   let candidateContract = $state<WorkspaceConfigTreeResponse["contract"] | null>(null);
@@ -56,10 +56,10 @@
         selectedPath = Object.keys(treeState.snapshot.entries).toSorted()[0] ?? "";
       }
       source = selectedPath ? treeState.snapshot.entries[selectedPath].content : "";
-      baseSnapshot = structuredClone(treeState.snapshot);
+      baseSnapshot = $state.snapshot(treeState.snapshot);
       baseRevision = treeState.snapshot.revision;
       baseDigest = treeState.snapshot.digest;
-      await toolchain?.setSnapshot(treeState.snapshot);
+      await toolchain?.setSnapshot(treeState.snapshot, treeState.contract.schema_bundle);
       draftChanges = [];
       renamePath = selectedPath;
       diagnostics = [];
@@ -181,10 +181,10 @@
       preflightDigest = "";
     candidateContract = null;
     conflict = false;
-      baseSnapshot = structuredClone(treeState.snapshot);
+      baseSnapshot = $state.snapshot(treeState.snapshot);
       baseRevision = treeState.snapshot.revision;
       baseDigest = treeState.snapshot.digest;
-      await toolchain?.setSnapshot(treeState.snapshot);
+      await toolchain?.setSnapshot(treeState.snapshot, treeState.contract.schema_bundle);
       source = treeState.snapshot.entries[selectedPath]?.content ?? "";
       diagnostics = [];
       status = `Committed revision ${treeState.snapshot.revision}.`;
@@ -210,7 +210,7 @@
     baseSnapshot = structuredClone(remote.snapshot);
     baseRevision = remote.snapshot.revision;
     baseDigest = remote.snapshot.digest;
-    await toolchain.setSnapshot(remote.snapshot);
+    await toolchain.setSnapshot(remote.snapshot, remote.contract.schema_bundle);
     try {
       const candidate = await toolchain.applyChanges(localChanges);
       draftChanges = localChanges;

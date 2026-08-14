@@ -3,7 +3,7 @@ use std::fmt;
 
 use decodal::{
     Data, Diagnostic, DiagnosticKind, Engine, HostEnvironment, ImportCandidate, ImportLoader,
-    LoadedImport, Span, Value,
+    LoadedImport, Span, SyntaxToken, SyntaxTokenKind, Value, tokenize_source,
 };
 use decodal_language_service::{CompletionResult, LanguageService};
 use serde::{Deserialize, Serialize};
@@ -752,14 +752,249 @@ pub struct EvaluationResult {
     pub projection_digest: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigFieldCompletionContext {
+    schema_path: Vec<String>,
+    from: usize,
+}
+
+#[derive(Debug)]
+enum ConfigCompletionContainer {
+    Object {
+        schema_path: Vec<String>,
+        pending_path: Vec<String>,
+        last_identifier_from: Option<usize>,
+        trailing_dot: bool,
+        reading_value: bool,
+    },
+    Array {
+        schema_path: Vec<String>,
+    },
+    Other {
+        schema_path: Vec<String>,
+    },
+}
+
+fn workspace_schema_assertion_object_start(
+    tokens: &[SyntaxToken],
+    utf8_byte_offset: usize,
+) -> Option<usize> {
+    let mut object_stack = Vec::<usize>::new();
+    let mut matching_assertions = Vec::<usize>::new();
+
+    for (index, token) in tokens.iter().enumerate() {
+        match &token.kind {
+            SyntaxTokenKind::LBrace => object_stack.push(index),
+            SyntaxTokenKind::RBrace => {
+                let Some(object_index) = object_stack.pop() else {
+                    continue;
+                };
+                let object_start = tokens[object_index].span.start as usize;
+                let object_end = token.span.start as usize;
+                if !(object_start < utf8_byte_offset && utf8_byte_offset <= object_end) {
+                    continue;
+                }
+                let mut suffix = tokens[index + 1..]
+                    .iter()
+                    .filter(|token| !matches!(token.kind, SyntaxTokenKind::Comment));
+                if !matches!(
+                    suffix.next().map(|token| &token.kind),
+                    Some(SyntaxTokenKind::As)
+                ) {
+                    continue;
+                }
+                let Some(SyntaxTokenKind::Ident(global)) = suffix.next().map(|token| &token.kind)
+                else {
+                    continue;
+                };
+                if global == WORKSPACE_CONFIG_SCHEMA_GLOBAL {
+                    matching_assertions.push(object_start);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    matching_assertions.into_iter().max()
+}
+
+fn config_field_completion_context(
+    source: &str,
+    utf8_byte_offset: usize,
+) -> Option<ConfigFieldCompletionContext> {
+    if utf8_byte_offset > source.len() || !source.is_char_boundary(utf8_byte_offset) {
+        return None;
+    }
+    let tokens = tokenize_source(source).ok()?;
+    let asserted_object_start = workspace_schema_assertion_object_start(&tokens, utf8_byte_offset)?;
+    let mut containers = Vec::<ConfigCompletionContainer>::new();
+
+    for token in tokens {
+        let token_start = token.span.start as usize;
+        let token_end = token.span.end as usize;
+        if token_start < asserted_object_start {
+            continue;
+        }
+        if token_start >= utf8_byte_offset {
+            break;
+        }
+        let kind = token.kind;
+        match kind {
+            SyntaxTokenKind::LBrace => {
+                let schema_path = pending_container_path(&containers);
+                containers.push(ConfigCompletionContainer::Object {
+                    schema_path,
+                    pending_path: Vec::new(),
+                    last_identifier_from: None,
+                    trailing_dot: false,
+                    reading_value: false,
+                });
+            }
+            SyntaxTokenKind::RBrace => {
+                pop_container(&mut containers, |container| {
+                    matches!(container, ConfigCompletionContainer::Object { .. })
+                });
+            }
+            SyntaxTokenKind::LBracket => {
+                let schema_path = pending_container_path(&containers);
+                containers.push(ConfigCompletionContainer::Array { schema_path });
+            }
+            SyntaxTokenKind::RBracket => {
+                pop_container(&mut containers, |container| {
+                    matches!(container, ConfigCompletionContainer::Array { .. })
+                });
+            }
+            SyntaxTokenKind::LParen => {
+                let schema_path = pending_container_path(&containers);
+                containers.push(ConfigCompletionContainer::Other { schema_path });
+            }
+            SyntaxTokenKind::RParen => {
+                pop_container(&mut containers, |container| {
+                    matches!(container, ConfigCompletionContainer::Other { .. })
+                });
+            }
+            SyntaxTokenKind::Ident(identifier) => {
+                let Some(ConfigCompletionContainer::Object {
+                    pending_path,
+                    last_identifier_from,
+                    trailing_dot,
+                    reading_value: false,
+                    ..
+                }) = containers.last_mut()
+                else {
+                    continue;
+                };
+                let identifier = if token_end > utf8_byte_offset {
+                    source[token_start..utf8_byte_offset].to_owned()
+                } else {
+                    identifier
+                };
+                if *trailing_dot || pending_path.is_empty() {
+                    pending_path.push(identifier);
+                } else {
+                    *pending_path.last_mut().expect("pending path is non-empty") = identifier;
+                }
+                *last_identifier_from = Some(token_start);
+                *trailing_dot = false;
+            }
+            SyntaxTokenKind::Dot => {
+                if let Some(ConfigCompletionContainer::Object {
+                    trailing_dot,
+                    reading_value: false,
+                    ..
+                }) = containers.last_mut()
+                {
+                    *trailing_dot = true;
+                }
+            }
+            SyntaxTokenKind::Equal => {
+                if let Some(ConfigCompletionContainer::Object { reading_value, .. }) =
+                    containers.last_mut()
+                {
+                    *reading_value = true;
+                }
+            }
+            SyntaxTokenKind::Semicolon => {
+                if let Some(ConfigCompletionContainer::Object {
+                    pending_path,
+                    last_identifier_from,
+                    trailing_dot,
+                    reading_value,
+                    ..
+                }) = containers.last_mut()
+                {
+                    pending_path.clear();
+                    *last_identifier_from = None;
+                    *trailing_dot = false;
+                    *reading_value = false;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let ConfigCompletionContainer::Object {
+        schema_path,
+        pending_path,
+        last_identifier_from,
+        trailing_dot,
+        reading_value: false,
+    } = containers.last()?
+    else {
+        return None;
+    };
+    let mut schema_path = schema_path.clone();
+    schema_path.extend(pending_path.iter().cloned());
+    Some(ConfigFieldCompletionContext {
+        schema_path,
+        from: if *trailing_dot {
+            utf8_byte_offset
+        } else {
+            last_identifier_from.unwrap_or(utf8_byte_offset)
+        },
+    })
+}
+
+fn pending_container_path(containers: &[ConfigCompletionContainer]) -> Vec<String> {
+    match containers.last() {
+        Some(ConfigCompletionContainer::Object {
+            schema_path,
+            pending_path,
+            reading_value: true,
+            ..
+        }) => schema_path.iter().chain(pending_path).cloned().collect(),
+        Some(ConfigCompletionContainer::Array { schema_path })
+        | Some(ConfigCompletionContainer::Other { schema_path }) => schema_path.clone(),
+        _ => Vec::new(),
+    }
+}
+
+fn pop_container(
+    containers: &mut Vec<ConfigCompletionContainer>,
+    matches: impl Fn(&ConfigCompletionContainer) -> bool,
+) {
+    if let Some(index) = containers.iter().rposition(matches) {
+        containers.truncate(index);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SnapshotEnvironment {
     snapshot: ConfigTreeSnapshot,
+    schema_bundle: Option<WorkspaceConfigSchemaBundle>,
 }
 
 impl SnapshotEnvironment {
     pub fn new(snapshot: ConfigTreeSnapshot) -> Self {
-        Self { snapshot }
+        Self {
+            snapshot,
+            schema_bundle: None,
+        }
+    }
+
+    pub fn with_schema_bundle(mut self, schema_bundle: WorkspaceConfigSchemaBundle) -> Self {
+        self.schema_bundle = Some(schema_bundle);
+        self
     }
 
     pub fn snapshot(&self) -> &ConfigTreeSnapshot {
@@ -954,6 +1189,32 @@ impl SnapshotEnvironment {
         LanguageService::new(self).complete(entrypoint.as_str(), source, utf8_byte_offset, explicit)
     }
 
+    pub fn complete_config(
+        &self,
+        entrypoint: &VirtualPath,
+        source: &str,
+        utf8_byte_offset: usize,
+        explicit: bool,
+    ) -> decodal::Result<Option<CompletionResult>> {
+        if self.schema_bundle.is_some()
+            && let Some(context) = config_field_completion_context(source, utf8_byte_offset)
+        {
+            let mut member_source = format!("{WORKSPACE_CONFIG_SCHEMA_GLOBAL}.");
+            member_source.push_str(&context.schema_path.join("."));
+            let mut completion = LanguageService::new(self).complete(
+                entrypoint.as_str(),
+                &member_source,
+                member_source.len(),
+                explicit,
+            )?;
+            if let Some(completion) = &mut completion {
+                completion.from = context.from;
+            }
+            return Ok(completion);
+        }
+        self.complete(entrypoint, source, utf8_byte_offset, explicit)
+    }
+
     pub fn format(&self, source: &str) -> Result<String, String> {
         decodal_language_tools::format_source(source).map_err(|error| error.to_string())
     }
@@ -989,7 +1250,17 @@ impl HostEnvironment for &SnapshotEnvironment {
         }
     }
 
-    fn configure_engine(&self, _engine: &mut Engine<Self::Loader>) -> decodal::Result<()> {
+    fn configure_engine(&self, engine: &mut Engine<Self::Loader>) -> decodal::Result<()> {
+        let Some(schema_bundle) = &self.schema_bundle else {
+            return Ok(());
+        };
+        let schema_module = engine.add_root_source(
+            WORKSPACE_CONFIG_SCHEMA_SOURCE,
+            WORKSPACE_CONFIG_SCHEMA_SOURCE,
+            &schema_bundle.source,
+        )?;
+        let schema = engine.eval_module(schema_module)?;
+        engine.bind_global_runtime(WORKSPACE_CONFIG_SCHEMA_GLOBAL, schema);
         Ok(())
     }
 }
@@ -1574,6 +1845,91 @@ mod tests {
         )
         .unwrap();
         assert_eq!(left.digest, right.digest);
+    }
+
+    #[test]
+    fn schema_completion_tracks_only_asserted_config_object_paths() {
+        assert_eq!(config_field_completion_context("{ pro", 5), None);
+
+        let root = "{ pro } as WorkspaceConfigSchema";
+        let root_cursor = root.find("pro").unwrap() + 3;
+        assert_eq!(
+            config_field_completion_context(root, root_cursor),
+            Some(ConfigFieldCompletionContext {
+                schema_path: vec!["pro".into()],
+                from: root_cursor - 3,
+            })
+        );
+        let nested = "{ profile = { def } } as WorkspaceConfigSchema";
+        let nested_cursor = nested.find("def").unwrap() + 3;
+        assert_eq!(
+            config_field_completion_context(nested, nested_cursor),
+            Some(ConfigFieldCompletionContext {
+                schema_path: vec!["profile".into(), "def".into()],
+                from: nested_cursor - 3,
+            })
+        );
+        let array = "{ profile = { entries = [{ sel }] } } as WorkspaceConfigSchema";
+        let array_cursor = array.find("sel").unwrap() + 3;
+        assert_eq!(
+            config_field_completion_context(array, array_cursor),
+            Some(ConfigFieldCompletionContext {
+                schema_path: vec!["profile".into(), "entries".into(), "sel".into()],
+                from: array_cursor - 3,
+            })
+        );
+        let value = "{ profile = \"default\" } as WorkspaceConfigSchema";
+        let value_cursor = value.find("default").unwrap() + 3;
+        assert_eq!(config_field_completion_context(value, value_cursor), None);
+    }
+
+    #[test]
+    fn completion_projects_workspace_schema_fields_into_config_objects() {
+        let snapshot = ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", "{}")]).unwrap();
+        let schema = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+            "builtin:profile",
+            "profile",
+            "1",
+            "{ profile = { default_profile = String; entries = [{ selector = String; }]; }; }",
+        )
+        .unwrap()])
+        .unwrap();
+        let environment = SnapshotEnvironment::new(snapshot).with_schema_bundle(schema);
+
+        let bare_source = "{ pro }";
+        let bare_cursor = bare_source.find("pro").unwrap() + 3;
+        let bare = environment
+            .complete_config(&path("main.dcdl"), bare_source, bare_cursor, true)
+            .unwrap();
+        assert!(
+            bare.is_none_or(|completion| !completion
+                .items
+                .iter()
+                .any(|item| item.label == "profile"))
+        );
+
+        let root_source = "{ pro } as WorkspaceConfigSchema";
+        let root_cursor = root_source.find("pro").unwrap() + 3;
+        let root = environment
+            .complete_config(&path("main.dcdl"), root_source, root_cursor, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(root.from, root_cursor - 3);
+        assert!(root.items.iter().any(|item| item.label == "profile"));
+
+        let nested_source = "{ profile = { def } } as WorkspaceConfigSchema";
+        let nested_cursor = nested_source.find("def").unwrap() + 3;
+        let nested = environment
+            .complete_config(&path("main.dcdl"), nested_source, nested_cursor, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(nested.from, nested_cursor - 3);
+        assert!(
+            nested
+                .items
+                .iter()
+                .any(|item| item.label == "default_profile")
+        );
     }
 
     #[test]

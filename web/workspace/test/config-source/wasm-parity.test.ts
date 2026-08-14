@@ -3,8 +3,11 @@
 import { assertEquals } from "jsr:@std/assert";
 import init, {
   analyze_snapshot,
+  complete_current,
   compose_schema_bundle,
   evaluate_snapshot,
+  set_schema_bundle,
+  set_snapshot,
 } from "../../src/lib/workspace/config-source/generated/config_source_wasm.js";
 import type {
   ConfigTreeSnapshot,
@@ -240,4 +243,75 @@ Deno.test("generated WASM preserves native Decodal 0.4 diagnostic semantics", ()
     assertEquals(diagnostic.message.length > 0, true);
     assertEquals(diagnostic.span.end_byte > diagnostic.span.start_byte, true);
   }
+});
+
+Deno.test("generated WASM returns completion items for the editor adapter", () => {
+  const source = 'import "./"';
+  set_snapshot({
+    ...snapshot,
+    entries: {
+      ...snapshot.entries,
+      "workspace.dcdl": {
+        ...snapshot.entries["workspace.dcdl"],
+        content: source,
+      },
+    },
+  });
+  const result = complete_current(
+    "workspace.dcdl",
+    source,
+    source.length - 1,
+    true,
+  ) as {
+    from: number;
+    items: Array<{ label: string; kind: string }>;
+  };
+
+  assertEquals(result.from, 8);
+  assertEquals(result.items[0].label, "./lib/value.dcdl");
+  assertEquals(result.items[0].kind, "file");
+});
+
+Deno.test("generated WASM completes asserted WorkspaceConfigSchema keys", () => {
+  const bareSource = "{ pro }";
+  const source = "{ pro } as WorkspaceConfigSchema";
+  const cursor = source.indexOf("pro") + 3;
+  set_snapshot({
+    ...snapshot,
+    entries: {
+      ...snapshot.entries,
+      "workspace.dcdl": {
+        ...snapshot.entries["workspace.dcdl"],
+        content: source,
+      },
+    },
+  });
+  set_schema_bundle({
+    contributions: [],
+    source: "{ profile = { default_profile = String; }; prompts = {}; }",
+    fingerprint: "sha256:test-schema",
+  });
+  const bare = complete_current(
+    "workspace.dcdl",
+    bareSource,
+    bareSource.indexOf("pro") + 3,
+    true,
+  ) as { items: Array<{ label: string }> } | null;
+  assertEquals(
+    bare?.items.some((item) => item.label === "profile") ?? false,
+    false,
+  );
+
+  const result = complete_current(
+    "workspace.dcdl",
+    source,
+    cursor,
+    true,
+  ) as {
+    from: number;
+    items: Array<{ label: string; kind: string }>;
+  };
+
+  assertEquals(result.from, 2);
+  assertEquals(result.items.some((item) => item.label === "profile"), true);
 });

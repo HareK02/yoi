@@ -459,11 +459,11 @@ Deno.test("Decodal source editor keeps imperative EditorView out of reactive sta
   );
 
   assert(
-    editor.includes("let view: EditorView | null = null") &&
-      !editor.includes("$state<EditorView") &&
+    editor.includes("let view = $state.raw<EditorView | null>(null)") &&
+      editor.includes("untrack(() => view)") &&
       editor.includes("untrack(() => value)") &&
       editor.includes("untrack(() => onChange)"),
-    "CodeMirror EditorView must not be reactive state; otherwise mount cleanup can loop forever",
+    "CodeMirror EditorView must not be deep reactive or tracked by the mount effect; otherwise cleanup can loop forever",
   );
 });
 

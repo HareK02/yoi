@@ -8,6 +8,7 @@ use wasm_bindgen::prelude::*;
 
 thread_local! {
     static SESSION: RefCell<Option<ConfigTreeSnapshot>> = const { RefCell::new(None) };
+    static SCHEMA_BUNDLE: RefCell<Option<WorkspaceConfigSchemaBundle>> = const { RefCell::new(None) };
 }
 
 #[wasm_bindgen]
@@ -20,6 +21,13 @@ pub fn compose_schema_bundle(contributions: JsValue) -> Result<JsValue, JsValue>
 pub fn set_snapshot(snapshot: JsValue) -> Result<(), JsValue> {
     let snapshot: ConfigTreeSnapshot = decode(snapshot)?;
     SESSION.with(|session| session.replace(Some(snapshot)));
+    Ok(())
+}
+
+#[wasm_bindgen]
+pub fn set_schema_bundle(schema_bundle: JsValue) -> Result<(), JsValue> {
+    let schema_bundle: WorkspaceConfigSchemaBundle = decode(schema_bundle)?;
+    SCHEMA_BUNDLE.with(|session| session.replace(Some(schema_bundle)));
     Ok(())
 }
 
@@ -91,8 +99,8 @@ pub fn complete_current(
             .as_ref()
             .ok_or_else(|| JsValue::from_str("config source snapshot is not initialized"))?;
         let utf8_byte_offset = utf16_to_utf8_offset(&source, utf16_offset)?;
-        let result = SnapshotEnvironment::new(snapshot.clone())
-            .complete(&entrypoint, &source, utf8_byte_offset, explicit)
+        let result = session_environment(snapshot.clone())
+            .complete_config(&entrypoint, &source, utf8_byte_offset, explicit)
             .map_err(|error| JsValue::from_str(&format!("{error:?}")))?
             .map(|result| WasmCompletionResult {
                 from: result.from,
@@ -132,7 +140,16 @@ pub fn analyze_snapshot(
 ) -> Result<JsValue, JsValue> {
     let snapshot: ConfigTreeSnapshot = decode(snapshot)?;
     let entrypoint = VirtualPath::parse(entrypoint).map_err(js_error)?;
-    encode(SnapshotEnvironment::new(snapshot).analyze(&entrypoint, source_override.as_deref()))
+    encode(session_environment(snapshot).analyze(&entrypoint, source_override.as_deref()))
+}
+
+fn session_environment(snapshot: ConfigTreeSnapshot) -> SnapshotEnvironment {
+    let schema_bundle = SCHEMA_BUNDLE.with(|schema_bundle| schema_bundle.borrow().clone());
+    let mut environment = SnapshotEnvironment::new(snapshot);
+    if let Some(schema_bundle) = schema_bundle {
+        environment = environment.with_schema_bundle(schema_bundle);
+    }
+    environment
 }
 
 #[wasm_bindgen]

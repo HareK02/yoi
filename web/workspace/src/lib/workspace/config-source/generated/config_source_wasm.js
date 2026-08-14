@@ -144,6 +144,16 @@ export function format_source(source) {
 }
 
 /**
+ * @param {any} schema_bundle
+ */
+export function set_schema_bundle(schema_bundle) {
+    const ret = wasm.set_schema_bundle(schema_bundle);
+    if (ret[1]) {
+        throw takeFromExternrefTable0(ret[0]);
+    }
+}
+
+/**
  * @param {any} snapshot
  */
 export function set_snapshot(snapshot) {

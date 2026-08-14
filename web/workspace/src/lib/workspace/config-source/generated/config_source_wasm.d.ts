@@ -19,6 +19,8 @@ export function formatSource(source: string): string;
 
 export function format_source(source: string): string;
 
+export function set_schema_bundle(schema_bundle: any): void;
+
 export function set_snapshot(snapshot: any): void;
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
@@ -33,6 +35,7 @@ export interface InitOutput {
     readonly evaluate_current: (a: any) => [number, number, number];
     readonly evaluate_snapshot: (a: any, b: any) => [number, number, number];
     readonly format_source: (a: number, b: number) => [number, number, number, number];
+    readonly set_schema_bundle: (a: any) => [number, number];
     readonly set_snapshot: (a: any) => [number, number];
     readonly formatSource: (a: number, b: number) => [number, number];
     readonly __wbindgen_malloc: (a: number, b: number) => number;
