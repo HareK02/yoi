@@ -1053,8 +1053,7 @@ impl Runtime {
         worker.status = worker_status_from_run_state(dispatch_result.run_state);
         let status = worker.status;
         #[cfg(feature = "ws-server")]
-        {
-            let payload = input_protocol_event(&input);
+        if let Some(payload) = input_protocol_event(&input) {
             state.push_worker_observation_event(worker_ref.clone(), payload);
         }
         state.publish_worker_upsert(worker_ref.worker_id)?;
@@ -1464,7 +1463,9 @@ impl Runtime {
     ) -> Result<(), RuntimeError> {
         let mut state = self.lock()?;
         state.ensure_worker_ref(worker_ref)?;
-        state.push_worker_observation_event(worker_ref.clone(), input_protocol_event(&input));
+        if let Some(payload) = input_protocol_event(&input) {
+            state.push_worker_observation_event(worker_ref.clone(), payload);
+        }
         Ok(())
     }
 
@@ -2646,30 +2647,28 @@ fn validate_worker_input(input: &WorkerInput) -> Result<(), RuntimeError> {
 }
 
 #[cfg(feature = "ws-server")]
-fn input_protocol_event(input: &WorkerInput) -> protocol::Event {
+fn input_protocol_event(input: &WorkerInput) -> Option<protocol::Event> {
     match input.kind {
-        WorkerInputKind::User => protocol::Event::UserMessage {
+        WorkerInputKind::User => Some(protocol::Event::UserMessage {
             segments: input.segments.clone().unwrap_or_else(|| {
                 vec![protocol::Segment::Text {
                     content: input.content.clone(),
                 }]
             }),
-        },
-        WorkerInputKind::Notify => protocol::Event::SystemItem {
-            item: serde_json::json!({
-                "kind": "embedded_worker_notification",
-                "content": input.content.clone(),
-            }),
-        },
+        }),
+        // The committed `SystemItem::Notification` is the sole agent-visible
+        // and Console-visible authority for Notify. A synthetic observation
+        // here would display the same notification twice.
+        WorkerInputKind::Notify => None,
         WorkerInputKind::Compact
         | WorkerInputKind::ListRewindTargets
-        | WorkerInputKind::RegisterPeer => protocol::Event::SystemItem {
+        | WorkerInputKind::RegisterPeer => Some(protocol::Event::SystemItem {
             item: serde_json::json!({
                 "kind": "embedded_worker_command_input",
                 "command": input.kind,
                 "content": input.content.clone(),
             }),
-        },
+        }),
     }
 }
 
@@ -3859,7 +3858,7 @@ mod tests {
 
     #[cfg(feature = "ws-server")]
     #[test]
-    fn send_input_records_protocol_observations() {
+    fn notify_input_does_not_duplicate_committed_notification_observation() {
         let runtime = Runtime::with_execution_backend(
             RuntimeOptions {
                 ..RuntimeOptions::default()
@@ -3880,15 +3879,40 @@ mod tests {
         let observations = runtime
             .read_worker_observation_events(&detail.worker_ref, WorkerObservationCursor::zero())
             .unwrap();
-        assert_eq!(observations.len(), 2);
+        assert_eq!(observations.len(), 1);
         assert!(matches!(
             observations[0].payload,
             protocol::Event::UserMessage { .. }
         ));
-        assert!(matches!(
-            observations[1].payload,
-            protocol::Event::SystemItem { .. }
-        ));
+
+        runtime
+            .observe_worker_event(
+                &detail.worker_ref,
+                protocol::Event::SystemItem {
+                    item: serde_json::json!({
+                        "kind": "notification",
+                        "message": "note",
+                        "body": "[Notification] note",
+                    }),
+                },
+            )
+            .unwrap();
+
+        let observations = runtime
+            .read_worker_observation_events(&detail.worker_ref, WorkerObservationCursor::zero())
+            .unwrap();
+        assert_eq!(observations.len(), 2);
+        let protocol::Event::SystemItem { item } = &observations[1].payload else {
+            panic!("committed notification observation must be a system item");
+        };
+        assert_eq!(item["kind"], "notification");
+        assert!(observations.iter().all(|observation| {
+            !matches!(
+                &observation.payload,
+                protocol::Event::SystemItem { item }
+                    if item["kind"] == "embedded_worker_notification"
+            )
+        }));
     }
 
     #[test]
