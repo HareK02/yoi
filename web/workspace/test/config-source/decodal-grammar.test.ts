@@ -18,6 +18,8 @@ import "main.dcdl" as WorkspaceConfigSchema
     },
   });
   if (errors.length > 0) {
-    throw new Error(`Decodal 0.4 grammar produced parse errors at ${errors.join(", ")}`);
+    throw new Error(
+      `Decodal 0.4 grammar produced parse errors at ${errors.join(", ")}`,
+    );
   }
 });

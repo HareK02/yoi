@@ -1361,6 +1361,82 @@ mod tests {
     }
 
     #[test]
+    fn workspace_typed_associative_values_remain_closed_and_typed() {
+        let schema = || {
+            WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+                "builtin:features",
+                "features",
+                "1",
+                "{ features = {...{ enabled = Bool; }}; }",
+            )
+            .unwrap()])
+            .unwrap()
+        };
+        for (source, expected_kind) in [
+            (
+                "{ features = { web = { enabled = \"yes\"; }; }; }",
+                "constraintviolation",
+            ),
+            ("{ features = { web = {}; }; }", "materialize"),
+            (
+                "{ features = { web = { enabled = true; typo = 1; }; }; }",
+                "constraintviolation",
+            ),
+        ] {
+            let snapshot =
+                ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", source)]).unwrap();
+            let diagnostics = SnapshotEnvironment::new(snapshot)
+                .evaluate_contract(&ToolchainContract::with_schema_bundle(
+                    1,
+                    vec![path("main.dcdl")],
+                    1,
+                    schema(),
+                ))
+                .unwrap_err();
+            assert_eq!(diagnostics[0].path, path("main.dcdl"));
+            assert_eq!(diagnostics[0].kind, expected_kind);
+            assert!(diagnostics[0].span.end_byte > diagnostics[0].span.start_byte);
+        }
+    }
+
+    #[test]
+    fn language_service_and_formatter_accept_decodal_0_4_schema_syntax() {
+        let source =
+            "{} as { features = {...{ enabled = Bool; }}; web = { enabled = Bool; ...Unknown }; }";
+        let snapshot = ConfigTreeSnapshot::from_entries(1, [entry("schema.dcdl", source)]).unwrap();
+        let environment = SnapshotEnvironment::new(snapshot);
+        let diagnostics = environment.analyze(&path("schema.dcdl"), None);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.kind != "syntax"),
+            "{diagnostics:#?}"
+        );
+
+        let completion_source = "{} as { web = { enabled = Unk } }";
+        let completion = environment
+            .complete(
+                &path("schema.dcdl"),
+                completion_source,
+                completion_source.find("Unk").unwrap() + "Unk".len(),
+                true,
+            )
+            .unwrap()
+            .expect("explicit completion is available");
+        assert!(format!("{completion:?}").contains("Unknown"));
+
+        let formatted = environment.format(source).unwrap();
+        assert!(formatted.contains(" as "));
+        assert!(formatted.contains("...Unknown"));
+        assert!(
+            environment
+                .analyze(&path("schema.dcdl"), Some(&formatted))
+                .iter()
+                .all(|diagnostic| diagnostic.kind != "syntax")
+        );
+    }
+
+    #[test]
     fn workspace_schema_preserves_fields_only_where_rest_is_explicit() {
         let snapshot = ConfigTreeSnapshot::from_entries(
             1,

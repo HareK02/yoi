@@ -13,14 +13,20 @@ import type {
 } from "../../src/lib/workspace/config-source/types.ts";
 
 const bytes = await Deno.readFile(
-  new URL("../../src/lib/workspace/config-source/generated/config_source_wasm_bg.wasm", import.meta.url),
+  new URL(
+    "../../src/lib/workspace/config-source/generated/config_source_wasm_bg.wasm",
+    import.meta.url,
+  ),
 );
 await init({ module_or_path: bytes });
 
 async function digestText(text: string): Promise<string> {
   const bytes = new TextEncoder().encode(text);
   const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return `sha256:${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+  return `sha256:${
+    Array.from(new Uint8Array(digest), (byte) =>
+      byte.toString(16).padStart(2, "0")).join("")
+  }`;
 }
 
 async function toolchainFingerprint(
@@ -56,7 +62,9 @@ const snapshot: ConfigTreeSnapshot = {
   },
 };
 
-const emptySchemaBundle = compose_schema_bundle([]) as WorkspaceConfigSchemaBundle;
+const emptySchemaBundle = compose_schema_bundle(
+  [],
+) as WorkspaceConfigSchemaBundle;
 const contract: ToolchainContract = {
   contract_version: 2,
   decodal_version: "0.4.0",
@@ -64,7 +72,10 @@ const contract: ToolchainContract = {
   entrypoints: ["workspace.dcdl"],
   import_policy_version: 1,
   schema_bundle: emptySchemaBundle,
-  fingerprint: await toolchainFingerprint(["workspace.dcdl"], emptySchemaBundle),
+  fingerprint: await toolchainFingerprint(
+    ["workspace.dcdl"],
+    emptySchemaBundle,
+  ),
 };
 
 Deno.test("generated WASM evaluates the same virtual import contract", () => {
@@ -148,15 +159,43 @@ Deno.test("generated WASM applies Decodal 0.4 typed maps and explicit object res
   });
 });
 
-Deno.test("generated WASM rejects unknown root fields with source provenance", () => {
-  let thrown: unknown;
+type ProjectedDiagnostic = {
+  path: string;
+  kind: string;
+  message: string;
+  span: { start_byte: number; end_byte: number };
+};
+
+function evaluateFailure(source: string): ProjectedDiagnostic {
   try {
-    evaluate_snapshot(schemaSnapshot("{ features = {}; custom = 42; }"), schemaContract);
+    evaluate_snapshot(schemaSnapshot(source), schemaContract);
   } catch (error) {
-    thrown = error;
+    const diagnostics = error as ProjectedDiagnostic[];
+    assertEquals(Array.isArray(diagnostics), true);
+    return diagnostics[0];
   }
-  const diagnostics = thrown as Array<{ path: string; kind: string }>;
-  assertEquals(Array.isArray(diagnostics), true);
-  assertEquals(diagnostics[0].path, "main.dcdl");
-  assertEquals(diagnostics[0].kind, "constraintviolation");
+  throw new Error("expected Decodal evaluation to fail");
+}
+
+Deno.test("generated WASM preserves native Decodal 0.4 diagnostic semantics", () => {
+  for (
+    const [source, expectedKind] of [
+      ["{ features = {}; custom = 42; }", "constraintviolation"],
+      [
+        '{ features = { web = { enabled = "yes"; }; }; }',
+        "constraintviolation",
+      ],
+      ["{ features = { web = {}; }; }", "materialize"],
+      [
+        "{ features = { web = { enabled = true; typo = 1; }; }; }",
+        "constraintviolation",
+      ],
+    ] as const
+  ) {
+    const diagnostic = evaluateFailure(source);
+    assertEquals(diagnostic.path, "main.dcdl");
+    assertEquals(diagnostic.kind, expectedKind);
+    assertEquals(diagnostic.message.length > 0, true);
+    assertEquals(diagnostic.span.end_byte > diagnostic.span.start_byte, true);
+  }
 });
