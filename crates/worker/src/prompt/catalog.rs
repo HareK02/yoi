@@ -596,6 +596,21 @@ mod tests {
     }
 
     #[test]
+    fn orchestrator_role_keeps_review_routing_owned_by_coder() {
+        let catalog = PromptCatalog::builtins_only().unwrap();
+        let prompt = &catalog.projection.templates["role.orchestrator"];
+        assert!(prompt.contains("assigned Coder owns its review/fix loop"));
+        assert!(prompt.contains("then use `SpawnTicketCoder`"));
+        assert!(prompt.contains("verify its current assignment names that Coder"));
+        assert!(prompt.contains("never route implementation to an unassigned Coder"));
+        assert!(prompt.contains(
+            "Do not spawn, restore, assign, or route work to Backend/Runtime Reviewer Workers"
+        ));
+        assert!(prompt.contains("never compensate by creating an independent Reviewer Worker"));
+        assert!(!prompt.contains("sibling Coder/Reviewer Workers"));
+    }
+
+    #[test]
     fn existing_internal_prompt_render_contracts_are_preserved() {
         let catalog = PromptCatalog::builtins_only().unwrap();
         assert!(catalog.compact_system().unwrap().contains("write_summary"));
