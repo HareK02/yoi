@@ -45,6 +45,30 @@ impl WorkspaceConfigSchemaRegistry {
     }
 }
 
+pub fn evaluate_workspace_config_state(
+    state: &WorkspaceConfigState,
+    schema_bundle: WorkspaceConfigSchemaBundle,
+) -> Result<EvaluationResult> {
+    let expected_fingerprint = state.contract.fingerprint.clone();
+    let contract = main_config_contract_with_schema(schema_bundle);
+    if !state.contract.schema_bundle.contributions.is_empty()
+        && contract.fingerprint != expected_fingerprint
+    {
+        return Err(Error::RegistryInconsistency(
+            "active Workspace config schema fingerprint does not match the current provider bundle"
+                .to_string(),
+        ));
+    }
+    SnapshotEnvironment::new(state.snapshot.clone())
+        .evaluate_contract(&contract)
+        .map_err(|diagnostics| {
+            Error::InvalidInput(
+                serde_json::to_string(&diagnostics)
+                    .unwrap_or_else(|_| "virtual config evaluation failed".to_string()),
+            )
+        })
+}
+
 fn main_config_contract_with_schema(
     schema_bundle: WorkspaceConfigSchemaBundle,
 ) -> ToolchainContract {
@@ -871,6 +895,44 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("toolchain fingerprint mismatch"));
+    }
+
+    #[test]
+    fn active_state_evaluation_rejects_provider_fingerprint_drift() {
+        let snapshot = ConfigTreeSnapshot::from_entries(
+            1,
+            [ConfigEntry::new(
+                path(MAIN_CONFIG_ENTRYPOINT),
+                ConfigContentType::Decodal,
+                "{}",
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let persisted_bundle =
+            WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+                "builtin:test",
+                "test",
+                "1",
+                r#"{ test = { value = String default "one"; }; }"#,
+            )
+            .unwrap()])
+            .unwrap();
+        let state = WorkspaceConfigState {
+            projection_digest: "persisted".to_string(),
+            contract: main_config_contract_with_schema(persisted_bundle),
+            snapshot,
+        };
+        let changed_bundle = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+            "builtin:test",
+            "test",
+            "2",
+            r#"{ test = { value = String default "two"; }; }"#,
+        )
+        .unwrap()])
+        .unwrap();
+        let error = evaluate_workspace_config_state(&state, changed_bundle).unwrap_err();
+        assert!(error.to_string().contains("schema fingerprint"));
     }
 
     #[tokio::test]

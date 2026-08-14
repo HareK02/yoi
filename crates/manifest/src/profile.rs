@@ -22,7 +22,6 @@ use crate::{
 
 const PROFILE_FORMAT_V1: &str = "yoi.profile.v1";
 const BUILTIN_MODEL_CATALOG: &str = include_str!("../../../resources/models/builtin.toml");
-const WORKSPACE_OVERRIDE_LOCAL_FILENAME: &str = "override.local.toml";
 
 struct BuiltinProfile {
     name: &'static str,
@@ -322,10 +321,10 @@ pub struct ProfileDiscovery {
 }
 
 impl ProfileDiscovery {
-    pub fn for_cwd(cwd: &Path) -> Self {
+    pub fn for_cwd(_cwd: &Path) -> Self {
         Self {
             user_config: paths::user_profiles_path(),
-            project_config: find_project_profiles_from(cwd),
+            project_config: None,
         }
     }
     pub fn with_sources(user_config: Option<PathBuf>, project_config: Option<PathBuf>) -> Self {
@@ -363,19 +362,6 @@ pub struct ProfileManifestSnapshot {
     pub source: ProfileSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<ProfileMetadata>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_override: Option<WorkspaceOverrideSnapshot>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkspaceOverrideSnapshot {
-    pub path: PathBuf,
-}
-
-#[derive(Debug)]
-struct WorkspaceOverrideLayer {
-    path: PathBuf,
-    config: WorkerManifestConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -495,7 +481,6 @@ impl ProfileResolver {
                 .as_deref()
                 .unwrap_or_else(|| Path::new(".")),
         )?;
-        let workspace_override = load_workspace_override_from(&workspace_base)?;
         let raw_artifact = read_profile_artifact_file(&absolute_path)?;
         resolve_profile_value(
             source,
@@ -504,7 +489,6 @@ impl ProfileResolver {
             options,
             raw_artifact.clone(),
             raw_artifact,
-            workspace_override,
         )
     }
 
@@ -519,7 +503,6 @@ impl ProfileResolver {
                 .as_deref()
                 .unwrap_or_else(|| Path::new(".")),
         )?;
-        let workspace_override = load_workspace_override_from(&workspace_base)?;
         let raw_artifact = builtin_profile_artifact(label).ok_or_else(|| {
             ProfileError::InvalidProfile(format!("unknown builtin profile artifact `{label}`"))
         })?;
@@ -530,7 +513,6 @@ impl ProfileResolver {
             options,
             raw_artifact.clone(),
             raw_artifact,
-            workspace_override,
         )
     }
 }
@@ -542,7 +524,6 @@ fn resolve_profile_value(
     options: ProfileResolveOptions,
     value: serde_json::Value,
     raw_artifact: serde_json::Value,
-    workspace_override: Option<WorkspaceOverrideLayer>,
 ) -> Result<ResolvedProfile, ProfileError> {
     if !workspace_base.is_absolute() {
         return Err(ProfileError::InvalidPath {
@@ -585,29 +566,11 @@ fn resolve_profile_value(
         memory: profile.memory,
         skills: profile.skills,
     };
-    let mut config =
-        WorkerManifestConfig::builtin_defaults().merge(config.resolve_paths(profile_dir));
-    let workspace_override_snapshot = if let Some(override_layer) = workspace_override {
-        let override_base =
-            override_layer
-                .path
-                .parent()
-                .ok_or_else(|| ProfileError::InvalidPath {
-                    path: override_layer.path.clone(),
-                    message: "workspace override path has no parent directory".into(),
-                })?;
-        config = config.merge(override_layer.config.resolve_paths(override_base));
-        Some(WorkspaceOverrideSnapshot {
-            path: override_layer.path,
-        })
-    } else {
-        None
-    };
+    let config = WorkerManifestConfig::builtin_defaults().merge(config.resolve_paths(profile_dir));
     let mut manifest = WorkerManifest::try_from(config).map_err(ProfileError::ManifestResolve)?;
     manifest.profile = Some(ProfileManifestSnapshot {
         source: source.clone(),
         profile: profile_meta.clone(),
-        workspace_override: workspace_override_snapshot,
     });
     let manifest_snapshot =
         serde_json::to_value(&manifest).map_err(ProfileError::SnapshotSerialize)?;
@@ -749,70 +712,6 @@ fn load_profile_registry_file(
         });
     }
     Ok(())
-}
-
-fn load_workspace_override_from(
-    workspace_base: &Path,
-) -> Result<Option<WorkspaceOverrideLayer>, ProfileError> {
-    find_workspace_override_from(workspace_base)
-        .map(|path| load_workspace_override_file(&path))
-        .transpose()
-}
-
-fn load_workspace_override_file(path: &Path) -> Result<WorkspaceOverrideLayer, ProfileError> {
-    let content =
-        std::fs::read_to_string(path).map_err(|source| ProfileError::WorkspaceOverrideRead {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    let config = WorkerManifestConfig::from_toml(&content).map_err(|source| {
-        ProfileError::WorkspaceOverrideParse {
-            path: path.to_path_buf(),
-            source,
-        }
-    })?;
-    if config.worker.name.is_some() {
-        return Err(ProfileError::InvalidWorkspaceOverride {
-            path: path.to_path_buf(),
-            message: "workspace-local manifest overrides cannot set worker.name; Worker identity is a runtime input".into(),
-        });
-    }
-    Ok(WorkspaceOverrideLayer {
-        path: path.to_path_buf(),
-        config,
-    })
-}
-
-fn find_workspace_override_from(start: &Path) -> Option<PathBuf> {
-    let start = start
-        .canonicalize()
-        .ok()
-        .unwrap_or_else(|| start.to_path_buf());
-    let mut cur: Option<&Path> = Some(start.as_path());
-    while let Some(dir) = cur {
-        let candidate = dir.join(".yoi").join(WORKSPACE_OVERRIDE_LOCAL_FILENAME);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        cur = dir.parent();
-    }
-    None
-}
-
-fn find_project_profiles_from(start: &Path) -> Option<PathBuf> {
-    let start = start
-        .canonicalize()
-        .ok()
-        .unwrap_or_else(|| start.to_path_buf());
-    let mut cur: Option<&Path> = Some(start.as_path());
-    while let Some(dir) = cur {
-        let candidate = dir.join(".yoi").join("profiles.toml");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        cur = dir.parent();
-    }
-    None
 }
 
 fn add_builtin_profiles(registry: &mut ProfileRegistry) {
@@ -1285,7 +1184,6 @@ pub fn resolve_profile_artifact_value(
         ProfileResolveOptions::with_worker_name(worker_name),
         raw_artifact.clone(),
         raw_artifact,
-        None,
     )
 }
 
@@ -1313,20 +1211,6 @@ pub enum ProfileError {
         #[source]
         source: toml::de::Error,
     },
-    #[error("failed to read workspace local manifest override {}: {source}", .path.display())]
-    WorkspaceOverrideRead {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to parse workspace local manifest override {}: {source}", .path.display())]
-    WorkspaceOverrideParse {
-        path: PathBuf,
-        #[source]
-        source: toml::de::Error,
-    },
-    #[error("invalid workspace local manifest override {}: {message}", .path.display())]
-    InvalidWorkspaceOverride { path: PathBuf, message: String },
     #[error("no default profile is configured")]
     NoDefaultProfile,
     #[error("profile resolution requires an explicit runtime Worker name")]
@@ -1594,7 +1478,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let err = ProfileResolver::new()
             .with_workspace_base(tmp.path())
-            .resolve(&ProfileSelector::Default, ProfileResolveOptions::default())
+            .resolve(
+                &ProfileSelector::source_named(ProfileRegistrySource::Builtin, "companion"),
+                ProfileResolveOptions::default(),
+            )
             .unwrap_err();
         assert!(matches!(err, ProfileError::MissingRuntimeWorkerName));
     }
@@ -1858,134 +1745,6 @@ worker_context_max_tokens = 68000
         );
     }
     #[test]
-    fn workspace_local_override_layers_over_profile_defaults() {
-        let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().join("project");
-        let nested = workspace.join("nested");
-        let yoi_dir = workspace.join(".yoi");
-        std::fs::create_dir_all(&nested).unwrap();
-        std::fs::create_dir_all(&yoi_dir).unwrap();
-        let override_path = yoi_dir.join(WORKSPACE_OVERRIDE_LOCAL_FILENAME);
-        std::fs::write(
-            &override_path,
-            r#"
-[worker]
-prompt_pack = "prompts.toml"
-[engine]
-language = "ja"
-[session]
-record_event_trace = false
-"#,
-        )
-        .unwrap();
-
-        let resolved = ProfileResolver::new()
-            .with_workspace_base(&nested)
-            .resolve(
-                &ProfileSelector::Default,
-                ProfileResolveOptions::with_worker_name("runtime-worker"),
-            )
-            .unwrap();
-
-        assert_eq!(resolved.manifest.worker.name, "runtime-worker");
-        assert_eq!(resolved.manifest.engine.language, "ja");
-        assert!(!resolved.manifest.session.record_event_trace);
-        assert_eq!(
-            resolved.manifest.worker.prompt_pack.as_deref(),
-            Some(yoi_dir.join("prompts.toml").as_path())
-        );
-        assert!(resolved.manifest.scope.allow.is_empty());
-        assert_eq!(
-            resolved
-                .manifest
-                .profile
-                .as_ref()
-                .and_then(|snapshot| snapshot.workspace_override.as_ref())
-                .map(|snapshot| snapshot.path.as_path()),
-            Some(override_path.as_path())
-        );
-    }
-
-    #[test]
-    fn workspace_local_override_uses_nearest_ancestor() {
-        let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().join("project");
-        let nested = workspace.join("nested");
-        let child = nested.join("child");
-        let parent_yoi = workspace.join(".yoi");
-        let nested_yoi = nested.join(".yoi");
-        std::fs::create_dir_all(&child).unwrap();
-        std::fs::create_dir_all(&parent_yoi).unwrap();
-        std::fs::create_dir_all(&nested_yoi).unwrap();
-        std::fs::write(
-            parent_yoi.join(WORKSPACE_OVERRIDE_LOCAL_FILENAME),
-            r#"
-[worker]
-prompt_pack = "parent-prompts.toml"
-[engine]
-language = "parent"
-"#,
-        )
-        .unwrap();
-        let nested_override_path = nested_yoi.join(WORKSPACE_OVERRIDE_LOCAL_FILENAME);
-        std::fs::write(
-            &nested_override_path,
-            r#"
-[worker]
-prompt_pack = "nested-prompts.toml"
-[engine]
-language = "nested"
-"#,
-        )
-        .unwrap();
-
-        let resolved = ProfileResolver::new()
-            .with_workspace_base(&child)
-            .resolve(
-                &ProfileSelector::Default,
-                ProfileResolveOptions::with_worker_name("runtime-worker"),
-            )
-            .unwrap();
-
-        assert_eq!(resolved.manifest.engine.language, "nested");
-        assert_eq!(
-            resolved.manifest.worker.prompt_pack.as_deref(),
-            Some(nested_yoi.join("nested-prompts.toml").as_path())
-        );
-        assert_eq!(
-            resolved
-                .manifest
-                .profile
-                .as_ref()
-                .and_then(|snapshot| snapshot.workspace_override.as_ref())
-                .map(|snapshot| snapshot.path.as_path()),
-            Some(nested_override_path.as_path())
-        );
-    }
-
-    #[test]
-    fn workspace_local_override_rejects_runtime_worker_name() {
-        let tmp = TempDir::new().unwrap();
-        let yoi_dir = tmp.path().join(".yoi");
-        std::fs::create_dir_all(&yoi_dir).unwrap();
-        std::fs::write(
-            yoi_dir.join(WORKSPACE_OVERRIDE_LOCAL_FILENAME),
-            "[worker]\nname = \"not-local\"\n",
-        )
-        .unwrap();
-
-        let err = ProfileResolver::new()
-            .with_workspace_base(tmp.path())
-            .resolve(
-                &ProfileSelector::Default,
-                ProfileResolveOptions::with_worker_name("runtime-worker"),
-            )
-            .unwrap_err();
-        assert!(matches!(err, ProfileError::InvalidWorkspaceOverride { .. }));
-        assert!(err.to_string().contains("worker.name"));
-    }
-
-    #[test]
     fn unsupported_profile_extension_has_clear_diagnostic() {
         let tmp = TempDir::new().unwrap();
         let path = write_profile(tmp.path(), "legacy.txt", "{}");
@@ -2003,7 +1762,7 @@ language = "nested"
         );
     }
     #[test]
-    fn discovery_reads_user_and_project_registry_and_project_default_wins() {
+    fn explicit_discovery_sources_preserve_non_workspace_tooling_contract() {
         let tmp = TempDir::new().unwrap();
         let user_config = tmp.path().join("profiles.toml");
         let project_dir = tmp.path().join("project/.yoi");

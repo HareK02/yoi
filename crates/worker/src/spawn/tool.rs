@@ -1550,8 +1550,7 @@ extract_threshold = 4000
         default: Option<&str>,
         profiles: &[(&str, &str, &str)],
     ) -> AvailableProfiles {
-        let yoi = project.join(".yoi");
-        let profile_dir = yoi.join("profiles");
+        let profile_dir = project.join("explicit-project-profiles");
         std::fs::create_dir_all(&profile_dir).unwrap();
         let mut registry_toml = String::new();
         if let Some(default) = default {
@@ -1560,9 +1559,9 @@ extract_threshold = 4000
         registry_toml.push_str("[profile]\n");
         for (name, file, body) in profiles {
             std::fs::write(profile_dir.join(file), body).unwrap();
-            registry_toml.push_str(&format!("{name} = \"profiles/{file}\"\n"));
+            registry_toml.push_str(&format!("{name} = \"explicit-project-profiles/{file}\"\n"));
         }
-        let registry_path = yoi.join("profiles.toml");
+        let registry_path = project.join("explicit-project-profiles.toml");
         std::fs::write(&registry_path, registry_toml).unwrap();
         AvailableProfiles {
             registry: Some(
@@ -1944,7 +1943,7 @@ max_tokens = 3333
 
         let user_config = tmp.path().join("user-profiles.toml");
         std::fs::write(&user_config, "[profile]\ncoder = \"user-coder.toml\"\n").unwrap();
-        let project_config = project.join(".yoi/profiles.toml");
+        let project_config = project.join("explicit-project-profiles.toml");
         let ambiguous = AvailableProfiles {
             registry: Some(
                 ProfileDiscovery::with_sources(Some(user_config), Some(project_config))

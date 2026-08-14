@@ -764,7 +764,7 @@ permission = "write"
         let yoi_dir = tmp.path().join(".yoi");
         std::fs::create_dir_all(&yoi_dir).unwrap();
         write(
-            &yoi_dir.join("override.local.toml"),
+            &yoi_dir.join("ignored-local-file.toml"),
             r#"
 [worker]
 name = "from-local-override"
@@ -822,7 +822,7 @@ permission = "write"
         let yoi_dir = workspace.join(".yoi");
         std::fs::create_dir_all(&yoi_dir).unwrap();
         write(
-            &yoi_dir.join("override.local.toml"),
+            &yoi_dir.join("ignored-local-file.toml"),
             r#"
 [worker]
 name = "from-local-override"

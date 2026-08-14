@@ -84,12 +84,7 @@ use crate::observation::{
     BackendObservationProxy, ObservationProxyError, RuntimeObservationClient,
     RuntimeObservationSource, RuntimeObservationSourceConfig,
 };
-use crate::profile_settings::{
-    CreateWorkspaceProfileSourceRequest, DeleteWorkspaceProfileSourceRequest,
-    DeleteWorkspaceProfileTreeFileRequest, ReadWorkspaceProfileTreeFileQuery,
-    UpdateWorkspaceMetadataRequest, UpdateWorkspaceProfileRegistryRequest,
-    UpdateWorkspaceProfileSourceRequest, WriteWorkspaceProfileTreeFileRequest,
-};
+use crate::profile_settings::UpdateWorkspaceMetadataRequest;
 use crate::records::{ObjectiveDetail, ProjectRecordList, TicketDetail};
 use crate::repositories::{
     ConfiguredRepository, RepositoryListProjection, RepositoryLogRead, RepositoryLookupError,
@@ -756,9 +751,17 @@ impl WorkspaceApi {
         let config_store = Arc::new(crate::SqliteWorkspaceStore::open(
             config.database_path.clone(),
         )?);
+        config_store.ensure_workspace_config_materialized(
+            &config.workspace_id,
+            &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        )?;
+        let config_schema_registry = crate::config_source::WorkspaceConfigSchemaRegistry::default()
+            .with_provider(Arc::new(
+                crate::profile_settings::ProfileConfigSchemaProvider,
+            ));
         let api = Self {
             config_store,
-            config_schema_registry: crate::config_source::WorkspaceConfigSchemaRegistry::default(),
+            config_schema_registry,
             authority: SqliteWorkspaceAuthority::new(
                 config.database_path.clone(),
                 config.workspace_id.clone(),
@@ -1171,27 +1174,7 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         )
         .route(
             "/api/w/{workspace_id}/settings/profiles",
-            get(scoped_get_profile_settings).post(scoped_create_profile_source),
-        )
-        .route(
-            "/api/w/{workspace_id}/settings/profiles/registry",
-            put(scoped_update_profile_registry),
-        )
-        .route(
-            "/api/w/{workspace_id}/settings/profiles/trees/{source_tree_id}",
-            get(scoped_get_profile_source_tree),
-        )
-        .route(
-            "/api/w/{workspace_id}/settings/profiles/trees/{source_tree_id}/file",
-            get(scoped_get_profile_tree_file)
-                .put(scoped_write_profile_tree_file)
-                .delete(scoped_delete_profile_tree_file),
-        )
-        .route(
-            "/api/w/{workspace_id}/settings/profiles/{profile_source_id}",
-            get(scoped_get_profile_source)
-                .put(scoped_update_profile_source)
-                .delete(scoped_delete_profile_source),
+            get(scoped_get_profile_settings),
         )
         .route(
             "/api/w/{workspace_id}/flows",
@@ -2577,130 +2560,19 @@ async fn scoped_get_profile_settings(
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
 ) -> ApiResult<Json<crate::profile_settings::ProfileSettingsResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    Ok(Json(crate::profile_settings::load_profile_settings(
-        &api.config.workspace_id,
-        &api.config.workspace_root,
-    )))
-}
-
-async fn scoped_create_profile_source(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedWorkspacePath>,
-    Json(request): Json<CreateWorkspaceProfileSourceRequest>,
-) -> ApiResult<Json<crate::profile_settings::ProfileSettingsMutationResponse>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    Ok(Json(crate::profile_settings::create_profile_source(
-        &api.config.workspace_id,
-        &api.config.workspace_root,
-        request,
-    )?))
-}
-
-async fn scoped_update_profile_registry(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedWorkspacePath>,
-    Json(request): Json<UpdateWorkspaceProfileRegistryRequest>,
-) -> ApiResult<Json<crate::profile_settings::ProfileSettingsMutationResponse>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    Ok(Json(crate::profile_settings::update_profile_registry(
-        &api.config.workspace_id,
-        &api.config.workspace_root,
-        request,
-    )?))
-}
-
-async fn scoped_get_profile_source_tree(
-    State(api): State<WorkspaceApi>,
-    AxumPath((workspace_id, source_tree_id)): AxumPath<(String, String)>,
-) -> ApiResult<Json<crate::profile_settings::WorkspaceProfileSourceTreeResponse>> {
-    validate_workspace_scope(&api, &workspace_id)?;
-    Ok(Json(crate::profile_settings::read_profile_source_tree(
-        &workspace_id,
-        &api.config.workspace_root,
-        &source_tree_id,
-    )?))
-}
-
-async fn scoped_get_profile_tree_file(
-    State(api): State<WorkspaceApi>,
-    AxumPath((workspace_id, source_tree_id)): AxumPath<(String, String)>,
-    Query(query): Query<ReadWorkspaceProfileTreeFileQuery>,
-) -> ApiResult<Json<crate::profile_settings::WorkspaceProfileSourceTreeFileResponse>> {
-    validate_workspace_scope(&api, &workspace_id)?;
-    Ok(Json(crate::profile_settings::read_profile_tree_file(
-        &workspace_id,
-        &api.config.workspace_root,
-        &source_tree_id,
-        query,
-    )?))
-}
-
-async fn scoped_write_profile_tree_file(
-    State(api): State<WorkspaceApi>,
-    AxumPath((workspace_id, source_tree_id)): AxumPath<(String, String)>,
-    Json(request): Json<WriteWorkspaceProfileTreeFileRequest>,
-) -> ApiResult<Json<crate::profile_settings::WorkspaceProfileSourceTreeFileResponse>> {
-    validate_workspace_scope(&api, &workspace_id)?;
-    Ok(Json(crate::profile_settings::write_profile_tree_file(
-        &workspace_id,
-        &api.config.workspace_root,
-        &source_tree_id,
-        request,
-    )?))
-}
-
-async fn scoped_delete_profile_tree_file(
-    State(api): State<WorkspaceApi>,
-    AxumPath((workspace_id, source_tree_id)): AxumPath<(String, String)>,
-    Json(request): Json<DeleteWorkspaceProfileTreeFileRequest>,
-) -> ApiResult<Json<crate::profile_settings::WorkspaceProfileSourceTreeResponse>> {
-    validate_workspace_scope(&api, &workspace_id)?;
-    Ok(Json(crate::profile_settings::delete_profile_tree_file(
-        &workspace_id,
-        &api.config.workspace_root,
-        &source_tree_id,
-        request,
-    )?))
-}
-
-async fn scoped_get_profile_source(
-    State(api): State<WorkspaceApi>,
-    AxumPath((workspace_id, profile_source_id)): AxumPath<(String, String)>,
-) -> ApiResult<Json<crate::profile_settings::WorkspaceProfileSourceDetailResponse>> {
-    validate_workspace_scope(&api, &workspace_id)?;
-    Ok(Json(crate::profile_settings::read_profile_source(
-        &api.config.workspace_id,
-        &api.config.workspace_root,
-        &profile_source_id,
-    )?))
-}
-
-async fn scoped_update_profile_source(
-    State(api): State<WorkspaceApi>,
-    AxumPath((workspace_id, profile_source_id)): AxumPath<(String, String)>,
-    Json(request): Json<UpdateWorkspaceProfileSourceRequest>,
-) -> ApiResult<Json<crate::profile_settings::ProfileSettingsMutationResponse>> {
-    validate_workspace_scope(&api, &workspace_id)?;
-    Ok(Json(crate::profile_settings::update_profile_source(
-        &api.config.workspace_id,
-        &api.config.workspace_root,
-        &profile_source_id,
-        request,
-    )?))
-}
-
-async fn scoped_delete_profile_source(
-    State(api): State<WorkspaceApi>,
-    AxumPath((workspace_id, profile_source_id)): AxumPath<(String, String)>,
-    Json(request): Json<DeleteWorkspaceProfileSourceRequest>,
-) -> ApiResult<Json<crate::profile_settings::ProfileSettingsMutationResponse>> {
-    validate_workspace_scope(&api, &workspace_id)?;
-    Ok(Json(crate::profile_settings::delete_profile_source(
-        &api.config.workspace_id,
-        &api.config.workspace_root,
-        &profile_source_id,
-        request,
-    )?))
+    let state = api
+        .config_store
+        .load_workspace_config(&path.workspace_id)?
+        .ok_or_else(|| {
+            ApiError::from(Error::InvalidRecordId("virtual config source tree".into()))
+        })?;
+    Ok(Json(
+        crate::profile_settings::project_profiles_from_workspace_config(
+            &path.workspace_id,
+            &state,
+        )?
+        .settings,
+    ))
 }
 
 async fn scoped_list_tickets(
@@ -5134,12 +5006,7 @@ fn start_memory_staging_consolidation(
     }
 
     let profile_selector = ProfileSelector::Builtin(MEMORY_CONSOLIDATION_PROFILE.to_string());
-    let resolved_config_bundle = crate::profile_settings::build_workspace_profile_config_bundle(
-        &api.config.workspace_root,
-        &api.config.workspace_id,
-        &api.config.workspace_created_at,
-        MEMORY_CONSOLIDATION_PROFILE,
-    )?;
+    let resolved_config_bundle = None;
     let initial_submit = vec![Segment::text(input_content)];
     let result = api.spawn_workspace_worker(
         &runtime_id,
@@ -8142,7 +8009,7 @@ async fn test_remote_runtime_connection(
 async fn get_worker_launch_options(
     State(api): State<WorkspaceApi>,
 ) -> ApiResult<Json<WorkerLaunchOptionsResponse>> {
-    Ok(Json(worker_launch_options_response(&api)))
+    Ok(Json(worker_launch_options_response(&api)?))
 }
 
 fn working_directory_request_from_repository(
@@ -8298,18 +8165,20 @@ async fn create_workspace_worker(
         initial_submit,
         working_directory,
     } = request;
+    let config_state = api
+        .config_store
+        .load_workspace_config(&api.config.workspace_id)?
+        .ok_or_else(|| Error::InvalidRecordId("virtual config source tree".into()))?;
+    let profile_projection = crate::profile_settings::project_profiles_from_workspace_config(
+        &api.config.workspace_id,
+        &config_state,
+    )?;
     let profile = profile
         .as_deref()
         .map(str::trim)
         .filter(|profile| !profile.is_empty())
         .map(ToOwned::to_owned)
-        .or_else(|| {
-            crate::profile_settings::load_profile_settings(
-                &api.config.workspace_id,
-                &api.config.workspace_root,
-            )
-            .default_profile
-        })
+        .or_else(|| profile_projection.settings.default_profile.clone())
         .ok_or_else(|| {
             settings_bad_request(
                 "workspace_default_profile_missing",
@@ -8317,24 +8186,20 @@ async fn create_workspace_worker(
             )
         })?;
     let profile_selector =
-        profile_selector_for_candidate_with_root(&api.config.workspace_root, &profile).ok_or_else(
-            || {
+        crate::profile_settings::selector_for_workspace_candidate(&profile_projection, &profile)
+            .ok_or_else(|| {
                 settings_bad_request(
                     "unsupported_worker_profile",
                     "profile must be selected from Backend-published worker profile candidates",
                 )
-            },
-        )?;
-    let resolved_config_bundle = if profile.starts_with("project:") {
-        crate::profile_settings::build_workspace_profile_config_bundle(
-            &api.config.workspace_root,
-            &api.config.workspace_id,
-            &api.config.workspace_created_at,
-            &profile,
-        )?
-    } else {
-        None
-    };
+            })?;
+    let resolved_config_bundle = crate::profile_settings::build_virtual_profile_config_bundle(
+        &profile_projection,
+        &config_state,
+        &api.config.workspace_id,
+        &api.config.workspace_created_at,
+        &profile,
+    )?;
     let display_name = sanitize_worker_display_name(&display_name).ok_or_else(|| {
         settings_bad_request(
             "invalid_worker_display_name",
@@ -10437,7 +10302,7 @@ async fn probe_remote_json(
     })
 }
 
-fn worker_launch_options_response(api: &WorkspaceApi) -> WorkerLaunchOptionsResponse {
+fn worker_launch_options_response(api: &WorkspaceApi) -> ApiResult<WorkerLaunchOptionsResponse> {
     let runtimes = api
         .runtime
         .list_runtimes(api.config.max_records.min(200))
@@ -10456,10 +10321,17 @@ fn worker_launch_options_response(api: &WorkspaceApi) -> WorkerLaunchOptionsResp
             }
         })
         .collect();
-    let profile_settings = crate::profile_settings::load_profile_settings(
+    let config_state = api
+        .config_store
+        .load_workspace_config(&api.config.workspace_id)?
+        .ok_or_else(|| {
+            ApiError::from(Error::InvalidRecordId("virtual config source tree".into()))
+        })?;
+    let profile_settings = crate::profile_settings::project_profiles_from_workspace_config(
         &api.config.workspace_id,
-        &api.config.workspace_root,
-    );
+        &config_state,
+    )?
+    .settings;
     let profiles = profile_settings
         .profiles
         .into_iter()
@@ -10477,7 +10349,7 @@ fn worker_launch_options_response(api: &WorkspaceApi) -> WorkerLaunchOptionsResp
                 .unwrap_or_else(|| "Workspace profile.".to_string()),
         })
         .collect();
-    WorkerLaunchOptionsResponse {
+    Ok(WorkerLaunchOptionsResponse {
         workspace_id: api.config.workspace_id.clone(),
         runtimes,
         default_profile: profile_settings.default_profile,
@@ -10485,7 +10357,7 @@ fn worker_launch_options_response(api: &WorkspaceApi) -> WorkerLaunchOptionsResp
         repositories: working_directory_repository_options(api),
         working_directories: available_working_directory_summaries(api).unwrap_or_default(),
         diagnostics: Vec::new(),
-    }
+    })
 }
 
 fn working_directory_repository_options(
@@ -11067,27 +10939,6 @@ fn working_directory_request_for_browser(
         materializer: MaterializerKind::LocalGitWorktree,
         backend_workdir_id: None,
     })
-}
-
-fn profile_selector_for_candidate_with_root(
-    workspace_root: &Path,
-    profile: &str,
-) -> Option<ProfileSelector> {
-    if let Some(selector @ ProfileSelector::Builtin(_)) =
-        crate::profile_settings::selector_for_builtin_candidate(profile)
-    {
-        return Some(selector);
-    }
-    crate::profile_settings::project_profile_candidates(workspace_root)
-        .into_iter()
-        .find(|candidate| {
-            candidate.profile_id == profile
-                && !candidate
-                    .diagnostics
-                    .iter()
-                    .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
-        })
-        .and_then(|_| crate::profile_settings::selector_for_builtin_candidate(profile))
 }
 
 fn parse_runtime_worker_id_for_registry(worker_id: &str) -> ApiResult<u64> {
@@ -12777,93 +12628,6 @@ mod tests {
     }
 
     #[test]
-    fn worker_profile_candidates_are_backend_published_and_mapped() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::create_dir_all(dir.path().join(".yoi")).unwrap();
-        fs::write(
-            dir.path().join(".yoi/profiles.toml"),
-            "default = \"builtin:companion\"\n",
-        )
-        .unwrap();
-        let settings = crate::profile_settings::load_profile_settings("workspace-test", dir.path());
-        for expected in [
-            "builtin:companion",
-            "builtin:intake",
-            "builtin:orchestrator",
-            "builtin:coder",
-            "builtin:reviewer",
-        ] {
-            assert!(
-                settings
-                    .profiles
-                    .iter()
-                    .any(|profile| profile.profile_id == expected),
-                "missing {expected}"
-            );
-        }
-        assert!(
-            settings
-                .profiles
-                .iter()
-                .all(|profile| profile.profile_id != "builtin:default")
-        );
-        assert_eq!(
-            settings.default_profile.as_deref(),
-            Some("builtin:companion")
-        );
-        assert!(matches!(
-            profile_selector_for_candidate_with_root(dir.path(), "builtin:coder"),
-            Some(ProfileSelector::Builtin(value)) if value == "builtin:coder"
-        ));
-        assert!(
-            profile_selector_for_candidate_with_root(dir.path(), "free-text-profile").is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn worker_launch_options_publish_every_valid_workspace_profile_and_default() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::create_dir_all(dir.path().join(".yoi/profiles")).unwrap();
-        fs::write(
-            dir.path().join(".yoi/profiles.toml"),
-            concat!(
-                "default = \"builtin:companion\"\n",
-                "[profile.custom]\n",
-                "path = \".yoi/profiles/custom.dcdl\"\n",
-            ),
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join(".yoi/profiles/custom.dcdl"),
-            "slug = \"custom\"; description = \"Custom profile\";\n",
-        )
-        .unwrap();
-        let api = test_app(dir.path()).await;
-
-        let response = get_json(api, "/api/workers/launch-options").await;
-        assert_eq!(response["default_profile"], "builtin:companion");
-        let profiles = response["profiles"].as_array().unwrap();
-        for expected in [
-            "builtin:companion",
-            "builtin:intake",
-            "builtin:orchestrator",
-            "builtin:coder",
-            "builtin:reviewer",
-            "project:custom",
-        ] {
-            assert!(
-                profiles.iter().any(|profile| profile["id"] == expected),
-                "missing {expected}: {profiles:?}"
-            );
-        }
-        assert!(
-            profiles
-                .iter()
-                .all(|profile| profile["id"] != "builtin:default")
-        );
-    }
-
-    #[test]
     fn runtime_connection_request_validation_bounds_browser_input() {
         let ok = AddRemoteRuntimeConnectionRequest {
             runtime_id: "team-runtime_1".to_string(),
@@ -12908,218 +12672,6 @@ mod tests {
                 message: "not a typed workdir miss".to_string(),
             }]),
             "unknown"
-        );
-    }
-
-    #[tokio::test]
-    async fn profile_settings_api_returns_typed_diagnostics_for_duplicate_selector() {
-        let dir = tempfile::tempdir().unwrap();
-        let response = profile_settings_request(
-            dir.path(),
-            "POST",
-            "/settings/profiles",
-            json!({
-                "name": "coder",
-                "content": valid_profile_source("coder"),
-                "registry_revision": "missing"
-            }),
-        )
-        .await;
-        assert_eq!(response.0, StatusCode::BAD_REQUEST);
-        assert_diagnostic(&response.1, "profile_selector_duplicate");
-    }
-
-    #[tokio::test]
-    async fn profile_settings_api_returns_typed_diagnostics_for_invalid_decodal() {
-        let dir = tempfile::tempdir().unwrap();
-        let response = profile_settings_request(
-            dir.path(),
-            "POST",
-            "/settings/profiles",
-            json!({
-                "name": "bad",
-                "content": "not decodal",
-                "registry_revision": "missing"
-            }),
-        )
-        .await;
-        assert_eq!(response.0, StatusCode::BAD_REQUEST);
-        assert!(
-            diagnostic_codes(&response.1)
-                .iter()
-                .any(|code| code.starts_with("profile_source_"))
-        );
-    }
-
-    #[tokio::test]
-    async fn profile_settings_api_returns_typed_diagnostic_for_invalid_registry_schema() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::create_dir_all(dir.path().join(".yoi")).unwrap();
-        fs::write(dir.path().join(".yoi/profiles.toml"), "[profile\n").unwrap();
-        let response = profile_settings_request(
-            dir.path(),
-            "POST",
-            "/settings/profiles",
-            json!({
-                "name": "schema",
-                "content": valid_profile_source("schema"),
-                "registry_revision": test_file_revision(&dir.path().join(".yoi/profiles.toml"))
-            }),
-        )
-        .await;
-        assert_eq!(response.0, StatusCode::BAD_REQUEST);
-        assert_diagnostic(&response.1, "profile_registry_schema_invalid");
-    }
-
-    #[tokio::test]
-    async fn profile_settings_api_returns_conflict_diagnostic_for_stale_revision() {
-        let dir = tempfile::tempdir().unwrap();
-        let response = profile_settings_request(
-            dir.path(),
-            "POST",
-            "/settings/profiles",
-            json!({
-                "name": "alpha",
-                "content": valid_profile_source("alpha"),
-                "registry_revision": "stale"
-            }),
-        )
-        .await;
-        assert_eq!(response.0, StatusCode::CONFLICT);
-        assert_diagnostic(&response.1, "profile_registry_revision_conflict");
-    }
-
-    #[tokio::test]
-    async fn profile_settings_api_returns_typed_diagnostic_for_too_large_source() {
-        let dir = tempfile::tempdir().unwrap();
-        let response = profile_settings_request(
-            dir.path(),
-            "POST",
-            "/settings/profiles",
-            json!({
-                "name": "large",
-                "content": "x".repeat((256 * 1024) + 1),
-                "registry_revision": "missing"
-            }),
-        )
-        .await;
-        assert_eq!(response.0, StatusCode::BAD_REQUEST);
-        assert_diagnostic(&response.1, "profile_source_too_large");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn profile_settings_api_redacts_symlink_escape_response() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::create_dir_all(dir.path().join(".yoi/profiles")).unwrap();
-        fs::write(dir.path().join(".yoi/profiles.toml"), "").unwrap();
-        let outside = dir.path().join("outside.dcdl");
-        fs::write(&outside, valid_profile_source("escape")).unwrap();
-        std::os::unix::fs::symlink(&outside, dir.path().join(".yoi/profiles/escape.dcdl")).unwrap();
-        let response = profile_settings_request(
-            dir.path(),
-            "PUT",
-            "/settings/profiles/registry",
-            json!({
-                "registry_revision": test_file_revision(&dir.path().join(".yoi/profiles.toml")),
-                "default_profile": null,
-                "profiles": [{ "name": "escape", "profile_source_id": "project:escape" }]
-            }),
-        )
-        .await;
-        assert_eq!(response.0, StatusCode::BAD_REQUEST);
-        assert_diagnostic(&response.1, "profile_source_symlink_escape");
-        let rendered = response.1.to_string();
-        assert!(!rendered.contains(dir.path().to_string_lossy().as_ref()));
-    }
-
-    #[tokio::test]
-    async fn worker_launch_rejects_invalid_project_profile_candidate() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::create_dir_all(dir.path().join(".yoi/profiles")).unwrap();
-        fs::write(
-            dir.path().join(".yoi/profiles.toml"),
-            "[profile.bad]\npath = \"profiles/bad.dcdl\"\n",
-        )
-        .unwrap();
-        fs::write(dir.path().join(".yoi/profiles/bad.dcdl"), "not decodal").unwrap();
-        let candidates =
-            crate::profile_settings::load_profile_settings("workspace-test", dir.path())
-                .profiles
-                .into_iter()
-                .filter(|profile| {
-                    !profile
-                        .diagnostics
-                        .iter()
-                        .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
-                })
-                .map(|profile| profile.profile_id)
-                .collect::<Vec<_>>();
-        assert!(!candidates.iter().any(|profile| profile == "project:bad"));
-        assert!(profile_selector_for_candidate_with_root(dir.path(), "project:bad").is_none());
-    }
-
-    fn valid_profile_source(slug: &str) -> String {
-        format!(
-            r#"{{
-                slug = "{slug}";
-                description = "Test";
-                scope = "workspace_read";
-            }}"#
-        )
-    }
-
-    fn test_file_revision(path: &Path) -> String {
-        let Ok(metadata) = fs::metadata(path) else {
-            return "missing".to_string();
-        };
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        format!("rev:{modified}:{}", metadata.len())
-    }
-
-    async fn profile_settings_request(
-        workspace_root: &Path,
-        method: &str,
-        path: &str,
-        body: Value,
-    ) -> (StatusCode, Value) {
-        let app = test_app(workspace_root.to_path_buf()).await;
-        let request = Request::builder()
-            .method(method)
-            .uri(format!("/api/w/{TEST_WORKSPACE_ID}{path}"))
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let response = app.oneshot(request).await.unwrap();
-        let status = response.status();
-        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-        let json = serde_json::from_slice::<Value>(&bytes).unwrap();
-        (status, json)
-    }
-
-    fn diagnostic_codes(response: &Value) -> Vec<String> {
-        response["diagnostics"]
-            .as_array()
-            .expect("diagnostics array")
-            .iter()
-            .map(|diagnostic| diagnostic["code"].as_str().unwrap().to_string())
-            .collect()
-    }
-
-    fn assert_diagnostic(response: &Value, code: &str) {
-        let codes = diagnostic_codes(response);
-        assert!(
-            !codes.is_empty(),
-            "diagnostics must not be empty: {response}"
-        );
-        assert!(
-            codes.iter().any(|actual| actual == code),
-            "missing {code}: {codes:?}"
         );
     }
 
@@ -13405,14 +12957,7 @@ mod tests {
             )
             .unwrap();
 
-        let resolved_config_bundle =
-            crate::profile_settings::build_workspace_profile_config_bundle(
-                &api.config.workspace_root,
-                &api.config.workspace_id,
-                &api.config.workspace_created_at,
-                MEMORY_CONSOLIDATION_PROFILE,
-            )
-            .unwrap();
+        let resolved_config_bundle = None;
         let existing = api
             .runtime
             .spawn_worker(
@@ -16064,12 +15609,6 @@ mod tests {
     #[tokio::test]
     async fn browser_worker_create_uses_workspace_default_and_preserves_unsupported_diagnostics() {
         let dir = tempfile::tempdir().unwrap();
-        fs::create_dir_all(dir.path().join(".yoi")).unwrap();
-        fs::write(
-            dir.path().join(".yoi/profiles.toml"),
-            "default = \"builtin:coder\"\n",
-        )
-        .unwrap();
         let app = test_app(dir.path()).await;
         let created = post_json(
             app.clone(),
@@ -16090,7 +15629,7 @@ mod tests {
             .find(|worker| worker["worker_id"] == created["worker_id"])
             .expect("created Worker should be listed");
         assert_eq!(worker["label"], "Worker");
-        assert_eq!(worker["profile"], "builtin:coder");
+        assert_eq!(worker["profile"], "builtin:companion");
         assert!(worker.get("role").is_none());
         assert_eq!(worker["worker_id"], created["worker_id"]);
         let detail_path = format!(
@@ -17743,6 +17282,37 @@ mod tests {
         assert_eq!(shown["title"], "Objective CRUD updated");
         assert_eq!(shown["state"], "paused");
         assert_eq!(shown["linked_tickets"], json!(["00000000001J3"]));
+    }
+
+    #[tokio::test]
+    async fn profile_settings_are_read_only_virtual_config_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_app(dir.path()).await;
+        let path = format!("/api/w/{TEST_WORKSPACE_ID}/settings/profiles");
+        let settings = get_json(app.clone(), &path).await;
+        assert_eq!(settings["default_profile"], "builtin:companion");
+        assert_eq!(settings["config_revision"], 0);
+        assert!(settings["tree_digest"].as_str().is_some());
+        assert!(settings["projection_digest"].as_str().is_some());
+        assert!(
+            settings["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|profile| profile["editable"] == false)
+        );
+        let mutation = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&path)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mutation.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     async fn get_json(app: Router, uri: &str) -> Value {
