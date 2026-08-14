@@ -12714,6 +12714,8 @@ mod tests {
         materializer: worker_runtime::working_directory::LocalGitWorktreeMaterializer,
         spawn_failure: std::sync::Mutex<Option<String>>,
         inputs: std::sync::Mutex<Vec<(worker_runtime::identity::WorkerRef, String)>>,
+        protocol_methods:
+            std::sync::Mutex<Vec<(worker_runtime::identity::WorkerRef, protocol::Method)>>,
     }
 
     impl Default for DeterministicExecutionBackend {
@@ -12733,6 +12735,7 @@ mod tests {
                 ),
                 spawn_failure: std::sync::Mutex::new(None),
                 inputs: std::sync::Mutex::new(Vec::new()),
+                protocol_methods: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -12740,6 +12743,10 @@ mod tests {
     impl DeterministicExecutionBackend {
         fn take_inputs(&self) -> Vec<(worker_runtime::identity::WorkerRef, String)> {
             std::mem::take(&mut *self.inputs.lock().expect("inputs lock"))
+        }
+
+        fn protocol_methods(&self) -> Vec<(worker_runtime::identity::WorkerRef, protocol::Method)> {
+            self.protocol_methods.lock().unwrap().clone()
         }
 
         fn fail_first_spawn(message: impl Into<String>) -> Self {
@@ -12833,6 +12840,21 @@ mod tests {
                 run_state: worker_runtime::execution::WorkerExecutionRunState::Idle,
                 working_directory,
             }
+        }
+
+        fn dispatch_method(
+            &self,
+            handle: &worker_runtime::execution::WorkerExecutionHandle,
+            method: protocol::Method,
+        ) -> worker_runtime::execution::WorkerExecutionResult {
+            self.protocol_methods
+                .lock()
+                .unwrap()
+                .push((handle.worker_ref().clone(), method));
+            worker_runtime::execution::WorkerExecutionResult::accepted(
+                worker_runtime::execution::WorkerExecutionOperation::ProtocolMethod,
+                worker_runtime::execution::WorkerExecutionRunState::Idle,
+            )
         }
 
         fn stop_worker(
@@ -17109,7 +17131,7 @@ mod tests {
     #[tokio::test]
     async fn workspace_subscription_returns_workspace_snapshot() {
         let dir = tempfile::tempdir().unwrap();
-        let api = test_api(dir.path()).await;
+        let (api, execution_backend) = test_api_with_recording_backend(dir.path()).await;
 
         let spawn_request = WorkerSpawnRequest {
             intent: WorkerSpawnIntent::WorkspaceCompanion,
@@ -17310,6 +17332,42 @@ mod tests {
                 break;
             }
         }
+        let resume = protocol::subscription::SubscriptionFrame::new(
+            protocol::subscription::SubscriptionFramePayload::WorkerProtocol(
+                protocol::subscription::SubscriptionWorkerProtocolMethod {
+                    subscription_id: second_protocol_subscription_id,
+                    method: protocol::Method::Resume,
+                },
+            ),
+        );
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&resume).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if execution_backend
+                    .protocol_methods()
+                    .iter()
+                    .any(|(worker_ref, method)| {
+                        worker_ref.worker_id.to_string() == worker_id
+                            && matches!(method, protocol::Method::Resume)
+                    })
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Resume method should reach the Runtime execution backend");
+        let protocol_methods = execution_backend.protocol_methods();
+        assert!(protocol_methods.iter().any(|(worker_ref, method)| {
+            worker_ref.worker_id.to_string() == worker_id
+                && matches!(method, protocol::Method::Resume)
+        }));
         server.abort();
     }
 
