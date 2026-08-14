@@ -1,7 +1,7 @@
 //! Inline-viewport "spawn Worker and attach" UX.
 //!
 //! Rendered at the user's current cursor position when `yoi` is invoked
-//! with no positional argument. Discovers `.yoi/profiles.toml` profile
+//! with no positional argument. Uses user-configured and bundled Profile
 //! choices plus bundled profiles, defaults to the builtin profile, prompts for
 //! the Worker's name, and on confirmation launches the Worker runtime command as an
 //! independent process. Once the process reports its socket via the
@@ -654,68 +654,28 @@ mod tests {
     }
 
     #[test]
-    fn profile_choices_use_project_registry_default() {
+    fn profile_choices_ignore_repository_local_profile_registry() {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         let yoi = project.join(".yoi");
         std::fs::create_dir_all(&yoi).unwrap();
         std::fs::write(
             yoi.join("profiles.toml"),
-            r#"
-default = "coder"
-[profile]
-coder = "profiles/coder.toml"
-"#,
+            "default = \"coder\"\n[profile]\ncoder = \"profiles/coder.toml\"\n",
         )
         .unwrap();
 
         let (choices, default_index) = profile_choices_for_cwd(&project);
-        let default_choice = choices
-            .iter()
-            .position(|choice| choice.selector.as_deref() == Some("project:coder"))
-            .expect("project default choice is present");
-        assert_eq!(default_index, default_choice);
-        let selected = &choices[default_index];
-        assert_eq!(selected.selector.as_deref(), Some("project:coder"));
-        assert_eq!(selected.label, "project:coder (default)");
-        assert!(selected.is_default);
-    }
-
-    #[test]
-    fn profile_choices_include_builtin_and_project_default_marker() {
-        let temp = tempfile::tempdir().unwrap();
-        let project = temp.path().join("project");
-        let yoi = project.join(".yoi");
-        std::fs::create_dir_all(&yoi).unwrap();
-        std::fs::write(
-            yoi.join("profiles.toml"),
-            r#"
-default = "coder"
-[profile.coder]
-path = "profiles/coder.toml"
-description = "Project coder"
-"#,
-        )
-        .unwrap();
-
-        let (choices, default_index) = profile_choices_for_cwd(&project);
-        assert_eq!(choices[0].selector.as_deref(), Some("builtin:companion"));
-        assert_eq!(
-            choices[0].label,
-            "builtin:companion — Bundled Companion role profile"
+        assert_eq!(default_index, 0);
+        assert!(
+            choices
+                .iter()
+                .all(|choice| { choice.selector.as_deref() != Some("project:coder") })
         );
-        let project_index = choices
-            .iter()
-            .position(|choice| choice.selector.as_deref() == Some("project:coder"))
-            .expect("project default choice is present");
-        assert_eq!(default_index, project_index);
-        assert_eq!(
-            choices[project_index].selector.as_deref(),
-            Some("project:coder")
-        );
-        assert_eq!(
-            choices[project_index].label,
-            "project:coder (default) — Project coder"
+        assert!(
+            choices
+                .iter()
+                .any(|choice| { choice.selector.as_deref() == Some("builtin:companion") })
         );
     }
 

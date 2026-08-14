@@ -43,10 +43,15 @@ struct WorkspacePathOptions {
 }
 
 #[derive(Debug)]
+struct SkillWorkspaceOptions {
+    workspace_id: String,
+}
+
+#[derive(Debug)]
 enum SkillsCommand {
-    List(WorkspacePathOptions),
-    Lint(WorkspacePathOptions),
-    Show { workspace: PathBuf, name: String },
+    List(SkillWorkspaceOptions),
+    Lint(SkillWorkspaceOptions),
+    Show { workspace_id: String, name: String },
 }
 
 #[derive(Debug)]
@@ -513,11 +518,13 @@ fn ensure_no_inline_value(flag: &str, inline_value: Option<&str>) -> Result<(), 
 fn run_skills(command: SkillsCommand) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         SkillsCommand::List(options) => {
-            let catalog = yoi_workspace_server::skills::catalog(&options.workspace);
+            let state = load_skill_workspace_config(&options.workspace_id)?;
+            let catalog = yoi_workspace_server::skills::catalog(&state)?;
             println!("{}", serde_json::to_string_pretty(&catalog)?);
         }
         SkillsCommand::Lint(options) => {
-            let catalog = yoi_workspace_server::skills::lint(&options.workspace);
+            let state = load_skill_workspace_config(&options.workspace_id)?;
+            let catalog = yoi_workspace_server::skills::lint(&state)?;
             println!("{}", serde_json::to_string_pretty(&catalog)?);
             if catalog
                 .diagnostics
@@ -535,12 +542,24 @@ fn run_skills(command: SkillsCommand) -> Result<(), Box<dyn std::error::Error>> 
                 return Err(Box::new(CliError("Skill lint found errors".to_string())));
             }
         }
-        SkillsCommand::Show { workspace, name } => {
-            let detail = yoi_workspace_server::skills::detail(&workspace, &name)?;
+        SkillsCommand::Show { workspace_id, name } => {
+            let state = load_skill_workspace_config(&workspace_id)?;
+            let detail = yoi_workspace_server::skills::detail(&state, &name)?;
             println!("{}", serde_json::to_string_pretty(&detail)?);
         }
     }
     Ok(())
+}
+
+fn load_skill_workspace_config(
+    workspace_id: &str,
+) -> Result<yoi_workspace_server::config_source::WorkspaceConfigState, Box<dyn std::error::Error>> {
+    let store = SqliteWorkspaceStore::open(ServerConfig::default_server_database_path())?;
+    store.load_workspace_config(workspace_id)?.ok_or_else(|| {
+        Box::new(CliError(format!(
+            "Workspace `{workspace_id}` has no active config revision"
+        ))) as Box<dyn std::error::Error>
+    })
 }
 
 async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Error>> {
@@ -706,17 +725,17 @@ fn parse_skills_command(args: &[String]) -> Result<Command, CliError> {
     };
     match subcommand.as_str() {
         "list" => Ok(Command::Skills(SkillsCommand::List(
-            parse_workspace_path_options(rest)?,
+            parse_skill_workspace_options(rest)?,
         ))),
         "lint" => Ok(Command::Skills(SkillsCommand::Lint(
-            parse_workspace_path_options(rest)?,
+            parse_skill_workspace_options(rest)?,
         ))),
         "show" => {
             let Some((name, rest)) = rest.split_first() else {
                 return Err(CliError("skills show requires a Skill name".to_string()));
             };
             Ok(Command::Skills(SkillsCommand::Show {
-                workspace: parse_workspace_path_options(rest)?.workspace,
+                workspace_id: parse_skill_workspace_options(rest)?.workspace_id,
                 name: name.to_string(),
             }))
         }
@@ -728,6 +747,32 @@ fn parse_skills_command(args: &[String]) -> Result<Command, CliError> {
             "unknown skills subcommand `{other}`; expected `list`, `lint`, or `show`"
         ))),
     }
+}
+
+fn parse_skill_workspace_options(args: &[String]) -> Result<SkillWorkspaceOptions, CliError> {
+    let mut workspace_id = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--workspace" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| CliError("--workspace requires a Workspace id".to_string()))?;
+                workspace_id = Some(value.clone());
+            }
+            value if value.starts_with("--workspace=") => {
+                workspace_id = Some(value_after_equals(arg, "--workspace")?.to_string());
+            }
+            other => return Err(CliError(format!("unknown skills option `{other}`"))),
+        }
+    }
+    let workspace_id = workspace_id.ok_or_else(|| {
+        CliError("skills commands require --workspace <workspace-id>".to_string())
+    })?;
+    if workspace_id.trim().is_empty() {
+        return Err(CliError("--workspace must not be empty".to_string()));
+    }
+    Ok(SkillWorkspaceOptions { workspace_id })
 }
 
 fn parse_workspace_path_options(args: &[String]) -> Result<WorkspacePathOptions, CliError> {
@@ -848,7 +893,7 @@ fn print_config_help() {
 
 fn print_skills_help() {
     println!(
-        "yoi-server skills\n\nUsage:\n  yoi-server skills list [OPTIONS]\n  yoi-server skills lint [OPTIONS]\n  yoi-server skills show <NAME> [OPTIONS]\n\nDescription:\n  Uses the Workspace backend Skill catalog/lint/detail authority. Catalog output is lightweight and omits full SKILL.md bodies; detail output includes the body. allowed-tools and scripts are diagnostics only.\n\nOptions:\n      --workspace <PATH>  Workspace root (defaults to cwd)\n  -h, --help              Print help"
+        "yoi-server skills\n\nUsage:\n  yoi-server skills list --workspace <WORKSPACE_ID>\n  yoi-server skills lint --workspace <WORKSPACE_ID>\n  yoi-server skills show <NAME> --workspace <WORKSPACE_ID>\n\nDescription:\n  Reads the active Server DB virtual-config revision. Catalog output is lightweight and omits imported Markdown content; detail output includes that content. allowed-tools and scripts are diagnostics only.\n\nOptions:\n      --workspace <WORKSPACE_ID>  Workspace id in the Server DB (required)\n  -h, --help                      Print help"
     );
 }
 
@@ -872,6 +917,26 @@ mod tests {
         let args = vec!["--workspace".to_string(), temp.path().display().to_string()];
         let options = parse_init_options(&args).unwrap();
         assert_eq!(options.workspace, temp.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn parse_skills_requires_server_workspace_id() {
+        let error = parse_skills_command(&["list".to_string()]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "skills commands require --workspace <workspace-id>"
+        );
+        let command = parse_skills_command(&[
+            "show".to_string(),
+            "debug-rust".to_string(),
+            "--workspace=workspace-a".to_string(),
+        ])
+        .unwrap();
+        let Command::Skills(SkillsCommand::Show { workspace_id, name }) = command else {
+            panic!("expected skills show command");
+        };
+        assert_eq!(workspace_id, "workspace-a");
+        assert_eq!(name, "debug-rust");
     }
 
     #[test]

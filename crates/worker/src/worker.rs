@@ -53,7 +53,7 @@ use crate::internal_worker::{
 const COMPACTION_EXTENSION_DOMAIN: &str = "yoi.compaction";
 const COMPACTION_BLOCK_ID: &str = "compact";
 const WORKER_ORCHESTRATION_INSTRUCTION_ID: &str = "worker.orchestration";
-const WORKER_ORCHESTRATION_PROMPT_REF: &str = "$yoi/common/worker-orchestration";
+const WORKER_ORCHESTRATION_PROMPT_REF: &str = "common.worker_orchestration";
 
 fn worker_orchestration_instruction() -> FeatureInstructionDeclaration {
     FeatureInstructionDeclaration::new(
@@ -68,7 +68,7 @@ use crate::ipc::interceptor::WorkerInterceptor;
 use crate::ipc::notify_buffer::NotifyBuffer;
 use crate::prompt::agents_md::read_agents_md;
 use crate::prompt::catalog::{CatalogError, PromptCatalog};
-use crate::prompt::loader::PromptLoader;
+use crate::prompt::source::PromptCatalogSource;
 use crate::prompt::system::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
 use crate::runtime::dir;
 use crate::runtime::worker_allocation::{self, ScopeAllocationGuard, ScopeLockError};
@@ -4243,7 +4243,7 @@ where
     pub async fn from_manifest(
         manifest: WorkerManifest,
         store: St,
-        loader: PromptLoader,
+        loader: PromptCatalogSource,
     ) -> Result<Self, WorkerError> {
         let cwd = current_cwd()?;
         let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
@@ -4255,7 +4255,7 @@ where
     pub async fn from_manifest_with_context(
         manifest: WorkerManifest,
         store: St,
-        loader: PromptLoader,
+        loader: PromptCatalogSource,
         workspace_context: WorkerWorkspaceContext,
         filesystem_authority: WorkerFilesystemAuthority,
     ) -> Result<Self, WorkerError> {
@@ -4352,7 +4352,7 @@ where
     pub(crate) async fn from_internal_manifest_with_context(
         manifest: WorkerManifest,
         store: St,
-        loader: PromptLoader,
+        loader: PromptCatalogSource,
         workspace_context: WorkerWorkspaceContext,
         filesystem_authority: WorkerFilesystemAuthority,
         client_override: Option<Box<dyn LlmClient>>,
@@ -4435,7 +4435,7 @@ where
     pub async fn from_manifest_spawned(
         manifest: WorkerManifest,
         store: St,
-        loader: PromptLoader,
+        loader: PromptCatalogSource,
         callback_socket: PathBuf,
     ) -> Result<Self, WorkerError> {
         let cwd = current_cwd()?;
@@ -4455,7 +4455,7 @@ where
     pub async fn from_manifest_spawned_with_context(
         manifest: WorkerManifest,
         store: St,
-        loader: PromptLoader,
+        loader: PromptCatalogSource,
         callback_socket: PathBuf,
         workspace_context: WorkerWorkspaceContext,
         filesystem_authority: WorkerFilesystemAuthority,
@@ -4544,7 +4544,7 @@ where
         worker_name: &str,
         manifest: WorkerManifest,
         store: St,
-        loader: PromptLoader,
+        loader: PromptCatalogSource,
     ) -> Result<Self, WorkerError> {
         let cwd = current_cwd()?;
         let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
@@ -4564,7 +4564,7 @@ where
         worker_name: &str,
         manifest: WorkerManifest,
         store: St,
-        loader: PromptLoader,
+        loader: PromptCatalogSource,
         workspace_context: WorkerWorkspaceContext,
         filesystem_authority: WorkerFilesystemAuthority,
     ) -> Result<Self, WorkerError> {
@@ -4613,7 +4613,7 @@ where
         worker_name: &str,
         fallback: WorkerManifest,
         store: St,
-        loader: PromptLoader,
+        loader: PromptCatalogSource,
         workspace_context: WorkerWorkspaceContext,
         filesystem_authority: WorkerFilesystemAuthority,
     ) -> Result<Self, WorkerError> {
@@ -4683,7 +4683,7 @@ where
         segment_id: SegmentId,
         manifest: WorkerManifest,
         store: St,
-        loader: PromptLoader,
+        loader: PromptCatalogSource,
     ) -> Result<Self, WorkerError> {
         let cwd = current_cwd()?;
         let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
@@ -4705,7 +4705,7 @@ where
         segment_id: SegmentId,
         manifest: WorkerManifest,
         store: St,
-        loader: PromptLoader,
+        loader: PromptCatalogSource,
         workspace_context: WorkerWorkspaceContext,
         filesystem_authority: WorkerFilesystemAuthority,
     ) -> Result<Self, WorkerError> {
@@ -4903,7 +4903,7 @@ where
     pub async fn from_manifest_toml(toml: &str, store: St) -> Result<Self, WorkerError> {
         let config = WorkerManifestConfig::from_toml(toml).map_err(WorkerError::ManifestParse)?;
         let manifest = WorkerManifest::try_from(config).map_err(WorkerError::ManifestResolve)?;
-        Self::from_manifest(manifest, store, PromptLoader::builtins_only()).await
+        Self::from_manifest(manifest, store, PromptCatalogSource::builtins_only()).await
     }
 }
 
@@ -5588,7 +5588,7 @@ fn delegated_write_rule_to_deny(rule: WorkerSpawnedScopeRule) -> Option<ScopeRul
 /// a previously-rendered `system_prompt` verbatim.
 fn prepare_worker_common_with_context(
     manifest: &WorkerManifest,
-    loader: &PromptLoader,
+    loader: &PromptCatalogSource,
     parse_template: bool,
     workspace_context: WorkerWorkspaceContext,
     filesystem_authority: WorkerFilesystemAuthority,
@@ -5633,7 +5633,7 @@ fn prepare_worker_common_with_context(
 
 fn prepare_worker_common_from_scope(
     manifest: &WorkerManifest,
-    loader: &PromptLoader,
+    loader: &PromptCatalogSource,
     parse_template: bool,
     workspace_context: WorkerWorkspaceContext,
     filesystem_authority: WorkerFilesystemAuthority,
@@ -5655,7 +5655,7 @@ fn prepare_worker_common_from_scope(
         DelegationScope::from_config(&manifest.delegation_scope).map_err(WorkerError::Scope)?;
 
     let client = crate::model_client::build_client(&manifest.model)?;
-    let prompts = PromptCatalog::load(loader, manifest.worker.prompt_pack.as_deref())?;
+    let prompts = PromptCatalog::load(loader)?;
     let system_prompt_template = if parse_template {
         Some(
             SystemPromptTemplate::parse(&manifest.engine.instruction, loader.clone())
@@ -5706,7 +5706,7 @@ mod spawned_context_tests {
         manifest.memory = Some(manifest::MemoryConfig::default());
         let common = prepare_worker_common_with_context(
             &manifest,
-            &PromptLoader::builtins_only(),
+            &PromptCatalogSource::builtins_only(),
             false,
             WorkerWorkspaceContext::local_filesystem(Some(WorkspaceId::new("ws-test").unwrap())),
             WorkerFilesystemAuthority::local(workspace_root.clone(), cwd.clone()),
@@ -5739,7 +5739,7 @@ mod spawned_context_tests {
         std::fs::create_dir_all(&cwd).unwrap();
         let mut manifest = minimal_manifest_for_context_test(&workspace_root, &cwd);
         manifest.memory = Some(manifest::MemoryConfig::default());
-        let loader = PromptLoader::new(None, Some(workspace_root.clone()));
+        let loader = PromptCatalogSource::builtins_only();
         let workspace_id = WorkspaceId::new("ws-api-only").unwrap();
         let common = prepare_worker_common_with_context(
             &manifest,
@@ -5776,7 +5776,7 @@ mod spawned_context_tests {
         let manifest = minimal_manifest_for_context_test(&workspace_root, &cwd);
         let err = match prepare_worker_common_with_context(
             &manifest,
-            &PromptLoader::builtins_only(),
+            &PromptCatalogSource::builtins_only(),
             false,
             WorkerWorkspaceContext::local_filesystem(Some(WorkspaceId::new("ws-test").unwrap())),
             WorkerFilesystemAuthority::local(workspace_root.clone(), cwd.clone()),
@@ -5812,7 +5812,7 @@ mod spawned_context_tests {
         let manifest = minimal_manifest_for_context_test(&workspace_root, &cwd);
         let err = match prepare_worker_common_with_context(
             &manifest,
-            &PromptLoader::builtins_only(),
+            &PromptCatalogSource::builtins_only(),
             false,
             WorkerWorkspaceContext::local_filesystem(Some(WorkspaceId::new("ws-test").unwrap())),
             WorkerFilesystemAuthority::local(workspace_root.clone(), cwd.clone()),
@@ -6888,8 +6888,8 @@ mod build_summary_prompt_tests {
         .unwrap();
         worker.set_resident_memory_injection(gates.summary);
         let template = SystemPromptTemplate::parse(
-            "$yoi/default",
-            crate::prompt::loader::PromptLoader::builtins_only(),
+            "default",
+            crate::prompt::source::PromptCatalogSource::builtins_only(),
         )
         .unwrap();
         worker.set_system_prompt_template(template);

@@ -57,8 +57,20 @@ pub enum SkillSourceKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillProvenance {
     pub kind: SkillSourceKind,
-    /// Stable path-free id: `builtin:<name>` or `workspace:<name>`.
+    /// Stable id: `builtin:<name>` or `workspace:<name>`.
     pub id: String,
+    /// Virtual config/resource path. Never an absolute host filesystem path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_path: Option<String>,
+    /// Active Workspace config revision for Workspace Skills.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    /// Digest of the immutable `SKILL.md` source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_digest: Option<String>,
+    /// Digest of the active virtual config tree snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,7 +113,8 @@ pub struct SkillDetailResponse {
     pub overrides: Vec<SkillProvenance>,
     #[serde(default)]
     pub diagnostics: Vec<SkillDiagnostic>,
-    /// Full SKILL.md contents. This is intentionally omitted from catalog responses.
+    /// Imported Markdown content with YAML frontmatter delimiters removed.
+    /// This is intentionally omitted from catalog responses.
     pub body: String,
     #[serde(default)]
     pub allowed_tools: Vec<String>,
@@ -117,7 +130,7 @@ pub struct SkillActivationResponse {
     pub provenance: SkillProvenance,
     #[serde(default)]
     pub diagnostics: Vec<SkillDiagnostic>,
-    /// Full SKILL.md contents to append to Worker history on explicit activation.
+    /// Imported Markdown content to append to Worker history on explicit activation.
     pub body: String,
 }
 

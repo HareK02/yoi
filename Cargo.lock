@@ -596,9 +596,11 @@ dependencies = [
  "decodal",
  "decodal-language-service",
  "decodal-language-tools",
+ "minijinja",
  "pretty_assertions",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2 0.11.0",
  "thiserror 2.0.18",
  "ts-rs",
@@ -986,24 +988,24 @@ checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
 
 [[package]]
 name = "decodal"
-version = "0.2.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b6e47d6bc66cd3cd42c8df8ff77a994a7743e889045c6b762a6dbc360ad8494"
+checksum = "30e2a1ff0bf0d4160b998401a82aef64d26395e5b4798c55fbca6880a52f8e64"
 
 [[package]]
 name = "decodal-language-service"
-version = "0.2.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f25e462dce7c86743bd229ba91b831daf7928d524de9cef4ef861257ca156aa8"
+checksum = "577f8cdf109dc318c6bef32c95194f0b164ccea234ab0f70a02aeb3296813b16"
 dependencies = [
  "decodal",
 ]
 
 [[package]]
 name = "decodal-language-tools"
-version = "0.2.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08d8e3eb978cb1c2259df838ba2a8102bc45553d7b415216c80fc5b6a3f378c6"
+checksum = "2a18ca80b27386c5dbb160c74e88e6c1bfe33fd80f3cd5108bebe800b8aa698c"
 dependencies = [
  "decodal",
  "serde_json",
@@ -4793,7 +4795,6 @@ dependencies = [
  "fs4",
  "llm-engine",
  "manifest",
- "minijinja",
  "protocol",
  "pulldown-cmark",
  "ratatui",
@@ -4807,6 +4808,7 @@ dependencies = [
  "toml",
  "unicode-width",
  "uuid",
+ "worker",
 ]
 
 [[package]]
@@ -6058,6 +6060,7 @@ dependencies = [
  "chrono",
  "clap",
  "client",
+ "config-source",
  "dotenv",
  "flow",
  "fs4",

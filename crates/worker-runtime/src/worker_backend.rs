@@ -53,7 +53,7 @@ use worker::feature::builtin::{
 #[cfg(feature = "ws-server")]
 use worker::ipc::protocol_session::{live_log_entry_event, subscribe_worker_protocol_session};
 use worker::{
-    PromptLoader, SegmentLogSink, WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN, Worker,
+    PromptCatalogSource, SegmentLogSink, WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN, Worker,
     WorkerController, WorkerControllerTransport, WorkerError, WorkerFilesystemAuthority,
     WorkerHandle, WorkerSharedState, WorkerWorkspaceContext, WorkspaceClient, WorkspaceId,
 };
@@ -329,12 +329,12 @@ impl ProfileRuntimeWorkerFactory {
 
     fn restore_fallback_manifest(
         worker_name: &str,
-    ) -> Result<(manifest::WorkerManifest, PromptLoader), String> {
+    ) -> Result<(manifest::WorkerManifest, PromptCatalogSource), String> {
         let mut config = manifest::WorkerManifestConfig::builtin_defaults();
         config.worker.name = Some(worker_name.to_string());
         let manifest = manifest::WorkerManifest::try_from(config)
             .map_err(|err| format!("failed to build restore fallback manifest: {err}"))?;
-        Ok((manifest, PromptLoader::builtins_only()))
+        Ok((manifest, PromptCatalogSource::builtins_only()))
     }
     async fn resolve_profile_source_archive(
         &self,
@@ -566,7 +566,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         let archive = self
             .resolve_profile_source_archive(&request.request.profile_source)
             .await?;
-        let (manifest, loader) = {
+        let (manifest, mut loader) = {
             let manifest = archive
                 .resolve_profile(selector, &worker_root, &worker_name)
                 .map_err(|err| format!("failed to resolve profile source archive: {err}"))?;
@@ -584,6 +584,13 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 )?
             }
         };
+        if let Some(prompt_catalog) = request
+            .config_bundle
+            .as_ref()
+            .and_then(|bundle| bundle.prompt_catalog.clone())
+        {
+            loader = loader.with_effective_catalog(prompt_catalog);
+        }
         let flow_transition_enabled = manifest.feature.flow.enabled;
 
         let worker_aggregate_dir = self.worker_aggregate_dir(&request.worker_ref)?;
@@ -719,7 +726,14 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             self.worker_mutation_identity.as_ref(),
             self.embedded_worker_mutation_dispatcher.as_ref(),
         );
-        let (manifest, loader) = Self::restore_fallback_manifest(&worker_name)?;
+        let (manifest, mut loader) = Self::restore_fallback_manifest(&worker_name)?;
+        if let Some(prompt_catalog) = request
+            .config_bundle
+            .as_ref()
+            .and_then(|bundle| bundle.prompt_catalog.clone())
+        {
+            loader = loader.with_effective_catalog(prompt_catalog);
+        }
 
         let worker_aggregate_dir = self.worker_aggregate_dir(&request.worker_ref)?;
         let session_dir = worker_aggregate_dir.join("session");
@@ -2090,6 +2104,7 @@ mod tests {
                 label: Some("adapter-test".to_string()),
             }],
             declarations: Vec::new(),
+            prompt_catalog: None,
             profile_source_archive: Some(sample_profile_archive()),
             profile_source_archive_handle: None,
         }

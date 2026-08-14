@@ -349,11 +349,6 @@ impl From<FeatureConfig> for FeatureConfigPartial {
 pub struct WorkerMetaConfig {
     #[serde(default)]
     pub name: Option<String>,
-    /// Optional `PromptCatalog` manifest pack override. See
-    /// [`crate::WorkerMeta::prompt_pack`] for semantics. Relative paths
-    /// are resolved through [`WorkerManifestConfig::resolve_paths`].
-    #[serde(default)]
-    pub prompt_pack: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -554,9 +549,6 @@ impl WorkerManifestConfig {
             base.display()
         );
         resolve_auth_file(&mut self.model.auth, base);
-        if let Some(ref mut pack) = self.worker.prompt_pack {
-            *pack = join_if_relative(base, pack);
-        }
         for rule in &mut self.scope.allow {
             rule.target = join_if_relative(base, &rule.target);
         }
@@ -718,7 +710,6 @@ impl WorkerMetaConfig {
     fn merge(self, upper: Self) -> Self {
         Self {
             name: upper.name.or(self.name),
-            prompt_pack: upper.prompt_pack.or(self.prompt_pack),
         }
     }
 }
@@ -1018,10 +1009,6 @@ impl TryFrom<WorkerManifestConfig> for WorkerManifest {
             .worker
             .name
             .ok_or(ResolveError::MissingField("worker.name"))?;
-        let prompt_pack = cfg.worker.prompt_pack;
-        if let Some(ref p) = prompt_pack {
-            ensure_absolute("worker.prompt_pack", p)?;
-        }
 
         validate_model_paths(&cfg.model, "model.auth.file")?;
 
@@ -1150,7 +1137,7 @@ impl TryFrom<WorkerManifestConfig> for WorkerManifest {
         validate_mcp_config(&cfg.mcp)?;
 
         Ok(WorkerManifest {
-            worker: WorkerMeta { name, prompt_pack },
+            worker: WorkerMeta { name },
             model: cfg.model,
             engine,
             scope: cfg.scope,
@@ -1187,7 +1174,6 @@ mod tests {
         WorkerManifestConfig {
             worker: WorkerMetaConfig {
                 name: Some("test".into()),
-                prompt_pack: None,
             },
             model: ModelManifest {
                 scheme: Some(SchemeKind::Anthropic),
@@ -1505,7 +1491,6 @@ mod tests {
         let lower = WorkerManifestConfig {
             worker: WorkerMetaConfig {
                 name: Some("lower".into()),
-                prompt_pack: None,
             },
             model: ModelManifest {
                 model_id: Some("lower-model".into()),
@@ -1516,7 +1501,6 @@ mod tests {
         let upper = WorkerManifestConfig {
             worker: WorkerMetaConfig {
                 name: Some("upper".into()),
-                prompt_pack: None,
             },
             ..Default::default()
         };
@@ -1925,7 +1909,6 @@ enabled = false
             .merge(WorkerManifestConfig {
                 worker: WorkerMetaConfig {
                     name: Some("feature-test".into()),
-                    prompt_pack: None,
                 },
                 model: ModelManifest {
                     scheme: Some(SchemeKind::Anthropic),
@@ -2008,7 +1991,6 @@ enabled = true
             .merge(WorkerManifestConfig {
                 worker: WorkerMetaConfig {
                     name: Some("feature-merge-test".into()),
-                    prompt_pack: None,
                 },
                 model: ModelManifest {
                     scheme: Some(SchemeKind::Anthropic),
@@ -2075,7 +2057,6 @@ permission = "write"
         let overlay = WorkerManifestConfig {
             worker: WorkerMetaConfig {
                 name: Some("x".into()),
-                prompt_pack: None,
             },
             model: ModelManifest {
                 scheme: Some(SchemeKind::Anthropic),

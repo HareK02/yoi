@@ -1,166 +1,72 @@
-import { workspaceApiJson, workspaceApiJsonWithBody } from "../api/http";
 import type {
-  ProfileSettingsMutationResponse,
   ProfileSettingsResponse,
   WorkspaceMetadataMutationResponse,
   WorkspaceMetadataSettingsResponse,
-  WorkspaceProfileSourceDetailResponse,
-  WorkspaceProfileSourceTreeFileResponse,
-  WorkspaceProfileSourceTreeResponse,
 } from "./profile-types";
 
-export function fetchWorkspaceMetadataSettings(
+export type WorkspaceProfileApi = {
+  getMetadata(workspaceId: string): Promise<WorkspaceMetadataSettingsResponse>;
+  updateMetadata(
+    workspaceId: string,
+    displayName: string,
+    expectedRevision: string,
+  ): Promise<WorkspaceMetadataMutationResponse>;
+  getProfiles(workspaceId: string): Promise<ProfileSettingsResponse>;
+};
+
+async function requestJson<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
+  const response = await fetch(input, init);
+  if (!response.ok) {
+    throw new Error(`request failed: ${response.status}`);
+  }
+  return (await response.json()) as T;
+}
+
+export async function fetchWorkspaceMetadataSettings(
   workspaceId: string,
 ): Promise<WorkspaceMetadataSettingsResponse> {
-  return workspaceApiJson(
+  return await requestJson<WorkspaceMetadataSettingsResponse>(
     `/api/w/${encodeURIComponent(workspaceId)}/settings/workspace`,
   );
 }
 
-export function updateWorkspaceMetadataSettings(
+export async function updateWorkspaceMetadataSettings(
   workspaceId: string,
   request: { display_name: string; revision: string },
 ): Promise<WorkspaceMetadataMutationResponse> {
-  return workspaceApiJsonWithBody(
+  return await requestJson<WorkspaceMetadataMutationResponse>(
     `/api/w/${encodeURIComponent(workspaceId)}/settings/workspace`,
     {
       method: "PUT",
+      headers: { "content-type": "application/json" },
       body: JSON.stringify(request),
     },
   );
 }
 
-export function fetchProfileSettings(
-  workspaceId: string,
-): Promise<ProfileSettingsResponse> {
-  return workspaceApiJson(
+export async function fetchProfileSettings(workspaceId: string): Promise<ProfileSettingsResponse> {
+  return await requestJson<ProfileSettingsResponse>(
     `/api/w/${encodeURIComponent(workspaceId)}/settings/profiles`,
   );
 }
 
-export function createProfileSource(
-  workspaceId: string,
-  request: {
-    name: string;
-    description?: string;
-    content: string;
-    registry_revision: string;
-  },
-): Promise<ProfileSettingsMutationResponse> {
-  return workspaceApiJsonWithBody(
-    `/api/w/${encodeURIComponent(workspaceId)}/settings/profiles`,
-    {
-      method: "POST",
-      body: JSON.stringify(request),
+export function createWorkspaceProfileApi(): WorkspaceProfileApi {
+  return {
+    async getMetadata(workspaceId) {
+      return await requestJson<WorkspaceMetadataSettingsResponse>(
+        `/api/w/${encodeURIComponent(workspaceId)}/settings/metadata`,
+      );
     },
-  );
-}
-
-export function updateProfileRegistry(
-  workspaceId: string,
-  request: {
-    registry_revision: string;
-    default_profile?: string | null;
-    profiles: Array<
-      {
-        name: string;
-        description?: string | null;
-        profile_source_id?: string | null;
-      }
-    >;
-  },
-): Promise<ProfileSettingsMutationResponse> {
-  return workspaceApiJsonWithBody(
-    `/api/w/${encodeURIComponent(workspaceId)}/settings/profiles/registry`,
-    {
-      method: "PUT",
-      body: JSON.stringify(request),
+    async updateMetadata(workspaceId, displayName, expectedRevision) {
+      return await requestJson<WorkspaceMetadataMutationResponse>(
+        `/api/w/${encodeURIComponent(workspaceId)}/settings/metadata`,
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ display_name: displayName, expected_revision: expectedRevision }),
+        },
+      );
     },
-  );
-}
-
-export function fetchProfileSource(
-  workspaceId: string,
-  sourceId: string,
-): Promise<WorkspaceProfileSourceDetailResponse> {
-  return workspaceApiJson(
-    `/api/w/${encodeURIComponent(workspaceId)}/settings/profiles/${
-      encodeURIComponent(sourceId)
-    }`,
-  );
-}
-
-export function updateProfileSource(
-  workspaceId: string,
-  sourceId: string,
-  request: { content: string; revision: string },
-): Promise<ProfileSettingsMutationResponse> {
-  return workspaceApiJsonWithBody(
-    `/api/w/${encodeURIComponent(workspaceId)}/settings/profiles/${
-      encodeURIComponent(sourceId)
-    }`,
-    { method: "PUT", body: JSON.stringify(request) },
-  );
-}
-
-export function deleteProfileSource(
-  workspaceId: string,
-  sourceId: string,
-  request: { registry_revision: string; source_revision: string },
-): Promise<ProfileSettingsMutationResponse> {
-  return workspaceApiJsonWithBody(
-    `/api/w/${encodeURIComponent(workspaceId)}/settings/profiles/${
-      encodeURIComponent(sourceId)
-    }`,
-    { method: "DELETE", body: JSON.stringify(request) },
-  );
-}
-
-export function fetchProfileSourceTree(
-  workspaceId: string,
-  sourceTreeId: string,
-): Promise<WorkspaceProfileSourceTreeResponse> {
-  return workspaceApiJson(
-    `/api/w/${encodeURIComponent(workspaceId)}/settings/profiles/trees/${
-      encodeURIComponent(sourceTreeId)
-    }`,
-  );
-}
-
-export function fetchProfileTreeFile(
-  workspaceId: string,
-  sourceTreeId: string,
-  path: string,
-): Promise<WorkspaceProfileSourceTreeFileResponse> {
-  return workspaceApiJson(
-    `/api/w/${encodeURIComponent(workspaceId)}/settings/profiles/trees/${
-      encodeURIComponent(sourceTreeId)
-    }/file?path=${encodeURIComponent(path)}`,
-  );
-}
-
-export function writeProfileTreeFile(
-  workspaceId: string,
-  sourceTreeId: string,
-  request: { path: string; content: string; revision?: string | null },
-): Promise<WorkspaceProfileSourceTreeFileResponse> {
-  return workspaceApiJsonWithBody(
-    `/api/w/${encodeURIComponent(workspaceId)}/settings/profiles/trees/${
-      encodeURIComponent(sourceTreeId)
-    }/file`,
-    { method: "PUT", body: JSON.stringify(request) },
-  );
-}
-
-export function deleteProfileTreeFile(
-  workspaceId: string,
-  sourceTreeId: string,
-  request: { path: string; revision: string },
-): Promise<WorkspaceProfileSourceTreeResponse> {
-  return workspaceApiJsonWithBody(
-    `/api/w/${encodeURIComponent(workspaceId)}/settings/profiles/trees/${
-      encodeURIComponent(sourceTreeId)
-    }/file`,
-    { method: "DELETE", body: JSON.stringify(request) },
-  );
+    getProfiles: fetchProfileSettings,
+  };
 }

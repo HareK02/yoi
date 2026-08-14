@@ -3,7 +3,7 @@
 //! 用途別に三つの base directory を持つ:
 //!
 //! - **`config_dir`** — 人が手で書く / 編集する設定。`profiles.toml`,
-//!   `providers.toml`, `models.toml`, `prompts/`, `prompts.toml` 等
+//!   `providers.toml`, `models.toml` 等
 //! - **`data_dir`** — プログラムが書く永続データ。`sessions/` 等
 //! - **`secret_data_dir`** — local secret store の読み書き base。既存
 //!   secret store は path-derived key を使うため、通常 data とは別に
@@ -83,16 +83,6 @@ pub fn runtime_dir() -> Option<PathBuf> {
 /// layer.
 pub fn user_profiles_path() -> Option<PathBuf> {
     user_profiles_path_from_config_dir(config_dir())
-}
-
-/// `<config_dir>/prompts/` — user prompts ライブラリ。
-pub fn user_prompts_dir() -> Option<PathBuf> {
-    user_prompts_dir_from_config_dir(config_dir())
-}
-
-/// `<config_dir>/prompts.toml` — user prompt pack。
-pub fn user_pack_file() -> Option<PathBuf> {
-    user_pack_file_from_config_dir(config_dir())
 }
 
 /// `<config_dir>/<file_name>` — providers.toml / models.toml 等の
@@ -198,14 +188,6 @@ fn resolve_runtime_dir_from_parts(
 
 fn user_profiles_path_from_config_dir(config_dir: Option<PathBuf>) -> Option<PathBuf> {
     Some(config_dir?.join("profiles.toml"))
-}
-
-fn user_prompts_dir_from_config_dir(config_dir: Option<PathBuf>) -> Option<PathBuf> {
-    Some(config_dir?.join("prompts"))
-}
-
-fn user_pack_file_from_config_dir(config_dir: Option<PathBuf>) -> Option<PathBuf> {
-    Some(config_dir?.join("prompts.toml"))
 }
 
 fn user_catalog_override_from_config_dir(
@@ -464,14 +446,6 @@ mod tests {
         assert_eq!(
             user_profiles_path_from_config_dir(config_dir.clone()).unwrap(),
             PathBuf::from("/sand/config/profiles.toml")
-        );
-        assert_eq!(
-            user_prompts_dir_from_config_dir(config_dir.clone()).unwrap(),
-            PathBuf::from("/sand/config/prompts")
-        );
-        assert_eq!(
-            user_pack_file_from_config_dir(config_dir.clone()).unwrap(),
-            PathBuf::from("/sand/config/prompts.toml")
         );
         assert_eq!(
             user_catalog_override_from_config_dir(config_dir, "providers.toml").unwrap(),

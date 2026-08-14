@@ -2,6 +2,7 @@ import "./base.dcdl" // {
     slug = "coder";
     description = "Ticket implementation coder profile.";
     scope = "workspace_write";
+    engine = { instruction = "role.coder"; };
 
     feature = {
         task = { enabled = true; };

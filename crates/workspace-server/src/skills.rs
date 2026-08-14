@@ -1,789 +1,600 @@
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, BTreeSet};
 
+use config_source::{
+    ConfigSchemaContribution, MarkdownDocumentProjection, VirtualPath, project_markdown_document,
+};
 use serde::Deserialize;
 use worker::skill::{
     SkillActivationResponse, SkillCatalogEntry, SkillCatalogResponse, SkillDetailResponse,
     SkillDiagnostic, SkillDiagnosticSeverity, SkillProvenance, SkillResourceRef, SkillSourceKind,
 };
 
-const BUILTIN_AGENT_SKILLS: &str = include_str!("../../../resources/skills/agent-skills/SKILL.md");
+use crate::config_source::{
+    WorkspaceConfigSchemaProvider, WorkspaceConfigState, evaluate_workspace_config_state,
+};
+
+const BUILTIN_SKILL_ID: &str = "agent-skills";
+const BUILTIN_SKILL_SOURCE: &str = include_str!("../../../resources/skills/agent-skills/SKILL.md");
+const BUILTIN_SKILL_VIRTUAL_PATH: &str = "builtin/skills/agent-skills/SKILL.md";
+const SKILL_SCHEMA_PROVIDER_ID: &str = "builtin:skills";
+const SKILL_SCHEMA_NAMESPACE: &str = "skills";
+const SKILL_SCHEMA_VERSION: &str = "1";
+const SKILL_CATALOG_AUTHORITY: &str = "workspace-config-skills-v1";
+
+/// Skill documents are values imported from `SKILL.md`. Known Agent Skills
+/// frontmatter is typed while extension keys remain concrete values.
+pub const SKILL_DOCUMENT_SCHEMA_SOURCE: &str = r#"{
+    frontmatter = {
+        name = String;
+        description = String;
+        license = String default "";
+        compatibility = String default "";
+        metadata = {...String} default {};
+        ...Unknown
+    };
+    content = String;
+}"#;
+
+const SKILL_CONFIG_SCHEMA_SOURCE: &str = r#"{
+    skills = {...{
+        frontmatter = {
+            name = String;
+            description = String;
+            license = String default "";
+            compatibility = String default "";
+            metadata = {...String} default {};
+            ...Unknown
+        };
+        content = String;
+    }} default {};
+}"#;
+
+#[derive(Debug, Clone, Copy)]
+pub struct SkillConfigSchemaProvider;
+
+impl WorkspaceConfigSchemaProvider for SkillConfigSchemaProvider {
+    fn contribution(&self) -> crate::Result<ConfigSchemaContribution> {
+        ConfigSchemaContribution::new(
+            SKILL_SCHEMA_PROVIDER_ID,
+            SKILL_SCHEMA_NAMESPACE,
+            SKILL_SCHEMA_VERSION,
+            SKILL_CONFIG_SCHEMA_SOURCE,
+        )
+        .map_err(|error| crate::Error::Config(error.to_string()))
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SkillError {
     #[error("unknown Skill `{0}`")]
     NotFound(String),
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-}
-
-#[derive(Debug, Clone)]
-struct SkillSource {
-    source_kind: SkillSourceKind,
-    parent_name: String,
-    content: String,
-    resource_root: Option<PathBuf>,
+    #[error("Skill `{0}` has blocking diagnostics")]
+    InvalidSkill(String),
+    #[error("failed to evaluate the active Workspace config revision: {0}")]
+    Evaluation(String),
+    #[error("the active Workspace config projection is missing its root value")]
+    MissingProjection,
+    #[error("the active Workspace config Skill projection is invalid: {0}")]
+    InvalidProjection(String),
 }
 
 #[derive(Debug, Clone)]
 struct ParsedSkill {
     name: String,
     description: String,
-    content: String,
     allowed_tools: Vec<String>,
-    diagnostics: Vec<SkillDiagnostic>,
+    body: String,
     provenance: SkillProvenance,
-    resource_root: Option<PathBuf>,
+    overrides: Vec<SkillProvenance>,
+    resources: Vec<SkillResourceRef>,
+    diagnostics: Vec<SkillDiagnostic>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-struct SkillFrontmatter {
-    name: Option<String>,
-    description: Option<String>,
-    license: Option<String>,
-    compatibility: Option<String>,
-    metadata: Option<BTreeMap<String, serde_yaml::Value>>,
+struct WorkspaceSkillProjection {
     #[serde(default)]
-    allowed_tools: Option<serde_yaml::Value>,
+    skills: BTreeMap<String, MarkdownDocumentProjection>,
 }
 
-pub fn catalog(workspace_root: &Path) -> SkillCatalogResponse {
-    let mut diagnostics = Vec::new();
-    let mut active = BTreeMap::<String, ParsedSkill>::new();
-    let mut builtin_by_name = BTreeMap::<String, ParsedSkill>::new();
-
-    for source in builtin_skill_sources() {
-        match parse_skill_source(source) {
-            Ok(skill) => {
-                builtin_by_name.insert(skill.name.clone(), skill.clone());
-                active.insert(skill.name.clone(), skill);
-            }
-            Err(errs) => diagnostics.extend(errs),
-        }
-    }
-
-    let workspace_sources = match workspace_skill_sources(workspace_root) {
-        Ok(sources) => sources,
-        Err(error) => {
-            diagnostics.push(SkillDiagnostic::error(
-                "workspace_skill_read_failed",
-                format!("failed to read workspace Skills: {error}"),
-                Some("workspace:.yoi/skills".to_string()),
-            ));
-            Vec::new()
-        }
-    };
-
-    for source in workspace_sources {
-        match parse_skill_source(source) {
-            Ok(skill) => {
-                let overrides = builtin_by_name
-                    .get(&skill.name)
-                    .map(|builtin| vec![builtin.provenance.clone()])
-                    .unwrap_or_default();
-                if let Some(overridden) = overrides.first() {
-                    diagnostics.push(SkillDiagnostic::warning(
-                        "workspace_skill_overrides_builtin",
-                        format!(
-                            "workspace Skill `{}` overrides builtin Skill `{}`",
-                            skill.name, overridden.id
-                        ),
-                        Some(skill.provenance.id.clone()),
-                    ));
-                }
-                let mut skill = skill;
-                if !overrides.is_empty() {
-                    skill.diagnostics.push(SkillDiagnostic::warning(
-                        "workspace_skill_overrides_builtin",
-                        "workspace Skill has priority over the builtin Skill with the same name",
-                        Some(skill.provenance.id.clone()),
-                    ));
-                }
-                active.insert(skill.name.clone(), skill);
-            }
-            Err(errs) => diagnostics.extend(errs),
-        }
-    }
-
-    let mut entries = active
+pub fn catalog(state: &WorkspaceConfigState) -> Result<SkillCatalogResponse, SkillError> {
+    let entries = merged_skills(state)?
         .into_values()
-        .map(|skill| {
-            let overrides = if matches!(&skill.provenance.kind, SkillSourceKind::Workspace) {
-                builtin_by_name
-                    .get(&skill.name)
-                    .map(|builtin| vec![builtin.provenance.clone()])
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            SkillCatalogEntry {
-                name: skill.name,
-                description: skill.description,
-                provenance: skill.provenance,
-                overrides,
-                diagnostics: skill.diagnostics,
-            }
-        })
-        .collect::<Vec<_>>();
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-
-    SkillCatalogResponse {
-        authority: "workspace-backend-skills-v0".to_string(),
+        .map(|skill| skill.catalog_entry())
+        .collect();
+    Ok(SkillCatalogResponse {
+        authority: SKILL_CATALOG_AUTHORITY.to_string(),
         entries,
-        diagnostics,
-    }
+        diagnostics: Vec::new(),
+    })
 }
 
-pub fn lint(workspace_root: &Path) -> SkillCatalogResponse {
-    catalog(workspace_root)
+pub fn lint(state: &WorkspaceConfigState) -> Result<SkillCatalogResponse, SkillError> {
+    catalog(state)
 }
 
-pub fn detail(workspace_root: &Path, name: &str) -> Result<SkillDetailResponse, SkillError> {
-    let skill = active_skill(workspace_root, name)?;
-    let overrides = if matches!(&skill.provenance.kind, SkillSourceKind::Workspace) {
-        builtin_skill_sources()
-            .into_iter()
-            .filter_map(|source| parse_skill_source(source).ok())
-            .find(|builtin| builtin.name == skill.name)
-            .map(|builtin| vec![builtin.provenance])
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    let resources = resource_refs(&skill);
+pub fn detail(state: &WorkspaceConfigState, name: &str) -> Result<SkillDetailResponse, SkillError> {
+    let skill = merged_skills(state)?
+        .remove(name)
+        .ok_or_else(|| SkillError::NotFound(name.to_string()))?;
     Ok(SkillDetailResponse {
         name: skill.name,
         description: skill.description,
         provenance: skill.provenance,
-        overrides,
+        overrides: skill.overrides,
         diagnostics: skill.diagnostics,
-        body: skill.content,
+        body: skill.body,
         allowed_tools: skill.allowed_tools,
-        allowed_tools_status:
-            "experimental_ignored_by_workspace_backend; does not grant or deny tool authority"
-                .to_string(),
-        resources,
+        allowed_tools_status: "experimental_hint_only".to_string(),
+        resources: skill.resources,
     })
 }
 
 pub fn activation(
-    workspace_root: &Path,
+    state: &WorkspaceConfigState,
     name: &str,
 ) -> Result<SkillActivationResponse, SkillError> {
-    let detail = detail(workspace_root, name)?;
+    let skill = merged_skills(state)?
+        .remove(name)
+        .ok_or_else(|| SkillError::NotFound(name.to_string()))?;
+    if skill.has_errors() {
+        return Err(SkillError::InvalidSkill(name.to_string()));
+    }
     Ok(SkillActivationResponse {
-        name: detail.name,
-        provenance: detail.provenance,
-        diagnostics: detail.diagnostics,
-        body: detail.body,
+        name: skill.name,
+        provenance: skill.provenance,
+        diagnostics: skill.diagnostics,
+        body: skill.body,
     })
 }
 
-fn active_skill(workspace_root: &Path, name: &str) -> Result<ParsedSkill, SkillError> {
-    let mut parsed = BTreeMap::<String, ParsedSkill>::new();
-    for source in builtin_skill_sources() {
-        if let Ok(skill) = parse_skill_source(source) {
-            parsed.insert(skill.name.clone(), skill);
+fn merged_skills(
+    state: &WorkspaceConfigState,
+) -> Result<BTreeMap<String, ParsedSkill>, SkillError> {
+    let mut merged = BTreeMap::new();
+    let builtin_projection = project_markdown_document(BUILTIN_SKILL_SOURCE)
+        .expect("embedded built-in Skill Markdown is valid");
+    let builtin = parse_skill(
+        BUILTIN_SKILL_ID,
+        builtin_projection,
+        SkillProvenance {
+            kind: SkillSourceKind::Builtin,
+            id: format!("builtin:{BUILTIN_SKILL_ID}"),
+            virtual_path: Some(BUILTIN_SKILL_VIRTUAL_PATH.to_string()),
+            revision: None,
+            source_digest: Some(config_source::digest_bytes(BUILTIN_SKILL_SOURCE.as_bytes())),
+            tree_digest: None,
+        },
+        Vec::new(),
+        None,
+    );
+    merged.insert(builtin.name.clone(), builtin);
+
+    let evaluation = evaluate_workspace_config_state(state, state.contract.schema_bundle.clone())
+        .map_err(|error| SkillError::Evaluation(error.to_string()))?;
+    let projection = evaluation
+        .projections
+        .first()
+        .ok_or(SkillError::MissingProjection)?;
+    let workspace =
+        serde_json::from_value::<WorkspaceSkillProjection>(projection.data_json.clone())
+            .map_err(|error| SkillError::InvalidProjection(error.to_string()))?;
+
+    for (config_key, document) in workspace.skills {
+        let name = string_field(&document.frontmatter, "name")
+            .unwrap_or(&config_key)
+            .to_string();
+        let canonical_path = format!("skills/{name}/SKILL.md");
+        let mut source_diagnostic = None;
+        let source_entry = VirtualPath::parse(&canonical_path)
+            .ok()
+            .and_then(|path| state.snapshot.entries.get(&path));
+        if let Some(entry) = source_entry {
+            match project_markdown_document(&entry.content) {
+                Ok(expected) if normalize_document(expected.clone()) == document => {}
+                Ok(_) => {
+                    source_diagnostic = Some(SkillDiagnostic::error(
+                        "skill_source_mismatch",
+                        format!(
+                            "Skill `{name}` must be the imported value of `{canonical_path}` in the active config revision"
+                        ),
+                        Some(format!("workspace:{name}")),
+                    ));
+                }
+                Err(message) => {
+                    source_diagnostic = Some(SkillDiagnostic::error(
+                        "invalid_skill_markdown",
+                        format!("{canonical_path}: {message}"),
+                        Some(format!("workspace:{name}")),
+                    ));
+                }
+            }
+        } else {
+            source_diagnostic = Some(SkillDiagnostic::error(
+                "missing_skill_source",
+                format!("Skill `{name}` requires `{canonical_path}` in the active config revision"),
+                Some(format!("workspace:{name}")),
+            ));
+        }
+        let source_digest = source_entry
+            .map(|entry| entry.content_digest.clone())
+            .unwrap_or_else(|| config_source::digest_bytes(canonical_path.as_bytes()));
+        let resources = workspace_resources(state, &name);
+        let mut skill = parse_skill(
+            &name,
+            document,
+            SkillProvenance {
+                kind: SkillSourceKind::Workspace,
+                id: format!("workspace:{name}"),
+                virtual_path: Some(canonical_path),
+                revision: Some(state.snapshot.revision),
+                source_digest: Some(source_digest),
+                tree_digest: Some(state.snapshot.digest.clone()),
+            },
+            resources,
+            source_diagnostic,
+        );
+        if let Some(overridden) = merged.insert(name, skill.clone()) {
+            skill.overrides.push(overridden.provenance);
+            merged.insert(skill.name.clone(), skill);
         }
     }
-    for source in workspace_skill_sources(workspace_root)? {
-        if let Ok(skill) = parse_skill_source(source) {
-            parsed.insert(skill.name.clone(), skill);
-        }
-    }
-    parsed
-        .remove(name)
-        .ok_or_else(|| SkillError::NotFound(name.to_string()))
+    Ok(merged)
 }
 
-fn builtin_skill_sources() -> Vec<SkillSource> {
-    vec![SkillSource {
-        source_kind: SkillSourceKind::Builtin,
-        parent_name: "agent-skills".to_string(),
-        content: BUILTIN_AGENT_SKILLS.to_string(),
-        resource_root: None,
-    }]
+fn normalize_document(mut document: MarkdownDocumentProjection) -> MarkdownDocumentProjection {
+    document
+        .frontmatter
+        .entry("license")
+        .or_insert_with(|| serde_json::Value::String(String::new()));
+    document
+        .frontmatter
+        .entry("compatibility")
+        .or_insert_with(|| serde_json::Value::String(String::new()));
+    document
+        .frontmatter
+        .entry("metadata")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    document
 }
 
-fn workspace_skill_sources(workspace_root: &Path) -> Result<Vec<SkillSource>, std::io::Error> {
-    let skills_dir = workspace_root.join(".yoi").join("skills");
-    if !skills_dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut sources = Vec::new();
-    for entry in fs::read_dir(&skills_dir)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if !file_type.is_dir() {
-            continue;
-        }
-        let parent_name = entry.file_name().to_string_lossy().to_string();
-        let skill_path = entry.path().join("SKILL.md");
-        if !skill_path.exists() {
-            sources.push(SkillSource {
-                source_kind: SkillSourceKind::Workspace,
-                parent_name,
-                content: String::new(),
-                resource_root: Some(entry.path()),
-            });
-            continue;
-        }
-        match fs::read_to_string(&skill_path) {
-            Ok(content) => sources.push(SkillSource {
-                source_kind: SkillSourceKind::Workspace,
-                parent_name,
-                content,
-                resource_root: Some(entry.path()),
-            }),
-            Err(error) => sources.push(SkillSource {
-                source_kind: SkillSourceKind::Workspace,
-                parent_name,
-                content: format!("__read_error__:{error}"),
-                resource_root: None,
-            }),
-        }
-    }
-    Ok(sources)
-}
-
-fn parse_skill_source(source: SkillSource) -> Result<ParsedSkill, Vec<SkillDiagnostic>> {
-    let provenance = provenance(source.source_kind.clone(), &source.parent_name);
+fn parse_skill(
+    fallback_name: &str,
+    document: MarkdownDocumentProjection,
+    provenance: SkillProvenance,
+    resources: Vec<SkillResourceRef>,
+    source_diagnostic: Option<SkillDiagnostic>,
+) -> ParsedSkill {
     let mut diagnostics = Vec::new();
-
-    if !valid_skill_name(&source.parent_name) {
+    if let Some(diagnostic) = source_diagnostic {
+        diagnostics.push(diagnostic);
+    }
+    let frontmatter = document.frontmatter;
+    let name = string_field(&frontmatter, "name").unwrap_or(fallback_name);
+    if !valid_skill_name(name) {
         diagnostics.push(SkillDiagnostic::error(
-            "invalid_skill_directory_name",
-            "Skill directory name must be 1-64 chars of lowercase letters, numbers, or single hyphens with no leading/trailing hyphen",
+            "invalid_skill_name",
+            "frontmatter `name` must be a lowercase kebab-case Skill id",
             Some(provenance.id.clone()),
         ));
     }
-    if source.content.is_empty() {
+    if name != fallback_name {
         diagnostics.push(SkillDiagnostic::error(
-            "missing_skill_markdown",
-            "Skill directory must contain SKILL.md",
-            Some(provenance.id.clone()),
-        ));
-        return Err(diagnostics);
-    }
-    if source.content.starts_with("__read_error__:") {
-        diagnostics.push(SkillDiagnostic::error(
-            "skill_markdown_read_failed",
-            source
-                .content
-                .trim_start_matches("__read_error__:")
-                .to_string(),
-            Some(provenance.id.clone()),
-        ));
-        return Err(diagnostics);
-    }
-
-    let Some((frontmatter, _markdown)) = split_frontmatter(&source.content) else {
-        diagnostics.push(SkillDiagnostic::error(
-            "missing_frontmatter",
-            "SKILL.md must start with YAML frontmatter delimited by ---",
-            Some(provenance.id.clone()),
-        ));
-        return Err(diagnostics);
-    };
-    let frontmatter_value = match serde_yaml::from_str::<serde_yaml::Value>(frontmatter) {
-        Ok(value) => value,
-        Err(error) => {
-            diagnostics.push(SkillDiagnostic::error(
-                "invalid_frontmatter_yaml",
-                format!("SKILL.md frontmatter is invalid YAML: {error}"),
-                Some(provenance.id.clone()),
-            ));
-            return Err(diagnostics);
-        }
-    };
-    diagnose_unsupported_frontmatter_keys(&frontmatter_value, &provenance, &mut diagnostics);
-    let frontmatter = match serde_yaml::from_value::<SkillFrontmatter>(frontmatter_value) {
-        Ok(frontmatter) => frontmatter,
-        Err(error) => {
-            diagnostics.push(SkillDiagnostic::error(
-                "invalid_frontmatter_yaml",
-                format!("SKILL.md frontmatter is invalid YAML: {error}"),
-                Some(provenance.id.clone()),
-            ));
-            return Err(diagnostics);
-        }
-    };
-
-    let Some(name) = frontmatter.name else {
-        diagnostics.push(SkillDiagnostic::error(
-            "missing_name",
-            "Skill frontmatter requires `name`",
-            Some(provenance.id.clone()),
-        ));
-        return Err(diagnostics);
-    };
-    if name != source.parent_name {
-        diagnostics.push(SkillDiagnostic::error(
-            "name_parent_mismatch",
-            "Skill frontmatter `name` must match its parent directory name",
+            "skill_name_mismatch",
+            format!("frontmatter name `{name}` must match Skill id `{fallback_name}`"),
             Some(provenance.id.clone()),
         ));
     }
-    if !valid_skill_name(&name) {
-        diagnostics.push(SkillDiagnostic::error(
-            "invalid_name",
-            "Skill name must be 1-64 chars of lowercase letters, numbers, or single hyphens with no leading/trailing hyphen",
-            Some(provenance.id.clone()),
-        ));
-    }
-
-    let Some(description) = frontmatter.description else {
+    let description = string_field(&frontmatter, "description")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if description.is_empty() {
         diagnostics.push(SkillDiagnostic::error(
             "missing_description",
-            "Skill frontmatter requires `description`",
-            Some(provenance.id.clone()),
-        ));
-        return Err(diagnostics);
-    };
-    let description = description.trim().to_string();
-    if description.is_empty() || description.chars().count() > 1024 {
-        diagnostics.push(SkillDiagnostic::error(
-            "invalid_description",
-            "Skill description must be 1-1024 characters",
-            Some(provenance.id.clone()),
-        ));
-    } else if description.chars().count() < 16 {
-        diagnostics.push(SkillDiagnostic::warning(
-            "description_too_generic",
-            "Skill description should state concrete when/what guidance",
+            "frontmatter `description` must be a non-empty string",
             Some(provenance.id.clone()),
         ));
     }
-
-    if let Some(license) = frontmatter.license.as_deref() {
-        validate_optional_string("license", license, &provenance, &mut diagnostics);
-    }
-    if let Some(compatibility) = frontmatter.compatibility.as_deref() {
-        validate_optional_string(
-            "compatibility",
-            compatibility,
-            &provenance,
-            &mut diagnostics,
-        );
-    }
-    if let Some(metadata) = frontmatter.metadata {
-        for (key, value) in metadata {
-            if !matches!(value, serde_yaml::Value::String(_)) {
-                diagnostics.push(SkillDiagnostic::error(
-                    "invalid_metadata_value",
-                    format!("metadata `{key}` must be a string value"),
-                    Some(provenance.id.clone()),
-                ));
-            }
+    for field in [
+        "profile",
+        "system_prompt",
+        "prompt",
+        "plugins",
+        "plugin",
+        "model_invokation",
+        "model_invocation",
+        "user_invocable",
+        "graph",
+        "invocation",
+    ] {
+        if frontmatter.contains_key(field) {
+            diagnostics.push(SkillDiagnostic::error(
+                "workflow_authority",
+                format!("frontmatter `{field}` is workflow/profile authority and is not allowed"),
+                Some(provenance.id.clone()),
+            ));
         }
     }
-
-    let mut allowed_tools = Vec::new();
-    if let Some(value) = frontmatter.allowed_tools {
-        allowed_tools = parse_allowed_tools(value, &provenance, &mut diagnostics);
+    let allowed_tools = frontmatter
+        .get("allowed-tools")
+        .map(parse_allowed_tools)
+        .unwrap_or_default();
+    if !allowed_tools.is_empty() {
         diagnostics.push(SkillDiagnostic::warning(
-            "allowed_tools_ignored",
-            "allowed-tools is experimental metadata only; Workspace Skill activation does not grant or deny tools",
+            "allowed_tools_hint",
+            "frontmatter `allowed-tools` is an instruction hint only and does not grant tools",
             Some(provenance.id.clone()),
         ));
     }
-
-    if diagnostics
-        .iter()
-        .any(|d| d.severity == SkillDiagnosticSeverity::Error)
-    {
-        return Err(diagnostics);
-    }
-
-    Ok(ParsedSkill {
-        name,
+    ParsedSkill {
+        name: fallback_name.to_string(),
         description,
-        content: source.content,
         allowed_tools,
-        diagnostics,
+        body: document.content,
         provenance,
-        resource_root: source.resource_root,
-    })
-}
-
-fn provenance(kind: SkillSourceKind, parent_name: &str) -> SkillProvenance {
-    let prefix = match kind {
-        SkillSourceKind::Builtin => "builtin",
-        SkillSourceKind::Workspace => "workspace",
-    };
-    SkillProvenance {
-        kind,
-        id: format!("{prefix}:{parent_name}"),
+        overrides: Vec::new(),
+        resources,
+        diagnostics,
     }
-}
-
-fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
-    let rest = content.strip_prefix("---\n")?;
-    let (frontmatter, body) = rest.split_once("\n---")?;
-    let body = body.strip_prefix('\n').unwrap_or(body);
-    Some((frontmatter, body))
 }
 
 fn valid_skill_name(name: &str) -> bool {
-    let len = name.chars().count();
-    if !(1..=64).contains(&len)
-        || name.starts_with('-')
-        || name.ends_with('-')
-        || name.contains("--")
-    {
-        return false;
-    }
-    name.chars()
-        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+    !name.is_empty()
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
-fn validate_optional_string(
+fn string_field<'a>(
+    frontmatter: &'a serde_json::Map<String, serde_json::Value>,
     field: &str,
-    value: &str,
-    provenance: &SkillProvenance,
-    diagnostics: &mut Vec<SkillDiagnostic>,
-) {
-    if value.trim().is_empty() {
-        diagnostics.push(SkillDiagnostic::error(
-            format!("invalid_{field}"),
-            format!("optional `{field}` must be a non-empty string when present"),
-            Some(provenance.id.clone()),
-        ));
-    }
+) -> Option<&'a str> {
+    frontmatter.get(field).and_then(serde_json::Value::as_str)
 }
 
-fn diagnose_unsupported_frontmatter_keys(
-    value: &serde_yaml::Value,
-    provenance: &SkillProvenance,
-    diagnostics: &mut Vec<SkillDiagnostic>,
-) {
-    let Some(mapping) = value.as_mapping() else {
-        diagnostics.push(SkillDiagnostic::error(
-            "invalid_frontmatter_shape",
-            "SKILL.md frontmatter must be a YAML mapping",
-            Some(provenance.id.clone()),
-        ));
-        return;
-    };
-
-    for key in mapping.keys() {
-        let Some(key) = key.as_str() else {
-            diagnostics.push(SkillDiagnostic::error(
-                "invalid_frontmatter_key",
-                "Skill frontmatter keys must be strings",
-                Some(provenance.id.clone()),
-            ));
-            continue;
-        };
-        if !is_supported_frontmatter_key(key) {
-            let (code, message) = if is_workflow_projection_key(key) {
-                (
-                    "unsupported_workflow_frontmatter_field",
-                    format!(
-                        "Skill frontmatter field `{key}` is a removed Workflow projection/invocation field and is not accepted as Skill semantics"
-                    ),
-                )
-            } else {
-                (
-                    "unsupported_frontmatter_field",
-                    format!(
-                        "Skill frontmatter field `{key}` is not supported; supported fields are name, description, license, compatibility, metadata, and allowed-tools"
-                    ),
-                )
-            };
-            diagnostics.push(SkillDiagnostic::error(
-                code,
-                message,
-                Some(provenance.id.clone()),
-            ));
-        }
-    }
-}
-
-fn is_supported_frontmatter_key(key: &str) -> bool {
-    matches!(
-        key,
-        "name" | "description" | "license" | "compatibility" | "metadata" | "allowed-tools"
-    )
-}
-
-fn is_workflow_projection_key(key: &str) -> bool {
-    matches!(
-        key,
-        "model_invokation"
-            | "model_invocation"
-            | "user_invocable"
-            | "workflow"
-            | "workflow_record"
-            | "workflow_invoke"
-            | "invocation"
-            | "invocations"
-            | "graph"
-            | "nodes"
-            | "edges"
-            | "triggers"
-    )
-}
-
-fn parse_allowed_tools(
-    value: serde_yaml::Value,
-    provenance: &SkillProvenance,
-    diagnostics: &mut Vec<SkillDiagnostic>,
-) -> Vec<String> {
+fn parse_allowed_tools(value: &serde_json::Value) -> Vec<String> {
     match value {
-        serde_yaml::Value::String(text) => text
-            .split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
+        serde_json::Value::String(value) => value
+            .split(|character: char| character == ',' || character.is_whitespace())
+            .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
             .collect(),
-        serde_yaml::Value::Sequence(items) => items
-            .into_iter()
-            .filter_map(|item| match item {
-                serde_yaml::Value::String(text) if !text.trim().is_empty() => Some(text),
-                _ => {
-                    diagnostics.push(SkillDiagnostic::warning(
-                        "invalid_allowed_tools_entry_ignored",
-                        "allowed-tools entries must be strings; invalid entries are ignored",
-                        Some(provenance.id.clone()),
-                    ));
-                    None
-                }
-            })
+        serde_json::Value::Array(values) => values
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
             .collect(),
-        _ => {
-            diagnostics.push(SkillDiagnostic::warning(
-                "invalid_allowed_tools_ignored",
-                "allowed-tools must be a string or string list; value ignored",
-                Some(provenance.id.clone()),
-            ));
-            Vec::new()
-        }
+        _ => Vec::new(),
     }
 }
 
-fn resource_refs(skill: &ParsedSkill) -> Vec<SkillResourceRef> {
-    let Some(root) = &skill.resource_root else {
-        return Vec::new();
-    };
-    let mut refs = Vec::new();
-    for (dir, kind, supported, diagnostic) in [
-        (
-            "references",
-            "reference",
-            false,
-            Some(
-                "Skill references are listed only; resource read endpoints are not implemented yet",
-            ),
-        ),
-        (
-            "assets",
-            "asset",
-            false,
-            Some("Skill assets are listed only; resource read endpoints are not implemented yet"),
-        ),
-        (
-            "scripts",
-            "script",
-            false,
-            Some(
-                "Skill scripts are discovered but not executable; use normal typed tools and permissions",
-            ),
-        ),
+fn workspace_resources(state: &WorkspaceConfigState, name: &str) -> Vec<SkillResourceRef> {
+    let mut resources = Vec::new();
+    for (kind, directory) in [
+        ("reference", "references"),
+        ("asset", "assets"),
+        ("script", "scripts"),
     ] {
-        let path = root.join(dir);
-        if !path.is_dir() {
-            continue;
-        }
-        if let Ok(entries) = fs::read_dir(&path) {
-            for entry in entries.flatten() {
-                if let Ok(file_type) = entry.file_type() {
-                    if !(file_type.is_file() || file_type.is_dir()) {
-                        continue;
-                    }
-                }
-                let name = format!("{dir}/{}", entry.file_name().to_string_lossy());
-                refs.push(SkillResourceRef {
-                    kind: kind.to_string(),
-                    name,
-                    supported,
-                    diagnostic: diagnostic.map(ToOwned::to_owned),
-                });
-            }
+        let prefix = format!("skills/{name}/{directory}/");
+        for child in resource_children(state, &prefix) {
+            resources.push(SkillResourceRef {
+                kind: kind.to_string(),
+                name: child,
+                supported: kind == "reference",
+                diagnostic: (kind != "reference").then(|| {
+                    format!("{kind} resources are catalogued but are not loaded automatically")
+                }),
+            });
         }
     }
-    refs.sort_by(|a, b| a.name.cmp(&b.name));
-    refs
+    resources
+}
+
+fn resource_children(state: &WorkspaceConfigState, prefix: &str) -> Vec<String> {
+    let mut children = BTreeSet::new();
+    for path in state.snapshot.entries.keys() {
+        let Some(relative) = path.as_str().strip_prefix(prefix) else {
+            continue;
+        };
+        if relative.is_empty() {
+            continue;
+        }
+        let child = relative.split('/').next().unwrap_or(relative);
+        children.insert(format!("{prefix}{child}"));
+    }
+    children.into_iter().collect()
+}
+
+impl ParsedSkill {
+    fn has_errors(&self) -> bool {
+        self.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == SkillDiagnosticSeverity::Error)
+    }
+
+    fn catalog_entry(&self) -> SkillCatalogEntry {
+        SkillCatalogEntry {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            provenance: self.provenance.clone(),
+            overrides: self.overrides.clone(),
+            diagnostics: self.diagnostics.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use config_source::{
+        ConfigContentType, ConfigEntry, ConfigTreeSnapshot, ToolchainContract,
+        WorkspaceConfigSchemaBundle,
+    };
+
     use super::*;
 
-    fn write_skill(root: &Path, name: &str, content: &str) {
-        let dir = root.join(".yoi").join("skills").join(name);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("SKILL.md"), content).unwrap();
+    fn state(main: &str, markdown: &str, name: &str) -> WorkspaceConfigState {
+        let skill_path = format!("skills/{name}/SKILL.md");
+        let reference_path = format!("skills/{name}/references/checklist.md");
+        let tree = ConfigTreeSnapshot::from_entries(
+            9,
+            [
+                ConfigEntry::new(
+                    VirtualPath::parse("main.dcdl").unwrap(),
+                    ConfigContentType::Decodal,
+                    main,
+                )
+                .unwrap(),
+                ConfigEntry::new(
+                    VirtualPath::parse(&skill_path).unwrap(),
+                    ConfigContentType::Text,
+                    markdown,
+                )
+                .unwrap(),
+                ConfigEntry::new(
+                    VirtualPath::parse(&reference_path).unwrap(),
+                    ConfigContentType::Text,
+                    "checklist",
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let bundle = WorkspaceConfigSchemaBundle::compose([SkillConfigSchemaProvider
+            .contribution()
+            .unwrap()])
+        .unwrap();
+        WorkspaceConfigState {
+            snapshot: tree,
+            contract: ToolchainContract::with_schema_bundle(
+                1,
+                vec![VirtualPath::parse("main.dcdl").unwrap()],
+                1,
+                bundle,
+            ),
+            projection_digest: "projection".to_string(),
+        }
+    }
+
+    fn main_source(name: &str) -> String {
+        let config_key = name.replace('-', "_");
+        format!(
+            r#"{{ skills = {{ {config_key} = import "./skills/{name}/SKILL.md" as {}; }}; }}"#,
+            SKILL_DOCUMENT_SCHEMA_SOURCE
+        )
     }
 
     #[test]
-    fn workspace_skill_is_cataloged_without_body_and_detail_contains_body() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_skill(
-            tmp.path(),
-            "debug-rust",
-            "---\nname: debug-rust\ndescription: Use when debugging Rust failures and deciding what tests to run.\nallowed-tools:\n  - Bash\nmetadata:\n  owner: dev\n---\n\n# Debug Rust\n\nRun focused checks.",
+    fn workspace_skill_projection_keeps_extensions_and_uses_virtual_resources() {
+        let markdown = concat!(
+            "---\n",
+            "name: debug-rust\n",
+            "description: Debug Rust failures\n",
+            "custom-authority: no\n",
+            "allowed-tools: Read Grep\n",
+            "metadata:\n  owner: platform\n",
+            "---\n",
+            "# Debug Rust\n",
         );
-
-        let catalog = catalog(tmp.path());
-        let entry = catalog
+        let state = state(&main_source("debug-rust"), markdown, "debug-rust");
+        let evaluation =
+            evaluate_workspace_config_state(&state, state.contract.schema_bundle.clone()).unwrap();
+        assert_eq!(
+            evaluation.projections[0].data_json["skills"]["debug_rust"]["frontmatter"]["custom-authority"],
+            "no"
+        );
+        let catalog = catalog(&state).unwrap();
+        let item = catalog
             .entries
             .iter()
-            .find(|entry| entry.name == "debug-rust")
-            .expect("workspace skill listed");
+            .find(|item| item.name == "debug-rust")
+            .unwrap();
+        assert_eq!(item.provenance.kind, SkillSourceKind::Workspace);
+        assert_eq!(item.provenance.revision, Some(9));
+        assert!(
+            item.diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity != SkillDiagnosticSeverity::Error)
+        );
+        let detail = detail(&state, "debug-rust").unwrap();
+        assert_eq!(detail.body, "# Debug Rust\n");
+        assert_eq!(detail.allowed_tools, vec!["Read", "Grep"]);
         assert_eq!(
-            entry.description,
-            "Use when debugging Rust failures and deciding what tests to run."
+            detail.resources[0].name,
+            "skills/debug-rust/references/checklist.md"
         );
-        assert_eq!(entry.provenance.id, "workspace:debug-rust");
-        let catalog_json = serde_json::to_string(&catalog).unwrap();
-        assert!(!catalog_json.contains("# Debug Rust"));
-
-        let detail = detail(tmp.path(), "debug-rust").unwrap();
-        assert!(detail.body.contains("# Debug Rust"));
-        assert_eq!(detail.allowed_tools, vec!["Bash"]);
-        assert!(
-            detail
-                .allowed_tools_status
-                .contains("does not grant or deny")
-        );
-        assert!(
-            detail
-                .diagnostics
-                .iter()
-                .any(|d| d.code == "allowed_tools_ignored")
+        assert_eq!(
+            activation(&state, "debug-rust").unwrap().body,
+            "# Debug Rust\n"
         );
     }
 
     #[test]
-    fn invalid_name_and_parent_mismatch_are_lint_errors() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_skill(
-            tmp.path(),
-            "Bad--Name",
-            "---\nname: other\ndescription: Use when checking invalid examples.\n---\n\n# Invalid",
+    fn workspace_override_replaces_builtin_deterministically() {
+        let markdown = concat!(
+            "---\nname: agent-skills\n",
+            "description: Workspace override\n",
+            "---\n# Workspace agent skills\n",
         );
-        let diagnostics = catalog(tmp.path()).diagnostics;
-        assert!(
-            diagnostics
-                .iter()
-                .any(|d| d.code == "invalid_skill_directory_name")
-        );
-        assert!(diagnostics.iter().any(|d| d.code == "name_parent_mismatch"));
-    }
-
-    #[test]
-    fn workflow_projection_frontmatter_fields_are_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_skill(
-            tmp.path(),
-            "workflow-shaped",
-            "---\nname: workflow-shaped\ndescription: Use when proving workflow projection fields are rejected as Skills.\nmodel_invokation: old-typo\nuser_invocable: true\ngraph: {}\ninvocation:\n  run: now\n---\n\n# Workflow Shaped",
-        );
-
-        let catalog = catalog(tmp.path());
-        assert!(
+        let state = state(&main_source("agent-skills"), markdown, "agent-skills");
+        let catalog = catalog(&state).unwrap();
+        assert_eq!(
             catalog
                 .entries
                 .iter()
-                .all(|entry| entry.name != "workflow-shaped")
+                .filter(|item| item.name == "agent-skills")
+                .count(),
+            1
         );
-        let codes = catalog
-            .diagnostics
+        let item = catalog
+            .entries
             .iter()
-            .map(|diagnostic| diagnostic.code.as_str())
-            .collect::<Vec<_>>();
-        assert!(codes.contains(&"unsupported_workflow_frontmatter_field"));
-        for unsupported in ["model_invokation", "user_invocable", "graph", "invocation"] {
-            assert!(
-                catalog.diagnostics.iter().any(|diagnostic| {
-                    diagnostic.code == "unsupported_workflow_frontmatter_field"
-                        && diagnostic.message.contains(unsupported)
-                }),
-                "missing unsupported-field diagnostic for {unsupported}"
-            );
-        }
+            .find(|item| item.name == "agent-skills")
+            .unwrap();
+        assert_eq!(item.description, "Workspace override");
+        assert_eq!(item.provenance.kind, SkillSourceKind::Workspace);
+        assert_eq!(item.overrides[0].kind, SkillSourceKind::Builtin);
+    }
+
+    #[test]
+    fn inline_skill_value_cannot_claim_canonical_source_identity() {
+        let main = r#"{
+            skills = {
+                debug_rust = {
+                    frontmatter = {
+                        name = "debug-rust";
+                        description = "Inline authority";
+                    };
+                    content = "inline";
+                };
+            };
+        }"#;
+        let markdown = "---\nname: debug-rust\ndescription: File authority\n---\nfile\n";
+        let state = state(main, markdown, "debug-rust");
+        let item = catalog(&state)
+            .unwrap()
+            .entries
+            .into_iter()
+            .find(|item| item.name == "debug-rust")
+            .unwrap();
+        assert!(
+            item.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "skill_source_mismatch")
+        );
         assert!(matches!(
-            detail(tmp.path(), "workflow-shaped"),
-            Err(SkillError::NotFound(_))
+            activation(&state, "debug-rust"),
+            Err(SkillError::InvalidSkill(_))
         ));
     }
 
     #[test]
-    fn unknown_frontmatter_fields_are_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_skill(
-            tmp.path(),
-            "unknown-field",
-            "---\nname: unknown-field\ndescription: Use when proving unsupported Skill fields are rejected.\ncustom-authority: no\n---\n\n# Unknown",
-        );
-
-        let catalog = catalog(tmp.path());
-        assert!(
-            catalog
-                .entries
-                .iter()
-                .all(|entry| entry.name != "unknown-field")
-        );
-        assert!(catalog.diagnostics.iter().any(|diagnostic| diagnostic.code
-            == "unsupported_frontmatter_field"
-            && diagnostic.message.contains("custom-authority")));
-    }
-
-    #[test]
-    fn workspace_skill_overrides_builtin() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_skill(
-            tmp.path(),
-            "agent-skills",
-            "---\nname: agent-skills\ndescription: Use when testing deterministic workspace override of builtin Skills.\n---\n\n# Workspace Override",
-        );
-        let catalog = catalog(tmp.path());
-        let entry = catalog
-            .entries
-            .iter()
-            .find(|entry| entry.name == "agent-skills")
-            .unwrap();
-        assert_eq!(entry.provenance.id, "workspace:agent-skills");
-        assert_eq!(entry.overrides[0].id, "builtin:agent-skills");
-        let detail = detail(tmp.path(), "agent-skills").unwrap();
-        assert!(detail.body.contains("Workspace Override"));
-    }
-
-    #[test]
-    fn scripts_are_reported_not_executable_without_raw_paths() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_skill(
-            tmp.path(),
-            "scripted-help",
-            "---\nname: scripted-help\ndescription: Use when checking Skill resource diagnostics safely.\n---\n\n# Scripted",
-        );
-        let script_dir = tmp.path().join(".yoi/skills/scripted-help/scripts");
-        std::fs::create_dir_all(&script_dir).unwrap();
-        std::fs::write(script_dir.join("run.sh"), "echo no").unwrap();
-        let detail = detail(tmp.path(), "scripted-help").unwrap();
-        let script = detail
-            .resources
-            .iter()
-            .find(|r| r.name == "scripts/run.sh")
-            .unwrap();
-        assert!(!script.supported);
-        assert!(
-            !serde_json::to_string(&detail)
-                .unwrap()
-                .contains(tmp.path().to_str().unwrap())
-        );
+    fn schema_accepts_unknown_extensions_but_keeps_skill_documents_typed() {
+        let contribution = SkillConfigSchemaProvider.contribution().unwrap();
+        assert_eq!(contribution.namespace, "skills");
+        assert!(contribution.source.contains("...Unknown"));
+        assert!(contribution.source.contains("metadata = {...String}"));
     }
 }

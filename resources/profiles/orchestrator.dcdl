@@ -2,6 +2,7 @@ import "./base.dcdl" // {
     slug = "orchestrator";
     description = "Ticket orchestrator profile.";
     scope = "workspace_write";
+    engine = { instruction = "role.orchestrator"; };
 
     feature = {
         task = { enabled = true; };

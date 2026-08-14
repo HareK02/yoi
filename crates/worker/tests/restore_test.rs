@@ -49,7 +49,7 @@ async fn restore_from_worker_metadata_rejects_missing_metadata() {
         "restore-test",
         manifest,
         store,
-        worker::PromptLoader::builtins_only(),
+        worker::PromptCatalogSource::builtins_only(),
     )
     .await;
 
@@ -84,7 +84,7 @@ async fn restore_from_worker_metadata_rejects_pending_segment() {
         "restore-test",
         manifest,
         store,
-        worker::PromptLoader::builtins_only(),
+        worker::PromptCatalogSource::builtins_only(),
     )
     .await;
 
@@ -126,7 +126,7 @@ async fn restore_from_worker_metadata_resolves_active_pointer_through_session_lo
         "restore-test",
         manifest,
         store,
-        worker::PromptLoader::builtins_only(),
+        worker::PromptCatalogSource::builtins_only(),
     )
     .await;
 
@@ -158,7 +158,7 @@ async fn restore_from_manifest_rejects_unknown_segment() {
         unknown_seg,
         manifest,
         store,
-        worker::PromptLoader::builtins_only(),
+        worker::PromptCatalogSource::builtins_only(),
     )
     .await;
 
@@ -195,7 +195,7 @@ async fn restore_from_manifest_rejects_empty_segment_log() {
         segid,
         manifest,
         store,
-        worker::PromptLoader::builtins_only(),
+        worker::PromptCatalogSource::builtins_only(),
     )
     .await;
 

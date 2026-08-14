@@ -1811,10 +1811,19 @@ mod tests {
                 label: Some("test".to_string()),
             }],
             declarations: Vec::new(),
+            prompt_catalog: None,
             profile_source_archive: None,
             profile_source_archive_handle: None,
         }
         .with_computed_digest()
+    }
+
+    fn store_coder_test_bundle(runtime: &Runtime) {
+        runtime
+            .store_config_bundle(test_bundle(ProfileSelector::Builtin(
+                "builtin:coder".to_string(),
+            )))
+            .unwrap();
     }
 
     fn scoped_task_request(objective: &str, workspace_id: &str) -> CreateWorkerRequest {
@@ -1922,6 +1931,7 @@ mod tests {
         let runtime =
             Runtime::with_execution_backend(RuntimeOptions::default(), Arc::new(AcceptingBackend))
                 .unwrap();
+        store_coder_test_bundle(&runtime);
         let (auth, signer) = auth_config_and_signer();
         let token_a = token_for_workspace(&signer, "workspace-a");
         let token_b = token_for_workspace(&signer, "workspace-b");
@@ -2002,6 +2012,7 @@ mod tests {
         let runtime =
             Runtime::with_execution_backend(RuntimeOptions::default(), Arc::new(AcceptingBackend))
                 .unwrap();
+        store_coder_test_bundle(&runtime);
         let (auth, signer_a, signer_b) = auth_config_and_two_signers();
         let token_a = token_for_workspace(&signer_a, "workspace-a");
         let token_b = token_for_workspace(&signer_b, "workspace-a");
@@ -2648,6 +2659,7 @@ mod ws_tests {
                 label: Some("ws".to_string()),
             }],
             declarations: Vec::new(),
+            prompt_catalog: None,
             profile_source_archive: None,
             profile_source_archive_handle: None,
         }

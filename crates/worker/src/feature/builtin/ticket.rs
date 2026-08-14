@@ -33,7 +33,7 @@ const FEATURE_NAME: &str = "Ticket tools";
 const FEATURE_DESCRIPTION: &str = "Typed local Ticket work-item operations over a bounded backend root. \
 The tools operate through the ticket crate backend and do not grant generic filesystem write scope.";
 const TICKET_WORKFLOW_INSTRUCTION_ID: &str = "ticket.workflow";
-const TICKET_WORKFLOW_PROMPT_REF: &str = "$yoi/common/tickets";
+const TICKET_WORKFLOW_PROMPT_REF: &str = "common.tickets";
 pub const TICKET_SERVICE_ID: &str = "ticket.authority";
 const TICKET_SERVICE_VERSION: &str = "1";
 

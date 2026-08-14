@@ -3,20 +3,20 @@ use std::fmt;
 
 use decodal::{
     Data, Diagnostic, DiagnosticKind, Engine, HostEnvironment, ImportCandidate, ImportLoader,
-    LoadedImport, Span,
+    LoadedImport, Span, Value,
 };
 use decodal_language_service::{CompletionResult, LanguageService};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const CONFIG_SOURCE_CONTRACT_VERSION: u32 = 2;
-pub const DECODAL_VERSION: &str = "0.2.0";
+pub const DECODAL_VERSION: &str = "0.4.0";
 pub const DEFAULT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_IMPORT_POLICY_VERSION: u32 = 1;
 pub const WORKSPACE_CONFIG_SCHEMA_GLOBAL: &str = "WorkspaceConfigSchema";
 pub const WORKSPACE_CONFIG_SCHEMA_SOURCE: &str = "workspace-config-schema.dcdl";
 pub const WORKSPACE_CONFIG_EVALUATION_SOURCE: &str =
-    "WorkspaceConfigSchema & import \"__MAIN_ENTRYPOINT__\"";
+    "import \"__MAIN_ENTRYPOINT__\" as WorkspaceConfigSchema";
 pub const MAX_ENTRY_COUNT: usize = 256;
 pub const MAX_CHANGE_COUNT: usize = 256;
 pub const MAX_ENTRY_BYTES: usize = 256 * 1024;
@@ -88,6 +88,151 @@ impl ConfigContentType {
             Self::Decodal => "text/x-decodal",
             Self::Text => "text/plain",
         }
+    }
+}
+
+/// Stable value projection used when a virtual config source imports Markdown.
+///
+/// Frontmatter delimiters are transport syntax and are intentionally absent from
+/// `content`; unknown frontmatter keys stay in `frontmatter` without a
+/// domain-specific parser interpreting them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarkdownDocumentProjection {
+    pub frontmatter: serde_json::Map<String, serde_json::Value>,
+    pub content: String,
+}
+
+/// Parse one Markdown source into the common virtual-config import shape.
+///
+/// Files without a leading YAML frontmatter delimiter produce an empty
+/// frontmatter object and preserve the complete file as `content`.
+pub fn project_markdown_document(source: &str) -> Result<MarkdownDocumentProjection, String> {
+    let Some(after_opening) = source
+        .strip_prefix("---\n")
+        .or_else(|| source.strip_prefix("---\r\n"))
+    else {
+        return Ok(MarkdownDocumentProjection {
+            frontmatter: serde_json::Map::new(),
+            content: source.to_string(),
+        });
+    };
+
+    let mut frontmatter_end = None;
+    let mut offset = 0usize;
+    for line_with_ending in after_opening.split_inclusive('\n') {
+        let line = line_with_ending.trim_end_matches(['\r', '\n']);
+        if line == "---" {
+            frontmatter_end = Some((offset, offset + line_with_ending.len()));
+            break;
+        }
+        offset += line_with_ending.len();
+    }
+    if frontmatter_end.is_none() && after_opening.ends_with("---") {
+        let start = after_opening.len() - 3;
+        if start == 0 || after_opening[..start].ends_with('\n') {
+            frontmatter_end = Some((start, after_opening.len()));
+        }
+    }
+    let Some((frontmatter_end, content_start)) = frontmatter_end else {
+        return Err("opening YAML frontmatter delimiter has no closing delimiter".to_string());
+    };
+
+    let frontmatter_source = &after_opening[..frontmatter_end];
+    let frontmatter = if frontmatter_source.trim().is_empty() {
+        serde_json::Map::new()
+    } else {
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(frontmatter_source)
+            .map_err(|error| format!("invalid YAML frontmatter: {error}"))?;
+        let value = yaml_to_json(yaml)?;
+        value
+            .as_object()
+            .cloned()
+            .ok_or_else(|| "YAML frontmatter must be a mapping".to_string())?
+    };
+
+    Ok(MarkdownDocumentProjection {
+        frontmatter,
+        content: after_opening[content_start..].to_string(),
+    })
+}
+
+fn yaml_to_json(value: serde_yaml::Value) -> Result<serde_json::Value, String> {
+    match value {
+        serde_yaml::Value::Null => Ok(serde_json::Value::Null),
+        serde_yaml::Value::Bool(value) => Ok(serde_json::Value::Bool(value)),
+        serde_yaml::Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                Ok(serde_json::Value::Number(value.into()))
+            } else if let Some(value) = value.as_u64() {
+                Ok(serde_json::Value::Number(value.into()))
+            } else if let Some(value) = value.as_f64() {
+                serde_json::Number::from_f64(value)
+                    .map(serde_json::Value::Number)
+                    .ok_or_else(|| "YAML frontmatter contains a non-finite number".to_string())
+            } else {
+                Err("YAML frontmatter contains an unsupported number".to_string())
+            }
+        }
+        serde_yaml::Value::String(value) => Ok(serde_json::Value::String(value)),
+        serde_yaml::Value::Sequence(values) => values
+            .into_iter()
+            .map(yaml_to_json)
+            .collect::<Result<Vec<_>, _>>()
+            .map(serde_json::Value::Array),
+        serde_yaml::Value::Mapping(values) => {
+            let mut object = serde_json::Map::new();
+            for (key, value) in values {
+                let serde_yaml::Value::String(key) = key else {
+                    return Err("YAML frontmatter mapping keys must be strings".to_string());
+                };
+                object.insert(key, yaml_to_json(value)?);
+            }
+            Ok(serde_json::Value::Object(object))
+        }
+        serde_yaml::Value::Tagged(_) => Err("YAML frontmatter tags are not supported".to_string()),
+    }
+}
+
+fn markdown_projection_to_value(projection: MarkdownDocumentProjection) -> Result<Value, String> {
+    Ok(Value::object([
+        (
+            "frontmatter",
+            json_to_decodal_value(serde_json::Value::Object(projection.frontmatter))?,
+        ),
+        ("content", Value::string(projection.content)),
+    ]))
+}
+
+fn json_to_decodal_value(value: serde_json::Value) -> Result<Value, String> {
+    match value {
+        serde_json::Value::Null => Err(
+            "YAML null values cannot be represented as concrete Decodal import values".to_string(),
+        ),
+        serde_json::Value::Bool(value) => Ok(Value::bool(value)),
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                Ok(Value::int(value))
+            } else if let Some(value) = value.as_u64() {
+                i64::try_from(value)
+                    .map(Value::int)
+                    .map_err(|_| "YAML integer exceeds the Decodal i64 range".to_string())
+            } else if let Some(value) = value.as_f64() {
+                Ok(Value::float(value))
+            } else {
+                Err("JSON number cannot be represented as a Decodal value".to_string())
+            }
+        }
+        serde_json::Value::String(value) => Ok(Value::string(value)),
+        serde_json::Value::Array(values) => values
+            .into_iter()
+            .map(json_to_decodal_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::array),
+        serde_json::Value::Object(values) => values
+            .into_iter()
+            .map(|(name, value)| Ok((name, json_to_decodal_value(value)?)))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::object),
     }
 }
 
@@ -326,12 +471,25 @@ impl ConfigTreeChange {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum ConfigProjectionValidator {
+    StaticTemplateCatalog {
+        namespace: String,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        key_aliases: BTreeMap<String, String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[ts(export)]
 pub struct ConfigSchemaContribution {
     pub provider_id: String,
     pub namespace: String,
     pub version: String,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_validator: Option<ConfigProjectionValidator>,
     pub source_digest: String,
 }
 
@@ -372,7 +530,13 @@ impl ConfigSchemaContribution {
             version,
             source_digest: digest_bytes(source.as_bytes()),
             source,
+            projection_validator: None,
         })
+    }
+
+    pub fn with_projection_validator(mut self, validator: ConfigProjectionValidator) -> Self {
+        self.projection_validator = Some(validator);
+        self
     }
 
     fn validate(&self) -> Result<(), ConfigTreeError> {
@@ -440,6 +604,7 @@ impl WorkspaceConfigSchemaBundle {
                             contribution.namespace.as_str(),
                             contribution.version.as_str(),
                             contribution.source_digest.as_str(),
+                            contribution.projection_validator.as_ref(),
                         )
                     })
                     .collect::<Vec<_>>(),
@@ -686,8 +851,11 @@ impl SnapshotEnvironment {
             )]
         })?;
         engine.bind_global_runtime(WORKSPACE_CONFIG_SCHEMA_GLOBAL, schema);
-        let evaluation_source =
-            WORKSPACE_CONFIG_EVALUATION_SOURCE.replace("__MAIN_ENTRYPOINT__", entrypoint.as_str());
+        let evaluation_source = if contract.schema_bundle.contributions.is_empty() {
+            format!("import \"{}\"", entrypoint.as_str())
+        } else {
+            WORKSPACE_CONFIG_EVALUATION_SOURCE.replace("__MAIN_ENTRYPOINT__", entrypoint.as_str())
+        };
         let evaluation_module = engine
             .add_root_source(
                 "workspace-config-evaluation.dcdl",
@@ -721,6 +889,15 @@ impl SnapshotEnvironment {
             )]
         })?;
         let data_json = decodal_data_to_json(&data);
+        if let Err(message) =
+            validate_projection_contracts(&data_json, &contract.schema_bundle.contributions)
+        {
+            return Err(vec![self.config_error(
+                entrypoint.clone(),
+                "projection_validation",
+                message,
+            )]);
+        }
         let projection_digest = digest_bytes(
             serde_json::to_vec(&data_json)
                 .expect("Decodal projection serializes")
@@ -850,8 +1027,26 @@ impl ImportLoader for SnapshotImportLoader {
                 format!("virtual config import is missing: {path}"),
             )
         })?;
+        let cache_key = snapshot_import_cache_key(entry);
+        if path.as_str().ends_with(".md") {
+            let projection = project_markdown_document(&entry.content).map_err(|message| {
+                Diagnostic::new(
+                    DiagnosticKind::Import,
+                    Span::default(),
+                    format!("failed to import Markdown `{path}`: {message}"),
+                )
+            })?;
+            let value = markdown_projection_to_value(projection).map_err(|message| {
+                Diagnostic::new(
+                    DiagnosticKind::Import,
+                    Span::default(),
+                    format!("failed to import Markdown `{path}`: {message}"),
+                )
+            })?;
+            return Ok(LoadedImport::value(cache_key, value));
+        }
         Ok(LoadedImport::source(
-            path.as_str(),
+            cache_key,
             path.as_str(),
             entry.content.clone(),
         ))
@@ -871,6 +1066,13 @@ impl ImportLoader for SnapshotImportLoader {
             .map(|specifier| ImportCandidate::new(specifier).with_detail("virtual config source"))
             .collect())
     }
+}
+
+fn snapshot_import_cache_key(entry: &ConfigEntry) -> String {
+    // The source id remains the virtual path for diagnostics and relative-import
+    // resolution. The cache identity also includes immutable source content so
+    // equal paths from different revisions cannot alias in an Engine cache.
+    format!("{}@{}", entry.path, entry.content_digest)
 }
 
 pub fn resolve_import(
@@ -1050,6 +1252,165 @@ fn decodal_data_to_json(data: &Data) -> serde_json::Value {
     }
 }
 
+fn validate_projection_contracts(
+    projection: &serde_json::Value,
+    contributions: &[ConfigSchemaContribution],
+) -> Result<(), String> {
+    for contribution in contributions {
+        let Some(ConfigProjectionValidator::StaticTemplateCatalog {
+            namespace,
+            key_aliases,
+        }) = &contribution.projection_validator
+        else {
+            continue;
+        };
+        let value = projection
+            .get(namespace)
+            .ok_or_else(|| format!("projection has no '{namespace}' template namespace"))?;
+        let mut templates = BTreeMap::new();
+        flatten_string_catalog("", value, &mut templates)?;
+        for (source, target) in key_aliases {
+            if let Some(value) = templates.remove(source) {
+                if templates.insert(target.clone(), value).is_some() {
+                    return Err(format!(
+                        "template catalog alias '{source}' collides with '{target}'"
+                    ));
+                }
+            }
+        }
+        validate_static_template_catalog(&templates)?;
+    }
+    Ok(())
+}
+
+fn flatten_string_catalog(
+    prefix: &str,
+    value: &serde_json::Value,
+    output: &mut BTreeMap<String, String>,
+) -> Result<(), String> {
+    match value {
+        serde_json::Value::String(source) if !prefix.is_empty() => {
+            output.insert(prefix.to_string(), source.clone());
+            Ok(())
+        }
+        serde_json::Value::Object(fields) => {
+            for (name, value) in fields {
+                let key = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}.{name}")
+                };
+                flatten_string_catalog(&key, value, output)?;
+            }
+            Ok(())
+        }
+        _ => Err(format!(
+            "template catalog leaf '{}' must be a string",
+            if prefix.is_empty() { "<root>" } else { prefix }
+        )),
+    }
+}
+
+pub fn validate_static_template_catalog(
+    templates: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    if templates.is_empty() {
+        return Err("template catalog is empty".to_string());
+    }
+    let mut environment = minijinja::Environment::new();
+    environment.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+    let mut graph = BTreeMap::new();
+    for (name, source) in templates {
+        environment
+            .add_template_owned(name.clone(), source.clone())
+            .map_err(|error| format!("template '{name}' does not compile: {error}"))?;
+        let includes = parse_static_template_includes(name, source)?;
+        for target in &includes {
+            if !templates.contains_key(target) {
+                return Err(format!(
+                    "template '{name}' includes missing target '{target}'"
+                ));
+            }
+        }
+        graph.insert(name.clone(), includes);
+    }
+    fn visit(
+        node: &str,
+        graph: &BTreeMap<String, Vec<String>>,
+        visiting: &mut Vec<String>,
+        visited: &mut BTreeSet<String>,
+    ) -> Result<(), String> {
+        if let Some(position) = visiting.iter().position(|entry| entry == node) {
+            let mut cycle = visiting[position..].to_vec();
+            cycle.push(node.to_string());
+            return Err(format!("template include cycle: {}", cycle.join(" -> ")));
+        }
+        if visited.contains(node) {
+            return Ok(());
+        }
+        visiting.push(node.to_string());
+        for target in &graph[node] {
+            visit(target, graph, visiting, visited)?;
+        }
+        visiting.pop();
+        visited.insert(node.to_string());
+        Ok(())
+    }
+    let mut visited = BTreeSet::new();
+    for node in graph.keys() {
+        visit(node, &graph, &mut Vec::new(), &mut visited)?;
+    }
+    Ok(())
+}
+
+fn parse_static_template_includes(template: &str, source: &str) -> Result<Vec<String>, String> {
+    let mut includes = Vec::new();
+    let mut rest = source;
+    while let Some(open) = rest.find("{%") {
+        let after_open = &rest[open + 2..];
+        let Some(close) = after_open.find("%}") else {
+            break;
+        };
+        let body = after_open[..close].trim();
+        let body = body.strip_prefix('-').unwrap_or(body).trim_start();
+        let body = body.strip_suffix('-').unwrap_or(body).trim_end();
+        if body.starts_with("include") {
+            let argument = body["include".len()..].trim();
+            let bytes = argument.as_bytes();
+            if bytes.len() < 2
+                || !matches!(bytes[0], b'\'' | b'"')
+                || bytes[bytes.len() - 1] != bytes[0]
+            {
+                return Err(format!(
+                    "template '{template}' include target must be one exact quoted dotted name"
+                ));
+            }
+            let target = &argument[1..argument.len() - 1];
+            if target.is_empty()
+                || target.contains('/')
+                || target.contains('\\')
+                || target.contains('$')
+                || target.ends_with(".md")
+                || target.split('.').any(|segment| {
+                    segment.is_empty()
+                        || !segment.chars().all(|character| {
+                            character.is_ascii_lowercase()
+                                || character.is_ascii_digit()
+                                || character == '_'
+                        })
+                })
+            {
+                return Err(format!(
+                    "template '{template}' has invalid catalog-root include target '{target}'"
+                ));
+            }
+            includes.push(target.to_string());
+        }
+        rest = &after_open[close + 2..];
+    }
+    Ok(includes)
+}
+
 fn snapshot_digest(entries: &BTreeMap<VirtualPath, ConfigEntry>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"yoi-config-tree-v1\0");
@@ -1142,6 +1503,10 @@ mod tests {
 
     fn entry(path_value: &str, content: &str) -> ConfigEntry {
         ConfigEntry::new(path(path_value), ConfigContentType::Decodal, content).unwrap()
+    }
+
+    fn text_entry(path_value: &str, content: &str) -> ConfigEntry {
+        ConfigEntry::new(path(path_value), ConfigContentType::Text, content).unwrap()
     }
 
     #[test]
@@ -1270,10 +1635,9 @@ mod tests {
     }
 
     #[test]
-    fn workspace_schema_is_applied_with_normal_decodal_composition() {
+    fn workspace_schema_applies_defaults_with_asymmetric_decodal_validation() {
         let snapshot =
-            ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", "{ web = {}; custom = 42; }")])
-                .unwrap();
+            ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", "{ web = {}; }")]).unwrap();
         let schema = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
             "builtin:web",
             "web",
@@ -1287,7 +1651,194 @@ mod tests {
             .evaluate_contract(&contract)
             .unwrap();
         assert_eq!(result.projections[0].data_json["web"]["enabled"], false);
-        assert_eq!(result.projections[0].data_json["custom"], 42);
+    }
+
+    #[test]
+    fn workspace_schema_rejects_unknown_root_and_nested_fields() {
+        let schema = || {
+            WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+                "builtin:web",
+                "web",
+                "1",
+                "{ web = { enabled = Bool default false; }; }",
+            )
+            .unwrap()])
+            .unwrap()
+        };
+        for (source, unknown_field) in [
+            ("{ web = {}; custom = 42; }", "custom"),
+            ("{ web = { typo = true; }; }", "typo"),
+        ] {
+            let snapshot =
+                ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", source)]).unwrap();
+            let diagnostics = SnapshotEnvironment::new(snapshot)
+                .evaluate_contract(&ToolchainContract::with_schema_bundle(
+                    1,
+                    vec![path("main.dcdl")],
+                    1,
+                    schema(),
+                ))
+                .unwrap_err();
+            assert_eq!(diagnostics[0].path, path("main.dcdl"));
+            assert_eq!(diagnostics[0].kind, "constraintviolation");
+            assert!(diagnostics[0].message.contains(unknown_field));
+            assert!(diagnostics[0].span.end_byte > diagnostics[0].span.start_byte);
+        }
+    }
+
+    #[test]
+    fn workspace_schema_supports_typed_associative_collections() {
+        let snapshot = ConfigTreeSnapshot::from_entries(
+            1,
+            [entry(
+                "main.dcdl",
+                "{ features = { web = { enabled = true; }; tickets = { enabled = false; }; }; }",
+            )],
+        )
+        .unwrap();
+        let schema = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+            "builtin:features",
+            "features",
+            "1",
+            "{ features = {...{ enabled = Bool; }}; }",
+        )
+        .unwrap()])
+        .unwrap();
+        let result = SnapshotEnvironment::new(snapshot)
+            .evaluate_contract(&ToolchainContract::with_schema_bundle(
+                1,
+                vec![path("main.dcdl")],
+                1,
+                schema,
+            ))
+            .unwrap();
+        assert_eq!(
+            result.projections[0].data_json["features"]["web"]["enabled"],
+            true
+        );
+        assert_eq!(
+            result.projections[0].data_json["features"]["tickets"]["enabled"],
+            false
+        );
+    }
+
+    #[test]
+    fn workspace_typed_associative_values_remain_closed_and_typed() {
+        let schema = || {
+            WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+                "builtin:features",
+                "features",
+                "1",
+                "{ features = {...{ enabled = Bool; }}; }",
+            )
+            .unwrap()])
+            .unwrap()
+        };
+        for (source, expected_kind) in [
+            (
+                "{ features = { web = { enabled = \"yes\"; }; }; }",
+                "constraintviolation",
+            ),
+            ("{ features = { web = {}; }; }", "materialize"),
+            (
+                "{ features = { web = { enabled = true; typo = 1; }; }; }",
+                "constraintviolation",
+            ),
+        ] {
+            let snapshot =
+                ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", source)]).unwrap();
+            let diagnostics = SnapshotEnvironment::new(snapshot)
+                .evaluate_contract(&ToolchainContract::with_schema_bundle(
+                    1,
+                    vec![path("main.dcdl")],
+                    1,
+                    schema(),
+                ))
+                .unwrap_err();
+            assert_eq!(diagnostics[0].path, path("main.dcdl"));
+            assert_eq!(diagnostics[0].kind, expected_kind);
+            assert!(diagnostics[0].span.end_byte > diagnostics[0].span.start_byte);
+        }
+    }
+
+    #[test]
+    fn language_service_and_formatter_accept_decodal_0_4_schema_syntax() {
+        let source =
+            "{} as { features = {...{ enabled = Bool; }}; web = { enabled = Bool; ...Unknown }; }";
+        let snapshot = ConfigTreeSnapshot::from_entries(1, [entry("schema.dcdl", source)]).unwrap();
+        let environment = SnapshotEnvironment::new(snapshot);
+        let diagnostics = environment.analyze(&path("schema.dcdl"), None);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.kind != "syntax"),
+            "{diagnostics:#?}"
+        );
+
+        let completion_source = "{} as { web = { enabled = Unk } }";
+        let completion = environment
+            .complete(
+                &path("schema.dcdl"),
+                completion_source,
+                completion_source.find("Unk").unwrap() + "Unk".len(),
+                true,
+            )
+            .unwrap()
+            .expect("explicit completion is available");
+        assert!(format!("{completion:?}").contains("Unknown"));
+
+        let formatted = environment.format(source).unwrap();
+        assert!(formatted.contains(" as "));
+        assert!(formatted.contains("...Unknown"));
+        assert!(
+            environment
+                .analyze(&path("schema.dcdl"), Some(&formatted))
+                .iter()
+                .all(|diagnostic| diagnostic.kind != "syntax")
+        );
+    }
+
+    #[test]
+    fn workspace_schema_preserves_fields_only_where_rest_is_explicit() {
+        let snapshot = ConfigTreeSnapshot::from_entries(
+            1,
+            [entry(
+                "main.dcdl",
+                "{ web = { enabled = true; extension_value = 42; }; }",
+            )],
+        )
+        .unwrap();
+        let schema = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+            "builtin:web",
+            "web",
+            "1",
+            "{ web = { enabled = Bool; ...Unknown }; }",
+        )
+        .unwrap()])
+        .unwrap();
+        let result = SnapshotEnvironment::new(snapshot)
+            .evaluate_contract(&ToolchainContract::with_schema_bundle(
+                1,
+                vec![path("main.dcdl")],
+                1,
+                schema,
+            ))
+            .unwrap();
+        assert_eq!(
+            result.projections[0].data_json["web"]["extension_value"],
+            42
+        );
+    }
+
+    #[test]
+    fn unresolved_unknown_cannot_be_materialized() {
+        let snapshot =
+            ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", "Unknown")]).unwrap();
+        let diagnostics = SnapshotEnvironment::new(snapshot)
+            .evaluate_contract(&ToolchainContract::new(1, vec![path("main.dcdl")], 1))
+            .unwrap_err();
+        assert_eq!(diagnostics[0].path, path("main.dcdl"));
+        assert!(!diagnostics[0].message.is_empty());
     }
 
     #[test]
@@ -1331,6 +1882,107 @@ mod tests {
         let configured =
             ToolchainContract::with_schema_bundle(1, vec![path("main.dcdl")], 1, schema);
         assert_ne!(empty.fingerprint, configured.fingerprint);
+    }
+
+    #[test]
+    fn snapshot_import_cache_key_binds_virtual_path_and_content_digest() {
+        let first = text_entry("skills/debug-rust/SKILL.md", "first");
+        let second = text_entry("skills/debug-rust/SKILL.md", "second");
+        let first_key = snapshot_import_cache_key(&first);
+        assert!(first_key.starts_with("skills/debug-rust/SKILL.md@sha256:"));
+        assert!(first_key.ends_with(&first.content_digest));
+        assert_ne!(first_key, snapshot_import_cache_key(&second));
+    }
+
+    #[test]
+    fn markdown_import_projects_frontmatter_and_content_as_a_value() {
+        let markdown = concat!(
+            "---\n",
+            "name: debug-rust\n",
+            "description: Debug Rust failures\n",
+            "custom-authority: no\n",
+            "allowed-tools: Read Grep\n",
+            "metadata:\n  owner: platform\n",
+            "---\n",
+            "# Debug Rust\n",
+        );
+        let snapshot = ConfigTreeSnapshot::from_entries(
+            3,
+            [
+                entry(
+                    "main.dcdl",
+                    r#"{ skill = import "./skills/debug-rust/SKILL.md" as { frontmatter = { name = String; description = String; ...Unknown }; content = String; }; }"#,
+                ),
+                text_entry("skills/debug-rust/SKILL.md", markdown),
+            ],
+        )
+        .unwrap();
+        let result = SnapshotEnvironment::new(snapshot.clone())
+            .evaluate_contract(&ToolchainContract::new(1, vec![path("main.dcdl")], 1))
+            .unwrap();
+        let skill = &result.projections[0].data_json["skill"];
+        assert_eq!(skill["frontmatter"]["name"], "debug-rust");
+        assert_eq!(skill["frontmatter"]["custom-authority"], "no");
+        assert_eq!(skill["frontmatter"]["allowed-tools"], "Read Grep");
+        assert_eq!(skill["frontmatter"]["metadata"]["owner"], "platform");
+        assert_eq!(skill["content"], "# Debug Rust\n");
+        assert_eq!(
+            snapshot.entries[&path("skills/debug-rust/SKILL.md")].content_digest,
+            digest_bytes(markdown.as_bytes())
+        );
+    }
+
+    #[test]
+    fn markdown_import_without_frontmatter_preserves_the_whole_body() {
+        let source = "# Plain skill\nKeep --- inside the body.\n";
+        assert_eq!(
+            project_markdown_document(source).unwrap(),
+            MarkdownDocumentProjection {
+                frontmatter: serde_json::Map::new(),
+                content: source.to_string(),
+            }
+        );
+        let snapshot = ConfigTreeSnapshot::from_entries(
+            1,
+            [
+                entry("main.dcdl", r#"import "./skills/plain/SKILL.md""#),
+                text_entry("skills/plain/SKILL.md", source),
+            ],
+        )
+        .unwrap();
+        let result = SnapshotEnvironment::new(snapshot)
+            .evaluate_contract(&ToolchainContract::new(1, vec![path("main.dcdl")], 1))
+            .unwrap();
+        assert_eq!(
+            result.projections[0].data_json["frontmatter"],
+            serde_json::json!({})
+        );
+        assert_eq!(result.projections[0].data_json["content"], source);
+    }
+
+    #[test]
+    fn malformed_markdown_frontmatter_is_an_import_diagnostic() {
+        assert_eq!(
+            project_markdown_document("---\nname: missing-close\nbody\n").unwrap_err(),
+            "opening YAML frontmatter delimiter has no closing delimiter"
+        );
+        let snapshot = ConfigTreeSnapshot::from_entries(
+            1,
+            [
+                entry("main.dcdl", r#"import "./skills/broken/SKILL.md""#),
+                text_entry(
+                    "skills/broken/SKILL.md",
+                    "---\nname: [unterminated\n---\nbody\n",
+                ),
+            ],
+        )
+        .unwrap();
+        let diagnostics = SnapshotEnvironment::new(snapshot)
+            .evaluate_contract(&ToolchainContract::new(1, vec![path("main.dcdl")], 1))
+            .unwrap_err();
+        assert_eq!(diagnostics[0].kind, "import");
+        assert!(diagnostics[0].message.contains("invalid YAML frontmatter"));
+        assert!(diagnostics[0].message.contains("skills/broken/SKILL.md"));
     }
 
     #[test]

@@ -23,10 +23,7 @@ const DEFAULT_PAGE_LIMIT: usize = 20;
 const MAX_PAGE_LIMIT: usize = 100;
 const MAX_READ_BYTES: usize = 16 * 1024;
 const OBSERVATION_INSTRUCTION_ID: &str = "worker-observation.policy";
-const OBSERVATION_PROMPT_REF: &str = "$yoi/common/worker-observation";
-#[cfg(test)]
-const OBSERVATION_PROMPT_SOURCE: &str =
-    include_str!("../../../../../resources/prompts/common/worker-observation.md");
+const OBSERVATION_PROMPT_REF: &str = "common.worker_observation";
 
 fn observation_instruction() -> FeatureInstructionDeclaration {
     FeatureInstructionDeclaration::new(
@@ -801,6 +798,8 @@ mod tests {
 
     #[test]
     fn prompt_source_names_the_worker_observation_contract() {
+        let catalog = crate::PromptCatalog::builtins_only().unwrap();
+        let source = &catalog.projection().templates["common.worker_observation"];
         for token in [
             "ListWorkerSessions",
             "ViewSessionOverview",
@@ -808,7 +807,7 @@ mod tests {
             "ReadSessionEntry",
             "SessionEntryRef",
         ] {
-            assert!(OBSERVATION_PROMPT_SOURCE.contains(token), "missing {token}");
+            assert!(source.contains(token), "missing {token}");
         }
     }
 

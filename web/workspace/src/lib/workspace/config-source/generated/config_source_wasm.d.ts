@@ -9,6 +9,8 @@ export function changes_between(base: any, candidate: any): any;
 
 export function complete_current(entrypoint: string, source: string, utf16_offset: number, explicit: boolean): any;
 
+export function compose_schema_bundle(contributions: any): any;
+
 export function evaluate_current(contract: any): any;
 
 export function evaluate_snapshot(snapshot: any, contract: any): any;
@@ -27,6 +29,7 @@ export interface InitOutput {
     readonly apply_changes: (a: any) => [number, number, number];
     readonly changes_between: (a: any, b: any) => [number, number, number];
     readonly complete_current: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number];
+    readonly compose_schema_bundle: (a: any) => [number, number, number];
     readonly evaluate_current: (a: any) => [number, number, number];
     readonly evaluate_snapshot: (a: any, b: any) => [number, number, number];
     readonly format_source: (a: number, b: number) => [number, number, number, number];

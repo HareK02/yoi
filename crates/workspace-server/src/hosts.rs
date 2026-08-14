@@ -1201,6 +1201,21 @@ impl RuntimeRegistry {
             _ => {}
         }
         let runtime = self.runtime(runtime_id)?;
+        if let Some(bundle) = request.resolved_config_bundle.clone() {
+            let sync = runtime.sync_config_bundle(bundle);
+            if sync.state != WorkerOperationState::Accepted {
+                let message = sync
+                    .diagnostics
+                    .first()
+                    .map(|diagnostic| diagnostic.message.clone())
+                    .unwrap_or_else(|| "Runtime rejected the resolved config bundle".to_string());
+                return Err(RuntimeRegistryError::RuntimeOperationFailed {
+                    runtime_id: runtime_id.to_string(),
+                    code: "worker_config_bundle_sync_rejected".to_string(),
+                    message,
+                });
+            }
+        }
         Ok(runtime.spawn_worker(request))
     }
 
@@ -1960,12 +1975,13 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             }
         };
         let workspace_id = workspace_api.workspace_id.clone();
+        let config_bundle = spawn_config_bundle_ref(&request);
         let create_request = CreateWorkerRequest {
             idempotency_key,
             idempotency_fingerprint,
             profile,
             display_name: request.requested_worker_name.clone(),
-            config_bundle: None,
+            config_bundle,
             profile_source,
             initial_input: initial_worker_input(&request.initial_submit),
             working_directory_request: request.resolved_working_directory_request.clone(),
@@ -3090,12 +3106,13 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 };
             }
         };
+        let config_bundle = spawn_config_bundle_ref(&request);
         let create = CreateWorkerRequest {
             idempotency_key,
             idempotency_fingerprint,
             profile,
             display_name: request.requested_worker_name.clone(),
-            config_bundle: None,
+            config_bundle,
             profile_source,
             initial_input: initial_worker_input(&request.initial_submit),
             working_directory_request: request.resolved_working_directory_request.clone(),
@@ -3360,6 +3377,16 @@ fn embedded_worker_projection_diagnostics() -> Vec<RuntimeDiagnostic> {
     )]
 }
 
+fn spawn_config_bundle_ref(request: &WorkerSpawnRequest) -> Option<ConfigBundleRef> {
+    request
+        .resolved_config_bundle
+        .as_ref()
+        .map(|bundle| ConfigBundleRef {
+            id: bundle.metadata.id.clone(),
+            digest: bundle.metadata.digest.clone(),
+        })
+}
+
 fn profile_source_archive_for_request(
     request: &WorkerSpawnRequest,
     profile: &ProfileSelector,
@@ -3469,6 +3496,7 @@ fn builtin_profile_config_bundle(
             label: embedded_profile_label(profile),
         }],
         declarations: Vec::new(),
+        prompt_catalog: None,
         profile_source_archive,
         profile_source_archive_handle,
     }
@@ -4409,6 +4437,7 @@ mod tests {
                 name: "read".to_string(),
                 reference: "capability:read".to_string(),
             }],
+            prompt_catalog: None,
             profile_source_archive: None,
             profile_source_archive_handle: None,
         }
@@ -4774,6 +4803,46 @@ mod tests {
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: Some(test_workspace_api()),
         }
+    }
+
+    #[test]
+    fn spawn_config_bundle_ref_preserves_bundle_identity() {
+        let mut request = embedded_spawn_request();
+        let bundle = test_config_bundle();
+        let expected_id = bundle.metadata.id.clone();
+        let expected_digest = bundle.metadata.digest.clone();
+        request.resolved_config_bundle = Some(bundle);
+
+        let bundle_ref = spawn_config_bundle_ref(&request).expect("bundle reference");
+        assert_eq!(bundle_ref.id, expected_id);
+        assert_eq!(bundle_ref.digest, expected_digest);
+    }
+
+    #[test]
+    fn registry_syncs_bundle_before_embedded_spawn() {
+        let runtime = EmbeddedWorkerRuntime::new_memory_with_execution_backend(
+            "local:test",
+            Arc::new(AcceptingExecutionBackend::default()),
+        )
+        .expect("test backend should connect");
+        let registry = RuntimeRegistry::for_workspace(runtime);
+        let mut request = embedded_spawn_request();
+        let bundle = test_config_bundle();
+        let bundle_ref = ConfigBundleRef {
+            id: bundle.metadata.id.clone(),
+            digest: bundle.metadata.digest.clone(),
+        };
+        request.resolved_config_bundle = Some(bundle);
+
+        let result = registry
+            .spawn_worker("embedded-worker-runtime", request)
+            .expect("spawn request");
+        assert_eq!(result.state, WorkerOperationState::Accepted);
+        let check = registry
+            .check_config_bundle("embedded-worker-runtime", bundle_ref)
+            .expect("bundle check");
+        assert_eq!(check.state, WorkerOperationState::Accepted);
+        assert!(check.availability.is_some());
     }
 
     #[test]

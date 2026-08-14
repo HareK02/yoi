@@ -121,19 +121,19 @@ root = ".yoi/tickets"
 
 [ticket.roles.intake]
 profile = "project:intake"
-launch_prompt = "$workspace/ticket/intake/launch"
+launch_prompt = "ticket.intake.launch"
 
 [ticket.roles.orchestrator]
 profile = "project:orchestrator"
-launch_prompt = "$workspace/ticket/orchestrator/launch"
+launch_prompt = "ticket.orchestrator.launch"
 
 [ticket.roles.coder]
 profile = "project:coder"
-launch_prompt = "$workspace/ticket/coder/launch"
+launch_prompt = "ticket.coder.launch"
 
 [ticket.roles.reviewer]
 profile = "project:reviewer"
-launch_prompt = "$workspace/ticket/reviewer/launch"
+launch_prompt = "ticket.reviewer.launch"
 ```
 
 Fixed roles are:
