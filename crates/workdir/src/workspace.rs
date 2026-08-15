@@ -6,6 +6,7 @@
 //! [`crate::http`].
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// Stable Workspace identity for a Worker hosted by a Runtime.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -40,6 +41,24 @@ pub enum WorkingDirectoryStatusKind {
     Corrupted,
     NotFound,
     Unknown,
+}
+
+impl WorkingDirectoryStatusKind {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::CleanupPending => "cleanup_pending",
+            Self::Corrupted => "corrupted",
+            Self::NotFound => "not_found",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl fmt::Display for WorkingDirectoryStatusKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,6 +218,23 @@ pub struct WorkingDirectoryDetailResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn working_directory_status_display_matches_wire_values() {
+        for (status, expected) in [
+            (WorkingDirectoryStatusKind::Active, "active"),
+            (
+                WorkingDirectoryStatusKind::CleanupPending,
+                "cleanup_pending",
+            ),
+            (WorkingDirectoryStatusKind::Corrupted, "corrupted"),
+            (WorkingDirectoryStatusKind::NotFound, "not_found"),
+            (WorkingDirectoryStatusKind::Unknown, "unknown"),
+        ] {
+            assert_eq!(status.to_string(), expected);
+            assert_eq!(serde_json::to_value(status).unwrap(), expected);
+        }
+    }
 
     #[test]
     fn occupied_and_free_list_response_round_trips() {
