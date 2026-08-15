@@ -84,9 +84,26 @@ pub struct GitCommitSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeTargetObservation {
+    pub selector: RepositorySelector,
+    pub commit: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitObservation {
+    pub commit: String,
+    pub parents: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepositoryLookupError {
     UnknownRepository { id: RepositoryId },
     UnsupportedProvider { id: RepositoryId, provider: String },
+    MissingDefaultSelector { id: RepositoryId },
+    InvalidSelector { id: RepositoryId, selector: String },
+    CommitNotFound { id: RepositoryId, commit: String },
+    InvalidCommitRelation { id: RepositoryId, detail: String },
+    ProviderFailure { id: RepositoryId, operation: String },
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +182,121 @@ impl RepositoryRegistryReader {
             commits,
             diagnostics,
         })
+    }
+
+    pub fn observe_merge_target(
+        &self,
+        id: &str,
+        requested_selector: Option<&str>,
+    ) -> Result<MergeTargetObservation, RepositoryLookupError> {
+        let repository = self.merge_repository(id)?;
+        let selector = requested_selector
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .or_else(|| repository.default_selector.clone())
+            .ok_or_else(|| RepositoryLookupError::MissingDefaultSelector { id: id.to_string() })?;
+        if selector.starts_with('-') || selector.as_bytes().contains(&0) {
+            return Err(RepositoryLookupError::InvalidSelector {
+                id: id.to_string(),
+                selector,
+            });
+        }
+        let spec = format!("{selector}^{{commit}}");
+        let commit = merge_git_stdout(
+            repository,
+            "resolve target",
+            &["rev-parse", "--verify", "--end-of-options", &spec],
+        )?
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+        if commit.is_empty() {
+            return Err(RepositoryLookupError::InvalidSelector {
+                id: id.to_string(),
+                selector,
+            });
+        }
+        Ok(MergeTargetObservation { selector, commit })
+    }
+
+    pub fn observe_commit(
+        &self,
+        id: &str,
+        commit: &str,
+    ) -> Result<CommitObservation, RepositoryLookupError> {
+        let repository = self.merge_repository(id)?;
+        let commit = commit.trim();
+        if commit.is_empty() || commit.starts_with('-') {
+            return Err(RepositoryLookupError::CommitNotFound {
+                id: id.to_string(),
+                commit: commit.into(),
+            });
+        }
+        let line = merge_git_stdout(
+            repository,
+            "read commit",
+            &[
+                "show",
+                "--no-patch",
+                "--format=%H %P",
+                "--end-of-options",
+                commit,
+            ],
+        )?;
+        let mut parts = line.split_whitespace();
+        let canonical = parts.next().unwrap_or_default().to_owned();
+        if canonical.is_empty() {
+            return Err(RepositoryLookupError::CommitNotFound {
+                id: id.to_string(),
+                commit: commit.into(),
+            });
+        }
+        Ok(CommitObservation {
+            commit: canonical,
+            parents: parts.map(str::to_owned).collect(),
+        })
+    }
+
+    pub fn ensure_ancestor(
+        &self,
+        id: &str,
+        ancestor: &str,
+        descendant: &str,
+    ) -> Result<(), RepositoryLookupError> {
+        let repository = self.merge_repository(id)?;
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&repository.path)
+            .args(["merge-base", "--is-ancestor", ancestor, descendant])
+            .status()
+            .map_err(|_| RepositoryLookupError::ProviderFailure {
+                id: id.into(),
+                operation: "check commit ancestry".into(),
+            })?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(RepositoryLookupError::InvalidCommitRelation {
+                id: id.into(),
+                detail: format!("commit {ancestor} is not an ancestor of {descendant}"),
+            })
+        }
+    }
+
+    fn merge_repository(&self, id: &str) -> Result<&ConfiguredRepository, RepositoryLookupError> {
+        let repository = self
+            .find(id)
+            .ok_or_else(|| RepositoryLookupError::UnknownRepository { id: id.into() })?;
+        if repository.provider != "git" {
+            return Err(RepositoryLookupError::UnsupportedProvider {
+                id: id.into(),
+                provider: repository.provider.clone(),
+            });
+        }
+        Ok(repository)
     }
 
     fn find(&self, id: &str) -> Option<&ConfiguredRepository> {
@@ -254,6 +386,19 @@ impl RepositoryRegistryReader {
         )?;
         Ok(parse_git_log(&output))
     }
+}
+
+fn merge_git_stdout(
+    repository: &ConfiguredRepository,
+    operation: &str,
+    args: &[&str],
+) -> Result<String, RepositoryLookupError> {
+    git_stdout(&repository.path, args.iter().copied()).map_err(|_| {
+        RepositoryLookupError::ProviderFailure {
+            id: repository.id.clone(),
+            operation: operation.into(),
+        }
+    })
 }
 
 fn git_stdout<'a, I>(repository_path: &PathBuf, args: I) -> Result<String, String>
@@ -420,6 +565,101 @@ mod tests {
         assert!(projection.items.is_empty());
         assert_eq!(projection.diagnostics.len(), 1);
         assert_eq!(projection.diagnostics[0].code, "repository_config_empty");
+    }
+
+    #[test]
+    fn merge_evidence_is_resolved_by_repository_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path();
+        assert!(
+            Command::new("git")
+                .args(["init", "-b", "main"])
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        for args in [
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(path)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(path.join("file.txt"), "base\n").unwrap();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["add", "file.txt"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["commit", "-m", "base"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let base = git_stdout(&path.to_path_buf(), ["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["checkout", "-b", "feature"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(path.join("file.txt"), "base\nfeature\n").unwrap();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["commit", "-am", "feature"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let source = git_stdout(&path.to_path_buf(), ["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let reader = RepositoryRegistryReader::new(vec![ConfiguredRepository {
+            id: "main".into(),
+            display_name: Some("Main".into()),
+            provider: "git".into(),
+            path: path.to_path_buf(),
+            uri: path.display().to_string(),
+            default_selector: Some("main".into()),
+        }]);
+        let target = reader.observe_merge_target("main", None).unwrap();
+        assert_eq!(target.selector, "main");
+        assert_eq!(target.commit, base);
+        assert_eq!(
+            reader.observe_commit("main", &source).unwrap().parents,
+            vec![base.clone()]
+        );
+        reader.ensure_ancestor("main", &base, &source).unwrap();
+        assert!(matches!(
+            reader.ensure_ancestor("main", &source, &base),
+            Err(RepositoryLookupError::InvalidCommitRelation { .. })
+        ));
     }
 
     #[test]

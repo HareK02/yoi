@@ -12,6 +12,7 @@ pub const MERGE_REQUEST_COMMON_TOOL_NAMES: &[&str] = &[
     "MergeRequestReadinessCheck",
     "MergeRequestOpen",
     "MergeRequestAddRevision",
+    "MergeRequestRecordMergeResult",
     "MergeRequestComplete",
 ];
 pub const MERGE_REQUEST_REVIEW_TOOL_NAME: &str = "MergeRequestReviewSubmit";
@@ -21,6 +22,7 @@ enum Kind {
     Readiness,
     Open,
     AddRevision,
+    RecordMergeResult,
     Complete,
     Review,
 }
@@ -41,7 +43,6 @@ struct OpenInput {
     revision_id: String,
     base_commit: String,
     head_commit: String,
-    head_tree: String,
     diff_digest: String,
     #[serde(default)]
     changed_paths: Vec<String>,
@@ -55,12 +56,35 @@ struct AddRevisionInput {
     revision_id: String,
     base_commit: String,
     head_commit: String,
-    head_tree: String,
     diff_digest: String,
     #[serde(default)]
     changed_paths: Vec<String>,
     #[serde(default)]
     summary: String,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RecordMergeResultInput {
+    ticket: String,
+    expected_current_revision_id: String,
+    operation_id: String,
+    target_commit: String,
+    source_commit: String,
+    result_commit: String,
+    strategy: MergeStrategyInput,
+    resolution: MergeResolutionInput,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum MergeStrategyInput {
+    FastForward,
+    Merge,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum MergeResolutionInput {
+    None,
+    Clean,
+    ConflictsResolved,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 struct CompleteInput {
@@ -101,6 +125,7 @@ impl Kind {
             Self::Readiness => "MergeRequestReadinessCheck",
             Self::Open => "MergeRequestOpen",
             Self::AddRevision => "MergeRequestAddRevision",
+            Self::RecordMergeResult => "MergeRequestRecordMergeResult",
             Self::Complete => "MergeRequestComplete",
             Self::Review => "MergeRequestReviewSubmit",
         }
@@ -113,6 +138,7 @@ impl Kind {
             Self::Show | Self::Readiness => json!(schemars::schema_for!(ShowInput)),
             Self::Open => json!(schemars::schema_for!(OpenInput)),
             Self::AddRevision => json!(schemars::schema_for!(AddRevisionInput)),
+            Self::RecordMergeResult => json!(schemars::schema_for!(RecordMergeResultInput)),
             Self::Complete => json!(schemars::schema_for!(CompleteInput)),
             Self::Review => json!(schemars::schema_for!(ReviewInput)),
         }
@@ -158,7 +184,7 @@ impl Tool for MergeRequestTool {
                     WorkspaceRequestMethod::Post,
                     format!("/api/w/{workspace_id}/tickets/{}/merge-request", v.ticket),
                     Some(
-                        json!({"repository_id":v.repository_id,"revision_id":v.revision_id,"base_commit":v.base_commit,"head_commit":v.head_commit,"head_tree":v.head_tree,"diff_digest":v.diff_digest,"changed_paths":v.changed_paths,"summary":v.summary}),
+                        json!({"repository_id":v.repository_id,"revision_id":v.revision_id,"base_commit":v.base_commit,"head_commit":v.head_commit,"diff_digest":v.diff_digest,"changed_paths":v.changed_paths,"summary":v.summary}),
                     ),
                 )
             }
@@ -172,7 +198,30 @@ impl Tool for MergeRequestTool {
                         v.ticket
                     ),
                     Some(
-                        json!({"expected_current_revision_id":v.expected_current_revision_id,"revision_id":v.revision_id,"base_commit":v.base_commit,"head_commit":v.head_commit,"head_tree":v.head_tree,"diff_digest":v.diff_digest,"changed_paths":v.changed_paths,"summary":v.summary}),
+                        json!({"expected_current_revision_id":v.expected_current_revision_id,"revision_id":v.revision_id,"base_commit":v.base_commit,"head_commit":v.head_commit,"diff_digest":v.diff_digest,"changed_paths":v.changed_paths,"summary":v.summary}),
+                    ),
+                )
+            }
+            Kind::RecordMergeResult => {
+                let v: RecordMergeResultInput = parse(input)?;
+                nonempty(&v.ticket)?;
+                let strategy = match v.strategy {
+                    MergeStrategyInput::FastForward => "fast_forward",
+                    MergeStrategyInput::Merge => "merge",
+                };
+                let resolution = match v.resolution {
+                    MergeResolutionInput::None => "none",
+                    MergeResolutionInput::Clean => "clean",
+                    MergeResolutionInput::ConflictsResolved => "conflicts_resolved",
+                };
+                (
+                    WorkspaceRequestMethod::Post,
+                    format!(
+                        "/api/w/{workspace_id}/tickets/{}/merge-request/merge-results",
+                        v.ticket
+                    ),
+                    Some(
+                        json!({"expected_current_revision_id":v.expected_current_revision_id,"operation_id":v.operation_id,"target_commit":v.target_commit,"source_commit":v.source_commit,"result_commit":v.result_commit,"strategy":strategy,"resolution":resolution}),
                     ),
                 )
             }
@@ -261,6 +310,7 @@ pub fn common_tools(client: Arc<dyn WorkspaceClient>) -> Vec<ToolDefinition> {
         definition(client.clone(), Kind::Readiness),
         definition(client.clone(), Kind::Open),
         definition(client.clone(), Kind::AddRevision),
+        definition(client.clone(), Kind::RecordMergeResult),
         definition(client, Kind::Complete),
     ]
 }
@@ -288,6 +338,9 @@ pub fn description(name: &str) -> Option<&'static str> {
         "MergeRequestAddRevision" => {
             Some("Append an immutable revision; prior approval cannot carry to the new revision.")
         }
+        "MergeRequestRecordMergeResult" => Some(
+            "Record validated immutable integration evidence for the current source revision and target tip.",
+        ),
         "MergeRequestComplete" => {
             Some("CAS-complete an approved revision with operation-id replay and crash fencing.")
         }
@@ -295,5 +348,22 @@ pub fn description(name: &str) -> Option<&'static str> {
             "Submit the attested direct-child Reviewer result bound to its immutable revision.",
         ),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_request_tool_contract_omits_tree_hashes_and_exposes_merge_result() {
+        let open = serde_json::to_string(&schemars::schema_for!(OpenInput)).unwrap();
+        let add = serde_json::to_string(&schemars::schema_for!(AddRevisionInput)).unwrap();
+        let result = serde_json::to_string(&schemars::schema_for!(RecordMergeResultInput)).unwrap();
+        assert!(!open.contains("head_tree"));
+        assert!(!add.contains("head_tree"));
+        assert!(result.contains("fast_forward"));
+        assert!(result.contains("conflicts_resolved"));
+        assert!(MERGE_REQUEST_COMMON_TOOL_NAMES.contains(&"MergeRequestRecordMergeResult"));
     }
 }

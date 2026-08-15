@@ -20,8 +20,31 @@
   type MergeRequestDetail = {
     state: "draft" | "open" | "closed" | "merged";
     review_status: "pending" | "approved" | "changes_requested";
-    current_revision: { revision_id: string; head_commit: string; head_tree: string; diff_digest: string; changed_paths: string[]; summary: string };
+    target_ref_selector?: string | null;
+    target_status: "known" | "unknown";
+    observed_target_commit?: string | null;
+    current_revision: { revision_id: string; head_commit: string; diff_digest: string; changed_paths: string[]; summary: string };
     current_review?: { decision: string; body: string; reviewer_effective_profile: string } | null;
+    current_merge_result?: {
+      merge_result_id: string;
+      target_commit: string;
+      source_commit: string;
+      result_commit: string;
+      strategy: "fast_forward" | "merge";
+      resolution: "none" | "clean" | "conflicts_resolved";
+      target_status: "current" | "applied" | "stale" | "unknown";
+      review_status: "pending" | "approved" | "changes_requested";
+    } | null;
+    applied_merge_result?: {
+      merge_result_id: string;
+      target_commit: string;
+      source_commit: string;
+      result_commit: string;
+      strategy: "fast_forward" | "merge";
+      resolution: "none" | "clean" | "conflicts_resolved";
+      target_status: "current" | "applied" | "stale" | "unknown";
+      review_status: "pending" | "approved" | "changes_requested";
+    } | null;
     merged_at?: string | null;
   };
 
@@ -368,15 +391,38 @@
           <p class="workspace-callout is-error">{data.mergeRequest.error}</p>
         {:else if mergeRequest}
           <p><strong>{mergeRequest.state}</strong> · {mergeRequest.review_status}</p>
+          <p>Target <code>{mergeRequest.target_ref_selector ?? "unknown"}</code> · {mergeRequest.target_status}</p>
+          {#if mergeRequest.observed_target_commit}<p>Target tip <code>{mergeRequest.observed_target_commit}</code></p>{/if}
           <p><code>{mergeRequest.current_revision.revision_id}</code></p>
           <p>Head <code>{mergeRequest.current_revision.head_commit}</code></p>
+          {#if mergeRequest.current_merge_result}
+            <p>
+              MergeResult <code>{mergeRequest.current_merge_result.merge_result_id}</code> ·
+              {mergeRequest.current_merge_result.strategy} / {mergeRequest.current_merge_result.resolution} ·
+              {mergeRequest.current_merge_result.target_status} / {mergeRequest.current_merge_result.review_status}
+            </p>
+            <p>Result <code>{mergeRequest.current_merge_result.result_commit}</code></p>
+          {:else if mergeRequest.applied_merge_result}
+            <p>
+              Applied MergeResult <code>{mergeRequest.applied_merge_result.merge_result_id}</code> ·
+              {mergeRequest.applied_merge_result.strategy} / {mergeRequest.applied_merge_result.resolution} ·
+              {mergeRequest.applied_merge_result.review_status}
+            </p>
+            <p>Result <code>{mergeRequest.applied_merge_result.result_commit}</code> is the current target tip.</p>
+          {:else if mergeRequest.state === "open"}
+            <p class="workspace-callout">No current MergeResult has been recorded for this target tip.</p>
+          {/if}
           {#if mergeRequest.current_revision.summary}<p>{mergeRequest.current_revision.summary}</p>{/if}
           {#if mergeRequest.current_review}
             <p><strong>{mergeRequest.current_review.decision}</strong> by {mergeRequest.current_review.reviewer_effective_profile}</p>
             {#if mergeRequest.current_review.body}<RichMarkdown text={mergeRequest.current_review.body} />{/if}
           {/if}
-          {#if mergeRequest.state === "open" && mergeRequest.review_status === "approved"}
-            <label><input type="checkbox" bind:checked={confirmMerge} /> Explicitly confirm merge of this revision</label>
+          {#if mergeRequest.state === "open"
+            && mergeRequest.review_status === "approved"
+            && mergeRequest.applied_merge_result?.target_status === "applied"
+            && (mergeRequest.applied_merge_result.strategy === "fast_forward"
+              || mergeRequest.applied_merge_result.review_status === "approved")}
+            <label><input type="checkbox" bind:checked={confirmMerge} /> Explicitly confirm the externally applied result</label>
             <button class="workspace-primary-button" type="button" disabled={!confirmMerge || busy !== null} onclick={mergeConfirmedRevision}>Confirm merge</button>
           {/if}
         {:else}
