@@ -1537,6 +1537,12 @@ pub trait TicketBackend {
         id: TicketIdOrSlug,
         relation: NewTicketRelation,
     ) -> Result<TicketRelation>;
+    fn remove_ticket_relation(
+        &self,
+        id: TicketIdOrSlug,
+        kind: TicketRelationKind,
+        target: TicketIdOrSlug,
+    ) -> Result<TicketRelation>;
     fn query_ticket_relations(
         &self,
         ticket: Option<TicketIdOrSlug>,
@@ -1615,6 +1621,11 @@ pub enum TicketBackendOperation {
     AddTicketRelation {
         id: TicketIdOrSlug,
         relation: NewTicketRelation,
+    },
+    RemoveTicketRelation {
+        id: TicketIdOrSlug,
+        kind: TicketRelationKind,
+        target: TicketIdOrSlug,
     },
     QueryTicketRelations {
         ticket: Option<TicketIdOrSlug>,
@@ -1717,6 +1728,11 @@ where
         }
         TicketBackendOperation::AddTicketRelation { id, relation } => {
             TicketBackendOperationResult::Relation(backend.add_ticket_relation(id, relation)?)
+        }
+        TicketBackendOperation::RemoveTicketRelation { id, kind, target } => {
+            TicketBackendOperationResult::Relation(
+                backend.remove_ticket_relation(id, kind, target)?,
+            )
         }
         TicketBackendOperation::QueryTicketRelations { ticket, kind } => {
             TicketBackendOperationResult::Relations(backend.query_ticket_relations(ticket, kind)?)
@@ -3378,6 +3394,58 @@ impl TicketBackend for SqliteTicketBackend {
         })
     }
 
+    fn remove_ticket_relation(
+        &self,
+        id: TicketIdOrSlug,
+        kind: TicketRelationKind,
+        target: TicketIdOrSlug,
+    ) -> Result<TicketRelation> {
+        self.with_write(|conn| {
+            let ticket_id = self.resolve_ticket_id(conn, id)?;
+            let target = self.resolve_ticket_id(conn, target)?;
+            let relation = conn
+                .query_row(
+                    "SELECT note, author, at FROM typed_ticket_relations WHERE workspace_id = ?1 AND ticket_id = ?2 AND kind = ?3 AND target = ?4",
+                    params![self.workspace_id, ticket_id, kind.as_str(), target],
+                    |row| {
+                        Ok(TicketRelation {
+                            ticket_id: ticket_id.clone(),
+                            kind,
+                            target: target.clone(),
+                            note: row.get(0)?,
+                            author: row.get(1)?,
+                            at: row.get(2)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(sqlite_err)?
+                .ok_or_else(|| {
+                    TicketError::NotFound(format!(
+                        "relation {} {} {}",
+                        ticket_id, kind, target
+                    ))
+                })?;
+            let deleted = conn
+                .execute(
+                    "DELETE FROM typed_ticket_relations WHERE workspace_id = ?1 AND ticket_id = ?2 AND kind = ?3 AND target = ?4",
+                    params![self.workspace_id, ticket_id, kind.as_str(), target],
+                )
+                .map_err(sqlite_err)?;
+            if deleted != 1 {
+                return Err(TicketError::Conflict(format!(
+                    "expected to remove one ticket relation, removed {deleted}"
+                )));
+            }
+            conn.execute(
+                "UPDATE typed_tickets SET updated_at = ?3 WHERE workspace_id = ?1 AND ticket_id = ?2",
+                params![self.workspace_id, ticket_id, now_utc()],
+            )
+            .map_err(sqlite_err)?;
+            Ok(relation)
+        })
+    }
+
     fn query_ticket_relations(
         &self,
         ticket: Option<TicketIdOrSlug>,
@@ -4015,6 +4083,39 @@ impl TicketBackend for LocalTicketBackend {
         write_ticket_relations_artifact(&path, &relations)?;
         self.set_frontmatter_fields(&item, &[("updated_at", &at)])?;
         Ok(output)
+    }
+
+    fn remove_ticket_relation(
+        &self,
+        id: TicketIdOrSlug,
+        kind: TicketRelationKind,
+        target: TicketIdOrSlug,
+    ) -> Result<TicketRelation> {
+        let _lock = self.acquire_lock()?;
+        self.ensure_backend_dirs()?;
+        let dir = self.find_ticket_dir(&id)?;
+        let item = dir.join("item.md");
+        let meta = ticket_meta_for_dir(&dir, read_item_file(&item)?.frontmatter)?;
+        let target_id = match target {
+            TicketIdOrSlug::Id(value) => value,
+            other => ticket_id_from_dir(&self.find_ticket_dir(&other)?)?,
+        };
+        let path = self.ticket_relations_path(&dir);
+        let mut relations = read_ticket_relations_artifact(&path, Some(&meta))?;
+        let Some(index) = relations
+            .iter()
+            .position(|relation| relation.kind == kind && relation.target == target_id)
+        else {
+            return Err(TicketError::NotFound(format!(
+                "relation {} {} {}",
+                meta.id, kind, target_id
+            )));
+        };
+        let removed = relations.remove(index);
+        write_ticket_relations_artifact(&path, &relations)?;
+        let at = now_utc();
+        self.set_frontmatter_fields(&item, &[("updated_at", &at)])?;
+        Ok(removed)
     }
 
     fn query_ticket_relations(
@@ -6103,6 +6204,55 @@ mod tests {
         assert!(matches!(ambiguous_err, TicketError::Conflict(_)));
     }
 
+    fn assert_ticket_relation_removal_semantics<B: TicketBackend>(backend: &B) {
+        let source = backend.create(NewTicket::new("source")).unwrap();
+        let target = backend.create(NewTicket::new("target")).unwrap();
+        backend
+            .add_ticket_relation(
+                TicketIdOrSlug::Id(source.id.clone()),
+                NewTicketRelation {
+                    kind: TicketRelationKind::DependsOn,
+                    target: target.id.clone(),
+                    note: Some("obsolete blocker".to_string()),
+                    author: Some("tester".to_string()),
+                },
+            )
+            .unwrap();
+
+        let removed = backend
+            .remove_ticket_relation(
+                TicketIdOrSlug::Id(source.id.clone()),
+                TicketRelationKind::DependsOn,
+                TicketIdOrSlug::Id(target.id.clone()),
+            )
+            .unwrap();
+        assert_eq!(removed.ticket_id, source.id);
+        assert_eq!(removed.target, target.id);
+        assert_eq!(removed.note.as_deref(), Some("obsolete blocker"));
+        assert!(
+            backend
+                .relation_view(TicketIdOrSlug::Id(source.id.clone()))
+                .unwrap()
+                .outgoing
+                .is_empty()
+        );
+        assert!(
+            backend
+                .relation_view(TicketIdOrSlug::Id(target.id.clone()))
+                .unwrap()
+                .incoming
+                .is_empty()
+        );
+        assert!(matches!(
+            backend.remove_ticket_relation(
+                TicketIdOrSlug::Id(source.id),
+                TicketRelationKind::DependsOn,
+                TicketIdOrSlug::Id(target.id),
+            ),
+            Err(TicketError::NotFound(_))
+        ));
+    }
+
     fn summary_with_state(state: TicketWorkflowState) -> TicketSummary {
         TicketSummary {
             id: "000TEST".to_string(),
@@ -6430,6 +6580,21 @@ state: planning
         let backend =
             SqliteTicketBackend::open(tmp.path().join("workspace.db"), "workspace-test").unwrap();
         assert_ticket_target_edit_semantics(&backend);
+    }
+
+    #[test]
+    fn local_backend_removes_ticket_relations() {
+        let tmp = TempDir::new().unwrap();
+        let backend = backend(&tmp);
+        assert_ticket_relation_removal_semantics(&backend);
+    }
+
+    #[test]
+    fn sqlite_backend_removes_ticket_relations() {
+        let tmp = TempDir::new().unwrap();
+        let backend =
+            SqliteTicketBackend::open(tmp.path().join("workspace.db"), "workspace-test").unwrap();
+        assert_ticket_relation_removal_semantics(&backend);
     }
 
     #[test]

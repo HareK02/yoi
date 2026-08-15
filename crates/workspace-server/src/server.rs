@@ -1324,7 +1324,7 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         )
         .route(
             "/api/w/{workspace_id}/tickets/{id}/relations",
-            post(scoped_record_ticket_relation),
+            post(scoped_record_ticket_relation).delete(scoped_remove_ticket_relation),
         )
         .route(
             "/api/w/{workspace_id}/tickets/{id}/orchestration-plans",
@@ -3939,6 +3939,35 @@ async fn scoped_record_ticket_relation(
 }
 
 #[derive(Debug, Deserialize)]
+struct TicketRelationRemoveRequest {
+    kind: ticket::TicketRelationKind,
+    target: String,
+}
+
+async fn scoped_remove_ticket_relation(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, id)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+    Json(relation): Json<TicketRelationRemoveRequest>,
+) -> ApiResult<Json<ticket::TicketRelation>> {
+    let result = execute_worker_ticket_rest_operation(
+        &api,
+        &workspace_id,
+        headers,
+        TicketBackendOperation::RemoveTicketRelation {
+            id: TicketIdOrSlug::Query(id),
+            kind: relation.kind,
+            target: TicketIdOrSlug::Id(relation.target),
+        },
+    )
+    .await?;
+    ticket_rest_result(result, |result| match result {
+        TicketBackendOperationResult::Relation(relation) => Some(relation),
+        _ => None,
+    })
+}
+
+#[derive(Debug, Deserialize)]
 struct TicketRelationSearchRequest {
     ticket: Option<TicketIdOrSlug>,
     kind: Option<ticket::TicketRelationKind>,
@@ -4068,6 +4097,7 @@ fn ticket_mutation_target(operation: &TicketBackendOperation) -> Option<&TicketI
         | TicketBackendOperation::QueueReady { id, .. }
         | TicketBackendOperation::Close { id, .. }
         | TicketBackendOperation::AddTicketRelation { id, .. }
+        | TicketBackendOperation::RemoveTicketRelation { id, .. }
         | TicketBackendOperation::AddOrchestrationPlanRecord { id, .. } => Some(id),
         _ => None,
     }
@@ -4134,6 +4164,7 @@ fn ticket_mutation_operation_kind(operation: &TicketBackendOperation) -> &'stati
         TicketBackendOperation::QueueReady { .. } => "queue_ready",
         TicketBackendOperation::Close { .. } => "close",
         TicketBackendOperation::AddTicketRelation { .. } => "add_relation",
+        TicketBackendOperation::RemoveTicketRelation { .. } => "remove_relation",
         TicketBackendOperation::AddOrchestrationPlanRecord { .. } => "add_plan_record",
         _ => "read",
     }

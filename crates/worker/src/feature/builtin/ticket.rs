@@ -157,6 +157,7 @@ const AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketQueue",
     "TicketClose",
     "TicketRelationRecord",
+    "TicketRelationRemove",
 ];
 
 const THREAD_TOOL_NAMES: &[&str] = &["TicketComment"];
@@ -175,6 +176,7 @@ const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketDependencyCheck",
     "TicketDoctor",
     "TicketRelationRecord",
+    "TicketRelationRemove",
     "TicketRelationQuery",
     "TicketOrchestrationPlanQuery",
 ];
@@ -189,6 +191,7 @@ const WORKFLOW_TOOL_NAMES: &[&str] = &[
     "TicketDependencyCheck",
     "TicketDoctor",
     "TicketRelationRecord",
+    "TicketRelationRemove",
     "TicketRelationQuery",
     "TicketOrchestrationPlanRecord",
     "TicketOrchestrationPlanQuery",
@@ -198,6 +201,7 @@ const WORKFLOW_ADDITIONAL_TOOL_NAMES: &[&str] = &[
     "TicketWorkflowState",
     "TicketClose",
     "TicketRelationRecord",
+    "TicketRelationRemove",
     "TicketOrchestrationPlanRecord",
 ];
 
@@ -689,6 +693,20 @@ impl WorkspaceHttpTicketBackend {
                 )?;
                 Ok(TicketBackendOperationResult::Relation(relation))
             }
+            TicketBackendOperation::RemoveTicketRelation { id, kind, target } => {
+                let target = match target {
+                    TicketIdOrSlug::Id(value)
+                    | TicketIdOrSlug::Slug(value)
+                    | TicketIdOrSlug::Query(value) => value,
+                };
+                let relation = Self::request(
+                    client,
+                    WorkspaceRequestMethod::Delete,
+                    format!("{base}/{}/relations", Self::ticket_path(&id)),
+                    Some(serde_json::json!({ "kind": kind, "target": target })),
+                )?;
+                Ok(TicketBackendOperationResult::Relation(relation))
+            }
             TicketBackendOperation::QueryTicketRelations { ticket, kind } => {
                 let relations = Self::request(
                     client,
@@ -911,6 +929,18 @@ impl TicketBackend for WorkspaceHttpTicketBackend {
     ) -> TicketResult<TicketRelation> {
         expect_ticket_result!(
             self.invoke(TicketBackendOperation::AddTicketRelation { id, relation }),
+            TicketBackendOperationResult::Relation
+        )
+    }
+
+    fn remove_ticket_relation(
+        &self,
+        id: TicketIdOrSlug,
+        kind: TicketRelationKind,
+        target: TicketIdOrSlug,
+    ) -> TicketResult<TicketRelation> {
+        expect_ticket_result!(
+            self.invoke(TicketBackendOperation::RemoveTicketRelation { id, kind, target }),
             TicketBackendOperationResult::Relation
         )
     }
@@ -1446,6 +1476,55 @@ provider = "github"
             )
             .unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn workspace_http_backend_deletes_exact_ticket_relation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 8192];
+            let len = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..len]);
+            assert!(
+                request
+                    .starts_with("DELETE /api/w/workspace-a/tickets/01SOURCE/relations HTTP/1.1")
+            );
+            assert!(request.contains("\"kind\":\"depends_on\""));
+            assert!(request.contains("\"target\":\"01TARGET\""));
+            let response_body = serde_json::to_string(&TicketRelation {
+                ticket_id: "01SOURCE".to_string(),
+                kind: TicketRelationKind::DependsOn,
+                target: "01TARGET".to_string(),
+                note: Some("obsolete".to_string()),
+                author: "tester".to_string(),
+                at: "2026-08-06T00:00:00Z".to_string(),
+            })
+            .unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            )
+            .unwrap();
+        });
+
+        let backend = WorkspaceHttpTicketBackend::new(Arc::new(
+            crate::worker::TestWorkspaceHttpClient::new("workspace-a", base_url),
+        ));
+        let removed = backend
+            .remove_ticket_relation(
+                TicketIdOrSlug::Id("01SOURCE".to_string()),
+                TicketRelationKind::DependsOn,
+                TicketIdOrSlug::Id("01TARGET".to_string()),
+            )
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(removed.ticket_id, "01SOURCE");
+        assert_eq!(removed.target, "01TARGET");
     }
 
     #[test]

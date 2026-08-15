@@ -57,8 +57,9 @@ pub const TICKET_BASE_READ_ONLY_TOOL_NAMES: [&str; 4] = [
     "TicketDoctor",
 ];
 
-pub const TICKET_ORCHESTRATION_TOOL_NAMES: [&str; 4] = [
+pub const TICKET_ORCHESTRATION_TOOL_NAMES: [&str; 5] = [
     "TicketRelationRecord",
+    "TicketRelationRemove",
     "TicketRelationQuery",
     "TicketOrchestrationPlanRecord",
     "TicketOrchestrationPlanQuery",
@@ -67,7 +68,7 @@ pub const TICKET_ORCHESTRATION_TOOL_NAMES: [&str; 4] = [
 pub const TICKET_ORCHESTRATION_READ_ONLY_TOOL_NAMES: [&str; 2] =
     ["TicketRelationQuery", "TicketOrchestrationPlanQuery"];
 
-pub const TICKET_TOOL_NAMES: [&str; 18] = [
+pub const TICKET_TOOL_NAMES: [&str; 19] = [
     "TicketCreate",
     "TicketEditItem",
     "TicketList",
@@ -83,6 +84,7 @@ pub const TICKET_TOOL_NAMES: [&str; 18] = [
     "TicketDependencyCheck",
     "TicketDoctor",
     "TicketRelationRecord",
+    "TicketRelationRemove",
     "TicketRelationQuery",
     "TicketOrchestrationPlanRecord",
     "TicketOrchestrationPlanQuery",
@@ -97,7 +99,7 @@ pub const TICKET_READ_ONLY_TOOL_NAMES: [&str; 6] = [
     "TicketOrchestrationPlanQuery",
 ];
 
-pub const TICKET_MUTATING_TOOL_NAMES: [&str; 12] = [
+pub const TICKET_MUTATING_TOOL_NAMES: [&str; 13] = [
     "TicketCreate",
     "TicketEditItem",
     "TicketComment",
@@ -109,6 +111,7 @@ pub const TICKET_MUTATING_TOOL_NAMES: [&str; 12] = [
     "TicketWorkflowState",
     "TicketClose",
     "TicketRelationRecord",
+    "TicketRelationRemove",
     "TicketOrchestrationPlanRecord",
 ];
 
@@ -146,6 +149,9 @@ a close event.";
 const RELATION_RECORD_DESCRIPTION: &str = "Record a forward typed Ticket-to-Ticket relation as durable \
 project-level metadata. Supported kinds are depends_on, blocks, related, supersedes, and duplicate_of; \
 inverse views are derived, not stored.";
+const RELATION_REMOVE_DESCRIPTION: &str = "Remove one exact forward typed Ticket relation identified by \
+source Ticket, relation kind, and target Ticket. Use this to correct obsolete or erroneous project-level \
+relation metadata; derived inverse views update automatically.";
 const RELATION_QUERY_DESCRIPTION: &str = "Query durable typed Ticket relation metadata. When a Ticket \
 is provided, both outgoing records owned by it and incoming forward records that target it are returned.";
 const ORCHESTRATION_PLAN_RECORD_DESCRIPTION: &str = "Append a typed Ticket orchestration plan record \
@@ -174,6 +180,7 @@ fn base_tool_description(name: &str) -> &'static str {
         "TicketWorkflowState" => WORKFLOW_STATE_DESCRIPTION,
         "TicketClose" => CLOSE_DESCRIPTION,
         "TicketRelationRecord" => RELATION_RECORD_DESCRIPTION,
+        "TicketRelationRemove" => RELATION_REMOVE_DESCRIPTION,
         "TicketRelationQuery" => RELATION_QUERY_DESCRIPTION,
         "TicketOrchestrationPlanRecord" => ORCHESTRATION_PLAN_RECORD_DESCRIPTION,
         "TicketOrchestrationPlanQuery" => ORCHESTRATION_PLAN_QUERY_DESCRIPTION,
@@ -322,6 +329,15 @@ impl TicketBackend for TicketToolBackend {
         relation: NewTicketRelation,
     ) -> TicketResult<TicketRelation> {
         self.backend.add_ticket_relation(id, relation)
+    }
+
+    fn remove_ticket_relation(
+        &self,
+        id: TicketIdOrSlug,
+        kind: TicketRelationKind,
+        target: TicketIdOrSlug,
+    ) -> TicketResult<TicketRelation> {
+        self.backend.remove_ticket_relation(id, kind, target)
     }
 
     fn query_ticket_relations(
@@ -627,6 +643,16 @@ struct TicketRelationRecordParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct TicketRelationRemoveParams {
+    /// Ticket id that owns the forward relation.
+    ticket: String,
+    /// Forward relation kind to remove.
+    kind: TicketRelationKindParam,
+    /// Target canonical Ticket id.
+    target: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketRelationQueryParams {
     /// Optional Ticket id to query. Includes outgoing and incoming forward records for that id.
     #[serde(default)]
@@ -833,6 +859,11 @@ struct TicketCloseTool {
 
 #[derive(Clone)]
 struct TicketRelationRecordTool {
+    backend: TicketToolBackend,
+}
+
+#[derive(Clone)]
+struct TicketRelationRemoveTool {
     backend: TicketToolBackend,
 }
 
@@ -1223,6 +1254,32 @@ impl Tool for TicketRelationRecordTool {
         Ok(json_output(
             format!(
                 "Recorded ticket relation {} {} {}",
+                output.ticket_id, output.kind, output.target
+            ),
+            ticket_relation_json(&output),
+        ))
+    }
+}
+
+#[async_trait]
+impl Tool for TicketRelationRemoveTool {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_engine::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let params: TicketRelationRemoveParams = parse_input("TicketRelationRemove", input_json)?;
+        let output = self
+            .backend
+            .remove_ticket_relation(
+                TicketIdOrSlug::Id(params.ticket),
+                params.kind.into_kind(),
+                TicketIdOrSlug::Id(params.target),
+            )
+            .map_err(|error| backend_error("TicketRelationRemove", error))?;
+        Ok(json_output(
+            format!(
+                "Removed ticket relation {} {} {}",
                 output.ticket_id, output.kind, output.target
             ),
             ticket_relation_json(&output),
@@ -1682,6 +1739,9 @@ fn input_schema(name: &str) -> Value {
         "TicketRelationRecord" => {
             serde_json::to_value(schemars::schema_for!(TicketRelationRecordParams))
         }
+        "TicketRelationRemove" => {
+            serde_json::to_value(schemars::schema_for!(TicketRelationRemoveParams))
+        }
         "TicketRelationQuery" => {
             serde_json::to_value(schemars::schema_for!(TicketRelationQueryParams))
         }
@@ -1720,6 +1780,7 @@ impl_from_backend!(TicketQueueTool);
 impl_from_backend!(TicketWorkflowStateTool);
 impl_from_backend!(TicketCloseTool);
 impl_from_backend!(TicketRelationRecordTool);
+impl_from_backend!(TicketRelationRemoveTool);
 impl_from_backend!(TicketRelationQueryTool);
 impl_from_backend!(TicketOrchestrationPlanRecordTool);
 impl_from_backend!(TicketOrchestrationPlanQueryTool);
@@ -1748,6 +1809,7 @@ pub fn ticket_tools(backend: impl Into<TicketToolBackend>) -> Vec<ToolDefinition
         tool_definition::<TicketDependencyCheckTool>("TicketDependencyCheck", backend.clone()),
         tool_definition::<TicketDoctorTool>("TicketDoctor", backend.clone()),
         tool_definition::<TicketRelationRecordTool>("TicketRelationRecord", backend.clone()),
+        tool_definition::<TicketRelationRemoveTool>("TicketRelationRemove", backend.clone()),
         tool_definition::<TicketRelationQueryTool>("TicketRelationQuery", backend.clone()),
         tool_definition::<TicketOrchestrationPlanRecordTool>(
             "TicketOrchestrationPlanRecord",
@@ -1821,6 +1883,7 @@ mod tests {
                 "TicketWorkflowState",
                 "TicketClose",
                 "TicketRelationRecord",
+                "TicketRelationRemove",
                 "TicketOrchestrationPlanRecord"
             ]
         );
@@ -2254,12 +2317,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_relation_tools_record_query_and_show_derived_view() {
+    async fn ticket_relation_tools_record_query_remove_and_show_derived_view() {
         let temp = TempDir::new().unwrap();
         let backend = backend(&temp);
         let source = backend.create(NewTicket::new("Relation Source")).unwrap();
         let target = backend.create(NewTicket::new("Relation Target")).unwrap();
         let record = tool_by_name(backend.clone(), "TicketRelationRecord");
+        let remove = tool_by_name(backend.clone(), "TicketRelationRemove");
         let query = tool_by_name(backend.clone(), "TicketRelationQuery");
         let show = tool_by_name(backend.clone(), "TicketShow");
 
@@ -2305,6 +2369,42 @@ mod tests {
             shown_json["relations"]["incoming"][0]["inverse_kind"],
             "dependency_of"
         );
+
+        let removed = remove
+            .execute(
+                &json!({
+                    "ticket": source.id.clone(),
+                    "kind": "depends_on",
+                    "target": target.id.clone()
+                })
+                .to_string(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        assert!(removed.summary.contains("Removed ticket relation"));
+        let removed_json: Value = serde_json::from_str(&removed.content.unwrap()).unwrap();
+        assert_eq!(removed_json["kind"], "depends_on");
+        assert_eq!(removed_json["target"], target.id);
+
+        let queried_after_remove = query
+            .execute(
+                &json!({ "ticket": source.id }).to_string(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let queried_after_remove_json: Value =
+            serde_json::from_str(&queried_after_remove.content.unwrap()).unwrap();
+        assert_eq!(queried_after_remove_json["count"], 0);
+
+        let shown_after_remove = show
+            .execute(&json!({ "id": target.id }).to_string(), Default::default())
+            .await
+            .unwrap();
+        let shown_after_remove_json: Value =
+            serde_json::from_str(&shown_after_remove.content.unwrap()).unwrap();
+        assert_eq!(shown_after_remove_json["relations"]["incoming"], json!([]));
     }
 
     #[tokio::test]
