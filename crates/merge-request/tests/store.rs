@@ -193,6 +193,83 @@ fn rejected_v6_schema_missing_diff_digest_is_archived_before_fresh_v7() {
 }
 
 #[test]
+fn interrupted_legacy_archive_with_empty_recreated_table_resumes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("interrupted.db");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE merge_request_schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);\
+         INSERT INTO merge_request_schema_migrations(version,name) VALUES(6,'rejected_merge_request_v6');\
+         CREATE TABLE merge_requests(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,ticket_id TEXT NOT NULL);\
+         CREATE TABLE merge_request_review_findings(workspace_id TEXT NOT NULL,attempt_id TEXT NOT NULL,ordinal INTEGER NOT NULL,severity TEXT NOT NULL,code TEXT,path TEXT,line INTEGER,body TEXT NOT NULL);\
+         CREATE TABLE legacy_v6_merge_request_review_findings(workspace_id TEXT NOT NULL,attempt_id TEXT NOT NULL,ordinal INTEGER NOT NULL,severity TEXT NOT NULL,code TEXT,path TEXT,line INTEGER,body TEXT NOT NULL);\
+         INSERT INTO legacy_v6_merge_request_review_findings VALUES('ws-a','AT1',0,'warning',NULL,NULL,NULL,'preserved evidence');",
+    )
+    .unwrap();
+    drop(conn);
+
+    SqliteMergeRequestStore::open(&path, "ws-a").unwrap();
+    let conn = Connection::open(&path).unwrap();
+    let archived_body: String = conn
+        .query_row(
+            "SELECT body FROM legacy_v6_merge_request_review_findings",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(archived_body, "preserved evidence");
+    let version: i64 = conn
+        .query_row(
+            "SELECT MAX(version) FROM merge_request_schema_migrations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, 8);
+    drop(conn);
+
+    SqliteMergeRequestStore::open(&path, "ws-a").unwrap();
+}
+
+#[test]
+fn conflicting_legacy_archive_rolls_back_all_table_renames() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("conflict.db");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE merge_request_schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);\
+         INSERT INTO merge_request_schema_migrations(version,name) VALUES(6,'rejected_merge_request_v6');\
+         CREATE TABLE merge_requests(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,ticket_id TEXT NOT NULL);\
+         CREATE TABLE merge_request_review_findings(body TEXT NOT NULL);\
+         CREATE TABLE merge_request_reviews(body TEXT NOT NULL);\
+         INSERT INTO merge_request_reviews VALUES('unarchived evidence');\
+         CREATE TABLE legacy_v6_merge_request_reviews(body TEXT NOT NULL);",
+    )
+    .unwrap();
+
+    let error = migrate(&conn).unwrap_err();
+    assert!(error.to_string().contains(
+        "legacy archive table legacy_v6_merge_request_reviews already exists while merge_request_reviews still contains data"
+    ));
+    let current_findings: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='merge_request_review_findings'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let archived_findings: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='legacy_v6_merge_request_review_findings'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(current_findings, 1);
+    assert_eq!(archived_findings, 0);
+}
+
+#[test]
 fn v7_completion_operations_are_preserved_as_legacy_assigned_coder_authority() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("v7.db");

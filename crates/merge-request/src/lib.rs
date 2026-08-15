@@ -677,7 +677,28 @@ impl SqliteMergeRequestStore {
 }
 
 pub fn migrate(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(Duration::from_secs(5)).map_err(db)?;
     conn.pragma_update(None, "foreign_keys", "ON").map_err(db)?;
+    // Acquire the writer lock before reading either the version or table layout so
+    // concurrent store initialization cannot act on a stale migration decision.
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(db)?;
+    let result = migrate_transaction(conn);
+    match result {
+        Ok(()) => match conn.execute_batch("COMMIT") {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(db(error))
+            }
+        },
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn migrate_transaction(conn: &Connection) -> Result<()> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS merge_request_schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);").map_err(db)?;
     let version: i64 = conn
         .query_row(
@@ -1014,24 +1035,39 @@ fn archive_incompatible_legacy_tables(conn: &Connection, version: i64) -> Result
         "merge_request_revisions",
         "merge_requests",
     ];
-    conn.pragma_update(None, "foreign_keys", "OFF")
-        .map_err(db)?;
     for table in tables {
         if !table_exists(conn, table)? {
             continue;
         }
         let archive = format!("legacy_v6_{table}");
         if table_exists(conn, &archive)? {
-            conn.pragma_update(None, "foreign_keys", "ON").map_err(db)?;
-            return Err(MergeRequestError::Database(format!(
-                "legacy archive table {archive} already exists"
-            )));
+            // The retired non-transactional migration could archive a table, recreate
+            // its empty replacement, and then fail. Resume that exact state without
+            // ever choosing between two populated copies.
+            if !table_is_empty(conn, table)? {
+                return Err(MergeRequestError::Database(format!(
+                    "legacy archive table {archive} already exists while {table} still contains data"
+                )));
+            }
+            conn.execute_batch(&format!("DROP TABLE {table};"))
+                .map_err(db)?;
+            continue;
         }
         conn.execute_batch(&format!("ALTER TABLE {table} RENAME TO {archive};"))
             .map_err(db)?;
     }
-    conn.pragma_update(None, "foreign_keys", "ON").map_err(db)?;
     Ok(())
+}
+
+fn table_is_empty(conn: &Connection, table: &str) -> Result<bool> {
+    let has_row: i64 = conn
+        .query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)"),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db)?;
+    Ok(has_row == 0)
 }
 
 fn table_has_columns(conn: &Connection, table: &str, required: &[&str]) -> Result<bool> {
