@@ -26,17 +26,26 @@ Workerの状態から純粋に再現可能で、且つ揮発性の無い操作�
 ```sh
 cargo test -p <crate> --lib <test-or-module-filter>
 cargo test -p <crate> --test <test-target> <test-filter>
-cargo check -p <crate> -p <dependent-crate>
 ```
 
-完了前には変更内容に応じて、対象crate全体のtest、影響するfeature構成、依存crateのcheckを追加する。通常の差分検証には以下を使う。
+完了前には、workspace rootで必ず`cargo check`を実行する。rootの`cargo check`は
+`default-members`に含まれるTUIやServerを含む通常のcompile closureを確認するため、公開型の
+変更ごとにLLMがreverse dependencyを推測して`-p`を列挙する運用にはしない。
 
 ```sh
+cargo check
+cargo test -p <changed-crate>
 cargo fmt --all -- --check
 git diff --check HEAD
 ```
 
-workspace全体、E2E、Nix/Docker buildなどの重い検証は、変更した境界を狭い検証では証明できない場合や明示的に要求された場合に選ぶ。実行した検証が何を証明するのかを意識し、広い検証を形式的に回すだけにしない。
+変更したcrate全体のtestに加え、影響するfeature構成やtest-only targetがある場合は、その検証を
+追加する。`cargo check`はtestを実行せず、通常有効でないfeatureまでは確認しないため、semanticな
+証明とfeature境界の検証はtargeted test/checkで補う。
+
+workspace全体のtest、`--all-targets`、E2E、Nix/Docker buildなどの重い検証は、変更した境界を
+通常のroot checkと狭い検証では証明できない場合や、明示的に要求された場合に選ぶ。実行した検証が
+何を証明するのかを意識し、広い検証を形式的に回すだけにしない。
 
 ---
 
