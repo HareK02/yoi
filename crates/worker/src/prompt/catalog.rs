@@ -528,6 +528,31 @@ mod tests {
     }
 
     #[test]
+    fn commit_capable_roles_classify_commits_by_change_type() {
+        let catalog = PromptCatalog::builtins_only().unwrap();
+        assert!(catalog.projection.templates.contains_key("common.git"));
+        let context = Value::from_serialize(serde_json::json!({
+            "cwd": "/workspace",
+            "date": "2026-08-16",
+            "language": "match the user's language",
+            "tool_capabilities": {
+                "memory_any": false,
+                "memory_mutation": false,
+                "memory_query": false,
+                "memory_read_document": false
+            }
+        }));
+
+        for prompt in ["default", "role.coder", "role.orchestrator"] {
+            let rendered = catalog.render_name(prompt, context.clone()).unwrap();
+            assert!(rendered.contains("use the change type as the subject prefix"));
+            assert!(rendered.contains("A change made because review"));
+            assert!(rendered.contains("Do not keep reusing a domain prefix"));
+            assert!(rendered.contains("fix: scope merge request foreign key checks"));
+        }
+    }
+
+    #[test]
     fn builtin_render_resolves_catalog_root_dotted_includes() {
         let catalog = PromptCatalog::builtins_only().unwrap();
         let source = &catalog.projection.templates["default"];
