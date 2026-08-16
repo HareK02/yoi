@@ -213,3 +213,23 @@ fn v11_migration_preserves_review_events_and_requires_selector_repair() {
         .unwrap();
     assert!(!old);
 }
+
+#[test]
+fn authority_reads_full_thread_while_public_pages_remain_bounded() {
+    let (_d, store) = fixture();
+    open(&store);
+    for index in 0..55 {
+        approve(&store, "same-subject", &format!("token-{index}"));
+    }
+    let mr = store.get("W", "T").unwrap();
+    assert!(mr.thread.len() > 100);
+    assert_eq!(
+        mr.effective_review("same-subject").unwrap().decision,
+        ReviewDecision::Approve
+    );
+    assert_eq!(store.thread_page("W", "T", None, 20).unwrap().len(), 20);
+    assert_eq!(
+        store.thread_page("W", "T", Some(100), 20).unwrap().len(),
+        11
+    );
+}

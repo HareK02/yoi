@@ -3728,7 +3728,9 @@ async fn scoped_show_merge_request(
     AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
-    let mr = merge_request_store(&api, &workspace_id)?.get(&workspace_id, &ticket_id)?;
+    let store = merge_request_store(&api, &workspace_id)?;
+    let mut mr = store.get(&workspace_id, &ticket_id)?;
+    mr.thread = store.thread_page(&workspace_id, &ticket_id, None, 100)?;
     let reader = api.repository_reader();
     let observed_at = Utc::now().to_rfc3339();
     let source = match mr.selector_from.as_deref() {

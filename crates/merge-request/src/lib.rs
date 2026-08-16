@@ -807,14 +807,16 @@ fn truncate_body(value: &mut String) {
     if value.len() <= MAX_BODY_BYTES {
         return;
     }
+    const MARKER: &str = "\n[truncated]";
+    let limit = MAX_BODY_BYTES.saturating_sub(MARKER.len());
     let boundary = value
         .char_indices()
         .map(|(index, _)| index)
-        .take_while(|index| *index <= MAX_BODY_BYTES)
+        .take_while(|index| *index <= limit)
         .last()
         .unwrap_or(0);
     value.truncate(boundary);
-    value.push_str("\n[truncated]");
+    value.push_str(MARKER);
 }
 
 fn bounded_body(name: &str, value: &str) -> Result<(), MergeRequestError> {
@@ -889,7 +891,7 @@ fn load_mr(c: &Connection, w: &str, m: &str) -> Result<Option<MergeRequest>, Mer
         ticket_ids: tickets,
         created_at: time(&created)?,
         updated_at: time(&updated)?,
-        thread: load_thread(c, w, m, None, 100)?,
+        thread: load_thread(c, w, m, None, i64::MAX as usize)?,
     }))
 }
 fn load_thread(
