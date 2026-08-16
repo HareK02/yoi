@@ -345,67 +345,24 @@ fn bounded_context_rejects_oversized_revision_evidence() {
 }
 
 #[test]
-fn rejected_v6_schema_missing_diff_digest_is_archived_before_fresh_v7() {
+fn v6_legacy_schema_fails_closed_without_archiving() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("legacy.db");
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
         "CREATE TABLE merge_request_schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);\
          INSERT INTO merge_request_schema_migrations(version,name) VALUES(6,'rejected_merge_request_v6');\
-         CREATE TABLE repositories(workspace_id TEXT NOT NULL,repository_id TEXT NOT NULL,PRIMARY KEY(workspace_id,repository_id));\
-         CREATE TABLE typed_tickets(workspace_id TEXT NOT NULL,ticket_id TEXT NOT NULL,workflow_state TEXT NOT NULL,workflow_state_explicit INTEGER NOT NULL DEFAULT 1,updated_at TEXT NOT NULL,PRIMARY KEY(workspace_id,ticket_id));\
-         CREATE TABLE ticket_worker_assignments(workspace_id TEXT NOT NULL,ticket_id TEXT NOT NULL,assignment_id TEXT NOT NULL,runtime_id TEXT NOT NULL,worker_id TEXT NOT NULL,PRIMARY KEY(workspace_id,ticket_id,assignment_id));\
-         CREATE TABLE merge_requests(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,repository_id TEXT NOT NULL,state TEXT NOT NULL,lifecycle_generation INTEGER NOT NULL,current_revision_id TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(workspace_id,merge_request_id));\
-         CREATE TABLE merge_request_ticket_relations(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,ticket_id TEXT NOT NULL,relation_kind TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(workspace_id,merge_request_id,ticket_id));\
-         CREATE TABLE merge_request_revisions(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,revision_id TEXT NOT NULL,ordinal INTEGER NOT NULL,base_commit TEXT NOT NULL,head_commit TEXT NOT NULL,head_tree TEXT NOT NULL,assignment_id TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(workspace_id,merge_request_id,revision_id));",
+         CREATE TABLE merge_requests(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,repository_id TEXT NOT NULL,state TEXT NOT NULL,lifecycle_generation INTEGER NOT NULL,current_revision_id TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(workspace_id,merge_request_id));",
     ).unwrap();
     drop(conn);
-    let store = SqliteMergeRequestStore::open(&path, "ws-a").unwrap();
-    assert!(store.show_for_ticket("missing").unwrap().is_none());
-    let conn = Connection::open(&path).unwrap();
-    let archived: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='legacy_v6_merge_requests'",[],|row|row.get(0)).unwrap();
-    assert_eq!(archived, 1);
-    for table in [
-        "merge_request_review_attempts",
-        "merge_request_completion_operations",
-    ] {
-        let present: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                params![table],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(present, 1);
-    }
-}
 
-#[test]
-fn interrupted_legacy_archive_with_empty_recreated_table_resumes() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("interrupted.db");
+    let error = SqliteMergeRequestStore::open(&path, "ws-a").unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported legacy merge request schema version 6")
+    );
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE merge_request_schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);\
-         INSERT INTO merge_request_schema_migrations(version,name) VALUES(6,'rejected_merge_request_v6');\
-         CREATE TABLE merge_requests(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,ticket_id TEXT NOT NULL);\
-         CREATE TABLE merge_request_review_findings(workspace_id TEXT NOT NULL,attempt_id TEXT NOT NULL,ordinal INTEGER NOT NULL,severity TEXT NOT NULL,code TEXT,path TEXT,line INTEGER,body TEXT NOT NULL);\
-         CREATE TABLE legacy_v6_merge_request_review_findings(workspace_id TEXT NOT NULL,attempt_id TEXT NOT NULL,ordinal INTEGER NOT NULL,severity TEXT NOT NULL,code TEXT,path TEXT,line INTEGER,body TEXT NOT NULL);\
-         INSERT INTO legacy_v6_merge_request_review_findings VALUES('ws-a','AT1',0,'warning',NULL,NULL,NULL,'preserved evidence');",
-    )
-    .unwrap();
-    drop(conn);
-
-    SqliteMergeRequestStore::open(&path, "ws-a").unwrap();
-    let conn = Connection::open(&path).unwrap();
-    let archived_body: String = conn
-        .query_row(
-            "SELECT body FROM legacy_v6_merge_request_review_findings",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(archived_body, "preserved evidence");
     let version: i64 = conn
         .query_row(
             "SELECT MAX(version) FROM merge_request_schema_migrations",
@@ -413,59 +370,33 @@ fn interrupted_legacy_archive_with_empty_recreated_table_resumes() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 8);
-    drop(conn);
-
-    SqliteMergeRequestStore::open(&path, "ws-a").unwrap();
-}
-
-#[test]
-fn conflicting_legacy_archive_rolls_back_all_table_renames() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("conflict.db");
-    let conn = Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE merge_request_schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);\
-         INSERT INTO merge_request_schema_migrations(version,name) VALUES(6,'rejected_merge_request_v6');\
-         CREATE TABLE merge_requests(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,ticket_id TEXT NOT NULL);\
-         CREATE TABLE merge_request_review_findings(body TEXT NOT NULL);\
-         CREATE TABLE merge_request_reviews(body TEXT NOT NULL);\
-         INSERT INTO merge_request_reviews VALUES('unarchived evidence');\
-         CREATE TABLE legacy_v6_merge_request_reviews(body TEXT NOT NULL);",
-    )
-    .unwrap();
-
-    let error = migrate(&conn).unwrap_err();
-    assert!(error.to_string().contains(
-        "legacy archive table legacy_v6_merge_request_reviews already exists while merge_request_reviews still contains data"
-    ));
-    let current_findings: i64 = conn
+    assert_eq!(version, 6);
+    let original: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='merge_request_review_findings'",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='merge_requests'",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    let archived_findings: i64 = conn
+    let archived: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='legacy_v6_merge_request_review_findings'",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE 'legacy_v6_%'",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(current_findings, 1);
-    assert_eq!(archived_findings, 0);
+    assert_eq!(original, 1);
+    assert_eq!(archived, 0);
 }
 
 #[test]
-fn v7_completion_operations_are_preserved_as_legacy_assigned_coder_authority() {
+fn v7_schema_is_rejected_without_mutating_completion_evidence() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("v7.db");
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
         "CREATE TABLE merge_request_schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);\
          INSERT INTO merge_request_schema_migrations(version,name) VALUES(7,'fresh_bounded_context_authority');\
-         CREATE TABLE repositories(workspace_id TEXT NOT NULL,repository_id TEXT NOT NULL,PRIMARY KEY(workspace_id,repository_id));\
          CREATE TABLE typed_tickets(workspace_id TEXT NOT NULL,ticket_id TEXT NOT NULL,workflow_state TEXT NOT NULL,workflow_state_explicit INTEGER NOT NULL DEFAULT 1,updated_at TEXT NOT NULL,PRIMARY KEY(workspace_id,ticket_id));\
          INSERT INTO typed_tickets VALUES('ws-a','T1','done',1,'t');\
          CREATE TABLE merge_request_completion_operations(workspace_id TEXT NOT NULL,operation_id TEXT NOT NULL,ticket_id TEXT NOT NULL,revision_id TEXT NOT NULL,assignment_id TEXT NOT NULL,fingerprint TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('pending','completed')),result_ticket_state TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(workspace_id,operation_id),FOREIGN KEY(workspace_id,ticket_id) REFERENCES typed_tickets(workspace_id,ticket_id));\
@@ -473,25 +404,19 @@ fn v7_completion_operations_are_preserved_as_legacy_assigned_coder_authority() {
     ).unwrap();
     drop(conn);
 
-    SqliteMergeRequestStore::open(&path, "ws-a").unwrap();
-    let conn = Connection::open(&path).unwrap();
-    let row: (String, String, Option<String>, Option<String>, String) = conn
-        .query_row(
-            "SELECT authority_kind,implementation_assignment_id,completion_actor_runtime_id,completion_actor_worker_id,fingerprint FROM merge_request_completion_operations WHERE operation_id='legacy-op'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-        )
-        .unwrap();
-    assert_eq!(
-        row,
-        (
-            "legacy_assigned_coder".into(),
-            "A1".into(),
-            None,
-            None,
-            "legacy-fingerprint".into()
-        )
+    let error = SqliteMergeRequestStore::open(&path, "ws-a").unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported legacy merge request schema version 7")
     );
+    let conn = Connection::open(&path).unwrap();
+    let row: (String, String) = conn.query_row(
+        "SELECT assignment_id,fingerprint FROM merge_request_completion_operations WHERE operation_id='legacy-op'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!(row, ("A1".into(), "legacy-fingerprint".into()));
     let version: i64 = conn
         .query_row(
             "SELECT MAX(version) FROM merge_request_schema_migrations",
@@ -499,23 +424,7 @@ fn v7_completion_operations_are_preserved_as_legacy_assigned_coder_authority() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 9);
-    let head_tree_columns: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('merge_request_revisions') WHERE name='head_tree'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(head_tree_columns, 0);
-    let merge_result_table: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='merge_request_merge_results'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(merge_result_table, 1);
+    assert_eq!(version, 7);
 }
 
 #[test]

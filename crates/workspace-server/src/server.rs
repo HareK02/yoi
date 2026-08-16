@@ -17013,8 +17013,9 @@ mod tests {
         );
         assert!(!default_root.starts_with(workspace_root.join(".yoi")));
 
-        let config = ServerConfig::local_dev(workspace_root, test_identity())
+        let mut config = ServerConfig::local_dev(workspace_root, test_identity())
             .with_embedded_runtime_store_root(default_root.clone());
+        config.database_path = ServerConfig::server_database_path_for_data_dir(&data_dir);
         let app = build_router(
             WorkspaceApi::new_with_execution_backend(
                 config,
