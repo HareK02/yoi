@@ -41,7 +41,6 @@ struct OpenInput {
     revision_id: String,
     base_commit: String,
     head_commit: String,
-    diff_digest: String,
     #[serde(default)]
     changed_paths: Vec<String>,
     #[serde(default)]
@@ -54,7 +53,6 @@ struct AddRevisionInput {
     revision_id: String,
     base_commit: String,
     head_commit: String,
-    diff_digest: String,
     #[serde(default)]
     changed_paths: Vec<String>,
     #[serde(default)]
@@ -174,7 +172,7 @@ impl Tool for MergeRequestTool {
                     WorkspaceRequestMethod::Post,
                     format!("/api/w/{workspace_id}/tickets/{}/merge-request", v.ticket),
                     Some(
-                        json!({"repository_id":v.repository_id,"revision_id":v.revision_id,"base_commit":v.base_commit,"head_commit":v.head_commit,"diff_digest":v.diff_digest,"changed_paths":v.changed_paths,"summary":v.summary}),
+                        json!({"repository_id":v.repository_id,"revision_id":v.revision_id,"base_commit":v.base_commit,"head_commit":v.head_commit,"changed_paths":v.changed_paths,"summary":v.summary}),
                     ),
                 )
             }
@@ -188,7 +186,7 @@ impl Tool for MergeRequestTool {
                         v.ticket
                     ),
                     Some(
-                        json!({"expected_current_revision_id":v.expected_current_revision_id,"revision_id":v.revision_id,"base_commit":v.base_commit,"head_commit":v.head_commit,"diff_digest":v.diff_digest,"changed_paths":v.changed_paths,"summary":v.summary}),
+                        json!({"expected_current_revision_id":v.expected_current_revision_id,"revision_id":v.revision_id,"base_commit":v.base_commit,"head_commit":v.head_commit,"changed_paths":v.changed_paths,"summary":v.summary}),
                     ),
                 )
             }
@@ -328,12 +326,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn merge_request_tool_contract_omits_tree_hashes_and_candidate_result_tool() {
+    fn merge_request_tool_contract_omits_redundant_revision_evidence_and_candidate_result_tool() {
         let open = serde_json::to_string(&schemars::schema_for!(OpenInput)).unwrap();
         let add = serde_json::to_string(&schemars::schema_for!(AddRevisionInput)).unwrap();
         let complete = serde_json::to_string(&schemars::schema_for!(CompleteInput)).unwrap();
         assert!(!open.contains("head_tree"));
         assert!(!add.contains("head_tree"));
+        assert!(!open.contains("diff_digest"));
+        assert!(!add.contains("diff_digest"));
         assert!(complete.contains("result_commit"));
         assert!(complete.contains("conflicts_resolved"));
         assert!(!MERGE_REQUEST_COMMON_TOOL_NAMES.contains(&"MergeRequestRecordMergeResult"));

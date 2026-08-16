@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 const REVIEWER_PROFILE: &str = "builtin:reviewer";
 const MAX_SUMMARY_BYTES: usize = 16 * 1024;
 const MAX_REVIEW_BODY_BYTES: usize = 64 * 1024;
@@ -190,7 +190,6 @@ pub struct MergeRequestRevision {
     pub ordinal: u64,
     pub base_commit: String,
     pub head_commit: String,
-    pub diff_digest: String,
     pub changed_paths: Vec<String>,
     pub summary: String,
     pub assignment_id: String,
@@ -524,13 +523,13 @@ impl SqliteMergeRequestStore {
             if input.revision.ordinal != current.current_revision.ordinal + 1 {
                 return Err(MergeRequestError::RevisionConflict(input.revision.revision_id.clone()));
             }
-            let existing: Option<(String, String, String)> = conn.query_row(
-                "SELECT base_commit, head_commit, diff_digest FROM merge_request_revisions WHERE workspace_id=?1 AND merge_request_id=?2 AND revision_id=?3",
+            let existing: Option<(String, String)> = conn.query_row(
+                "SELECT base_commit, head_commit FROM merge_request_revisions WHERE workspace_id=?1 AND merge_request_id=?2 AND revision_id=?3",
                 params![self.workspace_id, current.merge_request_id, input.revision.revision_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             ).optional().map_err(db)?;
             if let Some(existing) = existing {
-                if existing == (input.revision.base_commit.clone(), input.revision.head_commit.clone(), input.revision.diff_digest.clone()) {
+                if existing == (input.revision.base_commit.clone(), input.revision.head_commit.clone()) {
                     return Ok(current);
                 }
                 return Err(MergeRequestError::RevisionConflict(input.revision.revision_id.clone()));
@@ -823,8 +822,8 @@ fn migrate_locked(conn: &Connection, force_failure_after_migration_ddl: bool) ->
             ));
         }
         conn.execute_batch(MIGRATION_TABLE_SQL).map_err(db)?;
-        conn.execute_batch(SCHEMA_V10).map_err(db)?;
-        verify_schema_shape(conn, SCHEMA_V10, "v10")?;
+        conn.execute_batch(SCHEMA_V11).map_err(db)?;
+        verify_schema_shape(conn, SCHEMA_V11, "v11")?;
         ensure_foreign_key_integrity(conn)?;
         replace_schema_marker(conn, SCHEMA_VERSION)?;
         return verify(conn);
@@ -836,62 +835,87 @@ fn migrate_locked(conn: &Connection, force_failure_after_migration_ddl: bool) ->
             verify_marker_state(conn, SCHEMA_VERSION)?;
             verify(conn)
         }
+        10 => {
+            verify_marker_state(conn, 10)?;
+            if verify_schema_shape(conn, SCHEMA_V11, "v11").is_ok() {
+                return finish_v11_schema(conn);
+            }
+            verify_schema_shape(conn, SCHEMA_V10, "v10").map_err(|_| {
+                MergeRequestError::Database(
+                    "schema drift at merge request version 10; automatic migration requires the exact released v10 shape or a complete v11 shape for marker repair"
+                        .into(),
+                )
+            })?;
+            migrate_v10_to_v11(conn)?;
+            fail_after_migration_if_requested(force_failure_after_migration_ddl, 10)?;
+            finish_v11_schema(conn)
+        }
         9 => {
             verify_marker_table_shape(conn)?;
             remove_empty_v9_migration_debris(conn)?;
+            if verify_schema_shape(conn, SCHEMA_V11, "v11").is_ok() {
+                return finish_v11_schema(conn);
+            }
             if verify_schema_shape(conn, SCHEMA_V10, "v10").is_ok() {
-                ensure_foreign_key_integrity(conn)?;
-                replace_schema_marker(conn, SCHEMA_VERSION)?;
-                return verify(conn);
+                migrate_v10_to_v11(conn)?;
+                fail_after_migration_if_requested(force_failure_after_migration_ddl, 9)?;
+                return finish_v11_schema(conn);
             }
             verify_schema_shape(conn, SCHEMA_V9, "v9").map_err(|_| {
                 MergeRequestError::Database(
-                    "schema drift at merge request version 9; automatic migration requires the exact released v9 shape or a complete v10 shape for marker repair"
+                    "schema drift at merge request version 9; automatic migration requires the exact released v9 shape, a complete v10 shape, or a complete v11 shape for marker repair"
                         .into(),
                 )
             })?;
             migrate_v9_to_v10(conn)?;
-            if force_failure_after_migration_ddl {
-                return Err(MergeRequestError::Database(
-                    "forced v9 to v10 migration failure after DDL and data copy".into(),
-                ));
-            }
-            verify_schema_shape(conn, SCHEMA_V10, "v10")?;
-            ensure_foreign_key_integrity(conn)?;
-            replace_schema_marker(conn, SCHEMA_VERSION)?;
-            verify(conn)
+            migrate_v10_to_v11(conn)?;
+            fail_after_migration_if_requested(force_failure_after_migration_ddl, 9)?;
+            finish_v11_schema(conn)
         }
         8 => {
             verify_marker_state(conn, 8)?;
+            if verify_schema_shape(conn, SCHEMA_V11, "v11").is_ok() {
+                return finish_v11_schema(conn);
+            }
             if verify_schema_shape(conn, SCHEMA_V10, "v10").is_ok() {
-                ensure_foreign_key_integrity(conn)?;
-                replace_schema_marker(conn, SCHEMA_VERSION)?;
-                return verify(conn);
+                migrate_v10_to_v11(conn)?;
+                fail_after_migration_if_requested(force_failure_after_migration_ddl, 8)?;
+                return finish_v11_schema(conn);
             }
             verify_schema_shape(conn, SCHEMA_V8, "v8").map_err(|_| {
                 MergeRequestError::Database(
-                    "schema drift at merge request version 8; automatic migration requires the exact v8 shape or a complete v10 shape for marker repair"
+                    "schema drift at merge request version 8; automatic migration requires the exact v8 shape, a complete v10 shape, or a complete v11 shape for marker repair"
                         .into(),
                 )
             })?;
             migrate_v8_to_v10(conn)?;
-            if force_failure_after_migration_ddl {
-                return Err(MergeRequestError::Database(
-                    "forced v8 to v10 migration failure after DDL and data copy".into(),
-                ));
-            }
-            verify_schema_shape(conn, SCHEMA_V10, "v10")?;
-            ensure_foreign_key_integrity(conn)?;
-            replace_schema_marker(conn, SCHEMA_VERSION)?;
-            verify(conn)
+            migrate_v10_to_v11(conn)?;
+            fail_after_migration_if_requested(force_failure_after_migration_ddl, 8)?;
+            finish_v11_schema(conn)
         }
         0..=7 => Err(MergeRequestError::Database(format!(
-            "unsupported legacy merge request schema version {version}; automatic migration only supports exact v8 or v9 to v10"
+            "unsupported legacy merge request schema version {version}; automatic migration only supports exact v8, v9, or v10 to v11"
         ))),
         other => Err(MergeRequestError::Database(format!(
-            "unsupported merge request schema version {other}; expected version 8, 9, or {SCHEMA_VERSION}"
+            "unsupported merge request schema version {other}; expected version 8, 9, 10, or {SCHEMA_VERSION}"
         ))),
     }
+}
+
+fn fail_after_migration_if_requested(force_failure: bool, source_version: i64) -> Result<()> {
+    if force_failure {
+        return Err(MergeRequestError::Database(format!(
+            "forced v{source_version} to v11 migration failure after DDL and data copy"
+        )));
+    }
+    Ok(())
+}
+
+fn finish_v11_schema(conn: &Connection) -> Result<()> {
+    verify_schema_shape(conn, SCHEMA_V11, "v11")?;
+    ensure_foreign_key_integrity(conn)?;
+    replace_schema_marker(conn, SCHEMA_VERSION)?;
+    verify(conn)
 }
 
 fn remove_empty_v9_migration_debris(conn: &Connection) -> Result<()> {
@@ -1299,6 +1323,26 @@ fn migrate_v8_to_v10(conn: &Connection) -> Result<()> {
     .map_err(db)
 }
 
+fn migrate_v10_to_v11(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE merge_request_revisions_v11 (
+          workspace_id TEXT NOT NULL, merge_request_id TEXT NOT NULL, revision_id TEXT NOT NULL,
+          ordinal INTEGER NOT NULL, base_commit TEXT NOT NULL, head_commit TEXT NOT NULL,
+          summary TEXT NOT NULL, assignment_id TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY(workspace_id,merge_request_id,revision_id),
+          UNIQUE(workspace_id,merge_request_id,ordinal),
+          FOREIGN KEY(workspace_id,merge_request_id) REFERENCES merge_requests(workspace_id,merge_request_id) ON DELETE CASCADE
+         );
+         INSERT INTO merge_request_revisions_v11(
+          workspace_id,merge_request_id,revision_id,ordinal,base_commit,head_commit,summary,assignment_id,created_at
+         ) SELECT workspace_id,merge_request_id,revision_id,ordinal,base_commit,head_commit,summary,assignment_id,created_at
+             FROM merge_request_revisions;
+         DROP TABLE merge_request_revisions;
+         ALTER TABLE merge_request_revisions_v11 RENAME TO merge_request_revisions;",
+    )
+    .map_err(db)
+}
+
 pub fn verify(conn: &Connection) -> Result<()> {
     if !table_exists(conn, MIGRATION_TABLE)? {
         return Err(MergeRequestError::Database(
@@ -1312,7 +1356,7 @@ pub fn verify(conn: &Connection) -> Result<()> {
         )));
     }
     verify_marker_state(conn, SCHEMA_VERSION)?;
-    verify_schema_shape(conn, SCHEMA_V10, "v10")
+    verify_schema_shape(conn, SCHEMA_V11, "v11")
 }
 
 fn schema_version(conn: &Connection) -> Result<i64> {
@@ -1921,6 +1965,85 @@ CREATE TABLE merge_request_completion_operations (
 );
 "#;
 
+const SCHEMA_V11: &str = r#"
+CREATE TABLE merge_requests (
+ workspace_id TEXT NOT NULL, merge_request_id TEXT NOT NULL,
+ repository_id TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('draft','open','closed','merged')),
+ lifecycle_generation INTEGER NOT NULL, current_revision_id TEXT NOT NULL,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL, merged_by_account_id TEXT, merged_at TEXT,
+ target_ref_selector TEXT,
+ target_status TEXT NOT NULL DEFAULT 'unknown' CHECK(target_status IN ('known','unknown')),
+ merged_revision_id TEXT, merged_target_commit TEXT, merged_result_commit TEXT,
+ merge_strategy TEXT CHECK(merge_strategy IN ('fast_forward','merge')),
+ merge_resolution TEXT CHECK(merge_resolution IN ('none','clean','conflicts_resolved')),
+ merged_by_runtime_id TEXT, merged_by_worker_id TEXT,
+ PRIMARY KEY(workspace_id,merge_request_id),
+ FOREIGN KEY(workspace_id,repository_id) REFERENCES repositories(workspace_id,repository_id)
+);
+CREATE TABLE merge_request_ticket_relations (
+ workspace_id TEXT NOT NULL, merge_request_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+ relation_kind TEXT NOT NULL CHECK(relation_kind='implements'), created_at TEXT NOT NULL,
+ PRIMARY KEY(workspace_id,merge_request_id,ticket_id),
+ FOREIGN KEY(workspace_id,merge_request_id) REFERENCES merge_requests(workspace_id,merge_request_id) ON DELETE CASCADE,
+ FOREIGN KEY(workspace_id,ticket_id) REFERENCES typed_tickets(workspace_id,ticket_id) ON DELETE CASCADE
+);
+CREATE TABLE merge_request_revisions (
+ workspace_id TEXT NOT NULL, merge_request_id TEXT NOT NULL, revision_id TEXT NOT NULL,
+ ordinal INTEGER NOT NULL, base_commit TEXT NOT NULL, head_commit TEXT NOT NULL,
+ summary TEXT NOT NULL, assignment_id TEXT NOT NULL, created_at TEXT NOT NULL,
+ PRIMARY KEY(workspace_id,merge_request_id,revision_id), UNIQUE(workspace_id,merge_request_id,ordinal),
+ FOREIGN KEY(workspace_id,merge_request_id) REFERENCES merge_requests(workspace_id,merge_request_id) ON DELETE CASCADE
+);
+CREATE TABLE merge_request_revision_paths (
+ workspace_id TEXT NOT NULL, merge_request_id TEXT NOT NULL, revision_id TEXT NOT NULL, ordinal INTEGER NOT NULL, path TEXT NOT NULL,
+ PRIMARY KEY(workspace_id,merge_request_id,revision_id,ordinal),
+ FOREIGN KEY(workspace_id,merge_request_id,revision_id) REFERENCES merge_request_revisions(workspace_id,merge_request_id,revision_id) ON DELETE CASCADE
+);
+CREATE TABLE merge_request_reviewer_child_sessions (
+ workspace_id TEXT NOT NULL, child_session_id TEXT NOT NULL, parent_runtime_id TEXT NOT NULL,
+ parent_worker_id TEXT NOT NULL, effective_profile TEXT NOT NULL CHECK(effective_profile='builtin:reviewer'), registered_at TEXT NOT NULL,
+ PRIMARY KEY(workspace_id,child_session_id)
+);
+CREATE TABLE merge_request_review_attempts (
+ workspace_id TEXT NOT NULL, attempt_id TEXT NOT NULL, merge_request_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+ revision_id TEXT NOT NULL, lifecycle_generation INTEGER NOT NULL,
+ parent_assignment_id TEXT NOT NULL, parent_runtime_id TEXT NOT NULL, parent_worker_id TEXT NOT NULL,
+ child_session_id TEXT NOT NULL, child_effective_profile TEXT NOT NULL CHECK(child_effective_profile='builtin:reviewer'),
+ capability_token_sha256 TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('open','submitted','revoked')),
+ created_at TEXT NOT NULL, consumed_at TEXT,
+ PRIMARY KEY(workspace_id,attempt_id), UNIQUE(workspace_id,capability_token_sha256), UNIQUE(workspace_id,child_session_id),
+ FOREIGN KEY(workspace_id,merge_request_id,revision_id) REFERENCES merge_request_revisions(workspace_id,merge_request_id,revision_id),
+ FOREIGN KEY(workspace_id,ticket_id,parent_assignment_id) REFERENCES ticket_worker_assignments(workspace_id,ticket_id,assignment_id),
+ FOREIGN KEY(workspace_id,child_session_id) REFERENCES merge_request_reviewer_child_sessions(workspace_id,child_session_id)
+);
+CREATE TABLE merge_request_reviews (
+ workspace_id TEXT NOT NULL, attempt_id TEXT NOT NULL, merge_request_id TEXT NOT NULL, revision_id TEXT NOT NULL,
+ decision TEXT NOT NULL CHECK(decision IN ('approve','request_changes')), body TEXT NOT NULL, submitted_at TEXT NOT NULL,
+ PRIMARY KEY(workspace_id,attempt_id),
+ FOREIGN KEY(workspace_id,attempt_id) REFERENCES merge_request_review_attempts(workspace_id,attempt_id),
+ FOREIGN KEY(workspace_id,merge_request_id,revision_id) REFERENCES merge_request_revisions(workspace_id,merge_request_id,revision_id)
+);
+CREATE TABLE merge_request_review_findings (
+ workspace_id TEXT NOT NULL, attempt_id TEXT NOT NULL, ordinal INTEGER NOT NULL, severity TEXT NOT NULL,
+ code TEXT, path TEXT, line INTEGER, body TEXT NOT NULL, PRIMARY KEY(workspace_id,attempt_id,ordinal),
+ FOREIGN KEY(workspace_id,attempt_id) REFERENCES merge_request_reviews(workspace_id,attempt_id) ON DELETE CASCADE
+);
+CREATE TABLE merge_request_completion_operations (
+ workspace_id TEXT NOT NULL, operation_id TEXT NOT NULL, ticket_id TEXT NOT NULL, revision_id TEXT NOT NULL,
+ authority_kind TEXT NOT NULL CHECK(authority_kind IN ('workspace_orchestrator','legacy_assigned_coder')),
+ implementation_assignment_id TEXT NOT NULL, completion_actor_runtime_id TEXT, completion_actor_worker_id TEXT,
+ target_commit TEXT, source_commit TEXT, result_commit TEXT,
+ strategy TEXT CHECK(strategy IN ('fast_forward','merge')),
+ resolution TEXT CHECK(resolution IN ('none','clean','conflicts_resolved')),
+ fingerprint TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','completed')),
+ result_ticket_state TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ PRIMARY KEY(workspace_id,operation_id),
+ FOREIGN KEY(workspace_id,ticket_id) REFERENCES typed_tickets(workspace_id,ticket_id),
+ FOREIGN KEY(workspace_id,ticket_id,implementation_assignment_id)
+   REFERENCES ticket_worker_assignments(workspace_id,ticket_id,assignment_id)
+);
+"#;
+
 #[cfg(test)]
 mod migration_tests {
     use super::*;
@@ -1991,6 +2114,31 @@ CREATE TABLE ticket_worker_assignments(workspace_id TEXT NOT NULL,ticket_id TEXT
         conn
     }
 
+    fn exact_v10_connection() -> Connection {
+        let conn = fresh_connection();
+        conn.execute_batch(MIGRATION_TABLE_SQL).unwrap();
+        conn.execute(
+            "INSERT INTO merge_request_schema_migrations(version,applied_at) VALUES(10,'t0')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(SCHEMA_V10).unwrap();
+        conn.execute_batch(
+            "INSERT INTO repositories VALUES('ws','repo');
+             INSERT INTO typed_tickets VALUES('ws','T1','inprogress',1,'t0');
+             INSERT INTO ticket_worker_assignments VALUES('ws','T1','A1','R1','W1');
+             INSERT INTO merge_requests VALUES('ws','MR1','repo','open',1,'V1','t0','t0',NULL,NULL,'refs/heads/main','known',NULL,NULL,NULL,NULL,NULL,NULL,NULL);
+             INSERT INTO merge_request_ticket_relations VALUES('ws','MR1','T1','implements','t0');
+             INSERT INTO merge_request_revisions VALUES('ws','MR1','V1',1,'base','head','digest','summary','A1','t0');
+             INSERT INTO merge_request_revision_paths VALUES('ws','MR1','V1',0,'src/lib.rs');
+             INSERT INTO merge_request_reviewer_child_sessions VALUES('ws','C1','R1','W1','builtin:reviewer','t0');
+             INSERT INTO merge_request_review_attempts VALUES('ws','AT1','MR1','T1','V1',1,'A1','R1','W1','C1','builtin:reviewer','token','submitted','t0','t1');
+             INSERT INTO merge_request_reviews VALUES('ws','AT1','MR1','V1','approve','approved','t1');",
+        )
+        .unwrap();
+        conn
+    }
+
     fn marker_version(conn: &Connection) -> i64 {
         conn.query_row(
             "SELECT MAX(version) FROM merge_request_schema_migrations",
@@ -2005,7 +2153,7 @@ CREATE TABLE ticket_worker_assignments(workspace_id TEXT NOT NULL,ticket_id TEXT
         let conn = fresh_connection();
         migrate(&conn).unwrap();
         verify(&conn).unwrap();
-        assert_eq!(marker_version(&conn), 10);
+        assert_eq!(marker_version(&conn), 11);
         for column in [
             "target_ref_selector",
             "merged_revision_id",
@@ -2022,6 +2170,7 @@ CREATE TABLE ticket_worker_assignments(workspace_id TEXT NOT NULL,ticket_id TEXT
             );
         }
         assert!(!column_exists(&conn, "merge_request_revisions", "head_tree").unwrap());
+        assert!(!column_exists(&conn, "merge_request_revisions", "diff_digest").unwrap());
         assert!(!table_exists(&conn, "merge_request_merge_results").unwrap());
     }
 
@@ -2030,7 +2179,7 @@ CREATE TABLE ticket_worker_assignments(workspace_id TEXT NOT NULL,ticket_id TEXT
         let conn = exact_v8_connection();
         migrate(&conn).unwrap();
         verify(&conn).unwrap();
-        assert_eq!(marker_version(&conn), 10);
+        assert_eq!(marker_version(&conn), 11);
         assert_eq!(
             conn.query_row(
                 "SELECT head_commit FROM merge_request_revisions WHERE revision_id='V1'",
@@ -2069,13 +2218,80 @@ CREATE TABLE ticket_worker_assignments(workspace_id TEXT NOT NULL,ticket_id TEXT
     }
 
     #[test]
-    fn v8_to_v10_failure_rolls_back_schema_data_and_marker() {
+    fn exact_v10_migrates_revision_evidence_without_diff_digest() {
+        let conn = exact_v10_connection();
+        migrate(&conn).unwrap();
+        verify(&conn).unwrap();
+
+        assert_eq!(marker_version(&conn), 11);
+        assert!(!column_exists(&conn, "merge_request_revisions", "diff_digest").unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT base_commit,head_commit FROM merge_request_revisions WHERE revision_id='V1'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap(),
+            ("base".to_string(), "head".to_string())
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT path FROM merge_request_revision_paths WHERE revision_id='V1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "src/lib.rs"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT decision FROM merge_request_reviews WHERE attempt_id='AT1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "approve"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn v10_to_v11_failure_rolls_back_schema_data_and_marker() {
+        let conn = exact_v10_connection();
+        let error = migrate_with_failpoint(&conn, true).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("forced v10 to v11 migration failure")
+        );
+        assert_eq!(marker_version(&conn), 10);
+        assert!(column_exists(&conn, "merge_request_revisions", "diff_digest").unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT diff_digest FROM merge_request_revisions WHERE revision_id='V1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "digest"
+        );
+        verify_schema_shape(&conn, SCHEMA_V10, "v10 after rollback").unwrap();
+    }
+
+    #[test]
+    fn v8_to_v11_failure_rolls_back_schema_data_and_marker() {
         let conn = exact_v8_connection();
         let error = migrate_with_failpoint(&conn, true).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("forced v8 to v10 migration failure")
+                .contains("forced v8 to v11 migration failure")
         );
         assert_eq!(marker_version(&conn), 8);
         assert!(column_exists(&conn, "merge_request_revisions", "head_tree").unwrap());
@@ -2119,7 +2335,7 @@ CREATE TABLE ticket_worker_assignments(workspace_id TEXT NOT NULL,ticket_id TEXT
 
         migrate(&conn).unwrap();
         verify(&conn).unwrap();
-        assert_eq!(marker_version(&conn), 10);
+        assert_eq!(marker_version(&conn), 11);
         assert!(column_exists(&conn, "merge_requests", "merged_result_commit").unwrap());
     }
 
@@ -2136,17 +2352,17 @@ CREATE TABLE ticket_worker_assignments(workspace_id TEXT NOT NULL,ticket_id TEXT
         assert!(
             error
                 .to_string()
-                .contains("only supports exact v8 or v9 to v10")
+                .contains("only supports exact v8, v9, or v10 to v11")
         );
         assert_eq!(marker_version(&conn), 7);
     }
 
     #[test]
-    fn exact_v9_with_historical_markers_migrates_to_single_v10_marker() {
+    fn exact_v9_with_historical_markers_migrates_to_single_v11_marker() {
         let conn = exact_v9_connection();
         migrate(&conn).unwrap();
         verify(&conn).unwrap();
-        assert_eq!(marker_version(&conn), 10);
+        assert_eq!(marker_version(&conn), 11);
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM merge_request_schema_migrations",
@@ -2297,8 +2513,8 @@ fn load_revision(
     revision_id: &str,
 ) -> Result<MergeRequestRevision> {
     let mut revision: MergeRequestRevision = conn.query_row(
-        "SELECT revision_id,ordinal,base_commit,head_commit,diff_digest,summary,assignment_id,created_at FROM merge_request_revisions WHERE workspace_id=?1 AND merge_request_id=?2 AND revision_id=?3",
-        params![workspace_id,mr_id,revision_id], |r| Ok(MergeRequestRevision { revision_id:r.get(0)?, ordinal:r.get::<_,i64>(1)? as u64, base_commit:r.get(2)?, head_commit:r.get(3)?, diff_digest:r.get(4)?, changed_paths:Vec::new(), summary:r.get(5)?, assignment_id:r.get(6)?, created_at:r.get(7)? }),
+        "SELECT revision_id,ordinal,base_commit,head_commit,summary,assignment_id,created_at FROM merge_request_revisions WHERE workspace_id=?1 AND merge_request_id=?2 AND revision_id=?3",
+        params![workspace_id,mr_id,revision_id], |r| Ok(MergeRequestRevision { revision_id:r.get(0)?, ordinal:r.get::<_,i64>(1)? as u64, base_commit:r.get(2)?, head_commit:r.get(3)?, changed_paths:Vec::new(), summary:r.get(4)?, assignment_id:r.get(5)?, created_at:r.get(6)? }),
     ).map_err(db)?;
     let mut statement = conn.prepare("SELECT path FROM merge_request_revision_paths WHERE workspace_id=?1 AND merge_request_id=?2 AND revision_id=?3 ORDER BY ordinal").map_err(db)?;
     revision.changed_paths = statement
@@ -2315,7 +2531,7 @@ fn insert_revision(
     mr_id: &str,
     revision: &MergeRequestRevision,
 ) -> Result<()> {
-    conn.execute("INSERT INTO merge_request_revisions (workspace_id,merge_request_id,revision_id,ordinal,base_commit,head_commit,diff_digest,summary,assignment_id,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![workspace_id,mr_id,revision.revision_id,revision.ordinal as i64,revision.base_commit,revision.head_commit,revision.diff_digest,revision.summary,revision.assignment_id,revision.created_at]).map_err(db)?;
+    conn.execute("INSERT INTO merge_request_revisions (workspace_id,merge_request_id,revision_id,ordinal,base_commit,head_commit,summary,assignment_id,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![workspace_id,mr_id,revision.revision_id,revision.ordinal as i64,revision.base_commit,revision.head_commit,revision.summary,revision.assignment_id,revision.created_at]).map_err(db)?;
     for (ordinal, path) in revision.changed_paths.iter().enumerate() {
         conn.execute("INSERT INTO merge_request_revision_paths (workspace_id,merge_request_id,revision_id,ordinal,path) VALUES (?1,?2,?3,?4,?5)", params![workspace_id,mr_id,revision.revision_id,ordinal as i64,path]).map_err(db)?;
     }
@@ -2454,7 +2670,6 @@ fn validate_revision(revision: &MergeRequestRevision) -> Result<()> {
         ("revision_id", revision.revision_id.as_str()),
         ("base_commit", revision.base_commit.as_str()),
         ("head_commit", revision.head_commit.as_str()),
-        ("diff_digest", revision.diff_digest.as_str()),
         ("assignment_id", revision.assignment_id.as_str()),
     ] {
         nonempty(name, value)?;

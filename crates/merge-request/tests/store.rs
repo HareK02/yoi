@@ -47,7 +47,6 @@ fn revision(id: &str, ordinal: u64, head: &str) -> MergeRequestRevision {
         ordinal,
         base_commit: "base".into(),
         head_commit: head.into(),
-        diff_digest: format!("sha256:diff-{head}"),
         changed_paths: vec!["src/lib.rs".into()],
         summary: format!("revision {id}"),
         assignment_id: "A1".into(),

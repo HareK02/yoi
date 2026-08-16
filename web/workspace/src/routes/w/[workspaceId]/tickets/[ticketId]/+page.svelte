@@ -23,7 +23,7 @@
     target_ref_selector?: string | null;
     target_status: "known" | "unknown";
     observed_target_commit?: string | null;
-    current_revision: { revision_id: string; head_commit: string; diff_digest: string; changed_paths: string[]; summary: string };
+    current_revision: { revision_id: string; head_commit: string; changed_paths: string[]; summary: string };
     current_review?: { decision: string; body: string; reviewer_effective_profile: string } | null;
     merged_revision_id?: string | null;
     merged_target_commit?: string | null;

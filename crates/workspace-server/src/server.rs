@@ -3580,7 +3580,6 @@ struct OpenMergeRequestRequest {
     revision_id: String,
     base_commit: String,
     head_commit: String,
-    diff_digest: String,
     #[serde(default)]
     changed_paths: Vec<String>,
     #[serde(default)]
@@ -3593,7 +3592,6 @@ struct AddMergeRequestRevisionRequest {
     revision_id: String,
     base_commit: String,
     head_commit: String,
-    diff_digest: String,
     #[serde(default)]
     changed_paths: Vec<String>,
     #[serde(default)]
@@ -3809,7 +3807,6 @@ async fn scoped_open_merge_request(
         ordinal: 1,
         base_commit,
         head_commit: source_commit,
-        diff_digest: input.diff_digest,
         changed_paths: input.changed_paths,
         summary: input.summary,
         assignment_id: assignment.assignment_id.clone(),
@@ -3876,7 +3873,6 @@ async fn scoped_add_merge_request_revision(
                 ordinal: current.current_revision.ordinal + 1,
                 base_commit,
                 head_commit,
-                diff_digest: input.diff_digest,
                 changed_paths: input.changed_paths,
                 summary: input.summary,
                 assignment_id: assignment.assignment_id,
@@ -12807,7 +12803,6 @@ mod tests {
                     base_commit: target_commit.clone(),
                     head_commit: source_commit.clone(),
 
-                    diff_digest: "sha256:diff".into(),
                     changed_paths: vec!["src/lib.rs".into()],
                     summary: "approved revision".into(),
                     assignment_id: assignment.assignment_id.clone(),
