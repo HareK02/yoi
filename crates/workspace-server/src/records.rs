@@ -52,6 +52,7 @@ pub struct TicketDetail {
     pub priority: String,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+    pub item_revision: String,
     pub queued_by: Option<String>,
     pub queued_at: Option<String>,
     pub assignee: Option<String>,
@@ -62,9 +63,14 @@ pub struct TicketDetail {
     pub body_truncated: bool,
     pub event_count: usize,
     pub events: Vec<TicketEventDetail>,
+    pub event_page: QueryPage,
     pub artifact_count: usize,
     pub artifacts: Vec<String>,
     pub relations: TicketRelationView,
+    pub linked_objectives: Vec<ObjectiveLinkSummary>,
+    pub implementation_reports: Vec<TicketEvidenceEvent>,
+    pub merge_request: Option<TicketMergeRequestSummary>,
+    pub evidence: TicketEvidenceSummary,
     pub resolution: Option<String>,
     pub record_source: String,
 }
@@ -73,6 +79,7 @@ pub struct TicketDetail {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketEventDetail {
     pub sequence: usize,
+    pub event_ref: String,
     pub kind: String,
     pub author: Option<String>,
     pub at: Option<String>,
@@ -83,6 +90,8 @@ pub struct TicketEventDetail {
     pub state_field: Option<String>,
     pub heading: Option<String>,
     pub body: Option<String>,
+    pub attributes: std::collections::BTreeMap<String, String>,
+    pub references: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -185,6 +194,170 @@ impl From<ticket::TicketRelationView> for TicketRelationView {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct QueryPage {
+    pub limit: usize,
+    pub returned: usize,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+    pub sort: String,
+    pub source_limit: Option<usize>,
+    pub source_truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct ObjectiveLinkSummary {
+    pub id: String,
+    pub title: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct TicketEvidenceEvent {
+    pub event_ref: String,
+    pub sequence: usize,
+    pub kind: String,
+    pub at: Option<String>,
+    pub author: Option<String>,
+    pub excerpt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct TicketMergeRequestSummary {
+    pub merge_request_id: String,
+    pub state: String,
+    pub review_status: String,
+    pub revision_id: String,
+    pub base_commit: String,
+    pub head_commit: String,
+    pub changed_paths: Vec<String>,
+    pub updated_at: String,
+    pub review_submitted_at: Option<String>,
+    pub review_excerpt: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct TicketEvidenceSummary {
+    pub has_implementation_report: bool,
+    pub implementation_report_after_rescope: bool,
+    pub has_merge_request: bool,
+    pub has_commit: bool,
+    pub review_status: Option<String>,
+    pub approved: bool,
+    pub unresolved_request_changes: bool,
+    pub complete_for_integration: bool,
+    pub missing: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct TicketQueryRequest {
+    pub text: Option<String>,
+    #[serde(default)]
+    pub states: Vec<String>,
+    #[serde(default)]
+    pub event_kinds: Vec<String>,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    pub review_status: Option<String>,
+    #[serde(default)]
+    pub attention: Vec<String>,
+    pub related_ticket_id: Option<String>,
+    pub relation_kind: Option<String>,
+    pub linked_objective_id: Option<String>,
+    pub updated_after: Option<String>,
+    pub updated_before: Option<String>,
+    pub sort: Option<String>,
+    pub limit: Option<usize>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct TicketQueryItem {
+    pub id: String,
+    pub title: String,
+    pub state: String,
+    pub priority: String,
+    pub updated_at: Option<String>,
+    pub workspace_action_priority: String,
+    pub matched_fields: Vec<String>,
+    pub snippet: Option<String>,
+    pub matching_event: Option<TicketEvidenceEvent>,
+    pub linked_objective_ids: Vec<String>,
+    pub relation_count: usize,
+    pub blocker_count: usize,
+    pub evidence: TicketEvidenceSummary,
+    pub merge_request: Option<TicketMergeRequestSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct TicketQueryResponse {
+    pub items: Vec<TicketQueryItem>,
+    pub page: QueryPage,
+    pub record_authority: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct TicketShowRequest {
+    pub event_limit: Option<usize>,
+    pub event_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ObjectiveQueryRequest {
+    pub text: Option<String>,
+    #[serde(default)]
+    pub states: Vec<String>,
+    pub linked_ticket_id: Option<String>,
+    pub updated_after: Option<String>,
+    pub updated_before: Option<String>,
+    pub sort: Option<String>,
+    pub limit: Option<usize>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectiveQueryItem {
+    pub id: String,
+    pub title: String,
+    pub state: String,
+    pub updated_at: Option<String>,
+    pub matched_fields: Vec<String>,
+    pub snippet: Option<String>,
+    pub linked_ticket_count: usize,
+    pub linked_tickets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectiveQueryResponse {
+    pub items: Vec<ObjectiveQueryItem>,
+    pub page: QueryPage,
+    pub record_authority: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ObjectiveShowRequest {
+    pub event_limit: Option<usize>,
+    pub event_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct ObjectiveEventDetail {
+    pub event_ref: String,
+    pub kind: String,
+    pub body: Option<String>,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObjectiveSummary {
     pub id: String,
@@ -201,12 +374,15 @@ pub struct ObjectiveDetail {
     pub id: String,
     pub title: String,
     pub state: String,
+    pub revision: String,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub linked_tickets: Vec<String>,
     pub resources: Vec<ObjectiveResourceSummary>,
     pub body: String,
     pub body_truncated: bool,
+    pub events: Vec<ObjectiveEventDetail>,
+    pub event_page: QueryPage,
     pub record_source: String,
 }
 
@@ -227,7 +403,16 @@ pub fn ticket_api_typescript() -> String {
         InvalidProjectRecord::decl(&config),
         TicketSummary::decl(&config),
         TicketListResponse::decl(&config),
+        QueryPage::decl(&config),
         TicketEventDetail::decl(&config),
+        ObjectiveLinkSummary::decl(&config),
+        TicketEvidenceEvent::decl(&config),
+        TicketMergeRequestSummary::decl(&config),
+        TicketEvidenceSummary::decl(&config),
+        TicketQueryRequest::decl(&config),
+        TicketQueryItem::decl(&config),
+        TicketQueryResponse::decl(&config),
+        TicketShowRequest::decl(&config),
         TicketRelation::decl(&config),
         DerivedTicketRelation::decl(&config),
         TicketRelationBlocker::decl(&config),

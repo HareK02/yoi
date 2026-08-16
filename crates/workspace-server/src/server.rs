@@ -92,7 +92,10 @@ use crate::observation::{
     RuntimeObservationSource, RuntimeObservationSourceConfig,
 };
 use crate::profile_settings::UpdateWorkspaceMetadataRequest;
-use crate::records::{ObjectiveDetail, ProjectRecordList, TicketDetail};
+use crate::records::{
+    ObjectiveDetail, ObjectiveQueryRequest, ObjectiveQueryResponse, ObjectiveShowRequest,
+    ProjectRecordList, TicketDetail, TicketQueryRequest, TicketQueryResponse, TicketShowRequest,
+};
 use crate::repositories::{
     ConfiguredRepository, MergeTargetObservation, RepositoryListProjection, RepositoryLogRead,
     RepositoryLookupError, RepositoryRegistryReader, RepositorySummary,
@@ -1233,6 +1236,10 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             get(scoped_list_tickets).post(scoped_create_ticket_record),
         )
         .route(
+            "/api/w/{workspace_id}/tickets/query",
+            post(scoped_query_tickets),
+        )
+        .route(
             "/api/w/{workspace_id}/memory",
             get(scoped_get_memory_document),
         )
@@ -1369,6 +1376,10 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             get(scoped_get_ticket).patch(scoped_edit_ticket_item),
         )
         .route(
+            "/api/w/{workspace_id}/tickets/{id}/show",
+            post(scoped_show_ticket),
+        )
+        .route(
             "/api/w/{workspace_id}/tickets/{id}/assignment",
             get(scoped_get_ticket_worker_assignment)
                 .put(scoped_set_ticket_worker_assignment)
@@ -1399,10 +1410,18 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             "/api/w/{workspace_id}/objectives",
             get(scoped_list_objectives).post(scoped_create_objective),
         )
+        .route(
+            "/api/w/{workspace_id}/objectives/query",
+            post(scoped_query_objectives),
+        )
         .route("/api/objectives/{id}", get(get_objective))
         .route(
             "/api/w/{workspace_id}/objectives/{objective_id}",
             get(scoped_get_objective).patch(scoped_edit_objective),
+        )
+        .route(
+            "/api/w/{workspace_id}/objectives/{objective_id}/show",
+            post(scoped_show_objective),
         )
         .route(
             "/api/w/{workspace_id}/objectives/{objective_id}/state",
@@ -2641,6 +2660,24 @@ async fn scoped_get_ticket(
 ) -> ApiResult<Json<TicketDetail>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     get_ticket(State(api), AxumPath(path.id)).await
+}
+
+async fn scoped_query_tickets(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Json(query): Json<TicketQueryRequest>,
+) -> ApiResult<Json<TicketQueryResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    Ok(Json(api.authority.query_tickets(query)?))
+}
+
+async fn scoped_show_ticket(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRecordPath>,
+    Json(query): Json<TicketShowRequest>,
+) -> ApiResult<Json<TicketDetail>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    Ok(Json(api.authority.show_ticket(&path.id, query)?))
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -5579,6 +5616,26 @@ async fn scoped_get_objective(
 ) -> ApiResult<Json<ObjectiveDetail>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     get_objective(State(api), AxumPath(path.objective_id)).await
+}
+
+async fn scoped_query_objectives(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Json(query): Json<ObjectiveQueryRequest>,
+) -> ApiResult<Json<ObjectiveQueryResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    Ok(Json(api.authority.query_objectives(query)?))
+}
+
+async fn scoped_show_objective(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedObjectivePath>,
+    Json(query): Json<ObjectiveShowRequest>,
+) -> ApiResult<Json<ObjectiveDetail>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    Ok(Json(
+        api.authority.show_objective(&path.objective_id, query)?,
+    ))
 }
 
 async fn scoped_create_objective(
@@ -17704,9 +17761,63 @@ mod tests {
         assert_eq!(scoped_objective["id"], "00000000001J3");
         assert_eq!(scoped_objective["record_source"], "workspace-sqlite");
         assert_eq!(
+            scoped_objective["revision"].as_str().unwrap().is_empty(),
+            false
+        );
+        assert_eq!(
             scoped_objective["resources"][0]["path"],
             "memory-architecture-overview.md"
         );
+        let queried_tickets = request_json(
+            app.clone(),
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/tickets/query"),
+            Some(json!({
+                "limit": 1
+            })),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(queried_tickets["items"][0]["title"], "API Ticket");
+        let queried_ticket_id = queried_tickets["items"][0]["id"]
+            .as_str()
+            .expect("query Ticket id")
+            .to_string();
+        assert_eq!(queried_tickets["page"]["limit"], 1);
+        let shown_ticket = request_json(
+            app.clone(),
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{queried_ticket_id}/show"),
+            Some(json!({"event_limit": 10})),
+            StatusCode::OK,
+        )
+        .await;
+        assert!(shown_ticket["evidence"]["missing"].is_array());
+        assert!(shown_ticket["item_revision"].as_str().is_some());
+        let queried_objectives = request_json(
+            app.clone(),
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/objectives/query"),
+            Some(json!({
+                "text": "Objective body",
+                "linked_ticket_id": "00000000001J2",
+                "limit": 1
+            })),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(queried_objectives["items"][0]["id"], "00000000001J3");
+        assert_eq!(queried_objectives["page"]["limit"], 1);
+        let shown_objective = request_json(
+            app.clone(),
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/objectives/00000000001J3/show"),
+            Some(json!({"event_limit": 10})),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(shown_objective["linked_tickets"][0], "00000000001J2");
+        assert!(shown_objective["event_page"]["returned"].is_number());
 
         let memory_document =
             get_json(app.clone(), &format!("/api/w/{TEST_WORKSPACE_ID}/memory")).await;
