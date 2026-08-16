@@ -12,7 +12,6 @@ pub const MERGE_REQUEST_COMMON_TOOL_NAMES: &[&str] = &[
     "MergeRequestReadinessCheck",
     "MergeRequestOpen",
     "MergeRequestAddRevision",
-    "MergeRequestRecordMergeResult",
     "MergeRequestComplete",
 ];
 pub const MERGE_REQUEST_REVIEW_TOOL_NAME: &str = "MergeRequestReviewSubmit";
@@ -22,7 +21,6 @@ enum Kind {
     Readiness,
     Open,
     AddRevision,
-    RecordMergeResult,
     Complete,
     Review,
 }
@@ -63,10 +61,10 @@ struct AddRevisionInput {
     summary: String,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
-struct RecordMergeResultInput {
+struct CompleteInput {
     ticket: String,
-    expected_current_revision_id: String,
     operation_id: String,
+    expected_revision_id: String,
     target_commit: String,
     source_commit: String,
     result_commit: String,
@@ -85,12 +83,6 @@ enum MergeResolutionInput {
     None,
     Clean,
     ConflictsResolved,
-}
-#[derive(Debug, Deserialize, JsonSchema)]
-struct CompleteInput {
-    ticket: String,
-    operation_id: String,
-    expected_revision_id: String,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ReviewInput {
@@ -125,7 +117,6 @@ impl Kind {
             Self::Readiness => "MergeRequestReadinessCheck",
             Self::Open => "MergeRequestOpen",
             Self::AddRevision => "MergeRequestAddRevision",
-            Self::RecordMergeResult => "MergeRequestRecordMergeResult",
             Self::Complete => "MergeRequestComplete",
             Self::Review => "MergeRequestReviewSubmit",
         }
@@ -138,7 +129,6 @@ impl Kind {
             Self::Show | Self::Readiness => json!(schemars::schema_for!(ShowInput)),
             Self::Open => json!(schemars::schema_for!(OpenInput)),
             Self::AddRevision => json!(schemars::schema_for!(AddRevisionInput)),
-            Self::RecordMergeResult => json!(schemars::schema_for!(RecordMergeResultInput)),
             Self::Complete => json!(schemars::schema_for!(CompleteInput)),
             Self::Review => json!(schemars::schema_for!(ReviewInput)),
         }
@@ -202,8 +192,8 @@ impl Tool for MergeRequestTool {
                     ),
                 )
             }
-            Kind::RecordMergeResult => {
-                let v: RecordMergeResultInput = parse(input)?;
+            Kind::Complete => {
+                let v: CompleteInput = parse(input)?;
                 nonempty(&v.ticket)?;
                 let strategy = match v.strategy {
                     MergeStrategyInput::FastForward => "fast_forward",
@@ -217,25 +207,11 @@ impl Tool for MergeRequestTool {
                 (
                     WorkspaceRequestMethod::Post,
                     format!(
-                        "/api/w/{workspace_id}/tickets/{}/merge-request/merge-results",
-                        v.ticket
-                    ),
-                    Some(
-                        json!({"expected_current_revision_id":v.expected_current_revision_id,"operation_id":v.operation_id,"target_commit":v.target_commit,"source_commit":v.source_commit,"result_commit":v.result_commit,"strategy":strategy,"resolution":resolution}),
-                    ),
-                )
-            }
-            Kind::Complete => {
-                let v: CompleteInput = parse(input)?;
-                nonempty(&v.ticket)?;
-                (
-                    WorkspaceRequestMethod::Post,
-                    format!(
                         "/api/w/{workspace_id}/tickets/{}/merge-request/complete",
                         v.ticket
                     ),
                     Some(
-                        json!({"operation_id":v.operation_id,"expected_revision_id":v.expected_revision_id}),
+                        json!({"operation_id":v.operation_id,"expected_revision_id":v.expected_revision_id,"target_commit":v.target_commit,"source_commit":v.source_commit,"result_commit":v.result_commit,"strategy":strategy,"resolution":resolution}),
                     ),
                 )
             }
@@ -310,7 +286,6 @@ pub fn common_tools(client: Arc<dyn WorkspaceClient>) -> Vec<ToolDefinition> {
         definition(client.clone(), Kind::Readiness),
         definition(client.clone(), Kind::Open),
         definition(client.clone(), Kind::AddRevision),
-        definition(client.clone(), Kind::RecordMergeResult),
         definition(client, Kind::Complete),
     ]
 }
@@ -338,9 +313,6 @@ pub fn description(name: &str) -> Option<&'static str> {
         "MergeRequestAddRevision" => {
             Some("Append an immutable revision; prior approval cannot carry to the new revision.")
         }
-        "MergeRequestRecordMergeResult" => Some(
-            "Record validated immutable integration evidence for the current source revision and target tip.",
-        ),
         "MergeRequestComplete" => {
             Some("CAS-complete an approved revision with operation-id replay and crash fencing.")
         }
@@ -356,14 +328,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn merge_request_tool_contract_omits_tree_hashes_and_exposes_merge_result() {
+    fn merge_request_tool_contract_omits_tree_hashes_and_candidate_result_tool() {
         let open = serde_json::to_string(&schemars::schema_for!(OpenInput)).unwrap();
         let add = serde_json::to_string(&schemars::schema_for!(AddRevisionInput)).unwrap();
-        let result = serde_json::to_string(&schemars::schema_for!(RecordMergeResultInput)).unwrap();
+        let complete = serde_json::to_string(&schemars::schema_for!(CompleteInput)).unwrap();
         assert!(!open.contains("head_tree"));
         assert!(!add.contains("head_tree"));
-        assert!(result.contains("fast_forward"));
-        assert!(result.contains("conflicts_resolved"));
-        assert!(MERGE_REQUEST_COMMON_TOOL_NAMES.contains(&"MergeRequestRecordMergeResult"));
+        assert!(complete.contains("result_commit"));
+        assert!(complete.contains("conflicts_resolved"));
+        assert!(!MERGE_REQUEST_COMMON_TOOL_NAMES.contains(&"MergeRequestRecordMergeResult"));
     }
 }

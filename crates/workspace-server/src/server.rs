@@ -1291,10 +1291,6 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             post(scoped_add_merge_request_revision),
         )
         .route(
-            "/api/w/{workspace_id}/tickets/{id}/merge-request/merge-results",
-            post(scoped_record_merge_request_result),
-        )
-        .route(
             "/api/w/{workspace_id}/internal/reviewer-child-sessions",
             post(scoped_register_reviewer_child_session),
         )
@@ -3542,17 +3538,6 @@ struct AddMergeRequestRevisionRequest {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct RecordMergeResultRequest {
-    expected_current_revision_id: String,
-    operation_id: String,
-    target_commit: String,
-    source_commit: String,
-    result_commit: String,
-    strategy: merge_request::MergeStrategy,
-    resolution: merge_request::MergeResolution,
-}
-
-#[derive(Debug, serde::Deserialize)]
 struct RegisterReviewerChildSessionRequest {
     child_session_id: String,
 }
@@ -3561,8 +3546,6 @@ struct RegisterReviewerChildSessionRequest {
 struct RegisterMergeRequestReviewAttemptRequest {
     attempt_id: String,
     revision_id: String,
-    #[serde(default)]
-    merge_result_id: Option<String>,
     child_session_id: String,
     capability_token: String,
 }
@@ -3570,8 +3553,6 @@ struct RegisterMergeRequestReviewAttemptRequest {
 #[derive(Debug, serde::Deserialize)]
 struct SubmitMergeRequestReviewRequest {
     revision_id: String,
-    #[serde(default)]
-    merge_result_id: Option<String>,
     capability_token: String,
     decision: merge_request::ReviewDecision,
     #[serde(default)]
@@ -3584,6 +3565,11 @@ struct SubmitMergeRequestReviewRequest {
 struct CompleteMergeRequestRequest {
     operation_id: String,
     expected_revision_id: String,
+    target_commit: String,
+    source_commit: String,
+    result_commit: String,
+    strategy: merge_request::MergeStrategy,
+    resolution: merge_request::MergeResolution,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -3840,105 +3826,6 @@ async fn scoped_add_merge_request_revision(
     Ok(Json(mr))
 }
 
-async fn scoped_record_merge_request_result(
-    State(api): State<WorkspaceApi>,
-    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
-    headers: HeaderMap,
-    Json(input): Json<RecordMergeResultRequest>,
-) -> ApiResult<Json<merge_request::RecordMergeResultOutcome>> {
-    require_workspace_access(&workspace_id, &api)?;
-    let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
-    require_online_workspace_orchestrator_source(&api, &source)?;
-    let store = merge_request_store(&api, &workspace_id)?;
-    let mr = store.show_for_ticket(&ticket_id)?.ok_or_else(|| {
-        Error::from(merge_request::MergeRequestError::NotFound(
-            ticket_id.clone(),
-        ))
-    })?;
-    if mr.current_revision.revision_id != input.expected_current_revision_id {
-        return Err(
-            Error::from(merge_request::MergeRequestError::StaleRevision {
-                expected: input.expected_current_revision_id,
-                current: mr.current_revision.revision_id,
-            })
-            .into(),
-        );
-    }
-    let target = api
-        .repository_reader()
-        .observe_merge_target(&mr.repository_id, mr.target_ref_selector.as_deref())
-        .map_err(repository_merge_evidence_error)?;
-    let supplied_target = api
-        .repository_reader()
-        .observe_commit(&mr.repository_id, &input.target_commit)
-        .map_err(repository_merge_evidence_error)?;
-    let supplied_source = api
-        .repository_reader()
-        .observe_commit(&mr.repository_id, &input.source_commit)
-        .map_err(repository_merge_evidence_error)?;
-    let supplied_result = api
-        .repository_reader()
-        .observe_commit(&mr.repository_id, &input.result_commit)
-        .map_err(repository_merge_evidence_error)?;
-    if target.commit != supplied_target.commit {
-        return Err(Error::InvalidInput(
-            "MergeResult target_commit is not the current target tip".into(),
-        )
-        .into());
-    }
-    if mr.current_revision.head_commit != supplied_source.commit {
-        return Err(Error::InvalidInput(
-            "MergeResult source_commit is not the current source revision".into(),
-        )
-        .into());
-    }
-    match input.strategy {
-        merge_request::MergeStrategy::FastForward => {
-            if input.resolution != merge_request::MergeResolution::None
-                || supplied_result.commit != supplied_source.commit
-            {
-                return Err(Error::InvalidInput(
-                    "fast-forward MergeResult must use the source commit and resolution=none"
-                        .into(),
-                )
-                .into());
-            }
-            api.repository_reader()
-                .ensure_ancestor(&mr.repository_id, &target.commit, &supplied_source.commit)
-                .map_err(repository_merge_evidence_error)?;
-        }
-        merge_request::MergeStrategy::Merge => {
-            if input.resolution == merge_request::MergeResolution::None {
-                return Err(Error::InvalidInput(
-                    "merge MergeResult requires clean or conflicts_resolved resolution".into(),
-                )
-                .into());
-            }
-            if supplied_result.parents.len() != 2
-                || !supplied_result.parents.contains(&target.commit)
-                || !supplied_result.parents.contains(&supplied_source.commit)
-            {
-                return Err(Error::InvalidInput("merge result commit must have exactly the target and source commits as parents".into()).into());
-            }
-        }
-    }
-    let outcome = store.record_merge_result(merge_request::RecordMergeResult {
-        merge_result_id: format!("MRG-{}", Uuid::new_v4()),
-        ticket_id,
-        expected_revision_id: mr.current_revision.revision_id,
-        target_commit: target.commit,
-        source_commit: supplied_source.commit,
-        result_commit: supplied_result.commit,
-        strategy: input.strategy,
-        resolution: input.resolution,
-        operation_id: input.operation_id,
-        actor_runtime_id: source.runtime_id,
-        actor_worker_id: source.worker_id,
-        created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-    })?;
-    Ok(Json(outcome))
-}
-
 async fn scoped_register_reviewer_child_session(
     State(api): State<WorkspaceApi>,
     headers: HeaderMap,
@@ -3974,9 +3861,7 @@ async fn scoped_register_merge_request_review_attempt(
         .ok_or_else(|| {
             Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
         })?;
-    if input.merge_result_id.is_some() {
-        require_online_workspace_orchestrator_source(&api, &source)?;
-    } else if assignment.worker.runtime_id != source.runtime_id
+    if assignment.worker.runtime_id != source.runtime_id
         || assignment.worker.worker_id != source.worker_id
     {
         return Err(Error::TicketAssignmentConflict(
@@ -3989,7 +3874,6 @@ async fn scoped_register_merge_request_review_attempt(
             attempt_id: input.attempt_id,
             ticket_id,
             revision_id: input.revision_id,
-            merge_result_id: input.merge_result_id,
             parent_assignment_id: assignment.assignment_id,
             parent_runtime_id: source.runtime_id,
             parent_worker_id: source.worker_id,
@@ -4011,7 +3895,6 @@ async fn scoped_submit_merge_request_review(
         merge_request_store(&api, &workspace_id)?.submit_review(merge_request::SubmitReview {
             ticket_id,
             revision_id: input.revision_id,
-            merge_result_id: input.merge_result_id,
             capability_token: input.capability_token,
             decision: input.decision,
             body: input.body,
@@ -4038,47 +3921,141 @@ async fn scoped_complete_merge_request(
             Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
         })?;
     let store = merge_request_store(&api, &workspace_id)?;
-    let current = store.show_for_ticket(&ticket_id)?.ok_or_else(|| {
-        Error::from(merge_request::MergeRequestError::NotFound(
-            ticket_id.clone(),
-        ))
-    })?;
-    let target_commit = observe_merge_request_target(&api, &current);
-    let observed = store
-        .show_for_ticket_with_target(&ticket_id, target_commit.as_deref())?
-        .ok_or_else(|| {
-            Error::from(merge_request::MergeRequestError::NotFound(
-                ticket_id.clone(),
-            ))
-        })?;
-    let final_result = observed
-        .final_merge_result
-        .as_ref()
-        .ok_or(merge_request::MergeRequestError::FinalMergeResultMissing)?;
-    if final_result.target_status != merge_request::MergeResultTargetStatus::Applied {
-        return Err(merge_request::MergeRequestError::FinalMergeResultNotApplied.into());
+    let mr = store
+        .show_for_ticket(&ticket_id)?
+        .ok_or_else(|| merge_request::MergeRequestError::NotFound(ticket_id.clone()))?;
+    if mr.current_revision.revision_id != input.expected_revision_id {
+        return Err(merge_request::MergeRequestError::StaleRevision {
+            expected: input.expected_revision_id,
+            current: mr.current_revision.revision_id,
+        }
+        .into());
     }
-    let readiness = store.readiness_for_ticket_with_target(&ticket_id, target_commit.as_deref())?;
-    if !readiness.ready {
+    if mr.review_status != merge_request::ReviewStatus::Approved {
+        return Err(merge_request::MergeRequestError::NotApproved.into());
+    }
+    if input.source_commit != mr.current_revision.head_commit {
+        return Err(merge_request::MergeRequestError::InvalidMergeOutcome(
+            "source commit does not match the current approved revision".into(),
+        )
+        .into());
+    }
+    if mr.state == merge_request::MergeRequestState::Merged {
+        return Ok(Json(store.complete(
+            merge_request::CompleteMergeRequest {
+                operation_id: input.operation_id,
+                ticket_id,
+                expected_revision_id: mr.current_revision.revision_id,
+                target_commit: input.target_commit,
+                source_commit: input.source_commit,
+                result_commit: input.result_commit,
+                strategy: input.strategy,
+                resolution: input.resolution,
+                implementation_assignment_id: assignment.assignment_id,
+                completion_actor_runtime_id: source.runtime_id,
+                completion_actor_worker_id: source.worker_id,
+                now: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            },
+        )?));
+    }
+    let selector = mr
+        .target_ref_selector
+        .as_deref()
+        .ok_or(merge_request::MergeRequestError::UnknownTarget)?;
+    let repositories = api.repository_reader();
+    let observed_target = repositories
+        .observe_merge_target(&mr.repository_id, Some(selector))
+        .map_err(repository_merge_evidence_error)?;
+    let source_commit = repositories
+        .observe_commit(&mr.repository_id, &input.source_commit)
+        .map_err(repository_merge_evidence_error)?;
+    if source_commit.commit != input.source_commit {
+        return Err(Error::InvalidInput("source commit must be canonical".into()).into());
+    }
+    let result_commit = repositories
+        .observe_commit(&mr.repository_id, &input.result_commit)
+        .map_err(repository_merge_evidence_error)?;
+    if result_commit.commit != input.result_commit {
+        return Err(Error::InvalidInput("result commit must be canonical".into()).into());
+    }
+    match input.strategy {
+        merge_request::MergeStrategy::FastForward => {
+            if input.resolution != merge_request::MergeResolution::None
+                || input.result_commit != input.source_commit
+            {
+                return Err(merge_request::MergeRequestError::InvalidMergeOutcome(
+                    "fast-forward result must equal the approved source and use resolution=none"
+                        .into(),
+                )
+                .into());
+            }
+            repositories
+                .ensure_ancestor(
+                    &mr.repository_id,
+                    &input.target_commit,
+                    &input.source_commit,
+                )
+                .map_err(repository_merge_evidence_error)?;
+        }
+        merge_request::MergeStrategy::Merge => {
+            if input.resolution == merge_request::MergeResolution::None
+                || result_commit.parents
+                    != vec![input.target_commit.clone(), input.source_commit.clone()]
+            {
+                return Err(merge_request::MergeRequestError::InvalidMergeOutcome(
+                    "merge result must have the expected target and approved source as its two ordered parents"
+                        .into(),
+                )
+                .into());
+            }
+        }
+    }
+    let target_was_already_updated = observed_target.commit == input.result_commit;
+    if observed_target.commit != input.target_commit && !target_was_already_updated {
         return Err(Error::InvalidInput(format!(
-            "Merge Request is not completion-ready: {}",
-            readiness.blockers.join("; ")
+            "Merge Request target moved: expected {}, observed {}",
+            input.target_commit, observed_target.commit
         ))
         .into());
     }
-    let outcome = store.complete(merge_request::CompleteMergeRequest {
+    if !target_was_already_updated {
+        repositories
+            .update_merge_target(
+                &mr.repository_id,
+                selector,
+                &input.target_commit,
+                &input.result_commit,
+            )
+            .map_err(repository_merge_evidence_error)?;
+    }
+    let completion = merge_request::CompleteMergeRequest {
         operation_id: input.operation_id,
         ticket_id,
-        expected_revision_id: input.expected_revision_id,
-        expected_merge_result_id: final_result.merge_result_id.clone(),
-        observed_target_commit: target_commit
-            .ok_or(merge_request::MergeRequestError::FinalMergeResultNotApplied)?,
+        expected_revision_id: mr.current_revision.revision_id,
+        target_commit: input.target_commit.clone(),
+        source_commit: input.source_commit,
+        result_commit: input.result_commit.clone(),
+        strategy: input.strategy,
+        resolution: input.resolution,
         implementation_assignment_id: assignment.assignment_id,
         completion_actor_runtime_id: source.runtime_id,
         completion_actor_worker_id: source.worker_id,
         now: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-    })?;
-    Ok(Json(outcome))
+    };
+    match store.complete(completion) {
+        Ok(outcome) => Ok(Json(outcome)),
+        Err(error) => {
+            if !target_was_already_updated {
+                let _ = repositories.update_merge_target(
+                    &mr.repository_id,
+                    selector,
+                    &input.result_commit,
+                    &input.target_commit,
+                );
+            }
+            Err(error.into())
+        }
+    }
 }
 
 async fn scoped_reopen_merge_request(
@@ -4089,9 +4066,7 @@ async fn scoped_reopen_merge_request(
 ) -> ApiResult<Json<merge_request::MergeRequest>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
     require_workspace_access(&workspace_id, &api)?;
-    if headers.contains_key("authorization") {
-        return Err(Error::BrowserReopenConfirmationRequired.into());
-    }
+    reject_non_browser_reopen_auth(&headers)?;
     let _actor = require_actor(&api, &headers).await?;
     if !input.explicit_confirmation {
         return Err(Error::BrowserReopenConfirmationRequired.into());
@@ -4101,6 +4076,13 @@ async fn scoped_reopen_merge_request(
         &input.expected_revision_id,
         &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
     )?))
+}
+
+fn reject_non_browser_reopen_auth(headers: &HeaderMap) -> Result<()> {
+    if headers.contains_key("authorization") {
+        return Err(Error::BrowserReopenConfirmationRequired);
+    }
+    Ok(())
 }
 
 async fn scoped_close_ticket_record(
@@ -11720,6 +11702,17 @@ mod tests {
     };
 
     #[test]
+    fn reopen_confirmation_rejects_api_token_actor_before_session_resolution() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer api-token".parse().unwrap());
+        assert!(matches!(
+            reject_non_browser_reopen_auth(&headers),
+            Err(Error::BrowserReopenConfirmationRequired)
+        ));
+        assert!(reject_non_browser_reopen_auth(&HeaderMap::new()).is_ok());
+    }
+
+    #[test]
     fn flow_or_generic_worker_state_change_is_not_ticket_completion_authority() {
         let operation = TicketBackendOperation::SetWorkflowState {
             id: TicketIdOrSlug::Query("T1".to_string()),
@@ -12365,42 +12358,36 @@ mod tests {
     async fn merge_request_completion_endpoint_rejects_coder_and_accepts_orchestrator() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
-        let git_output = |args: &[&str]| {
+        let git_value = |args: &[&str]| {
             let output = std::process::Command::new("git")
                 .arg("-C")
                 .arg(workspace.path())
                 .args(args)
                 .output()
                 .unwrap();
-            assert!(output.status.success(), "git {:?} failed", args);
+            assert!(output.status.success());
             String::from_utf8(output.stdout).unwrap().trim().to_string()
         };
-        let base_commit = git_output(&["rev-parse", "HEAD"]);
-        std::fs::write(workspace.path().join("README.md"), "completion candidate\n").unwrap();
+        let target_commit = git_value(&["rev-parse", "HEAD"]);
+        let target_ref = git_value(&["symbolic-ref", "HEAD"]);
+        std::fs::write(workspace.path().join("README.md"), "merge source\n").unwrap();
+        for args in [&["add", "README.md"][..], &["commit", "-m", "source"][..]] {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(workspace.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let source_commit = git_value(&["rev-parse", "HEAD"]);
         assert!(
             std::process::Command::new("git")
                 .arg("-C")
                 .arg(workspace.path())
-                .args(["add", "README.md"])
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(workspace.path())
-                .args(["commit", "-m", "candidate"])
-                .status()
-                .unwrap()
-                .success()
-        );
-        let head_commit = git_output(&["rev-parse", "HEAD"]);
-        assert!(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(workspace.path())
-                .args(["reset", "--hard", &base_commit])
+                .args(["reset", "--hard", &target_commit])
                 .status()
                 .unwrap()
                 .success()
@@ -12441,12 +12428,12 @@ mod tests {
                 merge_request_id: "MR-server-completion".into(),
                 ticket_id: ticket.id.clone(),
                 repository_id: TEST_REPOSITORY_ID.into(),
-                target_ref_selector: "develop".into(),
+                target_ref_selector: target_ref.clone(),
                 revision: merge_request::MergeRequestRevision {
                     revision_id: "V1".into(),
                     ordinal: 1,
-                    base_commit: base_commit.clone(),
-                    head_commit: head_commit.clone(),
+                    base_commit: target_commit.clone(),
+                    head_commit: source_commit.clone(),
 
                     diff_digest: "sha256:diff".into(),
                     changed_paths: vec!["src/lib.rs".into()],
@@ -12472,7 +12459,6 @@ mod tests {
                 attempt_id: "attempt".into(),
                 ticket_id: ticket.id.clone(),
                 revision_id: "V1".into(),
-                merge_result_id: None,
                 parent_assignment_id: assignment.assignment_id.clone(),
                 parent_runtime_id: coder.worker_ref.runtime_id.clone(),
                 parent_worker_id: coder.worker_ref.worker_id.clone(),
@@ -12485,7 +12471,6 @@ mod tests {
             .submit_review(merge_request::SubmitReview {
                 ticket_id: ticket.id.clone(),
                 revision_id: "V1".into(),
-                merge_result_id: None,
                 capability_token: "review-token".into(),
                 decision: merge_request::ReviewDecision::Approve,
                 body: "approved".into(),
@@ -12493,31 +12478,6 @@ mod tests {
                 now: "t3".into(),
             })
             .unwrap();
-        mr_store
-            .record_merge_result(merge_request::RecordMergeResult {
-                operation_id: "record-complete-result".into(),
-                merge_result_id: "result-complete".into(),
-                ticket_id: ticket.id.clone(),
-                expected_revision_id: "V1".into(),
-                target_commit: base_commit.clone(),
-                source_commit: head_commit.clone(),
-                result_commit: head_commit.clone(),
-                strategy: merge_request::MergeStrategy::FastForward,
-                resolution: merge_request::MergeResolution::None,
-                actor_runtime_id: coder.worker_ref.runtime_id.clone(),
-                actor_worker_id: coder.worker_ref.worker_id.clone(),
-                created_at: "t4".into(),
-            })
-            .unwrap();
-        assert!(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(workspace.path())
-                .args(["reset", "--hard", &head_commit])
-                .status()
-                .unwrap()
-                .success()
-        );
 
         let worker_headers = |worker: &RuntimeWorkerRef| {
             let mut headers = HeaderMap::new();
@@ -12534,6 +12494,11 @@ mod tests {
         let request = || CompleteMergeRequestRequest {
             operation_id: "complete-operation".into(),
             expected_revision_id: "V1".into(),
+            target_commit: target_commit.clone(),
+            source_commit: source_commit.clone(),
+            result_commit: source_commit.clone(),
+            strategy: merge_request::MergeStrategy::FastForward,
+            resolution: merge_request::MergeResolution::None,
         };
         let coder_error = scoped_complete_merge_request(
             State(api.clone()),
@@ -12574,6 +12539,35 @@ mod tests {
                 .workflow_state,
             TicketWorkflowState::Done
         );
+        assert_eq!(
+            api.repository_reader()
+                .observe_merge_target(TEST_REPOSITORY_ID, Some(&target_ref))
+                .unwrap()
+                .commit,
+            source_commit
+        );
+        let merged = mr_store.show_for_ticket(&ticket.id).unwrap().unwrap();
+        assert_eq!(
+            merged.merged_target_commit.as_deref(),
+            Some(target_commit.as_str())
+        );
+        assert_eq!(
+            merged.merged_result_commit.as_deref(),
+            Some(source_commit.as_str())
+        );
+        assert_eq!(
+            merged.merge_strategy,
+            Some(merge_request::MergeStrategy::FastForward)
+        );
+        let Json(replayed) = scoped_complete_merge_request(
+            State(api.clone()),
+            worker_headers(&orchestrator),
+            AxumPath((api.config.workspace_id.clone(), ticket.id.clone())),
+            Json(request()),
+        )
+        .await
+        .unwrap();
+        assert!(replayed.replayed);
         let conn = rusqlite::Connection::open(&api.config.database_path).unwrap();
         let actor: String = conn
             .query_row(
@@ -13418,7 +13412,6 @@ mod tests {
         for args in [
             vec!["add", "README.md", ".gitignore"],
             vec!["commit", "-m", "init"],
-            vec!["branch", "-M", "develop"],
         ] {
             let status = std::process::Command::new("git")
                 .arg("-C")

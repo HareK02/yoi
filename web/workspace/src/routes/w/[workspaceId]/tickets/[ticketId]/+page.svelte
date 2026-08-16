@@ -25,16 +25,13 @@
     observed_target_commit?: string | null;
     current_revision: { revision_id: string; head_commit: string; diff_digest: string; changed_paths: string[]; summary: string };
     current_review?: { decision: string; body: string; reviewer_effective_profile: string } | null;
-    final_merge_result?: {
-      merge_result_id: string;
-      target_commit: string;
-      source_commit: string;
-      result_commit: string;
-      strategy: "fast_forward" | "merge";
-      resolution: "none" | "clean" | "conflicts_resolved";
-      target_status: "current" | "applied" | "stale" | "unknown";
-      review_status: "pending" | "approved" | "changes_requested";
-    } | null;
+    merged_revision_id?: string | null;
+    merged_target_commit?: string | null;
+    merged_result_commit?: string | null;
+    merge_strategy?: "fast_forward" | "merge" | null;
+    merge_resolution?: "none" | "clean" | "conflicts_resolved" | null;
+    merged_by_runtime_id?: string | null;
+    merged_by_worker_id?: string | null;
     merged_at?: string | null;
   };
 
@@ -361,15 +358,18 @@
           {#if mergeRequest.observed_target_commit}<p>Target tip <code>{mergeRequest.observed_target_commit}</code></p>{/if}
           <p><code>{mergeRequest.current_revision.revision_id}</code></p>
           <p>Head <code>{mergeRequest.current_revision.head_commit}</code></p>
-          {#if mergeRequest.final_merge_result}
+          {#if mergeRequest.merged_result_commit}
             <p>
-              Final MergeResult <code>{mergeRequest.final_merge_result.merge_result_id}</code> ·
-              {mergeRequest.final_merge_result.strategy} / {mergeRequest.final_merge_result.resolution} ·
-              {mergeRequest.final_merge_result.target_status} / {mergeRequest.final_merge_result.review_status}
+              Final merge · {mergeRequest.merge_strategy} / {mergeRequest.merge_resolution}
             </p>
-            <p>Result <code>{mergeRequest.final_merge_result.result_commit}</code></p>
-          {:else if mergeRequest.state === "open"}
-            <p class="workspace-callout">No final MergeResult has been selected for this revision.</p>
+            <p>
+              Target before <code>{mergeRequest.merged_target_commit}</code> · result
+              <code>{mergeRequest.merged_result_commit}</code>
+            </p>
+            <p>
+              Revision <code>{mergeRequest.merged_revision_id}</code> · completed by
+              <code>{mergeRequest.merged_by_runtime_id}/{mergeRequest.merged_by_worker_id}</code>
+            </p>
           {/if}
           {#if mergeRequest.current_revision.summary}<p>{mergeRequest.current_revision.summary}</p>{/if}
           {#if mergeRequest.current_review}

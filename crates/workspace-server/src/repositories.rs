@@ -97,13 +97,38 @@ pub struct CommitObservation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepositoryLookupError {
-    UnknownRepository { id: RepositoryId },
-    UnsupportedProvider { id: RepositoryId, provider: String },
-    MissingDefaultSelector { id: RepositoryId },
-    InvalidSelector { id: RepositoryId, selector: String },
-    CommitNotFound { id: RepositoryId, commit: String },
-    InvalidCommitRelation { id: RepositoryId, detail: String },
-    ProviderFailure { id: RepositoryId, operation: String },
+    UnknownRepository {
+        id: RepositoryId,
+    },
+    UnsupportedProvider {
+        id: RepositoryId,
+        provider: String,
+    },
+    MissingDefaultSelector {
+        id: RepositoryId,
+    },
+    InvalidSelector {
+        id: RepositoryId,
+        selector: String,
+    },
+    CommitNotFound {
+        id: RepositoryId,
+        commit: String,
+    },
+    InvalidCommitRelation {
+        id: RepositoryId,
+        detail: String,
+    },
+    TargetMoved {
+        id: RepositoryId,
+        selector: String,
+        expected: String,
+        observed: Option<String>,
+    },
+    ProviderFailure {
+        id: RepositoryId,
+        operation: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -284,6 +309,48 @@ impl RepositoryRegistryReader {
                 detail: format!("commit {ancestor} is not an ancestor of {descendant}"),
             })
         }
+    }
+
+    pub fn update_merge_target(
+        &self,
+        id: &str,
+        selector: &str,
+        expected_target: &str,
+        result_commit: &str,
+    ) -> Result<(), RepositoryLookupError> {
+        let repository = self.merge_repository(id)?;
+        if !selector.starts_with("refs/heads/")
+            || selector.starts_with('-')
+            || selector.as_bytes().contains(&0)
+        {
+            return Err(RepositoryLookupError::InvalidSelector {
+                id: id.into(),
+                selector: selector.into(),
+            });
+        }
+        self.observe_commit(id, result_commit)?;
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&repository.path)
+            .args(["update-ref", selector, result_commit, expected_target])
+            .status()
+            .map_err(|_| RepositoryLookupError::ProviderFailure {
+                id: id.into(),
+                operation: "guarded target update".into(),
+            })?;
+        if status.success() {
+            return Ok(());
+        }
+        let observed = self
+            .observe_merge_target(id, Some(selector))
+            .ok()
+            .map(|target| target.commit);
+        Err(RepositoryLookupError::TargetMoved {
+            id: id.into(),
+            selector: selector.into(),
+            expected: expected_target.into(),
+            observed,
+        })
     }
 
     fn merge_repository(&self, id: &str) -> Result<&ConfiguredRepository, RepositoryLookupError> {
@@ -656,6 +723,20 @@ mod tests {
             vec![base.clone()]
         );
         reader.ensure_ancestor("main", &base, &source).unwrap();
+        reader
+            .update_merge_target("main", "refs/heads/main", &base, &source)
+            .unwrap();
+        assert_eq!(
+            reader
+                .observe_merge_target("main", Some("refs/heads/main"))
+                .unwrap()
+                .commit,
+            source
+        );
+        assert!(matches!(
+            reader.update_merge_target("main", "refs/heads/main", &base, &base),
+            Err(RepositoryLookupError::TargetMoved { .. })
+        ));
         assert!(matches!(
             reader.ensure_ancestor("main", &source, &base),
             Err(RepositoryLookupError::InvalidCommitRelation { .. })

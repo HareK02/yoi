@@ -249,7 +249,6 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
 pub struct ReviewerAttemptContext {
     pub ticket_id: String,
     pub revision_id: String,
-    pub merge_result_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -310,14 +309,6 @@ impl WorkspaceClient for ReviewerChildWorkspaceClient {
             object.insert(
                 "revision_id".to_string(),
                 serde_json::Value::String(self.context.revision_id.clone()),
-            );
-            object.insert(
-                "merge_result_id".to_string(),
-                self.context
-                    .merge_result_id
-                    .clone()
-                    .map(serde_json::Value::String)
-                    .unwrap_or(serde_json::Value::Null),
             );
             object.insert(
                 "capability_token".to_string(),
@@ -462,7 +453,6 @@ mod reviewer_client_tests {
             ReviewerAttemptContext {
                 ticket_id: "T1".into(),
                 revision_id: "V1".into(),
-                merge_result_id: None,
             },
             "secret".into(),
         );

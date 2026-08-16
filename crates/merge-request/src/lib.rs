@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 9;
 const REVIEWER_PROFILE: &str = "builtin:reviewer";
 const MAX_SUMMARY_BYTES: usize = 16 * 1024;
 const MAX_REVIEW_BODY_BYTES: usize = 64 * 1024;
@@ -51,18 +51,8 @@ pub enum MergeRequestError {
     NotOpen(String),
     #[error("completion operation id was reused with different input")]
     OperationConflict,
-    #[error("merge result operation id was reused with different input")]
-    MergeResultOperationConflict,
-    #[error("merge result {0} was not found for the current Merge Request revision")]
-    MergeResultNotFound(String),
-    #[error("merge result is not the current final integration candidate")]
-    MergeResultNotFinal,
-    #[error("current final merge result is missing")]
-    FinalMergeResultMissing,
-    #[error("current target does not equal the final merge result commit")]
-    FinalMergeResultNotApplied,
-    #[error("merge result evidence is invalid: {0}")]
-    InvalidMergeResult(String),
+    #[error("completion merge outcome is invalid: {0}")]
+    InvalidMergeOutcome(String),
     #[error("Merge Request target is unknown and must be resolved explicitly")]
     UnknownTarget,
     #[error("Ticket must be inprogress before Merge Request completion (current: {0})")]
@@ -194,15 +184,6 @@ impl MergeResolution {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MergeResultTargetStatus {
-    Current,
-    Applied,
-    Stale,
-    Unknown,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeRequestRevision {
     pub revision_id: String,
@@ -229,8 +210,6 @@ pub struct ReviewFinding {
 pub struct MergeRequestReview {
     pub attempt_id: String,
     pub revision_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub merge_result_id: Option<String>,
     pub decision: ReviewDecision,
     pub body: String,
     pub findings: Vec<ReviewFinding>,
@@ -240,25 +219,6 @@ pub struct MergeRequestReview {
     pub reviewer_child_session_id: String,
     pub reviewer_effective_profile: String,
     pub submitted_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MergeResult {
-    pub merge_result_id: String,
-    pub revision_id: String,
-    pub target_commit: String,
-    pub source_commit: String,
-    pub result_commit: String,
-    pub strategy: MergeStrategy,
-    pub resolution: MergeResolution,
-    pub created_by_runtime_id: String,
-    pub created_by_worker_id: String,
-    pub created_at: String,
-    pub operation_id: String,
-    pub validated_at: String,
-    pub target_status: MergeResultTargetStatus,
-    pub review_status: ReviewStatus,
-    pub current_review: Option<MergeRequestReview>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,14 +237,22 @@ pub struct MergeRequest {
     pub current_revision: MergeRequestRevision,
     pub review_status: ReviewStatus,
     pub current_review: Option<MergeRequestReview>,
-    pub merge_results: Vec<MergeResult>,
-    /// The one explicitly selected final integration candidate. Historical
-    /// candidates remain in `merge_results` but never compete with this pointer.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub final_merge_result: Option<MergeResult>,
     pub created_at: String,
     pub updated_at: String,
-    pub merged_by_account_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_revision_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_target_commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_result_commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_strategy: Option<MergeStrategy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_resolution: Option<MergeResolution>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_by_runtime_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_by_worker_id: Option<String>,
     pub merged_at: Option<String>,
 }
 
@@ -323,7 +291,6 @@ pub struct RegisterReviewAttempt {
     pub attempt_id: String,
     pub ticket_id: String,
     pub revision_id: String,
-    pub merge_result_id: Option<String>,
     pub parent_assignment_id: String,
     pub parent_runtime_id: String,
     pub parent_worker_id: String,
@@ -337,7 +304,6 @@ pub struct RegisterReviewAttempt {
 pub struct SubmitReview {
     pub ticket_id: String,
     pub revision_id: String,
-    pub merge_result_id: Option<String>,
     pub capability_token: String,
     pub decision: ReviewDecision,
     pub body: String,
@@ -346,8 +312,8 @@ pub struct SubmitReview {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecordMergeResult {
-    pub merge_result_id: String,
+pub struct CompleteMergeRequest {
+    pub operation_id: String,
     pub ticket_id: String,
     pub expected_revision_id: String,
     pub target_commit: String,
@@ -355,25 +321,6 @@ pub struct RecordMergeResult {
     pub result_commit: String,
     pub strategy: MergeStrategy,
     pub resolution: MergeResolution,
-    pub operation_id: String,
-    pub actor_runtime_id: String,
-    pub actor_worker_id: String,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RecordMergeResultOutcome {
-    pub merge_result: MergeResult,
-    pub replayed: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompleteMergeRequest {
-    pub operation_id: String,
-    pub ticket_id: String,
-    pub expected_revision_id: String,
-    pub expected_merge_result_id: String,
-    pub observed_target_commit: String,
     pub implementation_assignment_id: String,
     pub completion_actor_runtime_id: String,
     pub completion_actor_worker_id: String,
@@ -398,8 +345,6 @@ pub struct MergeRequestReadiness {
     pub observed_target_commit: Option<String>,
     pub ready: bool,
     pub review_status: ReviewStatus,
-    pub merge_result_id: Option<String>,
-    pub merge_result_review_status: Option<ReviewStatus>,
     pub blockers: Vec<String>,
 }
 
@@ -510,26 +455,6 @@ impl SqliteMergeRequestStore {
         if mr.target_status != MergeRequestTargetStatus::Known || observed_target_commit.is_none() {
             blockers.push("merge request target is unknown or could not be resolved".into());
         }
-        let final_result = mr.final_merge_result.as_ref();
-        match final_result {
-            None if observed_target_commit.is_some() => {
-                blockers.push("current source revision has no final validated MergeResult".into())
-            }
-            Some(result) if result.target_status == MergeResultTargetStatus::Stale => {
-                blockers.push("target moved after the final MergeResult was recorded".into())
-            }
-            Some(result) if result.target_status == MergeResultTargetStatus::Unknown => {
-                blockers.push("final MergeResult target state could not be resolved".into())
-            }
-            Some(result)
-                if matches!(result.strategy, MergeStrategy::Merge)
-                    && result.review_status != ReviewStatus::Approved =>
-            {
-                blockers
-                    .push("non-fast-forward final MergeResult is not independently approved".into())
-            }
-            _ => {}
-        }
         Ok(MergeRequestReadiness {
             ticket_id: ticket_id.to_string(),
             merge_request_id: mr.merge_request_id,
@@ -538,8 +463,6 @@ impl SqliteMergeRequestStore {
             observed_target_commit: mr.observed_target_commit,
             ready: blockers.is_empty(),
             review_status: mr.review_status,
-            merge_result_id: final_result.map(|result| result.merge_result_id.clone()),
-            merge_result_review_status: final_result.map(|result| result.review_status),
             blockers,
         })
     }
@@ -617,10 +540,6 @@ impl SqliteMergeRequestStore {
                 "UPDATE merge_requests SET current_revision_id=?3, updated_at=?4 WHERE workspace_id=?1 AND merge_request_id=?2 AND current_revision_id=?5",
                 params![self.workspace_id, current.merge_request_id, input.revision.revision_id, input.now, input.expected_current_revision_id],
             ).map_err(db)?;
-            conn.execute(
-                "DELETE FROM merge_request_final_results WHERE workspace_id=?1 AND merge_request_id=?2",
-                params![self.workspace_id,current.merge_request_id],
-            ).map_err(db)?;
             load_merge_request(conn, &self.workspace_id, &input.ticket_id)?.ok_or_else(|| MergeRequestError::NotFound(input.ticket_id.clone()))
         })
     }
@@ -659,27 +578,7 @@ impl SqliteMergeRequestStore {
             if mr.current_revision.revision_id != input.revision_id {
                 return Err(MergeRequestError::StaleRevision { expected: input.revision_id.clone(), current: mr.current_revision.revision_id });
             }
-            if let Some(merge_result_id) = input.merge_result_id.as_deref() {
-                let exists: bool = conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM merge_request_merge_results WHERE workspace_id=?1 AND merge_request_id=?2 AND revision_id=?3 AND merge_result_id=?4)",
-                    params![self.workspace_id,mr.merge_request_id,input.revision_id,merge_result_id],
-                    |row| row.get(0),
-                ).map_err(db)?;
-                if !exists {
-                    return Err(MergeRequestError::MergeResultNotFound(merge_result_id.into()));
-                }
-                let is_final: bool = conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM merge_request_final_results WHERE workspace_id=?1 AND merge_request_id=?2 AND revision_id=?3 AND merge_result_id=?4)",
-                    params![self.workspace_id,mr.merge_request_id,input.revision_id,merge_result_id],
-                    |row| row.get(0),
-                ).map_err(db)?;
-                if !is_final {
-                    return Err(MergeRequestError::MergeResultNotFinal);
-                }
-                validate_current_assignment_id(conn, &self.workspace_id, &input.ticket_id, &input.parent_assignment_id)?;
-            } else {
-                validate_current_assignment(conn, &self.workspace_id, &input.ticket_id, &input.parent_assignment_id, &input.parent_runtime_id, &input.parent_worker_id)?;
-            }
+            validate_current_assignment(conn, &self.workspace_id, &input.ticket_id, &input.parent_assignment_id, &input.parent_runtime_id, &input.parent_worker_id)?;
             let effective_profile: Option<String> = conn.query_row(
                 "SELECT effective_profile FROM merge_request_reviewer_child_sessions WHERE workspace_id=?1 AND child_session_id=?2 AND parent_runtime_id=?3 AND parent_worker_id=?4",
                 params![self.workspace_id,input.child_session_id,input.parent_runtime_id,input.parent_worker_id],
@@ -689,8 +588,8 @@ impl SqliteMergeRequestStore {
                 return Err(MergeRequestError::InvalidReviewer);
             }
             conn.execute(
-                "INSERT INTO merge_request_review_attempts (workspace_id, attempt_id, merge_request_id, ticket_id, revision_id, merge_result_id, lifecycle_generation, parent_assignment_id, parent_runtime_id, parent_worker_id, child_session_id, child_effective_profile, capability_token_sha256, status, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'open',?14)",
-                params![self.workspace_id, input.attempt_id, mr.merge_request_id, input.ticket_id, input.revision_id, input.merge_result_id, mr.lifecycle_generation as i64, input.parent_assignment_id, input.parent_runtime_id, input.parent_worker_id, input.child_session_id, REVIEWER_PROFILE, token_hash(&input.capability_token), input.now],
+                "INSERT INTO merge_request_review_attempts (workspace_id, attempt_id, merge_request_id, ticket_id, revision_id, lifecycle_generation, parent_assignment_id, parent_runtime_id, parent_worker_id, child_session_id, child_effective_profile, capability_token_sha256, status, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'open',?13)",
+                params![self.workspace_id, input.attempt_id, mr.merge_request_id, input.ticket_id, input.revision_id, mr.lifecycle_generation as i64, input.parent_assignment_id, input.parent_runtime_id, input.parent_worker_id, input.child_session_id, REVIEWER_PROFILE, token_hash(&input.capability_token), input.now],
             ).map_err(|_| MergeRequestError::InvalidReviewAttempt)?;
             Ok(())
         })
@@ -716,12 +615,12 @@ impl SqliteMergeRequestStore {
         validate_review_input(&input)?;
         self.write(|conn| {
             let token = token_hash(&input.capability_token);
-            let attempt: Option<(String,String,Option<String>,String,String,String,String,String,String,i64)> = conn.query_row(
-                "SELECT attempt_id, merge_request_id, merge_result_id, parent_assignment_id, parent_runtime_id, parent_worker_id, child_session_id, child_effective_profile, status, lifecycle_generation FROM merge_request_review_attempts WHERE workspace_id=?1 AND ticket_id=?2 AND revision_id=?3 AND ((?4 IS NULL AND merge_result_id IS NULL) OR merge_result_id=?4) AND capability_token_sha256=?5",
-                params![self.workspace_id, input.ticket_id, input.revision_id, input.merge_result_id, token],
-                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?)),
+            let attempt: Option<(String,String,String,String,String,String,String,String,i64)> = conn.query_row(
+                "SELECT attempt_id, merge_request_id, parent_assignment_id, parent_runtime_id, parent_worker_id, child_session_id, child_effective_profile, status, lifecycle_generation FROM merge_request_review_attempts WHERE workspace_id=?1 AND ticket_id=?2 AND revision_id=?3 AND capability_token_sha256=?4",
+                params![self.workspace_id, input.ticket_id, input.revision_id, token],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?)),
             ).optional().map_err(db)?;
-            let Some((attempt_id, mr_id, merge_result_id, assignment_id, runtime_id, worker_id, child_session_id, effective_profile, status, lifecycle_generation)) = attempt else {
+            let Some((attempt_id, mr_id, assignment_id, runtime_id, worker_id, child_session_id, effective_profile, status, lifecycle_generation)) = attempt else {
                 return Err(MergeRequestError::InvalidReviewAttempt);
             };
             if status != "open" || effective_profile != REVIEWER_PROFILE || child_session_id == worker_id {
@@ -736,22 +635,10 @@ impl SqliteMergeRequestStore {
             if mr.current_revision.revision_id != input.revision_id {
                 return Err(MergeRequestError::StaleRevision { expected: input.revision_id.clone(), current: mr.current_revision.revision_id });
             }
-            if let Some(merge_result_id) = merge_result_id.as_deref() {
-                let is_final: bool = conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM merge_request_final_results WHERE workspace_id=?1 AND merge_request_id=?2 AND revision_id=?3 AND merge_result_id=?4)",
-                    params![self.workspace_id,mr.merge_request_id,input.revision_id,merge_result_id],
-                    |row| row.get(0),
-                ).map_err(db)?;
-                if !is_final {
-                    return Err(MergeRequestError::MergeResultNotFinal);
-                }
-                validate_current_assignment_id(conn, &self.workspace_id, &input.ticket_id, &assignment_id)?;
-            } else {
-                validate_current_assignment(conn, &self.workspace_id, &input.ticket_id, &assignment_id, &runtime_id, &worker_id)?;
-            }
+            validate_current_assignment(conn, &self.workspace_id, &input.ticket_id, &assignment_id, &runtime_id, &worker_id)?;
             conn.execute(
-                "INSERT INTO merge_request_reviews (workspace_id, attempt_id, merge_request_id, revision_id, merge_result_id, decision, body, submitted_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![self.workspace_id, attempt_id, mr_id, input.revision_id, merge_result_id, input.decision.as_str(), input.body, input.now],
+                "INSERT INTO merge_request_reviews (workspace_id, attempt_id, merge_request_id, revision_id, decision, body, submitted_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![self.workspace_id, attempt_id, mr_id, input.revision_id, input.decision.as_str(), input.body, input.now],
             ).map_err(|_| MergeRequestError::InvalidReviewAttempt)?;
             for (ordinal, finding) in input.findings.iter().enumerate() {
                 nonempty("finding.body", &finding.body)?;
@@ -768,102 +655,14 @@ impl SqliteMergeRequestStore {
         })
     }
 
-    pub fn record_merge_result(
-        &self,
-        input: RecordMergeResult,
-    ) -> Result<RecordMergeResultOutcome> {
-        for (name, value) in [
-            ("merge_result_id", input.merge_result_id.as_str()),
-            ("ticket_id", input.ticket_id.as_str()),
-            ("expected_revision_id", input.expected_revision_id.as_str()),
-            ("target_commit", input.target_commit.as_str()),
-            ("source_commit", input.source_commit.as_str()),
-            ("result_commit", input.result_commit.as_str()),
-            ("operation_id", input.operation_id.as_str()),
-            ("actor_runtime_id", input.actor_runtime_id.as_str()),
-            ("actor_worker_id", input.actor_worker_id.as_str()),
-        ] {
-            nonempty(name, value)?;
-        }
-        if matches!(input.strategy, MergeStrategy::FastForward)
-            && (input.result_commit != input.source_commit
-                || !matches!(input.resolution, MergeResolution::None))
-        {
-            return Err(MergeRequestError::InvalidMergeResult(
-                "fast-forward result must equal the source commit and use resolution=none".into(),
-            ));
-        }
-        if matches!(input.strategy, MergeStrategy::Merge)
-            && matches!(input.resolution, MergeResolution::None)
-        {
-            return Err(MergeRequestError::InvalidMergeResult(
-                "merge strategy requires clean or conflicts_resolved resolution".into(),
-            ));
-        }
-        let fingerprint = merge_result_fingerprint(&input);
-        self.write(|conn| {
-            if let Some((stored, merge_result_id, generation)) = conn
-                .query_row(
-                    "SELECT r.operation_fingerprint,r.merge_result_id,mr.lifecycle_generation FROM merge_request_merge_results r JOIN merge_requests mr ON mr.workspace_id=r.workspace_id AND mr.merge_request_id=r.merge_request_id WHERE r.workspace_id=?1 AND r.operation_id=?2",
-                    params![self.workspace_id,input.operation_id],
-                    |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?)),
-                )
-                .optional()
-                .map_err(db)?
-            {
-                if stored != fingerprint {
-                    return Err(MergeRequestError::MergeResultOperationConflict);
-                }
-                let merge_result = load_merge_result(
-                    conn,
-                    &self.workspace_id,
-                    &merge_result_id,
-                    generation as u64,
-                )?
-                    .ok_or_else(|| MergeRequestError::MergeResultNotFound(merge_result_id.clone()))?;
-                return Ok(RecordMergeResultOutcome { merge_result, replayed: true });
-            }
-            let mr = load_merge_request(conn, &self.workspace_id, &input.ticket_id)?
-                .ok_or_else(|| MergeRequestError::NotFound(input.ticket_id.clone()))?;
-            ensure_open(&mr)?;
-            if mr.target_status != MergeRequestTargetStatus::Known {
-                return Err(MergeRequestError::UnknownTarget);
-            }
-            if mr.current_revision.revision_id != input.expected_revision_id {
-                return Err(MergeRequestError::StaleRevision {
-                    expected: input.expected_revision_id.clone(),
-                    current: mr.current_revision.revision_id,
-                });
-            }
-            if mr.current_revision.head_commit != input.source_commit {
-                return Err(MergeRequestError::InvalidMergeResult(
-                    "source commit does not match the current source revision".into(),
-                ));
-            }
-            conn.execute(
-                "INSERT INTO merge_request_merge_results (workspace_id,merge_result_id,merge_request_id,ticket_id,revision_id,target_commit,source_commit,result_commit,strategy,resolution,created_by_runtime_id,created_by_worker_id,created_at,operation_id,operation_fingerprint,validated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?13)",
-                params![self.workspace_id,input.merge_result_id,mr.merge_request_id,input.ticket_id,input.expected_revision_id,input.target_commit,input.source_commit,input.result_commit,input.strategy.as_str(),input.resolution.as_str(),input.actor_runtime_id,input.actor_worker_id,input.created_at,input.operation_id,fingerprint],
-            ).map_err(db)?;
-            conn.execute(
-                "INSERT INTO merge_request_final_results (workspace_id,merge_request_id,revision_id,merge_result_id,selected_at) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(workspace_id,merge_request_id) DO UPDATE SET revision_id=excluded.revision_id,merge_result_id=excluded.merge_result_id,selected_at=excluded.selected_at",
-                params![self.workspace_id,mr.merge_request_id,input.expected_revision_id,input.merge_result_id,input.created_at],
-            ).map_err(db)?;
-            let merge_result = load_merge_result(conn, &self.workspace_id, &input.merge_result_id, mr.lifecycle_generation)?
-                .ok_or_else(|| MergeRequestError::MergeResultNotFound(input.merge_result_id.clone()))?;
-            Ok(RecordMergeResultOutcome { merge_result, replayed: false })
-        })
-    }
-
     pub fn complete(&self, input: CompleteMergeRequest) -> Result<CompletionOutcome> {
         for (name, value) in [
             ("operation_id", input.operation_id.as_str()),
             ("ticket_id", input.ticket_id.as_str()),
             ("revision_id", input.expected_revision_id.as_str()),
-            ("merge_result_id", input.expected_merge_result_id.as_str()),
-            (
-                "observed_target_commit",
-                input.observed_target_commit.as_str(),
-            ),
+            ("target_commit", input.target_commit.as_str()),
+            ("source_commit", input.source_commit.as_str()),
+            ("result_commit", input.result_commit.as_str()),
             (
                 "implementation_assignment_id",
                 input.implementation_assignment_id.as_str(),
@@ -879,6 +678,7 @@ impl SqliteMergeRequestStore {
         ] {
             nonempty(name, value)?;
         }
+        validate_completion_outcome(&input)?;
         let fingerprint = completion_fingerprint(&input);
         self.write(|conn| {
             if let Some((stored, status, state)) = conn.query_row(
@@ -892,51 +692,36 @@ impl SqliteMergeRequestStore {
                 }
             } else {
                 conn.execute(
-                    "INSERT INTO merge_request_completion_operations (workspace_id, operation_id, ticket_id, revision_id, merge_result_id, authority_kind, implementation_assignment_id, completion_actor_runtime_id, completion_actor_worker_id, fingerprint, status, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,'workspace_orchestrator',?6,?7,?8,?9,'pending',?10,?10)",
-                    params![self.workspace_id, input.operation_id, input.ticket_id, input.expected_revision_id, input.expected_merge_result_id, input.implementation_assignment_id, input.completion_actor_runtime_id, input.completion_actor_worker_id, fingerprint, input.now],
+                    "INSERT INTO merge_request_completion_operations (workspace_id, operation_id, ticket_id, revision_id, authority_kind, implementation_assignment_id, completion_actor_runtime_id, completion_actor_worker_id, target_commit, source_commit, result_commit, strategy, resolution, fingerprint, status, created_at, updated_at) VALUES (?1,?2,?3,?4,'workspace_orchestrator',?5,?6,?7,?8,?9,?10,?11,?12,?13,'pending',?14,?14)",
+                    params![self.workspace_id, input.operation_id, input.ticket_id, input.expected_revision_id, input.implementation_assignment_id, input.completion_actor_runtime_id, input.completion_actor_worker_id, input.target_commit, input.source_commit, input.result_commit, input.strategy.as_str(), input.resolution.as_str(), fingerprint, input.now],
                 ).map_err(db)?;
             }
             let mr = load_merge_request(conn, &self.workspace_id, &input.ticket_id)?
                 .ok_or_else(|| MergeRequestError::NotFound(input.ticket_id.clone()))?;
-            validate_current_implementation_assignment(
-                conn,
-                &self.workspace_id,
-                &input.ticket_id,
-                &input.implementation_assignment_id,
-            )?;
+            validate_current_implementation_assignment(conn, &self.workspace_id, &input.ticket_id, &input.implementation_assignment_id)?;
             ensure_open(&mr)?;
             if mr.current_revision.revision_id != input.expected_revision_id {
                 return Err(MergeRequestError::StaleRevision { expected: input.expected_revision_id.clone(), current: mr.current_revision.revision_id });
             }
+            if mr.current_revision.head_commit != input.source_commit {
+                return Err(MergeRequestError::InvalidMergeOutcome("source commit does not match the current approved revision".into()));
+            }
             if mr.review_status != ReviewStatus::Approved { return Err(MergeRequestError::NotApproved); }
-            let final_result = mr.final_merge_result.as_ref().ok_or(MergeRequestError::FinalMergeResultMissing)?;
-            if final_result.merge_result_id != input.expected_merge_result_id {
-                return Err(MergeRequestError::MergeResultNotFinal);
-            }
-            if final_result.result_commit != input.observed_target_commit {
-                return Err(MergeRequestError::FinalMergeResultNotApplied);
-            }
-            if matches!(final_result.strategy, MergeStrategy::Merge)
-                && final_result.review_status != ReviewStatus::Approved
-            {
-                return Err(MergeRequestError::NotApproved);
-            }
             let current_state: String = conn.query_row(
                 "SELECT workflow_state FROM typed_tickets WHERE workspace_id=?1 AND ticket_id=?2",
                 params![self.workspace_id, input.ticket_id], |row| row.get(0),
             ).optional().map_err(db)?.ok_or_else(|| MergeRequestError::NotFound(input.ticket_id.clone()))?;
-            if current_state != "inprogress" {
-                return Err(MergeRequestError::TicketStateConflict(current_state));
-            }
+            if current_state != "inprogress" { return Err(MergeRequestError::TicketStateConflict(current_state)); }
             let changed = conn.execute(
                 "UPDATE typed_tickets SET workflow_state='done', workflow_state_explicit=1, updated_at=?3 WHERE workspace_id=?1 AND ticket_id=?2 AND workflow_state='inprogress'",
                 params![self.workspace_id, input.ticket_id, input.now],
             ).map_err(db)?;
             if changed != 1 { return Err(MergeRequestError::TicketStateConflict("concurrent_change".into())); }
-            conn.execute(
-                "UPDATE merge_requests SET state='merged',merged_at=?3,updated_at=?3 WHERE workspace_id=?1 AND merge_request_id=?2 AND current_revision_id=?4 AND state='open'",
-                params![self.workspace_id,mr.merge_request_id,input.now,input.expected_revision_id],
+            let merged = conn.execute(
+                "UPDATE merge_requests SET state='merged', merged_revision_id=?3, merged_target_commit=?4, merged_result_commit=?5, merge_strategy=?6, merge_resolution=?7, merged_by_runtime_id=?8, merged_by_worker_id=?9, merged_at=?10, updated_at=?10 WHERE workspace_id=?1 AND merge_request_id=?2 AND state='open' AND current_revision_id=?3",
+                params![self.workspace_id, mr.merge_request_id, input.expected_revision_id, input.target_commit, input.result_commit, input.strategy.as_str(), input.resolution.as_str(), input.completion_actor_runtime_id, input.completion_actor_worker_id, input.now],
             ).map_err(db)?;
+            if merged != 1 { return Err(MergeRequestError::OperationConflict); }
             append_completion_event(conn, &self.workspace_id, &input)?;
             conn.execute(
                 "UPDATE merge_request_completion_operations SET status='completed', result_ticket_state='done', updated_at=?3 WHERE workspace_id=?1 AND operation_id=?2 AND status='pending'",
@@ -1030,14 +815,13 @@ fn migrate_locked(conn: &Connection, force_failure_after_v9_ddl: bool) -> Result
     if !marker_exists {
         if has_merge_request_domain_tables(conn)? {
             return Err(MergeRequestError::Database(
-                "unsupported unversioned legacy merge request schema; automatic migration requires a fresh database or exact version 9"
+                "unsupported unversioned legacy merge request schema; automatic migration requires a fresh database or exact version 8"
                     .into(),
             ));
         }
         conn.execute_batch(MIGRATION_TABLE_SQL).map_err(db)?;
         conn.execute_batch(SCHEMA_V9).map_err(db)?;
-        migrate_v9_to_v10(conn)?;
-        verify_schema_v10(conn)?;
+        verify_schema_shape(conn, SCHEMA_V9, "v9")?;
         ensure_foreign_key_integrity(conn)?;
         replace_schema_marker(conn, SCHEMA_VERSION)?;
         return verify(conn);
@@ -1049,50 +833,113 @@ fn migrate_locked(conn: &Connection, force_failure_after_v9_ddl: bool) -> Result
             verify_marker_state(conn, SCHEMA_VERSION)?;
             verify(conn)
         }
-        9 => {
-            verify_marker_state(conn, 9)?;
-            verify_schema_shape(conn, SCHEMA_V9, "v9").map_err(|_| {
+        8 => {
+            verify_marker_state(conn, 8)?;
+            if verify_schema_shape(conn, SCHEMA_V9, "v9").is_ok() {
+                ensure_foreign_key_integrity(conn)?;
+                replace_schema_marker(conn, SCHEMA_VERSION)?;
+                return verify(conn);
+            }
+            verify_schema_shape(conn, SCHEMA_V8, "v8").map_err(|_| {
                 MergeRequestError::Database(
-                    "schema drift at merge request version 9; automatic migration requires the exact v9 shape"
+                    "schema drift at merge request version 8; automatic migration requires the exact v8 shape or a complete v9 shape for marker repair"
                         .into(),
                 )
             })?;
-            migrate_v9_to_v10(conn)?;
+            migrate_v8_to_v9(conn)?;
             if force_failure_after_v9_ddl {
                 return Err(MergeRequestError::Database(
-                    "forced v9 to v10 migration failure after DDL".into(),
+                    "forced v8 to v9 migration failure after DDL and data copy".into(),
                 ));
             }
-            verify_schema_v10(conn)?;
+            verify_schema_shape(conn, SCHEMA_V9, "v9")?;
             ensure_foreign_key_integrity(conn)?;
             replace_schema_marker(conn, SCHEMA_VERSION)?;
             verify(conn)
         }
-        0..=8 => Err(MergeRequestError::Database(format!(
-            "unsupported legacy merge request schema version {version}; automatic migration only supports exact v9 to v10"
+        0..=7 => Err(MergeRequestError::Database(format!(
+            "unsupported legacy merge request schema version {version}; automatic migration only supports exact v8 to v9"
         ))),
         other => Err(MergeRequestError::Database(format!(
-            "unsupported merge request schema version {other}; expected version 9 or {SCHEMA_VERSION}"
+            "unsupported merge request schema version {other}; expected version 8 or {SCHEMA_VERSION}"
         ))),
     }
 }
 
-fn migrate_v9_to_v10(conn: &Connection) -> Result<()> {
-    conn.execute_batch(MIGRATE_V9_TO_V10_SQL).map_err(db)
-}
+fn migrate_v8_to_v9(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "ALTER TABLE merge_requests ADD COLUMN target_ref_selector TEXT;
+         ALTER TABLE merge_requests ADD COLUMN target_status TEXT NOT NULL DEFAULT 'unknown' CHECK(target_status IN ('known','unknown'));
+         ALTER TABLE merge_requests ADD COLUMN merged_revision_id TEXT;
+         ALTER TABLE merge_requests ADD COLUMN merged_target_commit TEXT;
+         ALTER TABLE merge_requests ADD COLUMN merged_result_commit TEXT;
+         ALTER TABLE merge_requests ADD COLUMN merge_strategy TEXT CHECK(merge_strategy IN ('fast_forward','merge'));
+         ALTER TABLE merge_requests ADD COLUMN merge_resolution TEXT CHECK(merge_resolution IN ('none','clean','conflicts_resolved'));
+         ALTER TABLE merge_requests ADD COLUMN merged_by_runtime_id TEXT;
+         ALTER TABLE merge_requests ADD COLUMN merged_by_worker_id TEXT;
 
-fn verify_schema_v10(conn: &Connection) -> Result<()> {
-    let expected = Connection::open_in_memory().map_err(db)?;
-    expected.execute_batch(SCHEMA_V9).map_err(db)?;
-    expected.execute_batch(MIGRATE_V9_TO_V10_SQL).map_err(db)?;
-    let expected_shape = domain_schema_shape(&expected)?;
-    let actual_shape = domain_schema_shape(conn)?;
-    if actual_shape != expected_shape {
-        return Err(MergeRequestError::Database(
-            "schema drift: merge request v10 shape mismatch".into(),
-        ));
-    }
-    Ok(())
+         CREATE TABLE merge_request_revisions_v9 (
+          workspace_id TEXT NOT NULL, merge_request_id TEXT NOT NULL, revision_id TEXT NOT NULL,
+          ordinal INTEGER NOT NULL, base_commit TEXT NOT NULL, head_commit TEXT NOT NULL,
+          diff_digest TEXT NOT NULL, summary TEXT NOT NULL, assignment_id TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY(workspace_id,merge_request_id,revision_id),
+          UNIQUE(workspace_id,merge_request_id,ordinal),
+          FOREIGN KEY(workspace_id,merge_request_id) REFERENCES merge_requests(workspace_id,merge_request_id) ON DELETE CASCADE
+         );
+         INSERT INTO merge_request_revisions_v9(
+          workspace_id,merge_request_id,revision_id,ordinal,base_commit,head_commit,diff_digest,summary,assignment_id,created_at
+         ) SELECT workspace_id,merge_request_id,revision_id,ordinal,base_commit,head_commit,diff_digest,summary,assignment_id,created_at
+             FROM merge_request_revisions;
+         DROP TABLE merge_request_revisions;
+         ALTER TABLE merge_request_revisions_v9 RENAME TO merge_request_revisions;
+
+         CREATE TABLE merge_request_review_attempts_v9 (
+          workspace_id TEXT NOT NULL, attempt_id TEXT NOT NULL, merge_request_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+          revision_id TEXT NOT NULL, lifecycle_generation INTEGER NOT NULL,
+          parent_assignment_id TEXT NOT NULL, parent_runtime_id TEXT NOT NULL, parent_worker_id TEXT NOT NULL,
+          child_session_id TEXT NOT NULL, child_effective_profile TEXT NOT NULL CHECK(child_effective_profile='builtin:reviewer'),
+          capability_token_sha256 TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('open','submitted','revoked')),
+          created_at TEXT NOT NULL, consumed_at TEXT,
+          PRIMARY KEY(workspace_id,attempt_id), UNIQUE(workspace_id,capability_token_sha256), UNIQUE(workspace_id,child_session_id),
+          FOREIGN KEY(workspace_id,merge_request_id,revision_id) REFERENCES merge_request_revisions(workspace_id,merge_request_id,revision_id),
+          FOREIGN KEY(workspace_id,ticket_id,parent_assignment_id) REFERENCES ticket_worker_assignments(workspace_id,ticket_id,assignment_id),
+          FOREIGN KEY(workspace_id,child_session_id) REFERENCES merge_request_reviewer_child_sessions(workspace_id,child_session_id)
+         );
+         INSERT INTO merge_request_review_attempts_v9(
+          workspace_id,attempt_id,merge_request_id,ticket_id,revision_id,lifecycle_generation,
+          parent_assignment_id,parent_runtime_id,parent_worker_id,child_session_id,child_effective_profile,
+          capability_token_sha256,status,created_at,consumed_at
+         ) SELECT workspace_id,attempt_id,merge_request_id,ticket_id,revision_id,lifecycle_generation,
+                  parent_assignment_id,parent_runtime_id,parent_worker_id,child_session_id,child_effective_profile,
+                  capability_token_sha256,status,created_at,consumed_at
+             FROM merge_request_review_attempts;
+         DROP TABLE merge_request_review_attempts;
+         ALTER TABLE merge_request_review_attempts_v9 RENAME TO merge_request_review_attempts;
+
+         CREATE TABLE merge_request_completion_operations_v9 (
+          workspace_id TEXT NOT NULL, operation_id TEXT NOT NULL, ticket_id TEXT NOT NULL, revision_id TEXT NOT NULL,
+          authority_kind TEXT NOT NULL CHECK(authority_kind IN ('workspace_orchestrator','legacy_assigned_coder')),
+          implementation_assignment_id TEXT NOT NULL, completion_actor_runtime_id TEXT, completion_actor_worker_id TEXT,
+          target_commit TEXT, source_commit TEXT, result_commit TEXT,
+          strategy TEXT CHECK(strategy IN ('fast_forward','merge')),
+          resolution TEXT CHECK(resolution IN ('none','clean','conflicts_resolved')),
+          fingerprint TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','completed')),
+          result_ticket_state TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          PRIMARY KEY(workspace_id,operation_id),
+          FOREIGN KEY(workspace_id,ticket_id) REFERENCES typed_tickets(workspace_id,ticket_id),
+          FOREIGN KEY(workspace_id,ticket_id,implementation_assignment_id)
+            REFERENCES ticket_worker_assignments(workspace_id,ticket_id,assignment_id)
+         );
+         INSERT INTO merge_request_completion_operations_v9(
+          workspace_id,operation_id,ticket_id,revision_id,authority_kind,implementation_assignment_id,
+          completion_actor_runtime_id,completion_actor_worker_id,fingerprint,status,result_ticket_state,created_at,updated_at
+         ) SELECT workspace_id,operation_id,ticket_id,revision_id,authority_kind,implementation_assignment_id,
+                  completion_actor_runtime_id,completion_actor_worker_id,fingerprint,status,result_ticket_state,created_at,updated_at
+             FROM merge_request_completion_operations;
+         DROP TABLE merge_request_completion_operations;
+         ALTER TABLE merge_request_completion_operations_v9 RENAME TO merge_request_completion_operations;",
+    )
+    .map_err(db)
 }
 
 pub fn verify(conn: &Connection) -> Result<()> {
@@ -1108,7 +955,7 @@ pub fn verify(conn: &Connection) -> Result<()> {
         )));
     }
     verify_marker_state(conn, SCHEMA_VERSION)?;
-    verify_schema_v10(conn)
+    verify_schema_shape(conn, SCHEMA_V9, "v9")
 }
 
 fn schema_version(conn: &Connection) -> Result<i64> {
@@ -1458,6 +1305,73 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
 
 const MIGRATION_TABLE: &str = "merge_request_schema_migrations";
 const MIGRATION_TABLE_SQL: &str = "CREATE TABLE merge_request_schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);";
+const SCHEMA_V8: &str = r#"
+CREATE TABLE merge_requests (
+ workspace_id TEXT NOT NULL, merge_request_id TEXT NOT NULL,
+ repository_id TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('draft','open','closed','merged')),
+ lifecycle_generation INTEGER NOT NULL, current_revision_id TEXT NOT NULL,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL, merged_by_account_id TEXT, merged_at TEXT,
+ PRIMARY KEY(workspace_id,merge_request_id),
+ FOREIGN KEY(workspace_id,repository_id) REFERENCES repositories(workspace_id,repository_id)
+);
+CREATE TABLE merge_request_ticket_relations (
+ workspace_id TEXT NOT NULL, merge_request_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+ relation_kind TEXT NOT NULL CHECK(relation_kind='implements'), created_at TEXT NOT NULL,
+ PRIMARY KEY(workspace_id,merge_request_id,ticket_id),
+ FOREIGN KEY(workspace_id,merge_request_id) REFERENCES merge_requests(workspace_id,merge_request_id) ON DELETE CASCADE,
+ FOREIGN KEY(workspace_id,ticket_id) REFERENCES typed_tickets(workspace_id,ticket_id) ON DELETE CASCADE
+);
+CREATE TABLE merge_request_revisions (
+ workspace_id TEXT NOT NULL, merge_request_id TEXT NOT NULL, revision_id TEXT NOT NULL,
+ ordinal INTEGER NOT NULL, base_commit TEXT NOT NULL, head_commit TEXT NOT NULL, head_tree TEXT NOT NULL, diff_digest TEXT NOT NULL,
+ summary TEXT NOT NULL, assignment_id TEXT NOT NULL, created_at TEXT NOT NULL,
+ PRIMARY KEY(workspace_id,merge_request_id,revision_id), UNIQUE(workspace_id,merge_request_id,ordinal),
+ FOREIGN KEY(workspace_id,merge_request_id) REFERENCES merge_requests(workspace_id,merge_request_id) ON DELETE CASCADE
+);
+CREATE TABLE merge_request_revision_paths (
+ workspace_id TEXT NOT NULL, merge_request_id TEXT NOT NULL, revision_id TEXT NOT NULL, ordinal INTEGER NOT NULL, path TEXT NOT NULL,
+ PRIMARY KEY(workspace_id,merge_request_id,revision_id,ordinal),
+ FOREIGN KEY(workspace_id,merge_request_id,revision_id) REFERENCES merge_request_revisions(workspace_id,merge_request_id,revision_id) ON DELETE CASCADE
+);
+CREATE TABLE merge_request_reviewer_child_sessions (
+ workspace_id TEXT NOT NULL, child_session_id TEXT NOT NULL, parent_runtime_id TEXT NOT NULL,
+ parent_worker_id TEXT NOT NULL, effective_profile TEXT NOT NULL CHECK(effective_profile='builtin:reviewer'), registered_at TEXT NOT NULL,
+ PRIMARY KEY(workspace_id,child_session_id)
+);
+CREATE TABLE merge_request_review_attempts (
+ workspace_id TEXT NOT NULL, attempt_id TEXT NOT NULL, merge_request_id TEXT NOT NULL, ticket_id TEXT NOT NULL,
+ revision_id TEXT NOT NULL, lifecycle_generation INTEGER NOT NULL,
+ parent_assignment_id TEXT NOT NULL, parent_runtime_id TEXT NOT NULL, parent_worker_id TEXT NOT NULL,
+ child_session_id TEXT NOT NULL, child_effective_profile TEXT NOT NULL CHECK(child_effective_profile='builtin:reviewer'),
+ capability_token_sha256 TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('open','submitted','revoked')),
+ created_at TEXT NOT NULL, consumed_at TEXT,
+ PRIMARY KEY(workspace_id,attempt_id), UNIQUE(workspace_id,capability_token_sha256), UNIQUE(workspace_id,child_session_id),
+ FOREIGN KEY(workspace_id,merge_request_id,revision_id) REFERENCES merge_request_revisions(workspace_id,merge_request_id,revision_id),
+ FOREIGN KEY(workspace_id,ticket_id,parent_assignment_id) REFERENCES ticket_worker_assignments(workspace_id,ticket_id,assignment_id)
+);
+CREATE TABLE merge_request_reviews (
+ workspace_id TEXT NOT NULL, attempt_id TEXT NOT NULL, merge_request_id TEXT NOT NULL, revision_id TEXT NOT NULL,
+ decision TEXT NOT NULL CHECK(decision IN ('approve','request_changes')), body TEXT NOT NULL, submitted_at TEXT NOT NULL,
+ PRIMARY KEY(workspace_id,attempt_id),
+ FOREIGN KEY(workspace_id,attempt_id) REFERENCES merge_request_review_attempts(workspace_id,attempt_id),
+ FOREIGN KEY(workspace_id,merge_request_id,revision_id) REFERENCES merge_request_revisions(workspace_id,merge_request_id,revision_id)
+);
+CREATE TABLE merge_request_review_findings (
+ workspace_id TEXT NOT NULL, attempt_id TEXT NOT NULL, ordinal INTEGER NOT NULL, severity TEXT NOT NULL,
+ code TEXT, path TEXT, line INTEGER, body TEXT NOT NULL, PRIMARY KEY(workspace_id,attempt_id,ordinal),
+ FOREIGN KEY(workspace_id,attempt_id) REFERENCES merge_request_reviews(workspace_id,attempt_id) ON DELETE CASCADE
+);
+CREATE TABLE merge_request_completion_operations (
+ workspace_id TEXT NOT NULL, operation_id TEXT NOT NULL, ticket_id TEXT NOT NULL, revision_id TEXT NOT NULL,
+ authority_kind TEXT NOT NULL CHECK(authority_kind IN ('workspace_orchestrator','legacy_assigned_coder')),
+ implementation_assignment_id TEXT NOT NULL, completion_actor_runtime_id TEXT, completion_actor_worker_id TEXT,
+ fingerprint TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','completed')),
+ result_ticket_state TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ PRIMARY KEY(workspace_id,operation_id),
+ FOREIGN KEY(workspace_id,ticket_id) REFERENCES typed_tickets(workspace_id,ticket_id)
+);
+"#;
+
 const SCHEMA_V9: &str = r#"
 CREATE TABLE merge_requests (
  workspace_id TEXT NOT NULL, merge_request_id TEXT NOT NULL,
@@ -1466,6 +1380,10 @@ CREATE TABLE merge_requests (
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, merged_by_account_id TEXT, merged_at TEXT,
  target_ref_selector TEXT,
  target_status TEXT NOT NULL DEFAULT 'unknown' CHECK(target_status IN ('known','unknown')),
+ merged_revision_id TEXT, merged_target_commit TEXT, merged_result_commit TEXT,
+ merge_strategy TEXT CHECK(merge_strategy IN ('fast_forward','merge')),
+ merge_resolution TEXT CHECK(merge_resolution IN ('none','clean','conflicts_resolved')),
+ merged_by_runtime_id TEXT, merged_by_worker_id TEXT,
  PRIMARY KEY(workspace_id,merge_request_id),
  FOREIGN KEY(workspace_id,repository_id) REFERENCES repositories(workspace_id,repository_id)
 );
@@ -1499,48 +1417,31 @@ CREATE TABLE merge_request_review_attempts (
  parent_assignment_id TEXT NOT NULL, parent_runtime_id TEXT NOT NULL, parent_worker_id TEXT NOT NULL,
  child_session_id TEXT NOT NULL, child_effective_profile TEXT NOT NULL CHECK(child_effective_profile='builtin:reviewer'),
  capability_token_sha256 TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('open','submitted','revoked')),
- created_at TEXT NOT NULL, consumed_at TEXT, merge_result_id TEXT,
+ created_at TEXT NOT NULL, consumed_at TEXT,
  PRIMARY KEY(workspace_id,attempt_id), UNIQUE(workspace_id,capability_token_sha256), UNIQUE(workspace_id,child_session_id),
  FOREIGN KEY(workspace_id,merge_request_id,revision_id) REFERENCES merge_request_revisions(workspace_id,merge_request_id,revision_id),
  FOREIGN KEY(workspace_id,ticket_id,parent_assignment_id) REFERENCES ticket_worker_assignments(workspace_id,ticket_id,assignment_id),
- FOREIGN KEY(workspace_id,child_session_id) REFERENCES merge_request_reviewer_child_sessions(workspace_id,child_session_id),
- FOREIGN KEY(workspace_id,merge_result_id) REFERENCES merge_request_merge_results(workspace_id,merge_result_id)
+ FOREIGN KEY(workspace_id,child_session_id) REFERENCES merge_request_reviewer_child_sessions(workspace_id,child_session_id)
 );
 CREATE TABLE merge_request_reviews (
  workspace_id TEXT NOT NULL, attempt_id TEXT NOT NULL, merge_request_id TEXT NOT NULL, revision_id TEXT NOT NULL,
  decision TEXT NOT NULL CHECK(decision IN ('approve','request_changes')), body TEXT NOT NULL, submitted_at TEXT NOT NULL,
- merge_result_id TEXT,
  PRIMARY KEY(workspace_id,attempt_id),
  FOREIGN KEY(workspace_id,attempt_id) REFERENCES merge_request_review_attempts(workspace_id,attempt_id),
- FOREIGN KEY(workspace_id,merge_request_id,revision_id) REFERENCES merge_request_revisions(workspace_id,merge_request_id,revision_id),
- FOREIGN KEY(workspace_id,merge_result_id) REFERENCES merge_request_merge_results(workspace_id,merge_result_id)
+ FOREIGN KEY(workspace_id,merge_request_id,revision_id) REFERENCES merge_request_revisions(workspace_id,merge_request_id,revision_id)
 );
 CREATE TABLE merge_request_review_findings (
  workspace_id TEXT NOT NULL, attempt_id TEXT NOT NULL, ordinal INTEGER NOT NULL, severity TEXT NOT NULL,
  code TEXT, path TEXT, line INTEGER, body TEXT NOT NULL, PRIMARY KEY(workspace_id,attempt_id,ordinal),
  FOREIGN KEY(workspace_id,attempt_id) REFERENCES merge_request_reviews(workspace_id,attempt_id) ON DELETE CASCADE
 );
-CREATE TABLE merge_request_merge_results (
- workspace_id TEXT NOT NULL, merge_result_id TEXT NOT NULL, merge_request_id TEXT NOT NULL,
- ticket_id TEXT NOT NULL, revision_id TEXT NOT NULL, target_commit TEXT NOT NULL,
- source_commit TEXT NOT NULL, result_commit TEXT NOT NULL,
- strategy TEXT NOT NULL CHECK(strategy IN ('fast_forward','merge')),
- resolution TEXT NOT NULL CHECK(resolution IN ('none','clean','conflicts_resolved')),
- created_by_runtime_id TEXT NOT NULL, created_by_worker_id TEXT NOT NULL,
- created_at TEXT NOT NULL, operation_id TEXT NOT NULL, operation_fingerprint TEXT NOT NULL,
- validated_at TEXT NOT NULL,
- PRIMARY KEY(workspace_id,merge_result_id),
- UNIQUE(workspace_id,operation_id),
- FOREIGN KEY(workspace_id,merge_request_id,revision_id)
-   REFERENCES merge_request_revisions(workspace_id,merge_request_id,revision_id),
- FOREIGN KEY(workspace_id,ticket_id) REFERENCES typed_tickets(workspace_id,ticket_id)
-);
-CREATE INDEX merge_request_merge_results_current_idx
- ON merge_request_merge_results(workspace_id,merge_request_id,revision_id,target_commit,created_at);
 CREATE TABLE merge_request_completion_operations (
  workspace_id TEXT NOT NULL, operation_id TEXT NOT NULL, ticket_id TEXT NOT NULL, revision_id TEXT NOT NULL,
  authority_kind TEXT NOT NULL CHECK(authority_kind IN ('workspace_orchestrator','legacy_assigned_coder')),
  implementation_assignment_id TEXT NOT NULL, completion_actor_runtime_id TEXT, completion_actor_worker_id TEXT,
+ target_commit TEXT, source_commit TEXT, result_commit TEXT,
+ strategy TEXT CHECK(strategy IN ('fast_forward','merge')),
+ resolution TEXT CHECK(resolution IN ('none','clean','conflicts_resolved')),
  fingerprint TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','completed')),
  result_ticket_state TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
  PRIMARY KEY(workspace_id,operation_id),
@@ -1550,38 +1451,14 @@ CREATE TABLE merge_request_completion_operations (
 );
 "#;
 
-const MIGRATE_V9_TO_V10_SQL: &str = r#"
-CREATE TABLE merge_request_final_results (
- workspace_id TEXT NOT NULL, merge_request_id TEXT NOT NULL, revision_id TEXT NOT NULL,
- merge_result_id TEXT NOT NULL, selected_at TEXT NOT NULL,
- PRIMARY KEY(workspace_id,merge_request_id),
- FOREIGN KEY(workspace_id,merge_request_id,revision_id)
-   REFERENCES merge_request_revisions(workspace_id,merge_request_id,revision_id) ON DELETE CASCADE,
- FOREIGN KEY(workspace_id,merge_result_id)
-   REFERENCES merge_request_merge_results(workspace_id,merge_result_id)
-);
-ALTER TABLE merge_request_completion_operations ADD COLUMN merge_result_id TEXT;
-"#;
-
 #[cfg(test)]
 mod migration_tests {
     use super::*;
 
     const SUPPORT_SCHEMA: &str = r#"
-CREATE TABLE repositories(
- workspace_id TEXT NOT NULL, repository_id TEXT NOT NULL,
- PRIMARY KEY(workspace_id,repository_id)
-);
-CREATE TABLE typed_tickets(
- workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, workflow_state TEXT NOT NULL,
- workflow_state_explicit INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL,
- PRIMARY KEY(workspace_id,ticket_id)
-);
-CREATE TABLE ticket_worker_assignments(
- workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, assignment_id TEXT NOT NULL,
- runtime_id TEXT NOT NULL, worker_id TEXT NOT NULL,
- PRIMARY KEY(workspace_id,ticket_id,assignment_id)
-);
+CREATE TABLE repositories(workspace_id TEXT NOT NULL,repository_id TEXT NOT NULL,PRIMARY KEY(workspace_id,repository_id));
+CREATE TABLE typed_tickets(workspace_id TEXT NOT NULL,ticket_id TEXT NOT NULL,workflow_state TEXT NOT NULL,workflow_state_explicit INTEGER NOT NULL DEFAULT 1,updated_at TEXT NOT NULL,PRIMARY KEY(workspace_id,ticket_id));
+CREATE TABLE ticket_worker_assignments(workspace_id TEXT NOT NULL,ticket_id TEXT NOT NULL,assignment_id TEXT NOT NULL,runtime_id TEXT NOT NULL,worker_id TEXT NOT NULL,PRIMARY KEY(workspace_id,ticket_id,assignment_id));
 "#;
 
     fn fresh_connection() -> Connection {
@@ -1590,27 +1467,29 @@ CREATE TABLE ticket_worker_assignments(
         conn
     }
 
-    fn exact_v9_connection() -> Connection {
+    fn exact_v8_connection() -> Connection {
         let conn = fresh_connection();
         conn.execute_batch(MIGRATION_TABLE_SQL).unwrap();
         conn.execute(
-            "INSERT INTO merge_request_schema_migrations(version) VALUES(9)",
+            "INSERT INTO merge_request_schema_migrations(version) VALUES(8)",
             [],
         )
         .unwrap();
-        conn.execute_batch(SCHEMA_V9).unwrap();
+        conn.execute_batch(SCHEMA_V8).unwrap();
         conn.execute_batch(
             "INSERT INTO repositories VALUES('ws','repo');
              INSERT INTO typed_tickets VALUES('ws','T1','inprogress',1,'t0');
              INSERT INTO ticket_worker_assignments VALUES('ws','T1','A1','R1','W1');
-             INSERT INTO merge_requests VALUES('ws','MR1','repo','open',3,'V1','t0','t1',NULL,NULL,'refs/heads/develop','known');
+             INSERT INTO merge_requests VALUES('ws','MR1','repo','open',3,'V1','t0','t1',NULL,NULL);
              INSERT INTO merge_request_ticket_relations VALUES('ws','MR1','T1','implements','t0');
-             INSERT INTO merge_request_revisions VALUES('ws','MR1','V1',1,'base','head','digest','summary','A1','t0');
-             INSERT INTO merge_request_merge_results VALUES('ws','R1','MR1','T1','V1','base','head','head','fast_forward','none','R1','W1','t1','OPR1','fp1','t1');
-             INSERT INTO merge_request_merge_results VALUES('ws','R2','MR1','T1','V1','base','head','merge','merge','clean','R1','W1','t2','OPR2','fp2','t2');
-             INSERT INTO merge_request_completion_operations VALUES('ws','OP1','T1','V1','workspace_orchestrator','A1','OR','OW','fingerprint','pending',NULL,'t0','t1');",
-        )
-        .unwrap();
+             INSERT INTO merge_request_revisions VALUES('ws','MR1','V1',1,'base','head','legacy-tree','digest','summary','A1','t0');
+             INSERT INTO merge_request_revision_paths VALUES('ws','MR1','V1',0,'src/lib.rs');
+             INSERT INTO merge_request_reviewer_child_sessions VALUES('ws','C1','R1','W1','builtin:reviewer','t0');
+             INSERT INTO merge_request_review_attempts VALUES('ws','AT1','MR1','T1','V1',3,'A1','R1','W1','C1','builtin:reviewer','token','submitted','t0','t1');
+             INSERT INTO merge_request_reviews VALUES('ws','AT1','MR1','V1','approve','approved','t1');
+             INSERT INTO merge_request_review_findings VALUES('ws','AT1',0,'warning','C','src/lib.rs',7,'finding');
+             INSERT INTO merge_request_completion_operations VALUES('ws','OP1','T1','V1','workspace_orchestrator','A1','R1','W1','fp','pending',NULL,'t0','t1');",
+        ).unwrap();
         conn
     }
 
@@ -1624,20 +1503,64 @@ CREATE TABLE ticket_worker_assignments(
     }
 
     #[test]
-    fn fresh_database_materializes_latest_v10_contract() {
+    fn fresh_database_materializes_final_merge_evidence_contract() {
         let conn = fresh_connection();
         migrate(&conn).unwrap();
         verify(&conn).unwrap();
-        assert_eq!(marker_version(&conn), 10);
-        assert!(table_exists(&conn, "merge_request_final_results").unwrap());
-        assert!(
-            column_exists(
-                &conn,
-                "merge_request_completion_operations",
-                "merge_result_id"
+        assert_eq!(marker_version(&conn), 9);
+        for column in [
+            "target_ref_selector",
+            "merged_revision_id",
+            "merged_target_commit",
+            "merged_result_commit",
+            "merge_strategy",
+            "merge_resolution",
+            "merged_by_runtime_id",
+            "merged_by_worker_id",
+        ] {
+            assert!(
+                column_exists(&conn, "merge_requests", column).unwrap(),
+                "missing {column}"
+            );
+        }
+        assert!(!column_exists(&conn, "merge_request_revisions", "head_tree").unwrap());
+        assert!(!table_exists(&conn, "merge_request_merge_results").unwrap());
+    }
+
+    #[test]
+    fn exact_v8_migrates_preserving_review_and_operation_evidence() {
+        let conn = exact_v8_connection();
+        migrate(&conn).unwrap();
+        verify(&conn).unwrap();
+        assert_eq!(marker_version(&conn), 9);
+        assert_eq!(
+            conn.query_row(
+                "SELECT head_commit FROM merge_request_revisions WHERE revision_id='V1'",
+                [],
+                |row| row.get::<_, String>(0)
             )
-            .unwrap()
+            .unwrap(),
+            "head"
         );
+        assert_eq!(
+            conn.query_row(
+                "SELECT decision FROM merge_request_reviews WHERE attempt_id='AT1'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "approve"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT target_ref_selector FROM merge_requests WHERE merge_request_id='MR1'",
+                [],
+                |row| row.get::<_, Option<String>>(0)
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(conn.query_row("SELECT result_commit FROM merge_request_completion_operations WHERE operation_id='OP1'", [], |row| row.get::<_,Option<String>>(0)).unwrap(), None);
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
                 row.get::<_, i64>(0)
@@ -1648,85 +1571,47 @@ CREATE TABLE ticket_worker_assignments(
     }
 
     #[test]
-    fn exact_v9_migrates_without_guessing_a_final_candidate() {
-        let conn = exact_v9_connection();
-        migrate(&conn).unwrap();
-        verify(&conn).unwrap();
-        assert_eq!(marker_version(&conn), 10);
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM merge_request_merge_results",
-                [],
-                |row| row.get::<_, i64>(0)
-            )
-            .unwrap(),
-            2
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM merge_request_final_results",
-                [],
-                |row| row.get::<_, i64>(0)
-            )
-            .unwrap(),
-            0,
-            "migration must not guess which historical candidate is final"
-        );
-        assert_eq!(
-            conn.query_row("SELECT merge_result_id FROM merge_request_completion_operations WHERE operation_id='OP1'", [], |row| row.get::<_, Option<String>>(0)).unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn v9_to_v10_failure_rolls_back_schema_and_marker() {
-        let conn = exact_v9_connection();
+    fn v8_to_v9_failure_rolls_back_schema_data_and_marker() {
+        let conn = exact_v8_connection();
         let error = migrate_with_failpoint(&conn, true).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("forced v9 to v10 migration failure")
+                .contains("forced v8 to v9 migration failure")
         );
-        assert_eq!(marker_version(&conn), 9);
-        assert!(!table_exists(&conn, "merge_request_final_results").unwrap());
-        assert!(
-            !column_exists(
-                &conn,
-                "merge_request_completion_operations",
-                "merge_result_id"
-            )
-            .unwrap()
-        );
-        verify_schema_shape(&conn, SCHEMA_V9, "v9 after rollback").unwrap();
+        assert_eq!(marker_version(&conn), 8);
+        assert!(column_exists(&conn, "merge_request_revisions", "head_tree").unwrap());
+        assert!(!column_exists(&conn, "merge_requests", "merged_result_commit").unwrap());
+        verify_schema_shape(&conn, SCHEMA_V8, "v8 after rollback").unwrap();
     }
 
     #[test]
-    fn drifted_v9_fails_closed_without_mutation() {
-        let conn = exact_v9_connection();
+    fn drifted_v8_fails_closed_without_mutation() {
+        let conn = exact_v8_connection();
         conn.execute_batch("ALTER TABLE merge_requests ADD COLUMN drift TEXT;")
             .unwrap();
         let error = migrate(&conn).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("schema drift at merge request version 9")
+                .contains("schema drift at merge request version 8")
         );
-        assert_eq!(marker_version(&conn), 9);
-        assert!(!table_exists(&conn, "merge_request_final_results").unwrap());
+        assert_eq!(marker_version(&conn), 8);
+        assert!(!column_exists(&conn, "merge_requests", "merged_result_commit").unwrap());
     }
 
     #[test]
-    fn versions_older_than_v9_are_rejected() {
+    fn versions_older_than_v8_are_rejected() {
         let conn = fresh_connection();
         conn.execute_batch(MIGRATION_TABLE_SQL).unwrap();
         conn.execute(
-            "INSERT INTO merge_request_schema_migrations(version) VALUES(8)",
+            "INSERT INTO merge_request_schema_migrations(version) VALUES(7)",
             [],
         )
         .unwrap();
         let error = migrate(&conn).unwrap_err();
-        assert!(error.to_string().contains("only supports exact v9 to v10"));
-        assert_eq!(marker_version(&conn), 8);
+        assert!(error.to_string().contains("only supports exact v8 to v9"));
+        assert_eq!(marker_version(&conn), 7);
     }
 }
 
@@ -1735,9 +1620,30 @@ fn load_merge_request(
     workspace_id: &str,
     ticket_id: &str,
 ) -> Result<Option<MergeRequest>> {
-    let row: Option<(String,String,String,Option<String>,String,String,i64,String,String,String,Option<String>,Option<String>)> = conn.query_row(
-        "SELECT mr.merge_request_id,rel.ticket_id,mr.repository_id,mr.target_ref_selector,mr.target_status,mr.state,mr.lifecycle_generation,mr.current_revision_id,mr.created_at,mr.updated_at,mr.merged_by_account_id,mr.merged_at FROM merge_requests mr JOIN merge_request_ticket_relations rel ON rel.workspace_id=mr.workspace_id AND rel.merge_request_id=mr.merge_request_id WHERE mr.workspace_id=?1 AND rel.ticket_id=?2 AND rel.relation_kind='implements' ORDER BY mr.updated_at DESC,mr.merge_request_id DESC LIMIT 1",
-        params![workspace_id,ticket_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?)),
+    type Row = (
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        String,
+        i64,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let row: Option<Row> = conn.query_row(
+        "SELECT mr.merge_request_id,rel.ticket_id,mr.repository_id,mr.target_ref_selector,mr.target_status,mr.state,mr.lifecycle_generation,mr.current_revision_id,mr.created_at,mr.updated_at,mr.merged_revision_id,mr.merged_target_commit,mr.merged_result_commit,mr.merge_strategy,mr.merge_resolution,mr.merged_by_runtime_id,mr.merged_by_worker_id,mr.merged_at FROM merge_requests mr JOIN merge_request_ticket_relations rel ON rel.workspace_id=mr.workspace_id AND rel.merge_request_id=mr.merge_request_id WHERE mr.workspace_id=?1 AND rel.ticket_id=?2 AND rel.relation_kind='implements' ORDER BY mr.updated_at DESC,mr.merge_request_id DESC LIMIT 1",
+        params![workspace_id,ticket_id],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?,r.get(12)?,r.get(13)?,r.get(14)?,r.get(15)?,r.get(16)?,r.get(17)?)),
     ).optional().map_err(db)?;
     let Some((
         mr_id,
@@ -1750,7 +1656,13 @@ fn load_merge_request(
         revision_id,
         created_at,
         updated_at,
-        merged_by_account_id,
+        merged_revision_id,
+        merged_target_commit,
+        merged_result_commit,
+        merge_strategy,
+        merge_resolution,
+        merged_by_runtime_id,
+        merged_by_worker_id,
         merged_at,
     )) = row
     else {
@@ -1763,22 +1675,6 @@ fn load_merge_request(
         Some(ReviewDecision::RequestChanges) => ReviewStatus::ChangesRequested,
         None => ReviewStatus::Pending,
     };
-    let merge_results =
-        load_merge_results(conn, workspace_id, &mr_id, &revision_id, generation as u64)?;
-    let final_merge_result_id: Option<String> = conn
-        .query_row(
-            "SELECT merge_result_id FROM merge_request_final_results WHERE workspace_id=?1 AND merge_request_id=?2 AND revision_id=?3",
-            params![workspace_id,mr_id,revision_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(db)?;
-    let final_merge_result = final_merge_result_id.and_then(|id| {
-        merge_results
-            .iter()
-            .find(|result| result.merge_result_id == id)
-            .cloned()
-    });
     Ok(Some(MergeRequest {
         merge_request_id: mr_id,
         workspace_id: workspace_id.into(),
@@ -1792,11 +1688,15 @@ fn load_merge_request(
         current_revision: revision,
         review_status,
         current_review,
-        merge_results,
-        final_merge_result,
         created_at,
         updated_at,
-        merged_by_account_id,
+        merged_revision_id,
+        merged_target_commit,
+        merged_result_commit,
+        merge_strategy: merge_strategy.as_deref().map(MergeStrategy::parse),
+        merge_resolution: merge_resolution.as_deref().map(MergeResolution::parse),
+        merged_by_runtime_id,
+        merged_by_worker_id,
         merged_at,
     }))
 }
@@ -1840,7 +1740,7 @@ fn load_latest_review(
     revision_id: &str,
     generation: i64,
 ) -> Result<Option<MergeRequestReview>> {
-    let attempt: Option<String> = conn.query_row("SELECT r.attempt_id FROM merge_request_reviews r JOIN merge_request_review_attempts a ON a.workspace_id=r.workspace_id AND a.attempt_id=r.attempt_id WHERE r.workspace_id=?1 AND r.merge_request_id=?2 AND r.revision_id=?3 AND r.merge_result_id IS NULL AND a.lifecycle_generation=?4 ORDER BY r.submitted_at DESC, r.attempt_id DESC LIMIT 1", params![workspace_id,mr_id,revision_id,generation], |r| r.get(0)).optional().map_err(db)?;
+    let attempt: Option<String> = conn.query_row("SELECT r.attempt_id FROM merge_request_reviews r JOIN merge_request_review_attempts a ON a.workspace_id=r.workspace_id AND a.attempt_id=r.attempt_id WHERE r.workspace_id=?1 AND r.merge_request_id=?2 AND r.revision_id=?3 AND a.lifecycle_generation=?4 ORDER BY r.submitted_at DESC, r.attempt_id DESC LIMIT 1", params![workspace_id,mr_id,revision_id,generation], |r| r.get(0)).optional().map_err(db)?;
     match attempt {
         Some(id) => load_review(conn, workspace_id, &id),
         None => Ok(None),
@@ -1852,13 +1752,12 @@ fn load_review(
     workspace_id: &str,
     attempt_id: &str,
 ) -> Result<Option<MergeRequestReview>> {
-    let row: Option<(String,Option<String>,String,String,String,String,String,String,String,String)> = conn.query_row(
-        "SELECT r.revision_id,r.merge_result_id,r.decision,r.body,a.parent_assignment_id,a.parent_runtime_id,a.parent_worker_id,a.child_session_id,a.child_effective_profile,r.submitted_at FROM merge_request_reviews r JOIN merge_request_review_attempts a ON a.workspace_id=r.workspace_id AND a.attempt_id=r.attempt_id WHERE r.workspace_id=?1 AND r.attempt_id=?2",
-        params![workspace_id,attempt_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?)),
+    let row: Option<(String,String,String,String,String,String,String,String,String)> = conn.query_row(
+        "SELECT r.revision_id,r.decision,r.body,a.parent_assignment_id,a.parent_runtime_id,a.parent_worker_id,a.child_session_id,a.child_effective_profile,r.submitted_at FROM merge_request_reviews r JOIN merge_request_review_attempts a ON a.workspace_id=r.workspace_id AND a.attempt_id=r.attempt_id WHERE r.workspace_id=?1 AND r.attempt_id=?2",
+        params![workspace_id,attempt_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?)),
     ).optional().map_err(db)?;
     let Some((
         revision_id,
-        merge_result_id,
         decision,
         body,
         assignment,
@@ -1888,7 +1787,6 @@ fn load_review(
     Ok(Some(MergeRequestReview {
         attempt_id: attempt_id.into(),
         revision_id,
-        merge_result_id,
         decision: ReviewDecision::parse(&decision),
         body,
         findings,
@@ -1919,15 +1817,6 @@ fn validate_current_implementation_assignment(
         return Err(MergeRequestError::AssignmentMismatch);
     }
     Ok(())
-}
-
-fn validate_current_assignment_id(
-    conn: &Connection,
-    workspace_id: &str,
-    ticket_id: &str,
-    assignment_id: &str,
-) -> Result<()> {
-    validate_current_implementation_assignment(conn, workspace_id, ticket_id, assignment_id)
 }
 
 fn validate_current_assignment(
@@ -2011,138 +1900,29 @@ fn validate_revision(revision: &MergeRequestRevision) -> Result<()> {
     Ok(())
 }
 
-fn merge_result_fingerprint(input: &RecordMergeResult) -> String {
-    token_hash(&format!(
-        "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
-        input.ticket_id,
-        input.expected_revision_id,
-        input.target_commit,
-        input.source_commit,
-        input.result_commit,
-        input.strategy.as_str(),
-        input.resolution.as_str(),
-        input.actor_runtime_id,
-        input.actor_worker_id,
-    ))
+fn validate_completion_outcome(input: &CompleteMergeRequest) -> Result<()> {
+    match input.strategy {
+        MergeStrategy::FastForward
+            if input.result_commit == input.source_commit
+                && input.resolution == MergeResolution::None => {}
+        MergeStrategy::Merge if input.resolution != MergeResolution::None => {}
+        MergeStrategy::FastForward => {
+            return Err(MergeRequestError::InvalidMergeOutcome(
+                "fast-forward result must equal the approved source commit and use resolution=none"
+                    .into(),
+            ));
+        }
+        MergeStrategy::Merge => {
+            return Err(MergeRequestError::InvalidMergeOutcome(
+                "merge strategy requires clean or conflicts_resolved resolution".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn apply_target_observation(mr: &mut MergeRequest, observed_target_commit: Option<&str>) {
     mr.observed_target_commit = observed_target_commit.map(str::to_owned);
-    for result in &mut mr.merge_results {
-        result.target_status = match observed_target_commit {
-            Some(commit) if result.target_commit == commit => MergeResultTargetStatus::Current,
-            Some(commit) if result.result_commit == commit => MergeResultTargetStatus::Applied,
-            Some(_) => MergeResultTargetStatus::Stale,
-            None => MergeResultTargetStatus::Unknown,
-        };
-    }
-    let final_id = mr
-        .final_merge_result
-        .as_ref()
-        .map(|result| result.merge_result_id.clone());
-    mr.final_merge_result = final_id.and_then(|id| {
-        mr.merge_results
-            .iter()
-            .find(|result| result.merge_result_id == id)
-            .cloned()
-    });
-}
-
-fn load_merge_result(
-    conn: &Connection,
-    workspace_id: &str,
-    merge_result_id: &str,
-    generation: u64,
-) -> Result<Option<MergeResult>> {
-    let row: Option<(String,String,String,String,String,String,String,String,String,String,String)> = conn.query_row(
-        "SELECT revision_id,target_commit,source_commit,result_commit,strategy,resolution,created_by_runtime_id,created_by_worker_id,created_at,operation_id,validated_at FROM merge_request_merge_results WHERE workspace_id=?1 AND merge_result_id=?2",
-        params![workspace_id,merge_result_id],
-        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?)),
-    ).optional().map_err(db)?;
-    let Some((
-        revision_id,
-        target_commit,
-        source_commit,
-        result_commit,
-        strategy,
-        resolution,
-        created_by_runtime_id,
-        created_by_worker_id,
-        created_at,
-        operation_id,
-        validated_at,
-    )) = row
-    else {
-        return Ok(None);
-    };
-    let current_review =
-        load_latest_merge_result_review(conn, workspace_id, merge_result_id, generation)?;
-    let review_status =
-        current_review
-            .as_ref()
-            .map_or(ReviewStatus::Pending, |review| match review.decision {
-                ReviewDecision::Approve => ReviewStatus::Approved,
-                ReviewDecision::RequestChanges => ReviewStatus::ChangesRequested,
-            });
-    Ok(Some(MergeResult {
-        merge_result_id: merge_result_id.into(),
-        revision_id,
-        target_commit,
-        source_commit,
-        result_commit,
-        strategy: MergeStrategy::parse(&strategy),
-        resolution: MergeResolution::parse(&resolution),
-        created_by_runtime_id,
-        created_by_worker_id,
-        created_at,
-        operation_id,
-        validated_at,
-        target_status: MergeResultTargetStatus::Unknown,
-        review_status,
-        current_review,
-    }))
-}
-
-fn load_merge_results(
-    conn: &Connection,
-    workspace_id: &str,
-    merge_request_id: &str,
-    revision_id: &str,
-    generation: u64,
-) -> Result<Vec<MergeResult>> {
-    let mut statement = conn.prepare(
-        "SELECT merge_result_id FROM merge_request_merge_results WHERE workspace_id=?1 AND merge_request_id=?2 AND revision_id=?3 ORDER BY created_at,merge_result_id",
-    ).map_err(db)?;
-    let ids = statement
-        .query_map(
-            params![workspace_id, merge_request_id, revision_id],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(db)?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(db)?;
-    ids.into_iter()
-        .map(|id| {
-            load_merge_result(conn, workspace_id, &id, generation)?
-                .ok_or(MergeRequestError::MergeResultNotFound(id))
-        })
-        .collect()
-}
-
-fn load_latest_merge_result_review(
-    conn: &Connection,
-    workspace_id: &str,
-    merge_result_id: &str,
-    generation: u64,
-) -> Result<Option<MergeRequestReview>> {
-    let attempt: Option<String> = conn.query_row(
-        "SELECT r.attempt_id FROM merge_request_reviews r JOIN merge_request_review_attempts a ON a.workspace_id=r.workspace_id AND a.attempt_id=r.attempt_id WHERE r.workspace_id=?1 AND r.merge_result_id=?2 AND a.lifecycle_generation=?3 ORDER BY r.submitted_at DESC,r.attempt_id DESC LIMIT 1",
-        params![workspace_id,merge_result_id,generation as i64], |row| row.get(0),
-    ).optional().map_err(db)?;
-    attempt
-        .map(|attempt| load_review(conn, workspace_id, &attempt))
-        .transpose()
-        .map(|review| review.flatten())
 }
 
 fn validate_review_input(input: &SubmitReview) -> Result<()> {
@@ -2200,11 +1980,14 @@ fn token_hash(token: &str) -> String {
 }
 fn completion_fingerprint(input: &CompleteMergeRequest) -> String {
     token_hash(&format!(
-        "workspace_orchestrator\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+        "workspace_orchestrator\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
         input.ticket_id,
         input.expected_revision_id,
-        input.expected_merge_result_id,
-        input.observed_target_commit,
+        input.target_commit,
+        input.source_commit,
+        input.result_commit,
+        input.strategy.as_str(),
+        input.resolution.as_str(),
         input.implementation_assignment_id,
         input.completion_actor_runtime_id,
         input.completion_actor_worker_id

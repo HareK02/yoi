@@ -68,9 +68,6 @@ struct SubWorkerSpawnInput {
 struct ReviewerHandoffInput {
     ticket_id: String,
     revision_id: String,
-    /// Optional immutable MergeResult subject. Omit for source-revision review.
-    #[serde(default)]
-    merge_result_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -425,7 +422,6 @@ impl Tool for SubWorkerSpawnTool {
             (
                 review.ticket_id.clone(),
                 review.revision_id.clone(),
-                review.merge_result_id.clone(),
                 uuid::Uuid::now_v7().to_string(),
                 format!(
                     "{}{}",
@@ -435,9 +431,7 @@ impl Tool for SubWorkerSpawnTool {
             )
         });
         let child_workspace_context =
-            if let Some((ticket_id, revision_id, merge_result_id, _, capability_token)) =
-                &reviewer_attempt
-            {
+            if let Some((ticket_id, revision_id, _, capability_token)) = &reviewer_attempt {
                 let workspace_id =
                     self.workspace_context
                         .workspace_id()
@@ -459,7 +453,6 @@ impl Tool for SubWorkerSpawnTool {
                         ReviewerAttemptContext {
                             ticket_id: ticket_id.clone(),
                             revision_id: revision_id.clone(),
-                            merge_result_id: merge_result_id.clone(),
                         },
                         capability_token.clone(),
                     ));
@@ -554,9 +547,7 @@ impl Tool for SubWorkerSpawnTool {
             }
         };
 
-        if let Some((ticket_id, revision_id, merge_result_id, attempt_id, capability_token)) =
-            &reviewer_attempt
-        {
+        if let Some((ticket_id, revision_id, attempt_id, capability_token)) = &reviewer_attempt {
             let workspace_id = self.workspace_context.workspace_id().ok_or_else(|| {
                 ToolError::ExecutionFailed("reviewer attempt lost Workspace identity".to_string())
             })?;
@@ -588,7 +579,6 @@ impl Tool for SubWorkerSpawnTool {
             let body = serde_json::json!({
                 "attempt_id": attempt_id,
                 "revision_id": revision_id,
-                "merge_result_id": merge_result_id,
                 "child_session_id": child_session_id,
                 "capability_token": capability_token,
             });
