@@ -319,10 +319,24 @@ impl RepositoryRegistryReader {
         result_commit: &str,
     ) -> Result<(), RepositoryLookupError> {
         let repository = self.merge_repository(id)?;
-        if !selector.starts_with("refs/heads/")
-            || selector.starts_with('-')
-            || selector.as_bytes().contains(&0)
-        {
+        let target_ref = if selector.starts_with("refs/heads/") {
+            selector.to_owned()
+        } else if selector.starts_with("refs/") {
+            return Err(RepositoryLookupError::InvalidSelector {
+                id: id.into(),
+                selector: selector.into(),
+            });
+        } else {
+            format!("refs/heads/{selector}")
+        };
+        let valid_ref = Command::new("git")
+            .args(["check-ref-format", target_ref.as_str()])
+            .status()
+            .map_err(|_| RepositoryLookupError::ProviderFailure {
+                id: id.into(),
+                operation: "validate target branch ref".into(),
+            })?;
+        if !valid_ref.success() || selector.starts_with('-') || selector.as_bytes().contains(&0) {
             return Err(RepositoryLookupError::InvalidSelector {
                 id: id.into(),
                 selector: selector.into(),
@@ -332,7 +346,12 @@ impl RepositoryRegistryReader {
         let status = Command::new("git")
             .arg("-C")
             .arg(&repository.path)
-            .args(["update-ref", selector, result_commit, expected_target])
+            .args([
+                "update-ref",
+                target_ref.as_str(),
+                result_commit,
+                expected_target,
+            ])
             .status()
             .map_err(|_| RepositoryLookupError::ProviderFailure {
                 id: id.into(),
@@ -724,7 +743,7 @@ mod tests {
         );
         reader.ensure_ancestor("main", &base, &source).unwrap();
         reader
-            .update_merge_target("main", "refs/heads/main", &base, &source)
+            .update_merge_target("main", "main", &base, &source)
             .unwrap();
         assert_eq!(
             reader

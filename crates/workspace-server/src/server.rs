@@ -4028,6 +4028,35 @@ async fn scoped_complete_merge_request(
             )
             .map_err(repository_merge_evidence_error)?;
     }
+    let verified_target = repositories.observe_merge_target(&mr.repository_id, Some(selector));
+    let verified_result = matches!(
+        verified_target.as_ref(),
+        Ok(target) if target.commit == input.result_commit
+    );
+    if !verified_result {
+        if !target_was_already_updated {
+            if let Err(rollback_error) = repositories.update_merge_target(
+                &mr.repository_id,
+                selector,
+                &input.result_commit,
+                &input.target_commit,
+            ) {
+                return Err(Error::InvalidInput(format!(
+                    "post-update target verification failed and guarded rollback also failed: verification={verified_target:?}; rollback={rollback_error:?}"
+                ))
+                .into());
+            }
+        }
+        return Err(Error::InvalidInput(format!(
+            "post-update target verification failed: expected result {}, observed {:?}",
+            input.result_commit,
+            verified_target
+                .as_ref()
+                .map(|target| target.commit.as_str())
+                .map_err(|error| error)
+        ))
+        .into());
+    }
     let completion = merge_request::CompleteMergeRequest {
         operation_id: input.operation_id,
         ticket_id,
