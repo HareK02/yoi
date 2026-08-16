@@ -19,34 +19,49 @@
 
   type MergeRequestThreadEvent =
     | {
-      kind: "request_for_review";
-      event_seq: number;
-      head_commit: string;
-      changed_paths: string[];
-      summary: string;
+      kind: "review_requested";
+      event_id: string;
+      sequence: number;
+      subject_ref: string;
+      requested_by: { runtime_id: string; worker_id: string };
+      reviewer: { runtime_id: string; worker_id: string };
     }
     | {
       kind: "review";
-      event_seq: number;
-      request_event_seq: number;
+      event_id: string;
+      sequence: number;
+      request_event_id: string;
+      subject_ref: string;
       decision: "approve" | "request_changes";
       body: string;
-      reviewer_profile: string;
+      reviewer: { runtime_id: string; worker_id: string };
+    }
+    | { kind: "review_revoked"; sequence: number; review_event_id: string; reason: string }
+    | { kind: "review_cancelled"; sequence: number; request_event_id: string; reason: string }
+    | {
+      kind: "comment";
+      sequence: number;
+      body: string;
+      author: { runtime_id: string; worker_id: string };
     }
     | {
       kind: "merge";
-      event_seq: number;
-      result_commit: string;
+      sequence: number;
+      approval_event_id: string;
+      approved_source_ref: string;
+      target_ref_after: string;
       strategy: "fast_forward" | "merge";
       resolution: "none" | "clean" | "conflicts_resolved";
       merged_by: { runtime_id: string; worker_id: string };
-    }
-    | { kind: "reopen" | "close"; event_seq: number; body: string };
+    };
 
+  type RefProjection = { status: "known" | "unknown" | "requires_repair"; ref?: string };
   type MergeRequestDetail = {
     state: "open" | "closed" | "merged";
-    selector_from: string;
+    selector_from: string | null;
     selector_to: string;
+    source: RefProjection;
+    target: RefProjection;
     thread: MergeRequestThreadEvent[];
   };
 
@@ -72,14 +87,12 @@
   let ticket = $state<TicketDetail>(loadedTicket);
   let mergeRequest = $state<MergeRequestDetail | null>(initialData.mergeRequest.data ?? null);
   const currentReviewRequest = $derived(
-    mergeRequest?.thread.findLast((event) => event.kind === "request_for_review") ?? null,
+    mergeRequest?.thread.findLast((event) => event.kind === "review_requested") ?? null,
   );
   const currentReview = $derived(
-    currentReviewRequest
-      ? mergeRequest?.thread.findLast(
-        (event) =>
-          event.kind === "review" &&
-          event.request_event_seq === currentReviewRequest.event_seq,
+    mergeRequest?.source.status === "known"
+      ? mergeRequest.thread.findLast(
+        (event) => event.kind === "review" && event.subject_ref === mergeRequest?.source.ref,
       ) ?? null
       : null,
   );
@@ -384,21 +397,37 @@
           <p class="workspace-callout is-error">{data.mergeRequest.error}</p>
         {:else if mergeRequest}
           <p><strong>{mergeRequest.state}</strong></p>
-          <p>From <code>{mergeRequest.selector_from}</code></p>
-          <p>To <code>{mergeRequest.selector_to}</code></p>
-          {#if currentReviewRequest?.kind === "request_for_review"}
-            <p>Candidate <code>{currentReviewRequest.head_commit}</code></p>
-            {#if currentReviewRequest.summary}<p>{currentReviewRequest.summary}</p>{/if}
+          <p>From <code>{mergeRequest.selector_from ?? "requires repair"}</code> · {mergeRequest.source.status}{mergeRequest.source.ref ? ` @ ${mergeRequest.source.ref}` : ""}</p>
+          <p>To <code>{mergeRequest.selector_to}</code> · {mergeRequest.target.status}{mergeRequest.target.ref ? ` @ ${mergeRequest.target.ref}` : ""}</p>
+          {#if currentReviewRequest?.kind === "review_requested"}
+            <p>Review requested for <code>{currentReviewRequest.subject_ref}</code></p>
           {/if}
           {#if currentReview?.kind === "review"}
-            <p><strong>{currentReview.decision}</strong> by {currentReview.reviewer_profile}</p>
+            <p><strong>{currentReview.decision}</strong> by <code>{currentReview.reviewer.runtime_id}/{currentReview.reviewer.worker_id}</code></p>
             {#if currentReview.body}<RichMarkdown text={currentReview.body} />{/if}
           {/if}
           {#if mergeEvent?.kind === "merge"}
             <p>Final merge · {mergeEvent.strategy} / {mergeEvent.resolution}</p>
-            <p>Result <code>{mergeEvent.result_commit}</code></p>
+            <p>Target ref <code>{mergeEvent.target_ref_after}</code></p>
             <p>Completed by <code>{mergeEvent.merged_by.runtime_id}/{mergeEvent.merged_by.worker_id}</code></p>
           {/if}
+          <h4>Thread</h4>
+          {#each mergeRequest.thread as event (event.sequence)}
+            <p>
+              <code>#{event.sequence}</code> · {event.kind}
+              {#if event.kind === "review_requested"}
+                · <code>{event.subject_ref}</code> · {event.requested_by.runtime_id}/{event.requested_by.worker_id}
+              {:else if event.kind === "review"}
+                · <code>{event.subject_ref}</code> · {event.reviewer.runtime_id}/{event.reviewer.worker_id}
+              {:else if event.kind === "comment"}
+                · {event.author.runtime_id}/{event.author.worker_id} · {event.body}
+              {:else if event.kind === "review_cancelled" || event.kind === "review_revoked"}
+                · {event.reason}
+              {:else if event.kind === "merge"}
+                · approval <code>{event.approval_event_id}</code>
+              {/if}
+            </p>
+          {/each}
         {:else}
           <p class="workspace-empty-copy">The assigned Coder has not opened a Merge Request.</p>
         {/if}

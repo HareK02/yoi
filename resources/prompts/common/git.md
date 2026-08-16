@@ -10,4 +10,4 @@ When creating a commit, use the change type as the subject prefix, not the affec
 
 A change made because review, validation, or user feedback found a defect is a `fix:` even when it belongs to the same feature Ticket and has not been merged yet. Do not keep reusing a domain prefix such as `merge-request:`, `runtime:`, or `worker:` across a series; those labels identify where the code lives rather than why each commit exists. If one prospective commit contains distinct change types, split it into coherent validated commits when practical; otherwise name it for the dominant intent.
 
-Before opening a Merge Request or appending a `RequestForReview` event, inspect the proposed commit subjects and correct misclassified local, unshared commits when safe. Do not rewrite shared history solely to rename existing commits unless the user explicitly requests it.
+Before opening a Merge Request or requesting review, inspect the proposed commit subjects and correct misclassified local, unshared commits when safe. Do not rewrite shared history solely to rename existing commits unless the user explicitly requests it.

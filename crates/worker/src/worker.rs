@@ -248,7 +248,6 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewerContext {
     pub ticket_id: String,
-    pub expected_head_commit: String,
 }
 
 #[derive(Debug)]
@@ -306,10 +305,6 @@ impl WorkspaceClient for ReviewerChildWorkspaceClient {
                     "review submission body must be an object".to_string(),
                 )
             })?;
-            object.insert(
-                "expected_head_commit".to_string(),
-                serde_json::Value::String(self.context.expected_head_commit.clone()),
-            );
             object.insert(
                 "capability_token".to_string(),
                 serde_json::Value::String(self.capability_token.clone()),
@@ -452,7 +447,6 @@ mod reviewer_client_tests {
             inner,
             ReviewerContext {
                 ticket_id: "T1".into(),
-                expected_head_commit: "head".into(),
             },
             "secret".into(),
         );
