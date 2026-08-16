@@ -342,6 +342,12 @@ pub struct WorkerTicketAssignmentRequest {
 pub(crate) fn worker_spawn_idempotency(
     request: &WorkerSpawnRequest,
 ) -> Result<Option<(String, String)>, String> {
+    if let Some(operation) = request.resolved_control_operation.as_ref() {
+        return Ok(Some((
+            operation.operation_id.clone(),
+            operation.input_fingerprint.clone(),
+        )));
+    }
     let Some(assignment) = request.ticket_assignment.as_ref() else {
         return Ok(None);
     };
@@ -351,6 +357,12 @@ pub(crate) fn worker_spawn_idempotency(
         assignment.operation_id.clone(),
         format!("sha256:{}", digest_hex(&encoded, 64)),
     )))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerControlOperation {
+    pub operation_id: String,
+    pub input_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -384,6 +396,9 @@ pub struct WorkerSpawnRequest {
     /// Backend-authored peer-session grants. Browser/model input cannot set this field.
     #[serde(skip, default)]
     pub resolved_worker_observation_grants: Vec<worker_runtime::identity::RuntimeWorkerRef>,
+    /// Trusted Backend operation identity used to make Worker-owned spawns replay-safe.
+    #[serde(skip, default)]
+    pub resolved_control_operation: Option<WorkerControlOperation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4801,8 +4816,26 @@ mod tests {
             resolved_config_bundle: None,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
+            resolved_control_operation: None,
             resolved_workspace_api: Some(test_workspace_api()),
         }
+    }
+
+    #[test]
+    fn trusted_control_operation_is_runtime_spawn_idempotency_authority() {
+        let mut request = embedded_spawn_request();
+        request.resolved_control_operation = Some(WorkerControlOperation {
+            operation_id: "control-op-1".to_string(),
+            input_fingerprint: "sha256:control-input".to_string(),
+        });
+
+        assert_eq!(
+            worker_spawn_idempotency(&request).unwrap(),
+            Some((
+                "control-op-1".to_string(),
+                "sha256:control-input".to_string(),
+            ))
+        );
     }
 
     #[test]
@@ -5016,6 +5049,7 @@ mod tests {
                     resolved_config_bundle: None,
                     resolved_worker_observation_enabled: false,
                     resolved_worker_observation_grants: Vec::new(),
+                    resolved_control_operation: None,
                     resolved_workspace_api: Some(test_workspace_api()),
                 },
             )
@@ -5113,6 +5147,7 @@ mod tests {
                     resolved_config_bundle: None,
                     resolved_worker_observation_enabled: false,
                     resolved_worker_observation_grants: Vec::new(),
+                    resolved_control_operation: None,
                     resolved_workspace_api: Some(test_workspace_api()),
                 },
             )
@@ -5149,6 +5184,7 @@ mod tests {
                     resolved_config_bundle: None,
                     resolved_worker_observation_enabled: false,
                     resolved_worker_observation_grants: Vec::new(),
+                    resolved_control_operation: None,
                     resolved_workspace_api: Some(test_workspace_api()),
                 },
             )

@@ -1,6 +1,9 @@
+#![cfg_attr(not(test), allow(dead_code, unused_imports))]
+
 //! Parent-facing tools for in-process Internal SubWorker sessions.
 //!
-//! All four tools share the same parent-owned `SpawnedWorkerRegistry` of typed session handles.
+//! Legacy direct-child tool constructors are test-only; production exposes the
+//! registry through the unified `worker.control` service and Worker tools.
 //! There is no Runtime catalog lookup or child socket transport, so a Worker can operate only on
 //! its direct Internal children. The socket helper at the bottom remains solely for the legacy
 //! top-level Worker callback protocol and is not part of SubWorker communication.
@@ -74,6 +77,7 @@ impl Tool for SubWorkerListTool {
     }
 }
 
+#[cfg(test)]
 pub fn sub_worker_list_tool(registry: Arc<SpawnedWorkerRegistry>) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(SubWorkerListInput);
@@ -132,6 +136,7 @@ impl Tool for SubWorkerSendTool {
     }
 }
 
+#[cfg(test)]
 pub fn sub_worker_send_tool(registry: Arc<SpawnedWorkerRegistry>) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(SubWorkerSendInput);
@@ -186,6 +191,7 @@ impl Tool for SubWorkerStopTool {
     }
 }
 
+#[cfg(test)]
 pub fn sub_worker_stop_tool(registry: Arc<SpawnedWorkerRegistry>) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(NameInput);

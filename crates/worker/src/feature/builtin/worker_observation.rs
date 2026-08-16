@@ -7,10 +7,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use session_store::collect_state;
 
+use super::manage_worker::{WORKER_CONTROL_SERVICE_ID, WorkerControlService};
 use crate::feature::{
     FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureInstructionContribution,
-    FeatureInstructionDeclaration, FeatureInstructionId, FeatureModule, ToolContribution,
-    ToolDeclaration,
+    FeatureInstructionDeclaration, FeatureInstructionId, FeatureModule, ServiceId,
+    ServiceRequirement, ToolContribution, ToolDeclaration,
 };
 use crate::session_capture::{
     ReadDetail, ReadOptions, ReadSelector, ReferenceKind, SearchOptions, SessionCapture,
@@ -111,11 +112,17 @@ impl WorkerObservationProvider for WorkspaceClientWorkerObservationProvider {
     async fn list_worker_sessions(
         &self,
     ) -> Result<Vec<WorkerObservationSubject>, WorkerObservationError> {
+        let workspace_id = self.client.workspace_id().ok_or_else(|| {
+            WorkerObservationError::Unavailable(
+                "Workspace observation requires a scoped Workspace client".to_string(),
+            )
+        })?;
         let response = self
             .client
-            .execute(crate::worker::WorkspaceRequest::get(
-                "/worker-observation/sessions",
-            ))
+            .execute(crate::worker::WorkspaceRequest::get(format!(
+                "/api/w/{}/worker-observation/sessions",
+                workspace_id
+            )))
             .map_err(workspace_client_error)?;
         let body = workspace_response_body(response)?;
         serde_json::from_str::<WorkspaceWorkerObservationListResponse>(&body)
@@ -129,11 +136,16 @@ impl WorkerObservationProvider for WorkspaceClientWorkerObservationProvider {
     ) -> Result<WorkerSessionCapture, WorkerObservationError> {
         let body = serde_json::to_string(subject)
             .map_err(|error| WorkerObservationError::Unavailable(error.to_string()))?;
+        let workspace_id = self.client.workspace_id().ok_or_else(|| {
+            WorkerObservationError::Unavailable(
+                "Workspace observation requires a scoped Workspace client".to_string(),
+            )
+        })?;
         let response = self
             .client
             .execute(crate::worker::WorkspaceRequest::json(
                 crate::worker::WorkspaceRequestMethod::Post,
-                "/worker-observation/session",
+                format!("/api/w/{}/worker-observation/session", workspace_id),
                 body,
             ))
             .map_err(workspace_client_error)?;
@@ -174,6 +186,43 @@ fn workspace_client_error(error: crate::worker::WorkspaceClientError) -> WorkerO
 }
 
 #[derive(Clone)]
+struct ControlAuthorizedObservationProvider {
+    control: Arc<dyn WorkerControlService>,
+    inner: Arc<dyn WorkerObservationProvider>,
+}
+
+#[async_trait]
+impl WorkerObservationProvider for ControlAuthorizedObservationProvider {
+    async fn list_worker_sessions(
+        &self,
+    ) -> Result<Vec<WorkerObservationSubject>, WorkerObservationError> {
+        let candidates = self.inner.list_worker_sessions().await?;
+        let mut granted = Vec::new();
+        for candidate in candidates {
+            if self
+                .control
+                .ensure_permission(&candidate.subject, "observe")
+                .await
+                .is_ok()
+            {
+                granted.push(candidate);
+            }
+        }
+        Ok(granted)
+    }
+
+    async fn capture_worker_session(
+        &self,
+        subject: &WorkerObservationSubjectRef,
+    ) -> Result<WorkerSessionCapture, WorkerObservationError> {
+        self.control
+            .ensure_permission(subject, "observe")
+            .await
+            .map_err(|_| WorkerObservationError::NotFound)?;
+        self.inner.capture_worker_session(subject).await
+    }
+}
+
 pub struct WorkerObservationFeature {
     provider: Arc<dyn WorkerObservationProvider>,
 }
@@ -190,11 +239,11 @@ impl FeatureModule for WorkerObservationFeature {
             .with_description(
                 "Read-only exploration of explicitly granted active Worker sessions.",
             )
-            .with_instruction(observation_instruction())
-            .with_tool(ToolDeclaration::new(
-                "ListWorkerSessions",
-                "List bounded summaries of active Worker sessions granted to this Worker.",
+            .with_service_requirement(ServiceRequirement::required(
+                ServiceId::builtin(WORKER_CONTROL_SERVICE_ID),
+                "Worker observation extends the known-Worker control authority",
             ))
+            .with_instruction(observation_instruction())
             .with_tool(ToolDeclaration::new(
                 "ViewSessionOverview",
                 "Show a sparse overview of the latest committed capture for one granted Worker session.",
@@ -215,21 +264,25 @@ impl FeatureModule for WorkerObservationFeature {
             .register(FeatureInstructionContribution::new(
                 observation_instruction(),
             ))?;
-        context.tools().register(ToolContribution::new(
-            "ListWorkerSessions",
-            list_definition(self.provider.clone()),
-        ))?;
+        let control = context
+            .services()
+            .require::<dyn WorkerControlService>(&ServiceId::builtin(WORKER_CONTROL_SERVICE_ID))?;
+        let provider: Arc<dyn WorkerObservationProvider> =
+            Arc::new(ControlAuthorizedObservationProvider {
+                control,
+                inner: self.provider.clone(),
+            });
         context.tools().register(ToolContribution::new(
             "ViewSessionOverview",
-            overview_definition(self.provider.clone()),
+            overview_definition(provider.clone()),
         ))?;
         context.tools().register(ToolContribution::new(
             "SearchSessionEntries",
-            search_definition(self.provider.clone()),
+            search_definition(provider.clone()),
         ))?;
         context.tools().register(ToolContribution::new(
             "ReadSessionEntry",
-            read_definition(self.provider.clone()),
+            read_definition(provider),
         ))?;
         Ok(())
     }
@@ -346,20 +399,6 @@ impl WorkerObservationProvider for SpawnedSubWorkerObservationProvider {
     }
 }
 
-fn list_definition(provider: Arc<dyn WorkerObservationProvider>) -> ToolDefinition {
-    Arc::new(move || {
-        let schema = serde_json::to_value(schemars::schema_for!(ListWorkerSessionsParams))
-            .unwrap_or_else(|_| serde_json::json!({}));
-        let meta = ToolMeta::new("ListWorkerSessions")
-            .description("List active Worker sessions explicitly granted to this Worker.")
-            .input_schema(schema);
-        let tool: Arc<dyn Tool> = Arc::new(ListWorkerSessionsTool {
-            provider: provider.clone(),
-        });
-        (meta, tool)
-    })
-}
-
 fn overview_definition(provider: Arc<dyn WorkerObservationProvider>) -> ToolDefinition {
     Arc::new(move || {
         let schema = serde_json::to_value(schemars::schema_for!(ViewSessionOverviewParams))
@@ -400,13 +439,6 @@ fn read_definition(provider: Arc<dyn WorkerObservationProvider>) -> ToolDefiniti
         });
         (meta, tool)
     })
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct ListWorkerSessionsParams {
-    #[serde(default)]
-    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -452,43 +484,6 @@ struct ReadSessionEntryParams {
 
 fn default_read_mode() -> String {
     "compact".to_string()
-}
-
-struct ListWorkerSessionsTool {
-    provider: Arc<dyn WorkerObservationProvider>,
-}
-
-#[async_trait]
-impl Tool for ListWorkerSessionsTool {
-    async fn execute(
-        &self,
-        input_json: &str,
-        _context: llm_engine::tool::ToolExecutionContext,
-    ) -> Result<ToolOutput, ToolError> {
-        let params: ListWorkerSessionsParams = parse_input("ListWorkerSessions", input_json)?;
-        let limit = bounded_limit(params.limit);
-        let mut subjects = self
-            .provider
-            .list_worker_sessions()
-            .await
-            .map_err(tool_error)?;
-        subjects.truncate(limit);
-        let sessions = subjects
-            .iter()
-            .map(|subject| {
-                serde_json::json!({
-                    "subject": bounded_subject(&subject.subject),
-                    "display_name": truncate_text(&subject.display_name, 200),
-                    "relation": truncate_text(&subject.relation, 64),
-                    "status": truncate_text(&subject.status, 64),
-                })
-            })
-            .collect::<Vec<_>>();
-        json_output(
-            format!("Listed {} Worker session(s).", sessions.len()),
-            serde_json::json!({ "sessions": sessions }),
-        )
-    }
 }
 
 struct ViewSessionOverviewTool {
@@ -692,31 +687,6 @@ fn parse_tool_part(value: &str) -> Result<ToolPart, ToolError> {
         .ok_or_else(|| ToolError::InvalidArgument(format!("invalid tool_part {value:?}")))
 }
 
-fn bounded_subject(subject: &WorkerObservationSubjectRef) -> WorkerObservationSubjectRef {
-    match subject {
-        WorkerObservationSubjectRef::RuntimeWorker {
-            runtime_id,
-            worker_id,
-        } => WorkerObservationSubjectRef::RuntimeWorker {
-            runtime_id: truncate_text(runtime_id, 200),
-            worker_id: truncate_text(worker_id, 200),
-        },
-        WorkerObservationSubjectRef::SubWorker { name } => WorkerObservationSubjectRef::SubWorker {
-            name: truncate_text(name, 200),
-        },
-    }
-}
-
-fn truncate_text(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        value.to_string()
-    } else {
-        let mut truncated = value.chars().take(max_chars).collect::<String>();
-        truncated.push('…');
-        truncated
-    }
-}
-
 fn bounded_limit(limit: Option<usize>) -> usize {
     limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT)
 }
@@ -801,7 +771,7 @@ mod tests {
         let catalog = crate::PromptCatalog::builtins_only().unwrap();
         let source = &catalog.projection().templates["common.worker_observation"];
         for token in [
-            "ListWorkerSessions",
+            "WorkerList",
             "ViewSessionOverview",
             "SearchSessionEntries",
             "ReadSessionEntry",
@@ -812,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_observation_installs_without_session_explore_or_memory_extract() {
+    fn worker_observation_requires_worker_control_service() {
         let provider = Arc::new(FakeProvider {
             captures: Mutex::new(Vec::new()),
         });
@@ -821,15 +791,15 @@ mod tests {
         let report = FeatureRegistryBuilder::new()
             .with_module(WorkerObservationFeature::new(provider))
             .install_into_pending(&mut pending_tools, &mut hook_builder);
-        assert!(report.reports[0].installed);
+        assert!(!report.reports[0].installed);
+        assert!(report.installed_tool_names().is_empty());
+        let descriptor = WorkerObservationFeature::new(Arc::new(FakeProvider {
+            captures: Mutex::new(Vec::new()),
+        }))
+        .descriptor();
         assert_eq!(
-            report.installed_tool_names(),
-            [
-                "ListWorkerSessions",
-                "ViewSessionOverview",
-                "SearchSessionEntries",
-                "ReadSessionEntry",
-            ]
+            descriptor.requires_services[0].id,
+            ServiceId::builtin(WORKER_CONTROL_SERVICE_ID)
         );
     }
 
@@ -838,13 +808,6 @@ mod tests {
         let provider = Arc::new(FakeProvider {
             captures: Mutex::new(vec![message("u1", Role::User, "first")]),
         });
-        let list = list_definition(provider.clone())().1;
-        let listed = list
-            .execute("{}", llm_engine::tool::ToolExecutionContext::direct())
-            .await
-            .unwrap();
-        assert!(listed.content.unwrap().contains("granted"));
-
         let read = read_definition(provider.clone())().1;
         let hidden = read
             .execute(
