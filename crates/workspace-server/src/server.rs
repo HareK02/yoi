@@ -4046,12 +4046,17 @@ async fn scoped_complete_merge_request(
         Ok(outcome) => Ok(Json(outcome)),
         Err(error) => {
             if !target_was_already_updated {
-                let _ = repositories.update_merge_target(
+                if let Err(rollback_error) = repositories.update_merge_target(
                     &mr.repository_id,
                     selector,
                     &input.result_commit,
                     &input.target_commit,
-                );
+                ) {
+                    return Err(Error::InvalidInput(format!(
+                        "merge finalization failed after target update and guarded rollback also failed: finalization={error}; rollback={rollback_error:?}"
+                    ))
+                    .into());
+                }
             }
             Err(error.into())
         }
