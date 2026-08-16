@@ -164,6 +164,20 @@ impl MergeRequestThreadEvent {
             Self::Merge(v) => v.sequence,
         }
     }
+    fn bound_bodies(&mut self) {
+        match self {
+            Self::Review(value) => {
+                truncate_body(&mut value.body);
+                for finding in &mut value.findings {
+                    truncate_body(&mut finding.body);
+                }
+            }
+            Self::ReviewRevoked(value) => truncate_body(&mut value.reason),
+            Self::ReviewCancelled(value) => truncate_body(&mut value.reason),
+            Self::Comment(value) => truncate_body(&mut value.body),
+            Self::ReviewRequested(_) | Self::Merge(_) => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -789,6 +803,20 @@ impl MergeRequestStore {
     }
 }
 
+fn truncate_body(value: &mut String) {
+    if value.len() <= MAX_BODY_BYTES {
+        return;
+    }
+    let boundary = value
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= MAX_BODY_BYTES)
+        .last()
+        .unwrap_or(0);
+    value.truncate(boundary);
+    value.push_str("\n[truncated]");
+}
+
 fn bounded_body(name: &str, value: &str) -> Result<(), MergeRequestError> {
     if value.len() > MAX_BODY_BYTES {
         Err(MergeRequestError::Validation(format!(
@@ -880,7 +908,7 @@ fn load_thread(
         .collect::<Result<Vec<_>, _>>()?;
     rows.into_iter()
         .map(|(k, j)| {
-            Ok(match k.as_str() {
+            let mut event = match k.as_str() {
                 "review_requested" => MergeRequestThreadEvent::ReviewRequested(json(&j)?),
                 "review" => MergeRequestThreadEvent::Review(json(&j)?),
                 "review_revoked" => MergeRequestThreadEvent::ReviewRevoked(json(&j)?),
@@ -888,7 +916,9 @@ fn load_thread(
                 "comment" => MergeRequestThreadEvent::Comment(json(&j)?),
                 "merge" => MergeRequestThreadEvent::Merge(json(&j)?),
                 _ => return Err(MergeRequestError::Corrupt(format!("unknown event `{k}`"))),
-            })
+            };
+            event.bound_bodies();
+            Ok(event)
         })
         .collect()
 }
