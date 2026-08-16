@@ -95,10 +95,6 @@ pub enum Error {
     #[error("unknown local repository `{0}`")]
     UnknownRepository(String),
     #[error(
-        "merge confirmation requires an authenticated Browser session; API tokens and Worker actors are not accepted"
-    )]
-    BrowserMergeConfirmationRequired,
-    #[error(
         "Merge Request reopen requires an authenticated Browser session and explicit confirmation"
     )]
     BrowserReopenConfirmationRequired,

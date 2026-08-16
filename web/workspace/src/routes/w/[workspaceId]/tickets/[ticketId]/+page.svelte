@@ -25,17 +25,7 @@
     observed_target_commit?: string | null;
     current_revision: { revision_id: string; head_commit: string; diff_digest: string; changed_paths: string[]; summary: string };
     current_review?: { decision: string; body: string; reviewer_effective_profile: string } | null;
-    current_merge_result?: {
-      merge_result_id: string;
-      target_commit: string;
-      source_commit: string;
-      result_commit: string;
-      strategy: "fast_forward" | "merge";
-      resolution: "none" | "clean" | "conflicts_resolved";
-      target_status: "current" | "applied" | "stale" | "unknown";
-      review_status: "pending" | "approved" | "changes_requested";
-    } | null;
-    applied_merge_result?: {
+    final_merge_result?: {
       merge_result_id: string;
       target_commit: string;
       source_commit: string;
@@ -78,7 +68,6 @@
   let transitionReason = $state("");
   let threadRole = $state("comment");
   let threadBody = $state("");
-  let confirmMerge = $state(false);
   let resolution = $state("");
   let busy = $state<string | null>(null);
   let errorMessage = $state<string | null>(null);
@@ -166,29 +155,6 @@
         body: threadBody.trim(),
       })
     ) threadBody = "";
-  }
-
-  async function mergeConfirmedRevision() {
-    if (!mergeRequest || !confirmMerge || busy) return;
-    busy = "merge";
-    errorMessage = null;
-    try {
-      mergeRequest = await workspaceApiJsonWithBody<MergeRequestDetail>(
-        `${ticketPath}/merge-request/merge`,
-        {
-          method: "POST",
-          body: JSON.stringify({
-            expected_revision_id: mergeRequest.current_revision.revision_id,
-            explicit_confirmation: true,
-          }),
-        },
-      );
-      confirmMerge = false;
-    } catch (error) {
-      errorMessage = error instanceof Error ? error.message : String(error);
-    } finally {
-      busy = null;
-    }
   }
 
   async function closeTicket(event: SubmitEvent) {
@@ -395,35 +361,20 @@
           {#if mergeRequest.observed_target_commit}<p>Target tip <code>{mergeRequest.observed_target_commit}</code></p>{/if}
           <p><code>{mergeRequest.current_revision.revision_id}</code></p>
           <p>Head <code>{mergeRequest.current_revision.head_commit}</code></p>
-          {#if mergeRequest.current_merge_result}
+          {#if mergeRequest.final_merge_result}
             <p>
-              MergeResult <code>{mergeRequest.current_merge_result.merge_result_id}</code> ·
-              {mergeRequest.current_merge_result.strategy} / {mergeRequest.current_merge_result.resolution} ·
-              {mergeRequest.current_merge_result.target_status} / {mergeRequest.current_merge_result.review_status}
+              Final MergeResult <code>{mergeRequest.final_merge_result.merge_result_id}</code> ·
+              {mergeRequest.final_merge_result.strategy} / {mergeRequest.final_merge_result.resolution} ·
+              {mergeRequest.final_merge_result.target_status} / {mergeRequest.final_merge_result.review_status}
             </p>
-            <p>Result <code>{mergeRequest.current_merge_result.result_commit}</code></p>
-          {:else if mergeRequest.applied_merge_result}
-            <p>
-              Applied MergeResult <code>{mergeRequest.applied_merge_result.merge_result_id}</code> ·
-              {mergeRequest.applied_merge_result.strategy} / {mergeRequest.applied_merge_result.resolution} ·
-              {mergeRequest.applied_merge_result.review_status}
-            </p>
-            <p>Result <code>{mergeRequest.applied_merge_result.result_commit}</code> is the current target tip.</p>
+            <p>Result <code>{mergeRequest.final_merge_result.result_commit}</code></p>
           {:else if mergeRequest.state === "open"}
-            <p class="workspace-callout">No current MergeResult has been recorded for this target tip.</p>
+            <p class="workspace-callout">No final MergeResult has been selected for this revision.</p>
           {/if}
           {#if mergeRequest.current_revision.summary}<p>{mergeRequest.current_revision.summary}</p>{/if}
           {#if mergeRequest.current_review}
             <p><strong>{mergeRequest.current_review.decision}</strong> by {mergeRequest.current_review.reviewer_effective_profile}</p>
             {#if mergeRequest.current_review.body}<RichMarkdown text={mergeRequest.current_review.body} />{/if}
-          {/if}
-          {#if mergeRequest.state === "open"
-            && mergeRequest.review_status === "approved"
-            && mergeRequest.applied_merge_result?.target_status === "applied"
-            && (mergeRequest.applied_merge_result.strategy === "fast_forward"
-              || mergeRequest.applied_merge_result.review_status === "approved")}
-            <label><input type="checkbox" bind:checked={confirmMerge} /> Explicitly confirm the externally applied result</label>
-            <button class="workspace-primary-button" type="button" disabled={!confirmMerge || busy !== null} onclick={mergeConfirmedRevision}>Confirm merge</button>
           {/if}
         {:else}
           <p class="workspace-empty-copy">The assigned Coder has not opened a Merge Request.</p>

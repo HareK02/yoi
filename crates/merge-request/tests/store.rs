@@ -240,6 +240,18 @@ fn merge_result_is_idempotent_target_fenced_and_non_ff_reviewed_independently() 
         Err(MergeRequestError::MergeResultOperationConflict)
     ));
 
+    // Multiple valid candidates for the same target are retained as history. The
+    // most recently recorded candidate is the one explicit final result.
+    record_result(
+        &store,
+        "V1",
+        "T1",
+        "h1",
+        "h1",
+        MergeStrategy::FastForward,
+        MergeResolution::None,
+        "op-same-target-old",
+    );
     record_result(
         &store,
         "V1",
@@ -258,6 +270,42 @@ fn merge_result_is_idempotent_target_fenced_and_non_ff_reviewed_independently() 
         pending.merge_result_review_status,
         Some(ReviewStatus::Pending)
     );
+    let candidates = store
+        .show_for_ticket_with_target("T1", Some("T1"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(candidates.merge_results.len(), 3);
+    assert_eq!(
+        candidates
+            .final_merge_result
+            .as_ref()
+            .map(|result| result.merge_result_id.as_str()),
+        Some("result-op-merge")
+    );
+    store
+        .register_reviewer_child_session(RegisterReviewerChildSession {
+            parent_runtime_id: "runtime-orchestrator".into(),
+            parent_worker_id: "workspace-orchestrator".into(),
+            child_session_id: "child-old-candidate".into(),
+            now: "2026-07-26T00:00:04Z".into(),
+        })
+        .unwrap();
+    let old_candidate_review = store.register_review_attempt(RegisterReviewAttempt {
+        attempt_id: "attempt-old-candidate".into(),
+        ticket_id: "T1".into(),
+        revision_id: "V1".into(),
+        merge_result_id: Some("result-op-same-target-old".into()),
+        parent_assignment_id: "A1".into(),
+        parent_runtime_id: "runtime-orchestrator".into(),
+        parent_worker_id: "workspace-orchestrator".into(),
+        child_session_id: "child-old-candidate".into(),
+        capability_token: "token-old-candidate".into(),
+        now: "2026-07-26T00:00:04Z".into(),
+    });
+    assert!(matches!(
+        old_candidate_review,
+        Err(MergeRequestError::MergeResultNotFinal)
+    ));
 
     store
         .register_reviewer_child_session(RegisterReviewerChildSession {
@@ -307,7 +355,7 @@ fn merge_result_is_idempotent_target_fenced_and_non_ff_reviewed_independently() 
         .unwrap();
     assert_eq!(
         applied
-            .applied_merge_result
+            .final_merge_result
             .as_ref()
             .map(|result| result.target_status),
         Some(MergeResultTargetStatus::Applied)
@@ -454,10 +502,52 @@ fn request_changes_new_revision_resets_and_exact_completion_replay_converges() {
     assert!(review(&store, "V1", "tok1", ReviewDecision::Approve).is_err());
     attempt(&store, "AT2", "V2", "tok2", "child2");
     review(&store, "V2", "tok2", ReviewDecision::Approve).unwrap();
+    let missing_result = store.complete(CompleteMergeRequest {
+        operation_id: "OP-missing-result".into(),
+        ticket_id: "T1".into(),
+        expected_revision_id: "V2".into(),
+        expected_merge_result_id: "missing".into(),
+        observed_target_commit: "h2".into(),
+        implementation_assignment_id: "A1".into(),
+        completion_actor_runtime_id: "OR".into(),
+        completion_actor_worker_id: "OW".into(),
+        now: "tc".into(),
+    });
+    assert!(matches!(
+        missing_result,
+        Err(MergeRequestError::FinalMergeResultMissing)
+    ));
+    record_result(
+        &store,
+        "V2",
+        "base",
+        "h2",
+        "h2",
+        MergeStrategy::FastForward,
+        MergeResolution::None,
+        "final-v2",
+    );
+    let not_applied = store.complete(CompleteMergeRequest {
+        operation_id: "OP-not-applied".into(),
+        ticket_id: "T1".into(),
+        expected_revision_id: "V2".into(),
+        expected_merge_result_id: "result-final-v2".into(),
+        observed_target_commit: "base".into(),
+        implementation_assignment_id: "A1".into(),
+        completion_actor_runtime_id: "OR".into(),
+        completion_actor_worker_id: "OW".into(),
+        now: "tc".into(),
+    });
+    assert!(matches!(
+        not_applied,
+        Err(MergeRequestError::FinalMergeResultNotApplied)
+    ));
     let input = CompleteMergeRequest {
         operation_id: "OP1".into(),
         ticket_id: "T1".into(),
         expected_revision_id: "V2".into(),
+        expected_merge_result_id: "result-final-v2".into(),
+        observed_target_commit: "h2".into(),
         implementation_assignment_id: "A1".into(),
         completion_actor_runtime_id: "OR".into(),
         completion_actor_worker_id: "OW".into(),
@@ -465,30 +555,22 @@ fn request_changes_new_revision_resets_and_exact_completion_replay_converges() {
     };
     let first = store.complete(input.clone()).unwrap();
     assert!(!first.replayed);
+    assert_eq!(
+        store.show_for_ticket("T1").unwrap().unwrap().state,
+        MergeRequestState::Merged
+    );
+    assert_eq!(
+        store
+            .show_for_ticket("T1")
+            .unwrap()
+            .unwrap()
+            .merged_at
+            .as_deref(),
+        Some("tc")
+    );
     let replay = store.complete(input).unwrap();
     assert!(replay.replayed);
-    assert!(matches!(
-        store.confirm_merge(MergeConfirmation {
-            ticket_id: "T1".into(),
-            expected_revision_id: "V2".into(),
-            authenticated_account_id: "runtime".into(),
-            actor_kind: "worker".into(),
-            explicit_confirmation: true,
-            now: "tm".into()
-        }),
-        Err(MergeRequestError::MergeConfirmationRequired)
-    ));
-    let merged = store
-        .confirm_merge(MergeConfirmation {
-            ticket_id: "T1".into(),
-            expected_revision_id: "V2".into(),
-            authenticated_account_id: "account-1".into(),
-            actor_kind: "user".into(),
-            explicit_confirmation: true,
-            now: "tm".into(),
-        })
-        .unwrap();
-    assert_eq!(merged.state, MergeRequestState::Merged);
+    assert_eq!(replay.ticket_state, "done");
     let conn = Connection::open(store.db_path()).unwrap();
     assert_eq!(
         conn.query_row(
@@ -570,7 +652,7 @@ fn spoof_self_approval_replay_and_cross_workspace_are_rejected() {
 }
 
 #[test]
-fn reopen_resets_approval_and_merge_requires_authenticated_explicit_user() {
+fn reopen_resets_approval() {
     let (_dir, store) = setup();
     open(&store);
     attempt(&store, "AT", "V1", "token", "child");
@@ -578,18 +660,6 @@ fn reopen_resets_approval_and_merge_requires_authenticated_explicit_user() {
     store.close("T1", "V1", "tc").unwrap();
     let reopened = store.reopen("T1", "V1", "tr").unwrap();
     assert_eq!(reopened.review_status, ReviewStatus::Pending);
-    let denied = store.confirm_merge(MergeConfirmation {
-        ticket_id: "T1".into(),
-        expected_revision_id: "V1".into(),
-        authenticated_account_id: "user".into(),
-        actor_kind: "user".into(),
-        explicit_confirmation: false,
-        now: "tm".into(),
-    });
-    assert!(matches!(
-        denied,
-        Err(MergeRequestError::MergeConfirmationRequired)
-    ));
 }
 
 #[test]
@@ -598,10 +668,22 @@ fn concurrent_exact_completion_replays_commit_one_ticket_side_effect() {
     open(&store);
     attempt(&store, "AT", "V1", "token", "child");
     review(&store, "V1", "token", ReviewDecision::Approve).unwrap();
+    record_result(
+        &store,
+        "V1",
+        "base",
+        "h1",
+        "h1",
+        MergeStrategy::FastForward,
+        MergeResolution::None,
+        "final-concurrent",
+    );
     let input = CompleteMergeRequest {
         operation_id: "OP-concurrent".into(),
         ticket_id: "T1".into(),
         expected_revision_id: "V1".into(),
+        expected_merge_result_id: "result-final-concurrent".into(),
+        observed_target_commit: "h1".into(),
         implementation_assignment_id: "A1".into(),
         completion_actor_runtime_id: "OR".into(),
         completion_actor_worker_id: "OW".into(),
@@ -641,10 +723,22 @@ fn operation_key_mismatch_and_actor_or_assignment_change_are_fenced() {
     open(&store);
     attempt(&store, "AT", "V1", "token", "child");
     review(&store, "V1", "token", ReviewDecision::Approve).unwrap();
+    record_result(
+        &store,
+        "V1",
+        "base",
+        "h1",
+        "h1",
+        MergeStrategy::FastForward,
+        MergeResolution::None,
+        "final-operation",
+    );
     let mut input = CompleteMergeRequest {
         operation_id: "OP".into(),
         ticket_id: "T1".into(),
         expected_revision_id: "V1".into(),
+        expected_merge_result_id: "result-final-operation".into(),
+        observed_target_commit: "h1".into(),
         implementation_assignment_id: "A1".into(),
         completion_actor_runtime_id: "OR".into(),
         completion_actor_worker_id: "OW".into(),

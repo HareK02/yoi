@@ -1315,10 +1315,6 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             post(scoped_reopen_merge_request),
         )
         .route(
-            "/api/w/{workspace_id}/tickets/{id}/merge-request/merge",
-            post(scoped_confirm_merge_request),
-        )
-        .route(
             "/api/w/{workspace_id}/tickets/{id}/workflow/close",
             post(scoped_close_ticket_record),
         )
@@ -3596,12 +3592,6 @@ struct RevisionTransitionRequest {
     explicit_confirmation: bool,
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct ConfirmMergeRequestRequest {
-    expected_revision_id: String,
-    explicit_confirmation: bool,
-}
-
 fn parse_workspace_id(value: &str) -> ApiResult<String> {
     if value.trim().is_empty() {
         return Err(Error::InvalidInput("workspace_id must not be empty".to_string()).into());
@@ -4047,58 +4037,6 @@ async fn scoped_complete_merge_request(
         .ok_or_else(|| {
             Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
         })?;
-    let outcome = merge_request_store(&api, &workspace_id)?.complete(
-        merge_request::CompleteMergeRequest {
-            operation_id: input.operation_id,
-            ticket_id,
-            expected_revision_id: input.expected_revision_id,
-            implementation_assignment_id: assignment.assignment_id,
-            completion_actor_runtime_id: source.runtime_id,
-            completion_actor_worker_id: source.worker_id,
-            now: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-        },
-    )?;
-    Ok(Json(outcome))
-}
-
-async fn scoped_reopen_merge_request(
-    State(api): State<WorkspaceApi>,
-    headers: HeaderMap,
-    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
-    Json(input): Json<RevisionTransitionRequest>,
-) -> ApiResult<Json<merge_request::MergeRequest>> {
-    let workspace_id = parse_workspace_id(&workspace_id)?;
-    require_workspace_access(&workspace_id, &api)?;
-    reject_non_browser_merge_auth(&headers)
-        .map_err(|_| Error::BrowserReopenConfirmationRequired)?;
-    let _actor = require_actor(&api, &headers).await?;
-    if !input.explicit_confirmation {
-        return Err(Error::BrowserReopenConfirmationRequired.into());
-    }
-    Ok(Json(merge_request_store(&api, &workspace_id)?.reopen(
-        &ticket_id,
-        &input.expected_revision_id,
-        &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-    )?))
-}
-
-fn reject_non_browser_merge_auth(headers: &HeaderMap) -> Result<()> {
-    if headers.contains_key("authorization") {
-        return Err(Error::BrowserMergeConfirmationRequired);
-    }
-    Ok(())
-}
-
-async fn scoped_confirm_merge_request(
-    State(api): State<WorkspaceApi>,
-    headers: HeaderMap,
-    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
-    Json(input): Json<ConfirmMergeRequestRequest>,
-) -> ApiResult<Json<merge_request::MergeRequest>> {
-    let workspace_id = parse_workspace_id(&workspace_id)?;
-    require_workspace_access(&workspace_id, &api)?;
-    reject_non_browser_merge_auth(&headers)?;
-    let actor = require_actor(&api, &headers).await?;
     let store = merge_request_store(&api, &workspace_id)?;
     let current = store.show_for_ticket(&ticket_id)?.ok_or_else(|| {
         Error::from(merge_request::MergeRequestError::NotFound(
@@ -4113,28 +4051,56 @@ async fn scoped_confirm_merge_request(
                 ticket_id.clone(),
             ))
         })?;
-    if observed.applied_merge_result.is_none() {
-        return Err(Error::InvalidInput(
-            "Merge Request result is not the current target tip; target update is a separate prerequisite operation".into(),
-        ).into());
+    let final_result = observed
+        .final_merge_result
+        .as_ref()
+        .ok_or(merge_request::MergeRequestError::FinalMergeResultMissing)?;
+    if final_result.target_status != merge_request::MergeResultTargetStatus::Applied {
+        return Err(merge_request::MergeRequestError::FinalMergeResultNotApplied.into());
     }
     let readiness = store.readiness_for_ticket_with_target(&ticket_id, target_commit.as_deref())?;
     if !readiness.ready {
         return Err(Error::InvalidInput(format!(
-            "Merge Request is not integration-ready: {}",
+            "Merge Request is not completion-ready: {}",
             readiness.blockers.join("; ")
         ))
         .into());
     }
-    let mr = store.confirm_merge(merge_request::MergeConfirmation {
+    let outcome = store.complete(merge_request::CompleteMergeRequest {
+        operation_id: input.operation_id,
         ticket_id,
         expected_revision_id: input.expected_revision_id,
-        authenticated_account_id: actor.account_id,
-        actor_kind: "user".to_string(),
-        explicit_confirmation: input.explicit_confirmation,
+        expected_merge_result_id: final_result.merge_result_id.clone(),
+        observed_target_commit: target_commit
+            .ok_or(merge_request::MergeRequestError::FinalMergeResultNotApplied)?,
+        implementation_assignment_id: assignment.assignment_id,
+        completion_actor_runtime_id: source.runtime_id,
+        completion_actor_worker_id: source.worker_id,
         now: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
     })?;
-    Ok(Json(mr))
+    Ok(Json(outcome))
+}
+
+async fn scoped_reopen_merge_request(
+    State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    Json(input): Json<RevisionTransitionRequest>,
+) -> ApiResult<Json<merge_request::MergeRequest>> {
+    let workspace_id = parse_workspace_id(&workspace_id)?;
+    require_workspace_access(&workspace_id, &api)?;
+    if headers.contains_key("authorization") {
+        return Err(Error::BrowserReopenConfirmationRequired.into());
+    }
+    let _actor = require_actor(&api, &headers).await?;
+    if !input.explicit_confirmation {
+        return Err(Error::BrowserReopenConfirmationRequired.into());
+    }
+    Ok(Json(merge_request_store(&api, &workspace_id)?.reopen(
+        &ticket_id,
+        &input.expected_revision_id,
+        &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+    )?))
 }
 
 async fn scoped_close_ticket_record(
@@ -11590,9 +11556,7 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.error {
-            Error::BrowserMergeConfirmationRequired | Error::BrowserReopenConfirmationRequired => {
-                StatusCode::FORBIDDEN
-            }
+            Error::BrowserReopenConfirmationRequired => StatusCode::FORBIDDEN,
             Error::TicketAssignmentConflict(_)
             | Error::WorkdirAttachmentConflict(_)
             | Error::WorkspaceConfigConflict(_) => StatusCode::CONFLICT,
@@ -11754,17 +11718,6 @@ mod tests {
         MemoryDocumentRecord, MemoryStagingRecord, ObjectiveRecord, ObjectiveResourceRecord,
         ObjectiveTicketLinkRecord, SqliteWorkspaceStore, WorkspaceRecord,
     };
-
-    #[test]
-    fn merge_confirmation_rejects_api_token_actor_before_session_resolution() {
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Bearer api-token".parse().unwrap());
-        assert!(matches!(
-            reject_non_browser_merge_auth(&headers),
-            Err(Error::BrowserMergeConfirmationRequired)
-        ));
-        assert!(reject_non_browser_merge_auth(&HeaderMap::new()).is_ok());
-    }
 
     #[test]
     fn flow_or_generic_worker_state_change_is_not_ticket_completion_authority() {
@@ -12412,6 +12365,46 @@ mod tests {
     async fn merge_request_completion_endpoint_rejects_coder_and_accepts_orchestrator() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
+        let git_output = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(workspace.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {:?} failed", args);
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        let base_commit = git_output(&["rev-parse", "HEAD"]);
+        std::fs::write(workspace.path().join("README.md"), "completion candidate\n").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(workspace.path())
+                .args(["add", "README.md"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(workspace.path())
+                .args(["commit", "-m", "candidate"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let head_commit = git_output(&["rev-parse", "HEAD"]);
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(workspace.path())
+                .args(["reset", "--hard", &base_commit])
+                .status()
+                .unwrap()
+                .success()
+        );
         let api = test_api(workspace.path()).await;
         let workspace_id = api.config.workspace_id.clone();
         let backend = browser_ticket_backend(&api).unwrap();
@@ -12452,8 +12445,8 @@ mod tests {
                 revision: merge_request::MergeRequestRevision {
                     revision_id: "V1".into(),
                     ordinal: 1,
-                    base_commit: "base".into(),
-                    head_commit: "head".into(),
+                    base_commit: base_commit.clone(),
+                    head_commit: head_commit.clone(),
 
                     diff_digest: "sha256:diff".into(),
                     changed_paths: vec!["src/lib.rs".into()],
@@ -12500,6 +12493,31 @@ mod tests {
                 now: "t3".into(),
             })
             .unwrap();
+        mr_store
+            .record_merge_result(merge_request::RecordMergeResult {
+                operation_id: "record-complete-result".into(),
+                merge_result_id: "result-complete".into(),
+                ticket_id: ticket.id.clone(),
+                expected_revision_id: "V1".into(),
+                target_commit: base_commit.clone(),
+                source_commit: head_commit.clone(),
+                result_commit: head_commit.clone(),
+                strategy: merge_request::MergeStrategy::FastForward,
+                resolution: merge_request::MergeResolution::None,
+                actor_runtime_id: coder.worker_ref.runtime_id.clone(),
+                actor_worker_id: coder.worker_ref.worker_id.clone(),
+                created_at: "t4".into(),
+            })
+            .unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(workspace.path())
+                .args(["reset", "--hard", &head_commit])
+                .status()
+                .unwrap()
+                .success()
+        );
 
         let worker_headers = |worker: &RuntimeWorkerRef| {
             let mut headers = HeaderMap::new();
@@ -13400,6 +13418,7 @@ mod tests {
         for args in [
             vec!["add", "README.md", ".gitignore"],
             vec!["commit", "-m", "init"],
+            vec!["branch", "-M", "develop"],
         ] {
             let status = std::process::Command::new("git")
                 .arg("-C")
