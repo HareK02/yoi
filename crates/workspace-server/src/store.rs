@@ -186,6 +186,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create durable Runtime Worker control grants",
         apply: create_worker_control_grant_authority,
     },
+    Migration {
+        version: 34,
+        name: "create Worker control delegation operation authority",
+        apply: create_worker_control_delegation_operation_authority,
+    },
 ];
 
 struct Migration {
@@ -345,6 +350,18 @@ pub struct WorkerControlGrantRecord {
     pub operation_id: String,
     pub created_at: String,
     pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerControlDelegationOperationRecord {
+    pub workspace_id: String,
+    pub source_controller: RuntimeWorkerRef,
+    pub source_grant_id: String,
+    pub operation_id: String,
+    pub input_fingerprint: String,
+    pub delegated_grant_id: Option<String>,
+    pub created_at: String,
+    pub completed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -787,6 +804,18 @@ pub trait ControlPlaneStore: Send + Sync {
         grant_id: &str,
         revoked_at: &str,
     ) -> Result<bool>;
+    fn reserve_worker_control_delegation_operation(
+        &self,
+        record: &WorkerControlDelegationOperationRecord,
+    ) -> Result<WorkerControlDelegationOperationRecord>;
+    fn complete_worker_control_delegation_operation(
+        &self,
+        workspace_id: &str,
+        source_controller: &RuntimeWorkerRef,
+        operation_id: &str,
+        delegated_grant_id: &str,
+        completed_at: &str,
+    ) -> Result<WorkerControlDelegationOperationRecord>;
 
     fn get_ticket_assignment_operation(
         &self,
@@ -2549,6 +2578,95 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn reserve_worker_control_delegation_operation(
+        &self,
+        record: &WorkerControlDelegationOperationRecord,
+    ) -> Result<WorkerControlDelegationOperationRecord> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO worker_control_delegation_operations (
+                    workspace_id, source_controller_runtime_id, source_controller_worker_id,
+                    source_grant_id, operation_id, input_fingerprint,
+                    delegated_grant_id, created_at, completed_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT (
+                    workspace_id, source_controller_runtime_id,
+                    source_controller_worker_id, operation_id
+                ) DO NOTHING"#,
+                params![
+                    record.workspace_id,
+                    record.source_controller.runtime_id,
+                    record.source_controller.worker_id,
+                    record.source_grant_id,
+                    record.operation_id,
+                    record.input_fingerprint,
+                    record.delegated_grant_id,
+                    record.created_at,
+                    record.completed_at,
+                ],
+            )?;
+            let persisted = read_worker_control_delegation_operation_by_key(
+                conn,
+                &record.workspace_id,
+                &record.source_controller,
+                &record.operation_id,
+            )?
+            .ok_or_else(|| {
+                Error::Store("worker control delegation operation was not persisted".to_string())
+            })?;
+            if persisted.source_grant_id != record.source_grant_id
+                || persisted.input_fingerprint != record.input_fingerprint
+            {
+                return Err(Error::InvalidInput(format!(
+                    "worker control delegation operation `{}` was already used with different input",
+                    record.operation_id
+                )));
+            }
+            Ok(persisted)
+        })
+    }
+
+    fn complete_worker_control_delegation_operation(
+        &self,
+        workspace_id: &str,
+        source_controller: &RuntimeWorkerRef,
+        operation_id: &str,
+        delegated_grant_id: &str,
+        completed_at: &str,
+    ) -> Result<WorkerControlDelegationOperationRecord> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"UPDATE worker_control_delegation_operations
+                   SET delegated_grant_id = ?5, completed_at = ?6
+                   WHERE workspace_id = ?1
+                     AND source_controller_runtime_id = ?2
+                     AND source_controller_worker_id = ?3
+                     AND operation_id = ?4
+                     AND (delegated_grant_id IS NULL OR delegated_grant_id = ?5)"#,
+                params![
+                    workspace_id,
+                    source_controller.runtime_id,
+                    source_controller.worker_id,
+                    operation_id,
+                    delegated_grant_id,
+                    completed_at,
+                ],
+            )?;
+            read_worker_control_delegation_operation_by_key(
+                conn,
+                workspace_id,
+                source_controller,
+                operation_id,
+            )?
+            .filter(|record| record.delegated_grant_id.as_deref() == Some(delegated_grant_id))
+            .ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "worker control delegation operation `{operation_id}` completed with a different grant"
+                ))
+            })
+        })
+    }
+
     fn get_ticket_assignment_operation(
         &self,
         workspace_id: &str,
@@ -3906,6 +4024,52 @@ fn read_worker_control_grant_by_operation(
     .map_err(Error::from)
 }
 
+fn read_worker_control_delegation_operation_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<WorkerControlDelegationOperationRecord> {
+    Ok(WorkerControlDelegationOperationRecord {
+        workspace_id: row.get(0)?,
+        source_controller: RuntimeWorkerRef::new(
+            row.get::<_, String>(1)?,
+            row.get::<_, u64>(2)?.to_string(),
+        ),
+        source_grant_id: row.get(3)?,
+        operation_id: row.get(4)?,
+        input_fingerprint: row.get(5)?,
+        delegated_grant_id: row.get(6)?,
+        created_at: row.get(7)?,
+        completed_at: row.get(8)?,
+    })
+}
+
+fn read_worker_control_delegation_operation_by_key(
+    conn: &Connection,
+    workspace_id: &str,
+    source_controller: &RuntimeWorkerRef,
+    operation_id: &str,
+) -> Result<Option<WorkerControlDelegationOperationRecord>> {
+    conn.query_row(
+        r#"SELECT workspace_id,
+                  source_controller_runtime_id, source_controller_worker_id,
+                  source_grant_id, operation_id, input_fingerprint,
+                  delegated_grant_id, created_at, completed_at
+           FROM worker_control_delegation_operations
+           WHERE workspace_id = ?1
+             AND source_controller_runtime_id = ?2
+             AND source_controller_worker_id = ?3
+             AND operation_id = ?4"#,
+        params![
+            workspace_id,
+            source_controller.runtime_id,
+            source_controller.worker_id,
+            operation_id,
+        ],
+        read_worker_control_delegation_operation_record,
+    )
+    .optional()
+    .map_err(Error::from)
+}
+
 fn current_ticket_worker_assignment_select_sql() -> String {
     "SELECT a.workspace_id, a.ticket_id, a.assignment_id, a.runtime_id, a.worker_id, \
             a.assigned_by, a.assigned_at \
@@ -4970,6 +5134,40 @@ fn create_worker_control_grant_authority(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn create_worker_control_delegation_operation_authority(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE worker_control_delegation_operations (
+            workspace_id TEXT NOT NULL,
+            source_controller_runtime_id TEXT NOT NULL,
+            source_controller_worker_id INTEGER NOT NULL,
+            source_grant_id TEXT NOT NULL,
+            operation_id TEXT NOT NULL,
+            input_fingerprint TEXT NOT NULL,
+            delegated_grant_id TEXT,
+            created_at TEXT NOT NULL,
+            completed_at TEXT,
+            PRIMARY KEY (
+                workspace_id,
+                source_controller_runtime_id,
+                source_controller_worker_id,
+                operation_id
+            ),
+            FOREIGN KEY (workspace_id, source_controller_runtime_id, source_controller_worker_id)
+                REFERENCES worker_registry (workspace_id, runtime_id, runtime_worker_id)
+                ON DELETE CASCADE,
+            FOREIGN KEY (workspace_id, source_grant_id)
+                REFERENCES worker_control_grants (workspace_id, grant_id)
+                ON DELETE CASCADE,
+            FOREIGN KEY (workspace_id, delegated_grant_id)
+                REFERENCES worker_control_grants (workspace_id, grant_id)
+                ON DELETE SET NULL
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
 fn create_worker_mutation_source_proof_replay_guard(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -5643,7 +5841,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 33);
+        assert_eq!(current_schema_version(&conn).unwrap(), 34);
         assert!(table_exists(&conn, "worker_workdir_attachment_reservations").unwrap());
     }
 
@@ -5676,7 +5874,7 @@ CREATE TABLE flow_events (event_id TEXT PRIMARY KEY);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 33);
+        assert_eq!(current_schema_version(&conn).unwrap(), 34);
         assert!(table_exists(&conn, "flow_sources").unwrap());
         assert!(table_exists(&conn, "flow_source_revisions").unwrap());
         assert!(!table_exists(&conn, "flow_instances").unwrap());
@@ -5743,7 +5941,7 @@ INSERT INTO worker_workdir_attachment_reservations (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 33);
+        assert_eq!(current_schema_version(&conn).unwrap(), 34);
         let repositories_sql: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'repositories'",
@@ -5923,7 +6121,7 @@ INSERT INTO workdir_registry (
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 33);
+        assert_eq!(store.schema_version().await.unwrap(), 34);
         assert!(
             !store
                 .with_conn(|conn| table_exists(conn, "worker_workspace_credentials"))
@@ -5940,7 +6138,7 @@ INSERT INTO workdir_registry (
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 33);
+        assert_eq!(reopened.schema_version().await.unwrap(), 34);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -6487,7 +6685,7 @@ INSERT INTO workdir_registry (
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 33);
+        assert_eq!(store.schema_version().await.unwrap(), 34);
 
         store
             .with_conn(|conn| {
@@ -6676,7 +6874,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 33);
+        assert_eq!(store.schema_version().await.unwrap(), 34);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -6742,7 +6940,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 33);
+        assert_eq!(store.schema_version().await.unwrap(), 34);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -7133,7 +7331,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 33);
+        assert_eq!(store.schema_version().await.unwrap(), 34);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),
