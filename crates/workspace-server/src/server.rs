@@ -103,9 +103,8 @@ use crate::skills;
 use crate::store::{
     AccountRecord, ApiTokenRecord, AuthChallengeRecord, BrowserSessionRecord, ControlPlaneStore,
     DeviceLoginFlowRecord, FlowSourceRecord, PasskeyCredentialRecord, RepositoryRecord,
-    TicketWorkerAssignmentRecord, UserRecord, WorkdirRegistryRecord,
-    WorkerControlDelegationOperationRecord, WorkerControlGrantRecord, WorkerRegistryRecord,
-    WorkerWorkdirLinkRecord, WorkspaceRecord,
+    TicketWorkerAssignmentRecord, UserRecord, WorkdirRegistryRecord, WorkerControlGrantRecord,
+    WorkerRegistryRecord, WorkerWorkdirLinkRecord, WorkspaceRecord,
 };
 use crate::{Error, Result};
 use worker_runtime::catalog::{
@@ -1478,18 +1477,6 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             get(list_known_workers).post(spawn_known_worker),
         )
         .route(
-            "/api/w/{workspace_id}/worker-control/grants/{grant_id}/share",
-            post(share_worker_control_grant),
-        )
-        .route(
-            "/api/w/{workspace_id}/worker-control/grants/{grant_id}/transfer",
-            post(transfer_worker_control_grant),
-        )
-        .route(
-            "/api/w/{workspace_id}/worker-control/grants/{grant_id}/revoke",
-            post(revoke_worker_control_grant),
-        )
-        .route(
             "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/input",
             post(send_known_worker_input),
         )
@@ -2256,12 +2243,6 @@ struct TranscriptQuery {
 #[derive(Debug, Deserialize)]
 struct ScopedWorkspacePath {
     workspace_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ScopedWorkerControlGrantPath {
-    workspace_id: String,
-    grant_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5917,7 +5898,6 @@ async fn scoped_workspace_orchestrator_status(
 
 #[derive(Debug, Serialize, Deserialize)]
 struct KnownWorkerRecord {
-    grant_id: String,
     subject: RuntimeWorkerRef,
     relation: String,
     origin: String,
@@ -5952,7 +5932,6 @@ async fn list_known_workers(
             .worker(&grant.subject)
             .map_err(|error| error.into_error())?;
         items.push(KnownWorkerRecord {
-            grant_id: grant.grant_id,
             subject: grant.subject,
             relation: grant.relation,
             origin: grant.origin,
@@ -6028,8 +6007,6 @@ async fn spawn_known_worker(
                 "stop".to_string(),
                 "restore".to_string(),
                 "remove".to_string(),
-                "share".to_string(),
-                "transfer".to_string(),
                 "observe".to_string(),
             ],
             operation_id,
@@ -6081,250 +6058,6 @@ fn authorize_known_worker_permission(
         )));
     }
     Ok(grant)
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DelegateWorkerControlGrantRequest {
-    target_controller: RuntimeWorkerRef,
-    operation_id: String,
-}
-
-async fn share_worker_control_grant(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedWorkerControlGrantPath>,
-    headers: HeaderMap,
-    Json(request): Json<DelegateWorkerControlGrantRequest>,
-) -> ApiResult<Json<WorkerControlGrantRecord>> {
-    delegate_worker_control_grant(api, path, headers, request, false).await
-}
-
-async fn transfer_worker_control_grant(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedWorkerControlGrantPath>,
-    headers: HeaderMap,
-    Json(request): Json<DelegateWorkerControlGrantRequest>,
-) -> ApiResult<Json<WorkerControlGrantRecord>> {
-    delegate_worker_control_grant(api, path, headers, request, true).await
-}
-
-fn worker_control_delegation_input_fingerprint(
-    controller: &RuntimeWorkerRef,
-    grant: &WorkerControlGrantRecord,
-    action: &str,
-    target_controller: &RuntimeWorkerRef,
-) -> Result<String> {
-    let operation_input = serde_json::json!({
-        "source_controller": controller,
-        "source_grant_id": &grant.grant_id,
-        "action": action,
-        "target_controller": target_controller,
-        "subject": &grant.subject,
-        "permissions": &grant.permissions,
-    });
-    let operation_bytes = serde_json::to_vec(&operation_input).map_err(|error| {
-        Error::InvalidInput(format!("invalid Worker delegation input: {error}"))
-    })?;
-    Ok(format!(
-        "sha256:{}",
-        Sha256::digest(&operation_bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    ))
-}
-
-async fn delegate_worker_control_grant(
-    api: WorkspaceApi,
-    path: ScopedWorkerControlGrantPath,
-    headers: HeaderMap,
-    request: DelegateWorkerControlGrantRequest,
-    transfer: bool,
-) -> ApiResult<Json<WorkerControlGrantRecord>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
-    let controller = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
-    let permission = if transfer { "transfer" } else { "share" };
-    let grant = api
-        .store
-        .get_worker_control_grant(&path.workspace_id, &path.grant_id)?
-        .filter(|grant| {
-            grant.controller == controller
-                && grant.permissions.iter().any(|value| value == permission)
-        })
-        .ok_or_else(|| Error::UnknownWorker {
-            worker: controller.clone(),
-        })?;
-    if request.target_controller == controller {
-        return Err(ApiError::from(Error::InvalidInput(
-            "target_controller must differ from the current Worker".to_string(),
-        )));
-    }
-    let operation_id = request.operation_id.trim();
-    if operation_id.is_empty() || operation_id.len() > 200 {
-        return Err(ApiError::from(Error::InvalidInput(
-            "operation_id must contain 1..=200 bytes".to_string(),
-        )));
-    }
-    let input_fingerprint = worker_control_delegation_input_fingerprint(
-        &controller,
-        &grant,
-        permission,
-        &request.target_controller,
-    )?;
-    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    let operation = api.store.reserve_worker_control_delegation_operation(
-        &WorkerControlDelegationOperationRecord {
-            workspace_id: path.workspace_id.clone(),
-            source_controller: controller.clone(),
-            source_grant_id: grant.grant_id.clone(),
-            operation_id: operation_id.to_string(),
-            input_fingerprint,
-            delegated_grant_id: None,
-            created_at: now.clone(),
-            completed_at: None,
-        },
-    )?;
-    if let Some(delegated_grant_id) = operation.delegated_grant_id.as_deref() {
-        let delegated = api
-            .store
-            .get_worker_control_grant(&path.workspace_id, delegated_grant_id)?
-            .ok_or_else(|| {
-                Error::Store("completed Worker delegation references a missing grant".to_string())
-            })?;
-        if transfer && grant.revoked_at.is_none() {
-            let lock = worker_control_lock(&api, &grant.grant_id);
-            let _guard = lock.lock().await;
-            if api
-                .store
-                .get_worker_control_grant(&path.workspace_id, &grant.grant_id)?
-                .is_some_and(|current| current.revoked_at.is_none())
-            {
-                api.store
-                    .revoke_worker_control_grant(&path.workspace_id, &grant.grant_id, &now)?;
-            }
-        }
-        return Ok(Json(delegated));
-    }
-    if grant.revoked_at.is_some() {
-        return Err(ApiError::from(Error::UnknownWorker {
-            worker: grant.subject,
-        }));
-    }
-    api.store
-        .get_active_worker_control_grant(
-            &path.workspace_id,
-            &controller,
-            &request.target_controller,
-        )?
-        .ok_or_else(|| Error::UnknownWorker {
-            worker: request.target_controller.clone(),
-        })?;
-    api.store
-        .get_worker_registry(&path.workspace_id, &request.target_controller)?
-        .ok_or_else(|| Error::UnknownWorker {
-            worker: request.target_controller.clone(),
-        })?;
-
-    let lock = worker_control_lock(&api, &grant.grant_id);
-    let _guard = lock.lock().await;
-    let current = api
-        .store
-        .get_worker_control_grant(&path.workspace_id, &path.grant_id)?
-        .filter(|candidate| {
-            candidate.controller == controller
-                && candidate.revoked_at.is_none()
-                && candidate
-                    .permissions
-                    .iter()
-                    .any(|value| value == permission)
-        })
-        .ok_or_else(|| Error::UnknownWorker {
-            worker: grant.subject.clone(),
-        })?;
-    api.store
-        .get_active_worker_control_grant(
-            &path.workspace_id,
-            &controller,
-            &request.target_controller,
-        )?
-        .ok_or_else(|| Error::UnknownWorker {
-            worker: request.target_controller.clone(),
-        })?;
-    let delegated_operation_id = format!(
-        "worker-control-delegate:{}:{}:{}:{}:{}",
-        controller.runtime_id, controller.worker_id, current.grant_id, permission, operation_id
-    );
-    let expected_origin = format!("worker_control_{permission}:{}", current.grant_id);
-    let delegated = api
-        .store
-        .create_worker_control_grant(&WorkerControlGrantRecord {
-            workspace_id: path.workspace_id.clone(),
-            grant_id: new_id("wcg"),
-            controller: request.target_controller,
-            subject: current.subject.clone(),
-            relation: if transfer { "transferred" } else { "shared" }.to_string(),
-            origin: expected_origin,
-            permissions: current.permissions.clone(),
-            operation_id: delegated_operation_id,
-            created_at: now.clone(),
-            revoked_at: None,
-        })?;
-    api.store.complete_worker_control_delegation_operation(
-        &path.workspace_id,
-        &controller,
-        operation_id,
-        &delegated.grant_id,
-        &now,
-    )?;
-    if transfer
-        && !api
-            .store
-            .revoke_worker_control_grant(&path.workspace_id, &current.grant_id, &now)?
-    {
-        return Err(ApiError::from(Error::UnknownWorker {
-            worker: current.subject,
-        }));
-    }
-    Ok(Json(delegated))
-}
-
-async fn revoke_worker_control_grant(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedWorkerControlGrantPath>,
-    headers: HeaderMap,
-) -> ApiResult<Json<WorkerControlGrantRecord>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
-    let controller = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
-    let grant = api
-        .store
-        .get_worker_control_grant(&path.workspace_id, &path.grant_id)?
-        .filter(|grant| grant.controller == controller && grant.revoked_at.is_none())
-        .ok_or_else(|| Error::UnknownWorker {
-            worker: controller.clone(),
-        })?;
-    let lock = worker_control_lock(&api, &grant.grant_id);
-    let _guard = lock.lock().await;
-    let current = api
-        .store
-        .get_worker_control_grant(&path.workspace_id, &path.grant_id)?
-        .filter(|candidate| candidate.controller == controller && candidate.revoked_at.is_none())
-        .ok_or_else(|| Error::UnknownWorker {
-            worker: grant.subject.clone(),
-        })?;
-    let revoked_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    if !api
-        .store
-        .revoke_worker_control_grant(&path.workspace_id, &path.grant_id, &revoked_at)?
-    {
-        return Err(ApiError::from(Error::UnknownWorker {
-            worker: current.subject,
-        }));
-    }
-    let mut revoked = current;
-    revoked.revoked_at = Some(revoked_at);
-    Ok(Json(revoked))
 }
 
 async fn send_known_worker_input(
@@ -13532,7 +13265,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(known.items.len(), 1);
-        assert_eq!(known.items[0].grant_id, "orchestrator-controls-generic");
         assert_eq!(known.items[0].subject, generic.worker_ref);
         assert_eq!(known.items[0].permissions, ["observe"]);
 
@@ -13571,17 +13303,15 @@ mod tests {
         .unwrap();
         assert!(capture["entries"].is_array());
 
-        let Json(revoked) = revoke_worker_control_grant(
-            State(api.clone()),
-            AxumPath(ScopedWorkerControlGrantPath {
-                workspace_id: workspace_id.clone(),
-                grant_id: "orchestrator-controls-generic".to_string(),
-            }),
-            observation_headers.clone(),
-        )
-        .await
-        .unwrap();
-        assert!(revoked.revoked_at.is_some());
+        let revoked = api
+            .store
+            .revoke_worker_control_grant(
+                &workspace_id,
+                "orchestrator-controls-generic",
+                "2026-07-27T00:00:02Z",
+            )
+            .unwrap();
+        assert!(revoked);
         let revoked_capture = scoped_capture_worker_observation_session(
             State(api.clone()),
             AxumPath(ScopedWorkspacePath {
@@ -13619,270 +13349,6 @@ mod tests {
         .await
         .unwrap();
         assert!(unauthorized["sessions"].as_array().unwrap().is_empty());
-
-        for (grant_id, permission) in [
-            ("orchestrator-share-source", "share"),
-            ("orchestrator-transfer-source", "transfer"),
-        ] {
-            api.store
-                .create_worker_control_grant(&WorkerControlGrantRecord {
-                    workspace_id: workspace_id.clone(),
-                    grant_id: grant_id.to_string(),
-                    controller: dedicated.worker.clone(),
-                    subject: generic.worker_ref.clone(),
-                    relation: "spawned".to_string(),
-                    origin: "test-delegation".to_string(),
-                    permissions: vec!["observe".to_string(), permission.to_string()],
-                    operation_id: format!("seed-{permission}"),
-                    created_at: "2026-07-27T00:00:01Z".to_string(),
-                    revoked_at: None,
-                })
-                .unwrap();
-        }
-        let target_controller = generic.worker_ref.clone();
-        let Json(shared) = share_worker_control_grant(
-            State(api.clone()),
-            AxumPath(ScopedWorkerControlGrantPath {
-                workspace_id: workspace_id.clone(),
-                grant_id: "orchestrator-share-source".to_string(),
-            }),
-            observation_headers.clone(),
-            Json(DelegateWorkerControlGrantRequest {
-                target_controller: target_controller.clone(),
-                operation_id: "share-operation".to_string(),
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(shared.controller, target_controller);
-        assert_eq!(shared.relation, "shared");
-
-        let alternate_target = RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, "1000");
-        let now = now_registry_timestamp();
-        api.store
-            .upsert_worker_registry(&WorkerRegistryRecord {
-                workspace_id: workspace_id.clone(),
-                worker: alternate_target.clone(),
-                display_name: "Alternate known target".to_string(),
-                profile: None,
-                retention_state: "normal".to_string(),
-                transcript_ref: None,
-                session_ref: None,
-                summary_ref: None,
-                diagnostics_ref: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            })
-            .unwrap();
-        let registry_only_target = RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, "1001");
-        api.store
-            .upsert_worker_registry(&WorkerRegistryRecord {
-                workspace_id: workspace_id.clone(),
-                worker: registry_only_target.clone(),
-                display_name: "Registry-only target".to_string(),
-                profile: None,
-                retention_state: "normal".to_string(),
-                transcript_ref: None,
-                session_ref: None,
-                summary_ref: None,
-                diagnostics_ref: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            })
-            .unwrap();
-        let unknown_target = share_worker_control_grant(
-            State(api.clone()),
-            AxumPath(ScopedWorkerControlGrantPath {
-                workspace_id: workspace_id.clone(),
-                grant_id: "orchestrator-share-source".to_string(),
-            }),
-            observation_headers.clone(),
-            Json(DelegateWorkerControlGrantRequest {
-                target_controller: registry_only_target,
-                operation_id: "share-registry-only".to_string(),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            unknown_target.into_response().status(),
-            StatusCode::NOT_FOUND
-        );
-        for (grant_id, operation_id, subject) in [
-            (
-                "orchestrator-knows-alternate",
-                "seed-known-alternate",
-                alternate_target.clone(),
-            ),
-            (
-                "orchestrator-second-share-source",
-                "seed-second-share",
-                generic.worker_ref.clone(),
-            ),
-        ] {
-            api.store
-                .create_worker_control_grant(&WorkerControlGrantRecord {
-                    workspace_id: workspace_id.clone(),
-                    grant_id: grant_id.to_string(),
-                    controller: dedicated.worker.clone(),
-                    subject,
-                    relation: "spawned".to_string(),
-                    origin: "test-delegation-conflict".to_string(),
-                    permissions: vec!["share".to_string()],
-                    operation_id: operation_id.to_string(),
-                    created_at: now.clone(),
-                    revoked_at: None,
-                })
-                .unwrap();
-        }
-        let changed_target = share_worker_control_grant(
-            State(api.clone()),
-            AxumPath(ScopedWorkerControlGrantPath {
-                workspace_id: workspace_id.clone(),
-                grant_id: "orchestrator-share-source".to_string(),
-            }),
-            observation_headers.clone(),
-            Json(DelegateWorkerControlGrantRequest {
-                target_controller: alternate_target,
-                operation_id: "share-operation".to_string(),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            changed_target.into_response().status(),
-            StatusCode::BAD_REQUEST
-        );
-        let changed_source_grant = share_worker_control_grant(
-            State(api.clone()),
-            AxumPath(ScopedWorkerControlGrantPath {
-                workspace_id: workspace_id.clone(),
-                grant_id: "orchestrator-second-share-source".to_string(),
-            }),
-            observation_headers.clone(),
-            Json(DelegateWorkerControlGrantRequest {
-                target_controller: generic.worker_ref.clone(),
-                operation_id: "share-operation".to_string(),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            changed_source_grant.into_response().status(),
-            StatusCode::BAD_REQUEST
-        );
-
-        let recovery_source = api
-            .store
-            .get_worker_control_grant(&workspace_id, "orchestrator-transfer-source")
-            .unwrap()
-            .unwrap();
-        let recovery_operation_id = "transfer-operation";
-        let recovery_fingerprint = worker_control_delegation_input_fingerprint(
-            &dedicated.worker,
-            &recovery_source,
-            "transfer",
-            &generic.worker_ref,
-        )
-        .unwrap();
-        let recovery_now = now_registry_timestamp();
-        api.store
-            .reserve_worker_control_delegation_operation(&WorkerControlDelegationOperationRecord {
-                workspace_id: workspace_id.clone(),
-                source_controller: dedicated.worker.clone(),
-                source_grant_id: recovery_source.grant_id.clone(),
-                operation_id: recovery_operation_id.to_string(),
-                input_fingerprint: recovery_fingerprint,
-                delegated_grant_id: None,
-                created_at: recovery_now.clone(),
-                completed_at: None,
-            })
-            .unwrap();
-        let precompleted_transfer = api
-            .store
-            .create_worker_control_grant(&WorkerControlGrantRecord {
-                workspace_id: workspace_id.clone(),
-                grant_id: "precompleted-transfer-grant".to_string(),
-                controller: generic.worker_ref.clone(),
-                subject: recovery_source.subject.clone(),
-                relation: "transferred".to_string(),
-                origin: format!("worker_control_transfer:{}", recovery_source.grant_id),
-                permissions: recovery_source.permissions.clone(),
-                operation_id: format!(
-                    "worker-control-delegate:{}:{}:{}:transfer:{}",
-                    dedicated.worker.runtime_id,
-                    dedicated.worker.worker_id,
-                    recovery_source.grant_id,
-                    recovery_operation_id,
-                ),
-                created_at: recovery_now.clone(),
-                revoked_at: None,
-            })
-            .unwrap();
-        api.store
-            .complete_worker_control_delegation_operation(
-                &workspace_id,
-                &dedicated.worker,
-                recovery_operation_id,
-                &precompleted_transfer.grant_id,
-                &recovery_now,
-            )
-            .unwrap();
-        assert!(
-            api.store
-                .get_worker_control_grant(&workspace_id, &recovery_source.grant_id)
-                .unwrap()
-                .unwrap()
-                .revoked_at
-                .is_none()
-        );
-
-        let Json(transferred) = transfer_worker_control_grant(
-            State(api.clone()),
-            AxumPath(ScopedWorkerControlGrantPath {
-                workspace_id: workspace_id.clone(),
-                grant_id: "orchestrator-transfer-source".to_string(),
-            }),
-            observation_headers.clone(),
-            Json(DelegateWorkerControlGrantRequest {
-                target_controller: generic.worker_ref.clone(),
-                operation_id: "transfer-operation".to_string(),
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(transferred.grant_id, precompleted_transfer.grant_id);
-        assert!(
-            api.store
-                .get_worker_control_grant(&workspace_id, &recovery_source.grant_id)
-                .unwrap()
-                .unwrap()
-                .revoked_at
-                .is_some()
-        );
-        let Json(transfer_replay) = transfer_worker_control_grant(
-            State(api.clone()),
-            AxumPath(ScopedWorkerControlGrantPath {
-                workspace_id: workspace_id.clone(),
-                grant_id: "orchestrator-transfer-source".to_string(),
-            }),
-            observation_headers,
-            Json(DelegateWorkerControlGrantRequest {
-                target_controller: generic.worker_ref.clone(),
-                operation_id: "transfer-operation".to_string(),
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(transfer_replay.grant_id, transferred.grant_id);
-        assert!(
-            api.store
-                .get_worker_control_grant(&workspace_id, "orchestrator-transfer-source")
-                .unwrap()
-                .unwrap()
-                .revoked_at
-                .is_some()
-        );
 
         let Json(existing) = scoped_start_workspace_orchestrator(
             State(api.clone()),

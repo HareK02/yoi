@@ -435,12 +435,6 @@ impl FeatureModule for ManageWorkerFeature {
                 WorkerOperation::Remove => {
                     definition::<WorkerRemoveInput>(operation, self.control.clone())
                 }
-                WorkerOperation::Share | WorkerOperation::Transfer => {
-                    definition::<WorkerDelegateInput>(operation, self.control.clone())
-                }
-                WorkerOperation::Revoke => {
-                    definition::<WorkerRevokeInput>(operation, self.control.clone())
-                }
             };
             context
                 .tools()
@@ -540,19 +534,6 @@ struct WorkerRemoveInput {
     reason: String,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct WorkerRevokeInput {
-    grant_id: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct WorkerDelegateInput {
-    grant_id: String,
-    target_controller: WorkerSubjectInput,
-}
-
 struct WorkspaceWorkerTool {
     operation: WorkerOperation,
     control: Arc<dyn WorkerControlService>,
@@ -568,13 +549,10 @@ enum WorkerOperation {
     Stop,
     Restore,
     Remove,
-    Share,
-    Transfer,
-    Revoke,
 }
 
 impl WorkerOperation {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 8] = [
         Self::List,
         Self::Spawn,
         Self::SendInput,
@@ -583,9 +561,6 @@ impl WorkerOperation {
         Self::Stop,
         Self::Restore,
         Self::Remove,
-        Self::Share,
-        Self::Transfer,
-        Self::Revoke,
     ];
 
     fn tool_name(self) -> &'static str {
@@ -598,9 +573,6 @@ impl WorkerOperation {
             Self::Stop => "WorkerStop",
             Self::Restore => "WorkerRestore",
             Self::Remove => "WorkerRemove",
-            Self::Share => "WorkerShare",
-            Self::Transfer => "WorkerTransfer",
-            Self::Revoke => "WorkerRevoke",
         }
     }
 
@@ -622,11 +594,6 @@ impl WorkerOperation {
             Self::Remove => {
                 "Remove an eligible stopped, unassigned, non-internal Worker. Supply the current Worker revision and a bounded reason; Backend validation and retention are authoritative."
             }
-            Self::Share => "Share one controlled Runtime Worker with another known Runtime Worker.",
-            Self::Transfer => {
-                "Transfer one controlled Runtime Worker to another known Runtime Worker."
-            }
-            Self::Revoke => "Revoke one durable Runtime Worker control grant owned by this Worker.",
         }
     }
 }
@@ -790,59 +757,6 @@ impl Tool for WorkspaceWorkerTool {
                         &expected_worker_revision,
                         &reason,
                     )
-                    .map_err(control_tool_error)?
-            }
-            WorkerOperation::Share | WorkerOperation::Transfer => {
-                let input = parse::<WorkerDelegateInput>(input_json, self.operation.tool_name())?;
-                let grant_id = authority_id(&input.grant_id, "grant_id")?;
-                let (runtime_id, worker_id) =
-                    runtime_subject_ids(&input.target_controller, self.operation)?;
-                let operation_id = format!(
-                    "worker-control-{}:{}",
-                    if self.operation == WorkerOperation::Transfer {
-                        "transfer"
-                    } else {
-                        "share"
-                    },
-                    non_empty(ctx.call_id.clone(), "tool call_id")?
-                );
-                let action = if self.operation == WorkerOperation::Transfer {
-                    "transfer"
-                } else {
-                    "share"
-                };
-                self.control
-                    .execute_runtime(WorkspaceRequest::json(
-                        WorkspaceRequestMethod::Post,
-                        format!(
-                            "/api/w/{}/worker-control/grants/{grant_id}/{action}",
-                            self.control.workspace_id()
-                        ),
-                        serde_json::json!({
-                            "target_controller": {
-                                "runtime_id": runtime_id,
-                                "worker_id": worker_id,
-                            },
-                            "operation_id": operation_id,
-                        })
-                        .to_string(),
-                    ))
-                    .await
-                    .map_err(control_tool_error)?
-            }
-            WorkerOperation::Revoke => {
-                let input = parse::<WorkerRevokeInput>(input_json, "WorkerRevoke")?;
-                let grant_id = authority_id(&input.grant_id, "grant_id")?;
-                self.control
-                    .execute_runtime(WorkspaceRequest::json(
-                        WorkspaceRequestMethod::Post,
-                        format!(
-                            "/api/w/{}/worker-control/grants/{grant_id}/revoke",
-                            self.control.workspace_id()
-                        ),
-                        "{}",
-                    ))
-                    .await
                     .map_err(control_tool_error)?
             }
         };
@@ -1131,9 +1045,6 @@ mod tests {
                 "WorkerStop",
                 "WorkerRestore",
                 "WorkerRemove",
-                "WorkerShare",
-                "WorkerTransfer",
-                "WorkerRevoke",
             ]
         );
     }
@@ -1245,45 +1156,6 @@ mod tests {
                     serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
                 assert_eq!(body["kind"], expected_kind);
             }
-        }
-    }
-
-    #[tokio::test]
-    async fn worker_share_and_transfer_use_typed_runtime_subjects_and_operation_ids() {
-        let client = Arc::new(RecordingWorkspaceClient::default());
-        for (operation, action) in [
-            (WorkerOperation::Share, "share"),
-            (WorkerOperation::Transfer, "transfer"),
-        ] {
-            WorkspaceWorkerTool {
-                operation,
-                control: test_control(client.clone()),
-            }
-            .execute(
-                &serde_json::json!({
-                    "grant_id": "grant-1",
-                    "target_controller": {
-                        "kind": "runtime_worker",
-                        "runtime_id": "runtime-2",
-                        "worker_id": "worker-9",
-                    },
-                })
-                .to_string(),
-                ToolExecutionContext::new("call-delegate", "batch-delegate", 0),
-            )
-            .await
-            .unwrap();
-            let request = client.requests.lock().unwrap().last().cloned().unwrap();
-            assert!(request.path.ends_with(&format!("/grant-1/{action}")));
-            let body: serde_json::Value =
-                serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
-            assert_eq!(body["target_controller"]["runtime_id"], "runtime-2");
-            assert!(
-                body["operation_id"]
-                    .as_str()
-                    .unwrap()
-                    .contains("call-delegate")
-            );
         }
     }
 
