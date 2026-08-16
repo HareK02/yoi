@@ -1003,17 +1003,39 @@ fn replace_schema_marker(conn: &Connection, version: i64) -> Result<()> {
 }
 
 fn ensure_foreign_key_integrity(conn: &Connection) -> Result<()> {
-    let mut statement = conn.prepare("PRAGMA foreign_key_check").map_err(db)?;
-    let mut rows = statement.query([]).map_err(db)?;
-    if let Some(row) = rows.next().map_err(db)? {
-        let table: String = row.get(0).map_err(db)?;
-        let row_id: Option<i64> = row.get(1).map_err(db)?;
-        let parent: String = row.get(2).map_err(db)?;
-        return Err(MergeRequestError::Database(format!(
-            "foreign key integrity check failed for table {table}, row {row_id:?}, parent {parent}"
-        )));
+    for table in merge_request_domain_table_names(conn)? {
+        let quoted = table.replace('\'', "''");
+        let mut statement = conn
+            .prepare(&format!("PRAGMA foreign_key_check('{quoted}')"))
+            .map_err(db)?;
+        let mut rows = statement.query([]).map_err(db)?;
+        if let Some(row) = rows.next().map_err(db)? {
+            let table: String = row.get(0).map_err(db)?;
+            let row_id: Option<i64> = row.get(1).map_err(db)?;
+            let parent: String = row.get(2).map_err(db)?;
+            return Err(MergeRequestError::Database(format!(
+                "foreign key integrity check failed for table {table}, row {row_id:?}, parent {parent}"
+            )));
+        }
     }
     Ok(())
+}
+
+fn merge_request_domain_table_names(conn: &Connection) -> Result<Vec<String>> {
+    let mut statement = conn
+        .prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type='table'
+               AND name LIKE 'merge_request_%'
+               AND name <> ?1
+             ORDER BY name",
+        )
+        .map_err(db)?;
+    statement
+        .query_map(params![MIGRATION_TABLE], |row| row.get::<_, String>(0))
+        .map_err(db)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(db)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1598,6 +1620,31 @@ CREATE TABLE ticket_worker_assignments(workspace_id TEXT NOT NULL,ticket_id TEXT
         );
         assert_eq!(marker_version(&conn), 8);
         assert!(!column_exists(&conn, "merge_requests", "merged_result_commit").unwrap());
+    }
+
+    #[test]
+    fn unrelated_foreign_key_mismatch_does_not_block_merge_request_migration() {
+        let conn = exact_v8_connection();
+        conn.execute_batch(
+            "CREATE TABLE unrelated_parent(
+                 left_id TEXT NOT NULL,
+                 right_id TEXT NOT NULL,
+                 PRIMARY KEY(left_id,right_id)
+             );
+             CREATE TABLE unrelated_child(
+                 left_id TEXT REFERENCES unrelated_parent(left_id)
+             );",
+        )
+        .unwrap();
+        let error = conn
+            .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
+            .unwrap_err();
+        assert!(error.to_string().contains("foreign key mismatch"));
+
+        migrate(&conn).unwrap();
+        verify(&conn).unwrap();
+        assert_eq!(marker_version(&conn), 9);
+        assert!(column_exists(&conn, "merge_requests", "merged_result_commit").unwrap());
     }
 
     #[test]
