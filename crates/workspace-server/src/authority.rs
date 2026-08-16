@@ -510,7 +510,8 @@ impl ObjectiveAuthority for SqliteWorkspaceAuthority {
         objectives.truncate(1_000);
         let mut items = Vec::new();
         for objective in objectives {
-            if !objective_matches_query(&objective, &query) {
+            let body_md = self.objective_record(&objective.id)?.body_md;
+            if !objective_matches_query(&objective, &body_md, &query) {
                 continue;
             }
             let linked_tickets = self
@@ -530,6 +531,7 @@ impl ObjectiveAuthority for SqliteWorkspaceAuthority {
                 objective,
                 linked_tickets,
                 query.query.as_deref(),
+                &body_md,
             ));
         }
         sort_objective_query_items(&mut items, sort);
@@ -1465,7 +1467,11 @@ fn ticket_item_after_cursor(
     }
 }
 
-fn objective_matches_query(objective: &ObjectiveSummary, query: &ObjectiveQueryRequest) -> bool {
+fn objective_matches_query(
+    objective: &ObjectiveSummary,
+    body_md: &str,
+    query: &ObjectiveQueryRequest,
+) -> bool {
     if !query.states.is_empty() && !query.states.iter().any(|state| state == &objective.state) {
         return false;
     }
@@ -1482,8 +1488,7 @@ fn objective_matches_query(objective: &ObjectiveSummary, query: &ObjectiveQueryR
     }
     query.query.as_ref().is_none_or(|text| {
         let needle = text.to_lowercase();
-        objective.title.to_lowercase().contains(&needle)
-            || objective.summary.to_lowercase().contains(&needle)
+        objective.title.to_lowercase().contains(&needle) || body_md.to_lowercase().contains(&needle)
     })
 }
 
@@ -1491,6 +1496,7 @@ fn objective_query_item(
     objective: ObjectiveSummary,
     linked_tickets: Vec<String>,
     text: Option<&str>,
+    body_md: &str,
 ) -> ObjectiveQueryItem {
     let mut matched_fields = Vec::new();
     let mut snippet = None;
@@ -1500,9 +1506,9 @@ fn objective_query_item(
             matched_fields.push("title".to_string());
             snippet = Some(objective.title.clone());
         }
-        if objective.summary.to_lowercase().contains(&needle) {
+        if body_md.to_lowercase().contains(&needle) {
             matched_fields.push("body".to_string());
-            snippet.get_or_insert_with(|| matching_snippet(&objective.summary, text));
+            snippet.get_or_insert_with(|| matching_snippet(body_md, text));
         }
     }
     ObjectiveQueryItem {
@@ -1791,7 +1797,10 @@ mod tests {
                 objective_id: "00000000001J3".to_string(),
                 title: "Control plane".to_string(),
                 state: "active".to_string(),
-                body_md: "Objective body.\n".to_string(),
+                body_md: format!(
+                    "Objective body. {}\n\nDeep objective marker.\n",
+                    "x".repeat(300)
+                ),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-02T00:00:00Z".to_string(),
             })
@@ -1892,6 +1901,21 @@ mod tests {
         assert_eq!(objective_query.items.len(), 1);
         assert_eq!(objective_query.items[0].linked_ticket_count, 1);
         assert_eq!(objective_query.page.limit, 1);
+        let body_query = authority
+            .query_objectives(ObjectiveQueryRequest {
+                query: Some("Deep objective marker".to_string()),
+                limit: Some(1),
+                ..ObjectiveQueryRequest::default()
+            })
+            .unwrap();
+        assert_eq!(body_query.items.len(), 1);
+        assert_eq!(body_query.items[0].matched_fields, vec!["body"]);
+        assert!(
+            body_query.items[0]
+                .snippet
+                .as_deref()
+                .is_some_and(|snippet| snippet.contains("Deep objective marker"))
+        );
         let memory = authority.ensure_memory_document().unwrap();
         assert_eq!(memory.body_md, DEFAULT_MEMORY_DOCUMENT_BODY);
         let updated = authority
