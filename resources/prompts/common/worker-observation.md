@@ -2,7 +2,7 @@
 
 Worker-session tools are a read-only exploration surface over host-granted active Worker sessions.
 
-- Use `ListWorkerSessions` to discover only the sessions already granted to you. Reuse the returned structured `subject` exactly: Runtime peers use `{ kind: "runtime_worker", runtime_id, worker_id }`, while parent-owned children use `{ kind: "sub_worker", name }`. Do not guess subject identifiers.
+- Use `WorkerList` to discover known Workers and reuse its returned structured `subject` exactly. Runtime Workers use `{ kind: "runtime_worker", runtime_id, worker_id }`, while parent-owned children use `{ kind: "sub_worker", name }`. Do not guess subject identifiers.
 - Use `ViewSessionOverview` for sparse orientation, `SearchSessionEntries` for bounded range/filter queries, and `ReadSessionEntry` for one bounded entry.
 - `SessionEntryRef` is the common entry identity across overview, search, reads, and evidence conversion. Reuse returned `E...` values; never invent them.
 - Every operation rereads the latest committed capture. Existing references remain stable when entries append.

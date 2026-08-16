@@ -181,6 +181,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist Workspace config schema contribution bundles",
         apply: persist_workspace_config_schema_bundles,
     },
+    Migration {
+        version: 33,
+        name: "create durable Runtime Worker control grants",
+        apply: create_worker_control_grant_authority,
+    },
 ];
 
 struct Migration {
@@ -323,6 +328,23 @@ pub struct WorkerRegistryRecord {
     pub diagnostics_ref: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Durable authority describing which Runtime Worker another Runtime Worker may
+/// discover and control. Revoked grants remain as audit evidence but are never
+/// returned by active-grant queries.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerControlGrantRecord {
+    pub workspace_id: String,
+    pub grant_id: String,
+    pub controller: RuntimeWorkerRef,
+    pub subject: RuntimeWorkerRef,
+    pub relation: String,
+    pub origin: String,
+    pub permissions: Vec<String>,
+    pub operation_id: String,
+    pub created_at: String,
+    pub revoked_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -731,6 +753,35 @@ pub trait ControlPlaneStore: Send + Sync {
     ) -> Result<bool>;
     fn delete_worker_registry(&self, workspace_id: &str, worker: &RuntimeWorkerRef)
     -> Result<bool>;
+
+    fn create_worker_control_grant(
+        &self,
+        record: &WorkerControlGrantRecord,
+    ) -> Result<WorkerControlGrantRecord>;
+    fn get_worker_control_grant_by_operation(
+        &self,
+        workspace_id: &str,
+        controller: &RuntimeWorkerRef,
+        operation_id: &str,
+    ) -> Result<Option<WorkerControlGrantRecord>>;
+    fn get_active_worker_control_grant(
+        &self,
+        workspace_id: &str,
+        controller: &RuntimeWorkerRef,
+        subject: &RuntimeWorkerRef,
+    ) -> Result<Option<WorkerControlGrantRecord>>;
+    fn list_active_worker_control_grants(
+        &self,
+        workspace_id: &str,
+        controller: &RuntimeWorkerRef,
+        limit: usize,
+    ) -> Result<Vec<WorkerControlGrantRecord>>;
+    fn revoke_worker_control_grant(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+        revoked_at: &str,
+    ) -> Result<bool>;
 
     fn get_ticket_assignment_operation(
         &self,
@@ -2321,6 +2372,157 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn create_worker_control_grant(
+        &self,
+        record: &WorkerControlGrantRecord,
+    ) -> Result<WorkerControlGrantRecord> {
+        self.with_conn(|conn| {
+            let permissions_json = serde_json::to_string(&record.permissions)
+                .map_err(|error| Error::Store(error.to_string()))?;
+            conn.execute(
+                r#"INSERT INTO worker_control_grants (
+                    workspace_id, grant_id,
+                    controller_runtime_id, controller_worker_id,
+                    subject_runtime_id, subject_worker_id,
+                    relation, origin, permissions_json, operation_id, created_at, revoked_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                ON CONFLICT (
+                    workspace_id,
+                    controller_runtime_id,
+                    controller_worker_id,
+                    operation_id
+                ) DO NOTHING"#,
+                params![
+                    record.workspace_id,
+                    record.grant_id,
+                    record.controller.runtime_id,
+                    record.controller.worker_id,
+                    record.subject.runtime_id,
+                    record.subject.worker_id,
+                    record.relation,
+                    record.origin,
+                    permissions_json,
+                    record.operation_id,
+                    record.created_at,
+                    record.revoked_at,
+                ],
+            )?;
+
+            let persisted = read_worker_control_grant_by_operation(
+                conn,
+                record.workspace_id.as_str(),
+                &record.controller,
+                record.operation_id.as_str(),
+            )?
+            .ok_or_else(|| Error::Store("worker control grant was not persisted".to_string()))?;
+            if persisted.subject != record.subject
+                || persisted.relation != record.relation
+                || persisted.origin != record.origin
+                || persisted.permissions != record.permissions
+            {
+                return Err(Error::InvalidInput(format!(
+                    "worker control operation `{}` was already used with different input",
+                    record.operation_id
+                )));
+            }
+            Ok(persisted)
+        })
+    }
+
+    fn get_worker_control_grant_by_operation(
+        &self,
+        workspace_id: &str,
+        controller: &RuntimeWorkerRef,
+        operation_id: &str,
+    ) -> Result<Option<WorkerControlGrantRecord>> {
+        self.with_conn(|conn| {
+            read_worker_control_grant_by_operation(conn, workspace_id, controller, operation_id)
+        })
+    }
+
+    fn get_active_worker_control_grant(
+        &self,
+        workspace_id: &str,
+        controller: &RuntimeWorkerRef,
+        subject: &RuntimeWorkerRef,
+    ) -> Result<Option<WorkerControlGrantRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                r#"SELECT workspace_id, grant_id,
+                          controller_runtime_id, controller_worker_id,
+                          subject_runtime_id, subject_worker_id,
+                          relation, origin, permissions_json, operation_id, created_at, revoked_at
+                   FROM worker_control_grants
+                   WHERE workspace_id = ?1
+                     AND controller_runtime_id = ?2 AND controller_worker_id = ?3
+                     AND subject_runtime_id = ?4 AND subject_worker_id = ?5
+                     AND revoked_at IS NULL
+                   ORDER BY created_at DESC
+                   LIMIT 1"#,
+                params![
+                    workspace_id,
+                    controller.runtime_id,
+                    controller.worker_id,
+                    subject.runtime_id,
+                    subject.worker_id,
+                ],
+                read_worker_control_grant_record,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn list_active_worker_control_grants(
+        &self,
+        workspace_id: &str,
+        controller: &RuntimeWorkerRef,
+        limit: usize,
+    ) -> Result<Vec<WorkerControlGrantRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"SELECT workspace_id, grant_id,
+                          controller_runtime_id, controller_worker_id,
+                          subject_runtime_id, subject_worker_id,
+                          relation, origin, permissions_json, operation_id, created_at, revoked_at
+                   FROM worker_control_grants
+                   WHERE workspace_id = ?1
+                     AND controller_runtime_id = ?2 AND controller_worker_id = ?3
+                     AND revoked_at IS NULL
+                   ORDER BY created_at ASC, grant_id ASC
+                   LIMIT ?4"#,
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    workspace_id,
+                    controller.runtime_id,
+                    controller.worker_id,
+                    limit as i64,
+                ],
+                read_worker_control_grant_record,
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
+        })
+    }
+
+    fn revoke_worker_control_grant(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+        revoked_at: &str,
+    ) -> Result<bool> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                r#"UPDATE worker_control_grants
+                   SET revoked_at = ?3
+                   WHERE workspace_id = ?1 AND grant_id = ?2 AND revoked_at IS NULL"#,
+                params![workspace_id, grant_id, revoked_at],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
     fn get_ticket_assignment_operation(
         &self,
         workspace_id: &str,
@@ -3627,6 +3829,57 @@ fn read_worker_registry_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Work
     })
 }
 
+fn read_worker_control_grant_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<WorkerControlGrantRecord> {
+    let permissions_json: String = row.get(8)?;
+    let permissions = serde_json::from_str(&permissions_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(WorkerControlGrantRecord {
+        workspace_id: row.get(0)?,
+        grant_id: row.get(1)?,
+        controller: RuntimeWorkerRef::new(
+            row.get::<_, String>(2)?,
+            row.get::<_, u64>(3)?.to_string(),
+        ),
+        subject: RuntimeWorkerRef::new(row.get::<_, String>(4)?, row.get::<_, u64>(5)?.to_string()),
+        relation: row.get(6)?,
+        origin: row.get(7)?,
+        permissions,
+        operation_id: row.get(9)?,
+        created_at: row.get(10)?,
+        revoked_at: row.get(11)?,
+    })
+}
+
+fn read_worker_control_grant_by_operation(
+    conn: &Connection,
+    workspace_id: &str,
+    controller: &RuntimeWorkerRef,
+    operation_id: &str,
+) -> Result<Option<WorkerControlGrantRecord>> {
+    conn.query_row(
+        r#"SELECT workspace_id, grant_id,
+                  controller_runtime_id, controller_worker_id,
+                  subject_runtime_id, subject_worker_id,
+                  relation, origin, permissions_json, operation_id, created_at, revoked_at
+           FROM worker_control_grants
+           WHERE workspace_id = ?1
+             AND controller_runtime_id = ?2 AND controller_worker_id = ?3
+             AND operation_id = ?4"#,
+        params![
+            workspace_id,
+            controller.runtime_id,
+            controller.worker_id,
+            operation_id,
+        ],
+        read_worker_control_grant_record,
+    )
+    .optional()
+    .map_err(Error::from)
+}
+
 fn current_ticket_worker_assignment_select_sql() -> String {
     "SELECT a.workspace_id, a.ticket_id, a.assignment_id, a.runtime_id, a.worker_id, \
             a.assigned_by, a.assigned_at \
@@ -4639,6 +4892,58 @@ pub(crate) fn persist_workspace_config_schema_bundles(conn: &Connection) -> Resu
     Ok(())
 }
 
+fn create_worker_control_grant_authority(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE worker_control_grants (
+            workspace_id TEXT NOT NULL,
+            grant_id TEXT NOT NULL,
+            controller_runtime_id TEXT NOT NULL,
+            controller_worker_id INTEGER NOT NULL,
+            subject_runtime_id TEXT NOT NULL,
+            subject_worker_id INTEGER NOT NULL,
+            relation TEXT NOT NULL,
+            origin TEXT NOT NULL,
+            permissions_json TEXT NOT NULL,
+            operation_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            revoked_at TEXT,
+            PRIMARY KEY (workspace_id, grant_id),
+            UNIQUE (
+                workspace_id,
+                controller_runtime_id,
+                controller_worker_id,
+                operation_id
+            ),
+            FOREIGN KEY (workspace_id, controller_runtime_id, controller_worker_id)
+                REFERENCES worker_registry (workspace_id, runtime_id, runtime_worker_id)
+                ON DELETE CASCADE,
+            FOREIGN KEY (workspace_id, subject_runtime_id, subject_worker_id)
+                REFERENCES worker_registry (workspace_id, runtime_id, runtime_worker_id)
+                ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_worker_control_grants_controller_active
+            ON worker_control_grants (
+                workspace_id,
+                controller_runtime_id,
+                controller_worker_id,
+                revoked_at,
+                created_at
+            );
+
+        CREATE INDEX idx_worker_control_grants_subject_active
+            ON worker_control_grants (
+                workspace_id,
+                subject_runtime_id,
+                subject_worker_id,
+                revoked_at
+            );
+        "#,
+    )?;
+    Ok(())
+}
+
 fn create_worker_mutation_source_proof_replay_guard(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -5312,7 +5617,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 32);
+        assert_eq!(current_schema_version(&conn).unwrap(), 33);
         assert!(table_exists(&conn, "worker_workdir_attachment_reservations").unwrap());
     }
 
@@ -5345,7 +5650,7 @@ CREATE TABLE flow_events (event_id TEXT PRIMARY KEY);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 32);
+        assert_eq!(current_schema_version(&conn).unwrap(), 33);
         assert!(table_exists(&conn, "flow_sources").unwrap());
         assert!(table_exists(&conn, "flow_source_revisions").unwrap());
         assert!(!table_exists(&conn, "flow_instances").unwrap());
@@ -5412,7 +5717,7 @@ INSERT INTO worker_workdir_attachment_reservations (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 32);
+        assert_eq!(current_schema_version(&conn).unwrap(), 33);
         let repositories_sql: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'repositories'",
@@ -5592,7 +5897,7 @@ INSERT INTO workdir_registry (
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 32);
+        assert_eq!(store.schema_version().await.unwrap(), 33);
         assert!(
             !store
                 .with_conn(|conn| table_exists(conn, "worker_workspace_credentials"))
@@ -5609,7 +5914,7 @@ INSERT INTO workdir_registry (
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 32);
+        assert_eq!(reopened.schema_version().await.unwrap(), 33);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -6156,7 +6461,7 @@ INSERT INTO workdir_registry (
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 32);
+        assert_eq!(store.schema_version().await.unwrap(), 33);
 
         store
             .with_conn(|conn| {
@@ -6345,7 +6650,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 32);
+        assert_eq!(store.schema_version().await.unwrap(), 33);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -6411,7 +6716,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 32);
+        assert_eq!(store.schema_version().await.unwrap(), 33);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -6672,9 +6977,109 @@ CREATE TABLE ticket_assignment_operations (
     }
 
     #[tokio::test]
+    async fn worker_control_grants_are_idempotent_scoped_and_revocable() {
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "workspace-control".to_string(),
+                owner_account_id: None,
+                display_name: "Control grants".to_string(),
+                state: "active".to_string(),
+                created_at: "2026-07-27T00:00:00Z".to_string(),
+                updated_at: "2026-07-27T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+        let worker_record = |worker_id: &str, display_name: &str| WorkerRegistryRecord {
+            workspace_id: "workspace-control".to_string(),
+            worker: RuntimeWorkerRef::new("runtime-a", worker_id),
+            display_name: display_name.to_string(),
+            profile: None,
+            retention_state: "normal".to_string(),
+            transcript_ref: None,
+            session_ref: None,
+            summary_ref: None,
+            diagnostics_ref: None,
+            created_at: "2026-07-27T00:00:00Z".to_string(),
+            updated_at: "2026-07-27T00:00:00Z".to_string(),
+        };
+        let controller_record = worker_record("1", "Controller");
+        let subject_record = worker_record("2", "Subject");
+        store.upsert_worker_registry(&controller_record).unwrap();
+        store.upsert_worker_registry(&subject_record).unwrap();
+
+        let grant = WorkerControlGrantRecord {
+            workspace_id: "workspace-control".to_string(),
+            grant_id: "grant-1".to_string(),
+            controller: controller_record.worker.clone(),
+            subject: subject_record.worker.clone(),
+            relation: "spawned".to_string(),
+            origin: "worker_spawn".to_string(),
+            permissions: vec![
+                "observe".to_string(),
+                "send_input".to_string(),
+                "stop".to_string(),
+            ],
+            operation_id: "spawn-op-1".to_string(),
+            created_at: "2026-07-27T00:00:01Z".to_string(),
+            revoked_at: None,
+        };
+        assert_eq!(store.create_worker_control_grant(&grant).unwrap(), grant);
+        assert_eq!(store.create_worker_control_grant(&grant).unwrap(), grant);
+        assert_eq!(
+            store
+                .list_active_worker_control_grants(
+                    "workspace-control",
+                    &controller_record.worker,
+                    10,
+                )
+                .unwrap(),
+            vec![grant.clone()]
+        );
+        assert_eq!(
+            store
+                .get_active_worker_control_grant(
+                    "workspace-control",
+                    &controller_record.worker,
+                    &subject_record.worker,
+                )
+                .unwrap(),
+            Some(grant.clone())
+        );
+
+        let conflicting_replay = WorkerControlGrantRecord {
+            subject: controller_record.worker.clone(),
+            ..grant.clone()
+        };
+        assert!(matches!(
+            store.create_worker_control_grant(&conflicting_replay),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(
+            store
+                .revoke_worker_control_grant(
+                    "workspace-control",
+                    &grant.grant_id,
+                    "2026-07-27T00:00:02Z",
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .list_active_worker_control_grants(
+                    "workspace-control",
+                    &controller_record.worker,
+                    10,
+                )
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 32);
+        assert_eq!(store.schema_version().await.unwrap(), 33);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),

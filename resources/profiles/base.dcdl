@@ -27,7 +27,7 @@ feature = {
     web = { enabled = true; };
     image = { enabled = true; };
     sub_worker = { enabled = true; };
-    worker = { enabled = false; };
+    worker = { enabled = true; };
     objective = { enabled = true; };
     ticket = { enabled = true; authoring = true; thread = true; };
 };
