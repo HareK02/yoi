@@ -6108,6 +6108,32 @@ async fn transfer_worker_control_grant(
     delegate_worker_control_grant(api, path, headers, request, true).await
 }
 
+fn worker_control_delegation_input_fingerprint(
+    controller: &RuntimeWorkerRef,
+    grant: &WorkerControlGrantRecord,
+    action: &str,
+    target_controller: &RuntimeWorkerRef,
+) -> Result<String> {
+    let operation_input = serde_json::json!({
+        "source_controller": controller,
+        "source_grant_id": &grant.grant_id,
+        "action": action,
+        "target_controller": target_controller,
+        "subject": &grant.subject,
+        "permissions": &grant.permissions,
+    });
+    let operation_bytes = serde_json::to_vec(&operation_input).map_err(|error| {
+        Error::InvalidInput(format!("invalid Worker delegation input: {error}"))
+    })?;
+    Ok(format!(
+        "sha256:{}",
+        Sha256::digest(&operation_bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
+}
+
 async fn delegate_worker_control_grant(
     api: WorkspaceApi,
     path: ScopedWorkerControlGrantPath,
@@ -6140,24 +6166,12 @@ async fn delegate_worker_control_grant(
             "operation_id must contain 1..=200 bytes".to_string(),
         )));
     }
-    let operation_input = serde_json::json!({
-        "source_controller": &controller,
-        "source_grant_id": &grant.grant_id,
-        "action": permission,
-        "target_controller": &request.target_controller,
-        "subject": &grant.subject,
-        "permissions": &grant.permissions,
-    });
-    let operation_bytes = serde_json::to_vec(&operation_input).map_err(|error| {
-        Error::InvalidInput(format!("invalid Worker delegation input: {error}"))
-    })?;
-    let input_fingerprint = format!(
-        "sha256:{}",
-        Sha256::digest(&operation_bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    );
+    let input_fingerprint = worker_control_delegation_input_fingerprint(
+        &controller,
+        &grant,
+        permission,
+        &request.target_controller,
+    )?;
     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let operation = api.store.reserve_worker_control_delegation_operation(
         &WorkerControlDelegationOperationRecord {
@@ -6256,6 +6270,13 @@ async fn delegate_worker_control_grant(
             created_at: now.clone(),
             revoked_at: None,
         })?;
+    api.store.complete_worker_control_delegation_operation(
+        &path.workspace_id,
+        &controller,
+        operation_id,
+        &delegated.grant_id,
+        &now,
+    )?;
     if transfer
         && !api
             .store
@@ -6265,13 +6286,6 @@ async fn delegate_worker_control_grant(
             worker: current.subject,
         }));
     }
-    api.store.complete_worker_control_delegation_operation(
-        &path.workspace_id,
-        &controller,
-        operation_id,
-        &delegated.grant_id,
-        &now,
-    )?;
     Ok(Json(delegated))
 }
 
@@ -13758,6 +13772,71 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
 
+        let recovery_source = api
+            .store
+            .get_worker_control_grant(&workspace_id, "orchestrator-transfer-source")
+            .unwrap()
+            .unwrap();
+        let recovery_operation_id = "transfer-operation";
+        let recovery_fingerprint = worker_control_delegation_input_fingerprint(
+            &dedicated.worker,
+            &recovery_source,
+            "transfer",
+            &generic.worker_ref,
+        )
+        .unwrap();
+        let recovery_now = now_registry_timestamp();
+        api.store
+            .reserve_worker_control_delegation_operation(&WorkerControlDelegationOperationRecord {
+                workspace_id: workspace_id.clone(),
+                source_controller: dedicated.worker.clone(),
+                source_grant_id: recovery_source.grant_id.clone(),
+                operation_id: recovery_operation_id.to_string(),
+                input_fingerprint: recovery_fingerprint,
+                delegated_grant_id: None,
+                created_at: recovery_now.clone(),
+                completed_at: None,
+            })
+            .unwrap();
+        let precompleted_transfer = api
+            .store
+            .create_worker_control_grant(&WorkerControlGrantRecord {
+                workspace_id: workspace_id.clone(),
+                grant_id: "precompleted-transfer-grant".to_string(),
+                controller: generic.worker_ref.clone(),
+                subject: recovery_source.subject.clone(),
+                relation: "transferred".to_string(),
+                origin: format!("worker_control_transfer:{}", recovery_source.grant_id),
+                permissions: recovery_source.permissions.clone(),
+                operation_id: format!(
+                    "worker-control-delegate:{}:{}:{}:transfer:{}",
+                    dedicated.worker.runtime_id,
+                    dedicated.worker.worker_id,
+                    recovery_source.grant_id,
+                    recovery_operation_id,
+                ),
+                created_at: recovery_now.clone(),
+                revoked_at: None,
+            })
+            .unwrap();
+        api.store
+            .complete_worker_control_delegation_operation(
+                &workspace_id,
+                &dedicated.worker,
+                recovery_operation_id,
+                &precompleted_transfer.grant_id,
+                &recovery_now,
+            )
+            .unwrap();
+        assert!(
+            api.store
+                .get_worker_control_grant(&workspace_id, &recovery_source.grant_id)
+                .unwrap()
+                .unwrap()
+                .revoked_at
+                .is_none()
+        );
+
         let Json(transferred) = transfer_worker_control_grant(
             State(api.clone()),
             AxumPath(ScopedWorkerControlGrantPath {
@@ -13772,6 +13851,15 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(transferred.grant_id, precompleted_transfer.grant_id);
+        assert!(
+            api.store
+                .get_worker_control_grant(&workspace_id, &recovery_source.grant_id)
+                .unwrap()
+                .unwrap()
+                .revoked_at
+                .is_some()
+        );
         let Json(transfer_replay) = transfer_worker_control_grant(
             State(api.clone()),
             AxumPath(ScopedWorkerControlGrantPath {
