@@ -503,7 +503,30 @@ impl MergeRequestStore {
         }
         let mut c = self.lock()?;
         let t = c.transaction()?;
-        let g:Option<(String,String,String,String,String,String)>=t.query_row("SELECT g.workspace_id,g.merge_request_id,g.request_event_id,g.subject_ref,g.reviewer_runtime_id,g.reviewer_worker_id FROM merge_request_review_grants g JOIN merge_request_ticket_relations rel ON rel.workspace_id=g.workspace_id AND rel.merge_request_id=g.merge_request_id WHERE g.capability_token=?1 AND rel.ticket_id=?2 AND g.status='issued'",params![i.capability_token,i.ticket_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
+        let g: Option<(String, String, String, String, String, String)> = t
+            .query_row(
+                "SELECT g.workspace_id,g.merge_request_id,g.request_event_id,g.subject_ref,
+                        g.reviewer_runtime_id,g.reviewer_worker_id
+                   FROM merge_request_review_grants g
+                   JOIN merge_request_ticket_relations rel
+                     ON rel.workspace_id=g.workspace_id AND rel.merge_request_id=g.merge_request_id
+                   JOIN merge_requests mr
+                     ON mr.workspace_id=g.workspace_id AND mr.merge_request_id=g.merge_request_id
+                  WHERE g.capability_token=?1 AND rel.ticket_id=?2
+                    AND g.status='issued' AND mr.state='open'",
+                params![i.capability_token, i.ticket_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
         let Some((ws, mr, req, subject, rr, rw)) = g else {
             return Err(MergeRequestError::Unauthorized(
                 "review grant invalid".into(),
@@ -633,14 +656,18 @@ impl MergeRequestStore {
             ));
         }
         let review = mr
-            .thread
-            .iter()
-            .find_map(|x| match x {
-                MergeRequestThreadEvent::Review(v) if v.event_id == i.approval_event_id => Some(v),
-                _ => None,
-            })
-            .ok_or_else(|| MergeRequestError::NotReady("approval event missing".into()))?;
-        if review.decision!=ReviewDecision::Approve||review.subject_ref!=i.current_subject_ref||mr.thread.iter().any(|x|matches!(x,MergeRequestThreadEvent::ReviewRevoked(v)if v.review_event_id==review.event_id)){return Err(MergeRequestError::NotReady("approval is not valid for current source ref".into()))}
+            .effective_review(&i.current_subject_ref)
+            .filter(|review| review.event_id == i.approval_event_id)
+            .ok_or_else(|| {
+                MergeRequestError::NotReady(
+                    "approval is not the current effective review for the source ref".into(),
+                )
+            })?;
+        if review.decision != ReviewDecision::Approve {
+            return Err(MergeRequestError::NotReady(
+                "current effective review does not approve the source ref".into(),
+            ));
+        }
         if i.target_ref_before == i.target_ref_after {
             return Err(MergeRequestError::Validation(
                 "target ref did not change".into(),
@@ -661,6 +688,48 @@ impl MergeRequestStore {
             ));
         }
         t.execute("UPDATE typed_tickets SET workflow_state='done',workflow_state_explicit=1,updated_at=?3 WHERE workspace_id=?1 AND ticket_id=?2",params![mr.workspace_id,i.ticket_id,i.now.to_rfc3339()])?;
+        let issued_grants = {
+            let mut statement = t.prepare(
+                "SELECT request_event_id,subject_ref,capability_token
+                   FROM merge_request_review_grants
+                  WHERE workspace_id=?1 AND merge_request_id=?2 AND status='issued'
+                  ORDER BY issued_at,request_event_id",
+            )?;
+            statement
+                .query_map(params![mr.workspace_id, mr.merge_request_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (request_event_id, subject_ref, capability_token) in issued_grants {
+            let cancelled = ReviewCancelledEvent {
+                event_id: Uuid::now_v7().to_string(),
+                sequence: next_seq(&t, &mr.workspace_id, &mr.merge_request_id)?,
+                request_event_id,
+                subject_ref,
+                reason: "Merge Request completed before review submission".into(),
+                created_at: i.now,
+            };
+            insert_event(
+                &t,
+                &mr.workspace_id,
+                &mr.merge_request_id,
+                "review_cancelled",
+                &cancelled,
+                i.now,
+                None,
+            )?;
+            t.execute(
+                "UPDATE merge_request_review_grants
+                    SET status='revoked',revoked_at=?2
+                  WHERE capability_token=?1 AND status='issued'",
+                params![capability_token, i.now.to_rfc3339()],
+            )?;
+        }
         let e = MergeEvent {
             event_id: Uuid::now_v7().to_string(),
             sequence: next_seq(&t, &mr.workspace_id, &mr.merge_request_id)?,
@@ -1076,14 +1145,16 @@ fn migrate_events(t: &Transaction<'_>) -> Result<(), MergeRequestError> {
                 created_at: time(&row_at)?,
             };
             insert_event(t, &ws, &mr, "review", &rev, rev.created_at, None)?
-        } else if status == "revoked" {
+        } else {
             let at = consumed.as_deref().unwrap_or(&created);
             let e = ReviewCancelledEvent {
                 event_id: format!("migrated-cancel-{a}"),
                 sequence: next_seq(t, &ws, &mr)?,
                 request_event_id: req.event_id,
                 subject_ref: subject,
-                reason: "legacy review attempt revoked".into(),
+                reason: format!(
+                    "legacy `{status}` review request cancelled because its capability cannot be migrated"
+                ),
                 created_at: time(at)?,
             };
             insert_event(t, &ws, &mr, "review_cancelled", &e, e.created_at, None)?

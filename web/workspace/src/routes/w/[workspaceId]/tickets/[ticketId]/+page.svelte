@@ -89,13 +89,17 @@
   const currentReviewRequest = $derived(
     mergeRequest?.thread.findLast((event) => event.kind === "review_requested") ?? null,
   );
-  const currentReview = $derived(
-    mergeRequest?.source.status === "known"
-      ? mergeRequest.thread.findLast(
-        (event) => event.kind === "review" && event.subject_ref === mergeRequest?.source.ref,
-      ) ?? null
-      : null,
-  );
+  const currentReview = $derived.by(() => {
+    if (mergeRequest?.source.status !== "known") return null;
+    const review = mergeRequest.thread.findLast(
+      (event) => event.kind === "review" && event.subject_ref === mergeRequest.source.ref,
+    );
+    if (!review || review.kind !== "review") return null;
+    const revoked = mergeRequest.thread.some(
+      (event) => event.kind === "review_revoked" && event.review_event_id === review.event_id,
+    );
+    return revoked ? null : review;
+  });
   const mergeEvent = $derived(
     mergeRequest?.thread.findLast((event) => event.kind === "merge") ?? null,
   );

@@ -190,7 +190,7 @@ fn review_revocation_invalidates_readiness() {
 #[test]
 fn v11_migration_preserves_review_events_and_requires_selector_repair() {
     let c = Connection::open_in_memory().unwrap();
-    c.execute_batch("CREATE TABLE repositories(workspace_id TEXT,repository_id TEXT,PRIMARY KEY(workspace_id,repository_id));CREATE TABLE typed_tickets(workspace_id TEXT,ticket_id TEXT,PRIMARY KEY(workspace_id,ticket_id));INSERT INTO repositories VALUES('W','R');INSERT INTO typed_tickets VALUES('W','T');CREATE TABLE merge_request_schema(singleton INTEGER PRIMARY KEY,version INTEGER);INSERT INTO merge_request_schema VALUES(1,11);CREATE TABLE merge_requests(workspace_id TEXT,merge_request_id TEXT,repository_id TEXT,state TEXT,target_ref_selector TEXT,current_revision_ordinal INTEGER,current_revision_id TEXT,created_at TEXT,updated_at TEXT,merged_revision_id TEXT,merged_at TEXT);CREATE TABLE merge_request_ticket_relations(workspace_id TEXT,merge_request_id TEXT,ticket_id TEXT,relation_kind TEXT,created_at TEXT);CREATE TABLE merge_request_revisions(workspace_id TEXT,merge_request_id TEXT,revision_id TEXT,ordinal INTEGER,base_commit TEXT,head_commit TEXT,diff_digest TEXT,summary TEXT,assignment_id TEXT,created_at TEXT);CREATE TABLE merge_request_revision_paths(workspace_id TEXT,merge_request_id TEXT,revision_id TEXT,ordinal INTEGER,path TEXT);CREATE TABLE merge_request_reviewer_child_sessions(workspace_id TEXT,child_session_id TEXT,parent_runtime_id TEXT,parent_worker_id TEXT,reviewer_profile TEXT,registered_at TEXT);CREATE TABLE merge_request_review_attempts(workspace_id TEXT,attempt_id TEXT,merge_request_id TEXT,ticket_id TEXT,revision_id TEXT,revision_ordinal INTEGER,parent_assignment_id TEXT,parent_runtime_id TEXT,parent_worker_id TEXT,child_session_id TEXT,reviewer_effective_profile TEXT,capability_token TEXT,status TEXT,created_at TEXT,consumed_at TEXT);CREATE TABLE merge_request_reviews(workspace_id TEXT,attempt_id TEXT,merge_request_id TEXT,revision_id TEXT,decision TEXT,body TEXT,submitted_at TEXT);CREATE TABLE merge_request_review_findings(workspace_id TEXT,attempt_id TEXT,ordinal INTEGER,severity TEXT,code TEXT,path TEXT,line INTEGER,body TEXT);CREATE TABLE merge_request_completion_operations(workspace_id TEXT,operation_id TEXT,ticket_id TEXT,revision_id TEXT,authority_kind TEXT,implementation_assignment_id TEXT,completion_actor_runtime_id TEXT,completion_actor_worker_id TEXT,target_commit TEXT,source_commit TEXT,result_commit TEXT,strategy TEXT,resolution TEXT,fingerprint TEXT,status TEXT,result_ticket_state TEXT,created_at TEXT,updated_at TEXT);INSERT INTO merge_requests VALUES('W','MR','R','open','develop',1,'V','2026-07-26T12:00:00Z','2026-07-26T12:00:00Z',NULL,NULL);INSERT INTO merge_request_ticket_relations VALUES('W','MR','T','implements','2026-07-26T12:00:00Z');INSERT INTO merge_request_revisions VALUES('W','MR','V',1,'base','subject','digest','summary','A','2026-07-26T12:00:00Z');INSERT INTO merge_request_review_attempts VALUES('W','AT','MR','T','V',1,'A','runtime','coder','child','builtin:reviewer','token','submitted','2026-07-26T12:00:00Z','2026-07-26T12:00:01Z');INSERT INTO merge_request_reviews VALUES('W','AT','MR','V','approve','approved','2026-07-26T12:00:01Z');").unwrap();
+    c.execute_batch("CREATE TABLE repositories(workspace_id TEXT,repository_id TEXT,PRIMARY KEY(workspace_id,repository_id));CREATE TABLE typed_tickets(workspace_id TEXT,ticket_id TEXT,PRIMARY KEY(workspace_id,ticket_id));INSERT INTO repositories VALUES('W','R');INSERT INTO typed_tickets VALUES('W','T');CREATE TABLE merge_request_schema(singleton INTEGER PRIMARY KEY,version INTEGER);INSERT INTO merge_request_schema VALUES(1,11);CREATE TABLE merge_requests(workspace_id TEXT,merge_request_id TEXT,repository_id TEXT,state TEXT,target_ref_selector TEXT,current_revision_ordinal INTEGER,current_revision_id TEXT,created_at TEXT,updated_at TEXT,merged_revision_id TEXT,merged_at TEXT);CREATE TABLE merge_request_ticket_relations(workspace_id TEXT,merge_request_id TEXT,ticket_id TEXT,relation_kind TEXT,created_at TEXT);CREATE TABLE merge_request_revisions(workspace_id TEXT,merge_request_id TEXT,revision_id TEXT,ordinal INTEGER,base_commit TEXT,head_commit TEXT,diff_digest TEXT,summary TEXT,assignment_id TEXT,created_at TEXT);CREATE TABLE merge_request_revision_paths(workspace_id TEXT,merge_request_id TEXT,revision_id TEXT,ordinal INTEGER,path TEXT);CREATE TABLE merge_request_reviewer_child_sessions(workspace_id TEXT,child_session_id TEXT,parent_runtime_id TEXT,parent_worker_id TEXT,reviewer_profile TEXT,registered_at TEXT);CREATE TABLE merge_request_review_attempts(workspace_id TEXT,attempt_id TEXT,merge_request_id TEXT,ticket_id TEXT,revision_id TEXT,revision_ordinal INTEGER,parent_assignment_id TEXT,parent_runtime_id TEXT,parent_worker_id TEXT,child_session_id TEXT,reviewer_effective_profile TEXT,capability_token TEXT,status TEXT,created_at TEXT,consumed_at TEXT);CREATE TABLE merge_request_reviews(workspace_id TEXT,attempt_id TEXT,merge_request_id TEXT,revision_id TEXT,decision TEXT,body TEXT,submitted_at TEXT);CREATE TABLE merge_request_review_findings(workspace_id TEXT,attempt_id TEXT,ordinal INTEGER,severity TEXT,code TEXT,path TEXT,line INTEGER,body TEXT);CREATE TABLE merge_request_completion_operations(workspace_id TEXT,operation_id TEXT,ticket_id TEXT,revision_id TEXT,authority_kind TEXT,implementation_assignment_id TEXT,completion_actor_runtime_id TEXT,completion_actor_worker_id TEXT,target_commit TEXT,source_commit TEXT,result_commit TEXT,strategy TEXT,resolution TEXT,fingerprint TEXT,status TEXT,result_ticket_state TEXT,created_at TEXT,updated_at TEXT);INSERT INTO merge_requests VALUES('W','MR','R','open','develop',1,'V','2026-07-26T12:00:00Z','2026-07-26T12:00:00Z',NULL,NULL);INSERT INTO merge_request_ticket_relations VALUES('W','MR','T','implements','2026-07-26T12:00:00Z');INSERT INTO merge_request_revisions VALUES('W','MR','V',1,'base','subject','digest','summary','A','2026-07-26T12:00:00Z');INSERT INTO merge_request_review_attempts VALUES('W','AT','MR','T','V',1,'A','runtime','coder','child','builtin:reviewer','token','submitted','2026-07-26T12:00:00Z','2026-07-26T12:00:01Z');INSERT INTO merge_request_reviews VALUES('W','AT','MR','V','approve','approved','2026-07-26T12:00:01Z');INSERT INTO merge_request_review_attempts VALUES('W','PENDING','MR','T','V',1,'A','runtime','coder','pending-child','builtin:reviewer','pending-token','registered','2026-07-26T12:00:02Z',NULL);").unwrap();
     merge_request::migrate(&c).unwrap();
     let selector: Option<String> = c
         .query_row("SELECT selector_from FROM merge_requests", [], |r| r.get(0))
@@ -203,7 +203,10 @@ fn v11_migration_preserves_review_events_and_requires_selector_repair() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(kinds, "review_requested,review");
+    assert_eq!(
+        kinds,
+        "review_requested,review,review_requested,review_cancelled"
+    );
     let old: bool = c
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='merge_request_revisions')",
@@ -232,4 +235,72 @@ fn authority_reads_full_thread_while_public_pages_remain_bounded() {
         store.thread_page("W", "T", Some(100), 20).unwrap().len(),
         11
     );
+}
+
+#[test]
+fn completion_rejects_superseded_approval_for_same_subject() {
+    let (_d, store) = fixture();
+    open(&store);
+    let old_approval = approve(&store, "subject", "approval");
+    request(&store, "subject", "changes");
+    store
+        .submit_review(SubmitMergeRequestReview {
+            ticket_id: "T".into(),
+            current_subject_ref: "subject".into(),
+            capability_token: "changes".into(),
+            decision: ReviewDecision::RequestChanges,
+            body: "changes required".into(),
+            findings: vec![],
+            now: at(5),
+        })
+        .unwrap();
+    let result = store.complete(CompleteMergeRequest {
+        ticket_id: "T".into(),
+        operation_id: "op".into(),
+        approval_event_id: old_approval.event_id,
+        current_subject_ref: "subject".into(),
+        target_ref_before: "before".into(),
+        target_ref_after: "after".into(),
+        strategy: MergeStrategy::FastForward,
+        resolution: ConflictResolution::None,
+        auth: auth(),
+        now: at(6),
+    });
+    assert!(matches!(result, Err(MergeRequestError::NotReady(_))));
+}
+
+#[test]
+fn completion_cancels_outstanding_grants_and_late_submit_fails() {
+    let (_d, store) = fixture();
+    open(&store);
+    let approval = approve(&store, "subject", "approval");
+    request(&store, "other-subject", "pending");
+    store
+        .complete(CompleteMergeRequest {
+            ticket_id: "T".into(),
+            operation_id: "op".into(),
+            approval_event_id: approval.event_id,
+            current_subject_ref: "subject".into(),
+            target_ref_before: "before".into(),
+            target_ref_after: "after".into(),
+            strategy: MergeStrategy::FastForward,
+            resolution: ConflictResolution::None,
+            auth: auth(),
+            now: at(6),
+        })
+        .unwrap();
+    let late = store.submit_review(SubmitMergeRequestReview {
+        ticket_id: "T".into(),
+        current_subject_ref: "other-subject".into(),
+        capability_token: "pending".into(),
+        decision: ReviewDecision::Approve,
+        body: "too late".into(),
+        findings: vec![],
+        now: at(7),
+    });
+    assert!(matches!(late, Err(MergeRequestError::Unauthorized(_))));
+    let mr = store.get("W", "T").unwrap();
+    assert!(mr.thread.iter().any(|event| matches!(event,
+        MergeRequestThreadEvent::ReviewCancelled(value)
+            if value.reason.contains("completed before review submission"))));
 }
