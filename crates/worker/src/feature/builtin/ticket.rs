@@ -9,6 +9,10 @@ use std::{
     sync::Arc,
 };
 
+use async_trait::async_trait;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use ticket::{
     LocalTicketBackend, MarkdownText, NewOrchestrationPlanRecord, NewTicket, NewTicketEvent,
     NewTicketRelation, OrchestrationPlanKind, OrchestrationPlanRecord, Result as TicketResult,
@@ -25,8 +29,168 @@ use crate::feature::{
     FeatureDescriptor, FeatureDiagnostic, FeatureInstallContext, FeatureInstallError,
     FeatureInstructionContribution, FeatureInstructionDeclaration, FeatureInstructionId,
     FeatureModule, ServiceDeclaration, ServiceId, ToolContribution, ToolDeclaration,
+    ToolDefinition,
 };
 use crate::worker::{WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod};
+use llm_engine::tool::{Tool, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
+
+#[derive(Clone, Copy)]
+enum WorkspaceTicketReadKind {
+    Query,
+    Show,
+}
+
+impl WorkspaceTicketReadKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Query => "QueryTicket",
+            Self::Show => "ShowTicket",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Query => {
+                "Query authoritative Workspace Tickets with bounded typed filters, stable snippets, evidence summaries, and cursor metadata."
+            }
+            Self::Show => {
+                "Show one authoritative Workspace Ticket with its item revision, paged thread, links, implementation reports, and current Merge Request review evidence."
+            }
+        }
+    }
+
+    fn schema(self) -> Value {
+        match self {
+            Self::Query => serde_json::to_value(schemars::schema_for!(WorkspaceQueryTicketInput))
+                .expect("QueryTicket schema serializes"),
+            Self::Show => serde_json::to_value(schemars::schema_for!(WorkspaceShowTicketInput))
+                .expect("ShowTicket schema serializes"),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+struct WorkspaceQueryTicketInput {
+    /// Full-text match over Ticket title, item body, and bounded thread excerpts.
+    text: Option<String>,
+    /// Exact workflow states. Empty means every state.
+    #[serde(default)]
+    states: Vec<String>,
+    /// Exact typed event kinds that must occur in the bounded thread window.
+    #[serde(default)]
+    event_kinds: Vec<String>,
+    /// Required evidence kinds: implementation_report, implementation_report_after_rescope,
+    /// merge_request, commit, or approved_review.
+    #[serde(default)]
+    evidence: Vec<String>,
+    /// Current authoritative Merge Request review status.
+    review_status: Option<String>,
+    /// Attention filters: blocked, ready, awaiting_review, unresolved_changes,
+    /// stale_after_rescope, or missing_evidence.
+    #[serde(default)]
+    attention: Vec<String>,
+    related_ticket_id: Option<String>,
+    relation_kind: Option<String>,
+    linked_objective_id: Option<String>,
+    updated_after: Option<String>,
+    updated_before: Option<String>,
+    /// updated_desc (default), priority, or title.
+    sort: Option<String>,
+    /// Page size; bounded by the Backend to 1..=100.
+    limit: Option<usize>,
+    /// Opaque cursor returned by a prior QueryTicket page.
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+struct WorkspaceShowTicketInput {
+    id: String,
+    /// Most-recent thread entries to return, bounded by the Backend to 1..=50.
+    event_limit: Option<usize>,
+    /// Opaque event cursor returned by a prior ShowTicket page.
+    event_cursor: Option<String>,
+}
+
+#[derive(Clone)]
+struct WorkspaceTicketReadTool {
+    client: Arc<dyn WorkspaceClient>,
+    kind: WorkspaceTicketReadKind,
+}
+
+#[async_trait]
+impl Tool for WorkspaceTicketReadTool {
+    async fn execute(
+        &self,
+        input: &str,
+        _context: ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let workspace_id = self.client.workspace_id().ok_or_else(|| {
+            ToolError::InvalidArgument("Workspace Ticket reads require workspace identity".into())
+        })?;
+        let (path, body) = match self.kind {
+            WorkspaceTicketReadKind::Query => {
+                let input: WorkspaceQueryTicketInput = serde_json::from_str(&input)
+                    .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
+                (
+                    format!("/api/w/{workspace_id}/tickets/query"),
+                    serde_json::to_value(input)
+                        .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?,
+                )
+            }
+            WorkspaceTicketReadKind::Show => {
+                let input: WorkspaceShowTicketInput = serde_json::from_str(&input)
+                    .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
+                if input.id.trim().is_empty() {
+                    return Err(ToolError::InvalidArgument(
+                        "ShowTicket.id must not be empty".into(),
+                    ));
+                }
+                let path = format!("/api/w/{workspace_id}/tickets/{}/show", input.id.trim());
+                let body = json!({
+                    "event_limit": input.event_limit,
+                    "event_cursor": input.event_cursor,
+                });
+                (path, body)
+            }
+        };
+        let response = self
+            .client
+            .execute(WorkspaceRequest::json(
+                WorkspaceRequestMethod::Post,
+                path,
+                serde_json::to_string(&body)
+                    .map_err(|error| ToolError::Internal(error.to_string()))?,
+            ))
+            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+        if !response.is_success() {
+            return Err(ToolError::ExecutionFailed(format!(
+                "Workspace Ticket API returned HTTP {}: {}",
+                response.status, response.body
+            )));
+        }
+        Ok(ToolOutput {
+            summary: self.kind.name().to_string(),
+            content: Some(response.body),
+            attachments: Vec::new(),
+        })
+    }
+}
+
+fn workspace_ticket_read_definition(
+    client: Arc<dyn WorkspaceClient>,
+    kind: WorkspaceTicketReadKind,
+) -> ToolDefinition {
+    Arc::new(move || {
+        let meta = ToolMeta::new(kind.name())
+            .description(kind.description())
+            .input_schema(kind.schema());
+        let tool: Arc<dyn Tool> = Arc::new(WorkspaceTicketReadTool {
+            client: client.clone(),
+            kind,
+        });
+        (meta, tool)
+    })
+}
 
 const FEATURE_ID: &str = "ticket";
 const FEATURE_NAME: &str = "Ticket tools";
@@ -143,8 +307,8 @@ impl TicketFeatureAccess {
 }
 
 const READ_ONLY_TOOL_NAMES: &[&str] = &[
-    "TicketList",
-    "TicketShow",
+    "QueryTicket",
+    "ShowTicket",
     "TicketDependencyCheck",
     "TicketDoctor",
     "TicketRelationQuery",
@@ -168,8 +332,8 @@ const INTAKE_TOOL_NAMES: &[&str] = &["TicketIntakeReady"];
 const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketCreate",
     "TicketEditItem",
-    "TicketList",
-    "TicketShow",
+    "QueryTicket",
+    "ShowTicket",
     "TicketComment",
     "TicketQueue",
     "TicketClose",
@@ -183,8 +347,8 @@ const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
 
 #[cfg(test)]
 const WORKFLOW_TOOL_NAMES: &[&str] = &[
-    "TicketList",
-    "TicketShow",
+    "QueryTicket",
+    "ShowTicket",
     "TicketComment",
     "TicketWorkflowState",
     "TicketClose",
@@ -413,6 +577,10 @@ impl FeatureModule for TicketFeature {
                 ticket_workflow_instruction(),
             ))?;
         let allowed_tool_names = self.enabled_tool_names();
+        let workspace_client = match &self.backend {
+            TicketFeatureBackend::WorkspaceClient(client) => Some(client.clone()),
+            TicketFeatureBackend::Local { .. } => None,
+        };
         let mut tools = context.tools();
         for definition in ticket_tools(backend) {
             let (meta, _) = definition();
@@ -423,6 +591,15 @@ impl FeatureModule for TicketFeature {
             {
                 continue;
             }
+            let definition = match (name.as_str(), workspace_client.as_ref()) {
+                ("QueryTicket", Some(client)) => {
+                    workspace_ticket_read_definition(client.clone(), WorkspaceTicketReadKind::Query)
+                }
+                ("ShowTicket", Some(client)) => {
+                    workspace_ticket_read_definition(client.clone(), WorkspaceTicketReadKind::Show)
+                }
+                _ => definition,
+            };
             tools.register(ToolContribution::new(name, definition))?;
         }
         if let TicketFeatureBackend::WorkspaceClient(client) = &self.backend {
@@ -1045,6 +1222,27 @@ mod tests {
     }
 
     #[test]
+    fn workspace_ticket_reads_expose_bounded_query_and_show_contracts_without_legacy_aliases() {
+        let client: Arc<dyn WorkspaceClient> = Arc::new(
+            crate::worker::TestWorkspaceHttpClient::new("workspace", "http://backend"),
+        );
+        let (query, _) =
+            workspace_ticket_read_definition(client.clone(), WorkspaceTicketReadKind::Query)();
+        assert_eq!(query.name, "QueryTicket");
+        assert!(query.input_schema["properties"]["evidence"].is_object());
+        assert!(query.input_schema["properties"]["attention"].is_object());
+        assert!(query.input_schema["properties"]["cursor"].is_object());
+        let (show, _) = workspace_ticket_read_definition(client, WorkspaceTicketReadKind::Show)();
+        assert_eq!(show.name, "ShowTicket");
+        assert!(show.input_schema["properties"]["event_limit"].is_object());
+        let tool_names = TicketFeatureAccess::workspace_authoring().tool_names();
+        assert!(tool_names.contains(&"QueryTicket"));
+        assert!(tool_names.contains(&"ShowTicket"));
+        assert!(!tool_names.contains(&"TicketList"));
+        assert!(!tool_names.contains(&"TicketShow"));
+    }
+
+    #[test]
     fn descriptor_declares_ticket_tools() {
         let temp = TempDir::new().unwrap();
         let feature = ticket_tools_feature(temp.path());
@@ -1200,8 +1398,8 @@ language = "Japanese"
         let descriptor_description = descriptor
             .tools
             .iter()
-            .find(|tool| tool.name == "TicketShow")
-            .expect("TicketShow declared")
+            .find(|tool| tool.name == "ShowTicket")
+            .expect("ShowTicket declared")
             .description
             .clone();
         assert!(descriptor_description.contains("Ticket record language: Japanese"));
@@ -1214,7 +1412,7 @@ language = "Japanese"
 
         assert_eq!(pending_tools.len(), READ_ONLY_TOOL_NAMES.len());
         assert_eq!(report.reports[0].installed_tools, READ_ONLY_TOOL_NAMES);
-        let description = pending_tool_description(&pending_tools, "TicketShow");
+        let description = pending_tool_description(&pending_tools, "ShowTicket");
         assert!(description.contains("Ticket record language: Japanese"));
         assert!(description.contains("distinct from worker.language"));
         assert!(description.contains("Preserve protocol literals"));

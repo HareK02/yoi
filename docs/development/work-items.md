@@ -34,8 +34,8 @@ Maintainers can inspect the local `.yoi/tickets/` files directly when debugging 
 Workers with the Ticket built-in feature can use typed Ticket tools:
 
 - `TicketCreate`
-- `TicketList` — lightweight bounded overview for selecting ids; it returns short summaries only and must not be used as body/thread/artifact authority.
-- `TicketShow` — detailed authority for a single Ticket, including body/thread/artifact metadata/resolution context subject to its own bounds.
+- `QueryTicket` — bounded authoritative Ticket discovery with typed state/text/event/evidence/relation/Objective/time/attention filters, stable snippets, and cursor metadata.
+- `ShowTicket` — detailed authority for one Ticket, including item revision, bounded thread/event references, relations, linked Objectives, implementation reports, and current Merge Request/review evidence.
 - `TicketComment`
 - `MergeRequestShow`, `MergeRequestOpen`, `MergeRequestAddRevision`, `MergeRequestComplete`
 - `MergeRequestReviewSubmit` — available only inside the attested direct-child Reviewer attempt; attempt/revision capability material is not model input.

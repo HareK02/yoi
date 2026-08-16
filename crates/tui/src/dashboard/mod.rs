@@ -2045,7 +2045,7 @@ impl DashboardApp {
             TicketRoleLaunchContext::new(current_workspace_root(), TicketRole::Intake);
         context.ticket = Some(TicketRef::id(ticket_id.clone()));
         context.user_instruction = Some(format!(
-            "Continue Intake for existing Ticket {ticket_id}. Do not create a duplicate Ticket unless the user explicitly requests one. Read TicketShow body/thread/artifacts before making routing or requirements decisions."
+            "Continue Intake for existing Ticket {ticket_id}. Do not create a duplicate Ticket unless the user explicitly requests one. Read ShowTicket body/thread/artifacts before making routing or requirements decisions."
         ));
         let store = match PanelRegistryStore::default_for_workspace(&context.workspace_root) {
             Ok(store) => store,
@@ -3925,7 +3925,7 @@ fn build_ready_ticket_refinement_thread_body(ticket_id: &str, instruction: &str)
 
 fn build_ready_ticket_refinement_launch_instruction(ticket_id: &str, instruction: &str) -> String {
     format!(
-        "Continue Ticket Intake / requirements sync for existing Ticket {ticket_id}. The Panel has returned the Ticket from ready to planning; do not queue the Ticket, do not route implementation, and do not create a duplicate unless the user explicitly asks for one. Read TicketShow body/thread/artifacts before making requirements or readiness decisions.\n\nUser refinement instruction:\n\n{instruction}"
+        "Continue Ticket Intake / requirements sync for existing Ticket {ticket_id}. The Panel has returned the Ticket from ready to planning; do not queue the Ticket, do not route implementation, and do not create a duplicate unless the user explicitly asks for one. Read ShowTicket body/thread/artifacts before making requirements or readiness decisions.\n\nUser refinement instruction:\n\n{instruction}"
     )
 }
 

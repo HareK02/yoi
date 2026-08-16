@@ -132,7 +132,7 @@ mod tests {
         let request = ShutdownAfterIdleRequest::default();
         let hook = TicketIntakeReadyShutdownHook::new(request.clone(), true);
 
-        hook.observe_tool_result(&tool_result("TicketShow", false));
+        hook.observe_tool_result(&tool_result("ShowTicket", false));
 
         assert!(!request.is_requested());
     }
