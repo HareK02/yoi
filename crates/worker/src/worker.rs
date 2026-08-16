@@ -238,30 +238,30 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
         ))
     }
 
-    /// Trusted review-attempt context is injected by the Internal SubWorker spawn layer.
+    /// Trusted review capability context is injected by the Internal SubWorker spawn layer.
     /// It is never accepted from a model-visible tool argument.
-    fn reviewer_attempt_context(&self) -> Option<&ReviewerAttemptContext> {
+    fn reviewer_context(&self) -> Option<&ReviewerContext> {
         None
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewerAttemptContext {
+pub struct ReviewerContext {
     pub ticket_id: String,
-    pub revision_id: String,
+    pub expected_head_commit: String,
 }
 
 #[derive(Debug)]
 pub struct ReviewerChildWorkspaceClient {
     inner: Arc<dyn WorkspaceClient>,
-    context: ReviewerAttemptContext,
+    context: ReviewerContext,
     capability_token: String,
 }
 
 impl ReviewerChildWorkspaceClient {
     pub fn new(
         inner: Arc<dyn WorkspaceClient>,
-        context: ReviewerAttemptContext,
+        context: ReviewerContext,
         capability_token: String,
     ) -> Self {
         Self {
@@ -282,7 +282,7 @@ impl WorkspaceClient for ReviewerChildWorkspaceClient {
     fn is_available(&self) -> bool {
         self.inner.is_available()
     }
-    fn reviewer_attempt_context(&self) -> Option<&ReviewerAttemptContext> {
+    fn reviewer_context(&self) -> Option<&ReviewerContext> {
         Some(&self.context)
     }
 
@@ -307,8 +307,8 @@ impl WorkspaceClient for ReviewerChildWorkspaceClient {
                 )
             })?;
             object.insert(
-                "revision_id".to_string(),
-                serde_json::Value::String(self.context.revision_id.clone()),
+                "expected_head_commit".to_string(),
+                serde_json::Value::String(self.context.expected_head_commit.clone()),
             );
             object.insert(
                 "capability_token".to_string(),
@@ -450,9 +450,9 @@ mod reviewer_client_tests {
         });
         let client = ReviewerChildWorkspaceClient::new(
             inner,
-            ReviewerAttemptContext {
+            ReviewerContext {
                 ticket_id: "T1".into(),
-                revision_id: "V1".into(),
+                expected_head_commit: "head".into(),
             },
             "secret".into(),
         );

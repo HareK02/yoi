@@ -17,22 +17,37 @@
     TicketDetail,
   } from "$lib/workspace/sidebar/types";
 
+  type MergeRequestThreadEvent =
+    | {
+      kind: "request_for_review";
+      event_seq: number;
+      head_commit: string;
+      changed_paths: string[];
+      summary: string;
+    }
+    | {
+      kind: "review";
+      event_seq: number;
+      request_event_seq: number;
+      decision: "approve" | "request_changes";
+      body: string;
+      reviewer_profile: string;
+    }
+    | {
+      kind: "merge";
+      event_seq: number;
+      result_commit: string;
+      strategy: "fast_forward" | "merge";
+      resolution: "none" | "clean" | "conflicts_resolved";
+      merged_by: { runtime_id: string; worker_id: string };
+    }
+    | { kind: "reopen" | "close"; event_seq: number; body: string };
+
   type MergeRequestDetail = {
-    state: "draft" | "open" | "closed" | "merged";
-    review_status: "pending" | "approved" | "changes_requested";
-    target_ref_selector?: string | null;
-    target_status: "known" | "unknown";
-    observed_target_commit?: string | null;
-    current_revision: { revision_id: string; head_commit: string; changed_paths: string[]; summary: string };
-    current_review?: { decision: string; body: string; reviewer_effective_profile: string } | null;
-    merged_revision_id?: string | null;
-    merged_target_commit?: string | null;
-    merged_result_commit?: string | null;
-    merge_strategy?: "fast_forward" | "merge" | null;
-    merge_resolution?: "none" | "clean" | "conflicts_resolved" | null;
-    merged_by_runtime_id?: string | null;
-    merged_by_worker_id?: string | null;
-    merged_at?: string | null;
+    state: "open" | "closed" | "merged";
+    selector_from: string;
+    selector_to: string;
+    thread: MergeRequestThreadEvent[];
   };
 
   const MUTABLE_TICKET_STATES = TICKET_STATES.filter((state) => state !== "done");
@@ -56,6 +71,21 @@
 
   let ticket = $state<TicketDetail>(loadedTicket);
   let mergeRequest = $state<MergeRequestDetail | null>(initialData.mergeRequest.data ?? null);
+  const currentReviewRequest = $derived(
+    mergeRequest?.thread.findLast((event) => event.kind === "request_for_review") ?? null,
+  );
+  const currentReview = $derived(
+    currentReviewRequest
+      ? mergeRequest?.thread.findLast(
+        (event) =>
+          event.kind === "review" &&
+          event.request_event_seq === currentReviewRequest.event_seq,
+      ) ?? null
+      : null,
+  );
+  const mergeEvent = $derived(
+    mergeRequest?.thread.findLast((event) => event.kind === "merge") ?? null,
+  );
   let editing = $state(false);
   let editTitle = $state(loadedTicket.title);
   let editBody = $state(loadedTicket.body);
@@ -353,28 +383,21 @@
         {#if data.mergeRequest.error}
           <p class="workspace-callout is-error">{data.mergeRequest.error}</p>
         {:else if mergeRequest}
-          <p><strong>{mergeRequest.state}</strong> · {mergeRequest.review_status}</p>
-          <p>Target <code>{mergeRequest.target_ref_selector ?? "unknown"}</code> · {mergeRequest.target_status}</p>
-          {#if mergeRequest.observed_target_commit}<p>Target tip <code>{mergeRequest.observed_target_commit}</code></p>{/if}
-          <p><code>{mergeRequest.current_revision.revision_id}</code></p>
-          <p>Head <code>{mergeRequest.current_revision.head_commit}</code></p>
-          {#if mergeRequest.merged_result_commit}
-            <p>
-              Final merge · {mergeRequest.merge_strategy} / {mergeRequest.merge_resolution}
-            </p>
-            <p>
-              Target before <code>{mergeRequest.merged_target_commit}</code> · result
-              <code>{mergeRequest.merged_result_commit}</code>
-            </p>
-            <p>
-              Revision <code>{mergeRequest.merged_revision_id}</code> · completed by
-              <code>{mergeRequest.merged_by_runtime_id}/{mergeRequest.merged_by_worker_id}</code>
-            </p>
+          <p><strong>{mergeRequest.state}</strong></p>
+          <p>From <code>{mergeRequest.selector_from}</code></p>
+          <p>To <code>{mergeRequest.selector_to}</code></p>
+          {#if currentReviewRequest?.kind === "request_for_review"}
+            <p>Candidate <code>{currentReviewRequest.head_commit}</code></p>
+            {#if currentReviewRequest.summary}<p>{currentReviewRequest.summary}</p>{/if}
           {/if}
-          {#if mergeRequest.current_revision.summary}<p>{mergeRequest.current_revision.summary}</p>{/if}
-          {#if mergeRequest.current_review}
-            <p><strong>{mergeRequest.current_review.decision}</strong> by {mergeRequest.current_review.reviewer_effective_profile}</p>
-            {#if mergeRequest.current_review.body}<RichMarkdown text={mergeRequest.current_review.body} />{/if}
+          {#if currentReview?.kind === "review"}
+            <p><strong>{currentReview.decision}</strong> by {currentReview.reviewer_profile}</p>
+            {#if currentReview.body}<RichMarkdown text={currentReview.body} />{/if}
+          {/if}
+          {#if mergeEvent?.kind === "merge"}
+            <p>Final merge · {mergeEvent.strategy} / {mergeEvent.resolution}</p>
+            <p>Result <code>{mergeEvent.result_commit}</code></p>
+            <p>Completed by <code>{mergeEvent.merged_by.runtime_id}/{mergeEvent.merged_by.worker_id}</code></p>
           {/if}
         {:else}
           <p class="workspace-empty-copy">The assigned Coder has not opened a Merge Request.</p>

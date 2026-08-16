@@ -366,7 +366,7 @@ impl FeatureModule for TicketFeature {
             ));
         }
         if let TicketFeatureBackend::WorkspaceClient(client) = &self.backend {
-            let names: Vec<&str> = if client.reviewer_attempt_context().is_some() {
+            let names: Vec<&str> = if client.reviewer_context().is_some() {
                 vec![
                     "MergeRequestShow",
                     merge_request::MERGE_REQUEST_REVIEW_TOOL_NAME,
@@ -426,7 +426,7 @@ impl FeatureModule for TicketFeature {
             tools.register(ToolContribution::new(name, definition))?;
         }
         if let TicketFeatureBackend::WorkspaceClient(client) = &self.backend {
-            let definitions = if client.reviewer_attempt_context().is_some() {
+            let definitions = if client.reviewer_context().is_some() {
                 merge_request::reviewer_tools(client.clone())
             } else {
                 merge_request::common_tools(client.clone())
