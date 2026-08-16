@@ -221,12 +221,7 @@ impl RepositoryRegistryReader {
             .map(str::to_owned)
             .or_else(|| repository.default_selector.clone())
             .ok_or_else(|| RepositoryLookupError::MissingDefaultSelector { id: id.to_string() })?;
-        if selector.starts_with('-') || selector.as_bytes().contains(&0) {
-            return Err(RepositoryLookupError::InvalidSelector {
-                id: id.to_string(),
-                selector,
-            });
-        }
+        let selector = normalize_target_branch_selector(id, &selector)?;
         let spec = format!("{selector}^{{commit}}");
         let commit = merge_git_stdout(
             repository,
@@ -319,29 +314,7 @@ impl RepositoryRegistryReader {
         result_commit: &str,
     ) -> Result<(), RepositoryLookupError> {
         let repository = self.merge_repository(id)?;
-        let target_ref = if selector.starts_with("refs/heads/") {
-            selector.to_owned()
-        } else if selector.starts_with("refs/") {
-            return Err(RepositoryLookupError::InvalidSelector {
-                id: id.into(),
-                selector: selector.into(),
-            });
-        } else {
-            format!("refs/heads/{selector}")
-        };
-        let valid_ref = Command::new("git")
-            .args(["check-ref-format", target_ref.as_str()])
-            .status()
-            .map_err(|_| RepositoryLookupError::ProviderFailure {
-                id: id.into(),
-                operation: "validate target branch ref".into(),
-            })?;
-        if !valid_ref.success() || selector.starts_with('-') || selector.as_bytes().contains(&0) {
-            return Err(RepositoryLookupError::InvalidSelector {
-                id: id.into(),
-                selector: selector.into(),
-            });
-        }
+        let target_ref = normalize_target_branch_selector(id, selector)?;
         self.observe_commit(id, result_commit)?;
         let status = Command::new("git")
             .arg("-C")
@@ -472,6 +445,37 @@ impl RepositoryRegistryReader {
         )?;
         Ok(parse_git_log(&output))
     }
+}
+
+fn normalize_target_branch_selector(
+    id: &str,
+    selector: &str,
+) -> Result<String, RepositoryLookupError> {
+    let selector = selector.trim();
+    let target_ref = if selector.starts_with("refs/heads/") {
+        selector.to_owned()
+    } else if selector.starts_with("refs/") {
+        return Err(RepositoryLookupError::InvalidSelector {
+            id: id.into(),
+            selector: selector.into(),
+        });
+    } else {
+        format!("refs/heads/{selector}")
+    };
+    let valid_ref = Command::new("git")
+        .args(["check-ref-format", target_ref.as_str()])
+        .status()
+        .map_err(|_| RepositoryLookupError::ProviderFailure {
+            id: id.into(),
+            operation: "validate target branch ref".into(),
+        })?;
+    if !valid_ref.success() || selector.starts_with('-') || selector.as_bytes().contains(&0) {
+        return Err(RepositoryLookupError::InvalidSelector {
+            id: id.into(),
+            selector: selector.into(),
+        });
+    }
+    Ok(target_ref)
 }
 
 fn merge_git_stdout(
@@ -725,6 +729,15 @@ mod tests {
             .unwrap()
             .trim()
             .to_string();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["update-ref", "refs/tags/main", &source])
+                .status()
+                .unwrap()
+                .success()
+        );
 
         let reader = RepositoryRegistryReader::new(vec![ConfiguredRepository {
             id: "main".into(),
@@ -734,8 +747,8 @@ mod tests {
             uri: path.display().to_string(),
             default_selector: Some("main".into()),
         }]);
-        let target = reader.observe_merge_target("main", None).unwrap();
-        assert_eq!(target.selector, "main");
+        let target = reader.observe_merge_target("main", Some("main")).unwrap();
+        assert_eq!(target.selector, "refs/heads/main");
         assert_eq!(target.commit, base);
         assert_eq!(
             reader.observe_commit("main", &source).unwrap().parents,
