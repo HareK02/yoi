@@ -428,8 +428,23 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
                     event_cursor: None,
                 },
             )?;
-            if ticket_matches_query(&summary, &detail, &query) {
-                items.push(ticket_query_item(summary, &detail, &query));
+            let authoritative = self
+                .ticket_backend
+                .show(TicketIdOrSlug::Id(summary.id.clone()))?;
+            if ticket_matches_query(
+                &summary,
+                &detail,
+                authoritative.document.body.as_str(),
+                &authoritative.events,
+                &query,
+            ) {
+                items.push(ticket_query_item(
+                    summary,
+                    &detail,
+                    authoritative.document.body.as_str(),
+                    &authoritative.events,
+                    &query,
+                ));
             }
         }
         sort_ticket_query_items(&mut items, sort);
@@ -1189,6 +1204,8 @@ fn parse_query_cursor(cursor: &str) -> Result<(String, String)> {
 fn ticket_matches_query(
     summary: &TicketSummary,
     detail: &TicketDetail,
+    authoritative_body: &str,
+    authoritative_events: &[TicketEvent],
     query: &TicketQueryRequest,
 ) -> bool {
     if !query.states.is_empty() && !query.states.iter().any(|state| state == &summary.state) {
@@ -1206,10 +1223,12 @@ fn ticket_matches_query(
         return false;
     }
     if !query.event_kinds.is_empty()
-        && !detail
-            .events
-            .iter()
-            .any(|event| query.event_kinds.iter().any(|kind| kind == &event.kind))
+        && !authoritative_events.iter().any(|event| {
+            query
+                .event_kinds
+                .iter()
+                .any(|kind| kind == event.kind.as_str())
+        })
     {
         return false;
     }
@@ -1275,34 +1294,69 @@ fn ticket_matches_query(
     }) {
         return false;
     }
-    if let Some(ticket_id) = &query.related_ticket_id {
-        let relation_json = serde_json::to_string(&detail.relations).unwrap_or_default();
-        if !relation_json.contains(ticket_id) {
-            return false;
-        }
+    if let Some(ticket_id) = &query.related_ticket_id
+        && !detail
+            .relations
+            .outgoing
+            .iter()
+            .any(|relation| &relation.target == ticket_id)
+        && !detail
+            .relations
+            .incoming
+            .iter()
+            .any(|relation| &relation.source_ticket == ticket_id)
+        && !detail
+            .relations
+            .blockers
+            .iter()
+            .any(|relation| &relation.blocking_ticket == ticket_id)
+        && !detail
+            .relations
+            .notices
+            .iter()
+            .any(|relation| &relation.related_ticket == ticket_id)
+    {
+        return false;
     }
-    if let Some(kind) = &query.relation_kind {
-        let relation_json = serde_json::to_string(&detail.relations).unwrap_or_default();
-        if !relation_json.contains(kind) {
-            return false;
-        }
+    if let Some(kind) = &query.relation_kind
+        && !detail
+            .relations
+            .outgoing
+            .iter()
+            .any(|relation| &relation.kind == kind)
+        && !detail
+            .relations
+            .incoming
+            .iter()
+            .any(|relation| &relation.forward_kind == kind)
+        && !detail
+            .relations
+            .blockers
+            .iter()
+            .any(|relation| &relation.relation_kind == kind)
+        && !detail
+            .relations
+            .notices
+            .iter()
+            .any(|relation| &relation.kind == kind)
+    {
+        return false;
     }
     query.query.as_ref().is_none_or(|text| {
         let needle = text.to_lowercase();
         summary.title.to_lowercase().contains(&needle)
-            || detail.body.to_lowercase().contains(&needle)
-            || detail.events.iter().any(|event| {
-                event
-                    .body
-                    .as_deref()
-                    .is_some_and(|body| body.to_lowercase().contains(&needle))
-            })
+            || authoritative_body.to_lowercase().contains(&needle)
+            || authoritative_events
+                .iter()
+                .any(|event| event.body.as_str().to_lowercase().contains(&needle))
     })
 }
 
 fn ticket_query_item(
     summary: TicketSummary,
     detail: &TicketDetail,
+    authoritative_body: &str,
+    authoritative_events: &[TicketEvent],
     query: &TicketQueryRequest,
 ) -> TicketQueryItem {
     let mut matched_fields = Vec::new();
@@ -1314,26 +1368,18 @@ fn ticket_query_item(
             matched_fields.push("title".to_string());
             snippet = Some(summary.title.clone());
         }
-        if detail.body.to_lowercase().contains(&needle) {
+        if authoritative_body.to_lowercase().contains(&needle) {
             matched_fields.push("body".to_string());
-            snippet.get_or_insert_with(|| matching_snippet(&detail.body, text));
+            snippet.get_or_insert_with(|| matching_snippet(authoritative_body, text));
         }
-        if let Some(event) = detail.events.iter().find(|event| {
-            event
-                .body
-                .as_deref()
-                .is_some_and(|body| body.to_lowercase().contains(&needle))
-        }) {
+        if let Some((sequence, event)) = authoritative_events
+            .iter()
+            .enumerate()
+            .find(|(_, event)| event.body.as_str().to_lowercase().contains(&needle))
+        {
             matched_fields.push("event".to_string());
-            matching_event = Some(TicketEvidenceEvent {
-                event_ref: event.event_ref.clone(),
-                sequence: event.sequence,
-                kind: event.kind.clone(),
-                at: event.at.clone(),
-                author: event.author.clone(),
-                excerpt: event.body.clone().unwrap_or_default(),
-            });
-            snippet.get_or_insert_with(|| event.body.clone().unwrap_or_default());
+            matching_event = Some(ticket_evidence_event(sequence, event));
+            snippet.get_or_insert_with(|| event.body.as_str().to_string());
         }
     }
     TicketQueryItem {
@@ -1826,6 +1872,42 @@ mod tests {
         );
 
         let authority = SqliteWorkspaceAuthority::new(&db_path, "workspace-test").unwrap();
+        authority
+            .ticket_backend
+            .add_event(
+                TicketIdOrSlug::Id("00000000001J2".to_string()),
+                ticket::NewTicketEvent::new(
+                    ticket::TicketEventKind::Other("historical_signal".to_string()),
+                    "Historical event marker.",
+                ),
+            )
+            .unwrap();
+        for index in 0..110 {
+            authority
+                .ticket_backend
+                .add_event(
+                    TicketIdOrSlug::Id("00000000001J2".to_string()),
+                    ticket::NewTicketEvent::new(
+                        ticket::TicketEventKind::Comment,
+                        format!("Filler event {index}."),
+                    ),
+                )
+                .unwrap();
+        }
+        authority
+            .ticket_backend
+            .add_ticket_relation(
+                TicketIdOrSlug::Id("00000000001J2".to_string()),
+                ticket::NewTicketRelation {
+                    kind: ticket::TicketRelationKind::Related,
+                    target: "00000000001J5".to_string(),
+                    note: Some(
+                        "mentions unrelated id 00000000001J9 and kind depends_on".to_string(),
+                    ),
+                    author: Some("tester".to_string()),
+                },
+            )
+            .unwrap();
         let tickets = authority.list_tickets(20).unwrap();
         assert_eq!(tickets.record_authority, "workspace-sqlite");
         assert_eq!(tickets.items[0].record_source, "sqlite_yoi_ticket");
@@ -1838,12 +1920,14 @@ mod tests {
 
         let ticket = authority.ticket("00000000001J2").unwrap();
         assert!(ticket.body.contains("Ticket body"));
+        assert!(ticket.body_truncated);
+        assert!(!ticket.body.contains("Deep Ticket marker"));
         assert!(!ticket.item_revision.is_empty());
         assert_eq!(ticket.linked_objectives[0].id, "00000000001J3");
         assert_eq!(ticket.event_page.returned, ticket.events.len());
         let ticket_query = authority
             .query_tickets(TicketQueryRequest {
-                query: Some("Ticket body".to_string()),
+                query: Some("Deep Ticket marker".to_string()),
                 states: vec!["ready".to_string()],
                 linked_objective_id: Some("00000000001J3".to_string()),
                 attention: vec!["unblocked".to_string(), "missing_commit".to_string()],
@@ -1859,6 +1943,44 @@ mod tests {
                 .contains(&"body".to_string())
         );
         assert_eq!(ticket_query.page.limit, 1);
+        let historical_event_query = authority
+            .query_tickets(TicketQueryRequest {
+                query: Some("Historical event marker".to_string()),
+                event_kinds: vec!["historical_signal".to_string()],
+                limit: Some(1),
+                ..TicketQueryRequest::default()
+            })
+            .unwrap();
+        assert_eq!(historical_event_query.items.len(), 1);
+        let matching_event = historical_event_query.items[0]
+            .matching_event
+            .as_ref()
+            .expect("matching historical event");
+        assert_eq!(matching_event.kind, "historical_signal");
+        assert!(matching_event.excerpt.contains("Historical event marker"));
+        let note_only_id = authority
+            .query_tickets(TicketQueryRequest {
+                related_ticket_id: Some("00000000001J9".to_string()),
+                ..TicketQueryRequest::default()
+            })
+            .unwrap();
+        assert!(note_only_id.items.is_empty());
+        let note_only_kind = authority
+            .query_tickets(TicketQueryRequest {
+                relation_kind: Some("depends_on".to_string()),
+                ..TicketQueryRequest::default()
+            })
+            .unwrap();
+        assert!(note_only_kind.items.is_empty());
+        let exact_relation = authority
+            .query_tickets(TicketQueryRequest {
+                related_ticket_id: Some("00000000001J5".to_string()),
+                relation_kind: Some("related".to_string()),
+                ..TicketQueryRequest::default()
+            })
+            .unwrap();
+        assert_eq!(exact_relation.items.len(), 1);
+        assert_eq!(exact_relation.items[0].id, "00000000001J2");
         let first_page = authority
             .query_tickets(TicketQueryRequest {
                 sort: Some("title".to_string()),
@@ -2052,7 +2174,10 @@ updated_at: "2026-01-02T00:00:00Z"
 ---
 
 Ticket body.
+{padding}
+Deep Ticket marker.
 "#,
+                padding = "x".repeat(70_000),
             ),
         )
         .unwrap();
