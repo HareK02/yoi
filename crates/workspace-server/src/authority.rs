@@ -10,12 +10,12 @@ use ticket::{
 };
 
 use crate::records::{
-    ObjectiveDetail, ObjectiveEventDetail, ObjectiveLinkSummary, ObjectiveQueryItem,
-    ObjectiveQueryRequest, ObjectiveQueryResponse, ObjectiveResourceSummary, ObjectiveShowRequest,
-    ObjectiveSummary, ProjectRecordList, QueryPage, TicketDetail, TicketEventDetail,
-    TicketEvidenceEvent, TicketEvidenceSummary, TicketMergeRequestSummary, TicketQueryItem,
-    TicketQueryRequest, TicketQueryResponse, TicketShowRequest, TicketSummary, summarize_body,
-    truncate_body, validate_project_id,
+    ObjectiveDetail, ObjectiveEventDetail, ObjectiveLinkSummary, ObjectiveLinkedTicketSummary,
+    ObjectiveQueryItem, ObjectiveQueryRequest, ObjectiveQueryResponse, ObjectiveResourceSummary,
+    ObjectiveShowRequest, ObjectiveSummary, ProjectRecordList, QueryPage, TicketAssignmentSummary,
+    TicketDetail, TicketEventDetail, TicketEvidenceEvent, TicketEvidenceSummary,
+    TicketMergeRequestSummary, TicketQueryItem, TicketQueryRequest, TicketQueryResponse,
+    TicketShowRequest, TicketSummary, summarize_body, truncate_body, validate_project_id,
 };
 use crate::store::{
     ControlPlaneStore, MemoryDocumentRecord, MemoryStagingRecord, MemoryStagingResolutionRecord,
@@ -163,6 +163,17 @@ impl SqliteWorkspaceAuthority {
             .into_iter()
             .map(|link| link.ticket_id)
             .collect::<Vec<_>>();
+        let linked_ticket_summaries = self
+            .list_tickets(1_000)?
+            .items
+            .into_iter()
+            .filter(|ticket| linked_tickets.iter().any(|id| id == &ticket.id))
+            .map(|ticket| ObjectiveLinkedTicketSummary {
+                id: ticket.id,
+                title: ticket.title,
+                state: ticket.state,
+            })
+            .collect::<Vec<_>>();
         let resources = self
             .store
             .list_objective_resources(&self.workspace_id, &record.objective_id)?
@@ -207,6 +218,7 @@ impl SqliteWorkspaceAuthority {
             created_at: Some(record.created_at),
             updated_at: Some(record.updated_at),
             linked_tickets,
+            linked_ticket_summaries,
             resources,
             body,
             body_truncated,
@@ -295,6 +307,14 @@ impl SqliteWorkspaceAuthority {
             .filter(|(_, event)| event.kind.as_str() == "implementation_report")
             .map(|(sequence, event)| ticket_evidence_event(sequence, event))
             .collect::<Vec<_>>();
+        let current_assignment = self
+            .store
+            .get_current_ticket_worker_assignment(&self.workspace_id, id)?
+            .map(|assignment| TicketAssignmentSummary {
+                assignment_id: assignment.assignment_id,
+                runtime_id: assignment.worker.runtime_id,
+                worker_id: assignment.worker.worker_id,
+            });
         let merge_request = self
             .merge_request_store
             .show_for_ticket(id)
@@ -313,6 +333,7 @@ impl SqliteWorkspaceAuthority {
             id: ticket.meta.id,
             title: ticket.meta.title,
             state: ticket.meta.workflow_state.as_str().to_string(),
+            readiness: ticket.meta.readiness,
             priority: ticket.meta.priority,
             created_at: ticket.meta.created_at,
             updated_at: ticket.meta.updated_at,
@@ -345,6 +366,7 @@ impl SqliteWorkspaceAuthority {
             relations: ticket.relations.into(),
             linked_objectives,
             implementation_reports,
+            current_assignment,
             merge_request,
             evidence,
             resolution: ticket
@@ -388,7 +410,7 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
     fn query_tickets(&self, query: TicketQueryRequest) -> Result<TicketQueryResponse> {
         validate_ticket_query(&query)?;
         let limit = query.limit.unwrap_or(50).clamp(1, 100);
-        let sort = normalize_ticket_sort(query.sort.as_deref())?;
+        let sort = normalize_ticket_sort(query.sort.as_deref(), query.query.is_some())?;
         let cursor = query
             .cursor
             .as_deref()
@@ -457,6 +479,7 @@ impl ObjectiveAuthority for SqliteWorkspaceAuthority {
                 id: record.objective_id,
                 title: record.title,
                 state: record.state,
+                created_at: Some(record.created_at),
                 updated_at: Some(record.updated_at),
                 summary: summarize_body(&record.body_md),
                 linked_tickets,
@@ -476,7 +499,7 @@ impl ObjectiveAuthority for SqliteWorkspaceAuthority {
             query.updated_before.as_deref(),
         )?;
         let limit = query.limit.unwrap_or(50).clamp(1, 100);
-        let sort = normalize_objective_sort(query.sort.as_deref())?;
+        let sort = normalize_objective_sort(query.sort.as_deref(), query.query.is_some())?;
         let cursor = query
             .cursor
             .as_deref()
@@ -506,7 +529,7 @@ impl ObjectiveAuthority for SqliteWorkspaceAuthority {
             items.push(objective_query_item(
                 objective,
                 linked_tickets,
-                query.text.as_deref(),
+                query.query.as_deref(),
             ));
         }
         sort_objective_query_items(&mut items, sort);
@@ -851,7 +874,9 @@ impl MemoryAuthority for SqliteWorkspaceAuthority {
 
 #[derive(Clone, Copy)]
 enum TicketQuerySort {
+    Relevance,
     UpdatedDesc,
+    CreatedDesc,
     Priority,
     Title,
 }
@@ -859,7 +884,9 @@ enum TicketQuerySort {
 impl std::fmt::Display for TicketQuerySort {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
+            Self::Relevance => "relevance",
             Self::UpdatedDesc => "updated_desc",
+            Self::CreatedDesc => "created_desc",
             Self::Priority => "priority",
             Self::Title => "title",
         })
@@ -868,14 +895,18 @@ impl std::fmt::Display for TicketQuerySort {
 
 #[derive(Clone, Copy)]
 enum ObjectiveQuerySort {
+    Relevance,
     UpdatedDesc,
+    CreatedDesc,
     Title,
 }
 
 impl std::fmt::Display for ObjectiveQuerySort {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
+            Self::Relevance => "relevance",
             Self::UpdatedDesc => "updated_desc",
+            Self::CreatedDesc => "created_desc",
             Self::Title => "title",
         })
     }
@@ -1031,7 +1062,13 @@ fn validate_ticket_query(query: &TicketQueryRequest) -> Result<()> {
     for attention in &query.attention {
         if !matches!(
             attention.as_str(),
-            "blocked"
+            "done_not_closed"
+                | "implementation_report_not_closed"
+                | "report_after_rescope"
+                | "unresolved_review"
+                | "missing_commit"
+                | "blocked"
+                | "unblocked"
                 | "ready"
                 | "awaiting_review"
                 | "unresolved_changes"
@@ -1044,7 +1081,15 @@ fn validate_ticket_query(query: &TicketQueryRequest) -> Result<()> {
         }
     }
     if let Some(status) = query.review_status.as_deref()
-        && !matches!(status, "pending" | "approved" | "changes_requested")
+        && !matches!(
+            status,
+            "none"
+                | "pending"
+                | "approved"
+                | "request_changes"
+                | "unresolved_changes"
+                | "changes_requested"
+        )
     {
         return Err(Error::InvalidRecordId(format!(
             "unsupported review status `{status}`"
@@ -1080,9 +1125,15 @@ fn validate_time_bounds(after: Option<&str>, before: Option<&str>) -> Result<()>
     Ok(())
 }
 
-fn normalize_ticket_sort(sort: Option<&str>) -> Result<TicketQuerySort> {
-    match sort.unwrap_or("updated_desc") {
+fn normalize_ticket_sort(sort: Option<&str>, has_query: bool) -> Result<TicketQuerySort> {
+    match sort.unwrap_or(if has_query {
+        "relevance"
+    } else {
+        "updated_desc"
+    }) {
+        "relevance" => Ok(TicketQuerySort::Relevance),
         "updated_desc" => Ok(TicketQuerySort::UpdatedDesc),
+        "created_desc" => Ok(TicketQuerySort::CreatedDesc),
         "priority" => Ok(TicketQuerySort::Priority),
         "title" => Ok(TicketQuerySort::Title),
         other => Err(Error::InvalidRecordId(format!(
@@ -1091,9 +1142,15 @@ fn normalize_ticket_sort(sort: Option<&str>) -> Result<TicketQuerySort> {
     }
 }
 
-fn normalize_objective_sort(sort: Option<&str>) -> Result<ObjectiveQuerySort> {
-    match sort.unwrap_or("updated_desc") {
+fn normalize_objective_sort(sort: Option<&str>, has_query: bool) -> Result<ObjectiveQuerySort> {
+    match sort.unwrap_or(if has_query {
+        "relevance"
+    } else {
+        "updated_desc"
+    }) {
+        "relevance" => Ok(ObjectiveQuerySort::Relevance),
         "updated_desc" => Ok(ObjectiveQuerySort::UpdatedDesc),
+        "created_desc" => Ok(ObjectiveQuerySort::CreatedDesc),
         "title" => Ok(ObjectiveQuerySort::Title),
         other => Err(Error::InvalidRecordId(format!(
             "unsupported Objective query sort `{other}`"
@@ -1154,10 +1211,17 @@ fn ticket_matches_query(
     {
         return false;
     }
-    if let Some(review_status) = &query.review_status
-        && detail.evidence.review_status.as_ref() != Some(review_status)
-    {
-        return false;
+    if let Some(review_status) = &query.review_status {
+        let matches = match review_status.as_str() {
+            "none" => detail.evidence.review_status.is_none(),
+            "request_changes" | "unresolved_changes" => {
+                detail.evidence.review_status.as_deref() == Some("changes_requested")
+            }
+            status => detail.evidence.review_status.as_deref() == Some(status),
+        };
+        if !matches {
+            return false;
+        }
     }
     if !query
         .evidence
@@ -1179,7 +1243,15 @@ fn ticket_matches_query(
         .attention
         .iter()
         .all(|attention| match attention.as_str() {
+            "done_not_closed" => summary.state == "done",
+            "implementation_report_not_closed" => {
+                detail.evidence.has_implementation_report && summary.state != "closed"
+            }
+            "report_after_rescope" => detail.evidence.implementation_report_after_rescope,
+            "unresolved_review" => detail.evidence.unresolved_request_changes,
+            "missing_commit" => !detail.evidence.has_commit,
             "blocked" => !detail.relations.blockers.is_empty(),
+            "unblocked" => detail.relations.blockers.is_empty(),
             "ready" => summary.state == "ready" && detail.relations.blockers.is_empty(),
             "awaiting_review" => detail.evidence.review_status.as_deref() == Some("pending"),
             "unresolved_changes" => detail.evidence.unresolved_request_changes,
@@ -1213,7 +1285,7 @@ fn ticket_matches_query(
             return false;
         }
     }
-    query.text.as_ref().is_none_or(|text| {
+    query.query.as_ref().is_none_or(|text| {
         let needle = text.to_lowercase();
         summary.title.to_lowercase().contains(&needle)
             || detail.body.to_lowercase().contains(&needle)
@@ -1234,7 +1306,7 @@ fn ticket_query_item(
     let mut matched_fields = Vec::new();
     let mut snippet = None;
     let mut matching_event = None;
-    if let Some(text) = query.text.as_ref() {
+    if let Some(text) = query.query.as_ref() {
         let needle = text.to_lowercase();
         if summary.title.to_lowercase().contains(&needle) {
             matched_fields.push("title".to_string());
@@ -1266,8 +1338,11 @@ fn ticket_query_item(
         id: summary.id,
         title: summary.title,
         state: summary.state,
+        readiness: detail.readiness.clone(),
         priority: summary.priority,
+        created_at: detail.created_at.clone(),
         updated_at: summary.updated_at,
+        item_revision: detail.item_revision.clone(),
         workspace_action_priority: summary.workspace_action_priority,
         matched_fields,
         snippet: snippet.map(|value| truncate_body(&value, 512).0),
@@ -1279,6 +1354,8 @@ fn ticket_query_item(
             .collect(),
         relation_count: detail.relations.outgoing.len() + detail.relations.incoming.len(),
         blocker_count: detail.relations.blockers.len(),
+        unresolved_blocker_count: detail.relations.blockers.len(),
+        unresolved_review_count: usize::from(detail.evidence.unresolved_request_changes),
         evidence: detail.evidence.clone(),
         merge_request: detail.merge_request.clone(),
     }
@@ -1295,9 +1372,27 @@ fn matching_snippet(body: &str, text: &str) -> String {
     body[start..end].to_string()
 }
 
+fn ticket_match_rank(item: &TicketQueryItem) -> usize {
+    if item.matched_fields.iter().any(|field| field == "title") {
+        0
+    } else if item.matched_fields.iter().any(|field| field == "body") {
+        1
+    } else if item.matched_fields.iter().any(|field| field == "event") {
+        2
+    } else {
+        3
+    }
+}
+
 fn ticket_sort_key(item: &TicketQueryItem, sort: TicketQuerySort) -> String {
     match sort {
+        TicketQuerySort::Relevance => format!(
+            "{}|{}",
+            ticket_match_rank(item),
+            item.updated_at.as_deref().unwrap_or("")
+        ),
         TicketQuerySort::UpdatedDesc => item.updated_at.clone().unwrap_or_default(),
+        TicketQuerySort::CreatedDesc => item.created_at.clone().unwrap_or_default(),
         TicketQuerySort::Priority => format!(
             "{}|{}",
             match item.workspace_action_priority.as_str() {
@@ -1313,9 +1408,17 @@ fn ticket_sort_key(item: &TicketQueryItem, sort: TicketQuerySort) -> String {
 
 fn sort_ticket_query_items(items: &mut [TicketQueryItem], sort: TicketQuerySort) {
     items.sort_by(|left, right| match sort {
+        TicketQuerySort::Relevance => ticket_match_rank(left)
+            .cmp(&ticket_match_rank(right))
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+            .then_with(|| left.id.cmp(&right.id)),
         TicketQuerySort::UpdatedDesc => right
             .updated_at
             .cmp(&left.updated_at)
+            .then_with(|| left.id.cmp(&right.id)),
+        TicketQuerySort::CreatedDesc => right
+            .created_at
+            .cmp(&left.created_at)
             .then_with(|| left.id.cmp(&right.id)),
         TicketQuerySort::Priority => {
             let rank = |item: &TicketQueryItem| match item.workspace_action_priority.as_str() {
@@ -1347,9 +1450,11 @@ fn ticket_item_after_cursor(
 ) -> bool {
     let key = ticket_sort_key(item, sort);
     match sort {
-        TicketQuerySort::UpdatedDesc => key < cursor.0 || (key == cursor.0 && item.id > cursor.1),
+        TicketQuerySort::UpdatedDesc | TicketQuerySort::CreatedDesc => {
+            key < cursor.0 || (key == cursor.0 && item.id > cursor.1)
+        }
         TicketQuerySort::Title => key > cursor.0 || (key == cursor.0 && item.id > cursor.1),
-        TicketQuerySort::Priority => {
+        TicketQuerySort::Relevance | TicketQuerySort::Priority => {
             let (rank, updated) = key.split_once('|').unwrap_or(("9", ""));
             let (cursor_rank, cursor_updated) = cursor.0.split_once('|').unwrap_or(("9", ""));
             rank > cursor_rank
@@ -1375,7 +1480,7 @@ fn objective_matches_query(objective: &ObjectiveSummary, query: &ObjectiveQueryR
     {
         return false;
     }
-    query.text.as_ref().is_none_or(|text| {
+    query.query.as_ref().is_none_or(|text| {
         let needle = text.to_lowercase();
         objective.title.to_lowercase().contains(&needle)
             || objective.summary.to_lowercase().contains(&needle)
@@ -1404,6 +1509,7 @@ fn objective_query_item(
         id: objective.id,
         title: objective.title,
         state: objective.state,
+        created_at: objective.created_at,
         updated_at: objective.updated_at,
         matched_fields,
         snippet,
@@ -1412,18 +1518,42 @@ fn objective_query_item(
     }
 }
 
+fn objective_match_rank(item: &ObjectiveQueryItem) -> usize {
+    if item.matched_fields.iter().any(|field| field == "title") {
+        0
+    } else if item.matched_fields.iter().any(|field| field == "body") {
+        1
+    } else {
+        2
+    }
+}
+
 fn objective_sort_key(item: &ObjectiveQueryItem, sort: ObjectiveQuerySort) -> String {
     match sort {
+        ObjectiveQuerySort::Relevance => format!(
+            "{}|{}",
+            objective_match_rank(item),
+            item.updated_at.as_deref().unwrap_or("")
+        ),
         ObjectiveQuerySort::UpdatedDesc => item.updated_at.clone().unwrap_or_default(),
+        ObjectiveQuerySort::CreatedDesc => item.created_at.clone().unwrap_or_default(),
         ObjectiveQuerySort::Title => item.title.to_lowercase(),
     }
 }
 
 fn sort_objective_query_items(items: &mut [ObjectiveQueryItem], sort: ObjectiveQuerySort) {
     items.sort_by(|left, right| match sort {
+        ObjectiveQuerySort::Relevance => objective_match_rank(left)
+            .cmp(&objective_match_rank(right))
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+            .then_with(|| left.id.cmp(&right.id)),
         ObjectiveQuerySort::UpdatedDesc => right
             .updated_at
             .cmp(&left.updated_at)
+            .then_with(|| left.id.cmp(&right.id)),
+        ObjectiveQuerySort::CreatedDesc => right
+            .created_at
+            .cmp(&left.created_at)
             .then_with(|| left.id.cmp(&right.id)),
         ObjectiveQuerySort::Title => left
             .title
@@ -1444,8 +1574,16 @@ fn objective_item_after_cursor(
 ) -> bool {
     let key = objective_sort_key(item, sort);
     match sort {
-        ObjectiveQuerySort::UpdatedDesc => {
+        ObjectiveQuerySort::UpdatedDesc | ObjectiveQuerySort::CreatedDesc => {
             key < cursor.0 || (key == cursor.0 && item.id > cursor.1)
+        }
+        ObjectiveQuerySort::Relevance => {
+            let (rank, updated) = key.split_once('|').unwrap_or(("9", ""));
+            let (cursor_rank, cursor_updated) = cursor.0.split_once('|').unwrap_or(("9", ""));
+            rank > cursor_rank
+                || (rank == cursor_rank
+                    && (updated < cursor_updated
+                        || (updated == cursor_updated && item.id > cursor.1)))
         }
         ObjectiveQuerySort::Title => key > cursor.0 || (key == cursor.0 && item.id > cursor.1),
     }
@@ -1696,9 +1834,10 @@ mod tests {
         assert_eq!(ticket.event_page.returned, ticket.events.len());
         let ticket_query = authority
             .query_tickets(TicketQueryRequest {
-                text: Some("Ticket body".to_string()),
+                query: Some("Ticket body".to_string()),
                 states: vec!["ready".to_string()],
                 linked_objective_id: Some("00000000001J3".to_string()),
+                attention: vec!["unblocked".to_string(), "missing_commit".to_string()],
                 limit: Some(1),
                 ..TicketQueryRequest::default()
             })
@@ -1740,9 +1879,11 @@ mod tests {
         let objective = authority.objective("00000000001J3").unwrap();
         assert!(objective.body.contains("Objective body"));
         assert!(!objective.revision.is_empty());
+        assert_eq!(objective.linked_ticket_summaries[0].id, "00000000001J2");
+        assert_eq!(objective.linked_ticket_summaries[0].state, "ready");
         let objective_query = authority
             .query_objectives(ObjectiveQueryRequest {
-                text: Some("Control plane".to_string()),
+                query: Some("Control plane".to_string()),
                 linked_ticket_id: Some("00000000001J2".to_string()),
                 limit: Some(1),
                 ..ObjectiveQueryRequest::default()

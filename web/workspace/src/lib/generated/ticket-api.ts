@@ -61,6 +61,12 @@ export type TicketEvidenceEvent = {
   excerpt: string;
 };
 
+export type TicketAssignmentSummary = {
+  assignment_id: string;
+  runtime_id: string;
+  worker_id: string;
+};
+
 export type TicketMergeRequestSummary = {
   merge_request_id: string;
   state: string;
@@ -87,7 +93,7 @@ export type TicketEvidenceSummary = {
 };
 
 export type TicketQueryRequest = {
-  text: string | null;
+  query: string | null;
   states: Array<string>;
   event_kinds: Array<string>;
   evidence: Array<string>;
@@ -107,8 +113,11 @@ export type TicketQueryItem = {
   id: string;
   title: string;
   state: string;
+  readiness: string | null;
   priority: string;
+  created_at: string | null;
   updated_at: string | null;
+  item_revision: string;
   workspace_action_priority: string;
   matched_fields: Array<string>;
   snippet: string | null;
@@ -116,6 +125,8 @@ export type TicketQueryItem = {
   linked_objective_ids: Array<string>;
   relation_count: number;
   blocker_count: number;
+  unresolved_blocker_count: number;
+  unresolved_review_count: number;
   evidence: TicketEvidenceSummary;
   merge_request: TicketMergeRequestSummary | null;
 };
@@ -174,6 +185,7 @@ export type TicketDetail = {
   id: string;
   title: string;
   state: string;
+  readiness: string | null;
   priority: string;
   created_at: string | null;
   updated_at: string | null;
@@ -194,6 +206,7 @@ export type TicketDetail = {
   relations: TicketRelationView;
   linked_objectives: Array<ObjectiveLinkSummary>;
   implementation_reports: Array<TicketEvidenceEvent>;
+  current_assignment: TicketAssignmentSummary | null;
   merge_request: TicketMergeRequestSummary | null;
   evidence: TicketEvidenceSummary;
   resolution: string | null;

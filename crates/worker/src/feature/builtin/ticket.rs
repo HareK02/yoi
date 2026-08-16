@@ -70,32 +70,102 @@ impl WorkspaceTicketReadKind {
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum WorkspaceTicketStateFilter {
+    Planning,
+    Ready,
+    Queued,
+    Inprogress,
+    Done,
+    Closed,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum WorkspaceTicketEvidenceFilter {
+    ImplementationReport,
+    ImplementationReportAfterRescope,
+    MergeRequest,
+    Commit,
+    ApprovedReview,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum WorkspaceTicketReviewFilter {
+    None,
+    Pending,
+    Approved,
+    RequestChanges,
+    UnresolvedChanges,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum WorkspaceTicketAttentionFilter {
+    DoneNotClosed,
+    ImplementationReportNotClosed,
+    ReportAfterRescope,
+    UnresolvedReview,
+    MissingCommit,
+    Blocked,
+    Unblocked,
+    Ready,
+    AwaitingReview,
+    UnresolvedChanges,
+    StaleAfterRescope,
+    MissingEvidence,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum WorkspaceTicketRelationFilter {
+    DependsOn,
+    Blocks,
+    Related,
+    Supersedes,
+    DuplicateOf,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum WorkspaceTicketSort {
+    Relevance,
+    UpdatedDesc,
+    CreatedDesc,
+    Priority,
+    Title,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 struct WorkspaceQueryTicketInput {
     /// Full-text match over Ticket title, item body, and bounded thread excerpts.
-    text: Option<String>,
+    query: Option<String>,
     /// Exact workflow states. Empty means every state.
     #[serde(default)]
-    states: Vec<String>,
+    states: Vec<WorkspaceTicketStateFilter>,
     /// Exact typed event kinds that must occur in the bounded thread window.
     #[serde(default)]
     event_kinds: Vec<String>,
     /// Required evidence kinds: implementation_report, implementation_report_after_rescope,
     /// merge_request, commit, or approved_review.
     #[serde(default)]
-    evidence: Vec<String>,
-    /// Current authoritative Merge Request review status.
-    review_status: Option<String>,
-    /// Attention filters: blocked, ready, awaiting_review, unresolved_changes,
-    /// stale_after_rescope, or missing_evidence.
+    evidence: Vec<WorkspaceTicketEvidenceFilter>,
+    /// Current authoritative Merge Request review status: none, pending, approved,
+    /// request_changes, or unresolved_changes.
+    review_status: Option<WorkspaceTicketReviewFilter>,
+    /// Attention filters include done_not_closed, implementation_report_not_closed,
+    /// report_after_rescope, unresolved_review, missing_commit, blocked, and unblocked.
     #[serde(default)]
-    attention: Vec<String>,
+    attention: Vec<WorkspaceTicketAttentionFilter>,
     related_ticket_id: Option<String>,
-    relation_kind: Option<String>,
+    relation_kind: Option<WorkspaceTicketRelationFilter>,
     linked_objective_id: Option<String>,
     updated_after: Option<String>,
     updated_before: Option<String>,
-    /// updated_desc (default), priority, or title.
-    sort: Option<String>,
+    /// relevance (default when query is present), updated_desc, created_desc,
+    /// priority, or title.
+    sort: Option<WorkspaceTicketSort>,
     /// Page size; bounded by the Backend to 1..=100.
     limit: Option<usize>,
     /// Opaque cursor returned by a prior QueryTicket page.
@@ -306,14 +376,7 @@ impl TicketFeatureAccess {
     }
 }
 
-const READ_ONLY_TOOL_NAMES: &[&str] = &[
-    "QueryTicket",
-    "ShowTicket",
-    "TicketDependencyCheck",
-    "TicketDoctor",
-    "TicketRelationQuery",
-    "TicketOrchestrationPlanQuery",
-];
+const READ_ONLY_TOOL_NAMES: &[&str] = &["QueryTicket", "ShowTicket"];
 
 const AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketCreate",
@@ -337,12 +400,8 @@ const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketComment",
     "TicketQueue",
     "TicketClose",
-    "TicketDependencyCheck",
-    "TicketDoctor",
     "TicketRelationRecord",
     "TicketRelationRemove",
-    "TicketRelationQuery",
-    "TicketOrchestrationPlanQuery",
 ];
 
 #[cfg(test)]
@@ -353,10 +412,8 @@ const WORKFLOW_TOOL_NAMES: &[&str] = &[
     "TicketWorkflowState",
     "TicketClose",
     "TicketDependencyCheck",
-    "TicketDoctor",
     "TicketRelationRecord",
     "TicketRelationRemove",
-    "TicketRelationQuery",
     "TicketOrchestrationPlanRecord",
     "TicketOrchestrationPlanQuery",
 ];
@@ -364,9 +421,11 @@ const WORKFLOW_TOOL_NAMES: &[&str] = &[
 const WORKFLOW_ADDITIONAL_TOOL_NAMES: &[&str] = &[
     "TicketWorkflowState",
     "TicketClose",
+    "TicketDependencyCheck",
     "TicketRelationRecord",
     "TicketRelationRemove",
     "TicketOrchestrationPlanRecord",
+    "TicketOrchestrationPlanQuery",
 ];
 
 #[derive(Clone, Debug)]
@@ -1232,10 +1291,30 @@ mod tests {
         assert!(query.input_schema["properties"]["evidence"].is_object());
         assert!(query.input_schema["properties"]["attention"].is_object());
         assert!(query.input_schema["properties"]["cursor"].is_object());
+        let query_schema = serde_json::to_string(&query.input_schema).unwrap();
+        assert!(query_schema.contains("done_not_closed"));
+        assert!(query_schema.contains("request_changes"));
+        assert!(query_schema.contains("created_desc"));
+        assert!(
+            query_schema.len() < 8_000,
+            "QueryTicket schema grew unexpectedly"
+        );
         let (show, _) = workspace_ticket_read_definition(client, WorkspaceTicketReadKind::Show)();
         assert_eq!(show.name, "ShowTicket");
         assert!(show.input_schema["properties"]["event_limit"].is_object());
         let tool_names = TicketFeatureAccess::workspace_authoring().tool_names();
+        assert_eq!(tool_names.len(), 9);
+        assert!(
+            tool_names.len() < 13,
+            "authoring catalog must stay below the prior broad catalog"
+        );
+        let workflow_names = TicketFeatureAccess::workflow().tool_names();
+        assert_eq!(workflow_names.len(), 10);
+        assert!(
+            workflow_names.len() < 12,
+            "workflow catalog must stay below the prior broad catalog"
+        );
+        assert_eq!(TicketFeatureAccess::review().tool_names().len(), 2);
         assert!(tool_names.contains(&"QueryTicket"));
         assert!(tool_names.contains(&"ShowTicket"));
         assert!(!tool_names.contains(&"TicketList"));

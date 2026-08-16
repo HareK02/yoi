@@ -17799,7 +17799,7 @@ mod tests {
             "POST",
             &format!("/api/w/{TEST_WORKSPACE_ID}/objectives/query"),
             Some(json!({
-                "text": "Objective body",
+                "query": "Objective body",
                 "linked_ticket_id": "00000000001J2",
                 "limit": 1
             })),

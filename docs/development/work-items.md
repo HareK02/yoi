@@ -41,8 +41,8 @@ Workers with the Ticket built-in feature can use typed Ticket tools:
 - `MergeRequestReviewSubmit` — available only inside the attested direct-child Reviewer attempt; attempt/revision capability material is not model input.
 - `TicketClose`
 - `TicketRelationRecord`
-- `TicketRelationQuery`
-- `TicketDoctor`
+
+Profile-visible Ticket catalogs are intentionally smaller than the former broad read catalog: Workspace authoring exposes 9 tools instead of 13, workflow exposes 10 instead of 12, and review exposes only `QueryTicket` plus `ShowTicket` (2 instead of 6). The `QueryTicket` schema is regression-guarded below 8 KiB while consolidating relation/evidence/attention discovery; diagnostics are not projected into normal profiles, while specialized orchestration-plan commands remain visible only to workflow roles that need their distinct semantics.
 
 These tools operate through the typed Ticket backend. They are not arbitrary filesystem write permission to `.yoi/tickets/`.
 

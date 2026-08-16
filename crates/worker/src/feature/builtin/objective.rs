@@ -422,12 +422,12 @@ fn list_schema() -> serde_json::Value {
         "type":"object",
         "additionalProperties": false,
         "properties":{
-            "text":{"type":["string","null"]},
+            "query":{"type":["string","null"]},
             "states":{"type":"array","items":{"type":"string"},"default":[]},
             "linked_ticket_id":{"type":["string","null"]},
             "updated_after":{"type":["string","null"]},
             "updated_before":{"type":["string","null"]},
-            "sort":{"type":["string","null"],"enum":["updated_desc","title",null]},
+            "sort":{"type":["string","null"],"enum":["relevance","updated_desc","created_desc","title",null]},
             "limit":{"type":["integer","null"],"minimum":1,"maximum":100},
             "cursor":{"type":["string","null"]}
         }
@@ -510,7 +510,7 @@ fn id_ticket_schema(required: &[&str]) -> serde_json::Value {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct QueryObjectiveInput {
-    text: Option<String>,
+    query: Option<String>,
     #[serde(default)]
     states: Vec<String>,
     linked_ticket_id: Option<String>,

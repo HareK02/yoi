@@ -49,6 +49,7 @@ pub struct TicketDetail {
     pub id: String,
     pub title: String,
     pub state: String,
+    pub readiness: Option<String>,
     pub priority: String,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
@@ -69,6 +70,7 @@ pub struct TicketDetail {
     pub relations: TicketRelationView,
     pub linked_objectives: Vec<ObjectiveLinkSummary>,
     pub implementation_reports: Vec<TicketEvidenceEvent>,
+    pub current_assignment: Option<TicketAssignmentSummary>,
     pub merge_request: Option<TicketMergeRequestSummary>,
     pub evidence: TicketEvidenceSummary,
     pub resolution: Option<String>,
@@ -227,6 +229,14 @@ pub struct TicketEvidenceEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct TicketAssignmentSummary {
+    pub assignment_id: String,
+    pub runtime_id: String,
+    pub worker_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketMergeRequestSummary {
     pub merge_request_id: String,
     pub state: String,
@@ -257,7 +267,7 @@ pub struct TicketEvidenceSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketQueryRequest {
-    pub text: Option<String>,
+    pub query: Option<String>,
     #[serde(default)]
     pub states: Vec<String>,
     #[serde(default)]
@@ -283,8 +293,11 @@ pub struct TicketQueryItem {
     pub id: String,
     pub title: String,
     pub state: String,
+    pub readiness: Option<String>,
     pub priority: String,
+    pub created_at: Option<String>,
     pub updated_at: Option<String>,
+    pub item_revision: String,
     pub workspace_action_priority: String,
     pub matched_fields: Vec<String>,
     pub snippet: Option<String>,
@@ -292,6 +305,8 @@ pub struct TicketQueryItem {
     pub linked_objective_ids: Vec<String>,
     pub relation_count: usize,
     pub blocker_count: usize,
+    pub unresolved_blocker_count: usize,
+    pub unresolved_review_count: usize,
     pub evidence: TicketEvidenceSummary,
     pub merge_request: Option<TicketMergeRequestSummary>,
 }
@@ -313,7 +328,7 @@ pub struct TicketShowRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ObjectiveQueryRequest {
-    pub text: Option<String>,
+    pub query: Option<String>,
     #[serde(default)]
     pub states: Vec<String>,
     pub linked_ticket_id: Option<String>,
@@ -329,6 +344,7 @@ pub struct ObjectiveQueryItem {
     pub id: String,
     pub title: String,
     pub state: String,
+    pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub matched_fields: Vec<String>,
     pub snippet: Option<String>,
@@ -359,10 +375,18 @@ pub struct ObjectiveEventDetail {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectiveLinkedTicketSummary {
+    pub id: String,
+    pub title: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObjectiveSummary {
     pub id: String,
     pub title: String,
     pub state: String,
+    pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub summary: String,
     pub linked_tickets: Vec<String>,
@@ -378,6 +402,7 @@ pub struct ObjectiveDetail {
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub linked_tickets: Vec<String>,
+    pub linked_ticket_summaries: Vec<ObjectiveLinkedTicketSummary>,
     pub resources: Vec<ObjectiveResourceSummary>,
     pub body: String,
     pub body_truncated: bool,
@@ -407,6 +432,7 @@ pub fn ticket_api_typescript() -> String {
         TicketEventDetail::decl(&config),
         ObjectiveLinkSummary::decl(&config),
         TicketEvidenceEvent::decl(&config),
+        TicketAssignmentSummary::decl(&config),
         TicketMergeRequestSummary::decl(&config),
         TicketEvidenceSummary::decl(&config),
         TicketQueryRequest::decl(&config),
