@@ -70,6 +70,7 @@ impl ComposerHistoryStore {
         let workspace = workspace_identity(workspace_root);
         let path = data_dir
             .as_ref()
+            .join("client")
             .join("composer-history")
             .join("workspaces")
             .join(format!("{}-{}", workspace.label, workspace.key))
@@ -186,7 +187,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn store_path_is_workspace_scoped_under_data_dir() {
+    fn store_path_is_workspace_scoped_under_client_data_dir() {
         let data_dir = TempDir::new().unwrap();
         let store = ComposerHistoryStore::for_data_dir(data_dir.path(), Path::new("/repo/yoi"));
         let other = ComposerHistoryStore::for_data_dir(data_dir.path(), Path::new("/repo/other"));
@@ -196,9 +197,41 @@ mod tests {
             store
                 .path()
                 .to_string_lossy()
-                .contains("composer-history/workspaces/yoi-")
+                .contains("client/composer-history/workspaces/yoi-")
         );
         assert_ne!(store.path(), other.path());
+    }
+
+    #[test]
+    fn legacy_top_level_history_is_ignored_without_migration_or_fallback() {
+        let data_dir = TempDir::new().unwrap();
+        let workspace_root = Path::new("/repo/yoi");
+        let workspace = workspace_identity(workspace_root);
+        let legacy_path = data_dir
+            .path()
+            .join("composer-history")
+            .join("workspaces")
+            .join(format!("{}-{}", workspace.label, workspace.key))
+            .join("history.json");
+        let legacy_file = ComposerHistoryFile {
+            version: COMPOSER_HISTORY_VERSION,
+            workspace,
+            entries: vec![vec![Segment::text("legacy entry")]],
+        };
+        let legacy_bytes = serde_json::to_vec_pretty(&legacy_file).unwrap();
+        fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        fs::write(&legacy_path, &legacy_bytes).unwrap();
+
+        let store = ComposerHistoryStore::for_data_dir(data_dir.path(), workspace_root);
+        assert!(store.load().unwrap().is_empty());
+        assert!(!store.path().exists());
+        assert_eq!(fs::read(&legacy_path).unwrap(), legacy_bytes);
+
+        let current_entries = VecDeque::from([vec![Segment::text("current entry")]]);
+        store.save(&current_entries).unwrap();
+
+        assert_eq!(store.load().unwrap(), current_entries);
+        assert_eq!(fs::read(&legacy_path).unwrap(), legacy_bytes);
     }
 
     #[test]

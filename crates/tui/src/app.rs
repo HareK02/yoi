@@ -2645,7 +2645,14 @@ mod composer_history_persistence_tests {
         let mut app = App::new_with_input_history_store("test".into(), store);
         submit_text(&mut app, "synthetic entry outside workspace yoi");
 
-        assert!(data_dir.path().join("composer-history").exists());
+        assert!(
+            data_dir
+                .path()
+                .join("client")
+                .join("composer-history")
+                .exists()
+        );
+        assert!(!data_dir.path().join("composer-history").exists());
         assert!(!workspace.path().join(".yoi").exists());
     }
 
