@@ -30,12 +30,224 @@ pub const WORKER_LIFECYCLE_SERVICE_ID: &str = "worker.lifecycle";
 pub const WORKER_CONTROL_SERVICE_ID: &str = "worker.control";
 const WORKER_LIFECYCLE_SERVICE_VERSION: &str = "1";
 
-pub trait WorkerControlService: Send + Sync {}
+#[async_trait]
+pub trait WorkerControlService: Send + Sync {
+    fn workspace_id(&self) -> &str;
+    fn known_subworkers(&self) -> Vec<serde_json::Value>;
+    async fn send_subworker(
+        &self,
+        name: &str,
+        content: String,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError>;
+    async fn stop_subworker(&self, name: &str) -> Result<WorkspaceResponse, WorkspaceClientError>;
+    async fn spawn_worker(
+        &self,
+        request: WorkerLifecycleSpawnRequest,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError>;
+    fn remove_runtime_worker(
+        &self,
+        runtime_id: &str,
+        worker_id: &str,
+        expected_worker_revision: &str,
+        reason: &str,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError>;
+    async fn execute_runtime(
+        &self,
+        request: WorkspaceRequest,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError>;
+    async fn ensure_permission(
+        &self,
+        subject: &super::worker_observation::WorkerObservationSubjectRef,
+        permission: &str,
+    ) -> Result<(), WorkspaceClientError>;
+}
 
-#[derive(Debug)]
-struct WorkspaceWorkerControlService;
+struct WorkspaceWorkerControlService {
+    client: Arc<dyn WorkspaceClient>,
+    workspace_id: String,
+    registry: Option<Arc<SpawnedWorkerRegistry>>,
+}
 
-impl WorkerControlService for WorkspaceWorkerControlService {}
+impl std::fmt::Debug for WorkspaceWorkerControlService {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkspaceWorkerControlService")
+            .field("workspace_id", &self.workspace_id)
+            .field("has_subworker_registry", &self.registry.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl WorkerControlService for WorkspaceWorkerControlService {
+    fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+
+    fn known_subworkers(&self) -> Vec<serde_json::Value> {
+        self.registry
+            .as_ref()
+            .map(|registry| {
+                registry
+                    .list_internal()
+                    .into_iter()
+                    .map(|internal| {
+                        serde_json::json!({
+                            "subject": { "kind": "sub_worker", "name": internal.worker_name },
+                            "relation": "direct_child",
+                            "origin": "sub_worker_spawn",
+                            "permissions": ["send_input", "stop", "observe"],
+                            "summary": {
+                                "display_name": internal.worker_name,
+                                "status": format!("{:?}", internal.session.status()).to_lowercase(),
+                            }
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    async fn send_subworker(
+        &self,
+        name: &str,
+        content: String,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        let record = self
+            .registry
+            .as_ref()
+            .and_then(|registry| registry.get_internal(name))
+            .ok_or_else(|| {
+                WorkspaceClientError::Request(
+                    "unknown Worker or permission not granted".to_string(),
+                )
+            })?;
+        record
+            .session
+            .send(content)
+            .await
+            .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
+        Ok(WorkspaceResponse {
+            status: 200,
+            body: serde_json::json!({ "subject": { "kind": "sub_worker", "name": name } })
+                .to_string(),
+        })
+    }
+
+    async fn stop_subworker(&self, name: &str) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        let registry = self.registry.as_ref().ok_or_else(|| {
+            WorkspaceClientError::Request("unknown Worker or permission not granted".to_string())
+        })?;
+        registry
+            .remove_internal(name)
+            .await
+            .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
+        Ok(WorkspaceResponse {
+            status: 200,
+            body: serde_json::json!({ "subject": { "kind": "sub_worker", "name": name } })
+                .to_string(),
+        })
+    }
+
+    async fn spawn_worker(
+        &self,
+        request: WorkerLifecycleSpawnRequest,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        WorkspaceWorkerLifecycleService {
+            client: self.client.clone(),
+            workspace_id: self.workspace_id.clone(),
+        }
+        .spawn(request)
+        .await
+    }
+
+    fn remove_runtime_worker(
+        &self,
+        runtime_id: &str,
+        worker_id: &str,
+        expected_worker_revision: &str,
+        reason: &str,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        self.client
+            .execute_worker_remove(runtime_id, worker_id, expected_worker_revision, reason)
+    }
+
+    async fn execute_runtime(
+        &self,
+        request: WorkspaceRequest,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        self.client.execute(request)
+    }
+
+    async fn ensure_permission(
+        &self,
+        subject: &super::worker_observation::WorkerObservationSubjectRef,
+        permission: &str,
+    ) -> Result<(), WorkspaceClientError> {
+        match subject {
+            super::worker_observation::WorkerObservationSubjectRef::SubWorker { name } => {
+                let known = self
+                    .registry
+                    .as_ref()
+                    .and_then(|registry| registry.get_internal(name))
+                    .is_some();
+                if known && matches!(permission, "send_input" | "stop" | "observe") {
+                    Ok(())
+                } else {
+                    Err(WorkspaceClientError::Request(
+                        "unknown Worker or permission not granted".to_string(),
+                    ))
+                }
+            }
+            super::worker_observation::WorkerObservationSubjectRef::RuntimeWorker {
+                runtime_id,
+                worker_id,
+            } => {
+                let response = self.client.execute(WorkspaceRequest::get(format!(
+                    "/api/w/{}/worker-control/workers",
+                    self.workspace_id
+                )))?;
+                if !response.is_success() {
+                    return Err(WorkspaceClientError::Request(format!(
+                        "Workspace control request returned {}: {}",
+                        response.status, response.body
+                    )));
+                }
+                let body: serde_json::Value =
+                    serde_json::from_str(&response.body).map_err(|error| {
+                        WorkspaceClientError::Request(format!(
+                            "invalid Workspace control response: {error}"
+                        ))
+                    })?;
+                let granted = body
+                    .get("items")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .any(|item| {
+                        item.get("subject")
+                            .and_then(|value| value.get("runtime_id"))
+                            == Some(&serde_json::Value::String(runtime_id.clone()))
+                            && item.get("subject").and_then(|value| value.get("worker_id"))
+                                == Some(&serde_json::Value::String(worker_id.clone()))
+                            && item
+                                .get("permissions")
+                                .and_then(serde_json::Value::as_array)
+                                .is_some_and(|permissions| {
+                                    permissions.iter().any(|candidate| candidate == permission)
+                                })
+                    });
+                if granted {
+                    Ok(())
+                } else {
+                    Err(WorkspaceClientError::Request(
+                        "unknown Worker or permission not granted".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+}
 
 #[async_trait]
 pub trait WorkerLifecycleService: Send + Sync {
@@ -108,7 +320,7 @@ impl WorkerLifecycleService for WorkspaceWorkerLifecycleService {
 #[derive(Clone)]
 pub struct ManageWorkerFeature {
     client: Arc<dyn WorkspaceClient>,
-    registry: Option<Arc<SpawnedWorkerRegistry>>,
+    control: Arc<dyn WorkerControlService>,
     direct_spawn: bool,
 }
 
@@ -116,7 +328,10 @@ impl std::fmt::Debug for ManageWorkerFeature {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ManageWorkerFeature")
-            .field("has_registry", &self.registry.is_some())
+            .field(
+                "has_subworker_registry",
+                &!self.control.known_subworkers().is_empty(),
+            )
             .field("direct_spawn", &self.direct_spawn)
             .finish_non_exhaustive()
     }
@@ -127,9 +342,15 @@ pub fn manage_worker_feature(
     registry: Option<Arc<SpawnedWorkerRegistry>>,
     direct_spawn: bool,
 ) -> ManageWorkerFeature {
+    let workspace_id = client.workspace_id().unwrap_or_default().to_string();
+    let control: Arc<dyn WorkerControlService> = Arc::new(WorkspaceWorkerControlService {
+        client: client.clone(),
+        workspace_id,
+        registry,
+    });
     ManageWorkerFeature {
         client,
-        registry,
+        control,
         direct_spawn,
     }
 }
@@ -189,57 +410,37 @@ impl FeatureModule for ManageWorkerFeature {
                 WORKER_LIFECYCLE_SERVICE_VERSION,
                 "Known-Worker discovery and permission-fenced control operations",
             ),
-            Arc::new(WorkspaceWorkerControlService) as Arc<dyn WorkerControlService>,
+            self.control.clone(),
         )?;
         for operation in WorkerOperation::ALL {
             if operation == WorkerOperation::Spawn && !self.direct_spawn {
                 continue;
             }
             let definition = match operation {
-                WorkerOperation::List => definition::<WorkerListInput>(
-                    operation,
-                    self.client.clone(),
-                    workspace_id.clone(),
-                    self.registry.clone(),
-                ),
-                WorkerOperation::Spawn => definition::<WorkerSpawnInput>(
-                    operation,
-                    self.client.clone(),
-                    workspace_id.clone(),
-                    self.registry.clone(),
-                ),
-                WorkerOperation::SendInput | WorkerOperation::Notify => {
-                    definition::<WorkerMessageInput>(
-                        operation,
-                        self.client.clone(),
-                        workspace_id.clone(),
-                        self.registry.clone(),
-                    )
+                WorkerOperation::List => {
+                    definition::<WorkerListInput>(operation, self.control.clone())
                 }
-                WorkerOperation::Cancel => definition::<WorkerStopInput>(
-                    operation,
-                    self.client.clone(),
-                    workspace_id.clone(),
-                    self.registry.clone(),
-                ),
-                WorkerOperation::Stop => definition::<WorkerStopInput>(
-                    operation,
-                    self.client.clone(),
-                    workspace_id.clone(),
-                    self.registry.clone(),
-                ),
-                WorkerOperation::Restore => definition::<WorkerTargetInput>(
-                    operation,
-                    self.client.clone(),
-                    workspace_id.clone(),
-                    self.registry.clone(),
-                ),
-                WorkerOperation::Remove => definition::<WorkerRemoveInput>(
-                    operation,
-                    self.client.clone(),
-                    workspace_id.clone(),
-                    self.registry.clone(),
-                ),
+                WorkerOperation::Spawn => {
+                    definition::<WorkerSpawnInput>(operation, self.control.clone())
+                }
+                WorkerOperation::SendInput | WorkerOperation::Notify => {
+                    definition::<WorkerMessageInput>(operation, self.control.clone())
+                }
+                WorkerOperation::Cancel | WorkerOperation::Stop => {
+                    definition::<WorkerStopInput>(operation, self.control.clone())
+                }
+                WorkerOperation::Restore => {
+                    definition::<WorkerTargetInput>(operation, self.control.clone())
+                }
+                WorkerOperation::Remove => {
+                    definition::<WorkerRemoveInput>(operation, self.control.clone())
+                }
+                WorkerOperation::Share | WorkerOperation::Transfer => {
+                    definition::<WorkerDelegateInput>(operation, self.control.clone())
+                }
+                WorkerOperation::Revoke => {
+                    definition::<WorkerRevokeInput>(operation, self.control.clone())
+                }
             };
             context
                 .tools()
@@ -298,26 +499,35 @@ struct WorkerWorkingDirectorySelection {
     relative_cwd: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum WorkerSubjectInput {
+    RuntimeWorker {
+        runtime_id: String,
+        worker_id: String,
+    },
+    SubWorker {
+        name: String,
+    },
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct WorkerTargetInput {
-    runtime_id: String,
-    worker_id: String,
+    subject: WorkerSubjectInput,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct WorkerMessageInput {
-    runtime_id: String,
-    worker_id: String,
+    subject: WorkerSubjectInput,
     content: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct WorkerStopInput {
-    runtime_id: String,
-    worker_id: String,
+    subject: WorkerSubjectInput,
     #[serde(default)]
     reason: Option<String>,
 }
@@ -325,17 +535,27 @@ struct WorkerStopInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct WorkerRemoveInput {
-    runtime_id: String,
-    worker_id: String,
+    subject: WorkerSubjectInput,
     expected_worker_revision: String,
     reason: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WorkerRevokeInput {
+    grant_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WorkerDelegateInput {
+    grant_id: String,
+    target_controller: WorkerSubjectInput,
+}
+
 struct WorkspaceWorkerTool {
     operation: WorkerOperation,
-    client: Arc<dyn WorkspaceClient>,
-    workspace_id: String,
-    registry: Option<Arc<SpawnedWorkerRegistry>>,
+    control: Arc<dyn WorkerControlService>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,10 +568,13 @@ enum WorkerOperation {
     Stop,
     Restore,
     Remove,
+    Share,
+    Transfer,
+    Revoke,
 }
 
 impl WorkerOperation {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 11] = [
         Self::List,
         Self::Spawn,
         Self::SendInput,
@@ -360,6 +583,9 @@ impl WorkerOperation {
         Self::Stop,
         Self::Restore,
         Self::Remove,
+        Self::Share,
+        Self::Transfer,
+        Self::Revoke,
     ];
 
     fn tool_name(self) -> &'static str {
@@ -372,6 +598,9 @@ impl WorkerOperation {
             Self::Stop => "WorkerStop",
             Self::Restore => "WorkerRestore",
             Self::Remove => "WorkerRemove",
+            Self::Share => "WorkerShare",
+            Self::Transfer => "WorkerTransfer",
+            Self::Revoke => "WorkerRevoke",
         }
     }
 
@@ -393,6 +622,11 @@ impl WorkerOperation {
             Self::Remove => {
                 "Remove an eligible stopped, unassigned, non-internal Worker. Supply the current Worker revision and a bounded reason; Backend validation and retention are authoritative."
             }
+            Self::Share => "Share one controlled Runtime Worker with another known Runtime Worker.",
+            Self::Transfer => {
+                "Transfer one controlled Runtime Worker to another known Runtime Worker."
+            }
+            Self::Revoke => "Revoke one durable Runtime Worker control grant owned by this Worker.",
         }
     }
 }
@@ -405,10 +639,142 @@ impl Tool for WorkspaceWorkerTool {
         ctx: ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let response = match self.operation {
+            WorkerOperation::List => {
+                parse::<WorkerListInput>(input_json, "WorkerList")?;
+                let response = self
+                    .control
+                    .execute_runtime(WorkspaceRequest::get(format!(
+                        "/api/w/{}/worker-control/workers",
+                        self.control.workspace_id()
+                    )))
+                    .await
+                    .map_err(control_tool_error)?;
+                self.with_subworkers(response)?
+            }
+            WorkerOperation::Spawn => {
+                let input = parse::<WorkerSpawnInput>(input_json, "WorkerSpawn")?;
+                let ticket_id = input
+                    .ticket_id
+                    .map(|ticket_id| authority_id(&ticket_id, "ticket_id"))
+                    .transpose()?;
+                let operation_id = ticket_id
+                    .as_ref()
+                    .map(|ticket_id| {
+                        let call_id = non_empty(ctx.call_id.clone(), "tool call_id")?;
+                        Ok::<_, ToolError>(format!("worker-spawn:{ticket_id}:{call_id}"))
+                    })
+                    .transpose()?;
+                self.control
+                    .spawn_worker(WorkerLifecycleSpawnRequest {
+                        runtime_id: authority_id(&input.runtime_id, "runtime_id")?,
+                        working_directory_id: authority_id(
+                            &input.working_directory_id,
+                            "working_directory_id",
+                        )?,
+                        relative_cwd: input
+                            .relative_cwd
+                            .map(|value| validate_relative_cwd(&value))
+                            .transpose()?,
+                        profile: non_empty(input.profile, "profile")?,
+                        ticket_id,
+                        operation_id,
+                        display_name: input
+                            .display_name
+                            .filter(|value| !value.trim().is_empty())
+                            .unwrap_or_else(|| "Workspace Worker".to_string()),
+                        initial_submit: input.initial_submit,
+                    })
+                    .await
+                    .map_err(control_tool_error)?
+            }
+            WorkerOperation::SendInput | WorkerOperation::Notify => {
+                let input = parse::<WorkerMessageInput>(input_json, self.operation.tool_name())?;
+                let content = non_empty(input.content, "content")?;
+                if content.len() > 16 * 1024 {
+                    return Err(ToolError::ExecutionFailed(
+                        "content must contain at most 16384 bytes".to_string(),
+                    ));
+                }
+                match input.subject {
+                    WorkerSubjectInput::SubWorker { name } => {
+                        if self.operation != WorkerOperation::SendInput {
+                            return Err(unsupported_subject(self.operation, "sub_worker"));
+                        }
+                        let subject = subworker_subject(&name)?;
+                        self.control
+                            .ensure_permission(&subject, "send_input")
+                            .await
+                            .map_err(control_tool_error)?;
+                        self.control
+                            .send_subworker(&name, content)
+                            .await
+                            .map_err(control_tool_error)?
+                    }
+                    subject @ WorkerSubjectInput::RuntimeWorker { .. } => {
+                        let (runtime_id, worker_id) =
+                            runtime_subject_ids(&subject, self.operation)?;
+                        self.control.execute_runtime(WorkspaceRequest::json(
+                            WorkspaceRequestMethod::Post,
+                            format!("/api/w/{}/worker-control/workers/{runtime_id}/{worker_id}/input", self.control.workspace_id()),
+                            serde_json::json!({
+                                "kind": if self.operation == WorkerOperation::Notify { "notify" } else { "user" },
+                                "content": content,
+                            }).to_string(),
+                        )).await.map_err(control_tool_error)?
+                    }
+                }
+            }
+            WorkerOperation::Cancel | WorkerOperation::Stop => {
+                let input = parse::<WorkerStopInput>(input_json, self.operation.tool_name())?;
+                match input.subject {
+                    WorkerSubjectInput::SubWorker { name } => {
+                        if self.operation != WorkerOperation::Stop {
+                            return Err(unsupported_subject(self.operation, "sub_worker"));
+                        }
+                        let subject = subworker_subject(&name)?;
+                        self.control
+                            .ensure_permission(&subject, "stop")
+                            .await
+                            .map_err(control_tool_error)?;
+                        self.control
+                            .stop_subworker(&name)
+                            .await
+                            .map_err(control_tool_error)?
+                    }
+                    subject @ WorkerSubjectInput::RuntimeWorker { .. } => {
+                        let (runtime_id, worker_id) =
+                            runtime_subject_ids(&subject, self.operation)?;
+                        let action = if self.operation == WorkerOperation::Cancel {
+                            "cancel"
+                        } else {
+                            "stop"
+                        };
+                        self.control.execute_runtime(WorkspaceRequest::json(
+                            WorkspaceRequestMethod::Post,
+                            format!("/api/w/{}/worker-control/workers/{runtime_id}/{worker_id}/{action}", self.control.workspace_id()),
+                            serde_json::json!({ "reason": input.reason }).to_string(),
+                        )).await.map_err(control_tool_error)?
+                    }
+                }
+            }
+            WorkerOperation::Restore => {
+                let input = parse::<WorkerTargetInput>(input_json, "WorkerRestore")?;
+                let (runtime_id, worker_id) = runtime_subject_ids(&input.subject, self.operation)?;
+                self.control
+                    .execute_runtime(WorkspaceRequest::json(
+                        WorkspaceRequestMethod::Post,
+                        format!(
+                            "/api/w/{}/worker-control/workers/{runtime_id}/{worker_id}/restore",
+                            self.control.workspace_id()
+                        ),
+                        "{}",
+                    ))
+                    .await
+                    .map_err(control_tool_error)?
+            }
             WorkerOperation::Remove => {
                 let input = parse::<WorkerRemoveInput>(input_json, "WorkerRemove")?;
-                let runtime_id = authority_id(&input.runtime_id, "runtime_id")?;
-                let worker_id = authority_id(&input.worker_id, "worker_id")?;
+                let (runtime_id, worker_id) = runtime_subject_ids(&input.subject, self.operation)?;
                 let expected_worker_revision =
                     non_empty(input.expected_worker_revision, "expected_worker_revision")?;
                 let reason = non_empty(input.reason, "reason")?;
@@ -417,153 +783,78 @@ impl Tool for WorkspaceWorkerTool {
                         "reason must contain at most 512 bytes".to_string(),
                     ));
                 }
-                self.client
-                    .execute_worker_remove(
+                self.control
+                    .remove_runtime_worker(
                         &runtime_id,
                         &worker_id,
                         &expected_worker_revision,
                         &reason,
                     )
-                    .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?
+                    .map_err(control_tool_error)?
             }
-            operation => {
-                let request = match operation {
-                    WorkerOperation::List => {
-                        parse::<WorkerListInput>(input_json, "WorkerList")?;
-                        WorkspaceRequest::get(format!(
-                            "/api/w/{}/worker-control/workers",
-                            self.workspace_id
-                        ))
-                    }
-                    WorkerOperation::SendInput | WorkerOperation::Notify => {
-                        let tool_name = operation.tool_name();
-                        let input = parse::<WorkerMessageInput>(input_json, tool_name)?;
-                        let runtime_id = authority_id(&input.runtime_id, "runtime_id")?;
-                        let worker_id = authority_id(&input.worker_id, "worker_id")?;
-                        let content = non_empty(input.content, "content")?;
-                        if content.len() > 16 * 1024 {
-                            return Err(ToolError::ExecutionFailed(
-                                "content must contain at most 16384 bytes".to_string(),
-                            ));
-                        }
-                        WorkspaceRequest::json(
-                            WorkspaceRequestMethod::Post,
-                            format!(
-                                "/api/w/{}/worker-control/workers/{runtime_id}/{worker_id}/input",
-                                self.workspace_id
-                            ),
-                            serde_json::json!({
-                                "kind": if operation == WorkerOperation::Notify { "notify" } else { "user" },
-                                "content": content,
-                            })
-                            .to_string(),
-                        )
-                    }
-                    WorkerOperation::Cancel => {
-                        let input = parse::<WorkerStopInput>(input_json, "WorkerCancel")?;
-                        let runtime_id = authority_id(&input.runtime_id, "runtime_id")?;
-                        let worker_id = authority_id(&input.worker_id, "worker_id")?;
-                        let reason = input.reason.unwrap_or_default();
-                        WorkspaceRequest::json(
-                            WorkspaceRequestMethod::Post,
-                            format!(
-                                "/api/w/{}/worker-control/workers/{runtime_id}/{worker_id}/cancel",
-                                self.workspace_id
-                            ),
-                            serde_json::json!({ "reason": reason }).to_string(),
-                        )
-                    }
-                    WorkerOperation::Spawn => {
-                        let input = parse::<WorkerSpawnInput>(input_json, "WorkerSpawn")?;
-                        let ticket_id = input
-                            .ticket_id
-                            .map(|ticket_id| authority_id(&ticket_id, "ticket_id"))
-                            .transpose()?;
-                        let operation_id = ticket_id
-                            .as_ref()
-                            .map(|ticket_id| {
-                                let call_id = non_empty(ctx.call_id.clone(), "tool call_id")?;
-                                Ok::<_, ToolError>(format!("worker-spawn:{ticket_id}:{call_id}"))
-                            })
-                            .transpose()?;
-                        let lifecycle = WorkspaceWorkerLifecycleService {
-                            client: self.client.clone(),
-                            workspace_id: self.workspace_id.clone(),
-                        };
-                        let response = lifecycle
-                            .spawn(WorkerLifecycleSpawnRequest {
-                                runtime_id: authority_id(&input.runtime_id, "runtime_id")?,
-                                working_directory_id: authority_id(
-                                    &input.working_directory_id,
-                                    "working_directory_id",
-                                )?,
-                                relative_cwd: input
-                                    .relative_cwd
-                                    .map(|value| validate_relative_cwd(&value))
-                                    .transpose()?,
-                                profile: non_empty(input.profile, "profile")?,
-                                ticket_id,
-                                operation_id,
-                                display_name: input
-                                    .display_name
-                                    .filter(|value| !value.trim().is_empty())
-                                    .unwrap_or_else(|| "Workspace Worker".to_string()),
-                                initial_submit: input.initial_submit,
-                            })
-                            .await
-                            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
-                        return tool_output(self.operation, response);
-                    }
-                    WorkerOperation::Stop => {
-                        let input = parse::<WorkerStopInput>(input_json, "WorkerStop")?;
-                        let runtime_id = authority_id(&input.runtime_id, "runtime_id")?;
-                        let worker_id = authority_id(&input.worker_id, "worker_id")?;
-                        WorkspaceRequest::json(
-                            WorkspaceRequestMethod::Post,
-                            format!(
-                                "/api/w/{}/worker-control/workers/{runtime_id}/{worker_id}/stop",
-                                self.workspace_id
-                            ),
-                            serde_json::json!({ "reason": input.reason }).to_string(),
-                        )
-                    }
-                    WorkerOperation::Restore => {
-                        let input = parse::<WorkerTargetInput>(input_json, "WorkerRestore")?;
-                        let runtime_id = authority_id(&input.runtime_id, "runtime_id")?;
-                        let worker_id = authority_id(&input.worker_id, "worker_id")?;
-                        WorkspaceRequest::json(
-                            WorkspaceRequestMethod::Post,
-                            format!(
-                                "/api/w/{}/worker-control/workers/{runtime_id}/{worker_id}/restore",
-                                self.workspace_id
-                            ),
-                            "{}",
-                        )
-                    }
-                    WorkerOperation::Remove => unreachable!("handled above"),
+            WorkerOperation::Share | WorkerOperation::Transfer => {
+                let input = parse::<WorkerDelegateInput>(input_json, self.operation.tool_name())?;
+                let grant_id = authority_id(&input.grant_id, "grant_id")?;
+                let (runtime_id, worker_id) =
+                    runtime_subject_ids(&input.target_controller, self.operation)?;
+                let operation_id = format!(
+                    "worker-control-{}:{}",
+                    if self.operation == WorkerOperation::Transfer {
+                        "transfer"
+                    } else {
+                        "share"
+                    },
+                    non_empty(ctx.call_id.clone(), "tool call_id")?
+                );
+                let action = if self.operation == WorkerOperation::Transfer {
+                    "transfer"
+                } else {
+                    "share"
                 };
-                self.client
-                    .execute(request)
-                    .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?
+                self.control
+                    .execute_runtime(WorkspaceRequest::json(
+                        WorkspaceRequestMethod::Post,
+                        format!(
+                            "/api/w/{}/worker-control/grants/{grant_id}/{action}",
+                            self.control.workspace_id()
+                        ),
+                        serde_json::json!({
+                            "target_controller": {
+                                "runtime_id": runtime_id,
+                                "worker_id": worker_id,
+                            },
+                            "operation_id": operation_id,
+                        })
+                        .to_string(),
+                    ))
+                    .await
+                    .map_err(control_tool_error)?
             }
-        };
-        let response = if self.operation == WorkerOperation::List {
-            self.with_subworkers(response).await?
-        } else {
-            response
+            WorkerOperation::Revoke => {
+                let input = parse::<WorkerRevokeInput>(input_json, "WorkerRevoke")?;
+                let grant_id = authority_id(&input.grant_id, "grant_id")?;
+                self.control
+                    .execute_runtime(WorkspaceRequest::json(
+                        WorkspaceRequestMethod::Post,
+                        format!(
+                            "/api/w/{}/worker-control/grants/{grant_id}/revoke",
+                            self.control.workspace_id()
+                        ),
+                        "{}",
+                    ))
+                    .await
+                    .map_err(control_tool_error)?
+            }
         };
         tool_output(self.operation, response)
     }
 }
 
 impl WorkspaceWorkerTool {
-    async fn with_subworkers(
+    fn with_subworkers(
         &self,
         mut response: WorkspaceResponse,
     ) -> Result<WorkspaceResponse, ToolError> {
-        let Some(registry) = &self.registry else {
-            return Ok(response);
-        };
         if !response.is_success() {
             return Ok(response);
         }
@@ -579,24 +870,49 @@ impl WorkspaceWorkerTool {
                     "WorkerList response did not contain an items array".to_string(),
                 )
             })?;
-        for internal in registry.list_internal() {
-            let child_name = internal.worker_name.clone();
-            items.push(serde_json::json!({
-                "subject": { "kind": "sub_worker", "name": child_name },
-                "relation": "direct_child",
-                "origin": "sub_worker_spawn",
-                "permissions": ["send_input", "stop", "observe"],
-                "summary": {
-                    "display_name": internal.worker_name,
-                    "status": format!("{:?}", internal.session.status()).to_lowercase(),
-                }
-            }));
-        }
+        items.extend(self.control.known_subworkers());
         response.body = serde_json::to_string(&body).map_err(|error| {
             ToolError::ExecutionFailed(format!("WorkerList could not encode its response: {error}"))
         })?;
         Ok(response)
     }
+}
+
+fn runtime_subject_ids(
+    subject: &WorkerSubjectInput,
+    operation: WorkerOperation,
+) -> Result<(String, String), ToolError> {
+    match subject {
+        WorkerSubjectInput::RuntimeWorker {
+            runtime_id,
+            worker_id,
+        } => Ok((
+            authority_id(runtime_id, "runtime_id")?,
+            authority_id(worker_id, "worker_id")?,
+        )),
+        WorkerSubjectInput::SubWorker { .. } => Err(unsupported_subject(operation, "sub_worker")),
+    }
+}
+
+fn subworker_subject(
+    name: &str,
+) -> Result<super::worker_observation::WorkerObservationSubjectRef, ToolError> {
+    Ok(
+        super::worker_observation::WorkerObservationSubjectRef::SubWorker {
+            name: authority_id(name, "name")?,
+        },
+    )
+}
+
+fn unsupported_subject(operation: WorkerOperation, kind: &str) -> ToolError {
+    ToolError::InvalidArgument(format!(
+        "{} does not support subject kind '{kind}'",
+        operation.tool_name()
+    ))
+}
+
+fn control_tool_error(error: WorkspaceClientError) -> ToolError {
+    ToolError::ExecutionFailed(error.to_string())
 }
 
 fn tool_output(
@@ -618,9 +934,7 @@ fn tool_output(
 
 fn definition<I: JsonSchema + 'static>(
     operation: WorkerOperation,
-    client: Arc<dyn WorkspaceClient>,
-    workspace_id: String,
-    registry: Option<Arc<SpawnedWorkerRegistry>>,
+    control: Arc<dyn WorkerControlService>,
 ) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(I);
@@ -630,9 +944,7 @@ fn definition<I: JsonSchema + 'static>(
             .input_schema(schema_value);
         let tool: Arc<dyn Tool> = Arc::new(WorkspaceWorkerTool {
             operation,
-            client: client.clone(),
-            workspace_id: workspace_id.clone(),
-            registry: registry.clone(),
+            control: control.clone(),
         });
         (meta, tool)
     })
@@ -733,14 +1045,20 @@ mod tests {
         }
     }
 
+    fn test_control(client: Arc<RecordingWorkspaceClient>) -> Arc<dyn WorkerControlService> {
+        Arc::new(WorkspaceWorkerControlService {
+            client,
+            workspace_id: "workspace%2Ftest".to_string(),
+            registry: None,
+        })
+    }
+
     #[tokio::test]
     async fn worker_spawn_forwards_typed_initial_submit_to_workspace_api() {
         let client = Arc::new(RecordingWorkspaceClient::default());
         let tool = WorkspaceWorkerTool {
             operation: WorkerOperation::Spawn,
-            client: client.clone(),
-            workspace_id: "workspace%2Ftest".to_string(),
-            registry: None,
+            control: test_control(client.clone()),
         };
         tool.execute(
             &serde_json::json!({
@@ -813,6 +1131,9 @@ mod tests {
                 "WorkerStop",
                 "WorkerRestore",
                 "WorkerRemove",
+                "WorkerShare",
+                "WorkerTransfer",
+                "WorkerRevoke",
             ]
         );
     }
@@ -869,8 +1190,11 @@ mod tests {
             (
                 WorkerOperation::SendInput,
                 serde_json::json!({
-                    "runtime_id": "runtime-1",
-                    "worker_id": "worker-7",
+                    "subject": {
+                        "kind": "runtime_worker",
+                        "runtime_id": "runtime-1",
+                        "worker_id": "worker-7",
+                    },
                     "content": "continue",
                 }),
                 "/input",
@@ -879,8 +1203,11 @@ mod tests {
             (
                 WorkerOperation::Notify,
                 serde_json::json!({
-                    "runtime_id": "runtime-1",
-                    "worker_id": "worker-7",
+                    "subject": {
+                        "kind": "runtime_worker",
+                        "runtime_id": "runtime-1",
+                        "worker_id": "worker-7",
+                    },
                     "content": "review ready",
                 }),
                 "/input",
@@ -889,8 +1216,11 @@ mod tests {
             (
                 WorkerOperation::Cancel,
                 serde_json::json!({
-                    "runtime_id": "runtime-1",
-                    "worker_id": "worker-7",
+                    "subject": {
+                        "kind": "runtime_worker",
+                        "runtime_id": "runtime-1",
+                        "worker_id": "worker-7",
+                    },
                     "reason": "superseded",
                 }),
                 "/cancel",
@@ -899,9 +1229,7 @@ mod tests {
         ] {
             WorkspaceWorkerTool {
                 operation,
-                client: client.clone(),
-                workspace_id: "workspace%2Ftest".to_string(),
-                registry: None,
+                control: test_control(client.clone()),
             }
             .execute(
                 &args.to_string(),
@@ -921,18 +1249,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_share_and_transfer_use_typed_runtime_subjects_and_operation_ids() {
+        let client = Arc::new(RecordingWorkspaceClient::default());
+        for (operation, action) in [
+            (WorkerOperation::Share, "share"),
+            (WorkerOperation::Transfer, "transfer"),
+        ] {
+            WorkspaceWorkerTool {
+                operation,
+                control: test_control(client.clone()),
+            }
+            .execute(
+                &serde_json::json!({
+                    "grant_id": "grant-1",
+                    "target_controller": {
+                        "kind": "runtime_worker",
+                        "runtime_id": "runtime-2",
+                        "worker_id": "worker-9",
+                    },
+                })
+                .to_string(),
+                ToolExecutionContext::new("call-delegate", "batch-delegate", 0),
+            )
+            .await
+            .unwrap();
+            let request = client.requests.lock().unwrap().last().cloned().unwrap();
+            assert!(request.path.ends_with(&format!("/grant-1/{action}")));
+            let body: serde_json::Value =
+                serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+            assert_eq!(body["target_controller"]["runtime_id"], "runtime-2");
+            assert!(
+                body["operation_id"]
+                    .as_str()
+                    .unwrap()
+                    .contains("call-delegate")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn worker_remove_forwards_only_target_revision_and_bounded_reason() {
         let client = Arc::new(RecordingWorkspaceClient::default());
         let tool = WorkspaceWorkerTool {
             operation: WorkerOperation::Remove,
-            client: client.clone(),
-            workspace_id: "workspace%2Ftest".to_string(),
-            registry: None,
+            control: test_control(client.clone()),
         };
         tool.execute(
             &serde_json::json!({
-                "runtime_id": "runtime-1",
-                "worker_id": "worker-7",
+                "subject": {
+                    "kind": "runtime_worker",
+                    "runtime_id": "runtime-1",
+                    "worker_id": "worker-7",
+                },
                 "expected_worker_revision": "2026-08-11T20:00:00Z",
                 "reason": "  retire completed Worker  "
             })
@@ -972,16 +1340,17 @@ mod tests {
         let client = Arc::new(RecordingWorkspaceClient::default());
         let tool = WorkspaceWorkerTool {
             operation: WorkerOperation::Remove,
-            client: client.clone(),
-            workspace_id: "workspace%2Ftest".to_string(),
-            registry: None,
+            control: test_control(client.clone()),
         };
         for reason in ["   ".to_string(), "x".repeat(513)] {
             let _error = tool
                 .execute(
                     &serde_json::json!({
-                        "runtime_id": "runtime-1",
-                        "worker_id": "worker-7",
+                        "subject": {
+                            "kind": "runtime_worker",
+                            "runtime_id": "runtime-1",
+                            "worker_id": "worker-7",
+                        },
                         "expected_worker_revision": "revision-1",
                         "reason": reason,
                     })
@@ -994,8 +1363,11 @@ mod tests {
         let _error = tool
             .execute(
                 &serde_json::json!({
-                    "runtime_id": "runtime-1",
-                    "worker_id": "worker-7",
+                    "subject": {
+                        "kind": "runtime_worker",
+                        "runtime_id": "runtime-1",
+                        "worker_id": "worker-7",
+                    },
                     "expected_worker_revision": "revision-1",
                     "reason": "retire",
                     "source_proof": "caller-controlled"

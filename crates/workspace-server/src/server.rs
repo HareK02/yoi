@@ -75,10 +75,10 @@ use crate::hosts::{
     EmbeddedWorkerRuntime, HostSummary, RemoteRuntimeConfig, RemoteWorkerRuntime,
     RuntimeDiagnostic, RuntimeRegistry, RuntimeRegistryError, RuntimeRegistryUnregisterResult,
     RuntimeSummary, TicketWorkerRole, WorkerCapabilitySummary, WorkerCompletionsRequest,
-    WorkerCompletionsResult, WorkerImplementationSummary, WorkerInputKind, WorkerInputRequest,
-    WorkerInputResult, WorkerLifecycleRequest, WorkerLifecycleResult, WorkerOperationState,
-    WorkerRestoreResult, WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest,
-    WorkerSpawnResult, WorkerSpawnWorkingDirectoryRequest, WorkerSummary,
+    WorkerCompletionsResult, WorkerControlOperation, WorkerImplementationSummary, WorkerInputKind,
+    WorkerInputRequest, WorkerInputResult, WorkerLifecycleRequest, WorkerLifecycleResult,
+    WorkerOperationState, WorkerRestoreResult, WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent,
+    WorkerSpawnRequest, WorkerSpawnResult, WorkerSpawnWorkingDirectoryRequest, WorkerSummary,
     WorkerTicketAssignmentRequest, WorkerWorkspaceSummary,
 };
 use crate::identity::WorkspaceIdentity;
@@ -264,6 +264,7 @@ pub struct WorkspaceApi {
     workdir_sessions: Arc<Mutex<HashMap<RuntimeWorkerRef, WorkdirSessionHandle>>>,
     workdir_session_locks: Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<tokio::sync::Mutex<()>>>>>,
     worker_remove_locks: Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<tokio::sync::Mutex<()>>>>>,
+    worker_control_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 #[derive(Clone)]
@@ -274,6 +275,7 @@ struct WorkspaceWorkerRemoveExecutor {
     workdir_sessions: Arc<Mutex<HashMap<RuntimeWorkerRef, WorkdirSessionHandle>>>,
     workdir_session_locks: Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<tokio::sync::Mutex<()>>>>>,
     worker_remove_locks: Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<tokio::sync::Mutex<()>>>>>,
+    worker_control_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl WorkspaceWorkerRemoveExecutor {
@@ -285,6 +287,7 @@ impl WorkspaceWorkerRemoveExecutor {
             workdir_sessions: api.workdir_sessions.clone(),
             workdir_session_locks: api.workdir_session_locks.clone(),
             worker_remove_locks: api.worker_remove_locks.clone(),
+            worker_control_locks: api.worker_control_locks.clone(),
         }
     }
 
@@ -347,17 +350,46 @@ impl WorkspaceWorkerRemoveExecutor {
             ));
         }
         let controller = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
-        let granted = self
+        let grant = self
             .store
             .get_active_worker_control_grant(&self.workspace_id, &controller, &target)
             .map_err(|_| "Worker control grant authority is unavailable".to_string())?
-            .is_some_and(|grant| {
+            .filter(|grant| {
                 grant
                     .permissions
                     .iter()
                     .any(|permission| permission == "remove")
             });
-        if !granted {
+        let Some(grant) = grant else {
+            return Ok(worker_remove_error_response(
+                StatusCode::NOT_FOUND,
+                "unknown_worker",
+                "The target Worker is not known to the current Worker",
+            ));
+        };
+        let control_lock = {
+            let mut locks = self
+                .worker_control_locks
+                .lock()
+                .map_err(|_| "Worker control lock registry was poisoned".to_string())?;
+            locks
+                .entry(grant.grant_id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _control_guard = control_lock.lock().await;
+        let still_granted = self
+            .store
+            .get_active_worker_control_grant(&self.workspace_id, &controller, &target)
+            .map_err(|_| "Worker control grant authority is unavailable".to_string())?
+            .is_some_and(|current| {
+                current.grant_id == grant.grant_id
+                    && current
+                        .permissions
+                        .iter()
+                        .any(|permission| permission == "remove")
+            });
+        if !still_granted {
             return Ok(worker_remove_error_response(
                 StatusCode::NOT_FOUND,
                 "unknown_worker",
@@ -787,6 +819,7 @@ impl WorkspaceApi {
             workdir_sessions: Arc::new(Mutex::new(HashMap::new())),
             workdir_session_locks: Arc::new(Mutex::new(HashMap::new())),
             worker_remove_locks: Arc::new(Mutex::new(HashMap::new())),
+            worker_control_locks: Arc::new(Mutex::new(HashMap::new())),
         };
         if let Some(dispatcher) = worker_remove_dispatcher {
             dispatcher
@@ -1444,6 +1477,18 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             get(list_known_workers).post(spawn_known_worker),
         )
         .route(
+            "/api/w/{workspace_id}/worker-control/grants/{grant_id}/share",
+            post(share_worker_control_grant),
+        )
+        .route(
+            "/api/w/{workspace_id}/worker-control/grants/{grant_id}/transfer",
+            post(transfer_worker_control_grant),
+        )
+        .route(
+            "/api/w/{workspace_id}/worker-control/grants/{grant_id}/revoke",
+            post(revoke_worker_control_grant),
+        )
+        .route(
             "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/input",
             post(send_known_worker_input),
         )
@@ -2052,7 +2097,7 @@ pub struct BrowserWorkingDirectoryCreateRequest {
     pub selector: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserWorkerWorkingDirectorySelection {
     pub working_directory_id: String,
@@ -2070,14 +2115,14 @@ pub struct BrowserWorkspaceOrchestratorResponse {
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateWorkspaceWorkerTicketAssignmentRequest {
     pub ticket_id: String,
     pub operation_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateWorkspaceWorkerRequest {
     pub runtime_id: String,
@@ -2093,6 +2138,9 @@ pub struct CreateWorkspaceWorkerRequest {
     /// Backend idempotency key used only for authenticated Worker-owned spawn/control.
     #[serde(default)]
     pub control_operation_id: Option<String>,
+    /// Trusted resolution populated only by the authenticated worker-control handler.
+    #[serde(skip, default)]
+    pub resolved_control_operation: Option<WorkerControlOperation>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2207,6 +2255,12 @@ struct TranscriptQuery {
 #[derive(Debug, Deserialize)]
 struct ScopedWorkspacePath {
     workspace_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScopedWorkerControlGrantPath {
+    workspace_id: String,
+    grant_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5274,6 +5328,7 @@ fn start_memory_staging_consolidation(
             resolved_config_bundle,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
+            resolved_control_operation: None,
             resolved_workspace_api: None,
         },
     )?;
@@ -5861,6 +5916,7 @@ async fn scoped_workspace_orchestrator_status(
 
 #[derive(Debug, Serialize, Deserialize)]
 struct KnownWorkerRecord {
+    grant_id: String,
     subject: RuntimeWorkerRef,
     relation: String,
     origin: String,
@@ -5895,6 +5951,7 @@ async fn list_known_workers(
             .worker(&grant.subject)
             .map_err(|error| error.into_error())?;
         items.push(KnownWorkerRecord {
+            grant_id: grant.grant_id,
             subject: grant.subject,
             relation: grant.relation,
             origin: grant.origin,
@@ -5913,7 +5970,7 @@ async fn spawn_known_worker(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
     headers: HeaderMap,
-    Json(request): Json<CreateWorkspaceWorkerRequest>,
+    Json(mut request): Json<CreateWorkspaceWorkerRequest>,
 ) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
@@ -5929,31 +5986,20 @@ async fn spawn_known_worker(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| Error::InvalidInput("control_operation_id is required".to_string()))?
         .to_string();
+    let fingerprint_input = serde_json::to_vec(&request)
+        .map_err(|error| Error::InvalidInput(format!("invalid Worker spawn input: {error}")))?;
+    let input_fingerprint = format!(
+        "sha256:{}",
+        Sha256::digest(&fingerprint_input)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    request.resolved_control_operation = Some(WorkerControlOperation {
+        operation_id: operation_id.clone(),
+        input_fingerprint,
+    });
     let controller = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
-    if request.ticket_assignment.is_none()
-        && let Some(existing) = api.store.get_worker_control_grant_by_operation(
-            &path.workspace_id,
-            &controller,
-            &operation_id,
-        )?
-    {
-        let worker = api
-            .runtime
-            .worker(&existing.subject)
-            .map_err(|error| error.into_error())?;
-        return Ok(Json(BrowserCreateWorkerResponse {
-            workspace_id: path.workspace_id,
-            console_href: format!(
-                "/w/{}/runtimes/{}/workers/{}/console",
-                encode_path_segment(&existing.workspace_id),
-                encode_path_segment(&existing.subject.runtime_id),
-                encode_path_segment(&existing.subject.worker_id),
-            ),
-            worker_ref: existing.subject,
-            worker,
-            diagnostics: Vec::new(),
-        }));
-    }
     let response = create_workspace_worker(State(api.clone()), headers, Json(request)).await?;
     if let Err(error) = api
         .store
@@ -5971,6 +6017,8 @@ async fn spawn_known_worker(
                 "stop".to_string(),
                 "restore".to_string(),
                 "remove".to_string(),
+                "share".to_string(),
+                "transfer".to_string(),
                 "observe".to_string(),
             ],
             operation_id,
@@ -5978,14 +6026,25 @@ async fn spawn_known_worker(
             revoked_at: None,
         })
     {
-        let subject = response.0.worker_ref.clone();
-        let _ = api.runtime.delete_worker(&subject);
-        let _ = api
-            .store
-            .delete_worker_registry(&path.workspace_id, &subject);
+        // Runtime creation is idempotent under the trusted control operation.
+        // Preserve the unacknowledged Worker/assignment so a retry converges on
+        // the same subject and can finish grant persistence without creating a
+        // second Worker or leaving assignment cleanup races.
         return Err(ApiError::from(error));
     }
     Ok(response)
+}
+
+fn worker_control_lock(api: &WorkspaceApi, grant_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = api
+        .worker_control_locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Arc::clone(
+        locks
+            .entry(grant_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+    )
 }
 
 fn authorize_known_worker_permission(
@@ -5994,7 +6053,7 @@ fn authorize_known_worker_permission(
     controller: &RuntimeWorkerRef,
     subject: &RuntimeWorkerRef,
     permission: &str,
-) -> Result<()> {
+) -> Result<WorkerControlGrantRecord> {
     let grant = api
         .store
         .get_active_worker_control_grant(workspace_id, controller, subject)?
@@ -6010,7 +6069,184 @@ fn authorize_known_worker_permission(
             "worker control permission `{permission}` was not granted"
         )));
     }
-    Ok(())
+    Ok(grant)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DelegateWorkerControlGrantRequest {
+    target_controller: RuntimeWorkerRef,
+    operation_id: String,
+}
+
+async fn share_worker_control_grant(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkerControlGrantPath>,
+    headers: HeaderMap,
+    Json(request): Json<DelegateWorkerControlGrantRequest>,
+) -> ApiResult<Json<WorkerControlGrantRecord>> {
+    delegate_worker_control_grant(api, path, headers, request, false).await
+}
+
+async fn transfer_worker_control_grant(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkerControlGrantPath>,
+    headers: HeaderMap,
+    Json(request): Json<DelegateWorkerControlGrantRequest>,
+) -> ApiResult<Json<WorkerControlGrantRecord>> {
+    delegate_worker_control_grant(api, path, headers, request, true).await
+}
+
+async fn delegate_worker_control_grant(
+    api: WorkspaceApi,
+    path: ScopedWorkerControlGrantPath,
+    headers: HeaderMap,
+    request: DelegateWorkerControlGrantRequest,
+    transfer: bool,
+) -> ApiResult<Json<WorkerControlGrantRecord>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
+    let controller = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
+    let permission = if transfer { "transfer" } else { "share" };
+    let grant = api
+        .store
+        .get_worker_control_grant(&path.workspace_id, &path.grant_id)?
+        .filter(|grant| {
+            grant.controller == controller
+                && grant.permissions.iter().any(|value| value == permission)
+        })
+        .ok_or_else(|| Error::UnknownWorker {
+            worker: controller.clone(),
+        })?;
+    if request.target_controller == controller {
+        return Err(ApiError::from(Error::InvalidInput(
+            "target_controller must differ from the current Worker".to_string(),
+        )));
+    }
+    api.store
+        .get_worker_registry(&path.workspace_id, &request.target_controller)?
+        .ok_or_else(|| Error::UnknownWorker {
+            worker: request.target_controller.clone(),
+        })?;
+    let operation_id = request.operation_id.trim();
+    if operation_id.is_empty() || operation_id.len() > 200 {
+        return Err(ApiError::from(Error::InvalidInput(
+            "operation_id must contain 1..=200 bytes".to_string(),
+        )));
+    }
+    let expected_origin = format!("worker_control_{permission}:{}", grant.grant_id);
+    if let Some(existing) = api.store.get_worker_control_grant_by_operation(
+        &path.workspace_id,
+        &request.target_controller,
+        operation_id,
+    )? {
+        if existing.subject == grant.subject && existing.origin == expected_origin {
+            if transfer && grant.revoked_at.is_none() {
+                let lock = worker_control_lock(&api, &grant.grant_id);
+                let _guard = lock.lock().await;
+                let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                if api
+                    .store
+                    .get_worker_control_grant(&path.workspace_id, &grant.grant_id)?
+                    .is_some_and(|current| current.revoked_at.is_none())
+                {
+                    api.store.revoke_worker_control_grant(
+                        &path.workspace_id,
+                        &grant.grant_id,
+                        &now,
+                    )?;
+                }
+            }
+            return Ok(Json(existing));
+        }
+        return Err(ApiError::from(Error::InvalidInput(
+            "operation_id was already used with different grant input".to_string(),
+        )));
+    }
+    if grant.revoked_at.is_some() {
+        return Err(ApiError::from(Error::UnknownWorker {
+            worker: grant.subject,
+        }));
+    }
+    let lock = worker_control_lock(&api, &grant.grant_id);
+    let _guard = lock.lock().await;
+    let current = api
+        .store
+        .get_worker_control_grant(&path.workspace_id, &path.grant_id)?
+        .filter(|candidate| {
+            candidate.controller == controller
+                && candidate.revoked_at.is_none()
+                && candidate
+                    .permissions
+                    .iter()
+                    .any(|value| value == permission)
+        })
+        .ok_or_else(|| Error::UnknownWorker {
+            worker: grant.subject.clone(),
+        })?;
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let delegated = api
+        .store
+        .create_worker_control_grant(&WorkerControlGrantRecord {
+            workspace_id: path.workspace_id.clone(),
+            grant_id: new_id("wcg"),
+            controller: request.target_controller,
+            subject: current.subject.clone(),
+            relation: if transfer { "transferred" } else { "shared" }.to_string(),
+            origin: expected_origin,
+            permissions: current.permissions.clone(),
+            operation_id: operation_id.to_string(),
+            created_at: now.clone(),
+            revoked_at: None,
+        })?;
+    if transfer
+        && !api
+            .store
+            .revoke_worker_control_grant(&path.workspace_id, &current.grant_id, &now)?
+    {
+        return Err(ApiError::from(Error::UnknownWorker {
+            worker: current.subject,
+        }));
+    }
+    Ok(Json(delegated))
+}
+
+async fn revoke_worker_control_grant(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkerControlGrantPath>,
+    headers: HeaderMap,
+) -> ApiResult<Json<WorkerControlGrantRecord>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
+    let controller = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
+    let grant = api
+        .store
+        .get_worker_control_grant(&path.workspace_id, &path.grant_id)?
+        .filter(|grant| grant.controller == controller && grant.revoked_at.is_none())
+        .ok_or_else(|| Error::UnknownWorker {
+            worker: controller.clone(),
+        })?;
+    let lock = worker_control_lock(&api, &grant.grant_id);
+    let _guard = lock.lock().await;
+    let current = api
+        .store
+        .get_worker_control_grant(&path.workspace_id, &path.grant_id)?
+        .filter(|candidate| candidate.controller == controller && candidate.revoked_at.is_none())
+        .ok_or_else(|| Error::UnknownWorker {
+            worker: grant.subject.clone(),
+        })?;
+    let revoked_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    if !api
+        .store
+        .revoke_worker_control_grant(&path.workspace_id, &path.grant_id, &revoked_at)?
+    {
+        return Err(ApiError::from(Error::UnknownWorker {
+            worker: current.subject,
+        }));
+    }
+    let mut revoked = current;
+    revoked.revoked_at = Some(revoked_at);
+    Ok(Json(revoked))
 }
 
 async fn send_known_worker_input(
@@ -6026,6 +6262,15 @@ async fn send_known_worker_input(
         WorkerInputKind::Notify => "notify",
         _ => "send_input",
     };
+    let grant = authorize_known_worker_permission(
+        &api,
+        &path.workspace_id,
+        &controller,
+        &path.worker,
+        permission,
+    )?;
+    let lock = worker_control_lock(&api, &grant.grant_id);
+    let _guard = lock.lock().await;
     authorize_known_worker_permission(
         &api,
         &path.workspace_id,
@@ -6045,6 +6290,15 @@ async fn cancel_known_worker(
     validate_workspace_scope(&api, &path.workspace_id)?;
     let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
     let controller = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
+    let grant = authorize_known_worker_permission(
+        &api,
+        &path.workspace_id,
+        &controller,
+        &path.worker,
+        "cancel",
+    )?;
+    let lock = worker_control_lock(&api, &grant.grant_id);
+    let _guard = lock.lock().await;
     authorize_known_worker_permission(
         &api,
         &path.workspace_id,
@@ -6065,6 +6319,10 @@ async fn stop_known_worker(
     let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
     let subject = path.worker.clone();
     let controller = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
+    let grant =
+        authorize_known_worker_permission(&api, &path.workspace_id, &controller, &subject, "stop")?;
+    let lock = worker_control_lock(&api, &grant.grant_id);
+    let _guard = lock.lock().await;
     authorize_known_worker_permission(&api, &path.workspace_id, &controller, &subject, "stop")?;
     scoped_stop_runtime_worker(State(api), AxumPath(path), Json(request)).await
 }
@@ -6078,6 +6336,15 @@ async fn restore_known_worker(
     let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
     let subject = path.worker.clone();
     let controller = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
+    let grant = authorize_known_worker_permission(
+        &api,
+        &path.workspace_id,
+        &controller,
+        &subject,
+        "restore",
+    )?;
+    let lock = worker_control_lock(&api, &grant.grant_id);
+    let _guard = lock.lock().await;
     authorize_known_worker_permission(&api, &path.workspace_id, &controller, &subject, "restore")?;
     scoped_restore_runtime_worker(State(api), AxumPath(path), Query(Default::default())).await
 }
@@ -6141,6 +6408,15 @@ async fn scoped_capture_worker_observation_session(
     };
     let target = RuntimeWorkerRef::new(runtime_id, worker_id);
     let controller = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
+    let grant = authorize_known_worker_permission(
+        &api,
+        &path.workspace_id,
+        &controller,
+        &target,
+        "observe",
+    )?;
+    let lock = worker_control_lock(&api, &grant.grant_id);
+    let _guard = lock.lock().await;
     authorize_known_worker_permission(&api, &path.workspace_id, &controller, &target, "observe")?;
     let target_summary = api
         .runtime
@@ -6242,16 +6518,8 @@ async fn scoped_start_workspace_orchestrator(
             resolved_working_directory: None,
             resolved_config_bundle: None,
             resolved_worker_observation_enabled: true,
-            resolved_worker_observation_grants: workers_response(api.clone())
-                .map(|response| {
-                    response
-                        .items
-                        .into_iter()
-                        .take(100)
-                        .map(|worker| worker.worker)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            resolved_worker_observation_grants: Vec::new(),
+            resolved_control_operation: None,
             resolved_workspace_api: None,
         },
     )?;
@@ -8692,6 +8960,7 @@ async fn create_workspace_worker(
         initial_submit,
         working_directory,
         control_operation_id: _,
+        resolved_control_operation,
     } = request;
     let config_state = api
         .config_store
@@ -8771,6 +9040,7 @@ async fn create_workspace_worker(
         resolved_config_bundle,
         resolved_worker_observation_enabled: false,
         resolved_worker_observation_grants: Vec::new(),
+        resolved_control_operation,
         resolved_workspace_api: None,
     };
     validate_ticket_assignment_spawn(&api, &runtime_id, &request)?;
@@ -12322,6 +12592,7 @@ mod tests {
             resolved_config_bundle: None,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
+            resolved_control_operation: None,
             resolved_workspace_api: None,
         };
         assert!(
@@ -12351,6 +12622,7 @@ mod tests {
             resolved_config_bundle: None,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
+            resolved_control_operation: None,
             resolved_workspace_api: None,
         };
         assert!(
@@ -12474,6 +12746,7 @@ mod tests {
             resolved_config_bundle: None,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
+            resolved_control_operation: None,
             resolved_workspace_api: None,
         };
 
@@ -12520,6 +12793,7 @@ mod tests {
                 }],
                 working_directory: None,
                 control_operation_id: None,
+                resolved_control_operation: None,
             }),
         )
         .await
@@ -12560,6 +12834,7 @@ mod tests {
                 initial_submit: Vec::new(),
                 working_directory: None,
                 control_operation_id: None,
+                resolved_control_operation: None,
             }),
         )
         .await
@@ -12595,6 +12870,7 @@ mod tests {
                 initial_submit: Vec::new(),
                 working_directory: None,
                 control_operation_id: None,
+                resolved_control_operation: None,
             }),
         )
         .await
@@ -12697,6 +12973,7 @@ mod tests {
                 }],
                 working_directory: None,
                 control_operation_id: None,
+                resolved_control_operation: None,
             }),
         )
         .await
@@ -12979,6 +13256,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_control_spawn_retry_converges_on_one_worker_and_one_grant() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let workspace_id = api.config.workspace_id.clone();
+        let Json(controller_worker) = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(CreateWorkspaceWorkerRequest {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                display_name: "Control caller".to_string(),
+                profile: None,
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                working_directory: None,
+                control_operation_id: None,
+                resolved_control_operation: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let controller = controller_worker.worker_ref;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-yoi-runtime-id",
+            axum::http::HeaderValue::from_str(&controller.runtime_id).unwrap(),
+        );
+        headers.insert(
+            "x-yoi-worker-id",
+            axum::http::HeaderValue::from_str(&controller.worker_id).unwrap(),
+        );
+        let request = || CreateWorkspaceWorkerRequest {
+            runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+            display_name: "Idempotent controlled child".to_string(),
+            profile: None,
+            ticket_assignment: None,
+            initial_submit: Vec::new(),
+            working_directory: None,
+            control_operation_id: Some("control-spawn-retry".to_string()),
+            resolved_control_operation: None,
+        };
+
+        let Json(first) = spawn_known_worker(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: workspace_id.clone(),
+            }),
+            headers.clone(),
+            Json(request()),
+        )
+        .await
+        .unwrap();
+        let Json(retried) = spawn_known_worker(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: workspace_id.clone(),
+            }),
+            headers,
+            Json(request()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(retried.worker_ref, first.worker_ref);
+        let mut conflicting_request = request();
+        conflicting_request.display_name = "Different controlled child".to_string();
+        let conflict = spawn_known_worker(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: workspace_id.clone(),
+            }),
+            {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    "x-yoi-runtime-id",
+                    axum::http::HeaderValue::from_str(&controller.runtime_id).unwrap(),
+                );
+                headers.insert(
+                    "x-yoi-worker-id",
+                    axum::http::HeaderValue::from_str(&controller.worker_id).unwrap(),
+                );
+                headers
+            },
+            Json(conflicting_request),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(conflict.into_response().status(), StatusCode::BAD_GATEWAY);
+        let grants = api
+            .store
+            .list_active_worker_control_grants(&workspace_id, &controller, 10)
+            .unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].subject, first.worker_ref);
+        assert_eq!(grants[0].operation_id, "control-spawn-retry");
+    }
+
+    #[tokio::test]
     async fn explicit_orchestrator_launch_marks_only_the_dedicated_worker() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
@@ -12996,6 +13371,7 @@ mod tests {
                 initial_submit: Vec::new(),
                 working_directory: None,
                 control_operation_id: None,
+                resolved_control_operation: None,
             }),
         )
         .await
@@ -13013,6 +13389,7 @@ mod tests {
                 initial_submit: Vec::new(),
                 working_directory: None,
                 control_operation_id: None,
+                resolved_control_operation: None,
             }),
         )
         .await
@@ -13069,6 +13446,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(known.items.len(), 1);
+        assert_eq!(known.items[0].grant_id, "orchestrator-controls-generic");
         assert_eq!(known.items[0].subject, generic.worker_ref);
         assert_eq!(known.items[0].permissions, ["observe"]);
 
@@ -13097,7 +13475,7 @@ mod tests {
             AxumPath(ScopedWorkspacePath {
                 workspace_id: workspace_id.clone(),
             }),
-            observation_headers,
+            observation_headers.clone(),
             Json(WorkerObservationSubjectRef::RuntimeWorker {
                 runtime_id: generic.worker_ref.runtime_id.clone(),
                 worker_id: generic.worker_ref.worker_id.clone(),
@@ -13106,6 +13484,35 @@ mod tests {
         .await
         .unwrap();
         assert!(capture["entries"].is_array());
+
+        let Json(revoked) = revoke_worker_control_grant(
+            State(api.clone()),
+            AxumPath(ScopedWorkerControlGrantPath {
+                workspace_id: workspace_id.clone(),
+                grant_id: "orchestrator-controls-generic".to_string(),
+            }),
+            observation_headers.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(revoked.revoked_at.is_some());
+        let revoked_capture = scoped_capture_worker_observation_session(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: workspace_id.clone(),
+            }),
+            observation_headers.clone(),
+            Json(WorkerObservationSubjectRef::RuntimeWorker {
+                runtime_id: generic.worker_ref.runtime_id.clone(),
+                worker_id: generic.worker_ref.worker_id.clone(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            revoked_capture.into_response().status(),
+            StatusCode::NOT_FOUND
+        );
 
         let mut unauthorized_headers = HeaderMap::new();
         unauthorized_headers.insert(
@@ -13126,6 +13533,80 @@ mod tests {
         .await
         .unwrap();
         assert!(unauthorized["sessions"].as_array().unwrap().is_empty());
+
+        for (grant_id, permission) in [
+            ("orchestrator-share-source", "share"),
+            ("orchestrator-transfer-source", "transfer"),
+        ] {
+            api.store
+                .create_worker_control_grant(&WorkerControlGrantRecord {
+                    workspace_id: workspace_id.clone(),
+                    grant_id: grant_id.to_string(),
+                    controller: dedicated.worker.clone(),
+                    subject: generic.worker_ref.clone(),
+                    relation: "spawned".to_string(),
+                    origin: "test-delegation".to_string(),
+                    permissions: vec!["observe".to_string(), permission.to_string()],
+                    operation_id: format!("seed-{permission}"),
+                    created_at: "2026-07-27T00:00:01Z".to_string(),
+                    revoked_at: None,
+                })
+                .unwrap();
+        }
+        let target_controller = generic.worker_ref.clone();
+        let Json(shared) = share_worker_control_grant(
+            State(api.clone()),
+            AxumPath(ScopedWorkerControlGrantPath {
+                workspace_id: workspace_id.clone(),
+                grant_id: "orchestrator-share-source".to_string(),
+            }),
+            observation_headers.clone(),
+            Json(DelegateWorkerControlGrantRequest {
+                target_controller: target_controller.clone(),
+                operation_id: "share-operation".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(shared.controller, target_controller);
+        assert_eq!(shared.relation, "shared");
+        let Json(transferred) = transfer_worker_control_grant(
+            State(api.clone()),
+            AxumPath(ScopedWorkerControlGrantPath {
+                workspace_id: workspace_id.clone(),
+                grant_id: "orchestrator-transfer-source".to_string(),
+            }),
+            observation_headers.clone(),
+            Json(DelegateWorkerControlGrantRequest {
+                target_controller: generic.worker_ref.clone(),
+                operation_id: "transfer-operation".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(transfer_replay) = transfer_worker_control_grant(
+            State(api.clone()),
+            AxumPath(ScopedWorkerControlGrantPath {
+                workspace_id: workspace_id.clone(),
+                grant_id: "orchestrator-transfer-source".to_string(),
+            }),
+            observation_headers,
+            Json(DelegateWorkerControlGrantRequest {
+                target_controller: generic.worker_ref.clone(),
+                operation_id: "transfer-operation".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(transfer_replay.grant_id, transferred.grant_id);
+        assert!(
+            api.store
+                .get_worker_control_grant(&workspace_id, "orchestrator-transfer-source")
+                .unwrap()
+                .unwrap()
+                .revoked_at
+                .is_some()
+        );
 
         let Json(existing) = scoped_start_workspace_orchestrator(
             State(api.clone()),
@@ -13656,6 +14137,7 @@ mod tests {
                     resolved_workspace_api: Some(test_worker_workspace_api(
                         EMBEDDED_WORKER_RUNTIME_ID,
                     )),
+                    resolved_control_operation: None,
                 },
             )
             .unwrap();
@@ -13804,6 +14286,7 @@ mod tests {
                     resolved_workspace_api: Some(test_worker_workspace_api(
                         EMBEDDED_WORKER_RUNTIME_ID,
                     )),
+                    resolved_control_operation: None,
                 },
             )
             .unwrap()
@@ -14003,6 +14486,7 @@ mod tests {
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: Some(test_worker_workspace_api(EMBEDDED_WORKER_RUNTIME_ID)),
+            resolved_control_operation: None,
         };
         let source_worker = api
             .runtime
@@ -14221,6 +14705,7 @@ mod tests {
                     resolved_workspace_api: Some(test_worker_workspace_api(
                         EMBEDDED_WORKER_RUNTIME_ID,
                     )),
+                    resolved_control_operation: None,
                 },
             )
             .unwrap()
@@ -14362,6 +14847,7 @@ mod tests {
             resolved_config_bundle: None,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
+            resolved_control_operation: None,
             resolved_workspace_api: None,
         };
         let Json(first) = scoped_create_runtime_worker(
@@ -14508,6 +14994,7 @@ mod tests {
                 ticket_id: second_ticket.id.clone(),
                 operation_id: "pending-spawn-operation".to_string(),
             }),
+            resolved_control_operation: None,
             ..request
         };
         pending_request.resolved_workspace_api =
@@ -14602,6 +15089,7 @@ mod tests {
             resolved_config_bundle: None,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
+            resolved_control_operation: None,
             resolved_workspace_api: None,
         };
         let Json(created) = scoped_create_runtime_worker(
@@ -15159,6 +15647,7 @@ mod tests {
                     resolved_worker_observation_enabled: false,
                     resolved_worker_observation_grants: Vec::new(),
                     resolved_workspace_api: None,
+                    resolved_control_operation: None,
                 },
             )
             .unwrap();
@@ -15239,6 +15728,7 @@ mod tests {
                     resolved_worker_observation_enabled: false,
                     resolved_worker_observation_grants: Vec::new(),
                     resolved_workspace_api: None,
+                    resolved_control_operation: None,
                 },
             )
             .unwrap();
@@ -17276,6 +17766,7 @@ mod tests {
                     resolved_workspace_api: Some(test_worker_workspace_api(
                         "embedded-worker-runtime",
                     )),
+                    resolved_control_operation: None,
                 },
             )
             .expect("spawn worker");
@@ -17792,6 +18283,7 @@ mod tests {
             resolved_config_bundle: Some(runtime_test_bundle()),
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
+            resolved_control_operation: None,
             resolved_workspace_api: None,
         };
         let spawned = api

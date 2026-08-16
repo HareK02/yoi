@@ -21,7 +21,6 @@ use crate::shutdown_after_idle::{
     ShutdownAfterIdleRequest, TicketIntakeReadyShutdownHook, is_ticket_intake_role,
     take_shutdown_request_after_status,
 };
-use crate::spawn::comm_tools::{sub_worker_send_tool, sub_worker_stop_tool};
 use crate::spawn::registry::SpawnedWorkerRegistry;
 use crate::spawn::tool::sub_worker_spawn_tool;
 use crate::worker::{
@@ -921,8 +920,6 @@ where
                 scope_handle,
                 prompts,
             ));
-            engine.register_tool(sub_worker_send_tool(spawned_registry.clone()));
-            engine.register_tool(sub_worker_stop_tool(spawned_registry.clone()));
             observation_providers.push(Arc::new(
                 crate::feature::builtin::worker_observation::SpawnedSubWorkerObservationProvider::new(
                     spawned_registry,

@@ -758,6 +758,11 @@ pub trait ControlPlaneStore: Send + Sync {
         &self,
         record: &WorkerControlGrantRecord,
     ) -> Result<WorkerControlGrantRecord>;
+    fn get_worker_control_grant(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<Option<WorkerControlGrantRecord>>;
     fn get_worker_control_grant_by_operation(
         &self,
         workspace_id: &str,
@@ -2426,6 +2431,27 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 )));
             }
             Ok(persisted)
+        })
+    }
+
+    fn get_worker_control_grant(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<Option<WorkerControlGrantRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                r#"SELECT workspace_id, grant_id,
+                          controller_runtime_id, controller_worker_id,
+                          subject_runtime_id, subject_worker_id,
+                          relation, origin, permissions_json, operation_id, created_at, revoked_at
+                   FROM worker_control_grants
+                   WHERE workspace_id = ?1 AND grant_id = ?2"#,
+                params![workspace_id, grant_id],
+                read_worker_control_grant_record,
+            )
+            .optional()
+            .map_err(Error::from)
         })
     }
 
@@ -6978,7 +7004,9 @@ CREATE TABLE ticket_assignment_operations (
 
     #[tokio::test]
     async fn worker_control_grants_are_idempotent_scoped_and_revocable() {
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("control-grants.db");
+        let store = SqliteWorkspaceStore::open(&database).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: "workspace-control".to_string(),
@@ -7047,6 +7075,20 @@ CREATE TABLE ticket_assignment_operations (
             Some(grant.clone())
         );
 
+        drop(store);
+        let store = SqliteWorkspaceStore::open(&database).unwrap();
+        assert_eq!(
+            store
+                .list_active_worker_control_grants(
+                    "workspace-control",
+                    &controller_record.worker,
+                    10,
+                )
+                .unwrap(),
+            vec![grant.clone()],
+            "known Runtime Worker grants survive Backend restart"
+        );
+
         let conflicting_replay = WorkerControlGrantRecord {
             subject: controller_record.worker.clone(),
             ..grant.clone()
@@ -7073,6 +7115,18 @@ CREATE TABLE ticket_assignment_operations (
                 )
                 .unwrap()
                 .is_empty()
+        );
+        assert!(
+            store
+                .delete_worker_registry("workspace-control", &subject_record.worker)
+                .unwrap()
+        );
+        assert!(
+            store
+                .get_worker_control_grant("workspace-control", &grant.grant_id)
+                .unwrap()
+                .is_none(),
+            "deleting a subject Worker cascades its durable control grants"
         );
     }
 

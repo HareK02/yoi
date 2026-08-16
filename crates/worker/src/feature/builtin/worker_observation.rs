@@ -7,7 +7,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use session_store::collect_state;
 
-use super::manage_worker::WORKER_CONTROL_SERVICE_ID;
+use super::manage_worker::{WORKER_CONTROL_SERVICE_ID, WorkerControlService};
 use crate::feature::{
     FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureInstructionContribution,
     FeatureInstructionDeclaration, FeatureInstructionId, FeatureModule, ServiceId,
@@ -186,6 +186,43 @@ fn workspace_client_error(error: crate::worker::WorkspaceClientError) -> WorkerO
 }
 
 #[derive(Clone)]
+struct ControlAuthorizedObservationProvider {
+    control: Arc<dyn WorkerControlService>,
+    inner: Arc<dyn WorkerObservationProvider>,
+}
+
+#[async_trait]
+impl WorkerObservationProvider for ControlAuthorizedObservationProvider {
+    async fn list_worker_sessions(
+        &self,
+    ) -> Result<Vec<WorkerObservationSubject>, WorkerObservationError> {
+        let candidates = self.inner.list_worker_sessions().await?;
+        let mut granted = Vec::new();
+        for candidate in candidates {
+            if self
+                .control
+                .ensure_permission(&candidate.subject, "observe")
+                .await
+                .is_ok()
+            {
+                granted.push(candidate);
+            }
+        }
+        Ok(granted)
+    }
+
+    async fn capture_worker_session(
+        &self,
+        subject: &WorkerObservationSubjectRef,
+    ) -> Result<WorkerSessionCapture, WorkerObservationError> {
+        self.control
+            .ensure_permission(subject, "observe")
+            .await
+            .map_err(|_| WorkerObservationError::NotFound)?;
+        self.inner.capture_worker_session(subject).await
+    }
+}
+
 pub struct WorkerObservationFeature {
     provider: Arc<dyn WorkerObservationProvider>,
 }
@@ -227,17 +264,25 @@ impl FeatureModule for WorkerObservationFeature {
             .register(FeatureInstructionContribution::new(
                 observation_instruction(),
             ))?;
+        let control = context
+            .services()
+            .require::<dyn WorkerControlService>(&ServiceId::builtin(WORKER_CONTROL_SERVICE_ID))?;
+        let provider: Arc<dyn WorkerObservationProvider> =
+            Arc::new(ControlAuthorizedObservationProvider {
+                control,
+                inner: self.provider.clone(),
+            });
         context.tools().register(ToolContribution::new(
             "ViewSessionOverview",
-            overview_definition(self.provider.clone()),
+            overview_definition(provider.clone()),
         ))?;
         context.tools().register(ToolContribution::new(
             "SearchSessionEntries",
-            search_definition(self.provider.clone()),
+            search_definition(provider.clone()),
         ))?;
         context.tools().register(ToolContribution::new(
             "ReadSessionEntry",
-            read_definition(self.provider.clone()),
+            read_definition(provider),
         ))?;
         Ok(())
     }
