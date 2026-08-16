@@ -304,3 +304,51 @@ fn completion_cancels_outstanding_grants_and_late_submit_fails() {
         MergeRequestThreadEvent::ReviewCancelled(value)
             if value.reason.contains("completed before review submission"))));
 }
+
+#[test]
+fn selector_repair_requires_and_accepts_an_approved_resolved_subject() {
+    let (dir, store) = fixture();
+    open(&store);
+    approve(&store, "approved-subject", "approval");
+    Connection::open(dir.path().join("db")).unwrap()
+        .execute("UPDATE merge_requests SET selector_from=NULL WHERE workspace_id='W' AND merge_request_id='MR'", [])
+        .unwrap();
+    let repaired = store
+        .repair_selector_from(RepairSelectorFrom {
+            workspace_id: "W".into(),
+            ticket_id: "T".into(),
+            selector_from: "restored-work".into(),
+            resolved_subject_ref: "approved-subject".into(),
+            repaired_by: WorkerIdentity {
+                runtime_id: "browser".into(),
+                worker_id: "user".into(),
+            },
+            reason: "confirmed migrated source".into(),
+            now: at(8),
+        })
+        .unwrap();
+    assert_eq!(repaired.selector_from.as_deref(), Some("restored-work"));
+}
+
+#[test]
+fn selector_repair_rejects_unapproved_resolved_subject() {
+    let (dir, store) = fixture();
+    open(&store);
+    approve(&store, "approved-subject", "approval");
+    Connection::open(dir.path().join("db")).unwrap()
+        .execute("UPDATE merge_requests SET selector_from=NULL WHERE workspace_id='W' AND merge_request_id='MR'", [])
+        .unwrap();
+    let result = store.repair_selector_from(RepairSelectorFrom {
+        workspace_id: "W".into(),
+        ticket_id: "T".into(),
+        selector_from: "wrong-work".into(),
+        resolved_subject_ref: "different-subject".into(),
+        repaired_by: WorkerIdentity {
+            runtime_id: "browser".into(),
+            worker_id: "user".into(),
+        },
+        reason: "wrong candidate".into(),
+        now: at(8),
+    });
+    assert!(matches!(result, Err(MergeRequestError::NotReady(_))));
+}

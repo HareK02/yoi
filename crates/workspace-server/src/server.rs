@@ -3877,14 +3877,17 @@ async fn scoped_repair_merge_request_selector(
     }
     let store = merge_request_store(&api, &workspace_id)?;
     let mr = store.get(&workspace_id, &ticket_id)?;
-    api.repository_reader()
+    let resolved_subject_ref = api
+        .repository_reader()
         .observe_merge_target(&mr.repository_id, Some(&input.selector_from))
-        .map_err(repository_merge_evidence_error)?;
+        .map_err(repository_merge_evidence_error)?
+        .commit;
     Ok(Json(store.repair_selector_from(
         merge_request::RepairSelectorFrom {
             workspace_id,
             ticket_id,
             selector_from: input.selector_from,
+            resolved_subject_ref,
             repaired_by: merge_request::WorkerIdentity {
                 runtime_id: "browser".into(),
                 worker_id: "authenticated-user".into(),
@@ -4079,17 +4082,6 @@ async fn scoped_complete_merge_request(
         )
         .into());
     }
-    let already = observed.commit == input.target_ref_after;
-    if !already {
-        repositories
-            .update_merge_target(
-                &mr.repository_id,
-                &mr.selector_to,
-                &input.target_ref_before,
-                &input.target_ref_after,
-            )
-            .map_err(repository_merge_evidence_error)?
-    }
     let completion = merge_request::CompleteMergeRequest {
         ticket_id,
         operation_id: input.operation_id,
@@ -4108,6 +4100,18 @@ async fn scoped_complete_merge_request(
         },
         now: Utc::now(),
     };
+    store.validate_completion(&completion)?;
+    let already = observed.commit == input.target_ref_after;
+    if !already {
+        repositories
+            .update_merge_target(
+                &mr.repository_id,
+                &mr.selector_to,
+                &input.target_ref_before,
+                &input.target_ref_after,
+            )
+            .map_err(repository_merge_evidence_error)?
+    }
     match store.complete(completion) {
         Ok(v) => Ok(Json(v)),
         Err(e) => {

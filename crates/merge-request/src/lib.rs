@@ -256,6 +256,7 @@ pub struct RepairSelectorFrom {
     pub workspace_id: String,
     pub ticket_id: String,
     pub selector_from: String,
+    pub resolved_subject_ref: String,
     pub repaired_by: WorkerIdentity,
     pub reason: String,
     pub now: DateTime<Utc>,
@@ -638,7 +639,66 @@ impl MergeRequestStore {
             review,
         })
     }
+    pub fn validate_completion(&self, i: &CompleteMergeRequest) -> Result<(), MergeRequestError> {
+        let mr = self.get(&i.auth.workspace_id, &i.ticket_id)?;
+        self.completion_auth(&i.auth, &i.ticket_id, &mr.repository_id)?;
+        if let Some(existing) = mr.thread.iter().find_map(|event| match event {
+            MergeRequestThreadEvent::Merge(value) if value.operation_id == i.operation_id => {
+                Some(value)
+            }
+            _ => None,
+        }) {
+            if existing.approval_event_id == i.approval_event_id
+                && existing.target_ref_before == i.target_ref_before
+                && existing.target_ref_after == i.target_ref_after
+            {
+                return Ok(());
+            }
+            return Err(MergeRequestError::Conflict(
+                "operation fingerprint mismatch".into(),
+            ));
+        }
+        if mr.state != MergeRequestState::Open {
+            return Err(MergeRequestError::Conflict(
+                "Merge Request is not open".into(),
+            ));
+        }
+        let review = mr
+            .effective_review(&i.current_subject_ref)
+            .filter(|review| review.event_id == i.approval_event_id)
+            .ok_or_else(|| {
+                MergeRequestError::NotReady(
+                    "approval is not the current effective review for the source ref".into(),
+                )
+            })?;
+        if review.decision != ReviewDecision::Approve {
+            return Err(MergeRequestError::NotReady(
+                "current effective review does not approve the source ref".into(),
+            ));
+        }
+        if i.target_ref_before == i.target_ref_after {
+            return Err(MergeRequestError::Validation(
+                "target ref did not change".into(),
+            ));
+        }
+        let state: Option<String> = self
+            .lock()?
+            .query_row(
+                "SELECT workflow_state FROM typed_tickets WHERE workspace_id=?1 AND ticket_id=?2",
+                params![mr.workspace_id, i.ticket_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if state.as_deref() != Some("inprogress") {
+            return Err(MergeRequestError::Conflict(
+                "Ticket must be inprogress".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn complete(&self, i: CompleteMergeRequest) -> Result<MergeEvent, MergeRequestError> {
+        self.validate_completion(&i)?;
         let mr = self.get(&i.auth.workspace_id, &i.ticket_id)?;
         self.completion_auth(&i.auth, &i.ticket_id, &mr.repository_id)?;
         if let Some(v) = mr.thread.iter().find_map(|x| match x {
@@ -765,10 +825,19 @@ impl MergeRequestStore {
         i: RepairSelectorFrom,
     ) -> Result<MergeRequest, MergeRequestError> {
         nonempty("selector_from", &i.selector_from)?;
+        nonempty("resolved_subject_ref", &i.resolved_subject_ref)?;
         let mr = self.get(&i.workspace_id, &i.ticket_id)?;
         if mr.selector_from.is_some() {
             return Err(MergeRequestError::Conflict(
                 "selector_from is immutable after it is set".into(),
+            ));
+        }
+        let approved = mr
+            .effective_review(&i.resolved_subject_ref)
+            .is_some_and(|review| review.decision == ReviewDecision::Approve);
+        if !approved {
+            return Err(MergeRequestError::NotReady(
+                "selector repair must resolve to an approved thread subject".into(),
             ));
         }
         let mut c = self.lock()?;
