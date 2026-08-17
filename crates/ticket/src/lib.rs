@@ -4319,6 +4319,12 @@ impl TicketBackend for LocalTicketBackend {
         let dir = self.find_ticket_dir(&id)?;
         let item = dir.join("item.md");
         let meta = ticket_meta_for_dir(&dir, read_item_file(&item)?.frontmatter)?;
+        if meta.workflow_state != TicketWorkflowState::Ready {
+            return Err(TicketError::StaleWorkflowState {
+                expected: TicketWorkflowState::Ready.as_str().to_owned(),
+                actual: meta.workflow_state.as_str().to_owned(),
+            });
+        }
         let ticket = self.ticket_from_dir(&dir)?;
         let target = resolve_ready_target(self.target_authority.as_ref(), "local", &ticket)?;
         let blockers = self.relation_blockers_for_meta(&meta)?;
@@ -7642,7 +7648,7 @@ state: planning
 
         assert!(matches!(
             backend.queue_ready(TicketIdOrSlug::Id(ticket.id.clone()), "workspace-panel"),
-            Err(TicketError::Conflict(_))
+            Err(TicketError::StaleWorkflowState { .. })
         ));
         let record = backend.show(TicketIdOrSlug::Id(ticket.id)).unwrap();
         assert_eq!(record.meta.workflow_state, TicketWorkflowState::Planning);
