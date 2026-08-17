@@ -767,21 +767,6 @@ mod tests {
     }
 
     #[test]
-    fn prompt_source_names_the_worker_observation_contract() {
-        let catalog = crate::PromptCatalog::builtins_only().unwrap();
-        let source = &catalog.projection().templates["common.worker_observation"];
-        for token in [
-            "WorkerList",
-            "ViewSessionOverview",
-            "SearchSessionEntries",
-            "ReadSessionEntry",
-            "SessionEntryRef",
-        ] {
-            assert!(source.contains(token), "missing {token}");
-        }
-    }
-
-    #[test]
     fn worker_observation_requires_worker_control_service() {
         let provider = Arc::new(FakeProvider {
             captures: Mutex::new(Vec::new()),

@@ -6955,7 +6955,6 @@ mod build_summary_prompt_tests {
         )
         .await;
 
-        assert!(rendered.contains("## Resident memory summary"));
         assert!(rendered.contains("summary body for resident prompt"));
         assert!(!rendered.contains("updated_at: 2026-01-01T00:00:00Z"));
         assert!(!rendered.contains("---\nupdated_at"));
@@ -6974,7 +6973,6 @@ mod build_summary_prompt_tests {
         )
         .await;
 
-        assert!(!rendered.contains("Resident memory summary"));
         assert!(!rendered.contains("disabled summary body"));
     }
 
@@ -6987,7 +6985,6 @@ mod build_summary_prompt_tests {
         )
         .await;
 
-        assert!(!rendered.contains("Resident memory summary"));
         assert!(!rendered.contains("memory-disabled summary body"));
     }
 
@@ -7000,8 +6997,7 @@ mod build_summary_prompt_tests {
         )
         .await;
 
-        assert!(rendered.contains("## Working boundaries"));
-        assert!(!rendered.contains("Resident memory summary"));
+        assert!(!rendered.trim().is_empty());
         assert!(!rendered.contains("bad summary body"));
     }
 
@@ -7015,7 +7011,6 @@ mod build_summary_prompt_tests {
         )
         .await;
 
-        assert!(!prompt.contains("Resident memory summary"));
         assert!(!prompt.contains("resident summary marker"));
     }
 

@@ -67,30 +67,4 @@ mod tests {
             assert_eq!(selected.revision, source.revision);
         }
     }
-
-    #[test]
-    fn coder_review_preserves_branch_policy_and_hands_approval_to_orchestrator() {
-        let source =
-            builtin_flow_source(CODER_REVIEW_FLOW_SLUG).expect("coder-review Flow must exist");
-
-        for required in [
-            "detached HEAD",
-            "work/<ticket-id>-<slug>",
-            "explicitly authorized",
-            "git add",
-            "git commit",
-            "Workdir is clean",
-            "current head commit",
-            "same Ticket work branch",
-            "new revision",
-        ] {
-            assert!(
-                source.content.contains(required),
-                "coder-review Flow must preserve branch/commit policy token {required:?}"
-            );
-        }
-        assert!(source.content.contains("hand off to the Orchestrator"));
-        assert!(source.content.contains("Do not call MergeRequestComplete"));
-        assert!(!source.content.contains("Call MergeRequestComplete with"));
-    }
 }

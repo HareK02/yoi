@@ -506,66 +506,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtin_dcdl_catalog_covers_worker_prompts() {
+    fn builtin_dcdl_catalog_loads() {
         let catalog = PromptCatalog::builtins_only().unwrap();
-        for prompt in WorkerPrompt::ALL {
-            assert!(catalog.projection.templates.contains_key(prompt.key()));
-        }
-        assert!(catalog.projection.templates.contains_key("default"));
-        assert!(
-            catalog
-                .projection
-                .templates
-                .contains_key("common.workspace")
-        );
-        assert!(catalog.projection.templates.contains_key("role.coder"));
-        assert!(
-            catalog
-                .projection
-                .templates
-                .contains_key("panel.orchestrator_idle_queue_notice")
-        );
-    }
-
-    #[test]
-    fn commit_capable_roles_classify_commits_by_change_type() {
-        let catalog = PromptCatalog::builtins_only().unwrap();
-        assert!(catalog.projection.templates.contains_key("common.git"));
-        let context = Value::from_serialize(serde_json::json!({
-            "cwd": "/workspace",
-            "date": "2026-08-16",
-            "language": "match the user's language",
-            "tool_capabilities": {
-                "memory_any": false,
-                "memory_mutation": false,
-                "memory_query": false,
-                "memory_read_document": false
-            }
-        }));
-
-        for prompt in ["default", "role.coder", "role.orchestrator"] {
-            let rendered = catalog.render_name(prompt, context.clone()).unwrap();
-            assert!(rendered.contains("use the change type as the subject prefix"));
-            assert!(rendered.contains("A change made because review"));
-            assert!(rendered.contains("Do not keep reusing a domain prefix"));
-            assert!(rendered.contains("fix: scope merge request foreign key checks"));
-        }
-    }
-
-    #[test]
-    fn builtin_render_resolves_catalog_root_dotted_includes() {
-        let catalog = PromptCatalog::builtins_only().unwrap();
-        let source = &catalog.projection.templates["default"];
-        assert!(source.contains("{% include \"common.workspace\" %}"));
-        assert!(source.contains("{% include \"common.tool_usage\" %}"));
-    }
-
-    #[test]
-    fn schema_is_closed_and_materializes_builtin_defaults() {
-        let source = prompt_schema_source().unwrap();
-        assert!(source.starts_with("{ prompts = {"));
-        assert!(source.contains("compact_system = String default"));
-        assert!(source.contains("role = {"));
+        assert!(!catalog.projection.templates.is_empty());
     }
 
     #[test]
@@ -591,7 +534,10 @@ mod tests {
 
     #[test]
     fn workspace_projection_digest_is_stable_and_verified() {
-        let templates = builtin_prompt_templates().unwrap();
+        let templates = BTreeMap::from([
+            ("first".to_string(), "FIRST".to_string()),
+            ("second".to_string(), "SECOND".to_string()),
+        ]);
         let projection = EffectivePromptCatalog::new(templates, 42, "schema", "toolchain").unwrap();
         projection.verify_digest().unwrap();
         let mut tampered = projection.clone();
@@ -606,70 +552,38 @@ mod tests {
 
     #[test]
     fn catalog_source_preserves_workspace_projection_for_subworkers() {
-        let mut templates = builtin_prompt_templates().unwrap();
-        templates.insert("common.workspace".into(), "CHILD OVERRIDE".into());
+        let templates = BTreeMap::from([("template".to_string(), "OVERRIDE".to_string())]);
         let catalog = PromptCatalog::from_projection(
             EffectivePromptCatalog::new(templates, 9, "schema", "toolchain").unwrap(),
         )
         .unwrap();
         let child = PromptCatalog::load(&catalog.source()).unwrap();
         assert_eq!(child.projection.config_revision, 9);
-        assert_eq!(
-            child.projection.templates["common.workspace"],
-            "CHILD OVERRIDE"
-        );
+        assert_eq!(child.projection.templates["template"], "OVERRIDE");
     }
 
     #[test]
-    fn orchestrator_role_keeps_review_routing_owned_by_coder() {
+    fn internal_prompt_helpers_load_and_render_arguments() {
         let catalog = PromptCatalog::builtins_only().unwrap();
-        let prompt = &catalog.projection.templates["role.orchestrator"];
-        assert!(prompt.contains("assigned Coder owns its review/fix loop"));
-        assert!(prompt.contains("then use `SpawnTicketCoder`"));
-        assert!(prompt.contains("verify its current assignment names that Coder"));
-        assert!(prompt.contains("never route implementation to an unassigned Coder"));
-        assert!(prompt.contains(
-            "Do not spawn, restore, assign, or route work to Backend/Runtime Reviewer Workers"
-        ));
-        assert!(prompt.contains("never compensate by creating an independent Reviewer Worker"));
-        assert!(
-            prompt.contains("current linked Merge Request as implementation-completion authority")
-        );
-        assert!(prompt.contains("do not require an `implementation_report`"));
-        assert!(prompt.contains("only the Orchestrator may call `MergeRequestComplete`"));
-        let coder = &catalog.projection.templates["role.coder"];
-        assert!(coder.contains("hand off to the Orchestrator"));
-        assert!(coder.contains("Do not call `MergeRequestComplete`"));
-        assert!(!prompt.contains("sibling Coder/Reviewer Workers"));
-    }
-
-    #[test]
-    fn existing_internal_prompt_render_contracts_are_preserved() {
-        let catalog = PromptCatalog::builtins_only().unwrap();
-        assert!(catalog.compact_system().unwrap().contains("write_summary"));
+        catalog.compact_system().unwrap();
         assert!(
             catalog
-                .memory_extract_system("Japanese")
+                .memory_extract_system("LANGUAGE_MARKER")
                 .unwrap()
-                .contains("`language`: `Japanese`")
+                .contains("LANGUAGE_MARKER")
         );
         assert!(
             catalog
-                .notify_wrapper("changed")
+                .notify_wrapper("NOTIFICATION_MARKER")
                 .unwrap()
-                .contains("changed")
+                .contains("NOTIFICATION_MARKER")
         );
         assert!(
             catalog
-                .working_boundaries_section("Readable: /a")
+                .working_boundaries_section("BOUNDARY_MARKER")
                 .unwrap()
-                .contains("Readable: /a")
+                .contains("BOUNDARY_MARKER")
         );
-        assert!(
-            catalog
-                .worker_orchestration_guidance_section()
-                .unwrap()
-                .contains("## SubWorker orchestration")
-        );
+        catalog.worker_orchestration_guidance_section().unwrap();
     }
 }

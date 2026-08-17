@@ -115,12 +115,16 @@ mod tests {
 
     #[test]
     fn workspace_override_deep_patches_builtin_and_preserves_other_leaves() {
+        let baseline = project_prompts_from_workspace_config(&state("{}")).unwrap();
         let state = state(r#"{ prompts = { common = { language = "OVERRIDE"; }; }; }"#);
         let catalog = project_prompts_from_workspace_config(&state).unwrap();
         assert_eq!(catalog.config_revision, 7);
         assert_eq!(catalog.templates["common.language"], "OVERRIDE");
-        assert!(!catalog.templates["common.workspace"].is_empty());
-        assert!(catalog.templates["default"].contains("common.workspace"));
+        for (key, value) in baseline.templates {
+            if key != "common.language" {
+                assert_eq!(catalog.templates.get(&key), Some(&value));
+            }
+        }
     }
 
     #[test]

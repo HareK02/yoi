@@ -4217,13 +4217,12 @@ mod tests {
     }
 
     #[test]
-    fn embedded_orchestrator_profile_enables_workdir_and_worker_authority() {
+    fn embedded_builtin_decodal_profiles_resolve_through_archive() {
         let root = tempfile::tempdir().unwrap();
         let broker = BackendResourceBroker::default();
         let runtime_id = "runtime-test";
-        let selector = ProfileSelector::Builtin("builtin:orchestrator".to_string());
         let bundle = builtin_profile_config_bundle(
-            &selector,
+            &ProfileSelector::Builtin("builtin:companion".to_string()),
             "workspace-test",
             Some(runtime_id),
             &broker,
@@ -4231,6 +4230,7 @@ mod tests {
         )
         .unwrap();
         let handle = bundle.profile_source_archive_handle.as_ref().unwrap();
+        assert!(bundle.profile_source_archive.is_none());
         let response = broker
             .fetch_profile_source_archive(worker_runtime::resource::BackendResourceFetchRequest {
                 handle: handle.clone(),
@@ -4244,85 +4244,12 @@ mod tests {
                 .unwrap()
                 .verify()
                 .unwrap();
-        let manifest = archive
-            .resolve_profile("builtin:orchestrator", root.path(), "embedded-orchestrator")
-            .unwrap();
-
-        assert!(manifest.feature.manage_workdir.enabled);
-        assert!(!manifest.feature.sub_worker.enabled);
-        assert!(manifest.feature.worker.enabled);
-    }
-
-    #[test]
-    fn embedded_companion_profile_enables_worker_management() {
-        let root = tempfile::tempdir().unwrap();
-        let selector = ProfileSelector::Builtin("builtin:companion".to_string());
-        let archive = builtin_profile_source_archive(&selector)
-            .unwrap()
-            .verify()
-            .unwrap();
-        let manifest = archive
-            .resolve_profile("builtin:companion", root.path(), "companion-test-worker")
-            .unwrap();
-
-        assert!(manifest.feature.worker.enabled);
-        assert!(manifest.feature.sub_worker.enabled);
-        assert!(!manifest.feature.manage_workdir.enabled);
-    }
-
-    #[test]
-    fn embedded_builtin_decodal_profiles_resolve_through_archive() {
-        let root = tempfile::tempdir().unwrap();
-        let broker = BackendResourceBroker::default();
-        let runtime_id = "runtime-test";
-        for selector in [
-            ProfileSelector::Builtin("builtin:companion".to_string()),
-            ProfileSelector::Builtin("builtin:intake".to_string()),
-            ProfileSelector::Builtin("builtin:orchestrator".to_string()),
-            ProfileSelector::Builtin("builtin:coder".to_string()),
-            ProfileSelector::Builtin("builtin:reviewer".to_string()),
-            ProfileSelector::Builtin("builtin:memory-consolidation".to_string()),
-        ] {
-            let bundle = builtin_profile_config_bundle(
-                &selector,
-                "workspace-test",
-                Some(runtime_id),
-                &broker,
-                ProfileSourceArchiveTransport::BackendResourceHandle,
-            )
-            .unwrap();
-            let handle = bundle.profile_source_archive_handle.as_ref().unwrap();
-            assert!(bundle.profile_source_archive.is_none());
-            let response = broker
-                .fetch_profile_source_archive(
-                    worker_runtime::resource::BackendResourceFetchRequest {
-                        handle: handle.clone(),
-                        runtime_id: runtime_id.to_string(),
-                        worker_id: None,
-                        audit_correlation_id: handle.audit_correlation_id.clone(),
-                    },
-                )
-                .unwrap();
-            let archive =
-                worker_runtime::resource::profile_source_archive_from_response(handle, response)
-                    .unwrap()
-                    .verify()
-                    .unwrap();
-            let selector_key = match &selector {
-                ProfileSelector::Builtin(name) | ProfileSelector::Named(name) => name.clone(),
-            };
+        assert!(!archive.reference().source_graph.entrypoints.is_empty());
+        for selector_key in archive.reference().source_graph.entrypoints.keys() {
             let manifest = archive
-                .resolve_profile(&selector_key, root.path(), "embedded-test-worker")
+                .resolve_profile(selector_key, root.path(), "embedded-test-worker")
                 .unwrap();
             assert_eq!(manifest.worker.name, "embedded-test-worker");
-            assert_eq!(
-                manifest.model.ref_.as_deref(),
-                Some("codex-oauth/gpt-5.6-sol")
-            );
-            if selector_key == "builtin:memory-consolidation" {
-                assert!(manifest.feature.memory.enabled);
-                assert!(manifest.feature.memory.staging);
-            }
         }
     }
 

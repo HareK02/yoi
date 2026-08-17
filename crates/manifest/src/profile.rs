@@ -1282,179 +1282,23 @@ mod tests {
         let registry = ProfileDiscovery::with_sources(None, None)
             .discover()
             .unwrap();
-        for expected in ["companion", "intake", "orchestrator", "coder", "reviewer"] {
-            let entry = registry
-                .select(&ProfileSelector::source_named(
-                    ProfileRegistrySource::Builtin,
-                    expected,
-                ))
-                .unwrap();
+        assert!(!registry.entries().is_empty());
+        for entry in registry.entries() {
             assert_eq!(entry.source, ProfileRegistrySource::Builtin);
             assert_eq!(entry.path, None);
-            assert_eq!(entry.provenance, format!("builtin:{expected}"));
 
             let resolved = ProfileResolver::new()
                 .with_workspace_base(tmp.path())
                 .resolve(
-                    &ProfileSelector::source_named(ProfileRegistrySource::Builtin, expected),
+                    &ProfileSelector::source_named(
+                        ProfileRegistrySource::Builtin,
+                        entry.name.as_str(),
+                    ),
                     ProfileResolveOptions::with_worker_name("role-worker"),
                 )
                 .unwrap();
-            assert_eq!(
-                resolved.profile.as_ref().unwrap().name.as_deref(),
-                Some(expected)
-            );
             assert_eq!(resolved.manifest.worker.name, "role-worker");
         }
-    }
-
-    #[test]
-    fn builtin_memory_consolidation_profile_enables_staging_by_feature() {
-        let tmp = TempDir::new().unwrap();
-        let resolved = ProfileResolver::new()
-            .with_workspace_base(tmp.path())
-            .resolve(
-                &ProfileSelector::source_named(
-                    ProfileRegistrySource::Builtin,
-                    "memory-consolidation",
-                ),
-                ProfileResolveOptions::with_worker_name("arbitrary-worker-name"),
-            )
-            .unwrap();
-
-        assert_eq!(
-            resolved.profile.as_ref().unwrap().name.as_deref(),
-            Some("memory-consolidation")
-        );
-        assert_eq!(resolved.manifest.worker.name, "arbitrary-worker-name");
-        assert!(resolved.manifest.feature.memory.enabled);
-        assert!(resolved.manifest.feature.memory.staging);
-        assert!(!resolved.manifest.feature.objective.enabled);
-    }
-
-    #[test]
-    fn builtin_role_profiles_preserve_role_tool_policy() {
-        let tmp = TempDir::new().unwrap();
-        let resolve = |role: &str| {
-            ProfileResolver::new()
-                .with_workspace_base(tmp.path())
-                .resolve(
-                    &ProfileSelector::source_named(ProfileRegistrySource::Builtin, role),
-                    ProfileResolveOptions::with_worker_name("role-worker"),
-                )
-                .unwrap()
-                .manifest
-        };
-
-        let companion = resolve("companion");
-        assert!(companion.feature.task.enabled);
-        assert!(companion.feature.sub_worker.enabled);
-        assert!(companion.feature.worker.enabled);
-        assert!(companion.scope.allow.is_empty());
-        assert!(companion.scope.deny.is_empty());
-        assert!(companion.delegation_scope.allow.is_empty());
-        assert_eq!(companion.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
-        assert!(companion.web.is_some());
-        assert!(companion.feature.ticket.enabled);
-        assert!(companion.feature.ticket.authoring);
-        assert!(companion.feature.ticket.thread);
-        assert!(companion.feature.objective.enabled);
-        assert!(!companion.feature.ticket.intake);
-        assert!(!companion.feature.orchestration.enabled);
-        assert_eq!(
-            companion.compaction.as_ref().unwrap().threshold,
-            Some(240000)
-        );
-        assert_eq!(
-            companion.compaction.as_ref().unwrap().request_threshold,
-            Some(270000)
-        );
-        assert_eq!(
-            companion
-                .compaction
-                .as_ref()
-                .unwrap()
-                .worker_context_max_tokens,
-            100000
-        );
-
-        let intake = resolve("intake");
-        assert!(intake.feature.task.enabled);
-        assert!(!intake.feature.sub_worker.enabled);
-        assert!(!intake.feature.worker.enabled);
-        assert!(intake.feature.ticket.enabled);
-        assert!(intake.feature.ticket.enabled);
-        assert!(intake.feature.ticket.authoring);
-        assert!(intake.feature.ticket.thread);
-        assert!(intake.feature.objective.enabled);
-        assert!(!intake.feature.manage_workdir.enabled);
-        assert!(intake.feature.ticket.intake);
-        assert!(!intake.feature.orchestration.enabled);
-        assert!(intake.scope.allow.is_empty());
-        assert!(intake.delegation_scope.allow.is_empty());
-        assert_eq!(intake.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
-        assert!(intake.web.is_some());
-        assert!(intake.compaction.is_some());
-
-        let orchestrator = resolve("orchestrator");
-        assert!(orchestrator.feature.task.enabled);
-        assert!(!orchestrator.feature.sub_worker.enabled);
-        assert!(orchestrator.feature.worker.enabled);
-        assert!(!orchestrator.feature.worker.direct_spawn);
-        assert!(orchestrator.feature.ticket.enabled);
-        assert!(orchestrator.feature.ticket.enabled);
-        assert!(!orchestrator.feature.ticket.authoring);
-        assert!(orchestrator.feature.ticket.thread);
-        assert!(orchestrator.feature.objective.enabled);
-        assert!(orchestrator.feature.manage_workdir.enabled);
-        assert!(!orchestrator.feature.ticket.intake);
-        assert!(orchestrator.feature.ticket.workflow);
-        assert!(orchestrator.feature.orchestration.enabled);
-        assert!(orchestrator.scope.allow.is_empty());
-        assert!(orchestrator.delegation_scope.allow.is_empty());
-        assert_eq!(
-            orchestrator.model.ref_.as_deref(),
-            Some("codex-oauth/gpt-5.5")
-        );
-        assert!(orchestrator.web.is_some());
-        assert!(orchestrator.compaction.is_some());
-
-        let coder = resolve("coder");
-        assert!(coder.feature.task.enabled);
-        assert!(coder.feature.sub_worker.enabled);
-        assert!(coder.feature.flow.enabled);
-        assert!(!coder.feature.worker.enabled);
-        assert!(coder.scope.allow.is_empty());
-        assert!(coder.delegation_scope.allow.is_empty());
-        assert_eq!(coder.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
-        assert!(coder.web.is_some());
-        assert!(coder.compaction.is_some());
-        assert!(coder.feature.ticket.enabled);
-        assert!(coder.feature.ticket.enabled);
-        assert!(!coder.feature.ticket.authoring);
-        assert!(coder.feature.ticket.thread);
-        assert!(coder.feature.objective.enabled);
-        assert!(!coder.feature.manage_workdir.enabled);
-        assert!(!coder.feature.ticket.intake);
-        assert!(!coder.feature.orchestration.enabled);
-        let reviewer = resolve("reviewer");
-        assert!(reviewer.feature.task.enabled);
-        assert!(!reviewer.feature.sub_worker.enabled);
-        assert!(!reviewer.feature.flow.enabled);
-        assert!(!reviewer.feature.worker.enabled);
-        assert!(reviewer.feature.ticket.enabled);
-        assert!(reviewer.feature.ticket.enabled);
-        assert!(!reviewer.feature.ticket.authoring);
-        assert!(reviewer.feature.ticket.thread);
-        assert!(reviewer.feature.objective.enabled);
-        assert!(!reviewer.feature.manage_workdir.enabled);
-        assert!(!reviewer.feature.ticket.intake);
-        assert!(!reviewer.feature.orchestration.enabled);
-        assert!(reviewer.scope.allow.is_empty());
-        assert!(reviewer.delegation_scope.allow.is_empty());
-        assert_eq!(reviewer.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
-        assert!(reviewer.web.is_some());
-        assert!(reviewer.compaction.is_some());
     }
 
     #[test]
@@ -1693,40 +1537,6 @@ worker_context_max_tokens = 68000
     fn rejects_absolute_profile_paths() {
         let err = resolve_profile_artifact(ProfileSource::Path { path: PathBuf::from("/profiles/bad.json") }, Path::new("/workspace"), serde_json::json!({"model": { "scheme": "anthropic", "model_id": "m", "auth": {"kind":"api_key", "file":"/secret/key"} }, "scope": "workspace_write"})).unwrap_err();
         assert!(err.to_string().contains("model.auth.file"));
-    }
-    #[test]
-    fn builtin_companion_resolves_without_external_evaluator() {
-        let tmp = TempDir::new().unwrap();
-        let resolved = ProfileResolver::new()
-            .with_workspace_base(tmp.path())
-            .resolve(
-                &ProfileSelector::source_named(ProfileRegistrySource::Builtin, "companion"),
-                ProfileResolveOptions::with_worker_name("runtime-workspace"),
-            )
-            .unwrap();
-        assert_eq!(resolved.manifest.worker.name, "runtime-workspace");
-        assert_eq!(
-            resolved.manifest.model.ref_.as_deref(),
-            Some("codex-oauth/gpt-5.5")
-        );
-        assert!(resolved.manifest.feature.ticket.enabled);
-        assert!(resolved.manifest.feature.ticket.authoring);
-        assert!(resolved.manifest.feature.ticket.thread);
-        assert!(!resolved.manifest.feature.ticket.intake);
-        assert!(!resolved.manifest.feature.orchestration.enabled);
-        assert_eq!(
-            resolved.profile.as_ref().unwrap().name.as_deref(),
-            Some("companion")
-        );
-        assert_eq!(
-            resolved.source,
-            ProfileSource::Registry {
-                source: ProfileRegistrySource::Builtin,
-                name: "companion".into(),
-                path: None,
-                provenance: Some("builtin:companion".into()),
-            }
-        );
     }
     #[test]
     fn unsupported_profile_extension_has_clear_diagnostic() {

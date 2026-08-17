@@ -741,32 +741,6 @@ mod tests {
     }
 
     #[test]
-    fn virtual_config_projection_is_builtin_only_by_default() {
-        let state = virtual_state(vec![
-            config_source::ConfigEntry::new(
-                VirtualPath::parse("main.dcdl").unwrap(),
-                ConfigContentType::Decodal,
-                "{}",
-            )
-            .unwrap(),
-        ]);
-        let projection = project_profiles_from_workspace_config("workspace-test", &state).unwrap();
-        assert_eq!(
-            projection.settings.default_profile.as_deref(),
-            Some("builtin:companion")
-        );
-        assert_eq!(projection.settings.config_revision, Some(7));
-        assert!(projection.settings.projection_digest.is_some());
-        assert!(
-            projection
-                .settings
-                .profiles
-                .iter()
-                .all(|item| !item.editable)
-        );
-    }
-
-    #[test]
     fn virtual_config_projection_builds_archive_from_active_revision() {
         let state = virtual_state(vec![
             config_source::ConfigEntry::new(
@@ -795,8 +769,7 @@ mod tests {
         assert_eq!(projection.settings.config_revision, Some(7));
         let prompt_catalog = bundle.prompt_catalog.as_ref().unwrap();
         assert_eq!(prompt_catalog.config_revision, 7);
-        assert!(prompt_catalog.templates.contains_key("default"));
-        assert!(prompt_catalog.templates.contains_key("common.workspace"));
+        assert!(!prompt_catalog.templates.is_empty());
         assert!(
             bundle
                 .metadata

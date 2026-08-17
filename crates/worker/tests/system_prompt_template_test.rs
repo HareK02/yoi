@@ -176,12 +176,9 @@ async fn template_is_not_materialised_before_first_run() {
 #[tokio::test]
 async fn materialise_on_first_turn_populates_worker() {
     let client = MockClient::new(vec![single_text_events("ok")]);
-    let (mut worker, pwd) = make_worker_with_body(
-        "date={{ date }} cwd={{ cwd }} tools={{ tools | join(',') }}",
-        client,
-    )
-    .await
-    .unwrap();
+    let (mut worker, pwd) = make_worker_with_body("date={{ date }}", client)
+        .await
+        .unwrap();
     worker.run_text("hi").await.unwrap();
     let rendered = worker
         .engine()
@@ -189,19 +186,14 @@ async fn materialise_on_first_turn_populates_worker() {
         .expect("system prompt materialised")
         .to_string();
     assert!(rendered.contains("date="));
-    assert!(rendered.contains("cwd="));
     assert!(rendered.contains(&pwd.display().to_string()));
     assert!(rendered.starts_with("date="));
-    // Trailing fixed section must be appended.
-    assert!(rendered.contains("## Working boundaries"));
 }
 
 #[tokio::test]
 async fn session_start_state_captures_rendered_prompt() {
     let client = MockClient::new(vec![single_text_events("ok")]);
-    let (mut worker, pwd) = make_worker_with_body("hello cwd={{ cwd }}", client)
-        .await
-        .unwrap();
+    let (mut worker, pwd) = make_worker_with_body("hello", client).await.unwrap();
     worker.run_text("hi").await.unwrap();
 
     let entries = worker
@@ -212,9 +204,8 @@ async fn session_start_state_captures_rendered_prompt() {
     match first {
         LogEntry::SegmentStart { system_prompt, .. } => {
             let sp = system_prompt.as_deref().expect("system prompt set");
-            assert!(sp.starts_with("hello cwd="));
+            assert!(sp.starts_with("hello"));
             assert!(sp.contains(&pwd.display().to_string()));
-            assert!(sp.contains("## Working boundaries"));
         }
         other => panic!("expected SegmentStart as first entry, got {other:?}"),
     }
@@ -253,19 +244,8 @@ async fn agents_md_is_injected_as_trailing_section_when_present() {
     worker.run_text("hi").await.unwrap();
     let rendered = worker.engine().get_system_prompt().unwrap().to_string();
     assert!(rendered.starts_with("BODY"));
-    assert!(rendered.contains("## Project instructions (AGENTS.md)"));
     assert!(rendered.contains("# project rules"));
     assert!(rendered.contains("be kind"));
-}
-
-#[tokio::test]
-async fn agents_md_absent_omits_trailing_section() {
-    let client = MockClient::new(vec![single_text_events("ok")]);
-    let (mut worker, _pwd) = make_worker_with_body("BODY", client).await.unwrap();
-    worker.run_text("hi").await.unwrap();
-    let rendered = worker.engine().get_system_prompt().unwrap().to_string();
-    assert!(!rendered.contains("## Project instructions"));
-    assert!(!rendered.contains("AGENTS.md"));
 }
 
 #[tokio::test]

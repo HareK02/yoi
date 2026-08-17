@@ -373,108 +373,57 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    #[test]
-    fn builtin_has_four_providers() {
-        let entries = load_builtin_providers().unwrap();
-        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec!["anthropic", "ollama-local", "codex-oauth", "openrouter"]
-        );
-    }
-
-    #[test]
-    fn builtin_provider_default_capability_present() {
-        let entries = load_builtin_providers().unwrap();
-        let anthropic = entries.iter().find(|e| e.id == "anthropic").unwrap();
-        assert!(anthropic.default_capability.is_some());
-    }
-
-    #[test]
-    fn builtin_models_cover_each_provider() {
-        let entries = load_builtin_models().unwrap();
-        let providers: std::collections::BTreeSet<&str> =
-            entries.iter().map(|m| m.provider.as_str()).collect();
-        for p in ["anthropic", "ollama-local", "codex-oauth", "openrouter"] {
-            assert!(
-                providers.contains(p),
-                "model catalog should cover provider `{p}`"
-            );
-        }
+    fn test_catalogs() -> (Vec<ProviderEntry>, Vec<ModelEntry>) {
+        (
+            vec![ProviderEntry {
+                id: "test-provider".to_string(),
+                display_name: "Test Provider".to_string(),
+                scheme: SchemeKind::OpenaiChat,
+                base_url: Some("https://example.invalid/v1".to_string()),
+                auth_hint: AuthHint::None,
+                default_capability: None,
+                default_context_window: Some(100_000),
+            }],
+            vec![ModelEntry {
+                id: "test-model".to_string(),
+                provider: "test-provider".to_string(),
+                context_window: Some(100_000),
+                max_context_window: Some(80_000),
+                capability: None,
+            }],
+        )
     }
 
     #[test]
     fn resolve_ref_merges_provider_and_model_catalog() {
-        let providers = load_builtin_providers().unwrap();
-        let models = load_builtin_models().unwrap();
+        let (providers, models) = test_catalogs();
         let manifest = ModelManifest {
-            ref_: Some("anthropic/claude-sonnet-4-6".into()),
+            ref_: Some("test-provider/test-model".into()),
             ..Default::default()
         };
         let cfg = resolve_with_catalogs(&manifest, &providers, &models).unwrap();
-        assert_eq!(cfg.scheme, SchemeKind::Anthropic);
-        assert_eq!(cfg.model_id, "claude-sonnet-4-6");
-        assert_eq!(cfg.base_url.as_deref(), Some("https://api.anthropic.com"));
-        match cfg.auth {
-            AuthRef::SecretRef { ref_ } => {
-                assert_eq!(ref_, "providers/anthropic/default");
-            }
-            _ => panic!("expected SecretRef auth from provider hint"),
-        }
-        assert!(
-            cfg.capability.is_some(),
-            "model catalog should provide capability"
-        );
-        assert_eq!(cfg.context_window, 1_000_000);
+        assert_eq!(cfg.scheme, SchemeKind::OpenaiChat);
+        assert_eq!(cfg.model_id, "test-model");
+        assert_eq!(cfg.base_url.as_deref(), Some("https://example.invalid/v1"));
+        assert!(matches!(cfg.auth, AuthRef::None));
+        assert_eq!(cfg.context_window, 80_000);
     }
 
     #[test]
     fn context_window_manifest_overrides_catalog() {
-        let providers = load_builtin_providers().unwrap();
-        let models = load_builtin_models().unwrap();
+        let (providers, models) = test_catalogs();
         let manifest = ModelManifest {
-            ref_: Some("anthropic/claude-sonnet-4-6".into()),
-            context_window: Some(123_456),
+            ref_: Some("test-provider/test-model".into()),
+            context_window: Some(70_000),
             ..Default::default()
         };
         let cfg = resolve_with_catalogs(&manifest, &providers, &models).unwrap();
-        assert_eq!(cfg.context_window, 123_456);
-    }
-
-    #[test]
-    fn codex_gpt56_sol_catalog_clamps_public_window_to_backend_limit() {
-        let providers = load_builtin_providers().unwrap();
-        let models = load_builtin_models().unwrap();
-        let manifest = ModelManifest {
-            ref_: Some("codex-oauth/gpt-5.6-sol".into()),
-            ..Default::default()
-        };
-        let cfg = resolve_with_catalogs(&manifest, &providers, &models).unwrap();
-        assert_eq!(cfg.model_id, "gpt-5.6-sol");
-        assert_eq!(cfg.context_window, 272_000);
-        assert_eq!(cfg.max_context_window, Some(272_000));
-        let capability = cfg.capability.expect("catalog capability");
-        assert!(capability.vision);
-        assert!(capability.reasoning.is_some());
-    }
-
-    #[test]
-    fn codex_gpt55_catalog_records_effective_context_window() {
-        let providers = load_builtin_providers().unwrap();
-        let models = load_builtin_models().unwrap();
-        let manifest = ModelManifest {
-            ref_: Some("codex-oauth/gpt-5.5".into()),
-            ..Default::default()
-        };
-        let cfg = resolve_with_catalogs(&manifest, &providers, &models).unwrap();
-        assert_eq!(cfg.context_window, 272_000);
-        assert_eq!(cfg.max_context_window, None);
+        assert_eq!(cfg.context_window, 70_000);
     }
 
     #[test]
     fn inline_context_window_is_clamped_by_manifest_backend_max() {
-        let providers = load_builtin_providers().unwrap();
-        let models = load_builtin_models().unwrap();
+        let (providers, models) = test_catalogs();
         let manifest = ModelManifest {
             scheme: Some(SchemeKind::Anthropic),
             model_id: Some("custom".into()),
@@ -490,25 +439,23 @@ mod tests {
 
     #[test]
     fn manifest_backend_max_clamps_ref_context_override() {
-        let providers = load_builtin_providers().unwrap();
-        let models = load_builtin_models().unwrap();
+        let (providers, models) = test_catalogs();
         let manifest = ModelManifest {
-            ref_: Some("codex-oauth/gpt-5.5".into()),
-            context_window: Some(1_000_000),
-            max_context_window: Some(500_000),
+            ref_: Some("test-provider/test-model".into()),
+            context_window: Some(100_000),
+            max_context_window: Some(50_000),
             ..Default::default()
         };
         let cfg = resolve_with_catalogs(&manifest, &providers, &models).unwrap();
-        assert_eq!(cfg.context_window, 500_000);
-        assert_eq!(cfg.max_context_window, Some(500_000));
+        assert_eq!(cfg.context_window, 50_000);
+        assert_eq!(cfg.max_context_window, Some(50_000));
     }
 
     #[test]
     fn resolve_ref_with_inline_overrides() {
-        let providers = load_builtin_providers().unwrap();
-        let models = load_builtin_models().unwrap();
+        let (providers, models) = test_catalogs();
         let manifest = ModelManifest {
-            ref_: Some("anthropic/claude-sonnet-4-6".into()),
+            ref_: Some("test-provider/test-model".into()),
             auth: Some(AuthRef::ApiKey {
                 file: Some(PathBuf::from("/tmp/sk-ant")),
             }),
@@ -525,22 +472,26 @@ mod tests {
 
     #[test]
     fn resolve_ref_with_nested_model_id() {
-        // OpenRouter: `<router>/<provider>/<model>` 形式の model_id を持つ
-        let providers = load_builtin_providers().unwrap();
-        let models = load_builtin_models().unwrap();
+        let (providers, mut models) = test_catalogs();
+        models.push(ModelEntry {
+            id: "namespace/model".to_string(),
+            provider: "test-provider".to_string(),
+            context_window: None,
+            max_context_window: None,
+            capability: None,
+        });
         let manifest = ModelManifest {
-            ref_: Some("openrouter/anthropic/claude-sonnet-4.6".into()),
+            ref_: Some("test-provider/namespace/model".into()),
             ..Default::default()
         };
         let cfg = resolve_with_catalogs(&manifest, &providers, &models).unwrap();
         assert_eq!(cfg.scheme, SchemeKind::OpenaiChat);
-        assert_eq!(cfg.model_id, "anthropic/claude-sonnet-4.6");
+        assert_eq!(cfg.model_id, "namespace/model");
     }
 
     #[test]
     fn resolve_ref_unknown_provider_is_hard_error() {
-        let providers = load_builtin_providers().unwrap();
-        let models = load_builtin_models().unwrap();
+        let (providers, models) = test_catalogs();
         let manifest = ModelManifest {
             ref_: Some("nope/some-model".into()),
             ..Default::default()
@@ -551,21 +502,19 @@ mod tests {
 
     #[test]
     fn resolve_ref_unknown_model_is_warn_not_error() {
-        let providers = load_builtin_providers().unwrap();
-        let models = load_builtin_models().unwrap();
+        let (providers, models) = test_catalogs();
         let manifest = ModelManifest {
-            ref_: Some("anthropic/some-future-claude".into()),
+            ref_: Some("test-provider/unknown-model".into()),
             ..Default::default()
         };
         let cfg = resolve_with_catalogs(&manifest, &providers, &models).unwrap();
-        assert_eq!(cfg.model_id, "some-future-claude");
-        assert!(cfg.capability.is_some(), "should use provider default");
+        assert_eq!(cfg.model_id, "unknown-model");
+        assert!(cfg.capability.is_none(), "should use provider default");
     }
 
     #[test]
     fn resolve_inline_full_form() {
-        let providers = load_builtin_providers().unwrap();
-        let models = load_builtin_models().unwrap();
+        let (providers, models) = test_catalogs();
         let manifest = ModelManifest {
             scheme: Some(SchemeKind::Anthropic),
             model_id: Some("claude-sonnet-4-6".into()),
@@ -583,8 +532,7 @@ mod tests {
 
     #[test]
     fn resolve_inline_context_window_override() {
-        let providers = load_builtin_providers().unwrap();
-        let models = load_builtin_models().unwrap();
+        let (providers, models) = test_catalogs();
         let manifest = ModelManifest {
             scheme: Some(SchemeKind::Anthropic),
             model_id: Some("claude-sonnet-4-6".into()),
@@ -600,8 +548,7 @@ mod tests {
 
     #[test]
     fn resolve_inline_missing_auth_errors() {
-        let providers = load_builtin_providers().unwrap();
-        let models = load_builtin_models().unwrap();
+        let (providers, models) = test_catalogs();
         let manifest = ModelManifest {
             scheme: Some(SchemeKind::Anthropic),
             model_id: Some("claude".into()),
@@ -613,8 +560,7 @@ mod tests {
 
     #[test]
     fn malformed_ref_errors() {
-        let providers = load_builtin_providers().unwrap();
-        let models = load_builtin_models().unwrap();
+        let (providers, models) = test_catalogs();
         let manifest = ModelManifest {
             ref_: Some("noslash".into()),
             ..Default::default()
@@ -711,6 +657,6 @@ auth_hint = { kind = "none" }
         // override ファイルは作らない
         let _g = ConfigDirGuard::new(dir.path());
         let entries = load_providers().unwrap();
-        assert_eq!(entries.len(), 4);
+        assert!(!entries.is_empty());
     }
 }

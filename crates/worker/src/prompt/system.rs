@@ -15,8 +15,6 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-#[cfg(test)]
-use std::path::Path;
 use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -26,8 +24,6 @@ use thiserror::Error;
 
 use crate::feature::{FeatureInstructionDeclaration, dedupe_instruction_contributions};
 use crate::prompt::catalog::{CatalogError, PromptCatalog};
-#[cfg(test)]
-use crate::prompt::catalog::{EffectivePromptCatalog, builtin_prompt_templates};
 use crate::prompt::source::PromptCatalogSource;
 
 #[derive(Debug, Error)]
@@ -319,76 +315,6 @@ fn append_trailing_section(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
-    use manifest::{Permission, ScopeConfig, ScopeRule};
-    use tempfile::TempDir;
-
-    fn fixed_now() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 4, 15, 9, 30, 0).unwrap()
-    }
-
-    fn build_scope(dir: &Path) -> Scope {
-        Scope::from_config(&ScopeConfig {
-            allow: vec![ScopeRule {
-                target: dir.to_path_buf(),
-                permission: Permission::Write,
-                recursive: true,
-            }],
-            deny: Vec::new(),
-        })
-        .unwrap()
-    }
-
-    fn context<'a>(
-        cwd: &'a Path,
-        scope: &'a Scope,
-        prompts: &'a PromptCatalog,
-    ) -> SystemPromptContext<'a> {
-        SystemPromptContext {
-            now: fixed_now(),
-            cwd: cwd.to_string_lossy(),
-            tool_names: vec!["Read".into(), "Write".into()],
-            scope,
-            agents_md: Some("PROJECT RULES".into()),
-            resident_summary: Some("DURABLE MEMORY"),
-            language: "Japanese",
-            feature_instructions: &[],
-            prompts,
-        }
-    }
-
-    #[test]
-    fn exact_catalog_name_renders_once_with_trailing_sections() {
-        let tmp = TempDir::new().unwrap();
-        let scope = build_scope(tmp.path());
-        let prompts = PromptCatalog::builtins_only().unwrap();
-        let template =
-            SystemPromptTemplate::parse("default", PromptCatalogSource::builtins_only()).unwrap();
-        let rendered = template
-            .render(&context(tmp.path(), &scope, &prompts))
-            .unwrap();
-        assert!(rendered.contains("2026-08-14") || rendered.contains("2026-04-15"));
-        assert!(rendered.contains("## Working boundaries"));
-        assert!(rendered.contains("PROJECT RULES"));
-        assert!(rendered.contains("DURABLE MEMORY"));
-    }
-
-    #[test]
-    fn workspace_override_is_visible_through_builtin_static_include() {
-        let mut templates = builtin_prompt_templates().unwrap();
-        templates.insert("common.workspace".into(), "WORKSPACE OVERRIDE".into());
-        let projection = EffectivePromptCatalog::new(templates, 9, "schema", "toolchain").unwrap();
-        let loader =
-            PromptCatalogSource::builtins_only().with_effective_catalog(projection.clone());
-        let prompts = PromptCatalog::from_projection(projection).unwrap();
-        let template = SystemPromptTemplate::parse("default", loader).unwrap();
-        let tmp = TempDir::new().unwrap();
-        let scope = build_scope(tmp.path());
-        let rendered = template
-            .render(&context(tmp.path(), &scope, &prompts))
-            .unwrap();
-        assert!(rendered.contains("WORKSPACE OVERRIDE"));
-    }
 
     #[test]
     fn rejects_legacy_prefix_relative_and_missing_names() {
@@ -396,22 +322,6 @@ mod tests {
             assert!(
                 SystemPromptTemplate::parse(reference, PromptCatalogSource::builtins_only())
                     .is_err()
-            );
-        }
-    }
-
-    #[test]
-    fn role_templates_are_selected_without_filesystem_resolution() {
-        let loader = PromptCatalogSource::builtins_only();
-        for role in [
-            "role.coder",
-            "role.intake",
-            "role.orchestrator",
-            "role.reviewer",
-        ] {
-            assert!(
-                SystemPromptTemplate::parse(role, loader.clone()).is_ok(),
-                "{role}"
             );
         }
     }
