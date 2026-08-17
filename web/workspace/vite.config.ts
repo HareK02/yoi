@@ -6,7 +6,13 @@ export default defineConfig({
 
   server: {
     allowedHosts: ["develop.hareworks.net"],
-    watch: { ignored: ["**/.tmp*", "**/.tmp*/**"] },
+    watch: {
+      ignored: [
+        "**/.tmp*",
+        "**/.tmp*/**",
+        "**/vite.config.*.timestamp-*.mjs",
+      ],
+    },
 
     proxy: {
       "/api": {
