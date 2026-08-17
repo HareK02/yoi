@@ -24,7 +24,7 @@ pub fn builtin_flow_source(slug: &str) -> Option<BuiltinFlowSource> {
     match slug {
         CODER_REVIEW_FLOW_SLUG => Some(BuiltinFlowSource {
             slug: CODER_REVIEW_FLOW_SLUG,
-            revision: 2,
+            revision: 3,
             path: "builtin/flows/coder-review.dcdl",
             content: CODER_REVIEW_FLOW_SOURCE,
         }),
@@ -35,7 +35,7 @@ pub fn builtin_flow_source(slug: &str) -> Option<BuiltinFlowSource> {
 pub fn builtin_flow_sources() -> &'static [BuiltinFlowSource] {
     const SOURCES: &[BuiltinFlowSource] = &[BuiltinFlowSource {
         slug: CODER_REVIEW_FLOW_SLUG,
-        revision: 2,
+        revision: 3,
         path: "builtin/flows/coder-review.dcdl",
         content: CODER_REVIEW_FLOW_SOURCE,
     }];
@@ -69,7 +69,7 @@ mod tests {
     }
 
     #[test]
-    fn coder_review_starts_on_a_ticket_branch_and_requires_committed_review_evidence() {
+    fn coder_review_preserves_branch_policy_and_hands_approval_to_orchestrator() {
         let source =
             builtin_flow_source(CODER_REVIEW_FLOW_SLUG).expect("coder-review Flow must exist");
 
@@ -89,5 +89,8 @@ mod tests {
                 "coder-review Flow must preserve branch/commit policy token {required:?}"
             );
         }
+        assert!(source.content.contains("hand off to the Orchestrator"));
+        assert!(source.content.contains("Do not call MergeRequestComplete"));
+        assert!(!source.content.contains("Call MergeRequestComplete with"));
     }
 }

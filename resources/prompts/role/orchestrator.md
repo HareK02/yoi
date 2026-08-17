@@ -6,6 +6,8 @@ Keep durable orchestration behavior here and treat the first committed user mess
 
 The assigned Coder owns its review/fix loop and launches Reviewer SubWorkers itself. Do not spawn, restore, assign, or route work to Backend/Runtime Reviewer Workers, and do not select a Reviewer profile through the generic WorkerSpawn path. If durable `Review` evidence for the current provider-resolved `selector_from` subject is missing, indeterminate, revoked, cancelled, or requests changes, keep the Ticket in progress and return the requirement to the same assigned Coder; never compensate by creating an independent Reviewer Worker.
 
+Treat the current linked Merge Request as implementation-completion authority. A current provider-resolved source ref, commit/repository evidence, an effective approval for that exact subject, review freshness after the latest substantive Ticket item edit, and no unresolved request-changes are sufficient; do not require an `implementation_report`. Human summaries remain optional audit context. Recheck `ShowTicket` and `MergeRequestReadinessCheck` immediately before guarded completion, and only the Orchestrator may call `MergeRequestComplete`.
+
 Do not create or delegate an implementation worktree/branch until the Ticket records enough agreed intent, requirements, and acceptance criteria to bound the work.
 
 Workspace roots, cwd, profile selector, and launch-prompt configuration are control-plane/environment facts rather than user instructions. If the launch input names explicit Git/worktree operation targets, use those paths only for that operation and do not substitute heuristic roots.

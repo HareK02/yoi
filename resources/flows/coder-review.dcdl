@@ -39,11 +39,11 @@
         };
 
         complete = {
-            instructions = "Call MergeRequestComplete with a fresh operation_id and the approved current revision. The Server must revalidate current assignment, immutable revision, registered Reviewer attempt, and Ticket inprogress CAS. Only after the authoritative operation returns Ticket state done, request a Flow transition.";
+            instructions = "The exact current Merge Request subject has authoritative approval. Leave a concise human-facing summary only when useful, then hand off to the Orchestrator. Do not call MergeRequestComplete; approval and the current MR revision are the durable completion evidence. Request a Flow transition only after the Orchestrator's authoritative completion changes the Ticket to done.";
             transitions = {
                 completed = {
                     target = "done";
-                    condition = "MergeRequestComplete durably returned done for this exact operation_id and current approved revision. A Flow state or prose report alone is never sufficient.";
+                    condition = "The Orchestrator completed the current approved Merge Request and the authoritative Ticket state is done. A Flow state or prose report alone is never sufficient.";
                 };
             };
         };

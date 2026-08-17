@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use merge_request::{
     MergeRequest, MergeRequestError, MergeRequestState, MergeRequestStore, MergeRequestThreadEvent,
     ReviewDecision,
@@ -167,12 +167,25 @@ impl merge_request::RepositorySource for AuthorityMergeRequestSource {
     }
 }
 
+pub trait TicketMergeRevisionSource: Send + Sync {
+    fn resolve_subject_ref(&self, repository_id: &str, selector: &str) -> Option<String>;
+}
+
+struct UnresolvedTicketMergeRevisionSource;
+
+impl TicketMergeRevisionSource for UnresolvedTicketMergeRevisionSource {
+    fn resolve_subject_ref(&self, _repository_id: &str, _selector: &str) -> Option<String> {
+        None
+    }
+}
+
 #[derive(Clone)]
 pub struct SqliteWorkspaceAuthority {
     workspace_id: String,
     store: SqliteWorkspaceStore,
     ticket_backend: SqliteTicketBackend,
     merge_request_store: Arc<MergeRequestStore>,
+    merge_revision_source: Arc<dyn TicketMergeRevisionSource>,
 }
 
 impl SqliteWorkspaceAuthority {
@@ -198,7 +211,16 @@ impl SqliteWorkspaceAuthority {
                 )
                 .map_err(|error| Error::Store(error.to_string()))?,
             ),
+            merge_revision_source: Arc::new(UnresolvedTicketMergeRevisionSource),
         })
+    }
+
+    pub fn with_merge_revision_source(
+        mut self,
+        merge_revision_source: Arc<dyn TicketMergeRevisionSource>,
+    ) -> Self {
+        self.merge_revision_source = merge_revision_source;
+        self
     }
 
     fn objective_record(&self, id: &str) -> Result<ObjectiveRecord> {
@@ -367,11 +389,21 @@ impl SqliteWorkspaceAuthority {
                 worker_id: assignment.worker.worker_id,
             });
         let merge_request = match self.merge_request_store.get(&self.workspace_id, id) {
-            Ok(request) => Some(merge_request_summary(request)),
+            Ok(request) => {
+                let current_subject_ref = request.selector_from.as_deref().and_then(|selector| {
+                    self.merge_revision_source
+                        .resolve_subject_ref(&request.repository_id, selector)
+                });
+                Some(merge_request_summary(request, current_subject_ref))
+            }
             Err(MergeRequestError::NotFound) => None,
             Err(error) => return Err(Error::Store(error.to_string())),
         };
-        let evidence = ticket_evidence_summary(&ticket.events, merge_request.as_ref());
+        let evidence = ticket_evidence_summary(
+            ticket.meta.repository_id.as_deref(),
+            &ticket.events,
+            merge_request.as_ref(),
+        );
         let item_revision = ticket
             .events
             .iter()
@@ -1023,17 +1055,45 @@ fn ticket_evidence_event(sequence: usize, event: &TicketEvent) -> TicketEvidence
     }
 }
 
-fn merge_request_summary(request: MergeRequest) -> TicketMergeRequestSummary {
-    let review_subject_ref = request.thread.iter().rev().find_map(|event| match event {
-        MergeRequestThreadEvent::ReviewRequested(review) => Some(review.subject_ref.as_str()),
+fn merge_request_summary(
+    request: MergeRequest,
+    current_subject_ref: Option<String>,
+) -> TicketMergeRequestSummary {
+    let latest_review_request = request.thread.iter().rev().find_map(|event| match event {
+        MergeRequestThreadEvent::ReviewRequested(review) => Some(review),
         _ => None,
     });
-    let current_review =
-        review_subject_ref.and_then(|subject_ref| request.effective_review(subject_ref));
+    let current_review = current_subject_ref
+        .as_deref()
+        .and_then(|subject_ref| request.effective_review(subject_ref));
+    let current_review_request = current_review
+        .and_then(|review| {
+            request.thread.iter().find_map(|event| match event {
+                MergeRequestThreadEvent::ReviewRequested(review_request)
+                    if review_request.event_id == review.request_event_id =>
+                {
+                    Some(review_request)
+                }
+                _ => None,
+            })
+        })
+        .or_else(|| {
+            current_subject_ref.as_deref().and_then(|subject_ref| {
+                request.thread.iter().rev().find_map(|event| match event {
+                    MergeRequestThreadEvent::ReviewRequested(review)
+                        if review.subject_ref == subject_ref =>
+                    {
+                        Some(review)
+                    }
+                    _ => None,
+                })
+            })
+        });
     let review_status = match current_review.map(|review| &review.decision) {
         Some(ReviewDecision::Approve) => "approved",
         Some(ReviewDecision::RequestChanges) => "changes_requested",
-        None => "pending",
+        None if latest_review_request.is_some() => "pending",
+        None => "none",
     }
     .to_string();
     let state = match request.state {
@@ -1045,68 +1105,132 @@ fn merge_request_summary(request: MergeRequest) -> TicketMergeRequestSummary {
 
     TicketMergeRequestSummary {
         merge_request_id: request.merge_request_id.clone(),
+        repository_id: request.repository_id.clone(),
         state,
         review_status,
         selector_from: request.selector_from.clone(),
         selector_to: request.selector_to.clone(),
         updated_at: request.updated_at.to_rfc3339(),
-        review_subject_ref: review_subject_ref.map(str::to_string),
+        current_subject_ref,
+        review_subject_ref: latest_review_request.map(|review| review.subject_ref.clone()),
+        review_requested_at: current_review_request.map(|review| review.created_at.to_rfc3339()),
         review_submitted_at: current_review.map(|review| review.created_at.to_rfc3339()),
         review_excerpt: current_review.map(|review| truncate_body(&review.body, 240).0),
     }
 }
 
+fn substantive_item_edit(event: &TicketEvent) -> bool {
+    if event.kind.as_str() != "item_edit" {
+        return false;
+    }
+    let Some(changes) = event.attributes.get("changes") else {
+        // Legacy item-edit events do not identify changed fields. Treat them as
+        // substantive so readiness fails closed rather than accepting a stale review.
+        return true;
+    };
+    changes
+        .split(',')
+        .map(str::trim)
+        .any(|field| matches!(field, "title" | "body" | "target"))
+}
+
+fn event_timestamp(event: &TicketEvent) -> Option<DateTime<Utc>> {
+    event
+        .at
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+}
+
 fn ticket_evidence_summary(
+    ticket_repository_id: Option<&str>,
     events: &[TicketEvent],
     merge_request: Option<&TicketMergeRequestSummary>,
 ) -> TicketEvidenceSummary {
-    let latest_report = events
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, event)| event.kind.as_str() == "implementation_report")
-        .map(|(sequence, _)| sequence);
-    let latest_rescope = events
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, event)| event.kind.as_str() == "item_edit")
-        .map(|(sequence, _)| sequence);
-    let report_after_rescope =
-        latest_report.is_some_and(|report| latest_rescope.is_none_or(|rescope| report > rescope));
-    let has_commit = merge_request.is_some_and(|request| {
+    let linked_merge_request = merge_request.filter(|request| {
+        request.state == "open"
+            && ticket_repository_id
+                .is_some_and(|repository_id| repository_id == request.repository_id)
+    });
+    let has_merge_request = linked_merge_request.is_some();
+    let has_current_subject_ref = linked_merge_request.is_some_and(|request| {
+        request
+            .current_subject_ref
+            .as_deref()
+            .is_some_and(|subject_ref| !subject_ref.is_empty())
+    });
+    let has_review_request = linked_merge_request.is_some_and(|request| {
         request
             .review_subject_ref
-            .as_ref()
+            .as_deref()
             .is_some_and(|subject_ref| !subject_ref.is_empty())
-    }) || events.iter().any(|event| {
-        event.attributes.contains_key("commit") || event.attributes.contains_key("head_commit")
     });
-    let review_status = merge_request.map(|request| request.review_status.clone());
-    let approved = review_status.as_deref() == Some("approved");
+    let has_commit = has_current_subject_ref;
+    let review_status = linked_merge_request.map(|request| request.review_status.clone());
+    let approved_current_subject = review_status.as_deref() == Some("approved");
     let unresolved_request_changes = review_status.as_deref() == Some("changes_requested");
+    let latest_rescope = events
+        .iter()
+        .filter(|event| substantive_item_edit(event))
+        .last();
+    let review_after_rescope = approved_current_subject
+        && latest_rescope.is_none_or(|rescope| {
+            let Some(rescope_at) = event_timestamp(rescope) else {
+                return false;
+            };
+            let Some(requested_at) = linked_merge_request
+                .and_then(|request| request.review_requested_at.as_deref())
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&Utc))
+            else {
+                return false;
+            };
+            let Some(reviewed_at) = linked_merge_request
+                .and_then(|request| request.review_submitted_at.as_deref())
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&Utc))
+            else {
+                return false;
+            };
+            requested_at > rescope_at && reviewed_at > rescope_at
+        });
+
     let mut missing = Vec::new();
-    if latest_report.is_none() {
-        missing.push("implementation_report".to_string());
-    } else if !report_after_rescope {
-        missing.push("implementation_report_after_rescope".to_string());
+    match merge_request {
+        None => missing.push("merge_request".to_string()),
+        Some(request) if request.state != "open" => missing.push("open_merge_request".to_string()),
+        Some(request)
+            if ticket_repository_id
+                .is_none_or(|repository_id| repository_id != request.repository_id) =>
+        {
+            missing.push("merge_request_repository".to_string())
+        }
+        Some(_) => {}
+    }
+    if !has_current_subject_ref {
+        missing.push("current_subject_ref".to_string());
     }
     if !has_commit {
         missing.push("commit".to_string());
     }
-    if merge_request.is_none() {
-        missing.push("merge_request".to_string());
+    if unresolved_request_changes {
+        missing.push("unresolved_request_changes".to_string());
     }
-    if !approved {
-        missing.push("approved_review".to_string());
+    if !approved_current_subject {
+        missing.push("approved_current_subject".to_string());
     }
+    if approved_current_subject && !review_after_rescope {
+        missing.push("review_after_rescope".to_string());
+    }
+
     TicketEvidenceSummary {
-        has_implementation_report: latest_report.is_some(),
-        implementation_report_after_rescope: report_after_rescope,
-        has_merge_request: merge_request.is_some(),
+        has_merge_request,
+        has_current_subject_ref,
+        has_review_request,
         has_commit,
         review_status,
-        approved,
+        approved_current_subject,
+        review_after_rescope,
         unresolved_request_changes,
         complete_for_integration: missing.is_empty(),
         missing,
@@ -1124,11 +1248,7 @@ fn validate_ticket_query(query: &TicketQueryRequest) -> Result<()> {
     for evidence in &query.evidence {
         if !matches!(
             evidence.as_str(),
-            "implementation_report"
-                | "implementation_report_after_rescope"
-                | "merge_request"
-                | "commit"
-                | "approved_review"
+            "merge_request" | "commit" | "approved_review"
         ) {
             return Err(Error::InvalidRecordId(format!(
                 "unsupported Ticket evidence filter `{evidence}`"
@@ -1139,8 +1259,6 @@ fn validate_ticket_query(query: &TicketQueryRequest) -> Result<()> {
         if !matches!(
             attention.as_str(),
             "done_not_closed"
-                | "implementation_report_not_closed"
-                | "report_after_rescope"
                 | "unresolved_review"
                 | "missing_commit"
                 | "blocked"
@@ -1260,6 +1378,41 @@ fn parse_query_cursor(cursor: &str) -> Result<(String, String)> {
     Ok((value[..length].to_string(), value[length..].to_string()))
 }
 
+fn ticket_evidence_matches(evidence: &TicketEvidenceSummary, filter: &str) -> bool {
+    match filter {
+        "merge_request" => evidence.has_merge_request,
+        "commit" => evidence.has_commit,
+        "approved_review" => evidence.approved_current_subject,
+        _ => false,
+    }
+}
+
+fn ticket_attention_matches(
+    state: &str,
+    evidence: &TicketEvidenceSummary,
+    is_blocked: bool,
+    authoritative_events: &[TicketEvent],
+    attention: &str,
+) -> bool {
+    match attention {
+        "done_not_closed" => state == "done",
+        "unresolved_review" => evidence.unresolved_request_changes,
+        "missing_commit" => !evidence.has_commit,
+        "blocked" => is_blocked,
+        "unblocked" => !is_blocked,
+        "ready" => state == "ready" && !is_blocked,
+        "awaiting_review" => {
+            evidence.has_review_request && evidence.review_status.as_deref() == Some("pending")
+        }
+        "unresolved_changes" => evidence.unresolved_request_changes,
+        "stale_after_rescope" => {
+            authoritative_events.iter().any(substantive_item_edit) && !evidence.review_after_rescope
+        }
+        "missing_evidence" => !evidence.complete_for_integration,
+        _ => false,
+    }
+}
+
 fn ticket_matches_query(
     summary: &TicketSummary,
     detail: &TicketDetail,
@@ -1293,7 +1446,10 @@ fn ticket_matches_query(
     }
     if let Some(review_status) = &query.review_status {
         let matches = match review_status.as_str() {
-            "none" => detail.evidence.review_status.is_none(),
+            "none" => matches!(
+                detail.evidence.review_status.as_deref(),
+                None | Some("none")
+            ),
             "request_changes" | "unresolved_changes" => {
                 detail.evidence.review_status.as_deref() == Some("changes_requested")
             }
@@ -1306,43 +1462,19 @@ fn ticket_matches_query(
     if !query
         .evidence
         .iter()
-        .all(|evidence| match evidence.as_str() {
-            "implementation_report" => detail.evidence.has_implementation_report,
-            "implementation_report_after_rescope" => {
-                detail.evidence.implementation_report_after_rescope
-            }
-            "merge_request" => detail.evidence.has_merge_request,
-            "commit" => detail.evidence.has_commit,
-            "approved_review" => detail.evidence.approved,
-            _ => false,
-        })
+        .all(|filter| ticket_evidence_matches(&detail.evidence, filter))
     {
         return false;
     }
-    if !query
-        .attention
-        .iter()
-        .all(|attention| match attention.as_str() {
-            "done_not_closed" => summary.state == "done",
-            "implementation_report_not_closed" => {
-                detail.evidence.has_implementation_report && summary.state != "closed"
-            }
-            "report_after_rescope" => detail.evidence.implementation_report_after_rescope,
-            "unresolved_review" => detail.evidence.unresolved_request_changes,
-            "missing_commit" => !detail.evidence.has_commit,
-            "blocked" => !detail.relations.blockers.is_empty(),
-            "unblocked" => detail.relations.blockers.is_empty(),
-            "ready" => summary.state == "ready" && detail.relations.blockers.is_empty(),
-            "awaiting_review" => detail.evidence.review_status.as_deref() == Some("pending"),
-            "unresolved_changes" => detail.evidence.unresolved_request_changes,
-            "stale_after_rescope" => {
-                detail.evidence.has_implementation_report
-                    && !detail.evidence.implementation_report_after_rescope
-            }
-            "missing_evidence" => !detail.evidence.complete_for_integration,
-            _ => false,
-        })
-    {
+    if !query.attention.iter().all(|attention| {
+        ticket_attention_matches(
+            &summary.state,
+            &detail.evidence,
+            !detail.relations.blockers.is_empty(),
+            authoritative_events,
+            attention,
+        )
+    }) {
         return false;
     }
     if query.linked_objective_id.as_ref().is_some_and(|id| {
@@ -1812,31 +1944,63 @@ fn workspace_action_priority_name(priority: TicketWorkspaceActionPriority) -> &'
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
 
     use super::*;
     use crate::store::{ObjectiveRecord, ObjectiveTicketLinkRecord, WorkspaceRecord};
 
-    #[test]
-    fn merge_request_summary_tracks_the_latest_requested_subject() {
-        let actor = merge_request::WorkerIdentity {
+    fn actor() -> merge_request::WorkerIdentity {
+        merge_request::WorkerIdentity {
             runtime_id: "runtime-1".to_string(),
             worker_id: "worker-1".to_string(),
-        };
-        let at = Utc::now();
-        let first_review = merge_request::ReviewEvent {
-            event_id: "review-1".to_string(),
-            sequence: 2,
-            request_event_id: "request-1".to_string(),
-            subject_ref: "commit-1".to_string(),
-            decision: ReviewDecision::Approve,
-            body: "approved".to_string(),
-            findings: Vec::new(),
-            reviewer: actor.clone(),
-            created_at: at,
-        };
-        let mut request = MergeRequest {
+        }
+    }
+
+    fn reviewed_merge_request(decision: ReviewDecision, revoked: bool) -> MergeRequest {
+        let requested_at = DateTime::parse_from_rfc3339("2026-01-01T00:03:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let reviewed_at = DateTime::parse_from_rfc3339("2026-01-01T00:04:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let reviewer = actor();
+        let mut thread = vec![
+            MergeRequestThreadEvent::ReviewRequested(merge_request::ReviewRequestedEvent {
+                event_id: "request-1".to_string(),
+                sequence: 1,
+                subject_ref: "commit-1".to_string(),
+                requested_by: reviewer.clone(),
+                reviewer: reviewer.clone(),
+                created_at: requested_at,
+            }),
+            MergeRequestThreadEvent::Review(merge_request::ReviewEvent {
+                event_id: "review-1".to_string(),
+                sequence: 2,
+                request_event_id: "request-1".to_string(),
+                subject_ref: "commit-1".to_string(),
+                decision,
+                body: "review body".to_string(),
+                findings: Vec::new(),
+                reviewer: reviewer.clone(),
+                created_at: reviewed_at,
+            }),
+        ];
+        if revoked {
+            thread.push(MergeRequestThreadEvent::ReviewRevoked(
+                merge_request::ReviewRevokedEvent {
+                    event_id: "revoke-1".to_string(),
+                    sequence: 3,
+                    review_event_id: "review-1".to_string(),
+                    subject_ref: "commit-1".to_string(),
+                    reason: "stale".to_string(),
+                    revoked_by: reviewer,
+                    created_at: reviewed_at + chrono::Duration::minutes(1),
+                },
+            ));
+        }
+        MergeRequest {
             workspace_id: "workspace-1".to_string(),
             merge_request_id: "mr-1".to_string(),
             repository_id: "main".to_string(),
@@ -1844,59 +2008,21 @@ mod tests {
             selector_from: Some("work/ticket-1".to_string()),
             selector_to: "orchestration".to_string(),
             ticket_ids: vec!["ticket-1".to_string()],
-            thread: vec![
-                MergeRequestThreadEvent::ReviewRequested(merge_request::ReviewRequestedEvent {
-                    event_id: "request-1".to_string(),
-                    sequence: 1,
-                    subject_ref: "commit-1".to_string(),
-                    requested_by: actor.clone(),
-                    reviewer: actor.clone(),
-                    created_at: at,
-                }),
-                MergeRequestThreadEvent::Review(first_review),
-                MergeRequestThreadEvent::ReviewRequested(merge_request::ReviewRequestedEvent {
-                    event_id: "request-2".to_string(),
-                    sequence: 3,
-                    subject_ref: "commit-2".to_string(),
-                    requested_by: actor.clone(),
-                    reviewer: actor.clone(),
-                    created_at: at,
-                }),
-            ],
-            created_at: at,
-            updated_at: at,
-        };
-
-        let pending = merge_request_summary(request.clone());
-        assert_eq!(pending.review_status, "pending");
-        assert_eq!(pending.review_subject_ref.as_deref(), Some("commit-2"));
-        assert_eq!(pending.review_submitted_at, None);
-
-        request.thread.push(MergeRequestThreadEvent::Review(
-            merge_request::ReviewEvent {
-                event_id: "review-2".to_string(),
-                sequence: 4,
-                request_event_id: "request-2".to_string(),
-                subject_ref: "commit-2".to_string(),
-                decision: ReviewDecision::Approve,
-                body: "current approval".to_string(),
-                findings: Vec::new(),
-                reviewer: actor,
-                created_at: at,
-            },
-        ));
-        let approved = merge_request_summary(request);
-        assert_eq!(approved.review_status, "approved");
-        assert_eq!(approved.review_subject_ref.as_deref(), Some("commit-2"));
-        assert_eq!(approved.review_excerpt.as_deref(), Some("current approval"));
+            thread,
+            created_at: requested_at,
+            updated_at: reviewed_at,
+        }
     }
 
-    #[test]
-    fn ticket_evidence_summary_requires_report_after_latest_rescope_and_approved_revision() {
-        let event = |kind: &str| TicketEvent {
+    fn ticket_event(kind: &str, at: &str, changes: Option<&str>) -> TicketEvent {
+        let mut attributes = BTreeMap::new();
+        if let Some(changes) = changes {
+            attributes.insert("changes".to_string(), changes.to_string());
+        }
+        TicketEvent {
             kind: ticket::TicketEventKind::Other(kind.to_string()),
             author: Some("coder".to_string()),
-            at: Some("2026-01-01T00:00:00Z".to_string()),
+            at: Some(at.to_string()),
             status: None,
             from: None,
             to: None,
@@ -1904,43 +2030,186 @@ mod tests {
             state_field: None,
             heading: None,
             body: ticket::MarkdownText::new(kind),
-            attributes: Default::default(),
+            attributes,
             references: Vec::new(),
-        };
-        let request = TicketMergeRequestSummary {
-            merge_request_id: "mr-1".to_string(),
-            state: "open".to_string(),
-            review_status: "approved".to_string(),
-            selector_from: Some("work/ticket".to_string()),
-            selector_to: "orchestration".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
-            review_subject_ref: Some("head".to_string()),
-            review_submitted_at: Some("2026-01-01T00:00:00Z".to_string()),
-            review_excerpt: Some("approved".to_string()),
-        };
-        let stale = ticket_evidence_summary(
-            &[event("implementation_report"), event("item_edit")],
-            Some(&request),
+        }
+    }
+
+    #[test]
+    fn merge_request_summary_uses_the_provider_resolved_current_subject() {
+        let approved = merge_request_summary(
+            reviewed_merge_request(ReviewDecision::Approve, false),
+            Some("commit-1".to_string()),
         );
-        assert!(!stale.implementation_report_after_rescope);
-        assert!(!stale.complete_for_integration);
-        assert!(
-            stale
-                .missing
-                .contains(&"implementation_report_after_rescope".to_string())
+        assert_eq!(approved.review_status, "approved");
+        assert_eq!(approved.current_subject_ref.as_deref(), Some("commit-1"));
+        assert_eq!(
+            approved.review_requested_at.as_deref(),
+            Some("2026-01-01T00:03:00+00:00")
         );
-        let current = ticket_evidence_summary(
+
+        let moved = merge_request_summary(
+            reviewed_merge_request(ReviewDecision::Approve, false),
+            Some("commit-2".to_string()),
+        );
+        assert_eq!(moved.review_status, "pending");
+        assert_eq!(moved.current_subject_ref.as_deref(), Some("commit-2"));
+        assert_eq!(moved.review_subject_ref.as_deref(), Some("commit-1"));
+        assert_eq!(moved.review_submitted_at, None);
+    }
+
+    #[test]
+    fn ticket_readiness_requires_current_unrevoked_approval_without_a_report() {
+        let approved = merge_request_summary(
+            reviewed_merge_request(ReviewDecision::Approve, false),
+            Some("commit-1".to_string()),
+        );
+        let evidence = ticket_evidence_summary(Some("main"), &[], Some(&approved));
+        assert!(evidence.complete_for_integration);
+        assert!(evidence.approved_current_subject);
+        assert!(evidence.review_after_rescope);
+        assert!(evidence.has_commit);
+
+        let with_audit_events = ticket_evidence_summary(
+            Some("main"),
             &[
-                event("implementation_report"),
-                event("item_edit"),
-                event("implementation_report"),
+                ticket_event("comment", "2026-01-01T00:05:00Z", None),
+                ticket_event("implementation_report", "2026-01-01T00:06:00Z", None),
             ],
-            Some(&request),
+            Some(&approved),
         );
-        assert!(current.implementation_report_after_rescope);
-        assert!(current.has_commit);
-        assert!(current.approved);
-        assert!(current.complete_for_integration);
+        assert!(with_audit_events.complete_for_integration);
+
+        let revoked = merge_request_summary(
+            reviewed_merge_request(ReviewDecision::Approve, true),
+            Some("commit-1".to_string()),
+        );
+        let evidence = ticket_evidence_summary(Some("main"), &[], Some(&revoked));
+        assert!(!evidence.approved_current_subject);
+        assert!(!evidence.complete_for_integration);
+
+        let changes = merge_request_summary(
+            reviewed_merge_request(ReviewDecision::RequestChanges, false),
+            Some("commit-1".to_string()),
+        );
+        let evidence = ticket_evidence_summary(Some("main"), &[], Some(&changes));
+        assert!(evidence.unresolved_request_changes);
+        assert!(!evidence.complete_for_integration);
+    }
+
+    #[test]
+    fn ticket_readiness_fails_closed_for_missing_or_closed_current_merge_request() {
+        let unresolved =
+            merge_request_summary(reviewed_merge_request(ReviewDecision::Approve, false), None);
+        let evidence = ticket_evidence_summary(Some("main"), &[], Some(&unresolved));
+        assert!(!evidence.has_current_subject_ref);
+        assert!(!evidence.has_commit);
+        assert!(!evidence.complete_for_integration);
+
+        let mut closed_request = reviewed_merge_request(ReviewDecision::Approve, false);
+        closed_request.state = MergeRequestState::Closed;
+        let closed = merge_request_summary(closed_request, Some("commit-1".to_string()));
+        let evidence = ticket_evidence_summary(Some("main"), &[], Some(&closed));
+        assert!(!evidence.has_merge_request);
+        assert!(!evidence.complete_for_integration);
+        assert!(evidence.missing.contains(&"open_merge_request".to_string()));
+    }
+
+    #[test]
+    fn ticket_readiness_requires_request_and_approval_after_substantive_rescope() {
+        let approved = merge_request_summary(
+            reviewed_merge_request(ReviewDecision::Approve, false),
+            Some("commit-1".to_string()),
+        );
+        let fresh = ticket_evidence_summary(
+            Some("main"),
+            &[ticket_event(
+                "item_edit",
+                "2026-01-01T00:02:00Z",
+                Some("body"),
+            )],
+            Some(&approved),
+        );
+        assert!(fresh.review_after_rescope);
+        assert!(fresh.complete_for_integration);
+
+        let stale = ticket_evidence_summary(
+            Some("main"),
+            &[ticket_event(
+                "item_edit",
+                "2026-01-01T00:05:00Z",
+                Some("title"),
+            )],
+            Some(&approved),
+        );
+        assert!(!stale.review_after_rescope);
+        assert!(!stale.complete_for_integration);
+        assert!(stale.missing.contains(&"review_after_rescope".to_string()));
+
+        let metadata_only = ticket_evidence_summary(
+            Some("main"),
+            &[ticket_event(
+                "item_edit",
+                "2026-01-01T00:05:00Z",
+                Some("formatter"),
+            )],
+            Some(&approved),
+        );
+        assert!(metadata_only.complete_for_integration);
+    }
+
+    #[test]
+    fn ticket_query_filters_map_to_current_merge_request_evidence() {
+        let approved_summary = merge_request_summary(
+            reviewed_merge_request(ReviewDecision::Approve, false),
+            Some("commit-1".to_string()),
+        );
+        let approved = ticket_evidence_summary(Some("main"), &[], Some(&approved_summary));
+        assert!(ticket_evidence_matches(&approved, "merge_request"));
+        assert!(ticket_evidence_matches(&approved, "commit"));
+        assert!(ticket_evidence_matches(&approved, "approved_review"));
+        assert!(!ticket_attention_matches(
+            "inprogress",
+            &approved,
+            false,
+            &[],
+            "missing_evidence",
+        ));
+
+        let pending_summary = merge_request_summary(
+            reviewed_merge_request(ReviewDecision::Approve, false),
+            Some("commit-2".to_string()),
+        );
+        let pending = ticket_evidence_summary(Some("main"), &[], Some(&pending_summary));
+        assert!(ticket_attention_matches(
+            "inprogress",
+            &pending,
+            false,
+            &[],
+            "awaiting_review",
+        ));
+        assert!(!ticket_evidence_matches(&pending, "approved_review"));
+
+        let stale_events = vec![ticket_event(
+            "item_edit",
+            "2026-01-01T00:05:00Z",
+            Some("target"),
+        )];
+        let stale = ticket_evidence_summary(Some("main"), &stale_events, Some(&approved_summary));
+        assert!(ticket_attention_matches(
+            "inprogress",
+            &stale,
+            false,
+            &stale_events,
+            "stale_after_rescope",
+        ));
+        assert!(ticket_attention_matches(
+            "inprogress",
+            &stale,
+            false,
+            &stale_events,
+            "missing_evidence",
+        ));
     }
 
     #[tokio::test]

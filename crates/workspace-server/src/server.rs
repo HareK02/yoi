@@ -62,7 +62,7 @@ use crate::auth::{
 };
 use crate::authority::{
     MemoryAuthority, ObjectiveAuthority, ObjectiveCreateInput, ObjectiveEditInput,
-    SqliteWorkspaceAuthority, TicketAuthority,
+    SqliteWorkspaceAuthority, TicketAuthority, TicketMergeRevisionSource,
 };
 use crate::companion::{
     CompanionCancelRequest, CompanionConsole, CompanionMessageRequest, CompanionMessageResponse,
@@ -809,7 +809,11 @@ impl WorkspaceApi {
             authority: SqliteWorkspaceAuthority::new(
                 config.database_path.clone(),
                 config.workspace_id.clone(),
-            )?,
+            )?
+            .with_merge_revision_source(Arc::new(MergeRequestRepositorySource {
+                workspace_id: config.workspace_id.clone(),
+                reader: RepositoryRegistryReader::new(config.repositories.clone()),
+            })),
             config,
             store,
             runtime,
@@ -3719,6 +3723,15 @@ impl merge_request::AssignmentSource for MergeRequestAssignmentSource {
 struct MergeRequestRepositorySource {
     workspace_id: String,
     reader: RepositoryRegistryReader,
+}
+
+impl TicketMergeRevisionSource for MergeRequestRepositorySource {
+    fn resolve_subject_ref(&self, repository_id: &str, selector: &str) -> Option<String> {
+        self.reader
+            .observe_merge_target(repository_id, Some(selector))
+            .ok()
+            .map(|target| target.commit)
+    }
 }
 
 impl merge_request::RepositorySource for MergeRequestRepositorySource {
@@ -12291,7 +12304,7 @@ mod tests {
         assert_eq!(builtin.definition.name, "coder-review");
         assert_eq!(builtin.selector.to_string(), "builtin:coder-review");
         assert_eq!(builtin.flow_id, "builtin:coder-review");
-        assert_eq!(builtin.revision, 2);
+        assert_eq!(builtin.revision, 3);
         assert_eq!(
             api.store
                 .list_flow_sources(&api.config.workspace_id)

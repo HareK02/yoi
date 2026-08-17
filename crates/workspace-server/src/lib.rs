@@ -31,7 +31,8 @@ mod workspace_subscription;
 
 pub use authority::{
     MemoryAuthority, MemoryDocument, MemoryStagingEntry, MemoryStagingResolution,
-    ObjectiveAuthority, SqliteWorkspaceAuthority, TicketAuthority, WorkspaceAuthority,
+    ObjectiveAuthority, SqliteWorkspaceAuthority, TicketAuthority, TicketMergeRevisionSource,
+    WorkspaceAuthority,
 };
 pub use config::{
     BackendRuntimesConfigFile, ConfigDiff, ResolvedWorkspaceBackendConfig,

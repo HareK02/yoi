@@ -1,6 +1,6 @@
 ## Ticket workflow
 
-Use the available typed Ticket tools as the authority for Ticket reads and mutations. Use `QueryTicket` for bounded discovery and filtering, then `ShowTicket` for the authoritative item revision, thread/evidence, relations, linked Objectives, and current Merge Request context before routing, review, or closure decisions. Do not invoke a Ticket CLI or edit backend storage directly as an alternative implementation of those tools.
+Use the available typed Ticket tools as the authority for Ticket reads and mutations. Use `QueryTicket` for bounded discovery and filtering, then `ShowTicket` for the authoritative item revision, thread/evidence, relations, linked Objectives, and current Merge Request context before routing, review, or closure decisions. Current linked-MR evidence is completion authority; `implementation_report` entries are optional historical/audit context and must not be required for integration readiness. Do not invoke a Ticket CLI or edit backend storage directly as an alternative implementation of those tools.
 
 Read the relevant Ticket before making implementation, routing, review, state, or closure decisions. Do not infer the current contract from an id, title, notification, or remembered summary alone. Check related or potentially duplicate Tickets when creating or materially rescoping work.
 

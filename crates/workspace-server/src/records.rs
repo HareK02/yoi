@@ -239,12 +239,15 @@ pub struct TicketAssignmentSummary {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketMergeRequestSummary {
     pub merge_request_id: String,
+    pub repository_id: String,
     pub state: String,
     pub review_status: String,
     pub selector_from: Option<String>,
     pub selector_to: String,
     pub updated_at: String,
+    pub current_subject_ref: Option<String>,
     pub review_subject_ref: Option<String>,
+    pub review_requested_at: Option<String>,
     pub review_submitted_at: Option<String>,
     pub review_excerpt: Option<String>,
 }
@@ -252,12 +255,13 @@ pub struct TicketMergeRequestSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketEvidenceSummary {
-    pub has_implementation_report: bool,
-    pub implementation_report_after_rescope: bool,
     pub has_merge_request: bool,
+    pub has_current_subject_ref: bool,
+    pub has_review_request: bool,
     pub has_commit: bool,
     pub review_status: Option<String>,
-    pub approved: bool,
+    pub approved_current_subject: bool,
+    pub review_after_rescope: bool,
     pub unresolved_request_changes: bool,
     pub complete_for_integration: bool,
     pub missing: Vec<String>,
