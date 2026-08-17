@@ -3893,6 +3893,20 @@ fn repository_merge_evidence_error(error: RepositoryLookupError) -> ApiError {
     .into()
 }
 
+fn recorded_merge_completion<'a>(
+    thread: &'a [merge_request::MergeRequestThreadEvent],
+    operation_id: &str,
+) -> Option<&'a merge_request::MergeEvent> {
+    thread.iter().find_map(|event| match event {
+        merge_request::MergeRequestThreadEvent::Merge(event)
+            if event.operation_id == operation_id =>
+        {
+            Some(event)
+        }
+        _ => None,
+    })
+}
+
 fn require_completed_target_observation(
     observed: &str,
     target_ref_before: &str,
@@ -4246,22 +4260,7 @@ async fn scoped_complete_merge_request(
     let store = merge_request_store(&api, &workspace_id)?;
     let mr = store.get(&workspace_id, &ticket_id)?;
     let repositories = api.repository_reader();
-    if let Some(existing) = mr.thread.iter().find_map(|event| match event {
-        merge_request::MergeRequestThreadEvent::Merge(event)
-            if event.operation_id == input.operation_id =>
-        {
-            Some(event)
-        }
-        _ => None,
-    }) {
-        let observed = repositories
-            .observe_merge_target(&mr.repository_id, Some(&mr.selector_to))
-            .map_err(repository_merge_evidence_error)?;
-        require_completed_target_observation(
-            &observed.commit,
-            &input.target_ref_before,
-            &input.target_ref_after,
-        )?;
+    if let Some(existing) = recorded_merge_completion(&mr.thread, &input.operation_id) {
         let replay = merge_request::CompleteMergeRequest {
             ticket_id,
             operation_id: input.operation_id,
@@ -12630,6 +12629,34 @@ mod tests {
             api.validate_worker_spawn_repository_scope(&workdir_flow_launch)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn recorded_completion_replay_is_identified_before_later_target_observation() {
+        let event = merge_request::MergeEvent {
+            event_id: "merge-event".into(),
+            sequence: 1,
+            operation_id: "operation".into(),
+            approval_event_id: "approval".into(),
+            approved_source_ref: "source".into(),
+            target_ref_before: "before".into(),
+            target_ref_after: "after".into(),
+            strategy: merge_request::MergeStrategy::FastForward,
+            resolution: merge_request::ConflictResolution::None,
+            merged_by: merge_request::WorkerIdentity {
+                runtime_id: "runtime".into(),
+                worker_id: "orchestrator".into(),
+            },
+            created_at: Utc::now(),
+        };
+        let thread = vec![merge_request::MergeRequestThreadEvent::Merge(event.clone())];
+
+        assert_eq!(
+            recorded_merge_completion(&thread, "operation"),
+            Some(&event)
+        );
+        assert!(recorded_merge_completion(&thread, "different").is_none());
+        assert!(require_completed_target_observation("later", "before", "after").is_err());
     }
 
     #[test]

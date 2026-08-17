@@ -670,6 +670,7 @@ mod tests {
         assert!(prompt.contains("guarded non-force push"));
         assert!(prompt.contains("Never mutate a Server-side repository path"));
         assert!(prompt.contains("If the repository push succeeds but completion recording fails"));
+        assert!(prompt.contains("later target movement does not invalidate an idempotent replay"));
         assert!(prompt.contains("closes the current assignment atomically"));
         assert!(!prompt.contains("sibling Coder/Reviewer Workers"));
     }
