@@ -6,9 +6,11 @@ use merge_request::{
     ReviewDecision,
 };
 use project_record::{allocate_record_id, unix_epoch_millis_now};
+use rusqlite::{params_from_iter, types::Value as SqlValue};
 
 use ticket::{
-    SqliteTicketBackend, TicketBackend, TicketEvent, TicketIdOrSlug, TicketWorkspaceActionPriority,
+    SqliteTicketBackend, SqliteTicketListCursor, SqliteTicketListItem, SqliteTicketListPageQuery,
+    TicketBackend, TicketEvent, TicketIdOrSlug, TicketWorkflowState, TicketWorkspaceActionPriority,
     project_ticket_workspace_item,
 };
 
@@ -17,8 +19,9 @@ use crate::records::{
     ObjectiveQueryItem, ObjectiveQueryRequest, ObjectiveQueryResponse, ObjectiveResourceSummary,
     ObjectiveShowRequest, ObjectiveSummary, ProjectRecordList, QueryPage, TicketAssignmentSummary,
     TicketDetail, TicketEventDetail, TicketEvidenceEvent, TicketEvidenceSummary,
-    TicketMergeRequestSummary, TicketQueryItem, TicketQueryRequest, TicketQueryResponse,
-    TicketShowRequest, TicketSummary, summarize_body, truncate_body, validate_project_id,
+    TicketListPageRequest, TicketMergeRequestSummary, TicketQueryItem, TicketQueryRequest,
+    TicketQueryResponse, TicketShowRequest, TicketSummary, TicketSummaryPage, summarize_body,
+    truncate_body, validate_project_id,
 };
 use crate::store::{
     ControlPlaneStore, MemoryDocumentRecord, MemoryStagingRecord, MemoryStagingResolutionRecord,
@@ -43,6 +46,7 @@ impl<T> WorkspaceAuthority for T where T: ObjectiveAuthority + TicketAuthority +
 
 pub trait TicketAuthority {
     fn list_tickets(&self, limit: usize) -> Result<ProjectRecordList<TicketSummary>>;
+    fn list_ticket_page(&self, request: TicketListPageRequest) -> Result<TicketSummaryPage>;
     fn query_tickets(&self, query: TicketQueryRequest) -> Result<TicketQueryResponse>;
     fn ticket(&self, id: &str) -> Result<TicketDetail>;
     fn show_ticket(&self, id: &str, query: TicketShowRequest) -> Result<TicketDetail>;
@@ -317,11 +321,318 @@ impl SqliteWorkspaceAuthority {
         })
     }
 
+    fn query_ticket_candidate_ids(
+        &self,
+        query: &TicketQueryRequest,
+        sort: TicketQuerySort,
+        after: Option<&(String, String)>,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let mut values = vec![SqlValue::Text(self.workspace_id.clone())];
+        let mut predicates = vec!["t.workspace_id=?1".to_string()];
+        let mut bind = |value: SqlValue| {
+            values.push(value);
+            format!("?{}", values.len())
+        };
+        if !query.states.is_empty() {
+            let states = query
+                .states
+                .iter()
+                .map(|state| bind(SqlValue::Text(state.clone())))
+                .collect::<Vec<_>>();
+            predicates.push(format!("t.workflow_state IN ({})", states.join(",")));
+        }
+        if let Some(text) = query.query.as_deref().filter(|text| !text.is_empty()) {
+            let pattern = bind(SqlValue::Text(format!("%{}%", text.to_lowercase())));
+            predicates.push(format!(
+                "(lower(t.title) LIKE {p} OR lower(t.body) LIKE {p} OR EXISTS (
+                    SELECT 1 FROM typed_ticket_events e
+                    WHERE e.workspace_id=t.workspace_id AND e.ticket_id=t.ticket_id
+                      AND lower(e.body) LIKE {p}))",
+                p = pattern
+            ));
+        }
+        if let Some(value) = &query.updated_after {
+            let value = bind(SqlValue::Text(value.clone()));
+            predicates.push(format!("COALESCE(t.updated_at,'')>={value}"));
+        }
+        if let Some(value) = &query.updated_before {
+            let value = bind(SqlValue::Text(value.clone()));
+            predicates.push(format!("COALESCE(t.updated_at,'')<={value}"));
+        }
+        if let Some(value) = &query.linked_objective_id {
+            let value = bind(SqlValue::Text(value.clone()));
+            predicates.push(format!("EXISTS (SELECT 1 FROM objective_ticket_links link WHERE link.workspace_id=t.workspace_id AND link.ticket_id=t.ticket_id AND link.objective_id={value})"));
+        }
+        if query.related_ticket_id.is_some() || query.relation_kind.is_some() {
+            let related = query
+                .related_ticket_id
+                .as_ref()
+                .map(|value| bind(SqlValue::Text(value.clone())));
+            let kind = query
+                .relation_kind
+                .as_ref()
+                .map(|value| bind(SqlValue::Text(value.clone())));
+            let related = related.map(|value| format!("AND ((r.ticket_id=t.ticket_id AND r.target={value}) OR (r.target=t.ticket_id AND r.ticket_id={value}))")).unwrap_or_default();
+            let kind = kind
+                .map(|value| format!("AND r.kind={value}"))
+                .unwrap_or_default();
+            predicates.push(format!("EXISTS (SELECT 1 FROM typed_ticket_relations r WHERE r.workspace_id=t.workspace_id {related} {kind})"));
+        }
+        let blocker = "EXISTS (SELECT 1 FROM typed_ticket_relations relation
+            JOIN typed_tickets blocker ON blocker.workspace_id=relation.workspace_id
+             AND blocker.ticket_id=CASE WHEN relation.ticket_id=t.ticket_id THEN relation.target ELSE relation.ticket_id END
+            WHERE relation.workspace_id=t.workspace_id
+              AND ((relation.ticket_id=t.ticket_id AND relation.kind='depends_on')
+                OR (relation.target=t.ticket_id AND relation.kind='blocks'))
+              AND blocker.workflow_state NOT IN ('done','closed'))";
+        let active_blocker = "EXISTS (SELECT 1 FROM typed_ticket_relations relation
+            JOIN typed_tickets blocker ON blocker.workspace_id=relation.workspace_id
+             AND blocker.ticket_id=CASE WHEN relation.ticket_id=t.ticket_id THEN relation.target ELSE relation.ticket_id END
+            WHERE relation.workspace_id=t.workspace_id
+              AND ((relation.ticket_id=t.ticket_id AND relation.kind='depends_on')
+                OR (relation.target=t.ticket_id AND relation.kind='blocks'))
+              AND blocker.workflow_state NOT IN ('queued','inprogress','done','closed'))";
+        let report_index = "(SELECT max(event.event_index) FROM typed_ticket_events event WHERE event.workspace_id=t.workspace_id AND event.ticket_id=t.ticket_id AND event.kind='implementation_report')";
+        let edit_index = "(SELECT max(event.event_index) FROM typed_ticket_events event WHERE event.workspace_id=t.workspace_id AND event.ticket_id=t.ticket_id AND event.kind='item_edit')";
+        let current_report = format!(
+            "({report_index} IS NOT NULL AND ({edit_index} IS NULL OR {report_index}>={edit_index}))"
+        );
+        let merge_request_id = "(SELECT relation.merge_request_id FROM merge_request_ticket_relations relation
+            JOIN merge_requests request ON request.workspace_id=relation.workspace_id AND request.merge_request_id=relation.merge_request_id
+            WHERE relation.workspace_id=t.workspace_id AND relation.ticket_id=t.ticket_id
+            ORDER BY CASE WHEN request.state='open' THEN 0 ELSE 1 END, request.created_at DESC LIMIT 1)";
+        let review_decision = format!("(SELECT json_extract(event.payload_json,'$.decision') FROM merge_request_events event
+            WHERE event.workspace_id=t.workspace_id AND event.merge_request_id={merge_request_id} AND event.kind='review'
+              AND json_extract(event.payload_json,'$.subject_ref')=(SELECT selector_from FROM merge_requests request WHERE request.workspace_id=t.workspace_id AND request.merge_request_id={merge_request_id})
+              AND NOT EXISTS (SELECT 1 FROM merge_request_events revoked WHERE revoked.workspace_id=event.workspace_id AND revoked.merge_request_id=event.merge_request_id AND revoked.kind='review_revoked' AND json_extract(revoked.payload_json,'$.review_event_id')=event.event_id)
+            ORDER BY event.sequence DESC LIMIT 1)");
+        let review_status = format!(
+            "CASE WHEN {merge_request_id} IS NULL THEN 'none' WHEN {review_decision}='approve' THEN 'approved' WHEN {review_decision}='request_changes' THEN 'request_changes' ELSE 'pending' END"
+        );
+        let has_commit = format!(
+            "({merge_request_id} IS NOT NULL OR EXISTS (SELECT 1 FROM typed_ticket_event_references reference WHERE reference.workspace_id=t.workspace_id AND reference.ticket_id=t.ticket_id AND reference.kind='commit'))"
+        );
+        for event_kind in &query.event_kinds {
+            let event_kind = bind(SqlValue::Text(event_kind.clone()));
+            predicates.push(format!("EXISTS (SELECT 1 FROM typed_ticket_events event WHERE event.workspace_id=t.workspace_id AND event.ticket_id=t.ticket_id AND event.kind={event_kind})"));
+        }
+        for evidence in &query.evidence {
+            predicates.push(match evidence.as_str() {
+                "merge_request" => format!("{merge_request_id} IS NOT NULL"),
+                "commit" => has_commit.clone(),
+                "approved_review" => format!("{review_status}='approved'"),
+                other => {
+                    return Err(Error::InvalidRecordId(format!(
+                        "unsupported evidence filter `{other}`"
+                    )));
+                }
+            });
+        }
+        if let Some(status) = &query.review_status {
+            let status = if status == "unresolved_changes" {
+                "request_changes"
+            } else {
+                status.as_str()
+            };
+            let status = bind(SqlValue::Text(status.to_string()));
+            predicates.push(format!("{review_status}={status}"));
+        }
+        for attention in &query.attention {
+            predicates.push(match attention.as_str() {
+                "done_not_closed" => "t.workflow_state='done'".to_string(),
+                "unresolved_review" | "unresolved_changes" => format!("{review_status}='request_changes'"),
+                "missing_commit" => format!("NOT {has_commit}"),
+                "blocked" => blocker.to_string(),
+                "unblocked" => format!("NOT {blocker}"),
+                "ready" => format!("t.workflow_state='ready' AND NOT {active_blocker}"),
+                "awaiting_review" => format!("t.workflow_state='inprogress' AND {current_report} AND {review_status}='pending'"),
+                "stale_after_rescope" => format!("{report_index} IS NOT NULL AND {edit_index}>{report_index}"),
+                "missing_evidence" => format!("NOT ({current_report} AND {has_commit} AND {review_status}='approved')"),
+                other => return Err(Error::InvalidRecordId(format!("unsupported attention filter `{other}`"))),
+            });
+        }
+        let rank_expression = match sort {
+            TicketQuerySort::Priority => format!(
+                "CASE WHEN t.workflow_state='ready' AND NOT {active_blocker} THEN 0 WHEN t.workflow_state IN ('queued','inprogress') THEN 1 ELSE 2 END"
+            ),
+            TicketQuerySort::Relevance => {
+                if let Some(text) = query.query.as_deref().filter(|text| !text.is_empty()) {
+                    let pattern = bind(SqlValue::Text(format!("%{}%", text.to_lowercase())));
+                    format!(
+                        "CASE WHEN lower(t.title) LIKE {pattern} THEN 0 WHEN lower(t.body) LIKE {pattern} THEN 1 WHEN EXISTS (SELECT 1 FROM typed_ticket_events event WHERE event.workspace_id=t.workspace_id AND event.ticket_id=t.ticket_id AND lower(event.body) LIKE {pattern}) THEN 2 ELSE 3 END"
+                    )
+                } else {
+                    "3".to_string()
+                }
+            }
+            _ => "0".to_string(),
+        };
+        if let Some((key, id)) = after {
+            match sort {
+                TicketQuerySort::UpdatedDesc => {
+                    let key = bind(SqlValue::Text(key.clone()));
+                    let id = bind(SqlValue::Text(id.clone()));
+                    predicates.push(format!("(COALESCE(t.updated_at,'')<{key} OR (COALESCE(t.updated_at,'')={key} AND t.ticket_id>{id}))"));
+                }
+                TicketQuerySort::CreatedDesc => {
+                    let key = bind(SqlValue::Text(key.clone()));
+                    let id = bind(SqlValue::Text(id.clone()));
+                    predicates.push(format!("(COALESCE(t.created_at,'')<{key} OR (COALESCE(t.created_at,'')={key} AND t.ticket_id>{id}))"));
+                }
+                TicketQuerySort::Title => {
+                    let key = bind(SqlValue::Text(key.clone()));
+                    let id = bind(SqlValue::Text(id.clone()));
+                    predicates.push(format!(
+                        "(lower(t.title)>{key} OR (lower(t.title)={key} AND t.ticket_id>{id}))"
+                    ));
+                }
+                TicketQuerySort::Priority | TicketQuerySort::Relevance => {
+                    let (rank, updated_at) = key.split_once('|').unwrap_or(("9", ""));
+                    let rank = bind(SqlValue::Integer(rank.parse::<i64>().unwrap_or(9)));
+                    let updated_at = bind(SqlValue::Text(updated_at.to_string()));
+                    let id = bind(SqlValue::Text(id.clone()));
+                    predicates.push(format!("({rank_expression}>{rank} OR ({rank_expression}={rank} AND (COALESCE(t.updated_at,'')<{updated_at} OR (COALESCE(t.updated_at,'')={updated_at} AND t.ticket_id>{id}))))"));
+                }
+            }
+        }
+        let order = match sort {
+            TicketQuerySort::Title => "t.title COLLATE NOCASE ASC, t.ticket_id ASC".to_string(),
+            TicketQuerySort::CreatedDesc => "t.created_at DESC, t.ticket_id ASC".to_string(),
+            TicketQuerySort::UpdatedDesc => "t.updated_at DESC, t.ticket_id ASC".to_string(),
+            TicketQuerySort::Priority | TicketQuerySort::Relevance => {
+                format!("{rank_expression} ASC, t.updated_at DESC, t.ticket_id ASC")
+            }
+        };
+        let limit = bind(SqlValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
+        let sql = format!(
+            "SELECT t.ticket_id FROM typed_tickets t WHERE {} ORDER BY {order} LIMIT {limit}",
+            predicates.join(" AND ")
+        );
+        self.store.with_conn(|connection| {
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement.query_map(params_from_iter(values.iter()), |row| row.get(0))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    fn query_objective_candidate_ids(
+        &self,
+        query: &ObjectiveQueryRequest,
+        sort: ObjectiveQuerySort,
+        after: Option<&(String, String)>,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let mut values = vec![SqlValue::Text(self.workspace_id.clone())];
+        let mut predicates = vec!["o.workspace_id=?1".to_string()];
+        let mut bind = |value: SqlValue| {
+            values.push(value);
+            format!("?{}", values.len())
+        };
+        if !query.states.is_empty() {
+            let states = query
+                .states
+                .iter()
+                .map(|state| bind(SqlValue::Text(state.clone())))
+                .collect::<Vec<_>>();
+            predicates.push(format!("o.state IN ({})", states.join(",")));
+        }
+        if let Some(text) = query.query.as_deref().filter(|text| !text.is_empty()) {
+            let pattern = bind(SqlValue::Text(format!("%{}%", text.to_lowercase())));
+            predicates.push(format!(
+                "(lower(o.title) LIKE {pattern} OR lower(o.body_md) LIKE {pattern})"
+            ));
+        }
+        if let Some(value) = &query.updated_after {
+            let value = bind(SqlValue::Text(value.clone()));
+            predicates.push(format!("o.updated_at>={value}"));
+        }
+        if let Some(value) = &query.updated_before {
+            let value = bind(SqlValue::Text(value.clone()));
+            predicates.push(format!("o.updated_at<={value}"));
+        }
+        if let Some(value) = &query.linked_ticket_id {
+            let value = bind(SqlValue::Text(value.clone()));
+            predicates.push(format!("EXISTS (SELECT 1 FROM objective_ticket_links link WHERE link.workspace_id=o.workspace_id AND link.objective_id=o.objective_id AND link.ticket_id={value})"));
+        }
+        let relevance_rank = if let Some(text) =
+            query.query.as_deref().filter(|text| !text.is_empty())
+        {
+            let pattern = bind(SqlValue::Text(format!("%{}%", text.to_lowercase())));
+            format!(
+                "CASE WHEN lower(o.title) LIKE {pattern} THEN 0 WHEN lower(o.body_md) LIKE {pattern} THEN 1 ELSE 2 END"
+            )
+        } else {
+            "2".to_string()
+        };
+        if let Some((key, id)) = after {
+            match sort {
+                ObjectiveQuerySort::UpdatedDesc => {
+                    let key = bind(SqlValue::Text(key.clone()));
+                    let id = bind(SqlValue::Text(id.clone()));
+                    predicates.push(format!(
+                        "(o.updated_at<{key} OR (o.updated_at={key} AND o.objective_id>{id}))"
+                    ));
+                }
+                ObjectiveQuerySort::CreatedDesc => {
+                    let key = bind(SqlValue::Text(key.clone()));
+                    let id = bind(SqlValue::Text(id.clone()));
+                    predicates.push(format!(
+                        "(o.created_at<{key} OR (o.created_at={key} AND o.objective_id>{id}))"
+                    ));
+                }
+                ObjectiveQuerySort::Title => {
+                    let key = bind(SqlValue::Text(key.clone()));
+                    let id = bind(SqlValue::Text(id.clone()));
+                    predicates.push(format!(
+                        "(lower(o.title)>{key} OR (lower(o.title)={key} AND o.objective_id>{id}))"
+                    ));
+                }
+                ObjectiveQuerySort::Relevance => {
+                    let (rank, updated_at) = key.split_once('|').unwrap_or(("9", ""));
+                    let rank = bind(SqlValue::Integer(rank.parse::<i64>().unwrap_or(9)));
+                    let updated_at = bind(SqlValue::Text(updated_at.to_string()));
+                    let id = bind(SqlValue::Text(id.clone()));
+                    predicates.push(format!("({relevance_rank}>{rank} OR ({relevance_rank}={rank} AND (o.updated_at<{updated_at} OR (o.updated_at={updated_at} AND o.objective_id>{id}))))"));
+                }
+            }
+        }
+        let order = match sort {
+            ObjectiveQuerySort::Title => {
+                "o.title COLLATE NOCASE ASC, o.objective_id ASC".to_string()
+            }
+            ObjectiveQuerySort::CreatedDesc => "o.created_at DESC, o.objective_id ASC".to_string(),
+            ObjectiveQuerySort::UpdatedDesc => "o.updated_at DESC, o.objective_id ASC".to_string(),
+            ObjectiveQuerySort::Relevance => {
+                format!("{relevance_rank} ASC, o.updated_at DESC, o.objective_id ASC")
+            }
+        };
+        let limit = bind(SqlValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
+        let sql = format!(
+            "SELECT o.objective_id FROM objectives o WHERE {} ORDER BY {order} LIMIT {limit}",
+            predicates.join(" AND ")
+        );
+        self.store.with_conn(|connection| {
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement.query_map(params_from_iter(values.iter()), |row| row.get(0))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
     fn read_ticket_detail(&self, id: &str, request: TicketShowRequest) -> Result<TicketDetail> {
         validate_project_id(id)?;
         let ticket = self
             .ticket_backend
             .show(TicketIdOrSlug::Id(id.to_string()))?;
+        self.ticket_detail_from_ticket(ticket, request)
+    }
+
+    fn ticket_detail_from_ticket(
+        &self,
+        ticket: ticket::Ticket,
+        request: TicketShowRequest,
+    ) -> Result<TicketDetail> {
+        let id = ticket.meta.id.as_str();
         let (body, body_truncated) =
             truncate_body(ticket.document.body.as_str(), DETAIL_BODY_LIMIT);
         let event_limit = request
@@ -458,42 +769,97 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
         })
     }
 
+    fn list_ticket_page(&self, request: TicketListPageRequest) -> Result<TicketSummaryPage> {
+        let limit = request.limit.unwrap_or(30).clamp(1, 100);
+        let mut states = request.states;
+        states.sort();
+        states.dedup();
+        let parsed_states = states
+            .iter()
+            .map(|state| {
+                TicketWorkflowState::parse(state).ok_or_else(|| {
+                    Error::InvalidRecordId(format!("unsupported ticket state `{state}`"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let fingerprint = format!("ticket-summary:v1:states={}", states.join(","));
+        let after = request
+            .cursor
+            .as_deref()
+            .map(|cursor| parse_ticket_summary_cursor(cursor, &fingerprint))
+            .transpose()?;
+        let page =
+            self.ticket_backend
+                .list_workspace_projection_page(SqliteTicketListPageQuery {
+                    states: parsed_states,
+                    limit,
+                    after,
+                })?;
+        let items = page
+            .items
+            .into_iter()
+            .map(ticket_summary_from_sqlite_item)
+            .collect::<Vec<_>>();
+        let next_cursor = page
+            .next
+            .map(|position| make_ticket_summary_cursor(&fingerprint, position));
+        Ok(TicketSummaryPage {
+            page: QueryPage {
+                limit,
+                returned: items.len(),
+                has_more: page.has_more,
+                next_cursor,
+                sort: "updated_desc".to_string(),
+                source_limit: None,
+                source_truncated: false,
+            },
+            items,
+            invalid_records: Vec::new(),
+            record_authority: RECORD_SOURCE_WORKSPACE_SQLITE.to_string(),
+        })
+    }
+
     fn query_tickets(&self, query: TicketQueryRequest) -> Result<TicketQueryResponse> {
         validate_ticket_query(&query)?;
         let limit = query.limit.unwrap_or(50).clamp(1, 100);
         let sort = normalize_ticket_sort(query.sort.as_deref(), query.query.is_some())?;
+        let fingerprint = ticket_query_fingerprint(&query, sort);
         let cursor = query
             .cursor
             .as_deref()
-            .map(parse_query_cursor)
+            .map(|cursor| parse_bound_query_cursor(cursor, &fingerprint))
             .transpose()?;
-        let mut summaries = self.list_tickets(1_001)?.items;
-        let source_truncated = summaries.len() > 1_000;
-        summaries.truncate(1_000);
+        let candidate_limit = limit.saturating_add(1);
+        let candidate_ids =
+            self.query_ticket_candidate_ids(&query, sort, cursor.as_ref(), candidate_limit)?;
+        let source_truncated = candidate_ids.len() == candidate_limit;
         let mut items = Vec::new();
-        for summary in summaries {
-            let detail = self.read_ticket_detail(
-                &summary.id,
+        for ticket_id in candidate_ids {
+            let authoritative = self
+                .ticket_backend
+                .show(TicketIdOrSlug::Id(ticket_id.clone()))?;
+            let summary = ticket_summary_from_ticket(&authoritative);
+            let authoritative_body = authoritative.document.body.clone();
+            let authoritative_events = authoritative.events.clone();
+            let detail = self.ticket_detail_from_ticket(
+                authoritative,
                 TicketShowRequest {
                     event_limit: Some(TICKET_EVENT_LIMIT),
                     event_cursor: None,
                 },
             )?;
-            let authoritative = self
-                .ticket_backend
-                .show(TicketIdOrSlug::Id(summary.id.clone()))?;
             if ticket_matches_query(
                 &summary,
                 &detail,
-                authoritative.document.body.as_str(),
-                &authoritative.events,
+                authoritative_body.as_str(),
+                &authoritative_events,
                 &query,
             ) {
                 items.push(ticket_query_item(
                     summary,
                     &detail,
-                    authoritative.document.body.as_str(),
-                    &authoritative.events,
+                    authoritative_body.as_str(),
+                    &authoritative_events,
                     &query,
                 ));
             }
@@ -505,7 +871,11 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
         let has_more = items.len() > limit;
         items.truncate(limit);
         let next_cursor = has_more
-            .then(|| items.last().map(|item| make_ticket_cursor(item, sort)))
+            .then(|| {
+                items
+                    .last()
+                    .map(|item| make_ticket_cursor(item, sort, &fingerprint))
+            })
             .flatten();
         Ok(TicketQueryResponse {
             page: QueryPage {
@@ -514,7 +884,7 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
                 has_more,
                 next_cursor,
                 sort: sort.to_string(),
-                source_limit: Some(1_000),
+                source_limit: Some(candidate_limit),
                 source_truncated,
             },
             items,
@@ -566,33 +936,36 @@ impl ObjectiveAuthority for SqliteWorkspaceAuthority {
         )?;
         let limit = query.limit.unwrap_or(50).clamp(1, 100);
         let sort = normalize_objective_sort(query.sort.as_deref(), query.query.is_some())?;
+        let fingerprint = objective_query_fingerprint(&query, sort);
         let cursor = query
             .cursor
             .as_deref()
-            .map(parse_query_cursor)
+            .map(|cursor| parse_bound_query_cursor(cursor, &fingerprint))
             .transpose()?;
-        let mut objectives = self.list_objectives(1_001)?.items;
-        let source_truncated = objectives.len() > 1_000;
-        objectives.truncate(1_000);
+        let candidate_limit = limit.saturating_add(1);
+        let objective_ids =
+            self.query_objective_candidate_ids(&query, sort, cursor.as_ref(), candidate_limit)?;
+        let source_truncated = objective_ids.len() == candidate_limit;
         let mut items = Vec::new();
-        for objective in objectives {
-            let body_md = self.objective_record(&objective.id)?.body_md;
-            if !objective_matches_query(&objective, &body_md, &query) {
-                continue;
-            }
+        for objective_id in objective_ids {
+            let record = self.objective_record(&objective_id)?;
             let linked_tickets = self
                 .store
-                .list_objective_ticket_links(&self.workspace_id, &objective.id)?
+                .list_objective_ticket_links(&self.workspace_id, &objective_id)?
                 .into_iter()
                 .map(|link| link.ticket_id)
                 .collect::<Vec<_>>();
-            if query
-                .linked_ticket_id
-                .as_ref()
-                .is_some_and(|id| !linked_tickets.iter().any(|ticket_id| ticket_id == id))
-            {
-                continue;
-            }
+            let body_md = record.body_md.clone();
+            let objective = ObjectiveSummary {
+                id: record.objective_id,
+                title: record.title,
+                state: record.state,
+                created_at: Some(record.created_at),
+                updated_at: Some(record.updated_at),
+                summary: summarize_body(&body_md),
+                linked_tickets: linked_tickets.clone(),
+                record_source: RECORD_SOURCE_WORKSPACE_SQLITE.to_string(),
+            };
             items.push(objective_query_item(
                 objective,
                 linked_tickets,
@@ -607,7 +980,11 @@ impl ObjectiveAuthority for SqliteWorkspaceAuthority {
         let has_more = items.len() > limit;
         items.truncate(limit);
         let next_cursor = has_more
-            .then(|| items.last().map(|item| make_objective_cursor(item, sort)))
+            .then(|| {
+                items
+                    .last()
+                    .map(|item| make_objective_cursor(item, sort, &fingerprint))
+            })
             .flatten();
         Ok(ObjectiveQueryResponse {
             page: QueryPage {
@@ -616,7 +993,7 @@ impl ObjectiveAuthority for SqliteWorkspaceAuthority {
                 has_more,
                 next_cursor,
                 sort: sort.to_string(),
-                source_limit: Some(1_000),
+                source_limit: Some(candidate_limit),
                 source_truncated,
             },
             items,
@@ -1240,6 +1617,35 @@ fn parse_offset_cursor(cursor: &str, field: &str) -> Result<usize> {
         .map_err(|_| Error::InvalidRecordId(format!("invalid {field}")))
 }
 
+fn make_bound_query_cursor(fingerprint: &str, key: &str, id: &str) -> String {
+    make_query_cursor(&format!("{fingerprint}\n{key}"), id)
+}
+
+fn parse_bound_query_cursor(value: &str, fingerprint: &str) -> Result<(String, String)> {
+    let (key, id) = parse_query_cursor(value)?;
+    let prefix = format!("{fingerprint}\n");
+    let key = key.strip_prefix(&prefix).ok_or_else(|| {
+        Error::InvalidRecordId("cursor does not match the current filters or sort".to_string())
+    })?;
+    Ok((key.to_string(), id))
+}
+
+fn ticket_query_fingerprint(query: &TicketQueryRequest, sort: TicketQuerySort) -> String {
+    let mut query = query.clone();
+    query.cursor = None;
+    query.limit = None;
+    query.sort = Some(sort.to_string());
+    serde_json::to_string(&query).expect("ticket query fingerprint must serialize")
+}
+
+fn objective_query_fingerprint(query: &ObjectiveQueryRequest, sort: ObjectiveQuerySort) -> String {
+    let mut query = query.clone();
+    query.cursor = None;
+    query.limit = None;
+    query.sort = Some(sort.to_string());
+    serde_json::to_string(&query).expect("objective query fingerprint must serialize")
+}
+
 fn make_query_cursor(key: &str, id: &str) -> String {
     format!("v1:{}:{key}{id}", key.len())
 }
@@ -1545,8 +1951,8 @@ fn sort_ticket_query_items(items: &mut [TicketQueryItem], sort: TicketQuerySort)
     });
 }
 
-fn make_ticket_cursor(item: &TicketQueryItem, sort: TicketQuerySort) -> String {
-    make_query_cursor(&ticket_sort_key(item, sort), &item.id)
+fn make_ticket_cursor(item: &TicketQueryItem, sort: TicketQuerySort, fingerprint: &str) -> String {
+    make_bound_query_cursor(fingerprint, &ticket_sort_key(item, sort), &item.id)
 }
 
 fn ticket_item_after_cursor(
@@ -1569,31 +1975,6 @@ fn ticket_item_after_cursor(
                         || (updated == cursor_updated && item.id > cursor.1)))
         }
     }
-}
-
-fn objective_matches_query(
-    objective: &ObjectiveSummary,
-    body_md: &str,
-    query: &ObjectiveQueryRequest,
-) -> bool {
-    if !query.states.is_empty() && !query.states.iter().any(|state| state == &objective.state) {
-        return false;
-    }
-    if query
-        .updated_after
-        .as_ref()
-        .is_some_and(|after| objective.updated_at.as_deref().unwrap_or("") <= after.as_str())
-        || query
-            .updated_before
-            .as_ref()
-            .is_some_and(|before| objective.updated_at.as_deref().unwrap_or("") >= before.as_str())
-    {
-        return false;
-    }
-    query.query.as_ref().is_none_or(|text| {
-        let needle = text.to_lowercase();
-        objective.title.to_lowercase().contains(&needle) || body_md.to_lowercase().contains(&needle)
-    })
 }
 
 fn objective_query_item(
@@ -1673,8 +2054,12 @@ fn sort_objective_query_items(items: &mut [ObjectiveQueryItem], sort: ObjectiveQ
     });
 }
 
-fn make_objective_cursor(item: &ObjectiveQueryItem, sort: ObjectiveQuerySort) -> String {
-    make_query_cursor(&objective_sort_key(item, sort), &item.id)
+fn make_objective_cursor(
+    item: &ObjectiveQueryItem,
+    sort: ObjectiveQuerySort,
+    fingerprint: &str,
+) -> String {
+    make_bound_query_cursor(fingerprint, &objective_sort_key(item, sort), &item.id)
 }
 
 fn objective_item_after_cursor(
@@ -1800,6 +2185,80 @@ fn memory_resolution_from_record(record: MemoryStagingResolutionRecord) -> Memor
         resolved_at: record.resolved_at,
         record_source: RECORD_SOURCE_WORKSPACE_SQLITE.to_string(),
     }
+}
+
+fn ticket_summary_from_ticket(ticket: &ticket::Ticket) -> TicketSummary {
+    let summary = ticket::TicketSummary {
+        id: ticket.meta.id.clone(),
+        slug: ticket.meta.slug.clone(),
+        title: ticket.meta.title.clone(),
+        status: ticket.meta.status.clone(),
+        kind: ticket.meta.kind.clone(),
+        priority: ticket.meta.priority.clone(),
+        labels: ticket.meta.labels.clone(),
+        readiness: ticket.meta.readiness.clone(),
+        workflow_state: ticket.meta.workflow_state,
+        workflow_state_explicit: ticket.meta.workflow_state_explicit,
+        queued_by: ticket.meta.queued_by.clone(),
+        queued_at: ticket.meta.queued_at.clone(),
+        updated_at: ticket.meta.updated_at.clone(),
+    };
+    ticket_summary_from_sqlite_item(SqliteTicketListItem {
+        summary,
+        relation_blockers: ticket.relations.blockers.clone(),
+    })
+}
+
+fn ticket_summary_from_sqlite_item(item: SqliteTicketListItem) -> TicketSummary {
+    let projection = project_ticket_workspace_item(&item.summary, &item.relation_blockers, None);
+    TicketSummary {
+        id: item.summary.id,
+        title: item.summary.title,
+        state: item.summary.workflow_state.as_str().to_string(),
+        priority: item.summary.priority,
+        updated_at: item.summary.updated_at,
+        queued_by: item.summary.queued_by,
+        queued_at: item.summary.queued_at,
+        workspace_action_priority: workspace_action_priority_name(projection.priority).to_string(),
+        record_source: "sqlite_yoi_ticket".to_string(),
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct TicketSummaryCursorEnvelope {
+    version: u8,
+    fingerprint: String,
+    position: SqliteTicketListCursor,
+}
+
+fn make_ticket_summary_cursor(fingerprint: &str, position: SqliteTicketListCursor) -> String {
+    make_query_cursor(
+        &serde_json::to_string(&TicketSummaryCursorEnvelope {
+            version: 1,
+            fingerprint: fingerprint.to_string(),
+            position,
+        })
+        .expect("ticket summary cursor must serialize"),
+        "",
+    )
+}
+
+fn parse_ticket_summary_cursor(
+    value: &str,
+    expected_fingerprint: &str,
+) -> Result<SqliteTicketListCursor> {
+    let (encoded, trailing) = parse_query_cursor(value)?;
+    if !trailing.is_empty() {
+        return Err(Error::InvalidRecordId("cursor is malformed".to_string()));
+    }
+    let cursor: TicketSummaryCursorEnvelope = serde_json::from_str(&encoded)
+        .map_err(|_| Error::InvalidRecordId("cursor is malformed".to_string()))?;
+    if cursor.version != 1 || cursor.fingerprint != expected_fingerprint {
+        return Err(Error::InvalidRecordId(
+            "cursor does not match the current ticket filters or sort".to_string(),
+        ));
+    }
+    Ok(cursor.position)
 }
 
 fn workspace_action_priority_name(priority: TicketWorkspaceActionPriority) -> &'static str {
@@ -2135,6 +2594,25 @@ mod tests {
             .unwrap();
         assert_eq!(exact_relation.items.len(), 1);
         assert_eq!(exact_relation.items[0].id, "00000000001J2");
+        let summary_page = authority
+            .list_ticket_page(TicketListPageRequest {
+                states: vec!["planning".to_string(), "ready".to_string()],
+                limit: Some(1),
+                cursor: None,
+            })
+            .unwrap();
+        assert_eq!(summary_page.items.len(), 1);
+        assert!(summary_page.page.has_more);
+        let mismatched_summary_cursor = authority.list_ticket_page(TicketListPageRequest {
+            states: vec!["done".to_string()],
+            limit: Some(1),
+            cursor: summary_page.page.next_cursor,
+        });
+        assert!(matches!(
+            mismatched_summary_cursor,
+            Err(Error::InvalidRecordId(_))
+        ));
+
         let first_page = authority
             .query_tickets(TicketQueryRequest {
                 sort: Some("title".to_string()),
@@ -2154,6 +2632,13 @@ mod tests {
         assert_eq!(second_page.items.len(), 1);
         assert_ne!(first_page.items[0].id, second_page.items[0].id);
         assert!(second_page.page.has_more);
+        let mismatched_cursor = authority.query_tickets(TicketQueryRequest {
+            sort: Some("updated_desc".to_string()),
+            limit: Some(1),
+            cursor: first_page.page.next_cursor.clone(),
+            ..TicketQueryRequest::default()
+        });
+        assert!(matches!(mismatched_cursor, Err(Error::InvalidRecordId(_))));
         let third_page = authority
             .query_tickets(TicketQueryRequest {
                 sort: Some("title".to_string()),
