@@ -12,6 +12,13 @@ import "./base.dcdl" // {
         worker = { enabled = true; direct_spawn = false; };
         manage_workdir = { enabled = true; };
         ticket = { enabled = true; thread = true; workflow = true; };
+        merge_request = {
+            show = true;
+            open = false;
+            review = false;
+            readiness_check = true;
+            complete = true;
+        };
         orchestration = { enabled = true; };
     };
 }

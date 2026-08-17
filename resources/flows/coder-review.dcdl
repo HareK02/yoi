@@ -15,7 +15,7 @@
         };
 
         review = {
-            instructions = "Spawn one actual direct-child SubWorker with profile builtin:reviewer, read-only scope, and a structured review handoff bound to the current immutable Merge Request revision. The child must commit MergeRequestReviewSubmit; prose output and Worker observation are not approval authority. After the structured current-revision result exists, request a Flow transition.";
+            instructions = "Spawn one actual direct-child SubWorker with profile builtin:reviewer, read-only scope, and a structured review handoff bound to the current immutable Merge Request revision. The child must commit MergeRequestReview; prose output and Worker observation are not approval authority. After the structured current-revision result exists, request a Flow transition.";
             transitions = {
                 approved = {
                     target = "complete";
@@ -39,17 +39,17 @@
         };
 
         complete = {
-            instructions = "Call MergeRequestComplete with a fresh operation_id and the approved current revision. The Server must revalidate current assignment, immutable revision, registered Reviewer attempt, and Ticket inprogress CAS. Only after the authoritative operation returns Ticket state done, request a Flow transition.";
+            instructions = "Leave concise implementation and validation evidence on the Ticket, then hand off the exact approved Merge Request revision to the Orchestrator for readiness and integration. Do not call MergeRequestComplete; Coder approval handoff is not Ticket completion authority. After durable handoff evidence exists, request a Flow transition.";
             transitions = {
                 completed = {
                     target = "done";
-                    condition = "MergeRequestComplete durably returned done for this exact operation_id and current approved revision. A Flow state or prose report alone is never sufficient.";
+                    condition = "The exact approved Merge Request revision and implementation evidence have been durably handed off to the Orchestrator. A Flow state or prose report alone is never Ticket completion authority.";
                 };
             };
         };
 
         done = {
-            instructions = "The guarded Merge Request completion operation committed Ticket state done. Flow terminal state only reflects that durable authority.";
+            instructions = "The approved implementation has been handed off for Orchestrator-owned readiness and integration. Flow terminal state only reflects that handoff.";
             terminal = true;
         };
     };

@@ -5890,6 +5890,13 @@ model_id = "claude-sonnet-4-20250514"
 [engine]
 instruction = "saved"
 
+[feature.merge_request]
+show = true
+open = false
+review = true
+readiness_check = false
+complete = false
+
 [[scope.allow]]
 target = "/snapshot/workspace"
 permission = "read"
@@ -5912,6 +5919,13 @@ model_id = "claude-sonnet-4-20250514"
 [engine]
 instruction = "current"
 
+[feature.merge_request]
+show = true
+open = true
+review = true
+readiness_check = true
+complete = true
+
 [[scope.allow]]
 target = "/current/workspace"
 permission = "write"
@@ -5931,6 +5945,14 @@ permission = "write"
         .unwrap();
 
         assert_eq!(restored.engine.instruction, "saved");
+        assert_eq!(
+            restored.feature.merge_request,
+            manifest::MergeRequestFeatureConfig {
+                show: true,
+                review: true,
+                ..Default::default()
+            }
+        );
         assert_eq!(restored.scope.allow.len(), 1);
         assert_eq!(
             restored.scope.allow[0].target,

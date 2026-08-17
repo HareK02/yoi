@@ -1,19 +1,41 @@
-use crate::feature::ToolDefinition;
+use crate::feature::{
+    FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureInstructionContribution,
+    FeatureInstructionDeclaration, FeatureInstructionId, FeatureModule, ToolContribution,
+    ToolDeclaration, ToolDefinition,
+};
 use crate::worker::{WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod};
 use async_trait::async_trait;
 use llm_engine::tool::{Tool, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
+use manifest::MergeRequestFeatureConfig;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
-pub const MERGE_REQUEST_COMMON_TOOL_NAMES: &[&str] = &[
-    "MergeRequestShow",
-    "MergeRequestReadinessCheck",
-    "MergeRequestOpen",
-    "MergeRequestComplete",
+pub const FEATURE_ID: &str = "merge_request";
+const FEATURE_NAME: &str = "Merge Request tools";
+const FEATURE_DESCRIPTION: &str =
+    "Operation-specific Merge Request workflow tools over Workspace authority.";
+const FEATURE_INSTRUCTION_ID: &str = "merge_request.workflow";
+pub const FEATURE_PROMPT_REF: &str = "common.merge_request";
+
+fn workflow_instruction() -> FeatureInstructionDeclaration {
+    FeatureInstructionDeclaration::new(
+        FeatureInstructionId::builtin(FEATURE_INSTRUCTION_ID),
+        FEATURE_PROMPT_REF,
+        "Operation-specific Merge Request workflow guidance",
+    )
+    .expect("static Merge Request workflow instruction declaration is valid")
+}
+
+const ALL_KINDS: [Kind; 5] = [
+    Kind::Show,
+    Kind::Open,
+    Kind::Review,
+    Kind::Readiness,
+    Kind::Complete,
 ];
-pub const MERGE_REQUEST_REVIEW_TOOL_NAME: &str = "MergeRequestReviewSubmit";
+
 #[derive(Clone, Copy)]
 enum Kind {
     Show,
@@ -89,13 +111,23 @@ struct ReviewFindingInput {
     body: String,
 }
 impl Kind {
+    fn enabled(self, config: MergeRequestFeatureConfig) -> bool {
+        match self {
+            Self::Show => config.show,
+            Self::Open => config.open,
+            Self::Review => config.review,
+            Self::Readiness => config.readiness_check,
+            Self::Complete => config.complete,
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::Show => "MergeRequestShow",
             Self::Readiness => "MergeRequestReadinessCheck",
             Self::Open => "MergeRequestOpen",
             Self::Complete => "MergeRequestComplete",
-            Self::Review => "MergeRequestReviewSubmit",
+            Self::Review => "MergeRequestReview",
         }
     }
     fn schema(self) -> serde_json::Value {
@@ -218,24 +250,53 @@ fn definition(client: Arc<dyn WorkspaceClient>, kind: Kind) -> ToolDefinition {
         )
     })
 }
-pub fn common_tools(c: Arc<dyn WorkspaceClient>) -> Vec<ToolDefinition> {
-    vec![
-        definition(c.clone(), Kind::Show),
-        definition(c.clone(), Kind::Readiness),
-        definition(c.clone(), Kind::Open),
-        definition(c, Kind::Complete),
-    ]
+pub struct MergeRequestFeature {
+    client: Arc<dyn WorkspaceClient>,
+    config: MergeRequestFeatureConfig,
 }
-pub fn reviewer_tools(c: Arc<dyn WorkspaceClient>) -> Vec<ToolDefinition> {
-    if c.reviewer_context().is_some() {
-        vec![
-            definition(c.clone(), Kind::Show),
-            definition(c, Kind::Review),
-        ]
-    } else {
-        vec![]
+
+impl MergeRequestFeature {
+    pub fn new(client: Arc<dyn WorkspaceClient>, config: MergeRequestFeatureConfig) -> Self {
+        Self { client, config }
+    }
+
+    fn kinds(&self) -> impl Iterator<Item = Kind> + '_ {
+        ALL_KINDS
+            .into_iter()
+            .filter(|kind| kind.enabled(self.config))
     }
 }
+
+impl FeatureModule for MergeRequestFeature {
+    fn descriptor(&self) -> FeatureDescriptor {
+        let mut descriptor = FeatureDescriptor::builtin(FEATURE_ID, FEATURE_NAME)
+            .with_description(FEATURE_DESCRIPTION);
+        if self.config.any() {
+            descriptor = descriptor.with_instruction(workflow_instruction());
+        }
+        for kind in self.kinds() {
+            descriptor = descriptor.with_tool(ToolDeclaration::new(
+                kind.name(),
+                description(kind.name()).unwrap_or("Merge Request operation."),
+            ));
+        }
+        descriptor
+    }
+
+    fn install(&self, ctx: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
+        if self.config.any() {
+            ctx.instructions()
+                .register(FeatureInstructionContribution::new(workflow_instruction()))?;
+        }
+        let mut tools = ctx.tools();
+        for kind in self.kinds() {
+            let definition = definition(self.client.clone(), kind);
+            tools.register(ToolContribution::new(kind.name(), definition))?;
+        }
+        Ok(())
+    }
+}
+
 pub fn description(n: &str) -> Option<&'static str> {
     match n {
         "MergeRequestShow" => Some("Read the selector-based Merge Request and append-only thread."),
@@ -248,7 +309,7 @@ pub fn description(n: &str) -> Option<&'static str> {
         "MergeRequestComplete" => {
             Some("Complete using an approved review event and final target-ref evidence.")
         }
-        "MergeRequestReviewSubmit" => {
+        "MergeRequestReview" => {
             Some("Submit the injected Reviewer capability result for its captured subject ref.")
         }
         _ => None,
@@ -257,6 +318,72 @@ pub fn description(n: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature::FeatureRegistryBuilder;
+    use crate::hook::HookRegistryBuilder;
+    use crate::worker::TestWorkspaceHttpClient;
+
+    fn install(config: MergeRequestFeatureConfig) -> (Vec<String>, Vec<String>) {
+        let client: Arc<dyn WorkspaceClient> =
+            Arc::new(TestWorkspaceHttpClient::new("workspace", "http://unused"));
+        let mut pending_tools = Vec::new();
+        let mut hook_builder = HookRegistryBuilder::default();
+        let report = FeatureRegistryBuilder::new()
+            .with_module(MergeRequestFeature::new(client, config))
+            .install_into_pending(&mut pending_tools, &mut hook_builder);
+        assert!(!report.has_errors(), "{}", report.error_message());
+        (
+            report.installed_tool_names(),
+            report
+                .installed_instruction_contributions()
+                .into_iter()
+                .map(|instruction| instruction.prompt_ref)
+                .collect(),
+        )
+    }
+
+    fn tool_names(config: MergeRequestFeatureConfig) -> Vec<String> {
+        install(config).0
+    }
+
+    #[test]
+    fn flags_define_the_exact_registered_tool_surface() {
+        let coder = MergeRequestFeatureConfig {
+            show: true,
+            open: true,
+            ..Default::default()
+        };
+        assert_eq!(tool_names(coder), ["MergeRequestShow", "MergeRequestOpen"]);
+
+        let reviewer = MergeRequestFeatureConfig {
+            show: true,
+            review: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            tool_names(reviewer),
+            ["MergeRequestShow", "MergeRequestReview"]
+        );
+
+        let orchestrator = MergeRequestFeatureConfig {
+            show: true,
+            readiness_check: true,
+            complete: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            tool_names(orchestrator),
+            [
+                "MergeRequestShow",
+                "MergeRequestReadinessCheck",
+                "MergeRequestComplete"
+            ]
+        );
+        assert_eq!(install(coder).1, [FEATURE_PROMPT_REF]);
+        let unspecified = install(MergeRequestFeatureConfig::default());
+        assert!(unspecified.0.is_empty());
+        assert!(unspecified.1.is_empty());
+    }
+
     #[test]
     fn schemas_hide_revision_and_commit_authority() {
         let schemas = [
@@ -276,6 +403,5 @@ mod tests {
                 assert!(!j.contains(banned), "{banned} in {j}")
             }
         }
-        assert!(!MERGE_REQUEST_COMMON_TOOL_NAMES.contains(&"MergeRequestRequestReview"));
     }
 }

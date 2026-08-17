@@ -528,6 +528,39 @@ mod tests {
     }
 
     #[test]
+    fn merge_request_instruction_matches_the_exposed_operations() {
+        let catalog = PromptCatalog::builtins_only().unwrap();
+        let coder = catalog
+            .render_name(
+                "common.merge_request",
+                Value::from_serialize(serde_json::json!({
+                    "tools": ["MergeRequestShow", "MergeRequestOpen"]
+                })),
+            )
+            .unwrap();
+        assert!(coder.contains("Reread the current Merge Request"));
+        assert!(coder.contains("Open the Merge Request only after"));
+        assert!(!coder.contains("Submit the authoritative verdict"));
+        assert!(!coder.contains("Complete integration only after"));
+
+        let orchestrator = catalog
+            .render_name(
+                "common.merge_request",
+                Value::from_serialize(serde_json::json!({
+                    "tools": [
+                        "MergeRequestShow",
+                        "MergeRequestReadinessCheck",
+                        "MergeRequestComplete"
+                    ]
+                })),
+            )
+            .unwrap();
+        assert!(orchestrator.contains("Use `MergeRequestReadinessCheck`"));
+        assert!(orchestrator.contains("Complete integration only after"));
+        assert!(!orchestrator.contains("Open the Merge Request only after"));
+    }
+
+    #[test]
     fn commit_capable_roles_classify_commits_by_change_type() {
         let catalog = PromptCatalog::builtins_only().unwrap();
         assert!(catalog.projection.templates.contains_key("common.git"));

@@ -919,6 +919,37 @@ fn apply_role_profile(
         _ => serde_json::json!({ "enabled": true, "authoring": true, "thread": true }),
     };
     value["feature"]["ticket"] = ticket;
+    let merge_request = match slug {
+        "coder" => serde_json::json!({
+            "show": true,
+            "open": true,
+            "review": false,
+            "readiness_check": false,
+            "complete": false
+        }),
+        "reviewer" => serde_json::json!({
+            "show": true,
+            "open": false,
+            "review": true,
+            "readiness_check": false,
+            "complete": false
+        }),
+        "orchestrator" => serde_json::json!({
+            "show": true,
+            "open": false,
+            "review": false,
+            "readiness_check": true,
+            "complete": true
+        }),
+        _ => serde_json::json!({
+            "show": false,
+            "open": false,
+            "review": false,
+            "readiness_check": false,
+            "complete": false
+        }),
+    };
+    value["feature"]["merge_request"] = merge_request;
 }
 
 fn reject_manifest_shaped_profile(value: &serde_json::Value) -> Result<(), ProfileError> {
@@ -1361,6 +1392,7 @@ mod tests {
         assert!(companion.feature.objective.enabled);
         assert!(!companion.feature.ticket.intake);
         assert!(!companion.feature.orchestration.enabled);
+        assert!(!companion.feature.merge_request.any());
         assert_eq!(
             companion.compaction.as_ref().unwrap().threshold,
             Some(240000)
@@ -1401,6 +1433,15 @@ mod tests {
         assert!(!orchestrator.feature.sub_worker.enabled);
         assert!(orchestrator.feature.worker.enabled);
         assert!(!orchestrator.feature.worker.direct_spawn);
+        assert_eq!(
+            orchestrator.feature.merge_request,
+            crate::MergeRequestFeatureConfig {
+                show: true,
+                readiness_check: true,
+                complete: true,
+                ..Default::default()
+            }
+        );
         assert!(orchestrator.feature.ticket.enabled);
         assert!(orchestrator.feature.ticket.enabled);
         assert!(!orchestrator.feature.ticket.authoring);
@@ -1424,6 +1465,14 @@ mod tests {
         assert!(coder.feature.sub_worker.enabled);
         assert!(coder.feature.flow.enabled);
         assert!(!coder.feature.worker.enabled);
+        assert_eq!(
+            coder.feature.merge_request,
+            crate::MergeRequestFeatureConfig {
+                show: true,
+                open: true,
+                ..Default::default()
+            }
+        );
         assert!(coder.scope.allow.is_empty());
         assert!(coder.delegation_scope.allow.is_empty());
         assert_eq!(coder.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
@@ -1442,6 +1491,14 @@ mod tests {
         assert!(!reviewer.feature.sub_worker.enabled);
         assert!(!reviewer.feature.flow.enabled);
         assert!(!reviewer.feature.worker.enabled);
+        assert_eq!(
+            reviewer.feature.merge_request,
+            crate::MergeRequestFeatureConfig {
+                show: true,
+                review: true,
+                ..Default::default()
+            }
+        );
         assert!(reviewer.feature.ticket.enabled);
         assert!(reviewer.feature.ticket.enabled);
         assert!(!reviewer.feature.ticket.authoring);
@@ -1604,6 +1661,14 @@ enabled = true
 authoring = false
 thread = false
 intake = false
+
+[feature.merge_request]
+show = true
+open = false
+review = true
+readiness_check = false
+complete = false
+
 [feature.orchestration]
 enabled = false
 "#,
@@ -1626,6 +1691,14 @@ enabled = false
         assert!(!resolved.manifest.feature.ticket.authoring);
         assert!(!resolved.manifest.feature.ticket.thread);
         assert!(!resolved.manifest.feature.ticket.intake);
+        assert_eq!(
+            resolved.manifest.feature.merge_request,
+            crate::MergeRequestFeatureConfig {
+                show: true,
+                review: true,
+                ..Default::default()
+            }
+        );
         assert!(!resolved.manifest.feature.orchestration.enabled);
         assert_eq!(
             resolved.manifest.delegation_scope.allow[0].target,

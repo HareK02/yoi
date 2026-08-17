@@ -30,6 +30,13 @@ feature = {
     worker = { enabled = false; };
     objective = { enabled = true; };
     ticket = { enabled = true; authoring = true; thread = true; };
+    merge_request = {
+        show = false;
+        open = false;
+        review = false;
+        readiness_check = false;
+        complete = false;
+    };
 };
 
 memory = {

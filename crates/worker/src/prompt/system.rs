@@ -319,6 +319,7 @@ fn append_trailing_section(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature::FeatureInstructionId;
     use chrono::TimeZone;
     use manifest::{Permission, ScopeConfig, ScopeRule};
     use tempfile::TempDir;
@@ -398,6 +399,48 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn merge_request_role_prompts_match_operation_specific_tool_surfaces() {
+        fn render(role: &str, tools: &[&str]) -> String {
+            let tmp = TempDir::new().unwrap();
+            let scope = build_scope(tmp.path());
+            let prompts = PromptCatalog::builtins_only().unwrap();
+            let template =
+                SystemPromptTemplate::parse(role, PromptCatalogSource::builtins_only()).unwrap();
+            let instruction = FeatureInstructionDeclaration::new(
+                FeatureInstructionId::builtin("merge_request.workflow"),
+                "common.merge_request",
+                "Merge Request workflow",
+            )
+            .unwrap();
+            let mut ctx = context(tmp.path(), &scope, &prompts);
+            ctx.tool_names = tools.iter().map(|name| (*name).to_string()).collect();
+            ctx.feature_instructions = std::slice::from_ref(&instruction);
+            template.render(&ctx).unwrap()
+        }
+
+        let coder = render("role.coder", &["MergeRequestShow", "MergeRequestOpen"]);
+        assert!(coder.contains("Open the Merge Request only after"));
+        assert!(!coder.contains("Complete integration only after"));
+        assert!(coder.contains("Do not call `MergeRequestComplete`"));
+
+        let reviewer = render("role.reviewer", &["MergeRequestShow", "MergeRequestReview"]);
+        assert!(reviewer.contains("Submit the authoritative verdict"));
+        assert!(!reviewer.contains("Open the Merge Request only after"));
+
+        let orchestrator = render(
+            "role.orchestrator",
+            &[
+                "MergeRequestShow",
+                "MergeRequestReadinessCheck",
+                "MergeRequestComplete",
+            ],
+        );
+        assert!(orchestrator.contains("Use `MergeRequestReadinessCheck`"));
+        assert!(orchestrator.contains("Complete integration only after"));
+        assert!(!orchestrator.contains("Submit the authoritative verdict"));
     }
 
     #[test]

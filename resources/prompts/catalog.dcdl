@@ -6,6 +6,7 @@ let
 defaultDocument = import "./default.md";
 commonLanguage = import "./common/language.md";
 commonGit = import "./common/git.md";
+commonMergeRequest = import "./common/merge-request.md";
 commonTickets = import "./common/tickets.md";
 commonToolUsage = import "./common/tool-usage.md";
 commonWorkerObservation = import "./common/worker-observation.md";
@@ -36,6 +37,7 @@ in
     common = {
         git = commonGit.content;
         language = commonLanguage.content;
+        merge_request = commonMergeRequest.content;
         tickets = commonTickets.content;
         tool_usage = commonToolUsage.content;
         worker_observation = commonWorkerObservation.content;

@@ -24,7 +24,6 @@ use ticket::{
     tool::{TICKET_TOOL_NAMES, TicketToolBackend, ticket_tool_description, ticket_tools},
 };
 
-use super::merge_request;
 use crate::feature::{
     FeatureDescriptor, FeatureDiagnostic, FeatureInstallContext, FeatureInstallError,
     FeatureInstructionContribution, FeatureInstructionDeclaration, FeatureInstructionId,
@@ -588,22 +587,6 @@ impl FeatureModule for TicketFeature {
                 ticket_tool_description(name, self.record_language.as_deref()),
             ));
         }
-        if let TicketFeatureBackend::WorkspaceClient(client) = &self.backend {
-            let names: Vec<&str> = if client.reviewer_context().is_some() {
-                vec![
-                    "MergeRequestShow",
-                    merge_request::MERGE_REQUEST_REVIEW_TOOL_NAME,
-                ]
-            } else {
-                merge_request::MERGE_REQUEST_COMMON_TOOL_NAMES.to_vec()
-            };
-            for name in names {
-                descriptor = descriptor.with_tool(ToolDeclaration::new(
-                    name,
-                    merge_request::description(name).unwrap_or("Merge Request operation."),
-                ));
-            }
-        }
         descriptor
     }
 
@@ -660,17 +643,6 @@ impl FeatureModule for TicketFeature {
                 _ => definition,
             };
             tools.register(ToolContribution::new(name, definition))?;
-        }
-        if let TicketFeatureBackend::WorkspaceClient(client) = &self.backend {
-            let definitions = if client.reviewer_context().is_some() {
-                merge_request::reviewer_tools(client.clone())
-            } else {
-                merge_request::common_tools(client.clone())
-            };
-            for definition in definitions {
-                let (meta, _) = definition();
-                tools.register(ToolContribution::new(meta.name.clone(), definition))?;
-            }
         }
         Ok(())
     }
