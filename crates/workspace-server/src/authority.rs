@@ -374,8 +374,10 @@ impl SqliteWorkspaceAuthority {
                 .as_ref()
                 .map(|value| bind(SqlValue::Text(value.clone())));
             let related = related
-                .map(|value| format!("AND r.ticket_id=t.ticket_id AND r.target={value}"))
-                .unwrap_or_else(|| "AND r.ticket_id=t.ticket_id".to_string());
+                .map(|value| format!("AND ((r.ticket_id=t.ticket_id AND r.target={value}) OR (r.target=t.ticket_id AND r.ticket_id={value}))"))
+                .unwrap_or_else(|| {
+                    "AND (r.ticket_id=t.ticket_id OR r.target=t.ticket_id)".to_string()
+                });
             let kind = kind
                 .map(|value| format!("AND r.kind={value}"))
                 .unwrap_or_default();
@@ -2678,6 +2680,16 @@ mod tests {
             .unwrap();
         assert_eq!(exact_relation.items.len(), 1);
         assert_eq!(exact_relation.items[0].id, "00000000001J2");
+        let incoming_relation = authority
+            .query_tickets(TicketQueryRequest {
+                related_ticket_id: Some("00000000001J2".to_string()),
+                relation_kind: Some("related".to_string()),
+                limit: Some(10),
+                ..TicketQueryRequest::default()
+            })
+            .unwrap();
+        assert_eq!(incoming_relation.items.len(), 1);
+        assert_eq!(incoming_relation.items[0].id, "00000000001J5");
         let summary_page = authority
             .list_ticket_page(TicketListPageRequest {
                 states: vec!["planning".to_string(), "ready".to_string()],
