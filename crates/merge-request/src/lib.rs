@@ -11,6 +11,13 @@ use uuid::Uuid;
 const SCHEMA_VERSION: i64 = 12;
 const PREVIOUS_SCHEMA_VERSION: i64 = 11;
 const MAX_BODY_BYTES: usize = 16 * 1024;
+const DOMAIN_TABLES: [&str; 5] = [
+    "merge_requests",
+    "merge_request_ticket_relations",
+    "merge_request_thread_events",
+    "merge_request_review_grants",
+    "merge_request_reviewer_child_sessions",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1143,27 +1150,87 @@ fn ticket_event(
 }
 
 pub fn migrate(c: &Connection) -> Result<(), MergeRequestError> {
-    match schema_version(c)? {
-        None => fresh(c),
-        Some(SCHEMA_VERSION) => verify(c),
-        Some(PREVIOUS_SCHEMA_VERSION) => from_v11(c),
-        Some(v) => Err(MergeRequestError::Operation(format!(
+    match schema_state(c)? {
+        SchemaState::Fresh => fresh(c),
+        SchemaState::Current(SCHEMA_VERSION) => verify(c),
+        SchemaState::Current(PREVIOUS_SCHEMA_VERSION) => from_v11(c, PreviousSchemaMarker::Current),
+        SchemaState::Legacy(PREVIOUS_SCHEMA_VERSION) => from_v11(c, PreviousSchemaMarker::Legacy),
+        SchemaState::Current(v) => Err(MergeRequestError::Operation(format!(
             "unsupported schema {v}"
+        ))),
+        SchemaState::Legacy(v) => Err(MergeRequestError::Operation(format!(
+            "unsupported legacy schema {v}"
         ))),
     }
 }
-fn schema_version(c: &Connection) -> Result<Option<i64>, MergeRequestError> {
-    let e:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='merge_request_schema')",[],|r|r.get(0))?;
-    if !e {
-        return Ok(None);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaState {
+    Fresh,
+    Current(i64),
+    Legacy(i64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviousSchemaMarker {
+    Current,
+    Legacy,
+}
+
+fn schema_state(c: &Connection) -> Result<SchemaState, MergeRequestError> {
+    let (current, legacy): (bool, bool) = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='merge_request_schema'),EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='merge_request_schema_migrations')",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if current && legacy {
+        return Err(MergeRequestError::Corrupt(
+            "both current and legacy schema markers exist".into(),
+        ));
     }
-    c.query_row(
-        "SELECT version FROM merge_request_schema WHERE singleton=1",
+    if current {
+        let (count, singleton, version): (i64, Option<i64>, Option<i64>) = c.query_row(
+            "SELECT COUNT(*),MIN(singleton),MAX(version) FROM merge_request_schema",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        if count != 1 || singleton != Some(1) {
+            return Err(MergeRequestError::Corrupt(
+                "current schema marker must contain exactly singleton 1".into(),
+            ));
+        }
+        let version = version.ok_or_else(|| {
+            MergeRequestError::Corrupt("current schema marker version is null".into())
+        })?;
+        return Ok(SchemaState::Current(version));
+    }
+    if legacy {
+        let (count, version): (i64, Option<i64>) = c.query_row(
+            "SELECT COUNT(*),MAX(version) FROM merge_request_schema_migrations",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if count != 1 {
+            return Err(MergeRequestError::Corrupt(
+                "legacy schema marker must contain exactly one version".into(),
+            ));
+        }
+        let version = version.ok_or_else(|| {
+            MergeRequestError::Corrupt("legacy schema marker version is null".into())
+        })?;
+        return Ok(SchemaState::Legacy(version));
+    }
+    let domain_tables: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name GLOB 'merge_request*')",
         [],
         |r| r.get(0),
-    )
-    .optional()
-    .map_err(Into::into)
+    )?;
+    if domain_tables {
+        return Err(MergeRequestError::Corrupt(
+            "merge request tables exist without a schema marker".into(),
+        ));
+    }
+    Ok(SchemaState::Fresh)
 }
 fn fresh(c: &Connection) -> Result<(), MergeRequestError> {
     let t = c.unchecked_transaction()?;
@@ -1180,13 +1247,26 @@ fn tables(t: &Transaction<'_>, marker: bool) -> Result<(), MergeRequestError> {
     t.execute_batch("CREATE TABLE merge_requests(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,repository_id TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN('open','merged','closed')),selector_from TEXT,selector_to TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(workspace_id,merge_request_id),FOREIGN KEY(workspace_id,repository_id)REFERENCES repositories(workspace_id,repository_id));CREATE TABLE merge_request_ticket_relations(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,ticket_id TEXT NOT NULL,relation_kind TEXT NOT NULL CHECK(relation_kind='implements'),created_at TEXT NOT NULL,PRIMARY KEY(workspace_id,merge_request_id,ticket_id),FOREIGN KEY(workspace_id,merge_request_id)REFERENCES merge_requests(workspace_id,merge_request_id)ON DELETE CASCADE,FOREIGN KEY(workspace_id,ticket_id)REFERENCES typed_tickets(workspace_id,ticket_id)ON DELETE CASCADE);CREATE TABLE merge_request_thread_events(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,event_id TEXT NOT NULL,sequence INTEGER NOT NULL,kind TEXT NOT NULL CHECK(kind IN('review_requested','review','review_revoked','review_cancelled','comment','merge')),payload_json TEXT NOT NULL,operation_id TEXT,created_at TEXT NOT NULL,PRIMARY KEY(workspace_id,merge_request_id,event_id),UNIQUE(workspace_id,merge_request_id,sequence),FOREIGN KEY(workspace_id,merge_request_id)REFERENCES merge_requests(workspace_id,merge_request_id)ON DELETE CASCADE);CREATE UNIQUE INDEX merge_request_merge_operations ON merge_request_thread_events(workspace_id,operation_id)WHERE operation_id IS NOT NULL;CREATE TABLE merge_request_review_grants(workspace_id TEXT NOT NULL,merge_request_id TEXT NOT NULL,request_event_id TEXT NOT NULL,subject_ref TEXT NOT NULL,reviewer_runtime_id TEXT NOT NULL,reviewer_worker_id TEXT NOT NULL,capability_token TEXT PRIMARY KEY,issued_at TEXT NOT NULL,consumed_at TEXT,revoked_at TEXT,status TEXT NOT NULL CHECK(status IN('issued','consumed','revoked')),FOREIGN KEY(workspace_id,merge_request_id,request_event_id)REFERENCES merge_request_thread_events(workspace_id,merge_request_id,event_id)ON DELETE CASCADE);CREATE TABLE merge_request_reviewer_child_sessions(workspace_id TEXT NOT NULL,child_session_id TEXT NOT NULL,parent_runtime_id TEXT NOT NULL,parent_worker_id TEXT NOT NULL,reviewer_profile TEXT NOT NULL,registered_at TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN('active','consumed')),PRIMARY KEY(workspace_id,child_session_id));")?;
     Ok(())
 }
-fn from_v11(c: &Connection) -> Result<(), MergeRequestError> {
+fn from_v11(
+    c: &Connection,
+    previous_marker: PreviousSchemaMarker,
+) -> Result<(), MergeRequestError> {
     let t = c.unchecked_transaction()?;
+    if previous_marker == PreviousSchemaMarker::Legacy {
+        t.execute_batch("CREATE TABLE merge_request_schema(singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL);")?;
+        t.execute(
+            "INSERT INTO merge_request_schema VALUES(1,?1)",
+            params![PREVIOUS_SCHEMA_VERSION],
+        )?;
+    }
     t.execute_batch("ALTER TABLE merge_requests RENAME TO merge_requests_v11;ALTER TABLE merge_request_ticket_relations RENAME TO merge_request_ticket_relations_v11;ALTER TABLE merge_request_revisions RENAME TO merge_request_revisions_v11;ALTER TABLE merge_request_revision_paths RENAME TO merge_request_revision_paths_v11;ALTER TABLE merge_request_reviewer_child_sessions RENAME TO merge_request_reviewer_child_sessions_v11;ALTER TABLE merge_request_review_attempts RENAME TO merge_request_review_attempts_v11;ALTER TABLE merge_request_reviews RENAME TO merge_request_reviews_v11;ALTER TABLE merge_request_review_findings RENAME TO merge_request_review_findings_v11;ALTER TABLE merge_request_completion_operations RENAME TO merge_request_completion_operations_v11;")?;
     tables(&t, false)?;
     t.execute("INSERT INTO merge_requests SELECT workspace_id,merge_request_id,repository_id,CASE state WHEN 'draft'THEN'open'ELSE state END,NULL,target_ref_selector,created_at,updated_at FROM merge_requests_v11",[])?;
     t.execute("INSERT INTO merge_request_ticket_relations SELECT * FROM merge_request_ticket_relations_v11",[])?;
     migrate_events(&t)?;
+    if previous_marker == PreviousSchemaMarker::Legacy {
+        t.execute("DROP TABLE merge_request_schema_migrations", [])?;
+    }
     t.execute_batch("DROP TABLE merge_request_review_findings_v11;DROP TABLE merge_request_reviews_v11;DROP TABLE merge_request_review_attempts_v11;DROP TABLE merge_request_reviewer_child_sessions_v11;DROP TABLE merge_request_revision_paths_v11;DROP TABLE merge_request_revisions_v11;DROP TABLE merge_request_completion_operations_v11;DROP TABLE merge_request_ticket_relations_v11;DROP TABLE merge_requests_v11;UPDATE merge_request_schema SET version=12 WHERE singleton=1;")?;
     fk(&t)?;
     t.commit()?;
@@ -1363,12 +1443,7 @@ fn migrate_events(t: &Transaction<'_>) -> Result<(), MergeRequestError> {
     Ok(())
 }
 fn verify(c: &Connection) -> Result<(), MergeRequestError> {
-    for n in [
-        "merge_requests",
-        "merge_request_ticket_relations",
-        "merge_request_thread_events",
-        "merge_request_review_grants",
-    ] {
+    for n in DOMAIN_TABLES {
         let e: bool = c.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table'AND name=?1)",
             params![n],
@@ -1381,15 +1456,16 @@ fn verify(c: &Connection) -> Result<(), MergeRequestError> {
     fk(c)
 }
 fn fk(c: &Connection) -> Result<(), MergeRequestError> {
-    let v: Option<(String, i64)> = c
-        .query_row("PRAGMA foreign_key_check", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
-        .optional()?;
-    if let Some((t, r)) = v {
-        return Err(MergeRequestError::Corrupt(format!(
-            "foreign key violation {t}:{r}"
-        )));
+    for table in DOMAIN_TABLES {
+        let sql = format!("PRAGMA foreign_key_check('{table}')");
+        let violation: Option<(String, Option<i64>, String)> = c
+            .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .optional()?;
+        if let Some((child, row, parent)) = violation {
+            return Err(MergeRequestError::Corrupt(format!(
+                "foreign key violation in `{child}` row {row:?}, parent `{parent}`"
+            )));
+        }
     }
     Ok(())
 }
