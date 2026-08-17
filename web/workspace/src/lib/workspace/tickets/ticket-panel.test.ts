@@ -1,4 +1,8 @@
 import {
+  appendUniqueTicketSummaries,
+  TICKET_LANE_PAGE_SIZE,
+  ticketLaneDefinitions,
+  ticketLaneQuery,
   ticketLanes,
   ticketWorkerLaunchHref,
   ticketWorkerMessage,
@@ -79,6 +83,49 @@ Deno.test("ticketLanes combines workflow states and sorts by state then update t
   ]);
 });
 
+Deno.test("ticket lane queries request independent pages of 30", () => {
+  const [readyPlanning, inprogressQueued, doneClosed] = ticketLaneDefinitions();
+
+  assertEquals(TICKET_LANE_PAGE_SIZE, 30);
+  assertEquals(ticketLaneQuery(readyPlanning).states, ["ready", "planning"]);
+  assertEquals(ticketLaneQuery(inprogressQueued).states, [
+    "inprogress",
+    "queued",
+  ]);
+  assertEquals(ticketLaneQuery(doneClosed, "next-page"), {
+    attention: [],
+    cursor: "next-page",
+    event_kinds: [],
+    evidence: [],
+    limit: 30,
+    linked_objective_id: null,
+    query: null,
+    related_ticket_id: null,
+    relation_kind: null,
+    review_status: null,
+    sort: "updated_desc",
+    states: ["done", "closed"],
+    updated_after: null,
+    updated_before: null,
+  });
+});
+
+Deno.test("incremental Ticket pages preserve order and discard duplicate ids", () => {
+  const current = [
+    { id: "first", title: "First", state: "ready", priority: "1" },
+    { id: "second", title: "Second", state: "planning", priority: "2" },
+  ] as TicketSummary[];
+  const incoming = [
+    { id: "second", title: "Duplicate", state: "planning", priority: "2" },
+    { id: "third", title: "Third", state: "planning", priority: "3" },
+  ] as TicketSummary[];
+
+  assertEquals(
+    appendUniqueTicketSummaries(current, incoming).map((ticket) => ticket.id),
+    ["first", "second", "third"],
+  );
+});
+
 Deno.test("ticket worker launch uses the common Worker route and bounded Ticket context", () => {
   const ticket = {
     id: "00001KYRRDVH9",
@@ -113,10 +160,22 @@ Deno.test("ticket panel starts the Orchestrator explicitly and gates orchestrati
     "src/routes/w/[workspaceId]/tickets/[ticketId]/+page.svelte",
   );
 
-  assertIncludes(panelSource, 'workspaceApiPath(data.workspaceId, "/orchestrator")');
+  assertIncludes(
+    panelSource,
+    'workspaceApiPath(data.workspaceId, "/orchestrator")',
+  );
   assertIncludes(panelSource, '{ method: "POST" }');
   assertIncludes(panelSource, "Start Orchestrator");
   assertIncludes(panelSource, "orchestrator.data?.online");
+  assertIncludes(
+    panelSource,
+    'workspaceApiPath(data.workspaceId, "/tickets/query")',
+  );
+  assertIncludes(
+    panelSource,
+    "onscroll={(event) => handleLaneScroll(event, lane.id)}",
+  );
+  assertIncludes(panelSource, "Loading 30 more…");
   assertIncludes(detailSource, "{#if orchestratorOnline}");
   assertIncludes(detailSource, "!orchestratorOnline");
   assertIncludes(detailSource, "Orchestrator offline");

@@ -1,4 +1,9 @@
-import type { TicketDetail, TicketSummary } from "$lib/generated/ticket-api";
+import type {
+  TicketDetail,
+  TicketQueryItem,
+  TicketQueryRequest,
+  TicketSummary,
+} from "$lib/generated/ticket-api";
 
 export const TICKET_STATES = [
   "planning",
@@ -47,6 +52,15 @@ const LANE_DEFINITIONS = [
   },
 ] as const;
 
+export const TICKET_LANE_PAGE_SIZE = 30;
+
+export type TicketLaneDefinition = (typeof LANE_DEFINITIONS)[number];
+export type TicketLaneId = TicketLaneDefinition["id"];
+export type TicketCardSummary = Pick<
+  TicketSummary,
+  "id" | "title" | "state" | "priority" | "updated_at"
+>;
+
 const STATE_SORT_ORDER = new Map<string, number>([
   ["ready", 0],
   ["planning", 1],
@@ -57,19 +71,74 @@ const STATE_SORT_ORDER = new Map<string, number>([
 ]);
 
 export type TicketLane = {
-  id: string;
+  id: TicketLaneId;
   label: string;
   states: readonly TicketState[];
-  tickets: TicketSummary[];
+  tickets: TicketCardSummary[];
 };
 
-function updatedAt(ticket: TicketSummary): number {
+export function ticketLaneDefinitions(): readonly TicketLaneDefinition[] {
+  return LANE_DEFINITIONS;
+}
+
+export function ticketLaneQuery(
+  lane: { states: readonly TicketState[] },
+  cursor: string | null = null,
+): TicketQueryRequest {
+  return {
+    attention: [],
+    cursor,
+    event_kinds: [],
+    evidence: [],
+    limit: TICKET_LANE_PAGE_SIZE,
+    linked_objective_id: null,
+    query: null,
+    related_ticket_id: null,
+    relation_kind: null,
+    review_status: null,
+    sort: "updated_desc",
+    states: [...lane.states],
+    updated_after: null,
+    updated_before: null,
+  };
+}
+
+export function ticketSummaryFromQueryItem(
+  item: TicketQueryItem,
+): TicketCardSummary {
+  return {
+    id: item.id,
+    priority: item.priority === null ? "normal" : String(item.priority),
+    state: item.state,
+    title: item.title,
+    updated_at: item.updated_at,
+  };
+}
+
+export function appendUniqueTicketSummaries(
+  current: TicketCardSummary[],
+  incoming: TicketCardSummary[],
+): TicketCardSummary[] {
+  const ids = new Set(current.map((ticket) => ticket.id));
+  return [
+    ...current,
+    ...incoming.filter((ticket) => {
+      if (ids.has(ticket.id)) return false;
+      ids.add(ticket.id);
+      return true;
+    }),
+  ];
+}
+
+function updatedAt(ticket: TicketCardSummary): number {
   if (!ticket.updated_at) return 0;
   const parsed = Date.parse(ticket.updated_at);
   return Number.isNaN(parsed) ? 0 : parsed;
 }
 
-export function sortTickets(tickets: TicketSummary[]): TicketSummary[] {
+export function sortTickets(
+  tickets: TicketCardSummary[],
+): TicketCardSummary[] {
   return [...tickets].sort((left, right) => {
     const stateDelta = (STATE_SORT_ORDER.get(left.state) ?? 99) -
       (STATE_SORT_ORDER.get(right.state) ?? 99);
@@ -80,7 +149,7 @@ export function sortTickets(tickets: TicketSummary[]): TicketSummary[] {
   });
 }
 
-export function ticketLanes(tickets: TicketSummary[]): TicketLane[] {
+export function ticketLanes(tickets: TicketCardSummary[]): TicketLane[] {
   return LANE_DEFINITIONS.map((definition) => ({
     ...definition,
     tickets: sortTickets(

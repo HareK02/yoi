@@ -218,19 +218,23 @@ Deno.test("workspace Tickets surface provides Kanban and lifecycle controls", as
     "Tickets and Objectives should each be a single sidebar link",
   );
   assert(
-    ticketsLoad.includes("?limit=1000") &&
-      ticketsPage.includes("data.tickets.data?.items") &&
-      ticketsPage.includes("ticketLanes(tickets)") &&
+    !ticketsLoad.includes("?limit=1000") &&
+      ticketsLoad.includes('workspaceApiPath(workspaceId, "/tickets/query")') &&
+      ticketsLoad.includes("ticketLaneDefinitions()") &&
+      ticketsLoad.includes("ticketLaneQuery(lane)") &&
       ticketsPage.includes('class="ticket-kanban"') &&
-      ticketsPage.includes("lane.tickets"),
-    "Tickets list should load every workflow state and render a workspace Kanban board",
+      ticketsPage.includes('class="ticket-lane-cards"') &&
+      ticketsPage.includes("handleLaneScroll") &&
+      ticketsPage.includes("Loading 30 more"),
+    "Tickets list should query and incrementally scroll each Kanban lane",
   );
   assert(
     ticketPanelModel.includes('label: "Ready + Planning"') &&
       ticketPanelModel.includes('label: "In progress + Queued"') &&
       ticketPanelModel.includes('label: "Done + Closed"') &&
-      ticketPanelModel.includes("updatedAt(right) - updatedAt(left)"),
-    "Ticket Kanban should combine related states and sort state priority before recency",
+      ticketPanelModel.includes("TICKET_LANE_PAGE_SIZE = 30") &&
+      ticketPanelModel.includes('sort: "updated_desc"'),
+    "Ticket Kanban should combine related states into independent cursor pages",
   );
   assert(
     generatedTicketApi.includes("Generated from yoi-workspace-server") &&
@@ -249,7 +253,9 @@ Deno.test("workspace Tickets surface provides Kanban and lifecycle controls", as
       ticketDetailPage.includes('mutate("state", "/state"') &&
       ticketDetailPage.includes('mutate("queue", "/queue"') &&
       !ticketDetailPage.includes("/merge-request/merge") &&
-      ticketDetailPage.includes("merged_result_commit") &&
+      ticketDetailPage.includes("mergeRequest.selector_from") &&
+      ticketDetailPage.includes("currentReview?.kind") &&
+      ticketDetailPage.includes("mergeEvent?.kind") &&
       !ticketDetailPage.includes('mutate("review", "/review"') &&
       ticketDetailPage.includes('mutate("close", "/close"') &&
       ticketDetailPage.includes("ticketWorkerLaunchHref") &&
