@@ -121,6 +121,7 @@ impl WorkdirTransportError {
                 (Code::UnknownCommand, "Workdir command was not found")
             }
             WorkdirError::Unavailable(_) => (Code::Unavailable, "Workdir session is unavailable"),
+            WorkdirError::Transport(_) => (Code::Internal, "Workdir transport failed"),
             WorkdirError::InvalidPath(_)
             | WorkdirError::RelativePath(_)
             | WorkdirError::InvalidGlob(_)
@@ -151,7 +152,8 @@ impl WorkdirTransportError {
             Code::Unsupported => WorkdirError::Unavailable(self.message),
             Code::UnknownCommand => WorkdirError::UnknownCommand("<remote>".to_string()),
             Code::InvalidRequest => WorkdirError::InvalidArgument(self.message),
-            Code::Unavailable | Code::Internal => WorkdirError::Unavailable(self.message),
+            Code::Unavailable => WorkdirError::Unavailable(self.message),
+            Code::Internal => WorkdirError::Transport(self.message),
         }
     }
 }
@@ -484,6 +486,19 @@ pub use client::{ClientSession as RemoteWorkdirSession, WorkdirHttpAuthorization
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_failure_remains_distinct_from_session_unavailable() {
+        let transport = WorkdirTransportError::from_workdir_error(&WorkdirError::Transport(
+            "Workspace API request timed out".to_string(),
+        ));
+        assert_eq!(transport.code, WorkdirTransportErrorCode::Internal);
+        assert_eq!(transport.message, "Workdir transport failed");
+        assert!(matches!(
+            transport.into_workdir_error(),
+            WorkdirError::Transport(_)
+        ));
+    }
 
     #[test]
     fn transport_error_does_not_expose_host_path() {

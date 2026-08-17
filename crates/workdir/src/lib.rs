@@ -270,6 +270,9 @@ pub enum WorkdirError {
     #[error("Workdir session is unavailable: {0}")]
     Unavailable(String),
 
+    #[error("Workdir transport failed: {0}")]
+    Transport(String),
+
     #[error("Workdir content was modified externally before the operation could be applied: {0}")]
     Conflict(String),
 

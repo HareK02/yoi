@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use worker::{
     WorkspaceClient, WorkspaceClientError, WorkspaceRequest, WorkspaceRequestMethod,
@@ -291,6 +291,7 @@ pub struct RuntimeOwnedWorkspaceClient {
     base_url: String,
     runtime_id: String,
     worker_id: String,
+    request_timeout: Option<Duration>,
     worker_remove: Option<RuntimeWorkerMutationForwarder>,
 }
 
@@ -306,12 +307,19 @@ impl RuntimeOwnedWorkspaceClient {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             runtime_id: runtime_id.into(),
             worker_id: worker_id.into(),
+            request_timeout: None,
             worker_remove: None,
         }
     }
 
     pub fn with_worker_remove(mut self, worker_remove: RuntimeWorkerMutationForwarder) -> Self {
         self.worker_remove = Some(worker_remove);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_request_timeout(mut self, request_timeout: Option<Duration>) -> Self {
+        self.request_timeout = request_timeout;
         self
     }
 }
@@ -351,9 +359,16 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
         let base_url = self.base_url.clone();
         let runtime_id = self.runtime_id.clone();
         let worker_id = self.worker_id.clone();
+        let request_timeout = self.request_timeout;
         if tokio::runtime::Handle::try_current().is_ok() {
             std::thread::spawn(move || {
-                execute_runtime_owned_workspace_http(&base_url, &runtime_id, &worker_id, request)
+                execute_runtime_owned_workspace_http(
+                    &base_url,
+                    &runtime_id,
+                    &worker_id,
+                    request_timeout,
+                    request,
+                )
             })
             .join()
             .map_err(|_| {
@@ -364,6 +379,7 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
                 &self.base_url,
                 &self.runtime_id,
                 &self.worker_id,
+                self.request_timeout,
                 request,
             )
         }
@@ -397,6 +413,7 @@ fn execute_runtime_owned_workspace_http(
     base_url: &str,
     runtime_id: &str,
     worker_id: &str,
+    request_timeout: Option<Duration>,
     request: WorkspaceRequest,
 ) -> Result<WorkspaceResponse, WorkspaceClientError> {
     if !request.path.starts_with('/') || request.path.starts_with("//") {
@@ -410,7 +427,16 @@ fn execute_runtime_owned_workspace_http(
         WorkspaceRequestMethod::Patch => reqwest::Method::PATCH,
         WorkspaceRequestMethod::Delete => reqwest::Method::DELETE,
     };
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(request_timeout)
+        .build()
+        .map_err(|error| {
+            WorkspaceClientError::Unavailable(format!(
+                "failed to build Workspace API HTTP client: {}",
+                reqwest_error_chain(&error)
+            ))
+        })?;
+    let request_label = format!("{method} {}", request.path);
     let mut request_builder = client
         .request(method, url)
         .header("x-yoi-runtime-id", runtime_id)
@@ -422,12 +448,50 @@ fn execute_runtime_owned_workspace_http(
     }
     let response = request_builder
         .send()
-        .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
+        .map_err(|error| workspace_http_error(&request_label, "waiting for response", error))?;
     let status = response.status().as_u16();
     let body = response
         .text()
-        .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
+        .map_err(|error| workspace_http_error(&request_label, "reading response body", error))?;
     Ok(WorkspaceResponse { status, body })
+}
+
+fn workspace_http_error(
+    request_label: &str,
+    stage: &str,
+    error: reqwest::Error,
+) -> WorkspaceClientError {
+    let details = reqwest_error_chain(&error);
+    if error.is_timeout() {
+        WorkspaceClientError::Request(format!(
+            "Workspace API {request_label} timed out while {stage}: {details}"
+        ))
+    } else if error.is_connect() {
+        WorkspaceClientError::Unavailable(format!(
+            "Workspace API {request_label} could not connect while {stage}: {details}"
+        ))
+    } else {
+        WorkspaceClientError::Request(format!(
+            "Workspace API {request_label} transport failed while {stage}: {details}"
+        ))
+    }
+}
+
+fn reqwest_error_chain(error: &reqwest::Error) -> String {
+    let mut details = error.to_string();
+    let mut source = std::error::Error::source(error);
+    for _ in 0..4 {
+        let Some(current) = source else {
+            break;
+        };
+        let current_text = current.to_string();
+        if !current_text.is_empty() && !details.ends_with(&current_text) {
+            details.push_str(": ");
+            details.push_str(&current_text);
+        }
+        source = std::error::Error::source(current);
+    }
+    details
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -663,6 +727,64 @@ mod tests {
         assert_eq!(target_worker_id, "worker-target");
         assert_eq!(expected_revision, "revision-7");
         assert_eq!(reason, "retire obsolete Worker");
+    }
+
+    #[test]
+    fn runtime_owned_workspace_client_has_no_fixed_request_timeout() {
+        let (base_url, server) = delayed_workspace_response(Duration::from_millis(75));
+        let client =
+            RuntimeOwnedWorkspaceClient::new("workspace-a", base_url, "runtime-a", "worker-a");
+        assert_eq!(client.request_timeout, None);
+
+        let response = client
+            .execute(WorkspaceRequest::json(
+                WorkspaceRequestMethod::Post,
+                "/api/test",
+                "{}",
+            ))
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, r#"{"ok":true}"#);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn runtime_owned_workspace_client_reports_request_timeouts() {
+        let (base_url, server) = delayed_workspace_response(Duration::from_millis(75));
+        let client =
+            RuntimeOwnedWorkspaceClient::new("workspace-a", base_url, "runtime-a", "worker-a")
+                .with_request_timeout(Some(Duration::from_millis(20)));
+
+        let error = client
+            .execute(WorkspaceRequest::json(
+                WorkspaceRequestMethod::Post,
+                "/api/test",
+                "{}",
+            ))
+            .unwrap_err();
+        assert!(matches!(error, WorkspaceClientError::Request(_)));
+        let message = error.to_string();
+        assert!(message.contains("POST /api/test"), "{message}");
+        assert!(message.contains("timed out"), "{message}");
+        server.join().unwrap();
+    }
+
+    fn delayed_workspace_response(delay: Duration) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = [0_u8; 8192];
+            let _ = stream.read(&mut bytes);
+            std::thread::sleep(delay);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            );
+        });
+        (format!("http://{address}"), server)
     }
 
     #[test]

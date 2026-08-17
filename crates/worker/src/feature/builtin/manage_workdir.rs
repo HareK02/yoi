@@ -29,7 +29,10 @@ use crate::feature::{
     FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureModule, ToolContribution,
     ToolDeclaration,
 };
-use crate::worker::{WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod, WorkspaceResponse};
+use crate::worker::{
+    WorkspaceClient, WorkspaceClientError, WorkspaceRequest, WorkspaceRequestMethod,
+    WorkspaceResponse,
+};
 
 const FEATURE_ID: &str = "manage-workdir";
 const FEATURE_NAME: &str = "Manage Workdir";
@@ -174,7 +177,7 @@ impl WorkspaceAttachedWorkdirSession {
                 encode_path_segment(workspace_id)
             ),
             serde_json::to_string(&operation).map_err(|error| {
-                WorkdirError::Unavailable(format!(
+                WorkdirError::Transport(format!(
                     "failed to encode Workspace Workdir operation: {error}"
                 ))
             })?,
@@ -182,25 +185,32 @@ impl WorkspaceAttachedWorkdirSession {
         let response = self
             .client
             .execute(request)
-            .map_err(|error| WorkdirError::Unavailable(error.to_string()))?;
+            .map_err(workspace_workdir_error)?;
         if !response.is_success() {
-            return Err(WorkdirError::Unavailable(format!(
+            return Err(WorkdirError::Transport(format!(
                 "Workspace Workdir API returned HTTP {}: {}",
                 response.status,
                 bounded_error_body(&response.body)
             )));
         }
         serde_json::from_str(&response.body).map_err(|error| {
-            WorkdirError::Unavailable(format!(
+            WorkdirError::Transport(format!(
                 "failed to decode Workspace Workdir operation result: {error}"
             ))
         })
     }
 
     fn mismatch(expected: &str) -> WorkdirError {
-        WorkdirError::Unavailable(format!(
+        WorkdirError::Transport(format!(
             "Workspace Backend returned a mismatched Workdir operation result; expected {expected}"
         ))
+    }
+}
+
+fn workspace_workdir_error(error: WorkspaceClientError) -> WorkdirError {
+    match error {
+        WorkspaceClientError::Unavailable(message) => WorkdirError::Unavailable(message),
+        other => WorkdirError::Transport(other.to_string()),
     }
 }
 
@@ -730,6 +740,25 @@ mod tests {
                 "linked_at": "2026-08-12T00:00:00Z"
             }
         })
+    }
+
+    #[test]
+    fn workspace_request_failure_is_not_reported_as_session_unavailable() {
+        let error = workspace_workdir_error(WorkspaceClientError::Request(
+            "Workspace API POST /workdir timed out".to_string(),
+        ));
+        assert!(matches!(error, WorkdirError::Transport(_)));
+        let message = error.to_string();
+        assert!(message.contains("timed out"), "{message}");
+        assert!(!message.contains("session is unavailable"), "{message}");
+    }
+
+    #[test]
+    fn workspace_unavailable_remains_a_session_error() {
+        let error = workspace_workdir_error(WorkspaceClientError::Unavailable(
+            "Workspace API could not connect".to_string(),
+        ));
+        assert!(matches!(error, WorkdirError::Unavailable(_)));
     }
 
     #[test]
