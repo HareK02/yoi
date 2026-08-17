@@ -18,7 +18,7 @@ use crate::runtime::dir::RuntimeDir;
 use crate::segment_log_sink::SegmentLogSink;
 use crate::shared_state::WorkerSharedState;
 use crate::shutdown_after_idle::{
-    ShutdownAfterIdleRequest, TicketIntakeReadyShutdownHook, is_ticket_intake_role,
+    ShutdownAfterIdleRequest, TicketMarkReadyShutdownHook, is_ticket_intake_role,
     take_shutdown_request_after_status,
 };
 use crate::spawn::registry::SpawnedWorkerRegistry;
@@ -423,11 +423,11 @@ impl WorkerController {
         .await?;
 
         // Intake role Workers self-terminate only after a successful
-        // TicketIntakeReady turn has fully settled back to Idle. The request
+        // TicketMarkReady turn has fully settled back to Idle. The request
         // is transient controller state, not model-visible context or ticket
         // claim metadata.
         let shutdown_after_idle = ShutdownAfterIdleRequest::default();
-        worker.add_post_tool_call_hook(TicketIntakeReadyShutdownHook::new(
+        worker.add_post_tool_call_hook(TicketMarkReadyShutdownHook::new(
             shutdown_after_idle.clone(),
             is_ticket_intake_role(worker.runtime_ticket_role()),
         ));

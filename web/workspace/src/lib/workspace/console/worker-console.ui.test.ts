@@ -247,9 +247,11 @@ Deno.test("workspace Tickets surface provides Kanban and lifecycle controls", as
   assert(
     ticketDetailLoad.includes("/repositories") &&
       ticketDetailPage.includes('mutate("state", "/state"') &&
+      ticketDetailPage.includes('mutate("ready", "/ready"') &&
       ticketDetailPage.includes('mutate("queue", "/queue"') &&
+      ticketDetailPage.includes("targetCandidateValid") &&
+      ticketDetailPage.includes("persistedTargetValid") &&
       !ticketDetailPage.includes("/merge-request/merge") &&
-      ticketDetailPage.includes("merged_result_commit") &&
       !ticketDetailPage.includes('mutate("review", "/review"') &&
       ticketDetailPage.includes('mutate("close", "/close"') &&
       ticketDetailPage.includes("ticketWorkerLaunchHref") &&
