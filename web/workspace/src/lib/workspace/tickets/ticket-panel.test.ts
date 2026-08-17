@@ -105,6 +105,32 @@ Deno.test("ticket worker launch uses the common Worker route and bounded Ticket 
   );
 });
 
+Deno.test("ticket board paginates every lane independently with bounded summary requests", async () => {
+  const loadSource = await Deno.readTextFile(
+    "src/routes/w/[workspaceId]/tickets/+page.ts",
+  );
+  const pageSource = await Deno.readTextFile(
+    "src/routes/w/[workspaceId]/tickets/+page.svelte",
+  );
+
+  assertIncludes(loadSource, 'limit: "30"');
+  assertIncludes(loadSource, "states: states.join");
+  assertIncludes(pageSource, "lane.page.next_cursor");
+  assertIncludes(pageSource, "lane.loading");
+  assertIncludes(pageSource, "mergeTickets");
+  assertIncludes(pageSource, "onscroll");
+  assertIncludes(pageSource, "Retry");
+  if (loadSource.includes("limit=1000") || pageSource.includes("limit=1000")) {
+    throw new Error("Ticket board must not fetch the legacy 1000-item list");
+  }
+  if (
+    loadSource.includes("/tickets/query") ||
+    pageSource.includes("/tickets/query")
+  ) {
+    throw new Error("Ticket board must use the bounded summary endpoint");
+  }
+});
+
 Deno.test("ticket panel starts the Orchestrator explicitly and gates orchestration actions", async () => {
   const panelSource = await Deno.readTextFile(
     "src/routes/w/[workspaceId]/tickets/+page.svelte",
@@ -113,7 +139,10 @@ Deno.test("ticket panel starts the Orchestrator explicitly and gates orchestrati
     "src/routes/w/[workspaceId]/tickets/[ticketId]/+page.svelte",
   );
 
-  assertIncludes(panelSource, 'workspaceApiPath(data.workspaceId, "/orchestrator")');
+  assertIncludes(
+    panelSource,
+    'workspaceApiPath(data.workspaceId, "/orchestrator")',
+  );
   assertIncludes(panelSource, '{ method: "POST" }');
   assertIncludes(panelSource, "Start Orchestrator");
   assertIncludes(panelSource, "orchestrator.data?.online");
