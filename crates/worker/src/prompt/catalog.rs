@@ -665,7 +665,29 @@ mod tests {
             "Do not spawn, restore, assign, or route work to Backend/Runtime Reviewer Workers"
         ));
         assert!(prompt.contains("never compensate by creating an independent Reviewer Worker"));
+        assert!(prompt.contains("durable `ready -> queued` transition delegates"));
+        assert!(prompt.contains("use the Ticket repository `origin` transport"));
+        assert!(prompt.contains("guarded non-force push"));
+        assert!(prompt.contains("Never mutate a Server-side repository path"));
+        assert!(prompt.contains("If the repository push succeeds but completion recording fails"));
+        assert!(prompt.contains("closes the current assignment atomically"));
         assert!(!prompt.contains("sibling Coder/Reviewer Workers"));
+    }
+
+    #[test]
+    fn coder_and_reviewer_roles_preserve_immutable_subject_authority() {
+        let catalog = PromptCatalog::builtins_only().unwrap();
+        let coder = &catalog.projection.templates["role.coder"];
+        assert!(coder.contains("publish the committed source selector without force"));
+        assert!(coder.contains("exact local `HEAD`"));
+        assert!(coder.contains("keep that source ref immutable"));
+        assert!(coder.contains("Do not update the target selector"));
+
+        let reviewer = &catalog.projection.templates["role.reviewer"];
+        assert!(reviewer.contains("never as a supplied verdict"));
+        assert!(reviewer.contains("ReviewRequested.subject_ref"));
+        assert!(reviewer.contains("do not merge"));
+        assert!(reviewer.contains("update a repository ref"));
     }
 
     #[test]

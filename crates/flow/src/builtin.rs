@@ -24,7 +24,7 @@ pub fn builtin_flow_source(slug: &str) -> Option<BuiltinFlowSource> {
     match slug {
         CODER_REVIEW_FLOW_SLUG => Some(BuiltinFlowSource {
             slug: CODER_REVIEW_FLOW_SLUG,
-            revision: 2,
+            revision: 3,
             path: "builtin/flows/coder-review.dcdl",
             content: CODER_REVIEW_FLOW_SOURCE,
         }),
@@ -35,7 +35,7 @@ pub fn builtin_flow_source(slug: &str) -> Option<BuiltinFlowSource> {
 pub fn builtin_flow_sources() -> &'static [BuiltinFlowSource] {
     const SOURCES: &[BuiltinFlowSource] = &[BuiltinFlowSource {
         slug: CODER_REVIEW_FLOW_SLUG,
-        revision: 2,
+        revision: 3,
         path: "builtin/flows/coder-review.dcdl",
         content: CODER_REVIEW_FLOW_SOURCE,
     }];
@@ -69,20 +69,21 @@ mod tests {
     }
 
     #[test]
-    fn coder_review_starts_on_a_ticket_branch_and_requires_committed_review_evidence() {
+    fn coder_review_publishes_immutable_source_before_review_and_preserves_fresh_review() {
         let source =
             builtin_flow_source(CODER_REVIEW_FLOW_SLUG).expect("coder-review Flow must exist");
 
         for required in [
-            "detached HEAD",
+            "Workdir Git state",
             "work/<ticket-id>-<slug>",
-            "explicitly authorized",
             "git add",
             "git commit",
-            "Workdir is clean",
-            "current head commit",
-            "same Ticket work branch",
-            "new revision",
+            "Publish the committed source ref",
+            "verify that the remote selector resolves to the exact local HEAD",
+            "immutable Merge Request",
+            "current Merge Request subject",
+            "fresh read-only Reviewer child",
+            "do not update the target selector",
         ] {
             assert!(
                 source.content.contains(required),

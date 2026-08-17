@@ -5,7 +5,7 @@
 
     states = {
         implement = {
-            instructions = "Before editing, inspect the assigned Workdir's Git state. A newly delegated Git Workdir normally starts at a detached HEAD. If HEAD is detached, create and switch to a local branch named `work/<ticket-id>-<slug>`, using the canonical Ticket id and a short lowercase kebab-case slug derived from the Ticket title or implementation scope. If the Workdir is already on a suitable work branch after restore, keep it. Never delete, reset, or overwrite an existing branch to resolve a name collision; choose a concise collision-free suffix and report the actual branch. For this assigned Ticket Workdir, you are explicitly authorized to create or switch the local work branch and to use `git add` and `git commit`. Commit coherent, validated implementation slices while working; do not push, merge, force-rewrite a submitted revision, delete branches, or discard pre-existing changes. Implement the requested Ticket scope, run the narrow and dependent validation required by the changed contracts, and record concrete evidence. Open or update the Ticket Merge Request with immutable repository revision evidence. Before requesting independent review, commit all intended changes, confirm that the Workdir is clean, and make the current MR revision authoritative. A Flow transition is never Ticket completion authority.";
+            instructions = "Inspect the assigned Workdir Git state before editing. Reuse a suitable restored `work/<ticket-id>-<slug>` branch, or create a collision-safe work branch from detached HEAD; never overwrite an existing branch. For this assigned Ticket Workdir, you are explicitly authorized to create or switch the local work branch and to use `git add` and `git commit`. Implement and validate the Ticket in coherent commits. Publish the committed source ref to the Ticket repository remote without force, verify that the remote selector resolves to the exact local HEAD, and open the Merge Request with immutable `selector_from` / `selector_to` evidence. Do not request review from a dirty Workdir or an unpublished source ref. Do not merge, force-rewrite a submitted revision, delete branches, or discard pre-existing changes. A Flow transition is never Ticket completion authority.";
             transitions = {
                 review = {
                     target = "review";
@@ -15,7 +15,7 @@
         };
 
         review = {
-            instructions = "Spawn one actual direct-child SubWorker with profile builtin:reviewer, read-only scope, and a structured review handoff bound to the current immutable Merge Request revision. The child must commit MergeRequestReview; prose output and Worker observation are not approval authority. After the structured current-revision result exists, request a Flow transition.";
+            instructions = "Use the current Ticket Merge Request as review authority. Confirm its immutable source selector resolves to the exact committed implementation HEAD, then spawn one actual direct-child SubWorker with profile builtin:reviewer, read-only scope, and a structured review handoff bound to the current immutable Merge Request revision. The trusted spawn layer records `ReviewRequested`; do not place commit/ref identity, capability material, or a prewritten verdict in model input. The child must commit MergeRequestReview; prose output and Worker observation are not approval authority. After the structured current-revision result exists, request a Flow transition.";
             transitions = {
                 approved = {
                     target = "complete";
@@ -29,7 +29,7 @@
         };
 
         fix = {
-            instructions = "Resolve every open Reviewer finding on the same Ticket work branch, rerun the validation affected by the fixes, commit the corrected implementation as a new revision, and preserve concrete evidence. Do not rewrite the previously reviewed commit or claim approval from the prior request_changes review. When the corrected committed revision is ready for a new independent review, request a Flow transition.";
+            instructions = "Resolve every open Reviewer finding on the same Ticket work branch, rerun the validation affected by the fixes, commit the corrected implementation as a new revision, publish the updated source ref without force, and verify its remote tip. Return to the existing open Merge Request and request review from a fresh read-only Reviewer child so the trusted spawn layer captures a new immutable subject. Do not rewrite the previously reviewed commit or claim approval from the prior request_changes review. When the corrected committed revision is ready for a new independent review, request a Flow transition.";
             transitions = {
                 review = {
                     target = "review";
@@ -39,7 +39,7 @@
         };
 
         complete = {
-            instructions = "Leave concise implementation and validation evidence on the Ticket, then hand off the exact approved Merge Request revision to the Orchestrator for readiness and integration. Do not call MergeRequestComplete; Coder approval handoff is not Ticket completion authority. After durable handoff evidence exists, request a Flow transition.";
+            instructions = "Verify the authoritative approval still matches the exact current Merge Request subject, keep the reviewed source ref immutable, leave concise implementation and validation evidence on the Ticket, then hand off to the Orchestrator. Do not call MergeRequestComplete, do not update the target selector, or treat the Flow terminal state as Ticket completion authority. After durable handoff evidence exists, request a Flow transition.";
             transitions = {
                 completed = {
                     target = "done";
