@@ -782,7 +782,10 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let fingerprint = format!("ticket-summary:v1:states={}", states.join(","));
+        let fingerprint = format!(
+            "ticket-summary:v2:sort=priority:states={}",
+            states.join(",")
+        );
         let after = request
             .cursor
             .as_deref()
@@ -809,7 +812,7 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
                 returned: items.len(),
                 has_more: page.has_more,
                 next_cursor,
-                sort: "updated_desc".to_string(),
+                sort: "priority".to_string(),
                 source_limit: None,
                 source_truncated: false,
             },

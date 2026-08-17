@@ -1426,6 +1426,7 @@ pub struct SqliteTicketListProjection {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SqliteTicketListCursor {
+    pub state_rank: i64,
     pub updated_at: Option<String>,
     pub ticket_id: String,
 }
@@ -2412,6 +2413,7 @@ impl SqliteTicketBackend {
                     .collect::<Vec<_>>(),
             )
             .map_err(|error| TicketError::Sqlite(error.to_string()))?;
+            let cursor_rank = query.after.as_ref().map(|cursor| cursor.state_rank);
             let cursor_updated_at = query
                 .after
                 .as_ref()
@@ -2431,11 +2433,24 @@ impl SqliteTicketBackend {
                            SELECT 1 FROM json_each(?2) AS state
                            WHERE state.value = ticket.workflow_state
                        ))
-                       AND (?3 IS NULL OR COALESCE(ticket.updated_at, '') < COALESCE(?4, '')
-                            OR (COALESCE(ticket.updated_at, '') = COALESCE(?4, '')
-                                AND ticket.ticket_id > ?3))
-                     ORDER BY ticket.updated_at DESC, ticket.ticket_id ASC
-                     LIMIT ?5",
+                       AND (?3 IS NULL OR
+                            CASE ticket.workflow_state
+                              WHEN 'ready' THEN 0 WHEN 'planning' THEN 1
+                              WHEN 'inprogress' THEN 2 WHEN 'queued' THEN 3
+                              WHEN 'done' THEN 4 WHEN 'closed' THEN 5 ELSE 6 END > ?4
+                            OR (CASE ticket.workflow_state
+                              WHEN 'ready' THEN 0 WHEN 'planning' THEN 1
+                              WHEN 'inprogress' THEN 2 WHEN 'queued' THEN 3
+                              WHEN 'done' THEN 4 WHEN 'closed' THEN 5 ELSE 6 END = ?4
+                              AND (COALESCE(ticket.updated_at, '') < COALESCE(?5, '')
+                                OR (COALESCE(ticket.updated_at, '') = COALESCE(?5, '')
+                                  AND ticket.ticket_id > ?3))))
+                     ORDER BY CASE ticket.workflow_state
+                                WHEN 'ready' THEN 0 WHEN 'planning' THEN 1
+                                WHEN 'inprogress' THEN 2 WHEN 'queued' THEN 3
+                                WHEN 'done' THEN 4 WHEN 'closed' THEN 5 ELSE 6 END ASC,
+                              ticket.updated_at DESC, ticket.ticket_id ASC
+                     LIMIT ?6",
                 )
                 .map_err(sqlite_err)?;
             let rows = statement
@@ -2444,6 +2459,7 @@ impl SqliteTicketBackend {
                         self.workspace_id,
                         states,
                         cursor_id,
+                        cursor_rank,
                         cursor_updated_at,
                         i64::try_from(fetch_limit).unwrap_or(i64::MAX)
                     ],
@@ -2458,6 +2474,14 @@ impl SqliteTicketBackend {
             let next = has_more.then(|| {
                 let summary = summaries.last().expect("non-empty page with continuation");
                 SqliteTicketListCursor {
+                    state_rank: match summary.workflow_state {
+                        TicketWorkflowState::Ready => 0,
+                        TicketWorkflowState::Planning => 1,
+                        TicketWorkflowState::InProgress => 2,
+                        TicketWorkflowState::Queued => 3,
+                        TicketWorkflowState::Done => 4,
+                        TicketWorkflowState::Closed => 5,
+                    },
                     updated_at: summary.updated_at.clone(),
                     ticket_id: summary.id.clone(),
                 }
@@ -6895,6 +6919,26 @@ state: planning
                 .unwrap();
             ids.push(ticket.id);
         }
+
+        Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE typed_tickets SET updated_at='2026-08-12T05:00:00Z' WHERE workspace_id=?1 AND ticket_id=?2",
+                params!["workspace-test", ids[2]],
+            )
+            .unwrap();
+        let combined_lane = backend
+            .list_workspace_projection_page(SqliteTicketListPageQuery {
+                states: vec![TicketWorkflowState::Ready, TicketWorkflowState::Planning],
+                limit: 1,
+                after: None,
+            })
+            .unwrap();
+        assert_eq!(
+            combined_lane.items[0].summary.workflow_state,
+            TicketWorkflowState::Ready,
+            "lane pagination order must match the UI's state-primary order",
+        );
 
         let first = backend
             .list_workspace_projection_page(SqliteTicketListPageQuery {
