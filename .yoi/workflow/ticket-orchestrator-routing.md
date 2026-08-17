@@ -36,8 +36,8 @@ TicketCreate / TicketComment
 
 Orchestrator は以下を行う。
 
-- Ticket を `TicketShow` で読む。
-- 必要に応じて関連 Ticket を `TicketList` / `TicketShow` で確認する。
+- Ticket を `ShowTicket` で読む。
+- 必要に応じて関連 Ticket を `QueryTicket` / `ShowTicket` で確認する。
 - Ticket body / thread / artifacts / resolution / review / implementation report を読む。
 - Ticket が Objective context と結びついている場合は、Objective を medium-term goal / motivation / strategy / success criteria / decision context として読む。ただし Objective context は判断背景であり、Ticket body/thread/artifacts や explicit Ticket relations / OrchestrationPlan records を読む代替ではない。
 - repository 状態、関連 docs/code、既存 worktree、visible Pods を必要に応じて明示的に確認する。
@@ -73,21 +73,21 @@ Orchestrator は以下を行う。
 
 利用可能なら、以下を使う。
 
-- `TicketList`: routing 候補や関連 Ticket の確認。
-- `TicketShow`: 対象 Ticket の body / thread / artifacts / resolution / typed relation metadata と derived inverse/blocker view を確認。
+- `QueryTicket`: routing 候補、関連 Ticket、project-level forward relation (`depends_on` / `blocks` / `related` / `supersedes` / `duplicate_of`) と derived blocker summary を bounded filter/projection で確認する。`depends_on` と incoming unresolved `blocks` は queue/acceptance blocker であり、`related` は blocker ではない。`supersedes` / `duplicate_of` は visible diagnostic として扱い、自動的な lifecycle 変更や scheduler 判断にはしない。
+- `ShowTicket`: 対象 Ticket の body / thread / artifacts / resolution / typed relation metadata、linked Objective、assignment、implementation/review evidence を確認する。
 - `TicketComment`: routing decision / intent packet / blocked reason / next question の記録。
 - `TicketWorkflowState`: `queued -> inprogress` acceptance、`inprogress -> done`、または concrete missing decision/information reason を伴う `ready|queued -> planning` に使う。
-- `TicketRelationQuery`: project-level の forward relation (`depends_on` / `blocks` / `related` / `supersedes` / `duplicate_of`) を読む。`depends_on` と incoming unresolved `blocks` は queue/acceptance blocker であり、`related` は blocker ではない。`supersedes` / `duplicate_of` は visible diagnostic として扱い、自動的な lifecycle 変更や scheduler 判断にはしない。
+- `TicketDependencyCheck`: queue/acceptance 直前の typed dependency readiness guard に使う。
+- `TicketRelationRecord` / `TicketRelationRemove`: ユーザー合意済みの durable project relation を明示的に更新する場合だけ使う。
 - `TicketOrchestrationPlanQuery`: 対象 Ticket や関連 Ticket の ordering / blocker / conflict / waiting-capacity / accepted-plan 記録を読む。queued acceptance 前に必ず確認する。
 - `TicketOrchestrationPlanRecord`: Orchestrator が routing 中に project-relevant な ordering / dependency / conflict / capacity/waiting / accepted-plan decision を残す。これは queue reorder、自動起動、state 変更ではない。
 - `TicketClose`: 完了権限と resolution が揃っている場合だけ使う。
-- `TicketDoctor`: routing 前後の整合性確認。
 
 `TicketCreate` は通常 Intake の責務だが、routing 中に follow-up Ticket が必要だと判断した場合は、ユーザー/上位 Orchestrator の合意後にだけ使う。
 
 ## Queued acceptance contract
 
-- `queued -> inprogress` acceptance の直前に `TicketShow` / `TicketRelationQuery` の relation blockers を再確認する。unresolved `depends_on` や incoming unresolved `blocks` が残る場合は implementation side effect を始めず、理由を thread に残して `planning` へ戻すか blocked diagnostic として停止する。
+- `queued -> inprogress` acceptance の直前に `ShowTicket` / `QueryTicket` の relation blocker projection を再確認する。unresolved `depends_on` や incoming unresolved `blocks` が残る場合は implementation side effect を始めず、理由を thread に残して `planning` へ戻すか blocked diagnostic として停止する。
 - Relation metadata は project-level constraint であり、OrchestrationPlan は runtime ordering/capacity decision である。relation を OrchestrationPlan で代替しないし、OrchestrationPlan を durable dependency authority として扱わない。
 
 `state = queued` は、Ticket が routing 対象として人間により Orchestrator へ渡された状態である。Orchestrator は queued notification を受けたら、Ticket、workspace state、対象 Ticket の `TicketOrchestrationPlanQuery` 記録、risk domain に応じた bounded project context を読んで、次のどちらかを行う。
@@ -100,7 +100,7 @@ Orchestrator は以下を行う。
 
 Parallel acceptance pass:
 
-- 明示的な queue review 中に複数の queued Ticket が見える場合、Orchestrator は最初の1件の完了待ちを default にしない。各 Ticket について Ticket body/thread/artifacts、TicketRelationQuery、TicketOrchestrationPlanQuery、workspace/worktree dirty state、visible Pods、既存 branches、conflict/dependency notes を確認する。
+- 明示的な queue review 中に複数の queued Ticket が見える場合、Orchestrator は最初の1件の完了待ちを default にしない。各 Ticket について Ticket body/thread/artifacts、QueryTicket の relation/blocker projection、TicketOrchestrationPlanQuery、workspace/worktree dirty state、visible Pods、既存 branches、conflict/dependency notes を確認する。
 - 追加で開始してよいのは、blocking relation/dependency がなく、`do_not_parallelize` または applicable conflict record がなく、source/write surfaces が disjoint または conflict risk が小さく機械的で、coder/reviewer follow-up capacity があり、acceptance basis となる Ticket thread/plan/workspace records を side effect 前に記録・commit でき、別 worktree/branch/scope を切れる Ticket だけである。
 - capacity が見えるのに queued Ticket を idle にする場合は、dependency / conflict / capacity / missing planning decision / dirty workspace / reviewer-coder bottleneck / migration boundary / human gate のいずれかの bounded reason を記録する。
 - この pass は scheduler、background runner、resource graph solver、automatic queue drain loop ではない。unqueued Ticket を開始せず、各 Ticket の `queued -> inprogress` acceptance を個別に記録する。
@@ -269,8 +269,8 @@ Action:
 ### 1. 状態確認
 
 - `git state --short --branch`
-- `TicketShow <target>`
-- 関連 Ticket の `TicketList` / `TicketShow`
+- `ShowTicket <target>`
+- 関連 Ticket の `QueryTicket` / `ShowTicket`
 - 必要に応じて docs/code/workflow/history
 - 必要に応じて visible Pods / worktrees / branches
 

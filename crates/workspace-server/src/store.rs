@@ -626,6 +626,12 @@ pub trait ControlPlaneStore: Send + Sync {
 
     fn upsert_objective(&self, record: &ObjectiveRecord) -> Result<()>;
     fn list_objectives(&self, workspace_id: &str, limit: usize) -> Result<Vec<ObjectiveRecord>>;
+    fn list_objectives_for_ticket(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ObjectiveRecord>>;
     fn get_objective(
         &self,
         workspace_id: &str,
@@ -1527,6 +1533,33 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )?;
             let rows =
                 stmt.query_map(params![workspace_id, limit as i64], read_objective_record)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
+        })
+    }
+
+    fn list_objectives_for_ticket(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ObjectiveRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"SELECT o.workspace_id, o.objective_id, o.title, o.state, o.body_md,
+                          o.created_at, o.updated_at
+                   FROM objectives AS o
+                   INNER JOIN objective_ticket_links AS l
+                     ON l.workspace_id = o.workspace_id
+                    AND l.objective_id = o.objective_id
+                   WHERE o.workspace_id = ?1 AND l.ticket_id = ?2
+                   ORDER BY o.updated_at DESC, o.objective_id ASC
+                   LIMIT ?3"#,
+            )?;
+            let rows = stmt.query_map(
+                params![workspace_id, ticket_id, limit as i64],
+                read_objective_record,
+            )?;
             rows.collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(Error::from)
         })

@@ -36,8 +36,8 @@ const MAX_DIAGNOSTIC_LIMIT: usize = 500;
 pub const TICKET_BASE_TOOL_NAMES: [&str; 14] = [
     "TicketCreate",
     "TicketEditItem",
-    "TicketList",
-    "TicketShow",
+    "QueryTicket",
+    "ShowTicket",
     "TicketComment",
     "TicketPlan",
     "TicketDecision",
@@ -51,8 +51,8 @@ pub const TICKET_BASE_TOOL_NAMES: [&str; 14] = [
 ];
 
 pub const TICKET_BASE_READ_ONLY_TOOL_NAMES: [&str; 4] = [
-    "TicketList",
-    "TicketShow",
+    "QueryTicket",
+    "ShowTicket",
     "TicketDependencyCheck",
     "TicketDoctor",
 ];
@@ -71,8 +71,8 @@ pub const TICKET_ORCHESTRATION_READ_ONLY_TOOL_NAMES: [&str; 2] =
 pub const TICKET_TOOL_NAMES: [&str; 19] = [
     "TicketCreate",
     "TicketEditItem",
-    "TicketList",
-    "TicketShow",
+    "QueryTicket",
+    "ShowTicket",
     "TicketComment",
     "TicketPlan",
     "TicketDecision",
@@ -91,8 +91,8 @@ pub const TICKET_TOOL_NAMES: [&str; 19] = [
 ];
 
 pub const TICKET_READ_ONLY_TOOL_NAMES: [&str; 6] = [
-    "TicketList",
-    "TicketShow",
+    "QueryTicket",
+    "ShowTicket",
     "TicketDependencyCheck",
     "TicketDoctor",
     "TicketRelationQuery",
@@ -121,13 +121,12 @@ backend assigns the id and writes the local Ticket file layout under the configu
 const EDIT_ITEM_DESCRIPTION: &str = "Edit a Ticket item through the configured typed Ticket backend. \
 This updates the current item title/body and appends an audited item_edit thread event. Intended for \
 User/Companion authoring surfaces, not Orchestrator implementation control.";
-const LIST_DESCRIPTION: &str = "List Tickets from the configured typed Ticket backend as a \
-lightweight bounded overview for selection only. Filter by query (`active`, `all`, a single workflow \
-state, or an explicit workflow-state list). Output is short summaries only; use TicketShow before \
-routing, closing, planning, or implementation decisions.";
-const SHOW_DESCRIPTION: &str = "Show one Ticket by id or exact query through the configured \
-typed Ticket backend. Output includes bounded Markdown body, recent thread events, resolution, and \
-artifact metadata.";
+const LIST_DESCRIPTION: &str = "Query Tickets from the configured typed Ticket backend as a bounded \
+overview. The local backend supports workflow-state selection; Workspace-backed Workers replace this \
+definition with the richer authoritative text/event/evidence/relation/Objective/time/attention query.";
+const SHOW_DESCRIPTION: &str = "Show one Ticket by id or exact query through the configured typed \
+Ticket backend. Output includes bounded Markdown body, recent thread events, resolution, and artifact \
+metadata; Workspace-backed Workers replace this definition with the richer authoritative evidence projection.";
 const COMMENT_DESCRIPTION: &str = "Append a typed Ticket comment event. `body` is Markdown.";
 const PLAN_DESCRIPTION: &str = "Append a typed Ticket plan event. `body` is Markdown.";
 const DECISION_DESCRIPTION: &str = "Append a typed Ticket decision event. `body` is Markdown.";
@@ -169,8 +168,8 @@ fn base_tool_description(name: &str) -> &'static str {
     match name {
         "TicketCreate" => CREATE_DESCRIPTION,
         "TicketEditItem" => EDIT_ITEM_DESCRIPTION,
-        "TicketList" => LIST_DESCRIPTION,
-        "TicketShow" => SHOW_DESCRIPTION,
+        "QueryTicket" => LIST_DESCRIPTION,
+        "ShowTicket" => SHOW_DESCRIPTION,
         "TicketComment" => COMMENT_DESCRIPTION,
         "TicketPlan" => PLAN_DESCRIPTION,
         "TicketDecision" => DECISION_DESCRIPTION,
@@ -464,7 +463,7 @@ impl TicketWorkflowStateParam {
 
 #[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
-enum TicketListStateParam {
+enum QueryTicketStateParam {
     Active,
     Planning,
     Ready,
@@ -475,7 +474,7 @@ enum TicketListStateParam {
     All,
 }
 
-impl TicketListStateParam {
+impl QueryTicketStateParam {
     fn as_list_state(self) -> Option<TicketListState> {
         match self {
             Self::Planning => Some(TicketListState::Planning),
@@ -490,10 +489,10 @@ impl TicketListStateParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct TicketListParams {
+struct QueryTicketParams {
     /// State filter. Defaults to active Tickets (all non-closed states). Use `all` to include closed Tickets.
     #[serde(default)]
-    state: Option<TicketListStateParam>,
+    state: Option<QueryTicketStateParam>,
     /// Explicit workflow-state filter list. Cannot be combined with `state`.
     #[serde(default)]
     states: Option<Vec<TicketWorkflowStateParam>>,
@@ -502,28 +501,28 @@ struct TicketListParams {
     limit: Option<usize>,
 }
 
-impl TicketListParams {
+impl QueryTicketParams {
     fn into_query(self) -> Result<(crate::TicketListQuery, String, Option<usize>), TicketError> {
         let query = if let Some(states) = self.states {
             if self.state.is_some() {
                 return Err(TicketError::Conflict(
-                    "TicketList accepts either `state` or `states`, not both".to_string(),
+                    "QueryTicket accepts either `state` or `states`, not both".to_string(),
                 ));
             }
             if states.is_empty() {
                 return Err(TicketError::Conflict(
-                    "TicketList `states` must include at least one workflow state".to_string(),
+                    "QueryTicket `states` must include at least one workflow state".to_string(),
                 ));
             }
             crate::TicketListQuery::states(states.into_iter().map(|state| state.into_list_state()))
         } else {
-            match self.state.unwrap_or(TicketListStateParam::Active) {
-                TicketListStateParam::Active => crate::TicketListQuery::active(),
-                TicketListStateParam::All => crate::TicketListQuery::all(),
+            match self.state.unwrap_or(QueryTicketStateParam::Active) {
+                QueryTicketStateParam::Active => crate::TicketListQuery::active(),
+                QueryTicketStateParam::All => crate::TicketListQuery::all(),
                 state => crate::TicketListQuery::state(
                     state
                         .as_list_state()
-                        .expect("workflow state list param maps to TicketListState"),
+                        .expect("workflow state list param maps to QueryTicketState"),
                 ),
             }
         };
@@ -533,7 +532,7 @@ impl TicketListParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct TicketShowParams {
+struct ShowTicketParams {
     /// Ticket id. Exactly one of `id` or `query` must be provided.
     #[serde(default)]
     id: Option<String>,
@@ -768,17 +767,17 @@ struct TicketRefOutput {
 }
 
 #[derive(Debug, Serialize)]
-struct TicketListOutput {
+struct QueryTicketOutput {
     state_filter: String,
     count: usize,
     returned: usize,
     truncated: bool,
     limit: usize,
-    tickets: Vec<TicketListTicketOutput>,
+    tickets: Vec<QueryTicketTicketOutput>,
 }
 
 #[derive(Debug, Serialize)]
-struct TicketListTicketOutput {
+struct QueryTicketTicketOutput {
     id: String,
     title: String,
     state: String,
@@ -808,12 +807,12 @@ struct TicketEditItemTool {
 }
 
 #[derive(Clone)]
-struct TicketListTool {
+struct QueryTicketTool {
     backend: TicketToolBackend,
 }
 
 #[derive(Clone)]
-struct TicketShowTool {
+struct ShowTicketTool {
     backend: TicketToolBackend,
 }
 
@@ -976,28 +975,28 @@ impl Tool for TicketEditItemTool {
 }
 
 #[async_trait]
-impl Tool for TicketListTool {
+impl Tool for QueryTicketTool {
     async fn execute(
         &self,
         input_json: &str,
         _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
-        let params: TicketListParams = parse_input("TicketList", input_json)?;
+        let params: QueryTicketParams = parse_input("QueryTicket", input_json)?;
         let (filter, state_filter, params_limit) = params
             .into_query()
-            .map_err(|error| backend_error("TicketList", error))?;
+            .map_err(|error| backend_error("QueryTicket", error))?;
         let limit = bounded(params_limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
         let tickets = self
             .backend
             .list(filter)
-            .map_err(|error| backend_error("TicketList", error))?;
+            .map_err(|error| backend_error("QueryTicket", error))?;
         let count = tickets.len();
         let returned_tickets: Vec<_> = tickets
             .into_iter()
             .take(limit)
             .map(ticket_summary_json)
             .collect();
-        let output = TicketListOutput {
+        let output = QueryTicketOutput {
             state_filter: state_filter.to_string(),
             count,
             returned: returned_tickets.len(),
@@ -1017,13 +1016,13 @@ impl Tool for TicketListTool {
 }
 
 #[async_trait]
-impl Tool for TicketShowTool {
+impl Tool for ShowTicketTool {
     async fn execute(
         &self,
         input_json: &str,
         _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
-        let params: TicketShowParams = parse_input("TicketShow", input_json)?;
+        let params: ShowTicketParams = parse_input("ShowTicket", input_json)?;
         let query = id_or_query(params.id, params.query)?;
         let event_limit = bounded(params.event_limit, DEFAULT_EVENT_LIMIT, MAX_EVENT_LIMIT);
         let artifact_limit = bounded(
@@ -1039,7 +1038,7 @@ impl Tool for TicketShowTool {
         let ticket = self
             .backend
             .show(query)
-            .map_err(|error| backend_error("TicketShow", error))?;
+            .map_err(|error| backend_error("ShowTicket", error))?;
         let summary = format!(
             "Ticket {} state {}",
             ticket.meta.id,
@@ -1484,9 +1483,9 @@ fn id_or_query(id: Option<String>, query: Option<String>) -> Result<TicketIdOrSl
     }
 }
 
-fn ticket_summary_json(ticket: TicketSummary) -> TicketListTicketOutput {
+fn ticket_summary_json(ticket: TicketSummary) -> QueryTicketTicketOutput {
     let hints = ticket_list_hints(&ticket);
-    TicketListTicketOutput {
+    QueryTicketTicketOutput {
         id: ticket.id,
         title: truncate_inline(ticket.title.as_str(), LIST_TITLE_MAX_CHARS),
         state: ticket.workflow_state.as_str().to_string(),
@@ -1722,8 +1721,8 @@ fn input_schema(name: &str) -> Value {
     match name {
         "TicketCreate" => serde_json::to_value(schemars::schema_for!(TicketCreateParams)),
         "TicketEditItem" => serde_json::to_value(schemars::schema_for!(TicketEditItemParams)),
-        "TicketList" => serde_json::to_value(schemars::schema_for!(TicketListParams)),
-        "TicketShow" => serde_json::to_value(schemars::schema_for!(TicketShowParams)),
+        "QueryTicket" => serde_json::to_value(schemars::schema_for!(QueryTicketParams)),
+        "ShowTicket" => serde_json::to_value(schemars::schema_for!(ShowTicketParams)),
         "TicketComment" | "TicketPlan" | "TicketDecision" | "TicketImplementationReport" => {
             serde_json::to_value(schemars::schema_for!(TicketThreadEventParams))
         }
@@ -1769,8 +1768,8 @@ macro_rules! impl_from_backend {
 
 impl_from_backend!(TicketCreateTool);
 impl_from_backend!(TicketEditItemTool);
-impl_from_backend!(TicketListTool);
-impl_from_backend!(TicketShowTool);
+impl_from_backend!(QueryTicketTool);
+impl_from_backend!(ShowTicketTool);
 impl_from_backend!(TicketCommentTool);
 impl_from_backend!(TicketPlanTool);
 impl_from_backend!(TicketDecisionTool);
@@ -1793,8 +1792,8 @@ pub fn ticket_tools(backend: impl Into<TicketToolBackend>) -> Vec<ToolDefinition
     vec![
         tool_definition::<TicketCreateTool>("TicketCreate", backend.clone()),
         tool_definition::<TicketEditItemTool>("TicketEditItem", backend.clone()),
-        tool_definition::<TicketListTool>("TicketList", backend.clone()),
-        tool_definition::<TicketShowTool>("TicketShow", backend.clone()),
+        tool_definition::<QueryTicketTool>("QueryTicket", backend.clone()),
+        tool_definition::<ShowTicketTool>("ShowTicket", backend.clone()),
         tool_definition::<TicketCommentTool>("TicketComment", backend.clone()),
         tool_definition::<TicketPlanTool>("TicketPlan", backend.clone()),
         tool_definition::<TicketDecisionTool>("TicketDecision", backend.clone()),
@@ -1861,8 +1860,8 @@ mod tests {
         assert_eq!(
             TICKET_READ_ONLY_TOOL_NAMES,
             [
-                "TicketList",
-                "TicketShow",
+                "QueryTicket",
+                "ShowTicket",
                 "TicketDependencyCheck",
                 "TicketDoctor",
                 "TicketRelationQuery",
@@ -1941,8 +1940,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let backend = backend(&temp);
         let create = tool_by_name(backend.clone(), "TicketCreate");
-        let list = tool_by_name(backend.clone(), "TicketList");
-        let show = tool_by_name(backend.clone(), "TicketShow");
+        let list = tool_by_name(backend.clone(), "QueryTicket");
+        let show = tool_by_name(backend.clone(), "ShowTicket");
         let doctor = tool_by_name(backend.clone(), "TicketDoctor");
 
         let created = create
@@ -2004,7 +2003,7 @@ mod tests {
     async fn ticket_list_tool_truncates_long_titles_and_hints() {
         let temp = TempDir::new().unwrap();
         let backend = backend(&temp);
-        let list = tool_by_name(backend.clone(), "TicketList");
+        let list = tool_by_name(backend.clone(), "QueryTicket");
         let mut ticket = NewTicket::new(format!(
             "Long Title {}",
             "x".repeat(LIST_TITLE_MAX_CHARS + 40)
@@ -2032,7 +2031,7 @@ mod tests {
     async fn ticket_list_tool_default_and_max_limits_are_bounded() {
         let temp = TempDir::new().unwrap();
         let backend = backend(&temp);
-        let list = tool_by_name(backend.clone(), "TicketList");
+        let list = tool_by_name(backend.clone(), "QueryTicket");
         for index in 0..(MAX_LIST_LIMIT + 5) {
             backend
                 .create(NewTicket::new(format!("Ticket {index:03}")))
@@ -2083,7 +2082,7 @@ mod tests {
     async fn ticket_list_tool_caps_all_and_closed_default_listing() {
         let temp = TempDir::new().unwrap();
         let backend = backend(&temp);
-        let list = tool_by_name(backend.clone(), "TicketList");
+        let list = tool_by_name(backend.clone(), "QueryTicket");
         for index in 0..(DEFAULT_LIST_LIMIT + 3) {
             let mut ticket = NewTicket::new(format!("Closed Ticket {index:03}"));
             ticket.workflow_state = Some(TicketWorkflowState::Closed);
@@ -2141,7 +2140,7 @@ mod tests {
     async fn ticket_list_tool_accepts_multi_state_list_and_rejects_mixed_filters() {
         let temp = TempDir::new().unwrap();
         let backend = backend(&temp);
-        let list = tool_by_name(backend.clone(), "TicketList");
+        let list = tool_by_name(backend.clone(), "QueryTicket");
         let planning = backend.create(NewTicket::new("Planning Ticket")).unwrap();
         let mut ready_input = NewTicket::new("Ready Ticket");
         ready_input.workflow_state = Some(TicketWorkflowState::Ready);
@@ -2188,7 +2187,7 @@ mod tests {
     async fn ticket_list_tool_omits_body_thread_artifact_and_resolution_content() {
         let temp = TempDir::new().unwrap();
         let backend = backend(&temp);
-        let list = tool_by_name(backend.clone(), "TicketList");
+        let list = tool_by_name(backend.clone(), "QueryTicket");
         let close = tool_by_name(backend.clone(), "TicketClose");
         let body_secret = "ITEM_BODY_SECRET_DO_NOT_LIST";
         let thread_secret = "THREAD_SECRET_DO_NOT_LIST";
@@ -2325,7 +2324,7 @@ mod tests {
         let record = tool_by_name(backend.clone(), "TicketRelationRecord");
         let remove = tool_by_name(backend.clone(), "TicketRelationRemove");
         let query = tool_by_name(backend.clone(), "TicketRelationQuery");
-        let show = tool_by_name(backend.clone(), "TicketShow");
+        let show = tool_by_name(backend.clone(), "ShowTicket");
 
         let recorded = record
             .execute(
@@ -2785,7 +2784,7 @@ mod tests {
     #[tokio::test]
     async fn ticket_show_requires_exactly_one_identifier() {
         let temp = TempDir::new().unwrap();
-        let show = tool_by_name(backend(&temp), "TicketShow");
+        let show = tool_by_name(backend(&temp), "ShowTicket");
         let error = show
             .execute(
                 &json!({ "id": "a", "query": "b" }).to_string(),

@@ -70,11 +70,10 @@ Intake は以下を行う。
 
 利用可能なら、以下の typed Ticket tools を使う。
 
-- `TicketList`: 既存 Ticket の一覧・重複確認。
-- `TicketShow`: 関連 Ticket の詳細確認。
+- `QueryTicket`: 既存 Ticket の一覧・重複確認。
+- `ShowTicket`: 関連 Ticket の詳細確認。
 - `TicketCreate`: 合意済み Ticket の作成。
 - `TicketComment`: 既存 Ticket refinement / decision / plan の記録。
-- `TicketDoctor`: 必要に応じた整合性確認。
 
 Intake は `MergeRequest*`, `TicketWorkflowState`, `TicketClose` を通常使わない。review authority は assigned Coder が起動した read-only direct-child Reviewer の immutable Merge Request attempt に属し、completion / merge / close は各guarded workflowの責務である。
 
@@ -96,7 +95,7 @@ Ticket tools が利用できない環境では、勝手に file write で代替�
 
 ### 2. 既存 Ticket を確認する
 
-`TicketList` / `TicketShow` で duplicate / related work を探す。
+`QueryTicket` / `ShowTicket` で duplicate / related work を探す。
 
 確認観点:
 

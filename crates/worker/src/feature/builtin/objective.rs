@@ -26,36 +26,45 @@ impl WorkspaceHttpObjectiveBackend {
         Self { client }
     }
 
-    async fn list(&self, input: ObjectiveListInput) -> Result<ToolOutput, ToolError> {
-        let mut url = format!(
-            "/api/w/{}/objectives",
+    async fn list(&self, input: QueryObjectiveInput) -> Result<ToolOutput, ToolError> {
+        let url = format!(
+            "/api/w/{}/objectives/query",
             self.client.workspace_id().unwrap_or_default()
         );
-        if let Some(limit) = input.limit {
-            url.push_str(&format!("?limit={}", limit.min(1000)));
-        }
-        let response = get_json::<ObjectiveListResponse>(self.client.as_ref(), &url)
-            .await
-            .map_err(backend_error)?;
-        let count = response.items.len();
+        let response = send_json::<QueryObjectiveInput, serde_json::Value>(
+            self.client.as_ref(),
+            reqwest::Method::POST,
+            &url,
+            &input,
+        )
+        .await
+        .map_err(backend_error)?;
         Ok(ToolOutput {
-            summary: format!("Listed {count} objective(s)"),
+            summary: "Queried Objectives".to_string(),
             content: Some(serde_json::to_string_pretty(&response).map_err(decode_error)?),
-
             attachments: Vec::new(),
         })
     }
 
-    async fn show(&self, input: ObjectiveShowInput) -> Result<ToolOutput, ToolError> {
-        let id = validate_id(&input.id, "ObjectiveShow")?;
-        let url = self.objective_url(id);
-        let response = get_json::<ObjectiveDetail>(self.client.as_ref(), &url)
-            .await
-            .map_err(backend_error)?;
-        Ok(objective_output(
-            format!("Read objective {}", response.id),
-            response,
-        )?)
+    async fn show(&self, input: ShowObjectiveInput) -> Result<ToolOutput, ToolError> {
+        let id = validate_id(&input.id, "ShowObjective")?;
+        let url = format!("{}/show", self.objective_url(id));
+        let response = send_json::<ObjectiveShowRequest, serde_json::Value>(
+            self.client.as_ref(),
+            reqwest::Method::POST,
+            &url,
+            &ObjectiveShowRequest {
+                event_limit: input.event_limit,
+                event_cursor: input.event_cursor,
+            },
+        )
+        .await
+        .map_err(backend_error)?;
+        Ok(ToolOutput {
+            summary: format!("Read objective {id}"),
+            content: Some(serde_json::to_string_pretty(&response).map_err(decode_error)?),
+            attachments: Vec::new(),
+        })
     }
 
     async fn create(&self, input: ObjectiveCreateInput) -> Result<ToolOutput, ToolError> {
@@ -195,13 +204,6 @@ fn backend_error(error: WorkspaceObjectiveBackendError) -> ToolError {
     ToolError::ExecutionFailed(error.to_string())
 }
 
-async fn get_json<T: for<'de> Deserialize<'de>>(
-    client: &dyn WorkspaceClient,
-    path: &str,
-) -> Result<T, WorkspaceObjectiveBackendError> {
-    decode_response(client.execute(WorkspaceRequest::get(path))?)
-}
-
 async fn send_json<B: Serialize, T: for<'de> Deserialize<'de>>(
     client: &dyn WorkspaceClient,
     method: reqwest::Method,
@@ -270,14 +272,14 @@ pub fn workspace_http_objective_tools(client: Arc<dyn WorkspaceClient>) -> Vec<T
     let backend = WorkspaceHttpObjectiveBackend::new(client);
     vec![
         objective_tool(
-            "ObjectiveList",
+            "QueryObjective",
             LIST_DESCRIPTION,
             list_schema(),
             backend.clone(),
             ObjectiveOperation::List,
         ),
         objective_tool(
-            "ObjectiveShow",
+            "ShowObjective",
             SHOW_DESCRIPTION,
             show_schema(),
             backend.clone(),
@@ -367,11 +369,11 @@ impl Tool for WorkspaceHttpObjectiveTool {
     ) -> Result<ToolOutput, ToolError> {
         match self.operation {
             ObjectiveOperation::List => {
-                let input = parse_input::<ObjectiveListInput>(input_json)?;
+                let input = parse_input::<QueryObjectiveInput>(input_json)?;
                 self.backend.list(input).await
             }
             ObjectiveOperation::Show => {
-                let input = parse_input::<ObjectiveShowInput>(input_json)?;
+                let input = parse_input::<ShowObjectiveInput>(input_json)?;
                 self.backend.show(input).await
             }
             ObjectiveOperation::Create => {
@@ -402,10 +404,8 @@ fn parse_input<T: for<'de> Deserialize<'de>>(input: &str) -> Result<T, ToolError
     serde_json::from_str(input).map_err(|error| ToolError::InvalidArgument(error.to_string()))
 }
 
-const LIST_DESCRIPTION: &str =
-    "List Objective records through Backend Workspace API authority as bounded summaries.";
-const SHOW_DESCRIPTION: &str =
-    "Show one Objective record by canonical id through Backend Workspace API authority.";
+const LIST_DESCRIPTION: &str = "Query authoritative Objectives with bounded typed filters, stable snippets, linked-Ticket context, and cursor metadata.";
+const SHOW_DESCRIPTION: &str = "Show one authoritative Objective with its revision, full linked-Ticket context, bounded body, and paged event metadata.";
 const CREATE_DESCRIPTION: &str =
     "Create an Objective record through Backend Workspace API authority.";
 const EDIT_DESCRIPTION: &str =
@@ -422,13 +422,29 @@ fn list_schema() -> serde_json::Value {
         "type":"object",
         "additionalProperties": false,
         "properties":{
-            "limit":{"type":["integer","null"],"minimum":0,"maximum":1000}
+            "query":{"type":["string","null"]},
+            "states":{"type":"array","items":{"type":"string"},"default":[]},
+            "linked_ticket_id":{"type":["string","null"]},
+            "updated_after":{"type":["string","null"]},
+            "updated_before":{"type":["string","null"]},
+            "sort":{"type":["string","null"],"enum":["relevance","updated_desc","created_desc","title",null]},
+            "limit":{"type":["integer","null"],"minimum":1,"maximum":100},
+            "cursor":{"type":["string","null"]}
         }
     })
 }
 
 fn show_schema() -> serde_json::Value {
-    id_schema(&["id"])
+    json!({
+        "type":"object",
+        "additionalProperties": false,
+        "required":["id"],
+        "properties":{
+            "id":{"type":"string"},
+            "event_limit":{"type":["integer","null"],"minimum":1,"maximum":50},
+            "event_cursor":{"type":["string","null"]}
+        }
+    })
 }
 
 fn create_schema() -> serde_json::Value {
@@ -480,17 +496,6 @@ fn unlink_ticket_schema() -> serde_json::Value {
     id_ticket_schema(&["id", "ticket_id"])
 }
 
-fn id_schema(required: &[&str]) -> serde_json::Value {
-    json!({
-        "type":"object",
-        "additionalProperties": false,
-        "required": required,
-        "properties":{
-            "id":{"type":"string"}
-        }
-    })
-}
-
 fn id_ticket_schema(required: &[&str]) -> serde_json::Value {
     json!({
         "type":"object",
@@ -503,14 +508,30 @@ fn id_ticket_schema(required: &[&str]) -> serde_json::Value {
     })
 }
 
-#[derive(Debug, Deserialize)]
-struct ObjectiveListInput {
+#[derive(Debug, Serialize, Deserialize)]
+struct QueryObjectiveInput {
+    query: Option<String>,
+    #[serde(default)]
+    states: Vec<String>,
+    linked_ticket_id: Option<String>,
+    updated_after: Option<String>,
+    updated_before: Option<String>,
+    sort: Option<String>,
     limit: Option<usize>,
+    cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ObjectiveShowInput {
+struct ShowObjectiveInput {
     id: String,
+    event_limit: Option<usize>,
+    event_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ObjectiveShowRequest {
+    event_limit: Option<usize>,
+    event_cursor: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -575,30 +596,6 @@ fn default_state() -> String {
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct ObjectiveListResponse {
-    items: Vec<ObjectiveSummary>,
-    invalid_records: Vec<InvalidProjectRecord>,
-    record_authority: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct InvalidProjectRecord {
-    label: String,
-    reason: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct ObjectiveSummary {
-    id: String,
-    title: String,
-    state: String,
-    updated_at: Option<String>,
-    summary: String,
-    linked_tickets: Vec<String>,
-    record_source: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct ObjectiveDetail {
     id: String,
     title: String,
@@ -637,10 +634,10 @@ mod tests {
                 "ObjectiveCreate",
                 "ObjectiveEdit",
                 "ObjectiveLinkTicket",
-                "ObjectiveList",
                 "ObjectiveSetState",
-                "ObjectiveShow",
                 "ObjectiveUnlinkTicket",
+                "QueryObjective",
+                "ShowObjective",
             ]
         );
     }
@@ -648,9 +645,12 @@ mod tests {
     #[test]
     fn objective_tool_schemas_are_bounded_and_mutation_scoped() {
         let list = list_schema();
-        assert_eq!(list["properties"]["limit"]["maximum"], 1000);
+        assert_eq!(list["properties"]["limit"]["maximum"], 100);
+        assert!(list["properties"]["cursor"].is_object());
+        assert!(list["properties"]["linked_ticket_id"].is_object());
         let show = show_schema();
         assert_eq!(show["required"][0], "id");
+        assert_eq!(show["properties"]["event_limit"]["maximum"], 50);
         let create = create_schema();
         assert_eq!(create["required"][0], "title");
         let edit = edit_schema();

@@ -11,7 +11,6 @@ pub const MERGE_REQUEST_COMMON_TOOL_NAMES: &[&str] = &[
     "MergeRequestShow",
     "MergeRequestReadinessCheck",
     "MergeRequestOpen",
-    "MergeRequestAddRevision",
     "MergeRequestComplete",
 ];
 pub const MERGE_REQUEST_REVIEW_TOOL_NAME: &str = "MergeRequestReviewSubmit";
@@ -20,7 +19,6 @@ enum Kind {
     Show,
     Readiness,
     Open,
-    AddRevision,
     Complete,
     Review,
 }
@@ -29,7 +27,6 @@ struct MergeRequestTool {
     client: Arc<dyn WorkspaceClient>,
     kind: Kind,
 }
-
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ShowInput {
     ticket: String,
@@ -38,23 +35,8 @@ struct ShowInput {
 struct OpenInput {
     ticket: String,
     repository_id: String,
-    revision_id: String,
-    base_commit: String,
-    head_commit: String,
-    #[serde(default)]
-    changed_paths: Vec<String>,
-    #[serde(default)]
-    summary: String,
-}
-#[derive(Debug, Deserialize, JsonSchema)]
-struct AddRevisionInput {
-    ticket: String,
-    expected_current_revision_id: String,
-    revision_id: String,
-    base_commit: String,
-    head_commit: String,
-    #[serde(default)]
-    changed_paths: Vec<String>,
+    selector_from: String,
+    selector_to: String,
     #[serde(default)]
     summary: String,
 }
@@ -62,10 +44,9 @@ struct AddRevisionInput {
 struct CompleteInput {
     ticket: String,
     operation_id: String,
-    expected_revision_id: String,
-    target_commit: String,
-    source_commit: String,
-    result_commit: String,
+    approval_event_id: String,
+    target_ref_before: String,
+    target_ref_after: String,
     strategy: MergeStrategyInput,
     resolution: MergeResolutionInput,
 }
@@ -104,63 +85,48 @@ struct ReviewFindingInput {
     #[serde(default)]
     path: Option<String>,
     #[serde(default)]
-    line: Option<u64>,
+    line: Option<u32>,
     body: String,
 }
-
 impl Kind {
     fn name(self) -> &'static str {
         match self {
             Self::Show => "MergeRequestShow",
             Self::Readiness => "MergeRequestReadinessCheck",
             Self::Open => "MergeRequestOpen",
-            Self::AddRevision => "MergeRequestAddRevision",
             Self::Complete => "MergeRequestComplete",
             Self::Review => "MergeRequestReviewSubmit",
         }
-    }
-    fn description(self) -> &'static str {
-        description(self.name()).unwrap_or("Merge Request operation.")
     }
     fn schema(self) -> serde_json::Value {
         match self {
             Self::Show | Self::Readiness => json!(schemars::schema_for!(ShowInput)),
             Self::Open => json!(schemars::schema_for!(OpenInput)),
-            Self::AddRevision => json!(schemars::schema_for!(AddRevisionInput)),
             Self::Complete => json!(schemars::schema_for!(CompleteInput)),
             Self::Review => json!(schemars::schema_for!(ReviewInput)),
         }
     }
 }
-
 #[async_trait]
 impl Tool for MergeRequestTool {
-    async fn execute(
-        &self,
-        input: &str,
-        _context: ToolExecutionContext,
-    ) -> Result<ToolOutput, ToolError> {
-        let workspace_id = self.client.workspace_id().ok_or_else(|| {
+    async fn execute(&self, input: &str, _: ToolExecutionContext) -> Result<ToolOutput, ToolError> {
+        let ws = self.client.workspace_id().ok_or_else(|| {
             ToolError::ExecutionFailed("Merge Request tools require Workspace identity".into())
         })?;
         let (method, path, body) = match self.kind {
-            Kind::Show => {
-                let v: ShowInput = parse(input)?;
-                nonempty(&v.ticket)?;
-                (
-                    WorkspaceRequestMethod::Get,
-                    format!("/api/w/{workspace_id}/tickets/{}/merge-request", v.ticket),
-                    None,
-                )
-            }
-            Kind::Readiness => {
+            Kind::Show | Kind::Readiness => {
                 let v: ShowInput = parse(input)?;
                 nonempty(&v.ticket)?;
                 (
                     WorkspaceRequestMethod::Get,
                     format!(
-                        "/api/w/{workspace_id}/tickets/{}/merge-request/readiness",
-                        v.ticket
+                        "/api/w/{ws}/tickets/{}/merge-request{}",
+                        v.ticket,
+                        if matches!(self.kind, Kind::Readiness) {
+                            "/readiness"
+                        } else {
+                            ""
+                        }
                     ),
                     None,
                 )
@@ -170,62 +136,35 @@ impl Tool for MergeRequestTool {
                 nonempty(&v.ticket)?;
                 (
                     WorkspaceRequestMethod::Post,
-                    format!("/api/w/{workspace_id}/tickets/{}/merge-request", v.ticket),
+                    format!("/api/w/{ws}/tickets/{}/merge-request", v.ticket),
                     Some(
-                        json!({"repository_id":v.repository_id,"revision_id":v.revision_id,"base_commit":v.base_commit,"head_commit":v.head_commit,"changed_paths":v.changed_paths,"summary":v.summary}),
-                    ),
-                )
-            }
-            Kind::AddRevision => {
-                let v: AddRevisionInput = parse(input)?;
-                nonempty(&v.ticket)?;
-                (
-                    WorkspaceRequestMethod::Post,
-                    format!(
-                        "/api/w/{workspace_id}/tickets/{}/merge-request/revisions",
-                        v.ticket
-                    ),
-                    Some(
-                        json!({"expected_current_revision_id":v.expected_current_revision_id,"revision_id":v.revision_id,"base_commit":v.base_commit,"head_commit":v.head_commit,"changed_paths":v.changed_paths,"summary":v.summary}),
+                        json!({"repository_id":v.repository_id,"selector_from":v.selector_from,"selector_to":v.selector_to,"summary":v.summary}),
                     ),
                 )
             }
             Kind::Complete => {
                 let v: CompleteInput = parse(input)?;
                 nonempty(&v.ticket)?;
-                let strategy = match v.strategy {
-                    MergeStrategyInput::FastForward => "fast_forward",
-                    MergeStrategyInput::Merge => "merge",
-                };
-                let resolution = match v.resolution {
-                    MergeResolutionInput::None => "none",
-                    MergeResolutionInput::Clean => "clean",
-                    MergeResolutionInput::ConflictsResolved => "conflicts_resolved",
-                };
                 (
                     WorkspaceRequestMethod::Post,
-                    format!(
-                        "/api/w/{workspace_id}/tickets/{}/merge-request/complete",
-                        v.ticket
-                    ),
+                    format!("/api/w/{ws}/tickets/{}/merge-request/complete", v.ticket),
                     Some(
-                        json!({"operation_id":v.operation_id,"expected_revision_id":v.expected_revision_id,"target_commit":v.target_commit,"source_commit":v.source_commit,"result_commit":v.result_commit,"strategy":strategy,"resolution":resolution}),
+                        json!({"operation_id":v.operation_id,"approval_event_id":v.approval_event_id,"target_ref_before":v.target_ref_before,"target_ref_after":v.target_ref_after,"strategy":match v.strategy{MergeStrategyInput::FastForward=>"fast_forward",MergeStrategyInput::Merge=>"merge"},"resolution":match v.resolution{MergeResolutionInput::None=>"none",MergeResolutionInput::Clean=>"clean",MergeResolutionInput::ConflictsResolved=>"conflicts_resolved"}}),
                     ),
                 )
             }
             Kind::Review => {
                 let v: ReviewInput = parse(input)?;
-                let context = self.client.reviewer_attempt_context().ok_or_else(|| {
+                let ctx = self.client.reviewer_context().ok_or_else(|| {
                     ToolError::ExecutionFailed(
-                        "MergeRequestReviewSubmit is available only to an attested Reviewer child"
-                            .into(),
+                        "Review submit requires injected Reviewer capability".into(),
                     )
                 })?;
                 (
                     WorkspaceRequestMethod::Post,
                     format!(
-                        "/api/w/{workspace_id}/tickets/{}/merge-request/reviews",
-                        context.ticket_id
+                        "/api/w/{ws}/tickets/{}/merge-request/reviews",
+                        ctx.ticket_id
                     ),
                     Some(
                         json!({"decision":match v.decision{ReviewDecisionInput::Approve=>"approve",ReviewDecisionInput::RequestChanges=>"request_changes"},"body":v.body,"findings":v.findings.into_iter().map(|f|json!({"severity":f.severity,"code":f.code,"path":f.path,"line":f.line,"body":f.body})).collect::<Vec<_>>() }),
@@ -233,32 +172,32 @@ impl Tool for MergeRequestTool {
                 )
             }
         };
-        let request = match body {
-            Some(body) => WorkspaceRequest::json(method, path, body.to_string()),
+        let req = match body {
+            Some(v) => WorkspaceRequest::json(method, path, v.to_string()),
             None => WorkspaceRequest::get(path),
         };
-        let response = self
+        let res = self
             .client
-            .execute(request)
+            .execute(req)
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-        if !response.is_success() {
+        if !res.is_success() {
             return Err(ToolError::ExecutionFailed(format!(
                 "Merge Request API returned HTTP {}: {}",
-                response.status, response.body
+                res.status, res.body
             )));
         }
         Ok(ToolOutput {
-            summary: self.kind.name().to_string(),
-            content: Some(response.body),
-            attachments: Vec::new(),
+            summary: self.kind.name().into(),
+            content: Some(res.body),
+            attachments: vec![],
         })
     }
 }
-fn parse<T: serde::de::DeserializeOwned>(value: &str) -> Result<T, ToolError> {
-    serde_json::from_str(value).map_err(|e| ToolError::InvalidArgument(e.to_string()))
+fn parse<T: serde::de::DeserializeOwned>(v: &str) -> Result<T, ToolError> {
+    serde_json::from_str(v).map_err(|e| ToolError::InvalidArgument(e.to_string()))
 }
-fn nonempty(value: &str) -> Result<(), ToolError> {
-    if value.trim().is_empty() {
+fn nonempty(v: &str) -> Result<(), ToolError> {
+    if v.trim().is_empty() {
         Err(ToolError::InvalidArgument(
             "ticket must not be empty".into(),
         ))
@@ -268,74 +207,75 @@ fn nonempty(value: &str) -> Result<(), ToolError> {
 }
 fn definition(client: Arc<dyn WorkspaceClient>, kind: Kind) -> ToolDefinition {
     Arc::new(move || {
-        let meta = ToolMeta::new(kind.name())
-            .description(kind.description())
-            .input_schema(kind.schema());
-        let tool: Arc<dyn Tool> = Arc::new(MergeRequestTool {
-            client: client.clone(),
-            kind,
-        });
-        (meta, tool)
+        (
+            ToolMeta::new(kind.name())
+                .description(description(kind.name()).unwrap_or("Merge Request operation."))
+                .input_schema(kind.schema()),
+            Arc::new(MergeRequestTool {
+                client: client.clone(),
+                kind,
+            }) as Arc<dyn Tool>,
+        )
     })
 }
-pub fn common_tools(client: Arc<dyn WorkspaceClient>) -> Vec<ToolDefinition> {
+pub fn common_tools(c: Arc<dyn WorkspaceClient>) -> Vec<ToolDefinition> {
     vec![
-        definition(client.clone(), Kind::Show),
-        definition(client.clone(), Kind::Readiness),
-        definition(client.clone(), Kind::Open),
-        definition(client.clone(), Kind::AddRevision),
-        definition(client, Kind::Complete),
+        definition(c.clone(), Kind::Show),
+        definition(c.clone(), Kind::Readiness),
+        definition(c.clone(), Kind::Open),
+        definition(c, Kind::Complete),
     ]
 }
-pub fn reviewer_tools(client: Arc<dyn WorkspaceClient>) -> Vec<ToolDefinition> {
-    if client.reviewer_attempt_context().is_some() {
+pub fn reviewer_tools(c: Arc<dyn WorkspaceClient>) -> Vec<ToolDefinition> {
+    if c.reviewer_context().is_some() {
         vec![
-            definition(client.clone(), Kind::Show),
-            definition(client, Kind::Review),
+            definition(c.clone(), Kind::Show),
+            definition(c, Kind::Review),
         ]
     } else {
-        Vec::new()
+        vec![]
     }
 }
-pub fn description(name: &str) -> Option<&'static str> {
-    match name {
-        "MergeRequestShow" => Some(
-            "Read the authoritative Merge Request, immutable current revision, and structured review status.",
-        ),
+pub fn description(n: &str) -> Option<&'static str> {
+    match n {
+        "MergeRequestShow" => Some("Read the selector-based Merge Request and append-only thread."),
         "MergeRequestReadinessCheck" => {
-            Some("Check derived merge readiness for the current immutable revision.")
+            Some("Resolve current provider refs and derive readiness from valid review events.")
         }
         "MergeRequestOpen" => {
-            Some("Open an immutable Merge Request revision for the current assigned Coder.")
-        }
-        "MergeRequestAddRevision" => {
-            Some("Append an immutable revision; prior approval cannot carry to the new revision.")
+            Some("Open a Merge Request with immutable source and target selectors.")
         }
         "MergeRequestComplete" => {
-            Some("CAS-complete an approved revision with operation-id replay and crash fencing.")
+            Some("Complete using an approved review event and final target-ref evidence.")
         }
-        "MergeRequestReviewSubmit" => Some(
-            "Submit the attested direct-child Reviewer result bound to its immutable revision.",
-        ),
+        "MergeRequestReviewSubmit" => {
+            Some("Submit the injected Reviewer capability result for its captured subject ref.")
+        }
         _ => None,
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn merge_request_tool_contract_omits_redundant_revision_evidence_and_candidate_result_tool() {
-        let open = serde_json::to_string(&schemars::schema_for!(OpenInput)).unwrap();
-        let add = serde_json::to_string(&schemars::schema_for!(AddRevisionInput)).unwrap();
-        let complete = serde_json::to_string(&schemars::schema_for!(CompleteInput)).unwrap();
-        assert!(!open.contains("head_tree"));
-        assert!(!add.contains("head_tree"));
-        assert!(!open.contains("diff_digest"));
-        assert!(!add.contains("diff_digest"));
-        assert!(complete.contains("result_commit"));
-        assert!(complete.contains("conflicts_resolved"));
-        assert!(!MERGE_REQUEST_COMMON_TOOL_NAMES.contains(&"MergeRequestRecordMergeResult"));
+    fn schemas_hide_revision_and_commit_authority() {
+        let schemas = [
+            schemars::schema_for!(OpenInput),
+            schemars::schema_for!(CompleteInput),
+        ];
+        for s in schemas {
+            let j = serde_json::to_string(&s).unwrap();
+            for banned in [
+                "revision_id",
+                "attempt_id",
+                "base_commit",
+                "head_commit",
+                "source_commit",
+                "result_commit",
+            ] {
+                assert!(!j.contains(banned), "{banned} in {j}")
+            }
+        }
+        assert!(!MERGE_REQUEST_COMMON_TOOL_NAMES.contains(&"MergeRequestRequestReview"));
     }
 }

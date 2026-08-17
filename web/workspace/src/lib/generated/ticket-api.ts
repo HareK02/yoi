@@ -23,8 +23,19 @@ export type TicketListResponse = {
   record_authority: string;
 };
 
+export type QueryPage = {
+  limit: number;
+  returned: number;
+  has_more: boolean;
+  next_cursor: string | null;
+  sort: string;
+  source_limit: number | null;
+  source_truncated: boolean;
+};
+
 export type TicketEventDetail = {
   sequence: number;
+  event_ref: string;
   kind: string;
   author: string | null;
   at: string | null;
@@ -35,6 +46,99 @@ export type TicketEventDetail = {
   state_field: string | null;
   heading: string | null;
   body: string | null;
+  attributes: { [key in string]: string };
+  references: Array<string>;
+};
+
+export type ObjectiveLinkSummary = { id: string; title: string; state: string };
+
+export type TicketEvidenceEvent = {
+  event_ref: string;
+  sequence: number;
+  kind: string;
+  at: string | null;
+  author: string | null;
+  excerpt: string;
+};
+
+export type TicketAssignmentSummary = {
+  assignment_id: string;
+  runtime_id: string;
+  worker_id: string;
+};
+
+export type TicketMergeRequestSummary = {
+  merge_request_id: string;
+  state: string;
+  review_status: string;
+  selector_from: string | null;
+  selector_to: string;
+  updated_at: string;
+  review_subject_ref: string | null;
+  review_submitted_at: string | null;
+  review_excerpt: string | null;
+};
+
+export type TicketEvidenceSummary = {
+  has_implementation_report: boolean;
+  implementation_report_after_rescope: boolean;
+  has_merge_request: boolean;
+  has_commit: boolean;
+  review_status: string | null;
+  approved: boolean;
+  unresolved_request_changes: boolean;
+  complete_for_integration: boolean;
+  missing: Array<string>;
+};
+
+export type TicketQueryRequest = {
+  query: string | null;
+  states: Array<string>;
+  event_kinds: Array<string>;
+  evidence: Array<string>;
+  review_status: string | null;
+  attention: Array<string>;
+  related_ticket_id: string | null;
+  relation_kind: string | null;
+  linked_objective_id: string | null;
+  updated_after: string | null;
+  updated_before: string | null;
+  sort: string | null;
+  limit: number | null;
+  cursor: string | null;
+};
+
+export type TicketQueryItem = {
+  id: string;
+  title: string;
+  state: string;
+  readiness: string | null;
+  priority: string;
+  created_at: string | null;
+  updated_at: string | null;
+  item_revision: string;
+  workspace_action_priority: string;
+  matched_fields: Array<string>;
+  snippet: string | null;
+  matching_event: TicketEvidenceEvent | null;
+  linked_objective_ids: Array<string>;
+  relation_count: number;
+  blocker_count: number;
+  unresolved_blocker_count: number;
+  unresolved_review_count: number;
+  evidence: TicketEvidenceSummary;
+  merge_request: TicketMergeRequestSummary | null;
+};
+
+export type TicketQueryResponse = {
+  items: Array<TicketQueryItem>;
+  page: QueryPage;
+  record_authority: string;
+};
+
+export type TicketShowRequest = {
+  event_limit: number | null;
+  event_cursor: string | null;
 };
 
 export type TicketRelation = {
@@ -80,9 +184,11 @@ export type TicketDetail = {
   id: string;
   title: string;
   state: string;
+  readiness: string | null;
   priority: string;
   created_at: string | null;
   updated_at: string | null;
+  item_revision: string;
   queued_by: string | null;
   queued_at: string | null;
   assignee: string | null;
@@ -93,9 +199,15 @@ export type TicketDetail = {
   body_truncated: boolean;
   event_count: number;
   events: Array<TicketEventDetail>;
+  event_page: QueryPage;
   artifact_count: number;
   artifacts: Array<string>;
   relations: TicketRelationView;
+  linked_objectives: Array<ObjectiveLinkSummary>;
+  implementation_reports: Array<TicketEvidenceEvent>;
+  current_assignment: TicketAssignmentSummary | null;
+  merge_request: TicketMergeRequestSummary | null;
+  evidence: TicketEvidenceSummary;
   resolution: string | null;
   record_source: string;
 };
