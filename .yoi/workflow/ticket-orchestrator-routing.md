@@ -49,6 +49,7 @@ Orchestrator は以下を行う。
 - 既存 umbrella/progress-container Ticket が concrete follow-up Ticket / Objective context で置き換え済みなら、superseded/decomposed として退役・close する routing を検討する。
 - implementation-ready の場合は `multi-agent-workflow` に渡す `IntentPacket` を作る。
 - implementation-ready かつ Ticket が `queued` の場合は、worktree 作成 / implementation Pod `SpawnPod` / coder routing などの side effect の前に、既存の typed Ticket backend/tool path で `queued -> inprogress` を記録する。
+- 人間による `ready -> queued` は、記録済み Ticket scopeについて、実装、current MRのguarded merge、completion記録、Ticket closeまでをWorkspace Orchestratorへ委任するdurable gateである。Orchestratorは`queued -> inprogress`を受理した後、current-ref approval、repository evidence、blocking relations、merge CASを確認して完了まで進め、別のmerge確認を待たない。Ticketがseparate approval gateを明記する場合、またはqueued scope外の新しい判断が必要な場合だけ停止する。
 - 明示的な queue review 中に、他にも queued Ticket が見え、capacity が空いている場合は、各 Ticket について relation / orchestration-plan / dirty state / visible Pods / worktree / conflict risk を確認し、独立して受理できるものを同じ routing pass で追加の `queued -> inprogress` 候補にする。
 - queued Ticket を capacity が見える状態で idle のまま残す場合は、dependency / conflict / capacity / missing planning decision / dirty workspace / reviewer-coder bottleneck / migration boundary / human gate のいずれかに絞った bounded reason を Ticket thread または `TicketOrchestrationPlanRecord` に残す。
 - `ready` または `queued` に concrete missing decision / information がある場合だけ、typed state-change/routing event 付きで `planning` に戻す。その event/comment には missing item、checked context、implementation latitude では足りない理由、次の planning question/action を含める。
@@ -61,7 +62,7 @@ Orchestrator は以下を行う。
 - 人間/上位 Orchestrator の許可または明示的な routing acceptance なしに coder / reviewer Pod や read-only investigation helper Pod を起動しない。
 - unqueued Ticket を capacity 埋めのために開始しない。parallel start の候補は、個別に `queued` であり、人間が routing を許可済みの Ticket に限る。
 - 設計境界の未決定を勝手に implementation-ready として固定しない。
-- merge / close / cleanup 権限を持たない場面で勝手に完了処理しない。
+- Ticketが`ready -> queued`されておらず完了権限を委任されていない場合、またはTicketがseparate approval gateを明記する場合に、勝手にmerge / close / cleanupしない。queued delegationとguarded completion evidenceが揃っている場合は、追加のhuman gateを作らず完了まで進める。
 - Ticket tools があるからといって arbitrary filesystem write を行わない。
 - broad multi-Ticket effort のために新しい umbrella/progress-container Ticket を作らない。
 - parent/child、sub-ticket、umbrella、part-of、contains などの hierarchy/container relation を split/refinement の代替として扱わない。
