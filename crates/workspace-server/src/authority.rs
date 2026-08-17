@@ -354,11 +354,11 @@ impl SqliteWorkspaceAuthority {
         }
         if let Some(value) = &query.updated_after {
             let value = bind(SqlValue::Text(value.clone()));
-            predicates.push(format!("COALESCE(t.updated_at,'')>={value}"));
+            predicates.push(format!("COALESCE(t.updated_at,'')>{value}"));
         }
         if let Some(value) = &query.updated_before {
             let value = bind(SqlValue::Text(value.clone()));
-            predicates.push(format!("COALESCE(t.updated_at,'')<={value}"));
+            predicates.push(format!("COALESCE(t.updated_at,'')<{value}"));
         }
         if let Some(value) = &query.linked_objective_id {
             let value = bind(SqlValue::Text(value.clone()));
@@ -373,7 +373,9 @@ impl SqliteWorkspaceAuthority {
                 .relation_kind
                 .as_ref()
                 .map(|value| bind(SqlValue::Text(value.clone())));
-            let related = related.map(|value| format!("AND ((r.ticket_id=t.ticket_id AND r.target={value}) OR (r.target=t.ticket_id AND r.ticket_id={value}))")).unwrap_or_default();
+            let related = related
+                .map(|value| format!("AND r.ticket_id=t.ticket_id AND r.target={value}"))
+                .unwrap_or_else(|| "AND r.ticket_id=t.ticket_id".to_string());
             let kind = kind
                 .map(|value| format!("AND r.kind={value}"))
                 .unwrap_or_default();
@@ -427,14 +429,20 @@ impl SqliteWorkspaceAuthority {
             "CASE WHEN {merge_request_id} IS NULL THEN 'none' WHEN {review_decision}='approve' THEN 'approved' WHEN {review_decision}='request_changes' THEN 'request_changes' ELSE 'pending' END"
         );
         let has_commit = format!(
-            "({merge_request_id} IS NOT NULL OR EXISTS (SELECT 1 FROM typed_ticket_event_references reference WHERE reference.workspace_id=t.workspace_id AND reference.ticket_id=t.ticket_id AND reference.kind='commit'))"
+            "({review_subject} IS NOT NULL OR EXISTS (SELECT 1 FROM typed_ticket_event_references reference WHERE reference.workspace_id=t.workspace_id AND reference.ticket_id=t.ticket_id AND reference.kind='commit'))"
         );
-        for event_kind in &query.event_kinds {
-            let event_kind = bind(SqlValue::Text(event_kind.clone()));
-            predicates.push(format!("EXISTS (SELECT 1 FROM typed_ticket_events event WHERE event.workspace_id=t.workspace_id AND event.ticket_id=t.ticket_id AND event.kind={event_kind})"));
+        if !query.event_kinds.is_empty() {
+            let event_kinds = query
+                .event_kinds
+                .iter()
+                .map(|event_kind| bind(SqlValue::Text(event_kind.clone())))
+                .collect::<Vec<_>>();
+            predicates.push(format!("EXISTS (SELECT 1 FROM typed_ticket_events event WHERE event.workspace_id=t.workspace_id AND event.ticket_id=t.ticket_id AND event.kind IN ({}))", event_kinds.join(",")));
         }
         for evidence in &query.evidence {
             predicates.push(match evidence.as_str() {
+                "implementation_report" => format!("{report_index} IS NOT NULL"),
+                "implementation_report_after_rescope" => current_report.clone(),
                 "merge_request" => format!("{merge_request_id} IS NOT NULL"),
                 "commit" => has_commit.clone(),
                 "approved_review" => format!("{review_status}='approved'"),
@@ -446,7 +454,7 @@ impl SqliteWorkspaceAuthority {
             });
         }
         if let Some(status) = &query.review_status {
-            let status = if status == "unresolved_changes" {
+            let status = if matches!(status.as_str(), "unresolved_changes" | "changes_requested") {
                 "request_changes"
             } else {
                 status.as_str()
@@ -457,15 +465,29 @@ impl SqliteWorkspaceAuthority {
         for attention in &query.attention {
             predicates.push(match attention.as_str() {
                 "done_not_closed" => "t.workflow_state='done'".to_string(),
-                "unresolved_review" | "unresolved_changes" => format!("{review_status}='request_changes'"),
+                "implementation_report_not_closed" => {
+                    format!("{report_index} IS NOT NULL AND t.workflow_state!='closed'")
+                }
+                "report_after_rescope" => current_report.clone(),
+                "unresolved_review" | "unresolved_changes" => {
+                    format!("{review_status}='request_changes'")
+                }
                 "missing_commit" => format!("NOT {has_commit}"),
                 "blocked" => blocker.to_string(),
                 "unblocked" => format!("NOT {blocker}"),
-                "ready" => format!("t.workflow_state='ready' AND NOT {active_blocker}"),
-                "awaiting_review" => format!("t.workflow_state='inprogress' AND {current_report} AND {review_status}='pending'"),
-                "stale_after_rescope" => format!("{report_index} IS NOT NULL AND {edit_index}>{report_index}"),
-                "missing_evidence" => format!("NOT ({current_report} AND {has_commit} AND {review_status}='approved')"),
-                other => return Err(Error::InvalidRecordId(format!("unsupported attention filter `{other}`"))),
+                "ready" => format!("t.workflow_state='ready' AND NOT {blocker}"),
+                "awaiting_review" => format!("{review_status}='pending'"),
+                "stale_after_rescope" => {
+                    format!("{report_index} IS NOT NULL AND NOT {current_report}")
+                }
+                "missing_evidence" => format!(
+                    "NOT ({current_report} AND {has_commit} AND {review_status}='approved')"
+                ),
+                other => {
+                    return Err(Error::InvalidRecordId(format!(
+                        "unsupported attention filter `{other}`"
+                    )));
+                }
             });
         }
         let rank_expression = match sort {
@@ -561,11 +583,11 @@ impl SqliteWorkspaceAuthority {
         }
         if let Some(value) = &query.updated_after {
             let value = bind(SqlValue::Text(value.clone()));
-            predicates.push(format!("o.updated_at>={value}"));
+            predicates.push(format!("o.updated_at>{value}"));
         }
         if let Some(value) = &query.updated_before {
             let value = bind(SqlValue::Text(value.clone()));
-            predicates.push(format!("o.updated_at<={value}"));
+            predicates.push(format!("o.updated_at<{value}"));
         }
         if let Some(value) = &query.linked_ticket_id {
             let value = bind(SqlValue::Text(value.clone()));
@@ -2576,6 +2598,34 @@ mod tests {
                 .any(|item| item.id == "00000000001J2"),
             "review-status storage predicate must query the authoritative MR thread schema"
         );
+        for evidence in [
+            "implementation_report",
+            "implementation_report_after_rescope",
+        ] {
+            authority
+                .query_tickets(TicketQueryRequest {
+                    evidence: vec![evidence.to_string()],
+                    limit: Some(10),
+                    ..TicketQueryRequest::default()
+                })
+                .unwrap_or_else(|error| panic!("accepted evidence filter {evidence}: {error}"));
+        }
+        for attention in ["implementation_report_not_closed", "report_after_rescope"] {
+            authority
+                .query_tickets(TicketQueryRequest {
+                    attention: vec![attention.to_string()],
+                    limit: Some(10),
+                    ..TicketQueryRequest::default()
+                })
+                .unwrap_or_else(|error| panic!("accepted attention filter {attention}: {error}"));
+        }
+        authority
+            .query_tickets(TicketQueryRequest {
+                review_status: Some("changes_requested".to_string()),
+                limit: Some(10),
+                ..TicketQueryRequest::default()
+            })
+            .expect("accepted review-status alias must execute");
         let historical_event_query = authority
             .query_tickets(TicketQueryRequest {
                 query: Some("Historical event marker".to_string()),
