@@ -402,11 +402,27 @@ impl SqliteWorkspaceAuthority {
             JOIN merge_requests request ON request.workspace_id=relation.workspace_id AND request.merge_request_id=relation.merge_request_id
             WHERE relation.workspace_id=t.workspace_id AND relation.ticket_id=t.ticket_id
             ORDER BY CASE WHEN request.state='open' THEN 0 ELSE 1 END, request.created_at DESC LIMIT 1)";
-        let review_decision = format!("(SELECT json_extract(event.payload_json,'$.decision') FROM merge_request_events event
-            WHERE event.workspace_id=t.workspace_id AND event.merge_request_id={merge_request_id} AND event.kind='review'
-              AND json_extract(event.payload_json,'$.subject_ref')=(SELECT selector_from FROM merge_requests request WHERE request.workspace_id=t.workspace_id AND request.merge_request_id={merge_request_id})
-              AND NOT EXISTS (SELECT 1 FROM merge_request_events revoked WHERE revoked.workspace_id=event.workspace_id AND revoked.merge_request_id=event.merge_request_id AND revoked.kind='review_revoked' AND json_extract(revoked.payload_json,'$.review_event_id')=event.event_id)
-            ORDER BY event.sequence DESC LIMIT 1)");
+        let review_subject = format!(
+            "(SELECT json_extract(requested.payload_json,'$.subject_ref')
+            FROM merge_request_thread_events requested
+            WHERE requested.workspace_id=t.workspace_id
+              AND requested.merge_request_id={merge_request_id}
+              AND requested.kind='review_requested'
+            ORDER BY requested.sequence DESC LIMIT 1)"
+        );
+        let review_decision = format!(
+            "(SELECT json_extract(event.payload_json,'$.decision')
+            FROM merge_request_thread_events event
+            WHERE event.workspace_id=t.workspace_id
+              AND event.merge_request_id={merge_request_id} AND event.kind='review'
+              AND json_extract(event.payload_json,'$.subject_ref')={review_subject}
+              AND NOT EXISTS (SELECT 1 FROM merge_request_thread_events revoked
+                WHERE revoked.workspace_id=event.workspace_id
+                  AND revoked.merge_request_id=event.merge_request_id
+                  AND revoked.kind='review_revoked'
+                  AND json_extract(revoked.payload_json,'$.review_event_id')=event.event_id)
+            ORDER BY event.sequence DESC LIMIT 1)"
+        );
         let review_status = format!(
             "CASE WHEN {merge_request_id} IS NULL THEN 'none' WHEN {review_decision}='approve' THEN 'approved' WHEN {review_decision}='request_changes' THEN 'request_changes' ELSE 'pending' END"
         );
@@ -2545,6 +2561,21 @@ mod tests {
                 .contains(&"body".to_string())
         );
         assert_eq!(ticket_query.page.limit, 1);
+        let no_review = authority
+            .query_tickets(TicketQueryRequest {
+                review_status: Some("none".to_string()),
+                sort: Some("updated_desc".to_string()),
+                limit: Some(10),
+                ..TicketQueryRequest::default()
+            })
+            .unwrap();
+        assert!(
+            no_review
+                .items
+                .iter()
+                .any(|item| item.id == "00000000001J2"),
+            "review-status storage predicate must query the authoritative MR thread schema"
+        );
         let historical_event_query = authority
             .query_tickets(TicketQueryRequest {
                 query: Some("Historical event marker".to_string()),
