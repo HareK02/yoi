@@ -69,7 +69,7 @@ pub const TICKET_ORCHESTRATION_TOOL_NAMES: [&str; 5] = [
 pub const TICKET_ORCHESTRATION_READ_ONLY_TOOL_NAMES: [&str; 2] =
     ["TicketRelationQuery", "TicketOrchestrationPlanQuery"];
 
-pub const TICKET_TOOL_NAMES: [&str; 19] = [
+pub const TICKET_TOOL_NAMES: [&str; 20] = [
     "TicketCreate",
     "TicketEditItem",
     "QueryTicket",
@@ -79,6 +79,7 @@ pub const TICKET_TOOL_NAMES: [&str; 19] = [
     "TicketDecision",
     "TicketImplementationReport",
     "TicketMarkReady",
+    "TicketIntakeReady",
     "TicketQueue",
     "TicketWorkflowState",
     "TicketClose",
@@ -100,7 +101,7 @@ pub const TICKET_READ_ONLY_TOOL_NAMES: [&str; 6] = [
     "TicketOrchestrationPlanQuery",
 ];
 
-pub const TICKET_MUTATING_TOOL_NAMES: [&str; 13] = [
+pub const TICKET_MUTATING_TOOL_NAMES: [&str; 14] = [
     "TicketCreate",
     "TicketEditItem",
     "TicketComment",
@@ -108,6 +109,7 @@ pub const TICKET_MUTATING_TOOL_NAMES: [&str; 13] = [
     "TicketDecision",
     "TicketImplementationReport",
     "TicketMarkReady",
+    "TicketIntakeReady",
     "TicketQueue",
     "TicketWorkflowState",
     "TicketClose",
@@ -136,6 +138,9 @@ const IMPLEMENTATION_REPORT_DESCRIPTION: &str =
 const MARK_READY_DESCRIPTION: &str = "Mark a planning Ticket ready through the typed Ticket backend. \
 The backend atomically validates and normalizes the persisted repository/ref target, records one typed \
 state_changed event, and transitions planning -> ready. `reason` is optional.";
+const INTAKE_READY_DESCRIPTION: &str = "Record a bounded intake summary and mark a planning Ticket ready. \
+The backend applies the same target validation and lock as TicketMarkReady and commits the summary, \
+state_changed event, effective target, and planning -> ready transition atomically.";
 const QUEUE_DESCRIPTION: &str = "Queue a ready Ticket for Orchestrator routing through the typed \
 Ticket backend. The backend performs the gated ready -> queued transition, records queued_by/queued_at, \
 and rejects unresolved blocking relations.";
@@ -176,6 +181,7 @@ fn base_tool_description(name: &str) -> &'static str {
         "TicketDecision" => DECISION_DESCRIPTION,
         "TicketImplementationReport" => IMPLEMENTATION_REPORT_DESCRIPTION,
         "TicketMarkReady" => MARK_READY_DESCRIPTION,
+        "TicketIntakeReady" => INTAKE_READY_DESCRIPTION,
         "TicketQueue" => QUEUE_DESCRIPTION,
         "TicketWorkflowState" => WORKFLOW_STATE_DESCRIPTION,
         "TicketClose" => CLOSE_DESCRIPTION,
@@ -564,6 +570,17 @@ struct TicketMarkReadyParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct TicketIntakeReadyParams {
+    /// Ticket id.
+    ticket: String,
+    /// Concise bounded intake summary appended before the ready transition.
+    intake_summary: String,
+    /// Optional reason attached to the state_changed event.
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketQueueParams {
     /// Ticket id.
     ticket: String,
@@ -829,6 +846,11 @@ struct TicketImplementationReportTool {
 
 #[derive(Clone)]
 struct TicketMarkReadyTool {
+    backend: TicketToolBackend,
+}
+
+#[derive(Clone)]
+struct TicketIntakeReadyTool {
     backend: TicketToolBackend,
 }
 
@@ -1138,11 +1160,45 @@ impl Tool for TicketMarkReadyTool {
                     operation_key: format!("ticket-mark-ready:{}", ctx.call_id),
                     reason: params.reason,
                     author: None,
+                    intake_summary: None,
                 },
             )
             .map_err(|error| backend_error("TicketMarkReady", error))?;
         Ok(json_output(
             format!("Marked ticket {} state ready", params.ticket),
+            json!({
+                "ticket": ticket.meta.id,
+                "state": ticket.meta.workflow_state.as_str(),
+                "repository_id": ticket.meta.repository_id,
+                "ref_selector": ticket.meta.ref_selector,
+                "ok": true
+            }),
+        ))
+    }
+}
+
+#[async_trait]
+impl Tool for TicketIntakeReadyTool {
+    async fn execute(
+        &self,
+        input_json: &str,
+        ctx: llm_engine::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let params: TicketIntakeReadyParams = parse_input("TicketIntakeReady", input_json)?;
+        let ticket = self
+            .backend
+            .mark_ready(
+                TicketIdOrSlug::Query(params.ticket.clone()),
+                TicketMarkReady {
+                    operation_key: format!("ticket-intake-ready:{}", ctx.call_id),
+                    reason: params.reason,
+                    author: None,
+                    intake_summary: Some(TicketIntakeSummary::new(params.intake_summary)),
+                },
+            )
+            .map_err(|error| backend_error("TicketIntakeReady", error))?;
+        Ok(json_output(
+            format!("Marked ticket {} state ready after intake", params.ticket),
             json!({
                 "ticket": ticket.meta.id,
                 "state": ticket.meta.workflow_state.as_str(),
@@ -1728,6 +1784,7 @@ fn input_schema(name: &str) -> Value {
             serde_json::to_value(schemars::schema_for!(TicketThreadEventParams))
         }
         "TicketMarkReady" => serde_json::to_value(schemars::schema_for!(TicketMarkReadyParams)),
+        "TicketIntakeReady" => serde_json::to_value(schemars::schema_for!(TicketIntakeReadyParams)),
         "TicketQueue" => serde_json::to_value(schemars::schema_for!(TicketQueueParams)),
         "TicketWorkflowState" => {
             serde_json::to_value(schemars::schema_for!(TicketWorkflowStateParams))
@@ -1776,6 +1833,7 @@ impl_from_backend!(TicketPlanTool);
 impl_from_backend!(TicketDecisionTool);
 impl_from_backend!(TicketImplementationReportTool);
 impl_from_backend!(TicketMarkReadyTool);
+impl_from_backend!(TicketIntakeReadyTool);
 impl_from_backend!(TicketQueueTool);
 impl_from_backend!(TicketWorkflowStateTool);
 impl_from_backend!(TicketCloseTool);
@@ -1803,6 +1861,7 @@ pub fn ticket_tools(backend: impl Into<TicketToolBackend>) -> Vec<ToolDefinition
             backend.clone(),
         ),
         tool_definition::<TicketMarkReadyTool>("TicketMarkReady", backend.clone()),
+        tool_definition::<TicketIntakeReadyTool>("TicketIntakeReady", backend.clone()),
         tool_definition::<TicketQueueTool>("TicketQueue", backend.clone()),
         tool_definition::<TicketWorkflowStateTool>("TicketWorkflowState", backend.clone()),
         tool_definition::<TicketCloseTool>("TicketClose", backend.clone()),
@@ -1897,6 +1956,7 @@ mod tests {
                 "TicketDecision",
                 "TicketImplementationReport",
                 "TicketMarkReady",
+                "TicketIntakeReady",
                 "TicketQueue",
                 "TicketWorkflowState",
                 "TicketClose",
@@ -2555,6 +2615,38 @@ mod tests {
                 (Some("queued"), Some("inprogress")),
                 (Some("inprogress"), Some("done"))
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ticket_intake_ready_records_summary_with_validated_target() {
+        let temp = TempDir::new().unwrap();
+        let backend = backend(&temp);
+        let mut input = NewTicket::new("Intake Workflow");
+        input.repository_id = Some("main".to_owned());
+        let created = backend.create(input).unwrap();
+        tool_by_name(backend.clone(), "TicketIntakeReady")
+            .execute(
+                &json!({
+                    "ticket": created.id.clone(),
+                    "intake_summary": "Requirements and target are accepted.",
+                    "reason": "intake_complete"
+                })
+                .to_string(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let record = backend.show(TicketIdOrSlug::Id(created.id)).unwrap();
+        assert_eq!(record.meta.workflow_state, TicketWorkflowState::Ready);
+        assert_eq!(record.meta.ref_selector.as_deref(), Some("develop"));
+        assert_eq!(
+            record
+                .events
+                .iter()
+                .filter(|event| event.kind == TicketEventKind::IntakeSummary)
+                .count(),
+            1
         );
     }
 

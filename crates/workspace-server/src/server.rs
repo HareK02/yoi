@@ -3312,6 +3312,7 @@ async fn scoped_mark_ticket_ready_from_browser(
                 operation_key: request.operation_key,
                 reason: request.reason,
                 author: Some("web".to_owned()),
+                intake_summary: None,
             },
         )
         .map_err(Error::from)?;
@@ -3660,6 +3661,8 @@ struct TicketMarkReadyRequest {
     operation_key: String,
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default)]
+    intake_summary: Option<ticket::TicketIntakeSummary>,
 }
 
 async fn scoped_set_ticket_state_field(
@@ -3717,6 +3720,7 @@ async fn scoped_mark_ticket_ready(
                 operation_key: request.operation_key,
                 reason: request.reason,
                 author: None,
+                intake_summary: request.intake_summary,
             },
         },
     )
@@ -4538,7 +4542,12 @@ fn bind_worker_ticket_operation_source(
         | TicketBackendOperation::SetStateField { change, .. }
         | TicketBackendOperation::SetWorkflowState { change, .. } => change.author = Some(author),
         TicketBackendOperation::AddIntakeSummary { summary, .. } => summary.author = Some(author),
-        TicketBackendOperation::MarkReady { request, .. } => request.author = Some(author),
+        TicketBackendOperation::MarkReady { request, .. } => {
+            request.author = Some(author.clone());
+            if let Some(summary) = request.intake_summary.as_mut() {
+                summary.author = Some(author);
+            }
+        }
         TicketBackendOperation::QueueReady { queued_by, .. } => *queued_by = author,
         TicketBackendOperation::AddTicketRelation { relation, .. } => {
             relation.author = Some(author)
@@ -13896,6 +13905,7 @@ mod tests {
             operation_key: "ready-server-test".to_owned(),
             reason: Some("target accepted".to_owned()),
             author: Some("test".to_owned()),
+            intake_summary: None,
         };
         let ready = backend
             .mark_ready(TicketIdOrSlug::Id(ticket_ref.id.clone()), request.clone())
@@ -13940,6 +13950,7 @@ mod tests {
                     operation_key: "missing-repository".to_owned(),
                     reason: None,
                     author: None,
+                    intake_summary: None,
                 },
             ),
             Err(ticket::TicketError::UnknownTargetRepository(_))
@@ -14072,6 +14083,7 @@ mod tests {
                     operation_key: "notification-ready".to_owned(),
                     reason: Some("ready for implementation".to_owned()),
                     author: None,
+                    intake_summary: None,
                 },
             },
             TicketBackendOperation::QueueReady {
@@ -14988,6 +15000,7 @@ mod tests {
             Json(TicketMarkReadyRequest {
                 operation_key: "browser-ready".to_owned(),
                 reason: Some("intake complete".to_owned()),
+                intake_summary: None,
             }),
         )
         .await

@@ -529,6 +529,8 @@ pub struct TicketMarkReady {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intake_summary: Option<TicketIntakeSummary>,
 }
 
 impl TicketTargetEdit {
@@ -589,6 +591,16 @@ fn mark_ready_fingerprint(
     digest.update(b"\0");
     if let Some(reason) = request.reason.as_deref() {
         digest.update(reason.as_bytes());
+    }
+    if let Some(summary) = request.intake_summary.as_ref() {
+        digest.update(b"\0intake-summary\0");
+        digest.update(summary.body.as_str().as_bytes());
+        for reference in &summary.references {
+            digest.update(b"\0");
+            digest.update(reference.kind.as_bytes());
+            digest.update(b":");
+            digest.update(reference.target.as_bytes());
+        }
     }
     digest
         .finalize()
@@ -3598,6 +3610,28 @@ impl TicketBackend for SqliteTicketBackend {
                 .unwrap_or("implementation target validated")
                 .to_owned();
             let at = now_utc();
+            if let Some(mut summary) = request.intake_summary.clone() {
+                validate_intake_summary(&summary)?;
+                summary.author = request.author.clone().or(summary.author);
+                self.insert_event(
+                    conn,
+                    &ticket_id,
+                    &TicketEvent {
+                        kind: TicketEventKind::IntakeSummary,
+                        author: summary.author,
+                        at: None,
+                        status: None,
+                        from: None,
+                        to: None,
+                        reason: None,
+                        state_field: None,
+                        heading: Some(TicketEventKind::IntakeSummary.heading()),
+                        body: summary.body,
+                        references: summary.references,
+                        attributes: BTreeMap::new(),
+                    },
+                )?;
+            }
             self.insert_event(
                 conn,
                 &ticket_id,
@@ -4252,7 +4286,11 @@ impl TicketBackend for LocalTicketBackend {
                 target.repository_id, target.ref_selector
             )),
         );
-        change.author = request.author.or_else(|| Some(default_author()));
+        change.author = request.author.clone().or_else(|| Some(default_author()));
+        if let Some(mut summary) = request.intake_summary {
+            summary.author = request.author.clone().or(summary.author);
+            self.append_intake_summary_event(&dir, &summary)?;
+        }
         self.append_state_changed_event_with_attributes(
             &dir,
             &change,
@@ -6960,6 +6998,7 @@ state: planning
             operation_key: "sqlite-ready".to_owned(),
             reason: Some("target accepted".to_owned()),
             author: Some("test".to_owned()),
+            intake_summary: None,
         };
         let ready = backend
             .mark_ready(
@@ -7377,6 +7416,7 @@ state: planning
                     operation_key: "test-flow-ready".to_owned(),
                     reason: Some("ready_for_queue".to_owned()),
                     author: Some("test".to_owned()),
+                    intake_summary: None,
                 },
             )
             .unwrap();
@@ -7648,6 +7688,7 @@ state: planning
             operation_key: "ready-op-1".to_owned(),
             reason: Some("accepted".to_owned()),
             author: Some("intake".to_owned()),
+            intake_summary: None,
         };
 
         let first = backend
@@ -7679,6 +7720,7 @@ state: planning
                     operation_key: "ready-op-1".to_owned(),
                     reason: Some("different".to_owned()),
                     author: Some("intake".to_owned()),
+                    intake_summary: None,
                 },
             ),
             Err(TicketError::OperationFingerprintMismatch { .. })

@@ -9,7 +9,7 @@ use ticket::config::TicketRole;
 
 use crate::hook::{Hook, HookPostToolAction, PostToolCall, ToolResultSummary};
 
-const TICKET_MARK_READY_TOOL_NAME: &str = "TicketMarkReady";
+const TICKET_INTAKE_READY_TOOL_NAME: &str = "TicketIntakeReady";
 
 #[derive(Clone, Default)]
 pub(crate) struct ShutdownAfterIdleRequest {
@@ -42,12 +42,12 @@ pub(crate) fn take_shutdown_request_after_status(
     status == WorkerStatus::Idle && shutdown_after_idle.take()
 }
 
-pub(crate) struct TicketMarkReadyShutdownHook {
+pub(crate) struct TicketIntakeReadyShutdownHook {
     shutdown_after_idle: ShutdownAfterIdleRequest,
     eligible_ticket_intake_role: bool,
 }
 
-impl TicketMarkReadyShutdownHook {
+impl TicketIntakeReadyShutdownHook {
     pub(crate) fn new(
         shutdown_after_idle: ShutdownAfterIdleRequest,
         eligible_ticket_intake_role: bool,
@@ -60,7 +60,7 @@ impl TicketMarkReadyShutdownHook {
 
     fn observe_tool_result(&self, info: &ToolResultSummary) {
         if self.eligible_ticket_intake_role
-            && info.tool_name == TICKET_MARK_READY_TOOL_NAME
+            && info.tool_name == TICKET_INTAKE_READY_TOOL_NAME
             && !info.is_error
         {
             self.shutdown_after_idle.request();
@@ -69,7 +69,7 @@ impl TicketMarkReadyShutdownHook {
 }
 
 #[async_trait]
-impl Hook<PostToolCall> for TicketMarkReadyShutdownHook {
+impl Hook<PostToolCall> for TicketIntakeReadyShutdownHook {
     async fn call(&self, info: &ToolResultSummary) -> HookPostToolAction {
         self.observe_tool_result(info);
         HookPostToolAction::Continue
@@ -98,9 +98,9 @@ mod tests {
     #[test]
     fn successful_ticket_intake_ready_schedules_shutdown_after_idle_for_intake_role() {
         let request = ShutdownAfterIdleRequest::default();
-        let hook = TicketMarkReadyShutdownHook::new(request.clone(), true);
+        let hook = TicketIntakeReadyShutdownHook::new(request.clone(), true);
 
-        hook.observe_tool_result(&tool_result(TICKET_MARK_READY_TOOL_NAME, false));
+        hook.observe_tool_result(&tool_result(TICKET_INTAKE_READY_TOOL_NAME, false));
 
         assert!(request.is_requested());
         assert!(request.take());
@@ -110,9 +110,9 @@ mod tests {
     #[test]
     fn failed_ticket_intake_ready_does_not_schedule_shutdown_after_idle() {
         let request = ShutdownAfterIdleRequest::default();
-        let hook = TicketMarkReadyShutdownHook::new(request.clone(), true);
+        let hook = TicketIntakeReadyShutdownHook::new(request.clone(), true);
 
-        hook.observe_tool_result(&tool_result(TICKET_MARK_READY_TOOL_NAME, true));
+        hook.observe_tool_result(&tool_result(TICKET_INTAKE_READY_TOOL_NAME, true));
 
         assert!(!request.is_requested());
     }
@@ -120,9 +120,9 @@ mod tests {
     #[test]
     fn non_intake_role_does_not_schedule_shutdown_after_idle() {
         let request = ShutdownAfterIdleRequest::default();
-        let hook = TicketMarkReadyShutdownHook::new(request.clone(), false);
+        let hook = TicketIntakeReadyShutdownHook::new(request.clone(), false);
 
-        hook.observe_tool_result(&tool_result(TICKET_MARK_READY_TOOL_NAME, false));
+        hook.observe_tool_result(&tool_result(TICKET_INTAKE_READY_TOOL_NAME, false));
 
         assert!(!request.is_requested());
     }
@@ -130,7 +130,7 @@ mod tests {
     #[test]
     fn other_successful_tools_do_not_schedule_shutdown_after_idle() {
         let request = ShutdownAfterIdleRequest::default();
-        let hook = TicketMarkReadyShutdownHook::new(request.clone(), true);
+        let hook = TicketIntakeReadyShutdownHook::new(request.clone(), true);
 
         hook.observe_tool_result(&tool_result("ShowTicket", false));
 

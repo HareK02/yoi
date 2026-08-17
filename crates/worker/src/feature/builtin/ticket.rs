@@ -381,6 +381,8 @@ const READ_ONLY_TOOL_NAMES: &[&str] = &["QueryTicket", "ShowTicket"];
 const AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketCreate",
     "TicketEditItem",
+    "TicketMarkReady",
+    "TicketQueue",
     "TicketClose",
     "TicketRelationRecord",
     "TicketRelationRemove",
@@ -388,7 +390,7 @@ const AUTHORING_TOOL_NAMES: &[&str] = &[
 
 const THREAD_TOOL_NAMES: &[&str] = &["TicketComment"];
 
-const INTAKE_TOOL_NAMES: &[&str] = &["TicketMarkReady"];
+const INTAKE_TOOL_NAMES: &[&str] = &["TicketIntakeReady"];
 
 #[cfg(test)]
 const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
@@ -397,6 +399,8 @@ const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
     "QueryTicket",
     "ShowTicket",
     "TicketComment",
+    "TicketMarkReady",
+    "TicketQueue",
     "TicketClose",
     "TicketRelationRecord",
     "TicketRelationRemove",
@@ -407,7 +411,6 @@ const WORKFLOW_TOOL_NAMES: &[&str] = &[
     "QueryTicket",
     "ShowTicket",
     "TicketComment",
-    "TicketQueue",
     "TicketWorkflowState",
     "TicketClose",
     "TicketDependencyCheck",
@@ -418,7 +421,6 @@ const WORKFLOW_TOOL_NAMES: &[&str] = &[
 ];
 
 const WORKFLOW_ADDITIONAL_TOOL_NAMES: &[&str] = &[
-    "TicketQueue",
     "TicketWorkflowState",
     "TicketClose",
     "TicketDependencyCheck",
@@ -1295,13 +1297,13 @@ mod tests {
         assert_eq!(show.name, "ShowTicket");
         assert!(show.input_schema["properties"]["event_limit"].is_object());
         let tool_names = TicketFeatureAccess::workspace_authoring().tool_names();
-        assert_eq!(tool_names.len(), 8);
+        assert_eq!(tool_names.len(), 10);
         assert!(
             tool_names.len() < 13,
             "authoring catalog must stay below the prior broad catalog"
         );
         let workflow_names = TicketFeatureAccess::workflow().tool_names();
-        assert_eq!(workflow_names.len(), 11);
+        assert_eq!(workflow_names.len(), 10);
         assert!(
             workflow_names.len() < 12,
             "workflow catalog must stay below the prior broad catalog"
@@ -1382,7 +1384,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(workspace_tools.contains(&"TicketCreate"));
         assert!(workspace_tools.contains(&"TicketEditItem"));
-        assert!(!workspace_tools.contains(&"TicketQueue"));
+        assert!(workspace_tools.contains(&"TicketQueue"));
         assert!(!workspace_tools.contains(&"TicketWorkflowState"));
 
         let orchestration =
@@ -1398,7 +1400,7 @@ mod tests {
         assert!(orchestration_tools.contains(&"TicketRelationRecord"));
         assert!(orchestration_tools.contains(&"TicketOrchestrationPlanRecord"));
         assert!(!orchestration_tools.contains(&"TicketEditItem"));
-        assert!(orchestration_tools.contains(&"TicketQueue"));
+        assert!(!orchestration_tools.contains(&"TicketQueue"));
 
         let work_report =
             ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::work_report());
@@ -1511,8 +1513,9 @@ language = "Japanese"
         assert_eq!(installed, WORKSPACE_AUTHORING_TOOL_NAMES);
         assert!(installed.iter().any(|tool| *tool == "TicketCreate"));
         assert!(installed.iter().any(|tool| *tool == "TicketEditItem"));
-        assert!(!installed.iter().any(|tool| *tool == "TicketQueue"));
-        assert!(!installed.iter().any(|tool| *tool == "TicketMarkReady"));
+        assert!(installed.iter().any(|tool| *tool == "TicketQueue"));
+        assert!(installed.iter().any(|tool| *tool == "TicketMarkReady"));
+        assert!(!installed.iter().any(|tool| *tool == "TicketIntakeReady"));
         assert!(!installed.iter().any(|tool| *tool == "TicketWorkflowState"));
         assert!(
             !installed
