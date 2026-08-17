@@ -191,6 +191,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create Worker control delegation operation authority",
         apply: create_worker_control_delegation_operation_authority,
     },
+    Migration {
+        version: 35,
+        name: "remove Worker control delegation authority",
+        apply: remove_worker_control_delegation_authority,
+    },
 ];
 
 struct Migration {
@@ -350,18 +355,6 @@ pub struct WorkerControlGrantRecord {
     pub operation_id: String,
     pub created_at: String,
     pub revoked_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorkerControlDelegationOperationRecord {
-    pub workspace_id: String,
-    pub source_controller: RuntimeWorkerRef,
-    pub source_grant_id: String,
-    pub operation_id: String,
-    pub input_fingerprint: String,
-    pub delegated_grant_id: Option<String>,
-    pub created_at: String,
-    pub completed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -810,19 +803,6 @@ pub trait ControlPlaneStore: Send + Sync {
         grant_id: &str,
         revoked_at: &str,
     ) -> Result<bool>;
-    fn reserve_worker_control_delegation_operation(
-        &self,
-        record: &WorkerControlDelegationOperationRecord,
-    ) -> Result<WorkerControlDelegationOperationRecord>;
-    fn complete_worker_control_delegation_operation(
-        &self,
-        workspace_id: &str,
-        source_controller: &RuntimeWorkerRef,
-        operation_id: &str,
-        delegated_grant_id: &str,
-        completed_at: &str,
-    ) -> Result<WorkerControlDelegationOperationRecord>;
-
     fn get_ticket_assignment_operation(
         &self,
         workspace_id: &str,
@@ -2611,95 +2591,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
-    fn reserve_worker_control_delegation_operation(
-        &self,
-        record: &WorkerControlDelegationOperationRecord,
-    ) -> Result<WorkerControlDelegationOperationRecord> {
-        self.with_conn(|conn| {
-            conn.execute(
-                r#"INSERT INTO worker_control_delegation_operations (
-                    workspace_id, source_controller_runtime_id, source_controller_worker_id,
-                    source_grant_id, operation_id, input_fingerprint,
-                    delegated_grant_id, created_at, completed_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                ON CONFLICT (
-                    workspace_id, source_controller_runtime_id,
-                    source_controller_worker_id, operation_id
-                ) DO NOTHING"#,
-                params![
-                    record.workspace_id,
-                    record.source_controller.runtime_id,
-                    record.source_controller.worker_id,
-                    record.source_grant_id,
-                    record.operation_id,
-                    record.input_fingerprint,
-                    record.delegated_grant_id,
-                    record.created_at,
-                    record.completed_at,
-                ],
-            )?;
-            let persisted = read_worker_control_delegation_operation_by_key(
-                conn,
-                &record.workspace_id,
-                &record.source_controller,
-                &record.operation_id,
-            )?
-            .ok_or_else(|| {
-                Error::Store("worker control delegation operation was not persisted".to_string())
-            })?;
-            if persisted.source_grant_id != record.source_grant_id
-                || persisted.input_fingerprint != record.input_fingerprint
-            {
-                return Err(Error::InvalidInput(format!(
-                    "worker control delegation operation `{}` was already used with different input",
-                    record.operation_id
-                )));
-            }
-            Ok(persisted)
-        })
-    }
-
-    fn complete_worker_control_delegation_operation(
-        &self,
-        workspace_id: &str,
-        source_controller: &RuntimeWorkerRef,
-        operation_id: &str,
-        delegated_grant_id: &str,
-        completed_at: &str,
-    ) -> Result<WorkerControlDelegationOperationRecord> {
-        self.with_conn(|conn| {
-            conn.execute(
-                r#"UPDATE worker_control_delegation_operations
-                   SET delegated_grant_id = ?5, completed_at = ?6
-                   WHERE workspace_id = ?1
-                     AND source_controller_runtime_id = ?2
-                     AND source_controller_worker_id = ?3
-                     AND operation_id = ?4
-                     AND (delegated_grant_id IS NULL OR delegated_grant_id = ?5)"#,
-                params![
-                    workspace_id,
-                    source_controller.runtime_id,
-                    source_controller.worker_id,
-                    operation_id,
-                    delegated_grant_id,
-                    completed_at,
-                ],
-            )?;
-            read_worker_control_delegation_operation_by_key(
-                conn,
-                workspace_id,
-                source_controller,
-                operation_id,
-            )?
-            .filter(|record| record.delegated_grant_id.as_deref() == Some(delegated_grant_id))
-            .ok_or_else(|| {
-                Error::InvalidInput(format!(
-                    "worker control delegation operation `{operation_id}` completed with a different grant"
-                ))
-            })
-        })
-    }
-
     fn get_ticket_assignment_operation(
         &self,
         workspace_id: &str,
@@ -4057,52 +3948,6 @@ fn read_worker_control_grant_by_operation(
     .map_err(Error::from)
 }
 
-fn read_worker_control_delegation_operation_record(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<WorkerControlDelegationOperationRecord> {
-    Ok(WorkerControlDelegationOperationRecord {
-        workspace_id: row.get(0)?,
-        source_controller: RuntimeWorkerRef::new(
-            row.get::<_, String>(1)?,
-            row.get::<_, u64>(2)?.to_string(),
-        ),
-        source_grant_id: row.get(3)?,
-        operation_id: row.get(4)?,
-        input_fingerprint: row.get(5)?,
-        delegated_grant_id: row.get(6)?,
-        created_at: row.get(7)?,
-        completed_at: row.get(8)?,
-    })
-}
-
-fn read_worker_control_delegation_operation_by_key(
-    conn: &Connection,
-    workspace_id: &str,
-    source_controller: &RuntimeWorkerRef,
-    operation_id: &str,
-) -> Result<Option<WorkerControlDelegationOperationRecord>> {
-    conn.query_row(
-        r#"SELECT workspace_id,
-                  source_controller_runtime_id, source_controller_worker_id,
-                  source_grant_id, operation_id, input_fingerprint,
-                  delegated_grant_id, created_at, completed_at
-           FROM worker_control_delegation_operations
-           WHERE workspace_id = ?1
-             AND source_controller_runtime_id = ?2
-             AND source_controller_worker_id = ?3
-             AND operation_id = ?4"#,
-        params![
-            workspace_id,
-            source_controller.runtime_id,
-            source_controller.worker_id,
-            operation_id,
-        ],
-        read_worker_control_delegation_operation_record,
-    )
-    .optional()
-    .map_err(Error::from)
-}
-
 fn current_ticket_worker_assignment_select_sql() -> String {
     "SELECT a.workspace_id, a.ticket_id, a.assignment_id, a.runtime_id, a.worker_id, \
             a.assigned_by, a.assigned_at \
@@ -5201,6 +5046,58 @@ fn create_worker_control_delegation_operation_authority(conn: &Connection) -> Re
     Ok(())
 }
 
+fn remove_worker_control_delegation_authority(conn: &Connection) -> Result<()> {
+    let mut statement =
+        conn.prepare("SELECT workspace_id, grant_id, permissions_json FROM worker_control_grants")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut permission_updates = Vec::new();
+    for row in rows {
+        let (workspace_id, grant_id, permissions_json) = row?;
+        let mut permissions: Vec<String> =
+            serde_json::from_str(&permissions_json).map_err(|error| {
+                Error::Store(format!(
+                    "failed to decode Worker control grant `{grant_id}` permissions during delegation removal: {error}"
+                ))
+            })?;
+        let previous_len = permissions.len();
+        permissions
+            .retain(|permission| !matches!(permission.as_str(), "share" | "transfer" | "revoke"));
+        if permissions.len() != previous_len {
+            permission_updates.push((
+                workspace_id,
+                grant_id,
+                serde_json::to_string(&permissions).map_err(|error| {
+                    Error::Store(format!(
+                        "failed to encode Worker control grant permissions during delegation removal: {error}"
+                    ))
+                })?,
+            ));
+        }
+    }
+    drop(statement);
+
+    for (workspace_id, grant_id, permissions_json) in permission_updates {
+        conn.execute(
+            "UPDATE worker_control_grants SET permissions_json = ?3 WHERE workspace_id = ?1 AND grant_id = ?2",
+            params![workspace_id, grant_id, permissions_json],
+        )?;
+    }
+    conn.execute(
+        r#"UPDATE worker_control_grants
+           SET revoked_at = COALESCE(revoked_at, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+           WHERE relation IN ('shared', 'transferred')"#,
+        [],
+    )?;
+    conn.execute_batch("DROP TABLE IF EXISTS worker_control_delegation_operations;")?;
+    Ok(())
+}
+
 fn create_worker_mutation_source_proof_replay_guard(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -5853,6 +5750,82 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
     }
 
     #[test]
+    fn schema_v35_removes_worker_control_delegation_authority() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_sqlite(&conn).unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 34)
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            (migration.apply)(&tx).unwrap();
+            tx.execute(
+                "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+                params![migration.version, migration.name],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        conn.execute_batch(
+            r#"
+INSERT INTO workspaces (
+    workspace_id, display_name, state, created_at, updated_at
+) VALUES ('workspace-a', 'Workspace A', 'active', '1', '1');
+INSERT INTO worker_registry (
+    workspace_id, runtime_id, runtime_worker_id, display_name,
+    retention_state, created_at, updated_at
+) VALUES
+    ('workspace-a', 'runtime-a', 1, 'Controller', 'normal', '1', '1'),
+    ('workspace-a', 'runtime-a', 2, 'Spawned Worker', 'normal', '1', '1'),
+    ('workspace-a', 'runtime-a', 3, 'Shared Worker', 'normal', '1', '1'),
+    ('workspace-a', 'runtime-a', 4, 'Transferred Worker', 'normal', '1', '1');
+INSERT INTO worker_control_grants (
+    workspace_id, grant_id,
+    controller_runtime_id, controller_worker_id,
+    subject_runtime_id, subject_worker_id,
+    relation, origin, permissions_json, operation_id, created_at, revoked_at
+) VALUES
+    ('workspace-a', 'spawned', 'runtime-a', 1, 'runtime-a', 2,
+     'spawned', 'spawn', '["observe","share","transfer","revoke","stop"]', 'spawn-op', '1', NULL),
+    ('workspace-a', 'shared', 'runtime-a', 1, 'runtime-a', 3,
+     'shared', 'share', '["observe"]', 'share-op', '1', NULL),
+    ('workspace-a', 'transferred', 'runtime-a', 1, 'runtime-a', 4,
+     'transferred', 'transfer', '["observe"]', 'transfer-op', '1', NULL);
+"#,
+        )
+        .unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 34);
+        assert!(table_exists(&conn, "worker_control_delegation_operations").unwrap());
+
+        apply_migrations(&conn).unwrap();
+
+        assert_eq!(current_schema_version(&conn).unwrap(), 35);
+        assert!(!table_exists(&conn, "worker_control_delegation_operations").unwrap());
+        let (permissions_json, revoked_at): (String, Option<String>) = conn
+            .query_row(
+                "SELECT permissions_json, revoked_at FROM worker_control_grants WHERE grant_id = 'spawned'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&permissions_json).unwrap(),
+            vec!["observe", "stop"]
+        );
+        assert!(revoked_at.is_none());
+        for grant_id in ["shared", "transferred"] {
+            let revoked_at: Option<String> = conn
+                .query_row(
+                    "SELECT revoked_at FROM worker_control_grants WHERE grant_id = ?1",
+                    [grant_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(revoked_at.is_some(), "{grant_id} grant remained active");
+        }
+    }
+
+    #[test]
     fn schema_v24_adds_attachment_reservations_to_already_applied_v23() {
         let conn = Connection::open_in_memory().unwrap();
         configure_sqlite(&conn).unwrap();
@@ -5874,7 +5847,7 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 34);
+        assert_eq!(current_schema_version(&conn).unwrap(), 35);
         assert!(table_exists(&conn, "worker_workdir_attachment_reservations").unwrap());
     }
 
@@ -5907,7 +5880,7 @@ CREATE TABLE flow_events (event_id TEXT PRIMARY KEY);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 34);
+        assert_eq!(current_schema_version(&conn).unwrap(), 35);
         assert!(table_exists(&conn, "flow_sources").unwrap());
         assert!(table_exists(&conn, "flow_source_revisions").unwrap());
         assert!(!table_exists(&conn, "flow_instances").unwrap());
@@ -5974,7 +5947,7 @@ INSERT INTO worker_workdir_attachment_reservations (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 34);
+        assert_eq!(current_schema_version(&conn).unwrap(), 35);
         let repositories_sql: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'repositories'",
@@ -6154,7 +6127,7 @@ INSERT INTO workdir_registry (
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 34);
+        assert_eq!(store.schema_version().await.unwrap(), 35);
         assert!(
             !store
                 .with_conn(|conn| table_exists(conn, "worker_workspace_credentials"))
@@ -6171,7 +6144,7 @@ INSERT INTO workdir_registry (
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 34);
+        assert_eq!(reopened.schema_version().await.unwrap(), 35);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -6718,7 +6691,7 @@ INSERT INTO workdir_registry (
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 34);
+        assert_eq!(store.schema_version().await.unwrap(), 35);
 
         store
             .with_conn(|conn| {
@@ -6907,7 +6880,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 34);
+        assert_eq!(store.schema_version().await.unwrap(), 35);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -6973,7 +6946,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 34);
+        assert_eq!(store.schema_version().await.unwrap(), 35);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -7234,7 +7207,7 @@ CREATE TABLE ticket_assignment_operations (
     }
 
     #[tokio::test]
-    async fn worker_control_grants_are_idempotent_scoped_and_revocable() {
+    async fn worker_control_grants_are_idempotent_scoped_and_support_internal_invalidation() {
         let dir = tempfile::tempdir().unwrap();
         let database = dir.path().join("control-grants.db");
         let store = SqliteWorkspaceStore::open(&database).unwrap();
@@ -7364,7 +7337,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 34);
+        assert_eq!(store.schema_version().await.unwrap(), 35);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),

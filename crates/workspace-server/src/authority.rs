@@ -1,7 +1,10 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use chrono::Utc;
-use merge_request::{MergeRequest, ReviewStatus, SqliteMergeRequestStore};
+use merge_request::{
+    MergeRequest, MergeRequestError, MergeRequestState, MergeRequestStore, MergeRequestThreadEvent,
+    ReviewDecision,
+};
 use project_record::{allocate_record_id, unix_epoch_millis_now};
 
 use ticket::{
@@ -127,26 +130,74 @@ pub struct MemoryStagingResolution {
 }
 
 #[derive(Clone)]
+struct AuthorityMergeRequestSource {
+    store: SqliteWorkspaceStore,
+}
+
+impl merge_request::AssignmentSource for AuthorityMergeRequestSource {
+    fn current_assignment(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+    ) -> std::result::Result<Option<merge_request::CurrentAssignment>, String> {
+        self.store
+            .get_current_ticket_worker_assignment(workspace_id, ticket_id)
+            .map(|assignment| {
+                assignment.map(|assignment| merge_request::CurrentAssignment {
+                    assignment_id: assignment.assignment_id,
+                    ticket_id: ticket_id.to_string(),
+                    runtime_id: assignment.worker.runtime_id,
+                    worker_id: assignment.worker.worker_id,
+                })
+            })
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl merge_request::RepositorySource for AuthorityMergeRequestSource {
+    fn repository_belongs_to_workspace(
+        &self,
+        workspace_id: &str,
+        repository_id: &str,
+    ) -> std::result::Result<bool, String> {
+        self.store
+            .get_repository(workspace_id, repository_id)
+            .map(|repository| repository.is_some())
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Clone)]
 pub struct SqliteWorkspaceAuthority {
     workspace_id: String,
     store: SqliteWorkspaceStore,
     ticket_backend: SqliteTicketBackend,
-    merge_request_store: SqliteMergeRequestStore,
+    merge_request_store: Arc<MergeRequestStore>,
 }
 
 impl SqliteWorkspaceAuthority {
     pub fn new(database_path: impl Into<PathBuf>, workspace_id: impl Into<String>) -> Result<Self> {
         let database_path = database_path.into();
         let workspace_id = workspace_id.into();
+        let store = SqliteWorkspaceStore::open(&database_path)?;
+        let merge_request_source = Arc::new(AuthorityMergeRequestSource {
+            store: store.clone(),
+        });
         Ok(Self {
             workspace_id: workspace_id.clone(),
-            store: SqliteWorkspaceStore::open(&database_path)?,
+            store,
             ticket_backend: SqliteTicketBackend::open_verified(
                 database_path.clone(),
-                workspace_id.clone(),
+                workspace_id,
             )?,
-            merge_request_store: SqliteMergeRequestStore::open(database_path, workspace_id)
+            merge_request_store: Arc::new(
+                MergeRequestStore::open(
+                    database_path,
+                    merge_request_source.clone(),
+                    merge_request_source,
+                )
                 .map_err(|error| Error::Store(error.to_string()))?,
+            ),
         })
     }
 
@@ -315,11 +366,11 @@ impl SqliteWorkspaceAuthority {
                 runtime_id: assignment.worker.runtime_id,
                 worker_id: assignment.worker.worker_id,
             });
-        let merge_request = self
-            .merge_request_store
-            .show_for_ticket(id)
-            .map_err(|error| Error::Store(error.to_string()))?
-            .map(merge_request_summary);
+        let merge_request = match self.merge_request_store.get(&self.workspace_id, id) {
+            Ok(request) => Some(merge_request_summary(request)),
+            Err(MergeRequestError::NotFound) => None,
+            Err(error) => return Err(Error::Store(error.to_string())),
+        };
         let evidence = ticket_evidence_summary(&ticket.events, merge_request.as_ref());
         let item_revision = ticket
             .events
@@ -973,31 +1024,35 @@ fn ticket_evidence_event(sequence: usize, event: &TicketEvent) -> TicketEvidence
 }
 
 fn merge_request_summary(request: MergeRequest) -> TicketMergeRequestSummary {
-    let review_status = match request.review_status {
-        ReviewStatus::Pending => "pending",
-        ReviewStatus::Approved => "approved",
-        ReviewStatus::ChangesRequested => "changes_requested",
-    };
+    let review_subject_ref = request.thread.iter().rev().find_map(|event| match event {
+        MergeRequestThreadEvent::ReviewRequested(review) => Some(review.subject_ref.as_str()),
+        _ => None,
+    });
+    let current_review =
+        review_subject_ref.and_then(|subject_ref| request.effective_review(subject_ref));
+    let review_status = match current_review.map(|review| &review.decision) {
+        Some(ReviewDecision::Approve) => "approved",
+        Some(ReviewDecision::RequestChanges) => "changes_requested",
+        None => "pending",
+    }
+    .to_string();
+    let state = match request.state {
+        MergeRequestState::Open => "open",
+        MergeRequestState::Merged => "merged",
+        MergeRequestState::Closed => "closed",
+    }
+    .to_string();
+
     TicketMergeRequestSummary {
-        merge_request_id: request.merge_request_id,
-        state: serde_json::to_value(request.state)
-            .ok()
-            .and_then(|value| value.as_str().map(str::to_string))
-            .unwrap_or_else(|| "open".to_string()),
-        review_status: review_status.to_string(),
-        revision_id: request.current_revision.revision_id,
-        base_commit: request.current_revision.base_commit,
-        head_commit: request.current_revision.head_commit,
-        changed_paths: request.current_revision.changed_paths,
-        updated_at: request.updated_at,
-        review_submitted_at: request
-            .current_review
-            .as_ref()
-            .map(|review| review.submitted_at.clone()),
-        review_excerpt: request
-            .current_review
-            .as_ref()
-            .map(|review| truncate_body(&review.body, 512).0),
+        merge_request_id: request.merge_request_id.clone(),
+        state,
+        review_status,
+        selector_from: request.selector_from.clone(),
+        selector_to: request.selector_to.clone(),
+        updated_at: request.updated_at.to_rfc3339(),
+        review_subject_ref: review_subject_ref.map(str::to_string),
+        review_submitted_at: current_review.map(|review| review.created_at.to_rfc3339()),
+        review_excerpt: current_review.map(|review| truncate_body(&review.body, 240).0),
     }
 }
 
@@ -1019,10 +1074,14 @@ fn ticket_evidence_summary(
         .map(|(sequence, _)| sequence);
     let report_after_rescope =
         latest_report.is_some_and(|report| latest_rescope.is_none_or(|rescope| report > rescope));
-    let has_commit = merge_request.is_some_and(|request| !request.head_commit.is_empty())
-        || events.iter().any(|event| {
-            event.attributes.contains_key("commit") || event.attributes.contains_key("head_commit")
-        });
+    let has_commit = merge_request.is_some_and(|request| {
+        request
+            .review_subject_ref
+            .as_ref()
+            .is_some_and(|subject_ref| !subject_ref.is_empty())
+    }) || events.iter().any(|event| {
+        event.attributes.contains_key("commit") || event.attributes.contains_key("head_commit")
+    });
     let review_status = merge_request.map(|request| request.review_status.clone());
     let approved = review_status.as_deref() == Some("approved");
     let unresolved_request_changes = review_status.as_deref() == Some("changes_requested");
@@ -1760,6 +1819,79 @@ mod tests {
     use crate::store::{ObjectiveRecord, ObjectiveTicketLinkRecord, WorkspaceRecord};
 
     #[test]
+    fn merge_request_summary_tracks_the_latest_requested_subject() {
+        let actor = merge_request::WorkerIdentity {
+            runtime_id: "runtime-1".to_string(),
+            worker_id: "worker-1".to_string(),
+        };
+        let at = Utc::now();
+        let first_review = merge_request::ReviewEvent {
+            event_id: "review-1".to_string(),
+            sequence: 2,
+            request_event_id: "request-1".to_string(),
+            subject_ref: "commit-1".to_string(),
+            decision: ReviewDecision::Approve,
+            body: "approved".to_string(),
+            findings: Vec::new(),
+            reviewer: actor.clone(),
+            created_at: at,
+        };
+        let mut request = MergeRequest {
+            workspace_id: "workspace-1".to_string(),
+            merge_request_id: "mr-1".to_string(),
+            repository_id: "main".to_string(),
+            state: MergeRequestState::Open,
+            selector_from: Some("work/ticket-1".to_string()),
+            selector_to: "orchestration".to_string(),
+            ticket_ids: vec!["ticket-1".to_string()],
+            thread: vec![
+                MergeRequestThreadEvent::ReviewRequested(merge_request::ReviewRequestedEvent {
+                    event_id: "request-1".to_string(),
+                    sequence: 1,
+                    subject_ref: "commit-1".to_string(),
+                    requested_by: actor.clone(),
+                    reviewer: actor.clone(),
+                    created_at: at,
+                }),
+                MergeRequestThreadEvent::Review(first_review),
+                MergeRequestThreadEvent::ReviewRequested(merge_request::ReviewRequestedEvent {
+                    event_id: "request-2".to_string(),
+                    sequence: 3,
+                    subject_ref: "commit-2".to_string(),
+                    requested_by: actor.clone(),
+                    reviewer: actor.clone(),
+                    created_at: at,
+                }),
+            ],
+            created_at: at,
+            updated_at: at,
+        };
+
+        let pending = merge_request_summary(request.clone());
+        assert_eq!(pending.review_status, "pending");
+        assert_eq!(pending.review_subject_ref.as_deref(), Some("commit-2"));
+        assert_eq!(pending.review_submitted_at, None);
+
+        request.thread.push(MergeRequestThreadEvent::Review(
+            merge_request::ReviewEvent {
+                event_id: "review-2".to_string(),
+                sequence: 4,
+                request_event_id: "request-2".to_string(),
+                subject_ref: "commit-2".to_string(),
+                decision: ReviewDecision::Approve,
+                body: "current approval".to_string(),
+                findings: Vec::new(),
+                reviewer: actor,
+                created_at: at,
+            },
+        ));
+        let approved = merge_request_summary(request);
+        assert_eq!(approved.review_status, "approved");
+        assert_eq!(approved.review_subject_ref.as_deref(), Some("commit-2"));
+        assert_eq!(approved.review_excerpt.as_deref(), Some("current approval"));
+    }
+
+    #[test]
     fn ticket_evidence_summary_requires_report_after_latest_rescope_and_approved_revision() {
         let event = |kind: &str| TicketEvent {
             kind: ticket::TicketEventKind::Other(kind.to_string()),
@@ -1779,11 +1911,10 @@ mod tests {
             merge_request_id: "mr-1".to_string(),
             state: "open".to_string(),
             review_status: "approved".to_string(),
-            revision_id: "revision-1".to_string(),
-            base_commit: "base".to_string(),
-            head_commit: "head".to_string(),
-            changed_paths: vec!["src/lib.rs".to_string()],
+            selector_from: Some("work/ticket".to_string()),
+            selector_to: "orchestration".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
+            review_subject_ref: Some("head".to_string()),
             review_submitted_at: Some("2026-01-01T00:00:00Z".to_string()),
             review_excerpt: Some("approved".to_string()),
         };

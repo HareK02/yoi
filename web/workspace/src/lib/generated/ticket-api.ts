@@ -71,11 +71,10 @@ export type TicketMergeRequestSummary = {
   merge_request_id: string;
   state: string;
   review_status: string;
-  revision_id: string;
-  base_commit: string;
-  head_commit: string;
-  changed_paths: Array<string>;
+  selector_from: string | null;
+  selector_to: string;
   updated_at: string;
+  review_subject_ref: string | null;
   review_submitted_at: string | null;
   review_excerpt: string | null;
 };
