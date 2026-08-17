@@ -54,7 +54,7 @@ impl WorkspaceTicketReadKind {
                 "Query authoritative Workspace Tickets with bounded typed filters, stable snippets, evidence summaries, and cursor metadata."
             }
             Self::Show => {
-                "Show one authoritative Workspace Ticket with its item revision, paged thread, links, implementation reports, and current Merge Request review evidence."
+                "Show one authoritative Workspace Ticket with its item revision, paged thread, links, historical implementation reports, and current Merge Request readiness evidence."
             }
         }
     }
@@ -83,8 +83,6 @@ enum WorkspaceTicketStateFilter {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum WorkspaceTicketEvidenceFilter {
-    ImplementationReport,
-    ImplementationReportAfterRescope,
     MergeRequest,
     Commit,
     ApprovedReview,
@@ -104,8 +102,6 @@ enum WorkspaceTicketReviewFilter {
 #[serde(rename_all = "snake_case")]
 enum WorkspaceTicketAttentionFilter {
     DoneNotClosed,
-    ImplementationReportNotClosed,
-    ReportAfterRescope,
     UnresolvedReview,
     MissingCommit,
     Blocked,
@@ -147,15 +143,15 @@ struct WorkspaceQueryTicketInput {
     /// Exact typed event kinds that must occur in the bounded thread window.
     #[serde(default)]
     event_kinds: Vec<String>,
-    /// Required evidence kinds: implementation_report, implementation_report_after_rescope,
-    /// merge_request, commit, or approved_review.
+    /// Required evidence kinds: merge_request, commit, or approved_review.
     #[serde(default)]
     evidence: Vec<WorkspaceTicketEvidenceFilter>,
     /// Current authoritative Merge Request review status: none, pending, approved,
     /// request_changes, or unresolved_changes.
     review_status: Option<WorkspaceTicketReviewFilter>,
-    /// Attention filters include done_not_closed, implementation_report_not_closed,
-    /// report_after_rescope, unresolved_review, missing_commit, blocked, and unblocked.
+    /// Attention filters include done_not_closed, unresolved_review, missing_commit,
+    /// blocked, unblocked, ready, awaiting_review, unresolved_changes,
+    /// stale_after_rescope, and missing_evidence.
     #[serde(default)]
     attention: Vec<WorkspaceTicketAttentionFilter>,
     related_ticket_id: Option<String>,

@@ -632,6 +632,14 @@ mod tests {
             "Do not spawn, restore, assign, or route work to Backend/Runtime Reviewer Workers"
         ));
         assert!(prompt.contains("never compensate by creating an independent Reviewer Worker"));
+        assert!(
+            prompt.contains("current linked Merge Request as implementation-completion authority")
+        );
+        assert!(prompt.contains("do not require an `implementation_report`"));
+        assert!(prompt.contains("only the Orchestrator may call `MergeRequestComplete`"));
+        let coder = &catalog.projection.templates["role.coder"];
+        assert!(coder.contains("hand off to the Orchestrator"));
+        assert!(coder.contains("Do not call `MergeRequestComplete`"));
         assert!(!prompt.contains("sibling Coder/Reviewer Workers"));
     }
 

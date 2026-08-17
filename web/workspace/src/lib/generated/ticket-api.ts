@@ -69,23 +69,27 @@ export type TicketAssignmentSummary = {
 
 export type TicketMergeRequestSummary = {
   merge_request_id: string;
+  repository_id: string;
   state: string;
   review_status: string;
   selector_from: string | null;
   selector_to: string;
   updated_at: string;
+  current_subject_ref: string | null;
   review_subject_ref: string | null;
+  review_requested_at: string | null;
   review_submitted_at: string | null;
   review_excerpt: string | null;
 };
 
 export type TicketEvidenceSummary = {
-  has_implementation_report: boolean;
-  implementation_report_after_rescope: boolean;
   has_merge_request: boolean;
+  has_current_subject_ref: boolean;
+  has_review_request: boolean;
   has_commit: boolean;
   review_status: string | null;
-  approved: boolean;
+  approved_current_subject: boolean;
+  review_after_rescope: boolean;
   unresolved_request_changes: boolean;
   complete_for_integration: boolean;
   missing: Array<string>;
