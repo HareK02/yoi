@@ -68,6 +68,15 @@ pub struct MergeRequestAuth {
     pub assignment_id: String,
 }
 
+impl MergeRequestAuth {
+    fn actor(&self) -> WorkerIdentity {
+        WorkerIdentity {
+            runtime_id: self.runtime_id.clone(),
+            worker_id: self.worker_id.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewRequestedEvent {
     pub event_id: String,
@@ -641,7 +650,7 @@ impl MergeRequestStore {
     }
     pub fn validate_completion(&self, i: &CompleteMergeRequest) -> Result<(), MergeRequestError> {
         let mr = self.get(&i.auth.workspace_id, &i.ticket_id)?;
-        self.completion_auth(&i.auth, &i.ticket_id, &mr.repository_id)?;
+        self.repo(&i.auth, &mr.repository_id)?;
         if let Some(existing) = mr.thread.iter().find_map(|event| match event {
             MergeRequestThreadEvent::Merge(value) if value.operation_id == i.operation_id => {
                 Some(value)
@@ -649,8 +658,12 @@ impl MergeRequestStore {
             _ => None,
         }) {
             if existing.approval_event_id == i.approval_event_id
+                && existing.approved_source_ref == i.current_subject_ref
                 && existing.target_ref_before == i.target_ref_before
                 && existing.target_ref_after == i.target_ref_after
+                && existing.strategy == i.strategy
+                && existing.resolution == i.resolution
+                && existing.merged_by == i.auth.actor()
             {
                 return Ok(());
             }
@@ -658,6 +671,7 @@ impl MergeRequestStore {
                 "operation fingerprint mismatch".into(),
             ));
         }
+        self.completion_auth(&i.auth, &i.ticket_id, &mr.repository_id)?;
         if mr.state != MergeRequestState::Open {
             return Err(MergeRequestError::Conflict(
                 "Merge Request is not open".into(),
@@ -711,8 +725,12 @@ impl MergeRequestStore {
             _ => None,
         }) {
             if existing.approval_event_id == i.approval_event_id
+                && existing.approved_source_ref == i.current_subject_ref
                 && existing.target_ref_before == i.target_ref_before
                 && existing.target_ref_after == i.target_ref_after
+                && existing.strategy == i.strategy
+                && existing.resolution == i.resolution
+                && existing.merged_by == i.auth.actor()
             {
                 return Ok(existing.clone());
             }
@@ -767,6 +785,16 @@ impl MergeRequestStore {
               WHERE workspace_id=?1 AND ticket_id=?2 AND workflow_state='inprogress'",
             params![mr.workspace_id, i.ticket_id, i.now.to_rfc3339()],
         )?;
+        let released_assignment = transaction.execute(
+            "DELETE FROM ticket_current_worker_assignments
+              WHERE workspace_id=?1 AND ticket_id=?2 AND assignment_id=?3",
+            params![mr.workspace_id, i.ticket_id, i.auth.assignment_id],
+        )?;
+        if released_assignment != 1 {
+            return Err(MergeRequestError::Unauthorized(
+                "completion assignment changed while closing Ticket".into(),
+            ));
+        }
         let issued_grants = {
             let mut statement = transaction.prepare(
                 "SELECT request_event_id,subject_ref,capability_token

@@ -3893,6 +3893,23 @@ fn repository_merge_evidence_error(error: RepositoryLookupError) -> ApiError {
     .into()
 }
 
+fn require_completed_target_observation(
+    observed: &str,
+    target_ref_before: &str,
+    target_ref_after: &str,
+) -> ApiResult<()> {
+    if observed == target_ref_after {
+        return Ok(());
+    }
+    if observed == target_ref_before {
+        return Err(Error::InvalidInput(
+            "target selector is still at target_ref_before; push the verified result from the Orchestrator Workdir before MergeRequestComplete".into(),
+        )
+        .into());
+    }
+    Err(Error::InvalidInput("target selector moved outside completion evidence".into()).into())
+}
+
 async fn scoped_show_merge_request(
     State(api): State<WorkspaceApi>,
     AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
@@ -4226,19 +4243,55 @@ async fn scoped_complete_merge_request(
     require_workspace_access(&workspace_id, &api)?;
     let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
     require_online_workspace_orchestrator_source(&api, &source)?;
+    let store = merge_request_store(&api, &workspace_id)?;
+    let mr = store.get(&workspace_id, &ticket_id)?;
+    let repositories = api.repository_reader();
+    if let Some(existing) = mr.thread.iter().find_map(|event| match event {
+        merge_request::MergeRequestThreadEvent::Merge(event)
+            if event.operation_id == input.operation_id =>
+        {
+            Some(event)
+        }
+        _ => None,
+    }) {
+        let observed = repositories
+            .observe_merge_target(&mr.repository_id, Some(&mr.selector_to))
+            .map_err(repository_merge_evidence_error)?;
+        require_completed_target_observation(
+            &observed.commit,
+            &input.target_ref_before,
+            &input.target_ref_after,
+        )?;
+        let replay = merge_request::CompleteMergeRequest {
+            ticket_id,
+            operation_id: input.operation_id,
+            approval_event_id: input.approval_event_id,
+            current_subject_ref: existing.approved_source_ref.clone(),
+            target_ref_before: input.target_ref_before,
+            target_ref_after: input.target_ref_after,
+            strategy: input.strategy,
+            resolution: input.resolution,
+            auth: merge_request::MergeRequestAuth {
+                workspace_id,
+                repository_id: mr.repository_id.clone(),
+                runtime_id: source.runtime_id,
+                worker_id: source.worker_id,
+                assignment_id: String::new(),
+            },
+            now: Utc::now(),
+        };
+        return store.complete(replay).map(Json).map_err(Into::into);
+    }
     let assignment = api
         .store
         .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
         .ok_or_else(|| {
             Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
         })?;
-    let store = merge_request_store(&api, &workspace_id)?;
-    let mr = store.get(&workspace_id, &ticket_id)?;
     let selector = mr
         .selector_from
         .as_deref()
         .ok_or_else(|| Error::InvalidInput("selector_from requires repair".into()))?;
-    let repositories = api.repository_reader();
     let current_source_ref = repositories
         .observe_merge_target(&mr.repository_id, Some(selector))
         .map_err(repository_merge_evidence_error)?
@@ -4246,12 +4299,11 @@ async fn scoped_complete_merge_request(
     let observed = repositories
         .observe_merge_target(&mr.repository_id, Some(&mr.selector_to))
         .map_err(repository_merge_evidence_error)?;
-    if observed.commit != input.target_ref_before && observed.commit != input.target_ref_after {
-        return Err(Error::InvalidInput(
-            "target selector moved outside completion evidence".into(),
-        )
-        .into());
-    }
+    require_completed_target_observation(
+        &observed.commit,
+        &input.target_ref_before,
+        &input.target_ref_after,
+    )?;
     let completion = merge_request::CompleteMergeRequest {
         ticket_id,
         operation_id: input.operation_id,
@@ -4271,31 +4323,7 @@ async fn scoped_complete_merge_request(
         now: Utc::now(),
     };
     store.validate_completion(&completion)?;
-    let already = observed.commit == input.target_ref_after;
-    if !already {
-        repositories
-            .update_merge_target(
-                &mr.repository_id,
-                &mr.selector_to,
-                &input.target_ref_before,
-                &input.target_ref_after,
-            )
-            .map_err(repository_merge_evidence_error)?
-    }
-    match store.complete(completion) {
-        Ok(v) => Ok(Json(v)),
-        Err(e) => {
-            if !already {
-                let _ = repositories.update_merge_target(
-                    &mr.repository_id,
-                    &mr.selector_to,
-                    &input.target_ref_after,
-                    &input.target_ref_before,
-                );
-            }
-            Err(e.into())
-        }
-    }
+    store.complete(completion).map(Json).map_err(Into::into)
 }
 
 fn reject_non_browser_reopen_auth(headers: &HeaderMap) -> Result<()> {
@@ -12443,7 +12471,7 @@ mod tests {
         assert_eq!(builtin.definition.name, "coder-review");
         assert_eq!(builtin.selector.to_string(), "builtin:coder-review");
         assert_eq!(builtin.flow_id, "builtin:coder-review");
-        assert_eq!(builtin.revision, 2);
+        assert_eq!(builtin.revision, 3);
         assert_eq!(
             api.store
                 .list_flow_sources(&api.config.workspace_id)
@@ -12602,6 +12630,26 @@ mod tests {
             api.validate_worker_spawn_repository_scope(&workdir_flow_launch)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn merge_request_completion_records_only_an_observed_remote_target_update() {
+        require_completed_target_observation("after", "before", "after").unwrap();
+
+        let not_pushed =
+            require_completed_target_observation("before", "before", "after").unwrap_err();
+        assert!(matches!(
+            not_pushed.error,
+            Error::InvalidInput(ref message)
+                if message.contains("push the verified result from the Orchestrator Workdir")
+        ));
+
+        let moved = require_completed_target_observation("other", "before", "after").unwrap_err();
+        assert!(matches!(
+            moved.error,
+            Error::InvalidInput(ref message)
+                if message.contains("moved outside completion evidence")
+        ));
     }
 
     #[test]
