@@ -1,9 +1,4 @@
-import type {
-  TicketDetail,
-  TicketQueryItem,
-  TicketQueryRequest,
-  TicketSummary,
-} from "$lib/generated/ticket-api";
+import type { TicketDetail, TicketSummary } from "$lib/generated/ticket-api";
 
 export const TICKET_STATES = [
   "planning",
@@ -77,57 +72,11 @@ export type TicketLane = {
   tickets: TicketCardSummary[];
 };
 
-export function ticketLaneDefinitions(): readonly TicketLaneDefinition[] {
-  return LANE_DEFINITIONS;
-}
-
-export function ticketLaneQuery(
-  lane: { states: readonly TicketState[] },
-  cursor: string | null = null,
-): TicketQueryRequest {
-  return {
-    attention: [],
-    cursor,
-    event_kinds: [],
-    evidence: [],
-    limit: TICKET_LANE_PAGE_SIZE,
-    linked_objective_id: null,
-    query: null,
-    related_ticket_id: null,
-    relation_kind: null,
-    review_status: null,
-    sort: "updated_desc",
-    states: [...lane.states],
-    updated_after: null,
-    updated_before: null,
-  };
-}
-
-export function ticketSummaryFromQueryItem(
-  item: TicketQueryItem,
-): TicketCardSummary {
-  return {
-    id: item.id,
-    priority: item.priority === null ? "normal" : String(item.priority),
-    state: item.state,
-    title: item.title,
-    updated_at: item.updated_at,
-  };
-}
-
-export function appendUniqueTicketSummaries(
-  current: TicketCardSummary[],
-  incoming: TicketCardSummary[],
-): TicketCardSummary[] {
-  const ids = new Set(current.map((ticket) => ticket.id));
-  return [
-    ...current,
-    ...incoming.filter((ticket) => {
-      if (ids.has(ticket.id)) return false;
-      ids.add(ticket.id);
-      return true;
-    }),
-  ];
+export function nextTicketLaneVisibleCount(
+  current: number,
+  total: number,
+): number {
+  return Math.min(total, current + TICKET_LANE_PAGE_SIZE);
 }
 
 function updatedAt(ticket: TicketCardSummary): number {

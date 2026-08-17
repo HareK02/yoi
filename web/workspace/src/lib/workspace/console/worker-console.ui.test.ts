@@ -218,23 +218,22 @@ Deno.test("workspace Tickets surface provides Kanban and lifecycle controls", as
     "Tickets and Objectives should each be a single sidebar link",
   );
   assert(
-    !ticketsLoad.includes("?limit=1000") &&
-      ticketsLoad.includes('workspaceApiPath(workspaceId, "/tickets/query")') &&
-      ticketsLoad.includes("ticketLaneDefinitions()") &&
-      ticketsLoad.includes("ticketLaneQuery(lane)") &&
+    ticketsLoad.includes("?limit=1000") &&
+      !ticketsLoad.includes("/tickets/query") &&
       ticketsPage.includes('class="ticket-kanban"') &&
       ticketsPage.includes('class="ticket-lane-cards"') &&
+      ticketsPage.includes("lane.tickets.slice(0, lane.visibleCount)") &&
       ticketsPage.includes("handleLaneScroll") &&
-      ticketsPage.includes("Loading 30 more"),
-    "Tickets list should query and incrementally scroll each Kanban lane",
+      ticketsPage.includes("revealNextTickets"),
+    "Tickets list should fetch lightweight summaries once and incrementally reveal each Kanban lane",
   );
   assert(
     ticketPanelModel.includes('label: "Ready + Planning"') &&
       ticketPanelModel.includes('label: "In progress + Queued"') &&
       ticketPanelModel.includes('label: "Done + Closed"') &&
       ticketPanelModel.includes("TICKET_LANE_PAGE_SIZE = 30") &&
-      ticketPanelModel.includes('sort: "updated_desc"'),
-    "Ticket Kanban should combine related states into independent cursor pages",
+      ticketPanelModel.includes("nextTicketLaneVisibleCount"),
+    "Ticket Kanban should combine related states into independent 30-item display windows",
   );
   assert(
     generatedTicketApi.includes("Generated from yoi-workspace-server") &&

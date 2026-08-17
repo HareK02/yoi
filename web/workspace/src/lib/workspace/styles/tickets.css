@@ -189,15 +189,6 @@
     font-size: 0.7rem;
     text-align: center;
   }
-  .ticket-lane-load-error {
-    display: grid;
-    gap: 0.5rem;
-    color: #d66;
-    padding: 0.5rem;
-  }
-  .ticket-lane-load-error button {
-    justify-self: start;
-  }
   .ticket-card {
     display: grid;
     gap: 0.55rem;

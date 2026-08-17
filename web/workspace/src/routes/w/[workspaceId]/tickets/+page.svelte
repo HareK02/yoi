@@ -1,40 +1,34 @@
 <script lang="ts">
   import { untrack } from "svelte";
-  import type { TicketQueryResponse } from "$lib/generated/ticket-api";
+  import type { TicketListResponse } from "$lib/generated/ticket-api";
   import type { ApiResult } from "$lib/workspace/api/http";
   import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
   import {
-    appendUniqueTicketSummaries,
-    ticketLaneQuery,
-    ticketSummaryFromQueryItem,
-    type TicketCardSummary,
+    nextTicketLaneVisibleCount,
+    TICKET_LANE_PAGE_SIZE,
+    ticketLanes,
+    type TicketLane,
     type TicketLaneId,
-    type TicketState,
     type WorkspaceOrchestratorStatus,
   } from "$lib/workspace/tickets/ticket-panel";
   import "$lib/workspace/styles/tickets.css";
 
-  type LanePage = {
-    id: TicketLaneId;
-    label: string;
-    states: TicketState[];
-    tickets: TicketCardSummary[];
-    nextCursor: string | null;
-    hasMore: boolean;
-    error: string | null;
-  };
+  type VisibleTicketLane = TicketLane & { visibleCount: number };
 
   const { data } = $props<{
     data: {
       workspaceId: string;
-      ticketLanePages: LanePage[];
+      tickets: ApiResult<TicketListResponse>;
       orchestrator: ApiResult<WorkspaceOrchestratorStatus>;
     };
   }>();
 
-  let lanes = $state<(LanePage & { loading: boolean })[]>(
+  let lanes = $state<VisibleTicketLane[]>(
     untrack(() =>
-      data.ticketLanePages.map((lane: LanePage) => ({ ...lane, loading: false }))
+      ticketLanes(data.tickets.data?.items ?? []).map((lane) => ({
+        ...lane,
+        visibleCount: Math.min(TICKET_LANE_PAGE_SIZE, lane.tickets.length),
+      }))
     ),
   );
   let orchestrator = $state<ApiResult<WorkspaceOrchestratorStatus>>(
@@ -42,7 +36,7 @@
   );
   let orchestratorStarting = $state(false);
   const displayedTicketCount = $derived(
-    lanes.reduce((count, lane) => count + lane.tickets.length, 0),
+    lanes.reduce((count, lane) => count + lane.visibleCount, 0),
   );
   const LANE_LOAD_THRESHOLD_PX = 96;
 
@@ -63,64 +57,18 @@
     return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString();
   }
 
-  function updateLane(
-    laneId: TicketLaneId,
-    update: (lane: LanePage & { loading: boolean }) =>
-      LanePage & { loading: boolean },
-  ): void {
-    lanes = lanes.map((lane) => lane.id === laneId ? update(lane) : lane);
-  }
-
-  async function loadMoreTickets(laneId: TicketLaneId): Promise<void> {
-    const lane = lanes.find((candidate) => candidate.id === laneId);
-    if (!lane || lane.loading || (!lane.hasMore && !lane.error)) return;
-
-    updateLane(laneId, (current) => ({
-      ...current,
-      loading: true,
-      error: null,
-    }));
-
-    let result: ApiResult<TicketQueryResponse>;
-    try {
-      result = await loadJson<TicketQueryResponse>(
-        fetch,
-        workspaceApiPath(data.workspaceId, "/tickets/query"),
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(ticketLaneQuery(lane, lane.nextCursor)),
-        },
-      );
-    } catch (error) {
-      updateLane(laneId, (current) => ({
-        ...current,
-        loading: false,
-        error: error instanceof Error
-          ? error.message
-          : "Unable to load more Tickets.",
-      }));
-      return;
-    }
-
-    if (!result.data) {
-      updateLane(laneId, (current) => ({
-        ...current,
-        loading: false,
-        error: result.error ?? "Unable to load more Tickets.",
-      }));
-      return;
-    }
-
-    const incoming = result.data.items.map(ticketSummaryFromQueryItem);
-    updateLane(laneId, (current) => ({
-      ...current,
-      tickets: appendUniqueTicketSummaries(current.tickets, incoming),
-      nextCursor: result.data?.page.next_cursor ?? null,
-      hasMore: result.data?.page.has_more ?? false,
-      loading: false,
-      error: null,
-    }));
+  function revealNextTickets(laneId: TicketLaneId): void {
+    lanes = lanes.map((lane) =>
+      lane.id === laneId
+        ? {
+          ...lane,
+          visibleCount: nextTicketLaneVisibleCount(
+            lane.visibleCount,
+            lane.tickets.length,
+          ),
+        }
+        : lane
+    );
   }
 
   function handleLaneScroll(event: Event, laneId: TicketLaneId): void {
@@ -128,7 +76,7 @@
     const distanceFromBottom = element.scrollHeight - element.scrollTop -
       element.clientHeight;
     if (distanceFromBottom <= LANE_LOAD_THRESHOLD_PX) {
-      void loadMoreTickets(laneId);
+      revealNextTickets(laneId);
     }
   }
 </script>
@@ -160,10 +108,14 @@
       </div>
       <div class="ticket-panel-summary" aria-label="Ticket summary">
         <strong>{displayedTicketCount}</strong>
-        <span>tickets loaded</span>
+        <span>tickets displayed</span>
       </div>
     </div>
   </header>
+
+  {#if data.tickets.error}
+    <p class="workspace-callout is-error">Tickets: {data.tickets.error}</p>
+  {/if}
 
   {#if orchestrator.error}
     <p class="workspace-callout is-error">
@@ -177,6 +129,8 @@
 
   <section class="ticket-kanban" aria-label="Ticket workflow board">
     {#each lanes as lane (lane.id)}
+      {@const displayedTickets = lane.tickets.slice(0, lane.visibleCount)}
+      {@const hasMore = lane.visibleCount < lane.tickets.length}
       <section class="ticket-lane" data-state={lane.id}>
         <header class="ticket-lane-header">
           <div>
@@ -184,7 +138,7 @@
             <h2>{lane.label}</h2>
           </div>
           <span class="ticket-lane-count">
-            {lane.tickets.length}{lane.hasMore ? "+" : ""}
+            {displayedTickets.length}{hasMore ? "+" : ""}
           </span>
         </header>
 
@@ -192,7 +146,7 @@
           class="ticket-lane-cards"
           onscroll={(event) => handleLaneScroll(event, lane.id)}
         >
-          {#each lane.tickets as ticket (ticket.id)}
+          {#each displayedTickets as ticket (ticket.id)}
             <a
               class="ticket-card"
               href={`/w/${encodeURIComponent(data.workspaceId)}/tickets/${encodeURIComponent(ticket.id)}`}
@@ -205,24 +159,15 @@
               </div>
             </a>
           {:else}
-            {#if !lane.error}
-              <div class="ticket-lane-empty">No tickets</div>
-            {/if}
+            <div class="ticket-lane-empty">No tickets</div>
           {/each}
 
-          {#if lane.loading}
-            <p class="ticket-lane-load-status" aria-live="polite">Loading 30 more…</p>
-          {:else if lane.error}
-            <div class="ticket-lane-load-error">
-              <small>{lane.error}</small>
-              <button
-                class="workspace-secondary-button"
-                type="button"
-                onclick={() => loadMoreTickets(lane.id)}
-              >Retry</button>
-            </div>
-          {:else if !lane.hasMore && lane.tickets.length > 0}
-            <p class="ticket-lane-load-status">All tickets loaded.</p>
+          {#if hasMore}
+            <p class="ticket-lane-load-status" aria-live="polite">
+              Scroll for {Math.min(TICKET_LANE_PAGE_SIZE, lane.tickets.length - lane.visibleCount)} more
+            </p>
+          {:else if displayedTickets.length > 0}
+            <p class="ticket-lane-load-status">All tickets displayed.</p>
           {/if}
         </div>
       </section>
