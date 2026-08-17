@@ -380,6 +380,7 @@ const READ_ONLY_TOOL_NAMES: &[&str] = &["QueryTicket", "ShowTicket"];
 const AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketCreate",
     "TicketEditItem",
+    "TicketMarkReady",
     "TicketQueue",
     "TicketClose",
     "TicketRelationRecord",
@@ -397,6 +398,7 @@ const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
     "QueryTicket",
     "ShowTicket",
     "TicketComment",
+    "TicketMarkReady",
     "TicketQueue",
     "TicketClose",
     "TicketRelationRecord",
@@ -866,16 +868,15 @@ impl WorkspaceHttpTicketBackend {
                     TicketError::Conflict(format!("serialize Ticket workflow change: {error}"))
                 })?),
             ),
-            TicketBackendOperation::MarkIntakeReady {
-                id,
-                summary,
-                change,
-            } => Self::request_unit(
+            TicketBackendOperation::MarkReady { id, request } => Self::request(
                 client,
                 WorkspaceRequestMethod::Post,
-                format!("{base}/{}/intake-ready", Self::ticket_path(&id)),
-                Some(serde_json::json!({ "summary": summary, "change": change })),
-            ),
+                format!("{base}/{}/workflow/mark-ready", Self::ticket_path(&id)),
+                Some(serde_json::to_value(request).map_err(|error| {
+                    TicketError::Conflict(format!("serialize Ticket mark-ready request: {error}"))
+                })?),
+            )
+            .map(TicketBackendOperationResult::Ticket),
             TicketBackendOperation::QueueReady { id, .. } => Self::request_unit(
                 client,
                 WorkspaceRequestMethod::Post,
@@ -1091,22 +1092,15 @@ impl TicketBackend for WorkspaceHttpTicketBackend {
         }
     }
 
-    fn mark_intake_ready(
+    fn mark_ready(
         &self,
         id: TicketIdOrSlug,
-        summary: TicketIntakeSummary,
-        change: TicketStateChange,
-    ) -> TicketResult<()> {
-        match self.invoke(TicketBackendOperation::MarkIntakeReady {
-            id,
-            summary,
-            change,
-        })? {
-            TicketBackendOperationResult::Unit => Ok(()),
-            other => Err(TicketError::Conflict(format!(
-                "unexpected ticket backend response: {other:?}"
-            ))),
-        }
+        request: ticket::TicketMarkReady,
+    ) -> TicketResult<Ticket> {
+        expect_ticket_result!(
+            self.invoke(TicketBackendOperation::MarkReady { id, request }),
+            TicketBackendOperationResult::Ticket
+        )
     }
 
     fn queue_ready(&self, id: TicketIdOrSlug, queued_by: &str) -> TicketResult<()> {
@@ -1275,7 +1269,7 @@ mod tests {
         assert_eq!(show.name, "ShowTicket");
         assert!(show.input_schema["properties"]["event_limit"].is_object());
         let tool_names = TicketFeatureAccess::workspace_authoring().tool_names();
-        assert_eq!(tool_names.len(), 9);
+        assert_eq!(tool_names.len(), 10);
         assert!(
             tool_names.len() < 13,
             "authoring catalog must stay below the prior broad catalog"
@@ -1492,6 +1486,7 @@ language = "Japanese"
         assert!(installed.iter().any(|tool| *tool == "TicketCreate"));
         assert!(installed.iter().any(|tool| *tool == "TicketEditItem"));
         assert!(installed.iter().any(|tool| *tool == "TicketQueue"));
+        assert!(installed.iter().any(|tool| *tool == "TicketMarkReady"));
         assert!(!installed.iter().any(|tool| *tool == "TicketIntakeReady"));
         assert!(!installed.iter().any(|tool| *tool == "TicketWorkflowState"));
         assert!(
