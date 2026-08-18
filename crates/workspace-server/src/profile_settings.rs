@@ -252,15 +252,25 @@ pub fn selector_for_workspace_candidate(
 fn validate_prompt_projection_matches_state(
     workspace_id: &str,
     state: &WorkspaceConfigState,
-    projection: &crate::prompt_settings::WorkspacePromptProjection,
+    projection: &worker::WorkspacePromptProjection,
 ) -> Result<()> {
-    if !projection.matches(workspace_id, state) {
-        return Err(Error::Config(
-            "Prompt projection identity does not match Workspace config state".to_string(),
-        ));
-    }
+    projection
+        .validate()
+        .map_err(|error| Error::Config(error.to_string()))?;
     let prompt_catalog = projection.catalog();
     let mismatches = [
+        (
+            projection.workspace_id != workspace_id,
+            "workspace identity",
+        ),
+        (
+            projection.source_digest != state.snapshot.digest,
+            "source digest",
+        ),
+        (
+            projection.projection_digest != prompt_catalog.catalog_digest,
+            "projection digest",
+        ),
         (
             prompt_catalog.config_revision != state.snapshot.revision,
             "config revision",
@@ -353,7 +363,7 @@ pub fn build_virtual_profile_config_bundle_with_prompt_projection(
     workspace_id: &str,
     workspace_created_at: &str,
     selector: &str,
-    prompt_projection: &crate::prompt_settings::WorkspacePromptProjection,
+    prompt_projection: &worker::WorkspacePromptProjection,
 ) -> Result<Option<ConfigBundle>> {
     validate_prompt_projection_matches_state(workspace_id, state, prompt_projection)?;
     let prompt_catalog = prompt_projection.catalog().clone();

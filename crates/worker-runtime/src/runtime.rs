@@ -900,8 +900,6 @@ impl Runtime {
                     worker.run_generation.saturating_add(1).max(1),
                 )
             };
-            let config_bundle =
-                state.resolve_config_bundle_ref(worker_request.config_bundle.as_ref())?;
             let backend = state.execution_backend.clone().ok_or_else(|| {
                 RuntimeError::WorkerExecutionUnavailable {
                     worker_id: worker_ref.worker_id.clone(),
@@ -924,7 +922,7 @@ impl Runtime {
                 context: self.execution_context(worker_ref.clone()),
                 previous_working_directory,
                 working_directory: None,
-                config_bundle,
+                config_bundle: None,
             };
             (backend, request)
         };
@@ -1580,8 +1578,6 @@ impl Runtime {
                         worker.run_generation.saturating_add(1).max(1),
                     )
                 };
-                let config_bundle =
-                    state.resolve_config_bundle_ref(request.config_bundle.as_ref())?;
                 state
                     .workers
                     .get_mut(&worker_id)
@@ -1593,7 +1589,7 @@ impl Runtime {
                     request,
                     run_generation,
                     previous_working_directory,
-                    config_bundle,
+                    config_bundle: None,
                 });
             }
             candidates
@@ -3476,12 +3472,12 @@ mod tests {
         runtime.restore_worker(&detail.worker_ref).unwrap();
         assert_eq!(
             backend.config_bundles.lock().unwrap().as_slice(),
-            &[Some(bundle.clone()), Some(bundle)]
+            &[Some(bundle), None]
         );
     }
 
     #[test]
-    fn restore_fails_closed_when_recorded_config_bundle_is_missing_or_mismatched() {
+    fn restore_does_not_require_recorded_config_bundle() {
         let (runtime, backend) = runtime_and_backend();
         let bundle = test_bundle();
         let detail = runtime
@@ -3489,11 +3485,11 @@ mod tests {
             .unwrap();
         runtime.stop_worker(&detail.worker_ref, None).unwrap();
         runtime.lock().unwrap().config_bundles.clear();
-        assert!(matches!(
-            runtime.restore_worker(&detail.worker_ref),
-            Err(RuntimeError::ConfigBundleMissing { .. })
-        ));
-        assert_eq!(backend.config_bundles.lock().unwrap().len(), 1);
+        runtime.restore_worker(&detail.worker_ref).unwrap();
+        assert_eq!(
+            backend.config_bundles.lock().unwrap().as_slice(),
+            &[Some(bundle), None]
+        );
 
         let (runtime, backend) = runtime_and_backend();
         let bundle = test_bundle();
@@ -3509,11 +3505,11 @@ mod tests {
             .unwrap()
             .config_bundles
             .insert(replacement.metadata.id.clone(), replacement);
-        assert!(matches!(
-            runtime.restore_worker(&detail.worker_ref),
-            Err(RuntimeError::ConfigBundleDigestMismatch { .. })
-        ));
-        assert_eq!(backend.config_bundles.lock().unwrap().len(), 1);
+        runtime.restore_worker(&detail.worker_ref).unwrap();
+        assert_eq!(
+            backend.config_bundles.lock().unwrap().as_slice(),
+            &[Some(bundle), None]
+        );
     }
 
     #[test]

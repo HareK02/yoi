@@ -33,7 +33,8 @@ pub use manifest::{
 };
 pub use model_client::{ProviderError, build_client};
 pub use prompt::catalog::{
-    CatalogError, EffectivePromptCatalog, PromptCatalog, WorkerPrompt, prompt_schema_source,
+    CatalogError, EffectivePromptCatalog, PromptCatalog, WorkerPrompt, WorkspacePromptProjection,
+    prompt_schema_source,
 };
 pub use prompt::source::PromptCatalogSource;
 pub use prompt::system::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};

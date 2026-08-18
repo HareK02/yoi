@@ -1244,6 +1244,10 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             get(scoped_get_workspace_config_tree),
         )
         .route(
+            "/api/w/{workspace_id}/config/projections/prompts",
+            get(scoped_get_prompt_projection),
+        )
+        .route(
             "/api/w/{workspace_id}/config/source-tree/commit",
             post(scoped_commit_workspace_config_tree),
         )
@@ -2579,6 +2583,25 @@ async fn scoped_get_workspace_config_revision(
 struct WorkspaceConfigEntryPath {
     workspace_id: String,
     path: String,
+}
+
+async fn scoped_get_prompt_projection(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+) -> ApiResult<Json<worker::WorkspacePromptProjection>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let state = api
+        .config_store
+        .load_workspace_config(&path.workspace_id)?
+        .ok_or_else(|| {
+            ApiError::from(Error::InvalidInput(
+                "Workspace config is not initialized".to_string(),
+            ))
+        })?;
+    let projection = api
+        .prompt_projection_cache
+        .resolve(&path.workspace_id, &state)?;
+    Ok(Json(projection.as_ref().clone()))
 }
 
 #[derive(Debug, Serialize)]

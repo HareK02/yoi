@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use config_source::{ConfigProjectionValidator, ConfigSchemaContribution};
-use worker::{EffectivePromptCatalog, prompt_schema_source};
+use worker::{EffectivePromptCatalog, WorkspacePromptProjection, prompt_schema_source};
 
 use crate::config_source::{
     WorkspaceConfigSchemaProvider, WorkspaceConfigState, evaluate_workspace_config_state,
@@ -13,6 +13,7 @@ use crate::{Error, Result};
 struct PromptProjectionCacheKey {
     workspace_id: String,
     config_revision: u64,
+    source_digest: String,
     projection_digest: String,
     schema_fingerprint: String,
     toolchain_fingerprint: String,
@@ -23,26 +24,11 @@ impl PromptProjectionCacheKey {
         Self {
             workspace_id: workspace_id.to_string(),
             config_revision: state.snapshot.revision,
+            source_digest: state.snapshot.digest.clone(),
             projection_digest: state.projection_digest.clone(),
             schema_fingerprint: state.contract.schema_bundle.fingerprint.clone(),
             toolchain_fingerprint: state.contract.fingerprint.clone(),
         }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct WorkspacePromptProjection {
-    identity: PromptProjectionCacheKey,
-    catalog: EffectivePromptCatalog,
-}
-
-impl WorkspacePromptProjection {
-    pub fn catalog(&self) -> &EffectivePromptCatalog {
-        &self.catalog
-    }
-
-    pub fn matches(&self, workspace_id: &str, state: &WorkspaceConfigState) -> bool {
-        self.identity == PromptProjectionCacheKey::new(workspace_id, state)
     }
 }
 
@@ -242,10 +228,14 @@ pub fn project_workspace_prompt_projection(
     workspace_id: &str,
     state: &WorkspaceConfigState,
 ) -> Result<WorkspacePromptProjection> {
-    Ok(WorkspacePromptProjection {
-        identity: PromptProjectionCacheKey::new(workspace_id, state),
-        catalog: project_prompts_from_workspace_config(state)?,
-    })
+    let catalog = project_prompts_from_workspace_config(state)?;
+    WorkspacePromptProjection::new(
+        workspace_id,
+        state.snapshot.digest.clone(),
+        catalog.catalog_digest.clone(),
+        catalog,
+    )
+    .map_err(|error| Error::RegistryInconsistency(error.to_string()))
 }
 
 #[cfg(test)]
