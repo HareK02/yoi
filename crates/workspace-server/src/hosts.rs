@@ -4251,6 +4251,10 @@ mod tests {
                 .unwrap();
             assert_eq!(manifest.worker.name, "embedded-test-worker");
         }
+        let companion = archive
+            .resolve_profile("builtin:companion", root.path(), "embedded-test-companion")
+            .unwrap();
+        assert!(companion.feature.manage_workdir.enabled);
     }
 
     #[test]

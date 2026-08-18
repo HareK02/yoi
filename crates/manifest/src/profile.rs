@@ -904,7 +904,9 @@ fn apply_role_profile(
         "enabled": matches!(slug, "companion" | "orchestrator"),
         "direct_spawn": slug != "orchestrator"
     });
-    value["feature"]["manage_workdir"] = serde_json::json!({ "enabled": slug == "orchestrator" });
+    value["feature"]["manage_workdir"] = serde_json::json!({
+        "enabled": matches!(slug, "companion" | "orchestrator")
+    });
     value["feature"]["orchestration"] = serde_json::json!({ "enabled": slug == "orchestrator" });
     let ticket = match slug {
         "companion" => serde_json::json!({ "enabled": true, "authoring": true, "thread": true }),
@@ -1330,6 +1332,20 @@ mod tests {
                 .unwrap();
             assert_eq!(resolved.manifest.worker.name, "role-worker");
         }
+    }
+
+    #[test]
+    fn builtin_companion_can_manage_workdirs() {
+        let tmp = TempDir::new().unwrap();
+        let resolved = ProfileResolver::new()
+            .with_workspace_base(tmp.path())
+            .resolve(
+                &ProfileSelector::source_named(ProfileRegistrySource::Builtin, "companion"),
+                ProfileResolveOptions::with_worker_name("companion-worker"),
+            )
+            .unwrap();
+
+        assert!(resolved.manifest.feature.manage_workdir.enabled);
     }
 
     #[test]

@@ -9,6 +9,7 @@ import "./base.dcdl" // {
         web = { enabled = true; };
         sub_worker = { enabled = true; };
         worker = { enabled = true; };
+        manage_workdir = { enabled = true; };
         ticket = { enabled = true; authoring = true; thread = true; };
     };
 }
