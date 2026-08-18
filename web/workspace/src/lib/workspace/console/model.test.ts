@@ -78,7 +78,7 @@ Deno.test("console routing projects live errors but not completion replies", () 
   );
 });
 
-Deno.test("snapshot and segment rotation retain one durable run_errored row", () => {
+Deno.test("snapshot replaces a live error with one durable run_errored row", () => {
   const projector = createConsoleProjector();
   let projection = projector.append([
     {
@@ -115,13 +115,16 @@ Deno.test("snapshot and segment rotation retain one durable run_errored row", ()
   assertEquals(errors[0].title, "Run error");
   assertEquals(errors[0].body, "provider unavailable");
   assertEquals(errors[0].error, true);
+});
 
-  projection = projector.append([
+Deno.test("segment rotation retains a live error beside the real SegmentStart history", () => {
+  const projector = createConsoleProjector();
+  const projection = projector.append([
     {
-      eventId: "second-live-error",
+      eventId: "live-error",
       event: {
         event: "error",
-        data: { code: "provider_error", message: "retry unavailable" },
+        data: { code: "provider_error", message: "provider unavailable" },
       } satisfies Event,
     },
     {
@@ -130,21 +133,30 @@ Deno.test("snapshot and segment rotation retain one durable run_errored row", ()
         event: "segment_rotated",
         data: {
           entry: {
-            kind: "run_errored",
+            kind: "segment_start",
             ts: 5,
-            interrupted: false,
-            message: "retry unavailable",
+            session_id: "session-1",
+            system_prompt: null,
+            config: {},
+            history: [{
+              kind: "message",
+              role: "user",
+              content: [{ kind: "text", text: "retained conversation" }],
+            }],
           },
         },
       } satisfies Event,
     },
   ]);
 
-  const rotatedErrors = projection.lines.filter((line) =>
-    line.kind === "error"
+  const errors = projection.lines.filter((line) => line.kind === "error");
+  assertEquals(errors.length, 1);
+  assertEquals(errors[0].title, "error · provider_error");
+  assertEquals(errors[0].body, "provider unavailable");
+  assert(
+    projection.lines.some((line) => line.body === "retained conversation"),
+    "SegmentStart history should still seed the rotated projection",
   );
-  assertEquals(rotatedErrors.length, 1);
-  assertEquals(rotatedErrors[0].body, "retry unavailable");
 });
 
 Deno.test("workerConsoleHref encodes runtime and worker target authority", () => {

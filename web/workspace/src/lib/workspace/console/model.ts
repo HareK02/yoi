@@ -328,12 +328,13 @@ export function applyProtocolEvent(
       next.status = event.data.status;
       break;
     case "segment_rotated": {
+      const retainedErrors = next.lines.filter((line) => line.kind === "error");
       const segment = snapshotProjectionFromEntries(
         envelope.eventId,
         [event.data.entry],
         next.cwd,
       );
-      next.lines = segment.lines;
+      next.lines = [...segment.lines, ...retainedErrors];
       next.tasks = segment.tasks;
       next.taskNextId = segment.taskNextId;
       break;

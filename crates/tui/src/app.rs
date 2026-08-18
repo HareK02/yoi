@@ -271,6 +271,9 @@ pub struct App {
     pub quit_confirm: Option<std::time::Instant>,
     /// Full display history in render order.
     pub blocks: Vec<Block>,
+    /// Turn/protocol errors retained when a real `SegmentStart` replaces the
+    /// replayable conversation rows during segment rotation.
+    run_error_messages: Vec<String>,
     pub scroll: Scroll,
     pub mode: Mode,
     pub cache: FileCache,
@@ -347,6 +350,7 @@ impl App {
             quit: false,
             quit_confirm: None,
             blocks: Vec::new(),
+            run_error_messages: Vec::new(),
             scroll: Scroll::default(),
             mode: Mode::Normal,
             cache: FileCache::new(),
@@ -812,6 +816,15 @@ impl App {
         });
     }
 
+    fn push_run_error(&mut self, message: String) {
+        self.run_error_messages.push(message.clone());
+        self.blocks.push(Block::Alert {
+            level: AlertLevel::Error,
+            source: AlertSource::Worker,
+            message,
+        });
+    }
+
     fn handle_error(&mut self, code: ErrorCode, message: String) {
         let text = format!("[{code:?}] {message}");
         let was_applying = if let Some(picker) = self.rewind_picker.as_mut() {
@@ -829,7 +842,7 @@ impl App {
                 Duration::from_secs(6),
             );
         }
-        self.push_error(text);
+        self.push_run_error(text);
     }
 
     fn rewind_submit_pending(&self) -> bool {
@@ -981,8 +994,16 @@ impl App {
                 self.assistant_streaming = false;
             }
             Event::SegmentRotated { entry } => {
+                let retained_run_errors = self.run_error_messages.clone();
                 self.reset_for_rotation();
                 self.apply_log_entry_raw(&entry);
+                for message in retained_run_errors {
+                    self.blocks.push(Block::Alert {
+                        level: AlertLevel::Error,
+                        source: AlertSource::Worker,
+                        message,
+                    });
+                }
                 self.assistant_streaming = false;
             }
             Event::SystemItem { item } => {
@@ -2005,6 +2026,7 @@ impl App {
         entries: &[serde_json::Value],
         greeting: Option<protocol::Greeting>,
     ) {
+        self.run_error_messages.clear();
         self.turn_index = 0;
         self.blocks.clear();
         self.cache = FileCache::new();
@@ -2082,11 +2104,7 @@ impl App {
                 self.apply_compaction_extension(&payload);
             }
             session_store::LogEntry::RunErrored { message, .. } => {
-                self.blocks.push(Block::Alert {
-                    level: AlertLevel::Error,
-                    source: AlertSource::Worker,
-                    message,
-                });
+                self.push_run_error(message);
             }
             // Non-history-bearing variants don't affect the block view.
             _ => {}
@@ -3269,7 +3287,7 @@ mod completion_flow_tests {
     }
 
     #[test]
-    fn snapshot_and_segment_rotation_retain_one_durable_run_error_block() {
+    fn snapshot_replaces_live_error_with_one_durable_run_error_block() {
         let mut app = App::new("test".into());
         app.handle_worker_event(Event::Error {
             code: ErrorCode::ProviderError,
@@ -3318,21 +3336,29 @@ mod completion_flow_tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(errors, ["provider unavailable"]);
+    }
 
+    #[test]
+    fn segment_rotation_retains_live_error_across_real_segment_start() {
+        let mut app = App::new("test".into());
         app.handle_worker_event(Event::Error {
             code: ErrorCode::ProviderError,
-            message: "retry unavailable".into(),
+            message: "provider unavailable".into(),
         });
-        let rotated_run_error = session_store::LogEntry::RunErrored {
+        let segment_start = session_store::LogEntry::SegmentStart {
             ts: 5,
-            interrupted: false,
-            message: "retry unavailable".into(),
+            session_id: uuid::Uuid::nil(),
+            system_prompt: None,
+            config: Default::default(),
+            history: Vec::new(),
+            forked_from: None,
+            compacted_from: None,
         };
         app.handle_worker_event(Event::SegmentRotated {
-            entry: serde_json::to_value(rotated_run_error).unwrap(),
+            entry: serde_json::to_value(segment_start).unwrap(),
         });
 
-        let rotated_errors = app
+        let errors = app
             .blocks
             .iter()
             .filter_map(|block| match block {
@@ -3344,7 +3370,7 @@ mod completion_flow_tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(rotated_errors, ["retry unavailable"]);
+        assert_eq!(errors, ["[ProviderError] provider unavailable"]);
     }
 
     #[test]
