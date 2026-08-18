@@ -93,7 +93,7 @@ fn approve(s: &MergeRequestStore, subject: &str, token: &str) -> ReviewEvent {
 }
 #[test]
 fn selectors_thread_and_completion_have_no_revision_or_commit_api() {
-    let (_d, s) = fixture();
+    let (d, s) = fixture();
     open(&s);
     let review = approve(&s, "opaque-source-ref", "token");
     let ready = s
@@ -122,6 +122,33 @@ fn selectors_thread_and_completion_have_no_revision_or_commit_api() {
     let mr = s.get("W", "T").unwrap();
     assert_eq!(mr.selector_from.as_deref(), Some("work/t"));
     assert_eq!(mr.state, MergeRequestState::Merged);
+    let current_assignment: bool = Connection::open(d.path().join("db"))
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM ticket_current_worker_assignments
+                 WHERE workspace_id='W' AND ticket_id='T'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!current_assignment);
+    let replayed = s
+        .complete(CompleteMergeRequest {
+            ticket_id: "T".into(),
+            operation_id: "op".into(),
+            approval_event_id: merged.approval_event_id.clone(),
+            current_subject_ref: merged.approved_source_ref.clone(),
+            target_ref_before: merged.target_ref_before.clone(),
+            target_ref_after: merged.target_ref_after.clone(),
+            strategy: merged.strategy,
+            resolution: merged.resolution,
+            auth: auth(),
+            now: at(6),
+        })
+        .unwrap();
+    assert_eq!(replayed, merged);
     let json = serde_json::to_string(&mr).unwrap();
     for banned in [
         "revision_id",

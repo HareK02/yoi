@@ -12,8 +12,7 @@ use ticket::config::{
 use ticket::{
     LocalTicketBackend, MarkdownText, NewTicket, NewTicketEvent, NewTicketRelation,
     SqliteTicketBackend, TicketBackend, TicketDoctorSeverity, TicketEventKind, TicketIdOrSlug,
-    TicketIntakeSummary, TicketListQuery, TicketListState, TicketRelationKind, TicketSummary,
-    TicketWorkflowState,
+    TicketListQuery, TicketListState, TicketRelationKind, TicketSummary, TicketWorkflowState,
 };
 
 const DEFAULT_LIST_LIMIT: usize = 50;
@@ -630,8 +629,16 @@ fn state(
     let id = TicketIdOrSlug::Query(options.query.clone());
     let target_state = match options.state {
         StateTarget::Planning => TicketWorkflowState::Planning,
-        StateTarget::Ready => TicketWorkflowState::Ready,
-        StateTarget::Queued => TicketWorkflowState::Queued,
+        StateTarget::Ready => {
+            return Err(TicketCliError::new(
+                "ready requires Workspace repository authority; use the Browser Mark ready action or TicketMarkReady",
+            ));
+        }
+        StateTarget::Queued => {
+            return Err(TicketCliError::new(
+                "queued is an Orchestrator operation; use TicketQueue after MarkReady succeeds",
+            ));
+        }
         StateTarget::InProgress => TicketWorkflowState::InProgress,
         StateTarget::Done => {
             return Err(TicketCliError::new(
@@ -646,33 +653,16 @@ fn state(
     };
     let current = backend.show(id.clone())?;
     let ticket_id = current.meta.id.clone();
-    match target_state {
-        TicketWorkflowState::Ready => backend.mark_intake_ready(
-            id,
-            TicketIntakeSummary::new("Marked ready by `yoi ticket state`."),
-            ticket::TicketStateChange {
-                from: current.meta.workflow_state.as_str().to_string(),
-                to: TicketWorkflowState::Ready.as_str().to_string(),
-                reason: "cli_state".to_string(),
-                author: Some("yoi ticket".to_string()),
-                body: "Marked ready by `yoi ticket state`.\n".into(),
-                references: Vec::new(),
-            },
-        )?,
-        TicketWorkflowState::Queued => backend.queue_ready(id, "yoi ticket")?,
-        _ => {
-            let from = current.meta.workflow_state;
-            let change = ticket::TicketStateChange {
-                from: from.as_str().to_string(),
-                to: target_state.as_str().to_string(),
-                reason: "cli_state".to_string(),
-                author: Some("yoi ticket".to_string()),
-                body: format!("State changed to `{}`.\n", target_state.as_str()).into(),
-                references: Vec::new(),
-            };
-            backend.set_workflow_state(id, change)?;
-        }
-    }
+    let from = current.meta.workflow_state;
+    let change = ticket::TicketStateChange {
+        from: from.as_str().to_string(),
+        to: target_state.as_str().to_string(),
+        reason: "cli_state".to_string(),
+        author: Some("yoi ticket".to_string()),
+        body: format!("State changed to `{}`.\n", target_state.as_str()).into(),
+        references: Vec::new(),
+    };
+    backend.set_workflow_state(id, change)?;
     Ok(success(format!(
         "state\t{}\t{}\n",
         ticket_id,
@@ -1335,23 +1325,14 @@ mod tests {
                 .contains(&format!("appended\t{}\timplementation_report", ticket_id))
         );
 
-        let ready = run(&temp, &["state", &ticket_id, "ready"]);
-        assert_eq!(ready.stdout, format!("state\t{}\tready\n", ticket_id));
-        let ready_listed = run(&temp, &["list", "--state", "ready"]);
-        assert!(ready_listed.stdout.contains(&ticket_id));
-
-        let queued = run(&temp, &["state", &ticket_id, "queued"]);
-        assert_eq!(queued.stdout, format!("state\t{}\tqueued\n", ticket_id));
-        let queued_listed = run(&temp, &["list", "--state", "queued"]);
-        assert!(queued_listed.stdout.contains(&ticket_id));
-
-        let inprogress = run(&temp, &["state", &ticket_id, "inprogress"]);
-        assert_eq!(
-            inprogress.stdout,
-            format!("state\t{}\tinprogress\n", ticket_id)
-        );
-        let inprogress_listed = run(&temp, &["list", "--state", "inprogress"]);
-        assert!(inprogress_listed.stdout.contains(&ticket_id));
+        let ready_error = parse_ticket_args(&args(&["state", &ticket_id, "ready"]))
+            .and_then(|cli| run_in_workspace(cli, temp.path()))
+            .unwrap_err();
+        assert!(ready_error.to_string().contains("TicketMarkReady"));
+        let queue_error = parse_ticket_args(&args(&["state", &ticket_id, "queued"]))
+            .and_then(|cli| run_in_workspace(cli, temp.path()))
+            .unwrap_err();
+        assert!(queue_error.to_string().contains("TicketQueue"));
 
         let done_error = parse_ticket_args(&args(&["state", &ticket_id, "done"]))
             .and_then(|cli| run_in_workspace(cli, temp.path()))

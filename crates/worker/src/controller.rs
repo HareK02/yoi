@@ -769,6 +769,21 @@ where
             ),
         );
     }
+    if feature_config.merge_request.any() {
+        let workspace_client = worker.workspace_client_handle();
+        if !workspace_client.is_available() || workspace_client.workspace_id().is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Merge Request tools require Backend Workspace API authority",
+            ));
+        }
+        feature_registry.add_module(
+            crate::feature::builtin::merge_request::MergeRequestFeature::new(
+                workspace_client,
+                feature_config.merge_request,
+            ),
+        );
+    }
     if feature_config.manage_workdir.enabled {
         // Workdir lifecycle is Workspace control-plane authority. The Worker
         // receives only the injected WorkspaceClient and never Runtime URLs,

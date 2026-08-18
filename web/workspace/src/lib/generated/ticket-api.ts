@@ -19,6 +19,7 @@ export type TicketListResponse = {
   workspace_id: string;
   limit: number;
   items: Array<TicketSummary>;
+  page: QueryPage;
   invalid_records: Array<InvalidProjectRecord>;
   record_authority: string;
 };

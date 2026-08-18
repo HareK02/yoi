@@ -178,7 +178,9 @@
     align-content: start;
     gap: 0.55rem;
     min-height: 0;
+    max-height: min(68vh, 48rem);
     overflow-y: auto;
+    overscroll-behavior: contain;
     padding: 0.6rem;
     scrollbar-gutter: stable;
   }
@@ -188,6 +190,27 @@
     padding: 0.5rem;
     font-size: 0.7rem;
     text-align: center;
+  }
+  .ticket-lane-page-state {
+    display: flex;
+    justify-content: center;
+    gap: 0.5rem;
+    margin: 0;
+    padding: 0.45rem;
+    color: var(--text-muted);
+    font-size: 0.72rem;
+    text-align: center;
+  }
+  .ticket-lane-page-error {
+    align-items: center;
+    color: var(--danger);
+  }
+  .ticket-lane-page-error button {
+    border: 1px solid var(--line);
+    border-radius: 0.35rem;
+    background: var(--bg-raised);
+    color: inherit;
+    padding: 0.2rem 0.45rem;
   }
   .ticket-card {
     display: grid;

@@ -18,9 +18,10 @@ use crate::model::{AuthRef, ModelManifest, ReasoningControl};
 use crate::plugin::PluginConfig;
 use crate::{
     CompactionConfig, EngineManifest, FeatureConfig, FeatureFlagConfig, FileUploadLimits,
-    McpConfig, McpEnvValue, McpStdioCwdPolicy, MemoryConfig, MemoryFeatureConfig, ScopeConfig,
-    SessionConfig, SkillsConfig, TicketFeatureConfig, ToolOutputLimits, ToolPermissionConfig,
-    ToolPermissionRule, WebConfig, WorkerFeatureConfig, WorkerManifest, WorkerMeta,
+    McpConfig, McpEnvValue, McpStdioCwdPolicy, MemoryConfig, MemoryFeatureConfig,
+    MergeRequestFeatureConfig, ScopeConfig, SessionConfig, SkillsConfig, TicketFeatureConfig,
+    ToolOutputLimits, ToolPermissionConfig, ToolPermissionRule, WebConfig, WorkerFeatureConfig,
+    WorkerManifest, WorkerMeta,
 };
 
 /// Partial-form Worker manifest. Every field is optional; one or more
@@ -97,6 +98,8 @@ pub struct FeatureConfigPartial {
     #[serde(default)]
     pub ticket: Option<TicketFeatureConfigPartial>,
     #[serde(default)]
+    pub merge_request: Option<MergeRequestFeatureConfigPartial>,
+    #[serde(default)]
     pub orchestration: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
     pub plugins: Option<FeatureFlagConfigPartial>,
@@ -127,6 +130,11 @@ impl FeatureConfigPartial {
                 FeatureFlagConfigPartial::merge,
             ),
             ticket: merge_option(self.ticket, other.ticket, TicketFeatureConfigPartial::merge),
+            merge_request: merge_option(
+                self.merge_request,
+                other.merge_request,
+                MergeRequestFeatureConfigPartial::merge,
+            ),
             orchestration: merge_option(
                 self.orchestration,
                 other.orchestration,
@@ -216,6 +224,28 @@ impl TicketFeatureConfigPartial {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MergeRequestFeatureConfigPartial {
+    pub show: Option<bool>,
+    pub open: Option<bool>,
+    pub review: Option<bool>,
+    pub readiness_check: Option<bool>,
+    pub complete: Option<bool>,
+}
+
+impl MergeRequestFeatureConfigPartial {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            show: other.show.or(self.show),
+            open: other.open.or(self.open),
+            review: other.review.or(self.review),
+            readiness_check: other.readiness_check.or(self.readiness_check),
+            complete: other.complete.or(self.complete),
+        }
+    }
+}
+
 impl From<FeatureConfigPartial> for FeatureConfig {
     fn from(value: FeatureConfigPartial) -> Self {
         Self {
@@ -246,6 +276,10 @@ impl From<FeatureConfigPartial> for FeatureConfig {
             ticket: value
                 .ticket
                 .map(TicketFeatureConfig::from)
+                .unwrap_or_default(),
+            merge_request: value
+                .merge_request
+                .map(MergeRequestFeatureConfig::from)
                 .unwrap_or_default(),
             orchestration: value
                 .orchestration
@@ -326,6 +360,30 @@ impl From<TicketFeatureConfig> for TicketFeatureConfigPartial {
     }
 }
 
+impl From<MergeRequestFeatureConfigPartial> for MergeRequestFeatureConfig {
+    fn from(value: MergeRequestFeatureConfigPartial) -> Self {
+        Self {
+            show: value.show.unwrap_or_default(),
+            open: value.open.unwrap_or_default(),
+            review: value.review.unwrap_or_default(),
+            readiness_check: value.readiness_check.unwrap_or_default(),
+            complete: value.complete.unwrap_or_default(),
+        }
+    }
+}
+
+impl From<MergeRequestFeatureConfig> for MergeRequestFeatureConfigPartial {
+    fn from(value: MergeRequestFeatureConfig) -> Self {
+        Self {
+            show: Some(value.show),
+            open: Some(value.open),
+            review: Some(value.review),
+            readiness_check: Some(value.readiness_check),
+            complete: Some(value.complete),
+        }
+    }
+}
+
 impl From<FeatureConfig> for FeatureConfigPartial {
     fn from(value: FeatureConfig) -> Self {
         Self {
@@ -339,6 +397,7 @@ impl From<FeatureConfig> for FeatureConfigPartial {
             objective: Some(value.objective.into()),
             manage_workdir: Some(value.manage_workdir.into()),
             ticket: Some(value.ticket.into()),
+            merge_request: Some(value.merge_request.into()),
             orchestration: Some(value.orchestration.into()),
             plugins: Some(value.plugins.into()),
         }
@@ -1880,6 +1939,7 @@ worker_max_turns = 7
         assert!(!manifest.feature.objective.enabled);
         assert!(!manifest.feature.manage_workdir.enabled);
         assert!(!manifest.feature.ticket.enabled);
+        assert!(!manifest.feature.merge_request.any());
     }
 
     #[test]
@@ -1898,6 +1958,13 @@ authoring = false
 thread = false
 intake = false
 workflow = false
+
+[feature.merge_request]
+show = true
+open = false
+review = true
+readiness_check = false
+complete = false
 
 [feature.orchestration]
 enabled = false
@@ -1934,6 +2001,14 @@ enabled = false
         assert!(!manifest.feature.ticket.thread);
         assert!(!manifest.feature.ticket.intake);
         assert!(!manifest.feature.ticket.workflow);
+        assert_eq!(
+            manifest.feature.merge_request,
+            MergeRequestFeatureConfig {
+                show: true,
+                review: true,
+                ..Default::default()
+            }
+        );
         assert!(!manifest.feature.orchestration.enabled);
         assert!(!manifest.feature.memory.enabled);
         assert!(!manifest.feature.memory.staging);
@@ -1957,6 +2032,13 @@ thread = false
 intake = false
 workflow = false
 
+[feature.merge_request]
+show = true
+open = false
+review = true
+readiness_check = false
+complete = false
+
 [feature.orchestration]
 enabled = false
 "#,
@@ -1967,6 +2049,11 @@ enabled = false
 [feature.ticket]
 thread = true
 workflow = true
+
+[feature.merge_request]
+open = true
+review = false
+readiness_check = true
 
 [feature.orchestration]
 enabled = true
@@ -2017,6 +2104,16 @@ enabled = true
         assert!(manifest.feature.ticket.thread);
         assert!(!manifest.feature.ticket.intake);
         assert!(manifest.feature.ticket.workflow);
+        assert_eq!(
+            manifest.feature.merge_request,
+            MergeRequestFeatureConfig {
+                show: true,
+                open: true,
+                review: false,
+                readiness_check: true,
+                complete: false,
+            }
+        );
         assert!(manifest.feature.orchestration.enabled);
         assert!(manifest.feature.objective.enabled);
         assert!(manifest.feature.web.enabled);

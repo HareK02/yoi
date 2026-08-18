@@ -919,6 +919,37 @@ fn apply_role_profile(
         _ => serde_json::json!({ "enabled": true, "authoring": true, "thread": true }),
     };
     value["feature"]["ticket"] = ticket;
+    let merge_request = match slug {
+        "coder" => serde_json::json!({
+            "show": true,
+            "open": true,
+            "review": false,
+            "readiness_check": false,
+            "complete": false
+        }),
+        "reviewer" => serde_json::json!({
+            "show": true,
+            "open": false,
+            "review": true,
+            "readiness_check": false,
+            "complete": false
+        }),
+        "orchestrator" => serde_json::json!({
+            "show": true,
+            "open": false,
+            "review": false,
+            "readiness_check": true,
+            "complete": true
+        }),
+        _ => serde_json::json!({
+            "show": false,
+            "open": false,
+            "review": false,
+            "readiness_check": false,
+            "complete": false
+        }),
+    };
+    value["feature"]["merge_request"] = merge_request;
 }
 
 fn reject_manifest_shaped_profile(value: &serde_json::Value) -> Result<(), ProfileError> {
@@ -1448,6 +1479,14 @@ enabled = true
 authoring = false
 thread = false
 intake = false
+
+[feature.merge_request]
+show = true
+open = false
+review = true
+readiness_check = false
+complete = false
+
 [feature.orchestration]
 enabled = false
 "#,
@@ -1470,6 +1509,14 @@ enabled = false
         assert!(!resolved.manifest.feature.ticket.authoring);
         assert!(!resolved.manifest.feature.ticket.thread);
         assert!(!resolved.manifest.feature.ticket.intake);
+        assert_eq!(
+            resolved.manifest.feature.merge_request,
+            crate::MergeRequestFeatureConfig {
+                show: true,
+                review: true,
+                ..Default::default()
+            }
+        );
         assert!(!resolved.manifest.feature.orchestration.enabled);
         assert_eq!(
             resolved.manifest.delegation_scope.allow[0].target,

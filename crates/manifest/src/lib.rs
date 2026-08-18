@@ -125,6 +125,8 @@ pub struct FeatureConfig {
     #[serde(default)]
     pub ticket: TicketFeatureConfig,
     #[serde(default)]
+    pub merge_request: MergeRequestFeatureConfig,
+    #[serde(default)]
     pub orchestration: FeatureFlagConfig,
     #[serde(default)]
     pub plugins: FeatureFlagConfig,
@@ -143,6 +145,7 @@ impl Default for FeatureConfig {
             objective: FeatureFlagConfig::disabled(),
             manage_workdir: FeatureFlagConfig::disabled(),
             ticket: TicketFeatureConfig::default(),
+            merge_request: MergeRequestFeatureConfig::default(),
             orchestration: FeatureFlagConfig::disabled(),
             plugins: FeatureFlagConfig::disabled(),
         }
@@ -250,6 +253,27 @@ pub struct TicketFeatureConfig {
     pub intake: bool,
     #[serde(default)]
     pub workflow: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MergeRequestFeatureConfig {
+    #[serde(default)]
+    pub show: bool,
+    #[serde(default)]
+    pub open: bool,
+    #[serde(default)]
+    pub review: bool,
+    #[serde(default)]
+    pub readiness_check: bool,
+    #[serde(default)]
+    pub complete: bool,
+}
+
+impl MergeRequestFeatureConfig {
+    pub fn any(self) -> bool {
+        self.show || self.open || self.review || self.readiness_check || self.complete
+    }
 }
 
 /// External Agent Skills (`SKILL.md`) ingest configuration. Skills are

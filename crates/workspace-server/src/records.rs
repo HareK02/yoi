@@ -13,6 +13,14 @@ pub struct ProjectRecordList<T> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TicketSummaryPage {
+    pub items: Vec<TicketSummary>,
+    pub page: QueryPage,
+    pub invalid_records: Vec<InvalidProjectRecord>,
+    pub record_authority: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct InvalidProjectRecord {
     pub label: String,
@@ -33,12 +41,23 @@ pub struct TicketSummary {
     pub record_source: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TicketListPageRequest {
+    #[serde(default)]
+    pub states: Vec<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketListResponse {
     pub workspace_id: String,
     pub limit: usize,
     pub items: Vec<TicketSummary>,
+    pub page: QueryPage,
     pub invalid_records: Vec<InvalidProjectRecord>,
     pub record_authority: String,
 }

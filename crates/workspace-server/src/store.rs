@@ -196,6 +196,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "remove Worker control delegation authority",
         apply: remove_worker_control_delegation_authority,
     },
+    Migration {
+        version: 36,
+        name: "add Objective query indexes",
+        apply: add_objective_query_indexes,
+    },
 ];
 
 struct Migration {
@@ -5046,6 +5051,24 @@ fn create_worker_control_delegation_operation_authority(conn: &Connection) -> Re
     Ok(())
 }
 
+fn add_objective_query_indexes(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS objectives_workspace_state_updated
+            ON objectives(workspace_id, state, updated_at DESC, objective_id);
+        CREATE INDEX IF NOT EXISTS objectives_workspace_updated
+            ON objectives(workspace_id, updated_at DESC, objective_id);
+        CREATE INDEX IF NOT EXISTS objectives_workspace_created
+            ON objectives(workspace_id, created_at DESC, objective_id);
+        CREATE INDEX IF NOT EXISTS objectives_workspace_title
+            ON objectives(workspace_id, title COLLATE NOCASE, objective_id);
+        CREATE INDEX IF NOT EXISTS objective_ticket_links_workspace_ticket_objective
+            ON objective_ticket_links(workspace_id, ticket_id, objective_id);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn remove_worker_control_delegation_authority(conn: &Connection) -> Result<()> {
     let mut statement =
         conn.prepare("SELECT workspace_id, grant_id, permissions_json FROM worker_control_grants")?;
@@ -5799,7 +5822,7 @@ INSERT INTO worker_control_grants (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 35);
+        assert_eq!(current_schema_version(&conn).unwrap(), 36);
         assert!(!table_exists(&conn, "worker_control_delegation_operations").unwrap());
         let (permissions_json, revoked_at): (String, Option<String>) = conn
             .query_row(
@@ -5847,7 +5870,7 @@ INSERT INTO worker_control_grants (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 35);
+        assert_eq!(current_schema_version(&conn).unwrap(), 36);
         assert!(table_exists(&conn, "worker_workdir_attachment_reservations").unwrap());
     }
 
@@ -5880,7 +5903,7 @@ CREATE TABLE flow_events (event_id TEXT PRIMARY KEY);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 35);
+        assert_eq!(current_schema_version(&conn).unwrap(), 36);
         assert!(table_exists(&conn, "flow_sources").unwrap());
         assert!(table_exists(&conn, "flow_source_revisions").unwrap());
         assert!(!table_exists(&conn, "flow_instances").unwrap());
@@ -5947,7 +5970,7 @@ INSERT INTO worker_workdir_attachment_reservations (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 35);
+        assert_eq!(current_schema_version(&conn).unwrap(), 36);
         let repositories_sql: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'repositories'",
@@ -6127,7 +6150,7 @@ INSERT INTO workdir_registry (
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 35);
+        assert_eq!(store.schema_version().await.unwrap(), 36);
         assert!(
             !store
                 .with_conn(|conn| table_exists(conn, "worker_workspace_credentials"))
@@ -6144,7 +6167,7 @@ INSERT INTO workdir_registry (
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 35);
+        assert_eq!(reopened.schema_version().await.unwrap(), 36);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -6691,7 +6714,7 @@ INSERT INTO workdir_registry (
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 35);
+        assert_eq!(store.schema_version().await.unwrap(), 36);
 
         store
             .with_conn(|conn| {
@@ -6880,7 +6903,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 35);
+        assert_eq!(store.schema_version().await.unwrap(), 36);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -6946,7 +6969,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 35);
+        assert_eq!(store.schema_version().await.unwrap(), 36);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -7337,7 +7360,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 35);
+        assert_eq!(store.schema_version().await.unwrap(), 36);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),

@@ -7,7 +7,7 @@ use crate::{Result, TicketError, sqlite_err};
 
 const MIGRATION_TABLE: &str = "ticket_schema_migrations";
 const MAX_SCHEMA_DIAGNOSTICS: usize = 32;
-pub const LATEST_SQLITE_TICKET_SCHEMA_VERSION: i64 = 3;
+pub const LATEST_SQLITE_TICKET_SCHEMA_VERSION: i64 = 4;
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -31,6 +31,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 3,
         name: "convert_legacy_reviews_to_comments",
         apply: retire_legacy_ticket_review_events,
+    },
+    Migration {
+        version: 4,
+        name: "add_ticket_query_indexes",
+        apply: add_ticket_query_indexes,
     },
 ];
 
@@ -507,6 +512,29 @@ fn retire_legacy_ticket_review_events(connection: &Connection) -> Result<()> {
         .map_err(sqlite_err)
 }
 
+fn add_ticket_query_indexes(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(
+            r#"
+        CREATE INDEX IF NOT EXISTS typed_tickets_workspace_state_updated
+            ON typed_tickets(workspace_id, workflow_state, updated_at DESC, ticket_id);
+        CREATE INDEX IF NOT EXISTS typed_tickets_workspace_updated
+            ON typed_tickets(workspace_id, updated_at DESC, ticket_id);
+        CREATE INDEX IF NOT EXISTS typed_tickets_workspace_created
+            ON typed_tickets(workspace_id, created_at DESC, ticket_id);
+        CREATE INDEX IF NOT EXISTS typed_tickets_workspace_title
+            ON typed_tickets(workspace_id, title COLLATE NOCASE, ticket_id);
+        CREATE INDEX IF NOT EXISTS typed_ticket_events_workspace_kind_ticket
+            ON typed_ticket_events(workspace_id, kind, ticket_id, event_index);
+        CREATE INDEX IF NOT EXISTS typed_ticket_relations_workspace_source_kind
+            ON typed_ticket_relations(workspace_id, ticket_id, kind, target);
+        CREATE INDEX IF NOT EXISTS typed_ticket_relations_workspace_target_kind
+            ON typed_ticket_relations(workspace_id, target, kind, ticket_id);
+        "#,
+        )
+        .map_err(sqlite_err)
+}
+
 fn add_column_if_missing(
     connection: &Connection,
     table: &str,
@@ -841,10 +869,10 @@ mod tests {
         verify_sqlite_ticket_schema(&connection).unwrap();
 
         let versions = load_applied_migrations(&connection).unwrap();
-        assert_eq!(versions.len(), 3);
+        assert_eq!(versions.len(), 4);
         assert_eq!(
             versions.get(&LATEST_SQLITE_TICKET_SCHEMA_VERSION),
-            Some(&"convert_legacy_reviews_to_comments".to_string())
+            Some(&"add_ticket_query_indexes".to_string())
         );
     }
 
@@ -989,7 +1017,7 @@ mod tests {
                 .to_string()
                 .contains("unsupported Ticket schema migration version 99")
         );
-        assert_eq!(load_applied_migrations(&connection).unwrap().len(), 4);
+        assert_eq!(load_applied_migrations(&connection).unwrap().len(), 5);
     }
 
     #[test]
@@ -1090,7 +1118,7 @@ mod tests {
         connection.execute("INSERT INTO typed_ticket_events (workspace_id,ticket_id,event_index,kind,author,at,status,heading,body) VALUES ('workspace-1','ticket-1',0,'review','reviewer','2026-08-11T00:00:00Z','approve','Review','legacy evidence')",[]).unwrap();
         connection.execute("INSERT INTO typed_ticket_event_attributes (workspace_id,ticket_id,event_index,key,value) VALUES ('workspace-1','ticket-1',0,'result','approve')",[]).unwrap();
         connection
-            .execute("DELETE FROM ticket_schema_migrations WHERE version=3", [])
+            .execute("DELETE FROM ticket_schema_migrations WHERE version>=3", [])
             .unwrap();
         migrate_sqlite_ticket_schema(&connection).unwrap();
         let (kind,status,heading,body):(String,Option<String>,Option<String>,Option<String>)=connection.query_row("SELECT kind,status,heading,body FROM typed_ticket_events WHERE workspace_id='workspace-1' AND ticket_id='ticket-1' AND event_index=0",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
@@ -1129,6 +1157,6 @@ mod tests {
 
         let connection = Connection::open(database).unwrap();
         verify_sqlite_ticket_schema(&connection).unwrap();
-        assert_eq!(load_applied_migrations(&connection).unwrap().len(), 3);
+        assert_eq!(load_applied_migrations(&connection).unwrap().len(), 4);
     }
 }

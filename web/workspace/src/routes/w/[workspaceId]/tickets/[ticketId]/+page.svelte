@@ -14,6 +14,7 @@
   import type { ApiResult } from "$lib/workspace/api/http";
   import type {
     RepositoryListResponse,
+    RepositorySummary,
     TicketDetail,
   } from "$lib/workspace/sidebar/types";
 
@@ -65,7 +66,9 @@
     thread: MergeRequestThreadEvent[];
   };
 
-  const MUTABLE_TICKET_STATES = TICKET_STATES.filter((state) => state !== "done");
+  const MUTABLE_TICKET_STATES = TICKET_STATES.filter((state) =>
+    state !== "done" && state !== "ready" && state !== "queued"
+  );
 
   const { data } = $props<{
     data: {
@@ -115,6 +118,27 @@
   let resolution = $state("");
   let busy = $state<string | null>(null);
   let errorMessage = $state<string | null>(null);
+  let readyOperationKey = $state<string | null>(null);
+  const selectedRepository = $derived(
+    (loadedRepositories?.items ?? []).find((repository: RepositorySummary) => repository.id === repositoryId) ?? null,
+  );
+  const effectiveRefSelector = $derived(refSelector.trim() || selectedRepository?.default_ref || "");
+  const targetCandidateValid = $derived(
+    ticket.state === "planning" &&
+      selectedRepository !== null &&
+      (selectedRepository.diagnostics ?? []).length === 0 &&
+      effectiveRefSelector.length > 0,
+  );
+  const persistedTargetValid = $derived(
+    ticket.repository_id !== null &&
+      ticket.ref_selector !== null &&
+      (loadedRepositories?.items ?? []).some((repository: RepositorySummary) =>
+        repository.id === ticket.repository_id && (repository.diagnostics ?? []).length === 0
+      ),
+  );
+  const implementationStartEligible = $derived(
+    persistedTargetValid && ticket.state !== "planning" && ticket.state !== "closed",
+  );
 
   const ticketPath = $derived(
     workspaceApiPath(
@@ -178,6 +202,33 @@
         }
         : { action: "clear" },
     }, "PATCH");
+  }
+
+  async function markReady() {
+    if (!targetCandidateValid || busy) return;
+    if (
+      ticket.repository_id !== repositoryId ||
+      (ticket.ref_selector ?? "") !== refSelector.trim()
+    ) {
+      const saved = await mutate("target", "", {
+        target: {
+          action: "set",
+          repository_id: repositoryId,
+          ref_selector: refSelector.trim() || null,
+        },
+      }, "PATCH");
+      if (!saved) return;
+    }
+    readyOperationKey ??= crypto.randomUUID();
+    if (
+      await mutate("ready", "/ready", {
+        operation_key: readyOperationKey,
+        reason: transitionReason.trim() || null,
+      })
+    ) {
+      readyOperationKey = null;
+      transitionReason = "";
+    }
   }
 
   async function transition(event: SubmitEvent) {
@@ -329,16 +380,19 @@
         <p class="ticket-assignment-line">
           Assigned to <strong>{ticket.assignee ?? "Unassigned"}</strong>
         </p>
-        {#if orchestratorOnline}
-          <p>The Orchestrator is online. Start a role-specific Worker with the Ticket target below.</p>
+        {#if orchestratorOnline && implementationStartEligible}
+          <p>The Orchestrator is online. Start a role-specific Worker with the validated Ticket target below.</p>
           <div class="ticket-role-actions">
             <a class="workspace-primary-button" href={ticketWorkerLaunchHref(data.workspaceId, ticket, "coder")}>Coder</a>
           </div>
         {:else}
-          <p class="workspace-callout">Start the Workspace Orchestrator from the Ticket panel before launching Ticket Workers.</p>
+          <p class="workspace-callout">
+            {orchestratorOnline
+              ? "Validate and persist the repository target before starting a Ticket Worker."
+              : "Start the Workspace Orchestrator from the Ticket panel before launching Ticket Workers."}
+          </p>
           <div class="ticket-role-actions">
             <button class="workspace-primary-button" type="button" disabled>Coder</button>
-            <button class="workspace-secondary-button" type="button" disabled>Reviewer</button>
           </div>
         {/if}
       </section>
@@ -347,15 +401,15 @@
         <header><h2>Repository target</h2></header>
         <form class="ticket-control-form" onsubmit={saveTarget}>
           <label>Repository
-            <select bind:value={repositoryId}>
+            <select bind:value={repositoryId} disabled={ticket.state !== "planning"}>
               <option value="">Not assigned</option>
               {#each loadedRepositories?.items ?? [] as repository}
                 <option value={repository.id}>{repository.display_name}</option>
               {/each}
             </select>
           </label>
-          <label>Ref selector<input bind:value={refSelector} placeholder="branch, tag, or revision" /></label>
-          <button class="workspace-secondary-button" type="submit" disabled={busy === "target"}>
+          <label>Ref selector<input bind:value={refSelector} placeholder={selectedRepository?.default_ref ?? "branch, tag, or revision"} disabled={ticket.state !== "planning"} /></label>
+          <button class="workspace-secondary-button" type="submit" disabled={busy === "target" || ticket.state !== "planning"}>
             {busy === "target" ? "Saving…" : "Save target"}
           </button>
         </form>
@@ -374,8 +428,15 @@
             Apply state
           </button>
         </form>
-        {#if ticket.state === "ready"}
-          <button class="workspace-primary-button ticket-queue-button" type="button" disabled={busy === "queue" || !orchestratorOnline} onclick={() => mutate("queue", "/queue", {})}>
+        {#if ticket.state === "planning"}
+          <button class="workspace-primary-button ticket-queue-button" type="button" disabled={busy !== null || !targetCandidateValid} onclick={markReady}>
+            {busy === "ready" ? "Marking ready…" : "Mark ready"}
+          </button>
+          {#if !targetCandidateValid}
+            <p class="workspace-empty-copy">Choose a healthy repository and an effective ref selector before marking ready.</p>
+          {/if}
+        {:else if ticket.state === "ready"}
+          <button class="workspace-primary-button ticket-queue-button" type="button" disabled={busy === "queue" || !orchestratorOnline || !persistedTargetValid} onclick={() => mutate("queue", "/queue", {})}>
             {busy === "queue" ? "Queueing…" : orchestratorOnline ? "Queue ticket" : "Orchestrator offline"}
           </button>
         {/if}

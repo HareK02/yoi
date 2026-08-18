@@ -12,5 +12,12 @@ import "./base.dcdl" // {
         flow = { enabled = true; };
         worker = { enabled = true; };
         ticket = { enabled = true; thread = true; };
+        merge_request = {
+            show = true;
+            open = true;
+            review = false;
+            readiness_check = false;
+            complete = false;
+        };
     };
 }

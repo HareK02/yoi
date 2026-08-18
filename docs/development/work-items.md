@@ -31,14 +31,15 @@ Maintainers can inspect the local `.yoi/tickets/` files directly when debugging 
 
 ## Ticket tools inside Workers
 
-Workers with the Ticket built-in feature can use typed Ticket tools:
+Workers with the Ticket and operation-specific Merge Request built-in features can use typed workflow tools:
 
 - `TicketCreate`
 - `QueryTicket` — bounded authoritative Ticket discovery with typed state/text/event/evidence/relation/Objective/time/attention filters, stable snippets, and cursor metadata.
 - `ShowTicket` — detailed authority for one Ticket, including item revision, bounded thread/event references, relations, linked Objectives, implementation reports, and current Merge Request/review evidence.
 - `TicketComment`
-- `MergeRequestShow`, `MergeRequestOpen`, `MergeRequestAddRevision`, `MergeRequestComplete`
-- `MergeRequestReviewSubmit` — available only inside the attested direct-child Reviewer attempt; attempt/revision capability material is not model input.
+- Coder: `MergeRequestShow`, `MergeRequestOpen`
+- Reviewer: `MergeRequestShow`, `MergeRequestReview` — available only inside the attested direct-child Reviewer request; grant and subject-ref capability material are not model input.
+- Orchestrator: `MergeRequestShow`, `MergeRequestReadinessCheck`, `MergeRequestComplete`
 - `TicketClose`
 - `TicketRelationRecord`
 
@@ -243,7 +244,7 @@ Implementation normally happens in a child git worktree created by the Orchestra
 
 The assigned Coder launches the Reviewer as an actual direct-child `builtin:reviewer` SubWorker with read-only scope and a structured handoff bound to the current immutable Merge Request revision. Server authority revalidates the parent assignment, Runtime-owned child session, effective profile, one-shot review attempt, and revision; prose output is not approval.
 
-The Reviewer records the structured result with `MergeRequestReviewSubmit`. Request changes requires a new immutable revision and a fresh child attempt. `MergeRequestComplete` performs guarded Ticket completion with operation-id dedupe/CAS semantics; Flow transitions are not completion authority.
+The Reviewer records the structured result with `MergeRequestReview`. Request changes requires a new immutable revision and a fresh child attempt. The Orchestrator uses `MergeRequestReadinessCheck` and then `MergeRequestComplete` for guarded integration with operation-id dedupe/CAS semantics; Flow transitions are not completion authority.
 
 Blockers must be fixed or explicitly escalated before merge-ready submission.
 
