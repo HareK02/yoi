@@ -45,7 +45,7 @@ impl FeatureModule for OrchestrationFeature {
             ))
             .with_tool(ToolDeclaration::new(
                 TOOL_NAME,
-                "Spawn and atomically assign a Coder Worker for an inprogress Ticket. The profile, Flow, display name, assignment operation, and initial message are fixed by orchestration policy.",
+                "Spawn and atomically assign a Coder Worker for a queued or already-inprogress Ticket. The guarded operation records queued acceptance only after spawn, initial input, assignment, and Workdir finalization. The profile, Flow, display name, assignment operation, and initial message are fixed by orchestration policy.",
             ))
     }
 
@@ -96,9 +96,12 @@ impl Tool for SpawnTicketCoderTool {
             .ticket_service
             .workflow_state(&ticket_id)
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
-        if workflow_state != ticket::TicketWorkflowState::InProgress {
+        if !matches!(
+            workflow_state,
+            ticket::TicketWorkflowState::Queued | ticket::TicketWorkflowState::InProgress
+        ) {
             return Err(ToolError::ExecutionFailed(format!(
-                "Ticket {ticket_id} must be inprogress before spawning its Coder; current state is {}",
+                "Ticket {ticket_id} must be queued or inprogress before spawning its Coder; current state is {}",
                 workflow_state.as_str()
             )));
         }
@@ -206,7 +209,7 @@ mod tests {
 
     impl TicketService for RecordingTicketService {
         fn workflow_state(&self, _ticket_id: &str) -> Result<TicketWorkflowState, TicketError> {
-            Ok(TicketWorkflowState::InProgress)
+            Ok(TicketWorkflowState::Queued)
         }
     }
 
@@ -277,10 +280,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_ticket_coder_rejects_ticket_before_worker_side_effect() {
+    async fn spawn_ticket_coder_rejects_ineligible_ticket_before_worker_side_effect() {
         let worker_service = Arc::new(RecordingService::default());
         let tool = SpawnTicketCoderTool {
-            ticket_service: Arc::new(FixedTicketService(TicketWorkflowState::Queued)),
+            ticket_service: Arc::new(FixedTicketService(TicketWorkflowState::Planning)),
             worker_service: worker_service.clone(),
         };
         let error = tool
@@ -295,7 +298,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("must be inprogress"));
+        assert!(error.to_string().contains("must be queued or inprogress"));
         assert!(worker_service.requests.lock().unwrap().is_empty());
     }
 

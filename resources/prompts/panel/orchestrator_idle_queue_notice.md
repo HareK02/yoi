@@ -1,7 +1,7 @@
 <system-reminder>
 Workspace Dashboard observed that this Orchestrator Worker is idle while queued Ticket work is present.
 
-This is bounded attention only, not scheduler authority. Do not drain the queue automatically. Before implementation side effects, verify the Ticket state and record the normal `queued -> inprogress` acceptance through Ticket tools.
+This is bounded attention only, not scheduler authority. Do not drain the queue automatically. Verify the Ticket is still `queued`, then use the guarded `SpawnTicketCoder` operation without a separate state transition; that operation records `queued -> inprogress` only after Worker creation, initial input, assignment, and Workdir finalization are durably accepted.
 
 Workspace: {{ workspace }}
 

@@ -2902,9 +2902,13 @@ fn validate_ticket_assignment_state(
     assignment: &WorkerTicketAssignmentRequest,
 ) -> Result<()> {
     let ticket = api.authority.ticket(&assignment.ticket_id)?;
-    if ticket.state != TicketWorkflowState::InProgress.as_str() {
+    if !matches!(
+        ticket.state.as_str(),
+        state if state == TicketWorkflowState::Queued.as_str()
+            || state == TicketWorkflowState::InProgress.as_str()
+    ) {
         return Err(Error::TicketAssignmentConflict(format!(
-            "Ticket {} must be inprogress before assigning an implementation Coder; current state is {}",
+            "Ticket {} must be queued or inprogress before assigning an implementation Coder; current state is {}",
             ticket.id, ticket.state
         )));
     }
@@ -3070,6 +3074,33 @@ fn assign_ticket_worker_from_lifecycle(
             false,
         )?
         .current)
+}
+
+fn accept_queued_ticket_after_worker_spawn(
+    api: &WorkspaceApi,
+    assignment: &crate::hosts::WorkerTicketAssignmentRequest,
+) -> Result<()> {
+    let ticket = api.authority.ticket(&assignment.ticket_id)?;
+    if ticket.state == TicketWorkflowState::InProgress.as_str() {
+        return Ok(());
+    }
+    if ticket.state != TicketWorkflowState::Queued.as_str() {
+        return Err(Error::TicketAssignmentConflict(format!(
+            "Ticket {} left queued state before Coder spawn acceptance; current state is {}",
+            ticket.id, ticket.state
+        )));
+    }
+    let mut change = TicketStateChange::new(
+        TicketWorkflowState::Queued.as_str(),
+        TicketWorkflowState::InProgress.as_str(),
+        "Coder spawn, assignment, and initial input were durably accepted",
+        "",
+    );
+    change.author = Some("workspace-orchestrator".to_string());
+    browser_ticket_backend(api)?
+        .set_workflow_state(TicketIdOrSlug::Id(ticket.id), change)
+        .map_err(Error::from)?;
+    Ok(())
 }
 
 fn existing_lifecycle_assignment_worker(
@@ -9274,6 +9305,20 @@ fn browser_worker_response_from_summary(
             link_worker_to_workdir(api, &worker_record, workdir_id, None)?;
         }
     }
+    if let Some(assignment) = assignment {
+        let context = WorkerSpawnCompensationContext {
+            assignment: Some(assignment),
+            prepared_workdir_id: selected_working_directory_id,
+            cleanup_spawned_workdir: false,
+        };
+        finalize_worker_spawn_stage(
+            api,
+            &worker,
+            &context,
+            WorkerSpawnFinalizeStage::TicketStateAccept,
+            accept_queued_ticket_after_worker_spawn(api, assignment).map_err(ApiError::from),
+        )?;
+    }
     let runtime_id = worker.worker.runtime_id.clone();
     let worker_id = worker.worker.worker_id.clone();
     let workspace_id = api.workspace_id().to_string();
@@ -9488,6 +9533,7 @@ enum WorkerSpawnFinalizeStage {
     WorkerRegistry,
     TicketAssignmentBind,
     TicketAssignmentCurrent,
+    TicketStateAccept,
     WorkdirRegistry,
     WorkdirAttachment,
 }
@@ -9498,6 +9544,7 @@ impl WorkerSpawnFinalizeStage {
             Self::WorkerRegistry => "worker_registry",
             Self::TicketAssignmentBind => "ticket_assignment_bind",
             Self::TicketAssignmentCurrent => "ticket_assignment_current",
+            Self::TicketStateAccept => "ticket_state_accept",
             Self::WorkdirRegistry => "workdir_registry",
             Self::WorkdirAttachment => "workdir_attachment",
         }
@@ -12829,7 +12876,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_assignment_spawn_requires_inprogress_before_runtime_side_effects() {
+    async fn ticket_assignment_spawn_requires_queued_or_inprogress_before_runtime_side_effects() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
@@ -12889,7 +12936,7 @@ mod tests {
         let api = test_api(workspace.path()).await;
         let backend = browser_ticket_backend(&api).unwrap();
         let mut input = ticket::NewTicket::new("Assigned Ticket");
-        input.workflow_state = Some(TicketWorkflowState::InProgress);
+        input.workflow_state = Some(TicketWorkflowState::Queued);
         let ticket = backend.create(input).unwrap();
         let response = create_workspace_worker(
             State(api.clone()),
@@ -12914,6 +12961,10 @@ mod tests {
         .unwrap()
         .0;
 
+        assert_eq!(
+            api.authority.ticket(&ticket.id).unwrap().state,
+            TicketWorkflowState::InProgress.as_str()
+        );
         let current = api
             .store
             .get_current_ticket_worker_assignment(&api.config.workspace_id, &ticket.id)
@@ -12930,6 +12981,50 @@ mod tests {
             .unwrap();
         assert_eq!(operation.assignment_id, Some(current.assignment_id));
         assert_eq!(operation.worker, Some(response.worker_ref));
+    }
+
+    #[tokio::test]
+    async fn failed_ticket_assignment_spawn_leaves_ticket_queued() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let backend = browser_ticket_backend(&api).unwrap();
+        let mut input = ticket::NewTicket::new("Queued Ticket");
+        input.workflow_state = Some(TicketWorkflowState::Queued);
+        let ticket = backend.create(input).unwrap();
+
+        let result = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(CreateWorkspaceWorkerRequest {
+                runtime_id: "missing-runtime".to_string(),
+                display_name: "Rejected Coder".to_string(),
+                profile: Some("builtin:coder".to_string()),
+                ticket_assignment: Some(CreateWorkspaceWorkerTicketAssignmentRequest {
+                    ticket_id: ticket.id.clone(),
+                    operation_id: "failed-queued-assignment".to_string(),
+                }),
+                initial_submit: vec![Segment::Flow {
+                    selector: "builtin:coder-review".to_string(),
+                }],
+                working_directory: None,
+                control_operation_id: None,
+                resolved_control_operation: None,
+            }),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            api.authority.ticket(&ticket.id).unwrap().state,
+            TicketWorkflowState::Queued.as_str()
+        );
+        assert!(
+            api.store
+                .get_current_ticket_worker_assignment(&api.config.workspace_id, &ticket.id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
