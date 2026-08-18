@@ -215,13 +215,15 @@ pub fn project_prompts_from_workspace_config(
             "active Workspace config projection has no prompts namespace".to_string(),
         )
     })?;
-    EffectivePromptCatalog::from_projection(
+    let mut catalog = EffectivePromptCatalog::from_projection(
         prompts,
         state.snapshot.revision,
         state.contract.schema_bundle.fingerprint.clone(),
         state.contract.fingerprint.clone(),
     )
-    .map_err(|error| Error::RegistryInconsistency(error.to_string()))
+    .map_err(|error| Error::RegistryInconsistency(error.to_string()))?;
+    catalog.source_digest = state.snapshot.digest.clone();
+    Ok(catalog)
 }
 
 pub fn project_workspace_prompt_projection(

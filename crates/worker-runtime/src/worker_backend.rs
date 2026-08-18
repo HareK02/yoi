@@ -653,18 +653,22 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         };
         if let Some(bundle) = request.config_bundle.as_ref() {
             if let Some(prompt_catalog) = bundle.prompt_catalog.clone() {
-                let source_digest = bundle
-                    .metadata
-                    .provenance
-                    .detail
-                    .as_deref()
-                    .and_then(|detail| {
-                        detail
-                            .split(';')
-                            .find_map(|part| part.strip_prefix("source_tree_digest="))
-                    })
-                    .unwrap_or(&prompt_catalog.catalog_digest)
-                    .to_string();
+                let source_digest = if prompt_catalog.source_digest.is_empty() {
+                    bundle
+                        .metadata
+                        .provenance
+                        .detail
+                        .as_deref()
+                        .and_then(|detail| {
+                            detail
+                                .split(';')
+                                .find_map(|part| part.strip_prefix("source_tree_digest="))
+                        })
+                        .unwrap_or(&prompt_catalog.catalog_digest)
+                        .to_string()
+                } else {
+                    prompt_catalog.source_digest.clone()
+                };
                 let projection = worker::WorkspacePromptProjection::new(
                     bundle.metadata.workspace_id.clone(),
                     source_digest,

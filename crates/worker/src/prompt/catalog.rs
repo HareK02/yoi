@@ -31,6 +31,8 @@ const BUILTIN_TOOLCHAIN_FINGERPRINT: &str = "builtin:prompts:decodal-0.4";
 pub struct EffectivePromptCatalog {
     pub templates: BTreeMap<String, String>,
     pub config_revision: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_digest: String,
     pub schema_fingerprint: String,
     pub toolchain_fingerprint: String,
     pub catalog_digest: String,
@@ -48,6 +50,7 @@ impl EffectivePromptCatalog {
         Ok(Self {
             templates,
             config_revision,
+            source_digest: String::new(),
             schema_fingerprint: schema_fingerprint.into(),
             toolchain_fingerprint: toolchain_fingerprint.into(),
             catalog_digest,
@@ -206,6 +209,11 @@ impl WorkspacePromptProjection {
         if projection_digest.trim().is_empty() {
             return Err(CatalogError::InvalidTemplateCatalog(
                 "Workspace Prompt projection digest must not be empty".to_string(),
+            ));
+        }
+        if !catalog.source_digest.is_empty() && catalog.source_digest != source_digest {
+            return Err(CatalogError::InvalidTemplateCatalog(
+                "Workspace Prompt projection source digest does not match its catalog".to_string(),
             ));
         }
         Ok(Self {
