@@ -2268,6 +2268,9 @@ struct ObjectiveEditRequest {
 #[derive(Debug, Deserialize)]
 struct TicketListQuery {
     limit: Option<usize>,
+    cursor: Option<String>,
+    /// Comma-separated workflow states. Repeated lane requests normally pass one state group.
+    states: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -8476,17 +8479,35 @@ async fn list_tickets(
     State(api): State<WorkspaceApi>,
     Query(query): Query<TicketListQuery>,
 ) -> ApiResult<Json<crate::records::TicketListResponse>> {
-    let requested_limit = query.limit.unwrap_or(api.config.max_records);
-    let limit = requested_limit.min(1000);
-    let ProjectRecordList {
+    let limit = query.limit.unwrap_or(30).clamp(1, 100);
+    let states = query
+        .states
+        .as_deref()
+        .map(|states| {
+            states
+                .split(',')
+                .filter(|state| !state.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let crate::records::TicketSummaryPage {
         items,
+        page,
         invalid_records,
         record_authority,
-    } = api.authority.list_tickets(limit)?;
+    } = api
+        .authority
+        .list_ticket_page(crate::records::TicketListPageRequest {
+            states,
+            limit: Some(limit),
+            cursor: query.cursor,
+        })?;
     Ok(Json(crate::records::TicketListResponse {
         workspace_id: api.config.workspace_id,
         limit,
         items,
+        page,
         invalid_records,
         record_authority,
     }))

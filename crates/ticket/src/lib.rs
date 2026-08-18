@@ -120,6 +120,26 @@ fn io_err(path: impl Into<PathBuf>, source: io::Error) -> TicketError {
     }
 }
 
+fn read_ticket_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TicketSummary> {
+    let workflow_state = row.get::<_, String>(7)?;
+    Ok(TicketSummary {
+        id: row.get(0)?,
+        slug: row.get(1)?,
+        title: row.get(2)?,
+        status: ExtensibleTicketStatus::from(row.get::<_, String>(3)?.as_str()),
+        kind: row.get(4)?,
+        priority: row.get(5)?,
+        labels: Vec::new(),
+        readiness: row.get(6)?,
+        workflow_state: TicketWorkflowState::parse(&workflow_state)
+            .unwrap_or(TicketWorkflowState::Planning),
+        workflow_state_explicit: row.get::<_, i64>(8)? != 0,
+        queued_by: row.get(9)?,
+        queued_at: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
+}
+
 fn sqlite_err(error: impl std::fmt::Display) -> TicketError {
     TicketError::Sqlite(error.to_string())
 }
@@ -1572,6 +1592,27 @@ pub struct SqliteTicketListProjection {
     pub items: Vec<SqliteTicketListItem>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SqliteTicketListCursor {
+    pub state_rank: i64,
+    pub updated_at: Option<String>,
+    pub ticket_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SqliteTicketListPageQuery {
+    pub states: Vec<TicketWorkflowState>,
+    pub limit: usize,
+    pub after: Option<SqliteTicketListCursor>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SqliteTicketListPage {
+    pub items: Vec<SqliteTicketListItem>,
+    pub has_more: bool,
+    pub next: Option<SqliteTicketListCursor>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketInvalidRecord {
     pub label: String,
@@ -2550,6 +2591,112 @@ impl SqliteTicketBackend {
                         }
                     })
                     .collect(),
+            })
+        })
+    }
+
+    /// Lists one stable keyset-paginated Workspace summary page.
+    ///
+    /// Filtering, ordering, and `limit + 1` are applied by SQLite before the bounded blocker
+    /// hydration query. The returned cursor is storage data; callers must wrap it in their own
+    /// opaque, query-bound transport cursor.
+    pub fn list_workspace_projection_page(
+        &self,
+        query: SqliteTicketListPageQuery,
+    ) -> Result<SqliteTicketListPage> {
+        self.with_read(|conn| {
+            let states = serde_json::to_string(
+                &query
+                    .states
+                    .iter()
+                    .map(|state| state.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|error| TicketError::Sqlite(error.to_string()))?;
+            let cursor_rank = query.after.as_ref().map(|cursor| cursor.state_rank);
+            let cursor_updated_at = query
+                .after
+                .as_ref()
+                .and_then(|cursor| cursor.updated_at.clone());
+            let cursor_id = query
+                .after
+                .as_ref()
+                .map(|cursor| cursor.ticket_id.as_str());
+            let fetch_limit = query.limit.saturating_add(1);
+            let mut statement = conn
+                .prepare(
+                    "SELECT ticket_id, slug, title, status, kind, priority, readiness,
+                            workflow_state, workflow_state_explicit, queued_by, queued_at, updated_at
+                     FROM typed_tickets AS ticket
+                     WHERE workspace_id = ?1
+                       AND (json_array_length(?2) = 0 OR EXISTS (
+                           SELECT 1 FROM json_each(?2) AS state
+                           WHERE state.value = ticket.workflow_state
+                       ))
+                       AND (?3 IS NULL OR
+                            CASE ticket.workflow_state
+                              WHEN 'ready' THEN 0 WHEN 'planning' THEN 1
+                              WHEN 'inprogress' THEN 2 WHEN 'queued' THEN 3
+                              WHEN 'done' THEN 4 WHEN 'closed' THEN 5 ELSE 6 END > ?4
+                            OR (CASE ticket.workflow_state
+                              WHEN 'ready' THEN 0 WHEN 'planning' THEN 1
+                              WHEN 'inprogress' THEN 2 WHEN 'queued' THEN 3
+                              WHEN 'done' THEN 4 WHEN 'closed' THEN 5 ELSE 6 END = ?4
+                              AND (COALESCE(ticket.updated_at, '') < COALESCE(?5, '')
+                                OR (COALESCE(ticket.updated_at, '') = COALESCE(?5, '')
+                                  AND ticket.ticket_id > ?3))))
+                     ORDER BY CASE ticket.workflow_state
+                                WHEN 'ready' THEN 0 WHEN 'planning' THEN 1
+                                WHEN 'inprogress' THEN 2 WHEN 'queued' THEN 3
+                                WHEN 'done' THEN 4 WHEN 'closed' THEN 5 ELSE 6 END ASC,
+                              ticket.updated_at DESC, ticket.ticket_id ASC
+                     LIMIT ?6",
+                )
+                .map_err(sqlite_err)?;
+            let rows = statement
+                .query_map(
+                    params![
+                        self.workspace_id,
+                        states,
+                        cursor_id,
+                        cursor_rank,
+                        cursor_updated_at,
+                        i64::try_from(fetch_limit).unwrap_or(i64::MAX)
+                    ],
+                    read_ticket_summary_row,
+                )
+                .map_err(sqlite_err)?;
+            let mut summaries = rows
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(sqlite_err)?;
+            let has_more = summaries.len() > query.limit;
+            summaries.truncate(query.limit);
+            let next = has_more.then(|| {
+                let summary = summaries.last().expect("non-empty page with continuation");
+                SqliteTicketListCursor {
+                    state_rank: match summary.workflow_state {
+                        TicketWorkflowState::Ready => 0,
+                        TicketWorkflowState::Planning => 1,
+                        TicketWorkflowState::InProgress => 2,
+                        TicketWorkflowState::Queued => 3,
+                        TicketWorkflowState::Done => 4,
+                        TicketWorkflowState::Closed => 5,
+                    },
+                    updated_at: summary.updated_at.clone(),
+                    ticket_id: summary.id.clone(),
+                }
+            });
+            let blockers = self.list_workspace_blockers(conn, &summaries)?;
+            Ok(SqliteTicketListPage {
+                items: summaries
+                    .into_iter()
+                    .map(|summary| SqliteTicketListItem {
+                        relation_blockers: blockers.get(&summary.id).cloned().unwrap_or_default(),
+                        summary,
+                    })
+                    .collect(),
+                has_more,
+                next,
             })
         })
     }
@@ -7235,6 +7382,86 @@ state: planning
     }
 
     #[test]
+    fn sqlite_workspace_projection_page_uses_stable_keyset_and_state_filter() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("workspace.db");
+        let backend = SqliteTicketBackend::open(&db_path, "workspace-test").unwrap();
+        let mut ids = Vec::new();
+        for (title, state, updated_at) in [
+            ("Newest", TicketWorkflowState::Ready, "2026-08-12T03:00:00Z"),
+            ("Middle", TicketWorkflowState::Ready, "2026-08-12T02:00:00Z"),
+            (
+                "Oldest",
+                TicketWorkflowState::Planning,
+                "2026-08-12T01:00:00Z",
+            ),
+        ] {
+            let mut input = NewTicket::new(title);
+            input.workflow_state = Some(state);
+            let ticket = backend.create(input).unwrap();
+            Connection::open(&db_path)
+                .unwrap()
+                .execute(
+                    "UPDATE typed_tickets SET updated_at=?3 WHERE workspace_id=?1 AND ticket_id=?2",
+                    params!["workspace-test", ticket.id, updated_at],
+                )
+                .unwrap();
+            ids.push(ticket.id);
+        }
+
+        Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE typed_tickets SET updated_at='2026-08-12T05:00:00Z' WHERE workspace_id=?1 AND ticket_id=?2",
+                params!["workspace-test", ids[2]],
+            )
+            .unwrap();
+        let combined_lane = backend
+            .list_workspace_projection_page(SqliteTicketListPageQuery {
+                states: vec![TicketWorkflowState::Ready, TicketWorkflowState::Planning],
+                limit: 1,
+                after: None,
+            })
+            .unwrap();
+        assert_eq!(
+            combined_lane.items[0].summary.workflow_state,
+            TicketWorkflowState::Ready,
+            "lane pagination order must match the UI's state-primary order",
+        );
+
+        let first = backend
+            .list_workspace_projection_page(SqliteTicketListPageQuery {
+                states: vec![TicketWorkflowState::Ready],
+                limit: 1,
+                after: None,
+            })
+            .unwrap();
+        assert_eq!(first.items[0].summary.id, ids[0]);
+        assert!(first.has_more);
+
+        let mut inserted = NewTicket::new("Inserted");
+        inserted.workflow_state = Some(TicketWorkflowState::Ready);
+        let inserted = backend.create(inserted).unwrap();
+        Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE typed_tickets SET updated_at='2026-08-12T04:00:00Z' WHERE workspace_id=?1 AND ticket_id=?2",
+                params!["workspace-test", inserted.id],
+            )
+            .unwrap();
+
+        let second = backend
+            .list_workspace_projection_page(SqliteTicketListPageQuery {
+                states: vec![TicketWorkflowState::Ready],
+                limit: 1,
+                after: first.next,
+            })
+            .unwrap();
+        assert_eq!(second.items[0].summary.id, ids[1]);
+        assert!(!second.has_more);
+    }
+
+    #[test]
     fn sqlite_workspace_projection_sql_shape_is_constant_for_ticket_count() {
         let source = include_str!("lib.rs");
         let start = source
@@ -7245,8 +7472,8 @@ state: planning
             .map(|offset| start + offset)
             .expect("following method");
         let projection_source = &source[start..end];
-        assert_eq!(projection_source.matches("self.with_read(").count(), 1);
-        assert_eq!(projection_source.matches(".prepare(").count(), 2);
+        assert_eq!(projection_source.matches("self.with_read(").count(), 2);
+        assert_eq!(projection_source.matches(".prepare(").count(), 3);
         let item_loop = projection_source
             .split("items: summaries")
             .nth(1)
