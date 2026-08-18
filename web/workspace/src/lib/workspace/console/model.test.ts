@@ -2,6 +2,7 @@ import type { Event } from "$lib/generated/protocol";
 import {
   type ConsoleLine,
   createConsoleProjector,
+  isConsoleProjectionEvent,
   projectConsole,
   segmentsToText,
   selectConsoleTimelineLines,
@@ -36,11 +37,11 @@ function consoleLine(id: string, kind: ConsoleLine["kind"]): ConsoleLine {
   };
 }
 
-function snapshotEvent(cwd: string): Event {
+function snapshotEvent(cwd: string, entries: unknown[] = []): Event {
   return {
     event: "snapshot",
     data: {
-      entries: [],
+      entries,
       greeting: {
         worker_name: "Worker",
         cwd,
@@ -56,6 +57,95 @@ function snapshotEvent(cwd: string): Event {
     },
   };
 }
+
+Deno.test("console routing projects live errors but not completion replies", () => {
+  const errorEvent = {
+    event: "error",
+    data: { code: "provider_error", message: "provider unavailable" },
+  } satisfies Event;
+  const completionEvent = {
+    event: "completions",
+    data: { kind: "file", entries: [] },
+  } satisfies Event;
+
+  assert(
+    isConsoleProjectionEvent(errorEvent),
+    "live errors must reach the timeline projector",
+  );
+  assert(
+    !isConsoleProjectionEvent(completionEvent),
+    "completion replies should remain control-only events",
+  );
+});
+
+Deno.test("snapshot and segment rotation retain one durable run_errored row", () => {
+  const projector = createConsoleProjector();
+  let projection = projector.append([
+    {
+      eventId: "live-error",
+      event: {
+        event: "error",
+        data: { code: "provider_error", message: "provider unavailable" },
+      } satisfies Event,
+    },
+    {
+      eventId: "idle-after-error",
+      event: { event: "status", data: { status: "idle" } } satisfies Event,
+    },
+  ]);
+
+  assertEquals(projection.status, "idle");
+  const liveErrors = projection.lines.filter((line) => line.kind === "error");
+  assertEquals(liveErrors.length, 1);
+  assertEquals(liveErrors[0].title, "error · provider_error");
+  assertEquals(liveErrors[0].body, "provider unavailable");
+
+  projection = projector.append([{
+    eventId: "reconnected-snapshot",
+    event: snapshotEvent("/repo", [{
+      kind: "run_errored",
+      ts: 3,
+      interrupted: false,
+      message: "provider unavailable",
+    }]),
+  }]);
+
+  const errors = projection.lines.filter((line) => line.kind === "error");
+  assertEquals(errors.length, 1);
+  assertEquals(errors[0].title, "Run error");
+  assertEquals(errors[0].body, "provider unavailable");
+  assertEquals(errors[0].error, true);
+
+  projection = projector.append([
+    {
+      eventId: "second-live-error",
+      event: {
+        event: "error",
+        data: { code: "provider_error", message: "retry unavailable" },
+      } satisfies Event,
+    },
+    {
+      eventId: "segment-rotated",
+      event: {
+        event: "segment_rotated",
+        data: {
+          entry: {
+            kind: "run_errored",
+            ts: 5,
+            interrupted: false,
+            message: "retry unavailable",
+          },
+        },
+      } satisfies Event,
+    },
+  ]);
+
+  const rotatedErrors = projection.lines.filter((line) =>
+    line.kind === "error"
+  );
+  assertEquals(rotatedErrors.length, 1);
+  assertEquals(rotatedErrors[0].body, "retry unavailable");
+});
 
 Deno.test("workerConsoleHref encodes runtime and worker target authority", () => {
   assert(

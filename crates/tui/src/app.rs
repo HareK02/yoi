@@ -2081,6 +2081,13 @@ impl App {
             } if domain == "yoi.compaction" => {
                 self.apply_compaction_extension(&payload);
             }
+            session_store::LogEntry::RunErrored { message, .. } => {
+                self.blocks.push(Block::Alert {
+                    level: AlertLevel::Error,
+                    source: AlertSource::Worker,
+                    message,
+                });
+            }
             // Non-history-bearing variants don't affect the block view.
             _ => {}
         }
@@ -3259,6 +3266,85 @@ mod completion_flow_tests {
             app.blocks.get(1),
             Some(Block::SystemMessage { text }) if text == "[File: src/main.rs]\nfn main() {}"
         ));
+    }
+
+    #[test]
+    fn snapshot_and_segment_rotation_retain_one_durable_run_error_block() {
+        let mut app = App::new("test".into());
+        app.handle_worker_event(Event::Error {
+            code: ErrorCode::ProviderError,
+            message: "provider unavailable".into(),
+        });
+        app.handle_worker_event(Event::Status {
+            status: WorkerStatus::Idle,
+        });
+
+        let live_errors = app
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Alert {
+                    level: AlertLevel::Error,
+                    source: AlertSource::Worker,
+                    message,
+                } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(live_errors, ["[ProviderError] provider unavailable"]);
+
+        let run_errored = session_store::LogEntry::RunErrored {
+            ts: 3,
+            interrupted: false,
+            message: "provider unavailable".into(),
+        };
+        app.handle_worker_event(Event::Snapshot {
+            greeting: test_greeting(),
+            entries: vec![serde_json::to_value(run_errored).unwrap()],
+            status: WorkerStatus::Idle,
+            in_flight: Default::default(),
+        });
+
+        let errors = app
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Alert {
+                    level: AlertLevel::Error,
+                    source: AlertSource::Worker,
+                    message,
+                } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(errors, ["provider unavailable"]);
+
+        app.handle_worker_event(Event::Error {
+            code: ErrorCode::ProviderError,
+            message: "retry unavailable".into(),
+        });
+        let rotated_run_error = session_store::LogEntry::RunErrored {
+            ts: 5,
+            interrupted: false,
+            message: "retry unavailable".into(),
+        };
+        app.handle_worker_event(Event::SegmentRotated {
+            entry: serde_json::to_value(rotated_run_error).unwrap(),
+        });
+
+        let rotated_errors = app
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Alert {
+                    level: AlertLevel::Error,
+                    source: AlertSource::Worker,
+                    message,
+                } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rotated_errors, ["retry unavailable"]);
     }
 
     #[test]

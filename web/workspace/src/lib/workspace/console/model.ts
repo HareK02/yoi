@@ -142,6 +142,10 @@ export type ConsoleEventInput = {
   observedAtMs?: number;
 };
 
+export function isConsoleProjectionEvent(event: ProtocolEvent): boolean {
+  return event.event !== "completions";
+}
+
 export function emptyConsoleProjection(): ConsoleProjection {
   return {
     lines: [],
@@ -1215,6 +1219,19 @@ function applyLogEntry(
     case "assistant_item":
     case "tool_result":
       applyLoggedItem(projection, eventId, entry["item"]);
+      break;
+    case "run_errored":
+      projection.lines.push(
+        line(
+          eventId,
+          "error",
+          "Run error",
+          stringField(entry, "message") ?? "Worker run failed.",
+          undefined,
+          false,
+          true,
+        ),
+      );
       break;
     case "extension":
       applyExtensionEntry(projection, eventId, entry);
