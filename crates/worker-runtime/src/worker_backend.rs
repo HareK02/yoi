@@ -232,7 +232,8 @@ impl WorkspacePromptProjectionCache {
                 return Ok(current.clone());
             }
             if current.config_revision == projection.config_revision
-                && (current.projection_digest != projection.projection_digest
+                && (current.source_digest != projection.source_digest
+                    || current.projection_digest != projection.projection_digest
                     || current.catalog.catalog_digest != projection.catalog.catalog_digest)
             {
                 return Err(format!(
@@ -2010,6 +2011,40 @@ mod tests {
 
         assert_eq!(resolved.as_ref(), &projection);
         assert_eq!(client.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn workspace_prompt_projection_cache_rejects_same_revision_source_drift() {
+        let catalog = worker::EffectivePromptCatalog::new(
+            BTreeMap::from([("default".to_string(), "prompt".to_string())]),
+            8,
+            "schema",
+            "toolchain",
+        )
+        .unwrap();
+        let first = worker::WorkspacePromptProjection::new(
+            "workspace-a",
+            "source-a",
+            catalog.catalog_digest.clone(),
+            catalog.clone(),
+        )
+        .unwrap();
+        let drifted = worker::WorkspacePromptProjection::new(
+            "workspace-a",
+            "source-b",
+            catalog.catalog_digest.clone(),
+            catalog,
+        )
+        .unwrap();
+        let cache = WorkspacePromptProjectionCache::default();
+
+        cache.observe(first).unwrap();
+        let error = cache.observe(drifted).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("without a config revision transition")
+        );
     }
 
     #[test]
