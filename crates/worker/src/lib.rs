@@ -45,7 +45,7 @@ pub use shared_state::WorkerSharedState;
 pub use worker::{
     LocalWorkingDirectory, WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN, Worker, WorkerError,
     WorkerFilesystemAuthority, WorkerRunResult, WorkerWorkspaceContext, WorkspaceClient,
-    WorkspaceClientError, WorkspaceId, WorkspaceIdError, WorkspaceRequest, WorkspaceRequestMethod,
-    WorkspaceResponse, apply_worker_manifest, marker_workspace_client,
-    unavailable_workspace_client,
+    WorkspaceClientError, WorkspaceId, WorkspaceIdError, WorkspacePromptCatalogResolution,
+    WorkspaceRequest, WorkspaceRequestMethod, WorkspaceResponse, apply_worker_manifest,
+    marker_workspace_client, unavailable_workspace_client,
 };

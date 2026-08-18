@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use worker::{
-    WorkspaceClient, WorkspaceClientError, WorkspacePromptProjection, WorkspaceRequest,
-    WorkspaceRequestMethod, WorkspaceResponse,
+    WorkspaceClient, WorkspaceClientError, WorkspacePromptCatalogResolution,
+    WorkspacePromptProjection, WorkspaceRequest, WorkspaceRequestMethod, WorkspaceResponse,
 };
 
 use crate::auth::{
@@ -287,6 +287,7 @@ fn execute_remote_worker_remove_http_blocking(
     Ok(WorkspaceResponse { status, body })
 }
 
+#[derive(Clone)]
 pub struct RuntimeOwnedWorkspaceClient {
     workspace_id: String,
     base_url: String,
@@ -398,15 +399,29 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
 
     fn current_prompt_projection(
         &self,
-    ) -> Result<Option<WorkspacePromptProjection>, WorkspaceClientError> {
+    ) -> Result<Option<WorkspacePromptCatalogResolution>, WorkspaceClientError> {
         let Some(cache) = self.prompt_projection_cache.as_ref() else {
             return Ok(None);
         };
-        if let Some(projection) = cache
+        if let Some(resolution) = cache
             .active(&self.workspace_id)
             .map_err(WorkspaceClientError::Request)?
         {
-            return Ok(Some((*projection).clone()));
+            return Ok(Some((*resolution).clone()));
+        }
+        let fetch_gate = cache
+            .fetch_gate(&self.workspace_id)
+            .map_err(WorkspaceClientError::Request)?;
+        let _fetch_guard = fetch_gate.lock().map_err(|_| {
+            WorkspaceClientError::Request(
+                "Workspace Prompt projection fetch gate was poisoned".to_string(),
+            )
+        })?;
+        if let Some(resolution) = cache
+            .active(&self.workspace_id)
+            .map_err(WorkspaceClientError::Request)?
+        {
+            return Ok(Some((*resolution).clone()));
         }
         let response = self.execute(WorkspaceRequest::get(format!(
             "/api/w/{}/config-sources/active/prompt-projection",
@@ -602,9 +617,78 @@ mod tests {
         .with_prompt_projection_cache(cache);
 
         let projection = client.current_prompt_projection().unwrap().unwrap();
+        let second = client.current_prompt_projection().unwrap().unwrap();
 
-        assert_eq!(projection.config_revision, 3);
-        assert_eq!(projection.source_digest, "source-3");
+        assert_eq!(projection.projection.config_revision, 3);
+        assert_eq!(projection.projection.source_digest, "source-3");
+        assert!(Arc::ptr_eq(&projection.catalog, &second.catalog));
+    }
+
+    #[test]
+    fn concurrent_prompt_projection_miss_fetches_once_and_shares_catalog() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::Barrier;
+
+        let catalog = worker::EffectivePromptCatalog::new(
+            std::collections::BTreeMap::from([(
+                "default".to_string(),
+                "shared prompt".to_string(),
+            )]),
+            5,
+            "schema",
+            "toolchain",
+        )
+        .unwrap();
+        let projection = WorkspacePromptProjection::new(
+            "workspace-a",
+            "source-5",
+            catalog.catalog_digest.clone(),
+            catalog,
+        )
+        .unwrap();
+        let body = serde_json::to_string(&projection).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let cache = Arc::new(WorkspacePromptProjectionCache::default());
+        let client =
+            RuntimeOwnedWorkspaceClient::new("workspace-a", base_url, "runtime-a", "worker-a")
+                .with_prompt_projection_cache(cache);
+        let barrier = Arc::new(Barrier::new(8));
+        let threads = (0..8)
+            .map(|_| {
+                let client = client.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    client.current_prompt_projection().unwrap().unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let resolutions = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        server.join().unwrap();
+
+        let first = &resolutions[0].catalog;
+        assert!(
+            resolutions
+                .iter()
+                .all(|resolution| Arc::ptr_eq(first, &resolution.catalog))
+        );
     }
 
     #[test]

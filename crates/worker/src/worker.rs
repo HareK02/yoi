@@ -212,6 +212,38 @@ pub enum WorkspaceClientError {
     Request(String),
 }
 
+#[derive(Clone)]
+pub struct WorkspacePromptCatalogResolution {
+    pub projection: Arc<WorkspacePromptProjection>,
+    pub catalog: Arc<PromptCatalog>,
+}
+
+impl std::fmt::Debug for WorkspacePromptCatalogResolution {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkspacePromptCatalogResolution")
+            .field("workspace_id", &self.projection.workspace_id)
+            .field("config_revision", &self.projection.config_revision)
+            .field("source_digest", &self.projection.source_digest)
+            .field("projection_digest", &self.projection.projection_digest)
+            .finish_non_exhaustive()
+    }
+}
+
+impl WorkspacePromptCatalogResolution {
+    pub fn new(projection: WorkspacePromptProjection) -> Result<Self, CatalogError> {
+        projection.validate()?;
+        let catalog = PromptCatalog::load(
+            &PromptCatalogSource::builtins_only()
+                .with_effective_catalog(projection.catalog.clone()),
+        )?;
+        Ok(Self {
+            projection: Arc::new(projection),
+            catalog,
+        })
+    }
+}
+
 /// Path-free Workspace operation authority injected by Runtime/host code.
 ///
 /// Workers receive this trait object rather than a Backend URL. The concrete
@@ -229,7 +261,7 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
     /// launch/session state; this hook never reconstructs historical prompts.
     fn current_prompt_projection(
         &self,
-    ) -> Result<Option<WorkspacePromptProjection>, WorkspaceClientError> {
+    ) -> Result<Option<WorkspacePromptCatalogResolution>, WorkspaceClientError> {
         Ok(None)
     }
 
@@ -296,7 +328,7 @@ impl WorkspaceClient for ReviewerChildWorkspaceClient {
 
     fn current_prompt_projection(
         &self,
-    ) -> Result<Option<WorkspacePromptProjection>, WorkspaceClientError> {
+    ) -> Result<Option<WorkspacePromptCatalogResolution>, WorkspaceClientError> {
         self.inner.current_prompt_projection()
     }
 
@@ -1258,7 +1290,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         if self.system_prompt_template.is_some() {
             return Ok(());
         }
-        let Some(projection) = self
+        let Some(resolution) = self
             .workspace_context
             .client()
             .current_prompt_projection()
@@ -1268,25 +1300,16 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         else {
             return Ok(());
         };
-        projection
-            .validate()
-            .map_err(|source| WorkerError::WorkspacePromptProjection {
-                message: source.to_string(),
-            })?;
+        let projection = &resolution.projection;
         let current = self.prompts.load();
         if current.projection().config_revision == projection.config_revision
             && current.projection().source_digest == projection.source_digest
             && current.projection().catalog_digest == projection.projection_digest
+            && Arc::ptr_eq(&current, &resolution.catalog)
         {
             return Ok(());
         }
-        let catalog = PromptCatalog::load(
-            &PromptCatalogSource::builtins_only().with_effective_catalog(projection.catalog),
-        )
-        .map_err(|source| WorkerError::WorkspacePromptProjection {
-            message: source.to_string(),
-        })?;
-        self.prompts.store(catalog);
+        self.prompts.store(resolution.catalog);
         Ok(())
     }
 

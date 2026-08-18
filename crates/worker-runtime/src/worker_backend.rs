@@ -219,14 +219,26 @@ impl WorkerObservationProvider for RuntimeGrantedWorkerObservationProvider {
 
 #[derive(Debug, Default)]
 pub(crate) struct WorkspacePromptProjectionCache {
-    active: Mutex<HashMap<String, Arc<worker::WorkspacePromptProjection>>>,
+    active: Mutex<HashMap<String, Arc<worker::WorkspacePromptCatalogResolution>>>,
+    fetch_gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl WorkspacePromptProjectionCache {
+    pub(crate) fn fetch_gate(&self, workspace_id: &str) -> Result<Arc<Mutex<()>>, String> {
+        let mut gates = self
+            .fetch_gates
+            .lock()
+            .map_err(|_| "Workspace Prompt projection fetch gates lock was poisoned".to_string())?;
+        Ok(gates
+            .entry(workspace_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone())
+    }
+
     pub(crate) fn active(
         &self,
         workspace_id: &str,
-    ) -> Result<Option<Arc<worker::WorkspacePromptProjection>>, String> {
+    ) -> Result<Option<Arc<worker::WorkspacePromptCatalogResolution>>, String> {
         self.active
             .lock()
             .map(|active| active.get(workspace_id).cloned())
@@ -236,31 +248,40 @@ impl WorkspacePromptProjectionCache {
     pub(crate) fn observe(
         &self,
         projection: worker::WorkspacePromptProjection,
-    ) -> Result<Arc<worker::WorkspacePromptProjection>, String> {
+    ) -> Result<Arc<worker::WorkspacePromptCatalogResolution>, String> {
         projection.validate().map_err(|error| error.to_string())?;
         let workspace_id = projection.workspace_id.clone();
-        let projection = Arc::new(projection);
+        let resolution = Arc::new(
+            worker::WorkspacePromptCatalogResolution::new(projection)
+                .map_err(|error| error.to_string())?,
+        );
         let mut active = self
             .active
             .lock()
             .map_err(|_| "Workspace Prompt projection cache lock was poisoned".to_string())?;
         if let Some(current) = active.get(&workspace_id) {
-            if current.config_revision > projection.config_revision {
+            if current.projection.config_revision > resolution.projection.config_revision {
                 return Ok(current.clone());
             }
-            if current.config_revision == projection.config_revision
-                && (current.source_digest != projection.source_digest
-                    || current.projection_digest != projection.projection_digest
-                    || current.catalog.catalog_digest != projection.catalog.catalog_digest)
+            if current.projection.config_revision == resolution.projection.config_revision
+                && (current.projection.source_digest != resolution.projection.source_digest
+                    || current.projection.projection_digest
+                        != resolution.projection.projection_digest
+                    || current.projection.catalog.catalog_digest
+                        != resolution.projection.catalog.catalog_digest
+                    || current.projection.catalog.schema_fingerprint
+                        != resolution.projection.catalog.schema_fingerprint
+                    || current.projection.catalog.toolchain_fingerprint
+                        != resolution.projection.catalog.toolchain_fingerprint)
             {
                 return Err(format!(
                     "Workspace Prompt projection identity changed without a config revision transition: workspace={workspace_id} revision={}",
-                    projection.config_revision
+                    resolution.projection.config_revision
                 ));
             }
         }
-        active.insert(workspace_id, projection.clone());
-        Ok(projection)
+        active.insert(workspace_id, resolution.clone());
+        Ok(resolution)
     }
 }
 
@@ -677,7 +698,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 )
                 .map_err(|error| error.to_string())?;
                 let projection = self.prompt_projection_cache.observe(projection)?;
-                loader = loader.with_effective_catalog(projection.catalog.clone());
+                loader = loader.with_effective_catalog(projection.projection.catalog.clone());
             }
         }
         let flow_transition_enabled = manifest.feature.flow.enabled;
@@ -1995,8 +2016,11 @@ mod tests {
         cache.observe(projection_v2).unwrap();
 
         let active = cache.active("workspace-a").unwrap().unwrap();
-        assert_eq!(active.config_revision, 9);
-        assert_eq!(active.catalog.catalog_digest, catalog_v2.catalog_digest);
+        assert_eq!(active.projection.config_revision, 9);
+        assert_eq!(
+            active.projection.catalog.catalog_digest,
+            catalog_v2.catalog_digest
+        );
     }
 
     #[test]
@@ -2031,6 +2055,35 @@ mod tests {
                 .to_string()
                 .contains("without a config revision transition")
         );
+    }
+
+    #[test]
+    fn workspace_prompt_projection_cache_rejects_same_revision_schema_drift() {
+        let templates = BTreeMap::from([("default".to_string(), "prompt".to_string())]);
+        let first_catalog =
+            worker::EffectivePromptCatalog::new(templates.clone(), 8, "schema-a", "toolchain")
+                .unwrap();
+        let drifted_catalog =
+            worker::EffectivePromptCatalog::new(templates, 8, "schema-b", "toolchain").unwrap();
+        let first = worker::WorkspacePromptProjection::new(
+            "workspace-a",
+            "source-a",
+            first_catalog.catalog_digest.clone(),
+            first_catalog,
+        )
+        .unwrap();
+        let drifted = worker::WorkspacePromptProjection::new(
+            "workspace-a",
+            "source-a",
+            drifted_catalog.catalog_digest.clone(),
+            drifted_catalog,
+        )
+        .unwrap();
+        let cache = WorkspacePromptProjectionCache::default();
+
+        cache.observe(first).unwrap();
+        let error = cache.observe(drifted).unwrap_err();
+        assert!(error.contains("without a config revision transition"));
     }
 
     #[test]
