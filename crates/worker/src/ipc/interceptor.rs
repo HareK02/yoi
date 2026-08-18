@@ -254,15 +254,25 @@ impl Interceptor for WorkerInterceptor {
         };
         let mut system_items: Vec<SystemItem> = Vec::with_capacity(drained.len());
         let mut items: Vec<Item> = Vec::with_capacity(drained.len());
-        for entry in drained {
-            let system_item =
-                build_system_item_with_provenance(&entry, &prompts, Some(provenance.clone()))
-                    .map_err(|error| format!("failed to render notify_wrapper: {error}"))?;
+        for entry in &drained {
+            let system_item = match build_system_item_with_provenance(
+                entry,
+                &prompts,
+                Some(provenance.clone()),
+            ) {
+                Ok(system_item) => system_item,
+                Err(error) => {
+                    self.pending_notifies.requeue_front(drained);
+                    return Err(format!("failed to render notify_wrapper: {error}"));
+                }
+            };
             items.push(system_item.to_history_item());
             system_items.push(system_item);
         }
-        self.commit_system_items(&system_items)
-            .map_err(|error| format!("session persistence failed: {error}"))?;
+        if let Err(error) = self.commit_system_items(&system_items) {
+            self.pending_notifies.requeue_front(drained);
+            return Err(format!("session persistence failed: {error}"));
+        }
         Ok(items)
     }
 
@@ -1127,6 +1137,46 @@ mod tests {
         assert_eq!(provenance.config_revision, 2);
         assert_eq!(provenance.source_digest, "source-2");
         assert_eq!(provenance.logical_name, "internal.notify_wrapper");
+    }
+
+    #[tokio::test]
+    async fn notify_render_failure_requeues_without_context_only_fallback() {
+        let prompts = test_prompts();
+        let buffer = NotifyBuffer::new();
+        let interceptor = WorkerInterceptor::new(
+            Arc::new(HookRegistryBuilder::new().build()),
+            None,
+            None,
+            buffer.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            prompts.clone(),
+            None,
+        );
+        let current = prompts.load_full();
+        let projection = current.projection();
+        let mut templates = projection.templates.clone();
+        templates.insert(
+            "internal.notify_wrapper".to_string(),
+            "{{ message | missing_notify_filter }}".to_string(),
+        );
+        let mut projection = crate::prompt::catalog::EffectivePromptCatalog::new(
+            templates,
+            3,
+            projection.schema_fingerprint.clone(),
+            projection.toolchain_fingerprint.clone(),
+        )
+        .unwrap();
+        projection.source_digest = "source-3".to_string();
+        prompts.store(Arc::new(
+            PromptCatalog::from_projection(projection).unwrap(),
+        ));
+        buffer.push_notify("must persist".to_string(), false);
+
+        let error = interceptor.pending_history_appends().await.unwrap_err();
+
+        assert!(error.contains("failed to render notify_wrapper"));
+        let requeued = buffer.drain();
+        assert_eq!(requeued.len(), 1);
     }
 
     #[tokio::test]
