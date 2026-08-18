@@ -6,6 +6,8 @@ use std::time::UNIX_EPOCH;
 use config_source::{ConfigContentType, ConfigSchemaContribution, VirtualPath};
 use manifest::{ProfileSource, resolve_profile_artifact_value};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use worker::EffectivePromptCatalog;
 use worker_runtime::config_bundle::{
     ConfigBundle, ConfigBundleMetadata, ConfigBundleProvenance, ConfigProfileDescriptor,
 };
@@ -247,6 +249,85 @@ pub fn selector_for_workspace_candidate(
         .then(|| worker_runtime::catalog::ProfileSelector::Named(profile.to_string()))
 }
 
+fn validate_prompt_projection_matches_state(
+    workspace_id: &str,
+    state: &WorkspaceConfigState,
+    projection: &crate::prompt_settings::WorkspacePromptProjection,
+) -> Result<()> {
+    if !projection.matches(workspace_id, state) {
+        return Err(Error::Config(
+            "Prompt projection identity does not match Workspace config state".to_string(),
+        ));
+    }
+    let prompt_catalog = projection.catalog();
+    let mismatches = [
+        (
+            prompt_catalog.config_revision != state.snapshot.revision,
+            "config revision",
+        ),
+        (
+            prompt_catalog.schema_fingerprint != state.contract.schema_bundle.fingerprint,
+            "schema fingerprint",
+        ),
+        (
+            prompt_catalog.toolchain_fingerprint != state.contract.fingerprint,
+            "toolchain fingerprint",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(mismatch, label)| mismatch.then_some(label))
+    .collect::<Vec<_>>();
+    if mismatches.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Config(format!(
+            "Prompt projection does not match Workspace config state: {}",
+            mismatches.join(", ")
+        )))
+    }
+}
+
+fn virtual_profile_bundle_id(
+    state: &WorkspaceConfigState,
+    workspace_id: &str,
+    profile_selector: &worker_runtime::catalog::ProfileSelector,
+    prompt_catalog: &EffectivePromptCatalog,
+    archive: Option<&ProfileSourceArchive>,
+) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"workspace-profile-launch-v1\0");
+    hasher.update(workspace_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(state.snapshot.revision.to_le_bytes());
+    hasher.update(b"\0");
+    hasher.update(state.snapshot.digest.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(state.projection_digest.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(
+        serde_json::to_vec(profile_selector).map_err(|error| Error::Config(error.to_string()))?,
+    );
+    hasher.update(b"\0");
+    hasher.update(prompt_catalog.catalog_digest.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(prompt_catalog.schema_fingerprint.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(prompt_catalog.toolchain_fingerprint.as_bytes());
+    if let Some(archive) = archive {
+        hasher.update(b"\0");
+        hasher.update(archive.reference.digest.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let identity = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!(
+        "workspace-config-profile-r{}-{identity}",
+        state.snapshot.revision
+    ))
+}
+
 pub fn build_virtual_profile_config_bundle(
     projection: &ProfileConfigProjection,
     state: &WorkspaceConfigState,
@@ -254,6 +335,28 @@ pub fn build_virtual_profile_config_bundle(
     workspace_created_at: &str,
     selector: &str,
 ) -> Result<Option<ConfigBundle>> {
+    let prompt_projection =
+        crate::prompt_settings::project_workspace_prompt_projection(workspace_id, state)?;
+    build_virtual_profile_config_bundle_with_prompt_projection(
+        projection,
+        state,
+        workspace_id,
+        workspace_created_at,
+        selector,
+        &prompt_projection,
+    )
+}
+
+pub fn build_virtual_profile_config_bundle_with_prompt_projection(
+    projection: &ProfileConfigProjection,
+    state: &WorkspaceConfigState,
+    workspace_id: &str,
+    workspace_created_at: &str,
+    selector: &str,
+    prompt_projection: &crate::prompt_settings::WorkspacePromptProjection,
+) -> Result<Option<ConfigBundle>> {
+    validate_prompt_projection_matches_state(workspace_id, state, prompt_projection)?;
+    let prompt_catalog = prompt_projection.catalog().clone();
     let archive = projection
         .entries
         .get(selector)
@@ -261,9 +364,16 @@ pub fn build_virtual_profile_config_bundle(
         .transpose()?;
     let profile_selector = selector_for_builtin_candidate(selector)
         .unwrap_or_else(|| worker_runtime::catalog::ProfileSelector::Named(selector.to_string()));
+    let bundle_id = virtual_profile_bundle_id(
+        state,
+        workspace_id,
+        &profile_selector,
+        &prompt_catalog,
+        archive.as_ref(),
+    )?;
     let bundle = ConfigBundle {
         metadata: ConfigBundleMetadata {
-            id: format!("workspace-config-profile-r{}", state.snapshot.revision),
+            id: bundle_id,
             digest: String::new(),
             revision: state.snapshot.revision.to_string(),
             workspace_id: workspace_id.to_string(),
@@ -281,7 +391,7 @@ pub fn build_virtual_profile_config_bundle(
             label: Some(selector.to_string()),
         }],
         declarations: Vec::new(),
-        prompt_catalog: Some(crate::prompt_settings::project_prompts_from_workspace_config(state)?),
+        prompt_catalog: Some(prompt_catalog),
         profile_source_archive: archive,
         profile_source_archive_handle: None,
     }
@@ -826,6 +936,146 @@ mod tests {
         let archive = bundle.profile_source_archive.unwrap();
         assert_eq!(archive.reference.source_graph.source_count, 2);
         assert_eq!(archive.reference.source_graph.import_count, 1);
+    }
+
+    #[test]
+    fn virtual_config_launch_bundle_identity_is_profile_specific_and_stable() {
+        let state = virtual_state(vec![
+            config_source::ConfigEntry::new(
+                VirtualPath::parse("main.dcdl").unwrap(),
+                ConfigContentType::Decodal,
+                "{}",
+            )
+            .unwrap(),
+        ]);
+        let projection = project_profiles_from_workspace_config("workspace-test", &state).unwrap();
+
+        let companion = build_virtual_profile_config_bundle(
+            &projection,
+            &state,
+            "workspace-test",
+            "2026-01-01T00:00:00Z",
+            "builtin:companion",
+        )
+        .unwrap()
+        .unwrap();
+        let companion_retry = build_virtual_profile_config_bundle(
+            &projection,
+            &state,
+            "workspace-test",
+            "2026-01-01T00:00:00Z",
+            "builtin:companion",
+        )
+        .unwrap()
+        .unwrap();
+        let coder = build_virtual_profile_config_bundle(
+            &projection,
+            &state,
+            "workspace-test",
+            "2026-01-01T00:00:00Z",
+            "builtin:coder",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(companion.metadata.id, companion_retry.metadata.id);
+        assert_eq!(companion.metadata.digest, companion_retry.metadata.digest);
+        assert_ne!(companion.metadata.id, coder.metadata.id);
+        assert_ne!(companion.metadata.digest, coder.metadata.digest);
+        assert!(
+            companion
+                .metadata
+                .id
+                .starts_with("workspace-config-profile-r7-")
+        );
+        assert!(
+            coder
+                .metadata
+                .id
+                .starts_with("workspace-config-profile-r7-")
+        );
+    }
+
+    #[test]
+    fn virtual_config_launch_bundle_rejects_prompt_projection_from_other_revision() {
+        let state = virtual_state(vec![
+            config_source::ConfigEntry::new(
+                VirtualPath::parse("main.dcdl").unwrap(),
+                ConfigContentType::Decodal,
+                "{}",
+            )
+            .unwrap(),
+        ]);
+        let projection = project_profiles_from_workspace_config("workspace-test", &state).unwrap();
+        let prompt_projection =
+            crate::prompt_settings::project_workspace_prompt_projection("workspace-test", &state)
+                .unwrap();
+        let mut mismatched_state = state.clone();
+        mismatched_state.snapshot.revision += 1;
+
+        let error = build_virtual_profile_config_bundle_with_prompt_projection(
+            &projection,
+            &mismatched_state,
+            "workspace-test",
+            "2026-01-01T00:00:00Z",
+            "builtin:coder",
+            &prompt_projection,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn virtual_config_launch_bundle_identity_separates_project_profile_archives() {
+        let state = virtual_state(vec![
+            config_source::ConfigEntry::new(
+                VirtualPath::parse("main.dcdl").unwrap(),
+                ConfigContentType::Decodal,
+                r#"{ profile = { entries = [
+                    { selector = "project:alpha"; source = "profiles/alpha.dcdl"; },
+                    { selector = "project:beta"; source = "profiles/beta.dcdl"; },
+                ]; }; }"#,
+            )
+            .unwrap(),
+            config_source::ConfigEntry::new(
+                VirtualPath::parse("profiles/alpha.dcdl").unwrap(),
+                ConfigContentType::Decodal,
+                valid_decodal("alpha"),
+            )
+            .unwrap(),
+            config_source::ConfigEntry::new(
+                VirtualPath::parse("profiles/beta.dcdl").unwrap(),
+                ConfigContentType::Decodal,
+                valid_decodal("beta"),
+            )
+            .unwrap(),
+        ]);
+        let projection = project_profiles_from_workspace_config("workspace-test", &state).unwrap();
+        let alpha = build_virtual_profile_config_bundle(
+            &projection,
+            &state,
+            "workspace-test",
+            "2026-01-01T00:00:00Z",
+            "project:alpha",
+        )
+        .unwrap()
+        .unwrap();
+        let beta = build_virtual_profile_config_bundle(
+            &projection,
+            &state,
+            "workspace-test",
+            "2026-01-01T00:00:00Z",
+            "project:beta",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_ne!(alpha.metadata.id, beta.metadata.id);
+        assert_ne!(alpha.metadata.digest, beta.metadata.digest);
+        assert_ne!(
+            alpha.profile_source_archive.unwrap().reference.digest,
+            beta.profile_source_archive.unwrap().reference.digest
+        );
     }
 
     #[test]

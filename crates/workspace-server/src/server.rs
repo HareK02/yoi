@@ -256,6 +256,7 @@ pub struct WorkspaceApi {
     pub(crate) store: Arc<dyn ControlPlaneStore>,
     config_store: Arc<crate::SqliteWorkspaceStore>,
     config_schema_registry: crate::config_source::WorkspaceConfigSchemaRegistry,
+    prompt_projection_cache: crate::prompt_settings::WorkspacePromptProjectionCache,
     authority: SqliteWorkspaceAuthority,
     runtime: Arc<RuntimeRegistry>,
     companion: Arc<CompanionConsole>,
@@ -806,6 +807,8 @@ impl WorkspaceApi {
         let api = Self {
             config_store,
             config_schema_registry,
+            prompt_projection_cache:
+                crate::prompt_settings::WorkspacePromptProjectionCache::default(),
             authority: SqliteWorkspaceAuthority::new(
                 config.database_path.clone(),
                 config.workspace_id.clone(),
@@ -5243,12 +5246,13 @@ fn dispatch_orchestrator_queue_attention(api: &WorkspaceApi) {
     else {
         return;
     };
-    let Ok(projection) =
-        crate::prompt_settings::project_prompts_from_workspace_config(&config_state)
+    let Ok(projection) = api
+        .prompt_projection_cache
+        .resolve(&api.config.workspace_id, &config_state)
     else {
         return;
     };
-    let Ok(catalog) = worker::PromptCatalog::from_projection(projection) else {
+    let Ok(catalog) = worker::PromptCatalog::from_projection(projection.catalog().clone()) else {
         return;
     };
     let content = match catalog.render_serializable(
@@ -9005,13 +9009,18 @@ async fn create_workspace_worker(
                     "profile must be selected from Backend-published worker profile candidates",
                 )
             })?;
-    let resolved_config_bundle = crate::profile_settings::build_virtual_profile_config_bundle(
-        &profile_projection,
-        &config_state,
-        &api.config.workspace_id,
-        &api.config.workspace_created_at,
-        &profile,
-    )?;
+    let prompt_catalog = api
+        .prompt_projection_cache
+        .resolve(&api.config.workspace_id, &config_state)?;
+    let resolved_config_bundle =
+        crate::profile_settings::build_virtual_profile_config_bundle_with_prompt_projection(
+            &profile_projection,
+            &config_state,
+            &api.config.workspace_id,
+            &api.config.workspace_created_at,
+            &profile,
+            prompt_catalog.as_ref(),
+        )?;
     let display_name = sanitize_worker_display_name(&display_name).ok_or_else(|| {
         settings_bad_request(
             "invalid_worker_display_name",
