@@ -211,6 +211,11 @@ impl WorkspacePromptProjection {
                 "Workspace Prompt projection digest must not be empty".to_string(),
             ));
         }
+        if projection_digest != catalog.catalog_digest {
+            return Err(CatalogError::InvalidTemplateCatalog(
+                "Workspace Prompt projection digest does not match its catalog".to_string(),
+            ));
+        }
         if !catalog.source_digest.is_empty() && catalog.source_digest != source_digest {
             return Err(CatalogError::InvalidTemplateCatalog(
                 "Workspace Prompt projection source digest does not match its catalog".to_string(),
