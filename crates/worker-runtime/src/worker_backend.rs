@@ -84,6 +84,13 @@ pub struct RuntimeWorkerController {
 /// controller-backed Worker for a Runtime catalog entry.
 #[async_trait]
 pub trait RuntimeWorkerFactory: Send + Sync + 'static {
+    fn observe_workspace_prompt_projection(
+        &self,
+        _projection: worker::WorkspacePromptProjection,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn spawn_controller(
         &self,
         request: WorkerExecutionSpawnRequest,
@@ -210,6 +217,74 @@ impl WorkerObservationProvider for RuntimeGrantedWorkerObservationProvider {
     }
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct WorkspacePromptProjectionCache {
+    active: Mutex<HashMap<String, Arc<worker::WorkspacePromptCatalogResolution>>>,
+    fetch_gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+}
+
+impl WorkspacePromptProjectionCache {
+    pub(crate) fn fetch_gate(&self, workspace_id: &str) -> Result<Arc<Mutex<()>>, String> {
+        let mut gates = self
+            .fetch_gates
+            .lock()
+            .map_err(|_| "Workspace Prompt projection fetch gates lock was poisoned".to_string())?;
+        Ok(gates
+            .entry(workspace_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone())
+    }
+
+    pub(crate) fn active(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<Arc<worker::WorkspacePromptCatalogResolution>>, String> {
+        self.active
+            .lock()
+            .map(|active| active.get(workspace_id).cloned())
+            .map_err(|_| "Workspace Prompt projection cache lock was poisoned".to_string())
+    }
+
+    pub(crate) fn observe(
+        &self,
+        projection: worker::WorkspacePromptProjection,
+    ) -> Result<Arc<worker::WorkspacePromptCatalogResolution>, String> {
+        projection.validate().map_err(|error| error.to_string())?;
+        let workspace_id = projection.workspace_id.clone();
+        let resolution = Arc::new(
+            worker::WorkspacePromptCatalogResolution::new(projection)
+                .map_err(|error| error.to_string())?,
+        );
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| "Workspace Prompt projection cache lock was poisoned".to_string())?;
+        if let Some(current) = active.get(&workspace_id) {
+            if current.projection.config_revision > resolution.projection.config_revision {
+                return Ok(current.clone());
+            }
+            if current.projection.config_revision == resolution.projection.config_revision
+                && (current.projection.source_digest != resolution.projection.source_digest
+                    || current.projection.projection_digest
+                        != resolution.projection.projection_digest
+                    || current.projection.catalog.catalog_digest
+                        != resolution.projection.catalog.catalog_digest
+                    || current.projection.catalog.schema_fingerprint
+                        != resolution.projection.catalog.schema_fingerprint
+                    || current.projection.catalog.toolchain_fingerprint
+                        != resolution.projection.catalog.toolchain_fingerprint)
+            {
+                return Err(format!(
+                    "Workspace Prompt projection identity changed without a config revision transition: workspace={workspace_id} revision={}",
+                    resolution.projection.config_revision
+                ));
+            }
+        }
+        active.insert(workspace_id, resolution.clone());
+        Ok(resolution)
+    }
+}
+
 #[derive(Clone)]
 pub struct ProfileRuntimeWorkerFactory {
     observation_hub: Arc<RuntimeWorkerObservationHub>,
@@ -217,6 +292,7 @@ pub struct ProfileRuntimeWorkerFactory {
     worker_aggregate_root: Option<PathBuf>,
     resource_client: Option<Arc<dyn BackendResourceClient>>,
     profile_archive_cache: Arc<ProfileSourceArchiveCache>,
+    prompt_projection_cache: Arc<WorkspacePromptProjectionCache>,
     runtime_id: Option<String>,
     worker_mutation_identity: Option<RuntimeIdentityMaterial>,
     embedded_worker_mutation_dispatcher: Option<Arc<dyn EmbeddedWorkerMutationDispatcher>>,
@@ -232,6 +308,7 @@ impl ProfileRuntimeWorkerFactory {
             worker_aggregate_root: None,
             resource_client: None,
             profile_archive_cache: Arc::new(ProfileSourceArchiveCache::default()),
+            prompt_projection_cache: Arc::new(WorkspacePromptProjectionCache::default()),
             runtime_id: None,
             worker_mutation_identity: None,
             embedded_worker_mutation_dispatcher: None,
@@ -335,6 +412,48 @@ impl ProfileRuntimeWorkerFactory {
             .map_err(|err| format!("failed to build restore fallback manifest: {err}"))?;
         Ok((manifest, PromptCatalogSource::builtins_only()))
     }
+    fn observe_bundle_prompt_projection(
+        &self,
+        bundle: &crate::config_bundle::ConfigBundle,
+        expected_workspace_id: Option<&str>,
+    ) -> Result<Option<Arc<worker::WorkspacePromptCatalogResolution>>, String> {
+        let Some(prompt_catalog) = bundle.prompt_catalog.clone() else {
+            return Ok(None);
+        };
+        if let Some(expected_workspace_id) = expected_workspace_id
+            && bundle.metadata.workspace_id != expected_workspace_id
+        {
+            return Err(format!(
+                "Workspace Prompt projection scope mismatch: expected {expected_workspace_id}, got {}",
+                bundle.metadata.workspace_id
+            ));
+        }
+        let source_digest = if prompt_catalog.source_digest.is_empty() {
+            bundle
+                .metadata
+                .provenance
+                .detail
+                .as_deref()
+                .and_then(|detail| {
+                    detail
+                        .split(';')
+                        .find_map(|part| part.strip_prefix("source_tree_digest="))
+                })
+                .unwrap_or(&prompt_catalog.catalog_digest)
+                .to_string()
+        } else {
+            prompt_catalog.source_digest.clone()
+        };
+        let projection = worker::WorkspacePromptProjection::new(
+            bundle.metadata.workspace_id.clone(),
+            source_digest,
+            prompt_catalog.catalog_digest.clone(),
+            prompt_catalog,
+        )
+        .map_err(|error| error.to_string())?;
+        self.prompt_projection_cache.observe(projection).map(Some)
+    }
+
     async fn resolve_profile_source_archive(
         &self,
         source: &ProfileSourceArchiveSource,
@@ -409,6 +528,7 @@ impl RuntimeWorkspaceBackendRef {
         workspace_scope: Option<&crate::runtime::RuntimeWorkspaceScope>,
         mutation_identity: Option<&RuntimeIdentityMaterial>,
         embedded_dispatcher: Option<&Arc<dyn EmbeddedWorkerMutationDispatcher>>,
+        prompt_projection_cache: Option<Arc<WorkspacePromptProjectionCache>>,
     ) -> WorkerWorkspaceContext {
         match self {
             Self::None => WorkerWorkspaceContext::no_workspace(),
@@ -423,6 +543,9 @@ impl RuntimeWorkspaceBackendRef {
                     runtime_id.clone(),
                     worker_ref.worker_id.to_string(),
                 );
+                if let Some(cache) = prompt_projection_cache {
+                    client = client.with_prompt_projection_cache(cache);
+                }
                 if let (Some(scope), Some(identity)) = (workspace_scope, mutation_identity) {
                     client = client.with_worker_remove(RuntimeWorkerMutationForwarder::remote(
                         identity,
@@ -521,6 +644,13 @@ fn runtime_local_workdir_session(
 
 #[async_trait]
 impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
+    fn observe_workspace_prompt_projection(
+        &self,
+        projection: worker::WorkspacePromptProjection,
+    ) -> Result<(), String> {
+        self.prompt_projection_cache.observe(projection).map(|_| ())
+    }
+
     async fn spawn_controller(
         &self,
         request: WorkerExecutionSpawnRequest,
@@ -560,6 +690,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             request.workspace_scope.as_ref(),
             self.worker_mutation_identity.as_ref(),
             self.embedded_worker_mutation_dispatcher.as_ref(),
+            Some(self.prompt_projection_cache.clone()),
         );
         let selector = profile.as_ref();
         let archive = self
@@ -583,12 +714,11 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 )?
             }
         };
-        if let Some(prompt_catalog) = request
-            .config_bundle
-            .as_ref()
-            .and_then(|bundle| bundle.prompt_catalog.clone())
+        if let Some(bundle) = request.config_bundle.as_ref()
+            && let Some(resolution) =
+                self.observe_bundle_prompt_projection(bundle, observation_workspace_id.as_deref())?
         {
-            loader = loader.with_effective_catalog(prompt_catalog);
+            loader = loader.with_effective_catalog(resolution.projection.catalog.clone());
         }
         let flow_transition_enabled = manifest.feature.flow.enabled;
 
@@ -724,15 +854,9 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             request.workspace_scope.as_ref(),
             self.worker_mutation_identity.as_ref(),
             self.embedded_worker_mutation_dispatcher.as_ref(),
+            Some(self.prompt_projection_cache.clone()),
         );
-        let (manifest, mut loader) = Self::restore_fallback_manifest(&worker_name)?;
-        if let Some(prompt_catalog) = request
-            .config_bundle
-            .as_ref()
-            .and_then(|bundle| bundle.prompt_catalog.clone())
-        {
-            loader = loader.with_effective_catalog(prompt_catalog);
-        }
+        let (manifest, loader) = Self::restore_fallback_manifest(&worker_name)?;
 
         let worker_aggregate_dir = self.worker_aggregate_dir(&request.worker_ref)?;
         let session_dir = worker_aggregate_dir.join("session");
@@ -767,11 +891,31 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             Err(WorkerError::WorkerMetadataPending { .. })
                 if request.request.initial_input.is_none() =>
             {
+                let pending_loader = if workspace_context.workspace_id().is_some() {
+                    let bundle = request.config_bundle.as_ref().ok_or_else(|| {
+                        "pending Workspace Worker restore requires operation-owned launch material; generic restore must not reconstruct it from current Workspace config"
+                            .to_string()
+                    })?;
+                    let resolution = self
+                        .observe_bundle_prompt_projection(
+                            bundle,
+                            observation_workspace_id.as_deref(),
+                        )?
+                        .ok_or_else(|| {
+                            "pending Workspace Worker restore requires a saved Workspace Prompt projection"
+                                .to_string()
+                        })?;
+                    loader
+                        .clone()
+                        .with_effective_catalog(resolution.projection.catalog.clone())
+                } else {
+                    loader.clone()
+                };
                 Worker::restore_pending_from_worker_metadata_with_context(
                     &worker_name,
                     manifest.clone(),
                     store,
-                    loader,
+                    pending_loader,
                     workspace_context,
                     filesystem_authority,
                 )
@@ -1276,6 +1420,13 @@ where
 {
     fn backend_id(&self) -> &str {
         &self.backend_id
+    }
+
+    fn observe_workspace_prompt_projection(
+        &self,
+        projection: worker::WorkspacePromptProjection,
+    ) -> Result<(), String> {
+        self.factory.observe_workspace_prompt_projection(projection)
     }
 
     fn create_working_directory(
@@ -1860,6 +2011,112 @@ mod tests {
     use session_store::{LogEntry, WorkerMetadataStore};
 
     #[test]
+    fn workspace_prompt_projection_notification_advances_shared_cache() {
+        let cache = WorkspacePromptProjectionCache::default();
+        let catalog_v1 = worker::EffectivePromptCatalog::new(
+            BTreeMap::from([("default".to_string(), "prompt-v1".to_string())]),
+            8,
+            "schema",
+            "toolchain",
+        )
+        .unwrap();
+        let projection_v1 = worker::WorkspacePromptProjection::new(
+            "workspace-a",
+            "source-v1",
+            catalog_v1.catalog_digest.clone(),
+            catalog_v1,
+        )
+        .unwrap();
+        let catalog_v2 = worker::EffectivePromptCatalog::new(
+            BTreeMap::from([("default".to_string(), "prompt-v2".to_string())]),
+            9,
+            "schema",
+            "toolchain",
+        )
+        .unwrap();
+        let projection_v2 = worker::WorkspacePromptProjection::new(
+            "workspace-a",
+            "source-v2",
+            catalog_v2.catalog_digest.clone(),
+            catalog_v2.clone(),
+        )
+        .unwrap();
+
+        cache.observe(projection_v1).unwrap();
+        cache.observe(projection_v2).unwrap();
+
+        let active = cache.active("workspace-a").unwrap().unwrap();
+        assert_eq!(active.projection.config_revision, 9);
+        assert_eq!(
+            active.projection.catalog.catalog_digest,
+            catalog_v2.catalog_digest
+        );
+    }
+
+    #[test]
+    fn workspace_prompt_projection_cache_rejects_same_revision_source_drift() {
+        let catalog = worker::EffectivePromptCatalog::new(
+            BTreeMap::from([("default".to_string(), "prompt".to_string())]),
+            8,
+            "schema",
+            "toolchain",
+        )
+        .unwrap();
+        let first = worker::WorkspacePromptProjection::new(
+            "workspace-a",
+            "source-a",
+            catalog.catalog_digest.clone(),
+            catalog.clone(),
+        )
+        .unwrap();
+        let drifted = worker::WorkspacePromptProjection::new(
+            "workspace-a",
+            "source-b",
+            catalog.catalog_digest.clone(),
+            catalog,
+        )
+        .unwrap();
+        let cache = WorkspacePromptProjectionCache::default();
+
+        cache.observe(first).unwrap();
+        let error = cache.observe(drifted).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("without a config revision transition")
+        );
+    }
+
+    #[test]
+    fn workspace_prompt_projection_cache_rejects_same_revision_schema_drift() {
+        let templates = BTreeMap::from([("default".to_string(), "prompt".to_string())]);
+        let first_catalog =
+            worker::EffectivePromptCatalog::new(templates.clone(), 8, "schema-a", "toolchain")
+                .unwrap();
+        let drifted_catalog =
+            worker::EffectivePromptCatalog::new(templates, 8, "schema-b", "toolchain").unwrap();
+        let first = worker::WorkspacePromptProjection::new(
+            "workspace-a",
+            "source-a",
+            first_catalog.catalog_digest.clone(),
+            first_catalog,
+        )
+        .unwrap();
+        let drifted = worker::WorkspacePromptProjection::new(
+            "workspace-a",
+            "source-a",
+            drifted_catalog.catalog_digest.clone(),
+            drifted_catalog,
+        )
+        .unwrap();
+        let cache = WorkspacePromptProjectionCache::default();
+
+        cache.observe(first).unwrap();
+        let error = cache.observe(drifted).unwrap_err();
+        assert!(error.contains("without a config revision transition"));
+    }
+
+    #[test]
     fn restart_restore_reconstructs_runtime_owned_worker_mutation_client() {
         let identity = RuntimeIdentityMaterial::generate("runtime-source").unwrap();
         let worker_ref = WorkerRef::new(crate::identity::WorkerId::new(17));
@@ -1871,12 +2128,12 @@ mod tests {
         let scope = crate::runtime::RuntimeWorkspaceScope::new("workspace-a", "server-main");
 
         let before_restart =
-            backend.worker_context(&worker_ref, Some(&scope), Some(&identity), None);
+            backend.worker_context(&worker_ref, Some(&scope), Some(&identity), None, None);
         let adapter = WorkerRuntimeExecutionBackend::new(FailingFactory).unwrap();
         let (after_restore_kind, after_restore_workspace_id) = adapter
             .run_on_adapter_runtime(async move {
                 let after_restore =
-                    backend.worker_context(&worker_ref, Some(&scope), Some(&identity), None);
+                    backend.worker_context(&worker_ref, Some(&scope), Some(&identity), None, None);
                 let client = after_restore.client_handle();
                 Ok((
                     client.kind().to_string(),
@@ -2064,6 +2321,7 @@ mod tests {
             let workspace_context = workspace_backend_ref.worker_context(
                 &request.worker_ref,
                 request.workspace_scope.as_ref(),
+                None,
                 None,
                 None,
             );
@@ -2466,9 +2724,45 @@ mod tests {
             .expect("embedded archive should resolve without Backend resource client");
     }
 
+    #[test]
+    fn pending_restore_launch_material_preserves_workspace_prompt_catalog() {
+        let root = tempfile::tempdir().unwrap();
+        let factory = ProfileRuntimeWorkerFactory::new(root.path());
+        let builtins = worker::PromptCatalog::builtins_only().unwrap();
+        let projection = builtins.projection();
+        let mut templates = projection.templates.clone();
+        templates.insert(
+            "internal.notify_wrapper".to_string(),
+            "PENDING-LAUNCH {{ message }}".to_string(),
+        );
+        let mut effective = worker::EffectivePromptCatalog::new(
+            templates,
+            7,
+            projection.schema_fingerprint.clone(),
+            projection.toolchain_fingerprint.clone(),
+        )
+        .unwrap();
+        effective.source_digest = "source-7".to_string();
+        let mut bundle = test_bundle();
+        bundle.metadata.workspace_id = "workspace-restore".to_string();
+        bundle.prompt_catalog = Some(effective);
+        bundle = bundle.with_computed_digest();
+
+        let resolution = factory
+            .observe_bundle_prompt_projection(&bundle, Some("workspace-restore"))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resolution.projection.config_revision, 7);
+        assert_eq!(
+            resolution.catalog.notify_wrapper("restored").unwrap(),
+            "PENDING-LAUNCH restored"
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial(worker_allocation)]
-    async fn restore_pending_worker_uses_saved_manifest_snapshot() {
+    async fn restore_pending_workspace_worker_without_system_prompt_fails_closed() {
         let root = tempfile::tempdir().unwrap();
         let runtime_store_dir = root.path().join("runtime");
         let worker_ref = WorkerRef::new(crate::identity::WorkerId::new(1));
@@ -2518,9 +2812,9 @@ mod tests {
             base_url: "http://workspace.invalid".to_string(),
         });
         let identity = RuntimeIdentityMaterial::generate("runtime-restore").unwrap();
-        let controller = ProfileRuntimeWorkerFactory::new(root.path())
-            .with_remote_worker_mutation_identity(identity)
+        let error = match ProfileRuntimeWorkerFactory::new(root.path())
             .with_runtime_store_dir(&runtime_store_dir)
+            .with_remote_worker_mutation_identity(identity)
             .restore_controller(WorkerExecutionRestoreRequest {
                 worker_ref: worker_ref.clone(),
                 run_generation: 1,
@@ -2535,25 +2829,11 @@ mod tests {
                 config_bundle: None,
             })
             .await
-            .expect("pending restore should use the saved manifest snapshot");
-        assert!(controller.handle.shared_state.flow_transition_enabled());
-        let run_dir = runtime_store_dir.join("workers/1/runs/1");
-        assert!(run_dir.join("worker.sock").exists());
-        assert!(run_dir.join("worker.out.log").is_file());
-        assert!(run_dir.join("worker.err.log").is_file());
-        assert!(run_dir.join("artifacts").is_dir());
-        assert!(run_dir.join("spawned").is_dir());
-
-        let shutdown = controller.shutdown.clone();
-        controller.handle.send(Method::Shutdown).await.unwrap();
-        if let Some(receiver) = shutdown.lock().await.take() {
-            receiver.await.unwrap();
-        }
-        assert!(
-            run_dir.is_dir(),
-            "run evidence remains until a separate retention policy disposes it"
-        );
-        assert!(!run_dir.join("worker.sock").exists());
+        {
+            Ok(_) => panic!("pending Workspace Worker restore unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.contains("requires operation-owned launch material"));
     }
 
     #[tokio::test]

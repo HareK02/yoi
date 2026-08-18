@@ -31,6 +31,8 @@ const BUILTIN_TOOLCHAIN_FINGERPRINT: &str = "builtin:prompts:decodal-0.4";
 pub struct EffectivePromptCatalog {
     pub templates: BTreeMap<String, String>,
     pub config_revision: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_digest: String,
     pub schema_fingerprint: String,
     pub toolchain_fingerprint: String,
     pub catalog_digest: String,
@@ -48,6 +50,7 @@ impl EffectivePromptCatalog {
         Ok(Self {
             templates,
             config_revision,
+            source_digest: String::new(),
             schema_fingerprint: schema_fingerprint.into(),
             toolchain_fingerprint: toolchain_fingerprint.into(),
             catalog_digest,
@@ -169,6 +172,87 @@ pub enum CatalogError {
     Serialize(#[from] serde_json::Error),
     #[error("effective Prompt catalog digest mismatch: expected {expected}, got {actual}")]
     DigestMismatch { expected: String, actual: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspacePromptProjection {
+    pub workspace_id: String,
+    pub config_revision: u64,
+    pub source_digest: String,
+    pub projection_digest: String,
+    pub schema_fingerprint: String,
+    pub toolchain_fingerprint: String,
+    pub catalog: EffectivePromptCatalog,
+}
+
+impl WorkspacePromptProjection {
+    pub fn new(
+        workspace_id: impl Into<String>,
+        source_digest: impl Into<String>,
+        projection_digest: impl Into<String>,
+        catalog: EffectivePromptCatalog,
+    ) -> Result<Self, CatalogError> {
+        let workspace_id = workspace_id.into();
+        let source_digest = source_digest.into();
+        let projection_digest = projection_digest.into();
+        catalog.verify_digest()?;
+        if workspace_id.trim().is_empty() {
+            return Err(CatalogError::InvalidTemplateCatalog(
+                "Workspace Prompt projection workspace_id must not be empty".to_string(),
+            ));
+        }
+        if source_digest.trim().is_empty() {
+            return Err(CatalogError::InvalidTemplateCatalog(
+                "Workspace Prompt projection source digest must not be empty".to_string(),
+            ));
+        }
+        if projection_digest.trim().is_empty() {
+            return Err(CatalogError::InvalidTemplateCatalog(
+                "Workspace Prompt projection digest must not be empty".to_string(),
+            ));
+        }
+        if projection_digest != catalog.catalog_digest {
+            return Err(CatalogError::InvalidTemplateCatalog(
+                "Workspace Prompt projection digest does not match its catalog".to_string(),
+            ));
+        }
+        if !catalog.source_digest.is_empty() && catalog.source_digest != source_digest {
+            return Err(CatalogError::InvalidTemplateCatalog(
+                "Workspace Prompt projection source digest does not match its catalog".to_string(),
+            ));
+        }
+        Ok(Self {
+            workspace_id,
+            config_revision: catalog.config_revision,
+            source_digest,
+            projection_digest,
+            schema_fingerprint: catalog.schema_fingerprint.clone(),
+            toolchain_fingerprint: catalog.toolchain_fingerprint.clone(),
+            catalog,
+        })
+    }
+
+    pub fn catalog(&self) -> &EffectivePromptCatalog {
+        &self.catalog
+    }
+
+    pub fn validate(&self) -> Result<(), CatalogError> {
+        let rebuilt = Self::new(
+            self.workspace_id.clone(),
+            self.source_digest.clone(),
+            self.projection_digest.clone(),
+            self.catalog.clone(),
+        )?;
+        if rebuilt.config_revision != self.config_revision
+            || rebuilt.schema_fingerprint != self.schema_fingerprint
+            || rebuilt.toolchain_fingerprint != self.toolchain_fingerprint
+        {
+            return Err(CatalogError::InvalidTemplateCatalog(
+                "Workspace Prompt projection metadata does not match its catalog".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub struct PromptCatalog {
@@ -548,6 +632,32 @@ mod tests {
             tampered.verify_digest(),
             Err(CatalogError::DigestMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn workspace_prompt_projection_round_trips_and_rejects_tampered_metadata() {
+        let catalog = EffectivePromptCatalog::new(
+            BTreeMap::from([("default".to_string(), "PROMPT".to_string())]),
+            8,
+            "schema",
+            "toolchain",
+        )
+        .unwrap();
+        let projection = WorkspacePromptProjection::new(
+            "workspace-a",
+            "source-digest",
+            catalog.catalog_digest.clone(),
+            catalog,
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&projection).unwrap();
+        let restored: WorkspacePromptProjection = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(restored, projection);
+        restored.validate().unwrap();
+
+        let mut tampered = restored;
+        tampered.config_revision += 1;
+        assert!(tampered.validate().is_err());
     }
 
     #[test]

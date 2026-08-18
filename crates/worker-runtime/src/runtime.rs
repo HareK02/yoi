@@ -300,6 +300,29 @@ impl Runtime {
         state.check_config_bundle_ref(reference)
     }
 
+    /// Notify the execution backend of the Workspace's current immutable
+    /// Prompt projection. The Runtime keeps this cache outside persisted Worker
+    /// restore authority.
+    pub fn observe_workspace_prompt_projection(
+        &self,
+        projection: worker::WorkspacePromptProjection,
+    ) -> Result<(), RuntimeError> {
+        let backend = {
+            let state = self.lock()?;
+            state.ensure_running()?;
+            state.execution_backend.clone().ok_or_else(|| {
+                RuntimeError::ExecutionBackendUnavailable {
+                    message:
+                        "Workspace Prompt projection notification requires an execution backend"
+                            .to_string(),
+                }
+            })?
+        };
+        backend
+            .observe_workspace_prompt_projection(projection)
+            .map_err(|message| RuntimeError::ExecutionBackendUnavailable { message })
+    }
+
     /// Stop the Runtime.  v0 keeps data readable after stop, but rejects new
     /// create/send/worker lifecycle mutations.
     pub fn stop_runtime(&self) -> Result<(), RuntimeError> {
@@ -900,8 +923,6 @@ impl Runtime {
                     worker.run_generation.saturating_add(1).max(1),
                 )
             };
-            let config_bundle =
-                state.resolve_config_bundle_ref(worker_request.config_bundle.as_ref())?;
             let backend = state.execution_backend.clone().ok_or_else(|| {
                 RuntimeError::WorkerExecutionUnavailable {
                     worker_id: worker_ref.worker_id.clone(),
@@ -924,7 +945,7 @@ impl Runtime {
                 context: self.execution_context(worker_ref.clone()),
                 previous_working_directory,
                 working_directory: None,
-                config_bundle,
+                config_bundle: None,
             };
             (backend, request)
         };
@@ -1580,8 +1601,6 @@ impl Runtime {
                         worker.run_generation.saturating_add(1).max(1),
                     )
                 };
-                let config_bundle =
-                    state.resolve_config_bundle_ref(request.config_bundle.as_ref())?;
                 state
                     .workers
                     .get_mut(&worker_id)
@@ -1593,7 +1612,7 @@ impl Runtime {
                     request,
                     run_generation,
                     previous_working_directory,
-                    config_bundle,
+                    config_bundle: None,
                 });
             }
             candidates
@@ -1941,7 +1960,7 @@ impl RuntimeState {
             next_worker_sequence: persisted.next_worker_sequence,
             next_diagnostic_id,
             workers,
-            config_bundles: persisted.config_bundles,
+            config_bundles: BTreeMap::new(),
             workspace_owners: persisted.workspace_owners,
             diagnostics,
             subscription_revision: 0,
@@ -1969,7 +1988,6 @@ impl RuntimeState {
                 .iter()
                 .map(|(worker_id, worker)| (worker_id.clone(), worker.persisted_record()))
                 .collect(),
-            config_bundles: self.config_bundles.clone(),
             workspace_owners: self.workspace_owners.clone(),
             diagnostics: self.diagnostics.clone(),
         }
@@ -3476,12 +3494,12 @@ mod tests {
         runtime.restore_worker(&detail.worker_ref).unwrap();
         assert_eq!(
             backend.config_bundles.lock().unwrap().as_slice(),
-            &[Some(bundle.clone()), Some(bundle)]
+            &[Some(bundle), None]
         );
     }
 
     #[test]
-    fn restore_fails_closed_when_recorded_config_bundle_is_missing_or_mismatched() {
+    fn restore_does_not_require_recorded_config_bundle() {
         let (runtime, backend) = runtime_and_backend();
         let bundle = test_bundle();
         let detail = runtime
@@ -3489,11 +3507,11 @@ mod tests {
             .unwrap();
         runtime.stop_worker(&detail.worker_ref, None).unwrap();
         runtime.lock().unwrap().config_bundles.clear();
-        assert!(matches!(
-            runtime.restore_worker(&detail.worker_ref),
-            Err(RuntimeError::ConfigBundleMissing { .. })
-        ));
-        assert_eq!(backend.config_bundles.lock().unwrap().len(), 1);
+        runtime.restore_worker(&detail.worker_ref).unwrap();
+        assert_eq!(
+            backend.config_bundles.lock().unwrap().as_slice(),
+            &[Some(bundle), None]
+        );
 
         let (runtime, backend) = runtime_and_backend();
         let bundle = test_bundle();
@@ -3509,11 +3527,11 @@ mod tests {
             .unwrap()
             .config_bundles
             .insert(replacement.metadata.id.clone(), replacement);
-        assert!(matches!(
-            runtime.restore_worker(&detail.worker_ref),
-            Err(RuntimeError::ConfigBundleDigestMismatch { .. })
-        ));
-        assert_eq!(backend.config_bundles.lock().unwrap().len(), 1);
+        runtime.restore_worker(&detail.worker_ref).unwrap();
+        assert_eq!(
+            backend.config_bundles.lock().unwrap().as_slice(),
+            &[Some(bundle), None]
+        );
     }
 
     #[test]
@@ -4137,7 +4155,10 @@ mod tests {
             runtime.summary().unwrap().backend,
             RuntimeBackendKind::FsStore
         );
-        runtime.store_config_bundle(test_bundle()).unwrap();
+        let transport_bundle = test_bundle();
+        runtime
+            .store_config_bundle(transport_bundle.clone())
+            .unwrap();
 
         let worker = runtime.create_worker(task_request("persist me")).unwrap();
         runtime
@@ -4171,6 +4192,13 @@ mod tests {
         .unwrap();
         let restored_worker = restored.worker_detail(&worker.worker_ref).unwrap();
         assert_eq!(restored_worker.status, WorkerStatus::Stopped);
+        assert!(matches!(
+            restored.check_config_bundle(&ConfigBundleRef {
+                id: transport_bundle.metadata.id.clone(),
+                digest: transport_bundle.metadata.digest.clone(),
+            }),
+            Err(RuntimeError::ConfigBundleMissing { .. })
+        ));
         assert!(!root.join("events.jsonl").exists());
         assert!(!worker_store_dir.join("observations.jsonl").exists());
         #[cfg(feature = "ws-server")]

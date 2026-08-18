@@ -33,7 +33,8 @@ pub use manifest::{
 };
 pub use model_client::{ProviderError, build_client};
 pub use prompt::catalog::{
-    CatalogError, EffectivePromptCatalog, PromptCatalog, WorkerPrompt, prompt_schema_source,
+    CatalogError, EffectivePromptCatalog, PromptCatalog, WorkerPrompt, WorkspacePromptProjection,
+    prompt_schema_source,
 };
 pub use prompt::source::PromptCatalogSource;
 pub use prompt::system::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
@@ -44,7 +45,7 @@ pub use shared_state::WorkerSharedState;
 pub use worker::{
     LocalWorkingDirectory, WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN, Worker, WorkerError,
     WorkerFilesystemAuthority, WorkerRunResult, WorkerWorkspaceContext, WorkspaceClient,
-    WorkspaceClientError, WorkspaceId, WorkspaceIdError, WorkspaceRequest, WorkspaceRequestMethod,
-    WorkspaceResponse, apply_worker_manifest, marker_workspace_client,
-    unavailable_workspace_client,
+    WorkspaceClientError, WorkspaceId, WorkspaceIdError, WorkspacePromptCatalogResolution,
+    WorkspaceRequest, WorkspaceRequestMethod, WorkspaceResponse, apply_worker_manifest,
+    marker_workspace_client, unavailable_workspace_client,
 };

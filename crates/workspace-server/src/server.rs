@@ -256,6 +256,7 @@ pub struct WorkspaceApi {
     pub(crate) store: Arc<dyn ControlPlaneStore>,
     config_store: Arc<crate::SqliteWorkspaceStore>,
     config_schema_registry: crate::config_source::WorkspaceConfigSchemaRegistry,
+    prompt_projection_cache: crate::prompt_settings::WorkspacePromptProjectionCache,
     authority: SqliteWorkspaceAuthority,
     runtime: Arc<RuntimeRegistry>,
     companion: Arc<CompanionConsole>,
@@ -806,6 +807,8 @@ impl WorkspaceApi {
         let api = Self {
             config_store,
             config_schema_registry,
+            prompt_projection_cache:
+                crate::prompt_settings::WorkspacePromptProjectionCache::default(),
             authority: SqliteWorkspaceAuthority::new(
                 config.database_path.clone(),
                 config.workspace_id.clone(),
@@ -1239,6 +1242,10 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/config/source-tree",
             get(scoped_get_workspace_config_tree),
+        )
+        .route(
+            "/api/w/{workspace_id}/config/projections/prompts",
+            get(scoped_get_prompt_projection),
         )
         .route(
             "/api/w/{workspace_id}/config/source-tree/commit",
@@ -2578,6 +2585,25 @@ struct WorkspaceConfigEntryPath {
     path: String,
 }
 
+async fn scoped_get_prompt_projection(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+) -> ApiResult<Json<worker::WorkspacePromptProjection>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let state = api
+        .config_store
+        .load_workspace_config(&path.workspace_id)?
+        .ok_or_else(|| {
+            ApiError::from(Error::InvalidInput(
+                "Workspace config is not initialized".to_string(),
+            ))
+        })?;
+    let projection = api
+        .prompt_projection_cache
+        .resolve(&path.workspace_id, &state)?;
+    Ok(Json(projection.as_ref().clone()))
+}
+
 #[derive(Debug, Serialize)]
 struct WorkspaceConfigTreeResponse {
     snapshot: ConfigTreeSnapshot,
@@ -2647,6 +2673,14 @@ async fn scoped_commit_workspace_config_tree(
     let state = api
         .config_store
         .commit_evaluated_workspace_config(&path.workspace_id, &candidate)?;
+    if let Ok(projection) = api
+        .prompt_projection_cache
+        .resolve(&path.workspace_id, &state)
+    {
+        let _diagnostics = api
+            .runtime
+            .observe_workspace_prompt_projection((*projection).clone());
+    }
     Ok((
         StatusCode::CREATED,
         Json(WorkspaceConfigTreeResponse {
@@ -2876,9 +2910,13 @@ fn validate_ticket_assignment_state(
     assignment: &WorkerTicketAssignmentRequest,
 ) -> Result<()> {
     let ticket = api.authority.ticket(&assignment.ticket_id)?;
-    if ticket.state != TicketWorkflowState::InProgress.as_str() {
+    if !matches!(
+        ticket.state.as_str(),
+        state if state == TicketWorkflowState::Queued.as_str()
+            || state == TicketWorkflowState::InProgress.as_str()
+    ) {
         return Err(Error::TicketAssignmentConflict(format!(
-            "Ticket {} must be inprogress before assigning an implementation Coder; current state is {}",
+            "Ticket {} must be queued or inprogress before assigning an implementation Coder; current state is {}",
             ticket.id, ticket.state
         )));
     }
@@ -3044,6 +3082,33 @@ fn assign_ticket_worker_from_lifecycle(
             false,
         )?
         .current)
+}
+
+fn accept_queued_ticket_after_worker_spawn(
+    api: &WorkspaceApi,
+    assignment: &crate::hosts::WorkerTicketAssignmentRequest,
+) -> Result<()> {
+    let ticket = api.authority.ticket(&assignment.ticket_id)?;
+    if ticket.state == TicketWorkflowState::InProgress.as_str() {
+        return Ok(());
+    }
+    if ticket.state != TicketWorkflowState::Queued.as_str() {
+        return Err(Error::TicketAssignmentConflict(format!(
+            "Ticket {} left queued state before Coder spawn acceptance; current state is {}",
+            ticket.id, ticket.state
+        )));
+    }
+    let mut change = TicketStateChange::new(
+        TicketWorkflowState::Queued.as_str(),
+        TicketWorkflowState::InProgress.as_str(),
+        "Coder spawn, assignment, and initial input were durably accepted",
+        "",
+    );
+    change.author = Some("workspace-orchestrator".to_string());
+    browser_ticket_backend(api)?
+        .set_workflow_state(TicketIdOrSlug::Id(ticket.id), change)
+        .map_err(Error::from)?;
+    Ok(())
 }
 
 fn existing_lifecycle_assignment_worker(
@@ -5243,12 +5308,13 @@ fn dispatch_orchestrator_queue_attention(api: &WorkspaceApi) {
     else {
         return;
     };
-    let Ok(projection) =
-        crate::prompt_settings::project_prompts_from_workspace_config(&config_state)
+    let Ok(projection) = api
+        .prompt_projection_cache
+        .resolve(&api.config.workspace_id, &config_state)
     else {
         return;
     };
-    let Ok(catalog) = worker::PromptCatalog::from_projection(projection) else {
+    let Ok(catalog) = worker::PromptCatalog::from_projection(projection.catalog().clone()) else {
         return;
     };
     let content = match catalog.render_serializable(
@@ -9005,13 +9071,18 @@ async fn create_workspace_worker(
                     "profile must be selected from Backend-published worker profile candidates",
                 )
             })?;
-    let resolved_config_bundle = crate::profile_settings::build_virtual_profile_config_bundle(
-        &profile_projection,
-        &config_state,
-        &api.config.workspace_id,
-        &api.config.workspace_created_at,
-        &profile,
-    )?;
+    let prompt_catalog = api
+        .prompt_projection_cache
+        .resolve(&api.config.workspace_id, &config_state)?;
+    let resolved_config_bundle =
+        crate::profile_settings::build_virtual_profile_config_bundle_with_prompt_projection(
+            &profile_projection,
+            &config_state,
+            &api.config.workspace_id,
+            &api.config.workspace_created_at,
+            &profile,
+            prompt_catalog.as_ref(),
+        )?;
     let display_name = sanitize_worker_display_name(&display_name).ok_or_else(|| {
         settings_bad_request(
             "invalid_worker_display_name",
@@ -9242,6 +9313,20 @@ fn browser_worker_response_from_summary(
             link_worker_to_workdir(api, &worker_record, workdir_id, None)?;
         }
     }
+    if let Some(assignment) = assignment {
+        let context = WorkerSpawnCompensationContext {
+            assignment: Some(assignment),
+            prepared_workdir_id: selected_working_directory_id,
+            cleanup_spawned_workdir: false,
+        };
+        finalize_worker_spawn_stage(
+            api,
+            &worker,
+            &context,
+            WorkerSpawnFinalizeStage::TicketStateAccept,
+            accept_queued_ticket_after_worker_spawn(api, assignment).map_err(ApiError::from),
+        )?;
+    }
     let runtime_id = worker.worker.runtime_id.clone();
     let worker_id = worker.worker.worker_id.clone();
     let workspace_id = api.workspace_id().to_string();
@@ -9456,6 +9541,7 @@ enum WorkerSpawnFinalizeStage {
     WorkerRegistry,
     TicketAssignmentBind,
     TicketAssignmentCurrent,
+    TicketStateAccept,
     WorkdirRegistry,
     WorkdirAttachment,
 }
@@ -9466,6 +9552,7 @@ impl WorkerSpawnFinalizeStage {
             Self::WorkerRegistry => "worker_registry",
             Self::TicketAssignmentBind => "ticket_assignment_bind",
             Self::TicketAssignmentCurrent => "ticket_assignment_current",
+            Self::TicketStateAccept => "ticket_state_accept",
             Self::WorkdirRegistry => "workdir_registry",
             Self::WorkdirAttachment => "workdir_attachment",
         }
@@ -12797,7 +12884,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_assignment_spawn_requires_inprogress_before_runtime_side_effects() {
+    async fn ticket_assignment_spawn_requires_queued_or_inprogress_before_runtime_side_effects() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
@@ -12857,7 +12944,7 @@ mod tests {
         let api = test_api(workspace.path()).await;
         let backend = browser_ticket_backend(&api).unwrap();
         let mut input = ticket::NewTicket::new("Assigned Ticket");
-        input.workflow_state = Some(TicketWorkflowState::InProgress);
+        input.workflow_state = Some(TicketWorkflowState::Queued);
         let ticket = backend.create(input).unwrap();
         let response = create_workspace_worker(
             State(api.clone()),
@@ -12882,6 +12969,10 @@ mod tests {
         .unwrap()
         .0;
 
+        assert_eq!(
+            api.authority.ticket(&ticket.id).unwrap().state,
+            TicketWorkflowState::InProgress.as_str()
+        );
         let current = api
             .store
             .get_current_ticket_worker_assignment(&api.config.workspace_id, &ticket.id)
@@ -12898,6 +12989,50 @@ mod tests {
             .unwrap();
         assert_eq!(operation.assignment_id, Some(current.assignment_id));
         assert_eq!(operation.worker, Some(response.worker_ref));
+    }
+
+    #[tokio::test]
+    async fn failed_ticket_assignment_spawn_leaves_ticket_queued() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let backend = browser_ticket_backend(&api).unwrap();
+        let mut input = ticket::NewTicket::new("Queued Ticket");
+        input.workflow_state = Some(TicketWorkflowState::Queued);
+        let ticket = backend.create(input).unwrap();
+
+        let result = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(CreateWorkspaceWorkerRequest {
+                runtime_id: "missing-runtime".to_string(),
+                display_name: "Rejected Coder".to_string(),
+                profile: Some("builtin:coder".to_string()),
+                ticket_assignment: Some(CreateWorkspaceWorkerTicketAssignmentRequest {
+                    ticket_id: ticket.id.clone(),
+                    operation_id: "failed-queued-assignment".to_string(),
+                }),
+                initial_submit: vec![Segment::Flow {
+                    selector: "builtin:coder-review".to_string(),
+                }],
+                working_directory: None,
+                control_operation_id: None,
+                resolved_control_operation: None,
+            }),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            api.authority.ticket(&ticket.id).unwrap().state,
+            TicketWorkflowState::Queued.as_str()
+        );
+        assert!(
+            api.store
+                .get_current_ticket_worker_assignment(&api.config.workspace_id, &ticket.id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -12996,7 +13131,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_profile_backend_launches_and_restores_workspace_orchestrator() {
+    async fn production_profile_backend_rejects_unrecoverable_pending_orchestrator_restore() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let config = test_server_config(workspace.path());
@@ -13036,17 +13171,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stopped.state, WorkerOperationState::Accepted);
-        let Json(restored) = scoped_start_workspace_orchestrator(
-            State(api),
-            AxumPath(ScopedWorkspacePath { workspace_id }),
+        let error = scoped_start_workspace_orchestrator(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: workspace_id.clone(),
+            }),
         )
         .await
-        .unwrap();
-        assert_eq!(restored.disposition, "restored");
-        assert!(restored.online);
-        assert_eq!(
-            restored.worker.expect("restored Orchestrator").worker,
-            worker
+        .expect_err("pending Workspace Orchestrator restore without durable Prompt must fail");
+        assert!(
+            format!("{error:?}").contains(
+                "pending Workspace Worker restore requires operation-owned launch material"
+            ),
+            "unexpected restore error: {error:?}"
         );
     }
 

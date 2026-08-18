@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use manifest::{
@@ -946,7 +947,7 @@ pub(crate) fn sub_worker_spawn_tool(
     registry: Arc<SpawnedWorkerRegistry>,
     spawner_manifest: WorkerManifest,
     spawner_scope: SharedScope,
-    prompts: Arc<PromptCatalog>,
+    prompts: Arc<ArcSwap<PromptCatalog>>,
 ) -> ToolDefinition {
     sub_worker_spawn_tool_impl(
         spawner_name,
@@ -972,13 +973,14 @@ fn sub_worker_spawn_tool_impl(
     registry: Arc<SpawnedWorkerRegistry>,
     spawner_manifest: WorkerManifest,
     spawner_scope: SharedScope,
-    prompts: Arc<PromptCatalog>,
+    prompts: Arc<ArcSwap<PromptCatalog>>,
 ) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(SubWorkerSpawnInput);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
         let available_profiles = AvailableProfiles::discover(&workspace_root);
         let description = prompts
+            .load_full()
             .sub_worker_spawn_tool_description(
                 &available_profiles.compact_list(),
                 &available_profiles.default_label(),
@@ -1002,7 +1004,7 @@ fn sub_worker_spawn_tool_impl(
             spawner_cwd.clone(),
             registry.clone(),
             spawner_manifest.clone(),
-            prompts.source(),
+            prompts.load_full().source(),
             available_profiles,
             spawner_scope.clone(),
             DelegationScope::from_config(&spawner_manifest.delegation_scope)

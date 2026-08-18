@@ -11,6 +11,7 @@ use std::borrow::Cow;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use llm_engine::Item;
 use llm_engine::UsageRecord;
@@ -20,7 +21,6 @@ use llm_engine::interceptor::{
 };
 use llm_engine::tool::ToolOutput;
 use tracing::info;
-use tracing::warn;
 
 use crate::compact::state::CompactState;
 use crate::compact::usage_tracker::UsageTracker;
@@ -31,7 +31,7 @@ use crate::hook::{
     HookRegistry, HookTurnEndAction, PreRequestContext, PreRequestInfo, PromptSubmitInfo,
     SystemItemAppendHandle, ToolCallSummary, ToolResultSummary, TurnEndInfo,
 };
-use crate::ipc::notify_buffer::{NotifyBuffer, build_system_item};
+use crate::ipc::notify_buffer::{NotifyBuffer, build_system_item_with_provenance};
 use crate::prompt::catalog::PromptCatalog;
 use crate::worker::SystemItemCommitter;
 use llm_engine::token_counter::total_tokens;
@@ -64,7 +64,9 @@ pub(crate) struct WorkerInterceptor {
     pending_attachments: Arc<Mutex<Vec<SystemItem>>>,
     /// Prompt catalog used to render pending notification entries into the
     /// same system-message text that will be persisted in history.
-    prompts: Arc<PromptCatalog>,
+    prompts: Arc<ArcSwap<PromptCatalog>>,
+    /// Workspace scope associated with Prompt projection provenance.
+    prompt_workspace_id: Option<String>,
     /// Type-erased commit handle. The interceptor uses it to commit
     /// `LogEntry::SystemItem` entries directly (sync) before
     /// returning the corresponding `Item::system_message`s up to the
@@ -84,7 +86,7 @@ impl WorkerInterceptor {
         usage_history: Option<Arc<Mutex<Vec<UsageRecord>>>>,
         pending_notifies: NotifyBuffer,
         pending_attachments: Arc<Mutex<Vec<SystemItem>>>,
-        prompts: Arc<PromptCatalog>,
+        prompts: Arc<ArcSwap<PromptCatalog>>,
         log_writer: Option<Arc<dyn SystemItemCommitter>>,
     ) -> Self {
         Self {
@@ -95,6 +97,7 @@ impl WorkerInterceptor {
             pending_notifies,
             pending_attachments,
             prompts,
+            prompt_workspace_id: None,
             log_writer,
             next_turn_index: AtomicUsize::new(0),
             tool_calls_this_turn: AtomicUsize::new(0),
@@ -103,6 +106,11 @@ impl WorkerInterceptor {
 
     pub(crate) fn with_usage_tracker(mut self, usage_tracker: Arc<UsageTracker>) -> Self {
         self.usage_tracker = Some(usage_tracker);
+        self
+    }
+
+    pub(crate) fn with_prompt_workspace_id(mut self, workspace_id: Option<String>) -> Self {
+        self.prompt_workspace_id = workspace_id;
         self
     }
 
@@ -162,6 +170,32 @@ impl WorkerInterceptor {
         }
         false
     }
+    fn attach_prompt_provenance(&self, items: &mut [SystemItem]) {
+        let prompts = self.prompts.load();
+        let projection = prompts.projection();
+        let provenance = |logical_name: &str| session_store::PromptRenderProvenance {
+            workspace_id: self.prompt_workspace_id.clone(),
+            config_revision: projection.config_revision,
+            source_digest: projection.source_digest.clone(),
+            projection_digest: projection.catalog_digest.clone(),
+            logical_name: logical_name.to_string(),
+        };
+        for item in items {
+            match item {
+                SystemItem::TaskReminder {
+                    prompt_provenance, ..
+                } if prompt_provenance.is_none() => {
+                    *prompt_provenance = Some(provenance("internal.task_reminder"));
+                }
+                SystemItem::Interrupt {
+                    prompt_provenance, ..
+                } if prompt_provenance.is_none() => {
+                    *prompt_provenance = Some(provenance("internal.interrupt_system_note"));
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -180,7 +214,7 @@ impl Interceptor for WorkerInterceptor {
                 return action.into();
             }
         }
-        let extras: Vec<SystemItem> = std::mem::take(
+        let mut extras: Vec<SystemItem> = std::mem::take(
             &mut *self
                 .pending_attachments
                 .lock()
@@ -194,6 +228,7 @@ impl Interceptor for WorkerInterceptor {
             // commits land BEFORE the worker pushes its
             // `Item::system_message`s, so on-disk order matches
             // worker-history order.
+            self.attach_prompt_provenance(&mut extras);
             let items: Vec<Item> = extras.iter().map(SystemItem::to_history_item).collect();
             match self.commit_system_items(&extras) {
                 Ok(()) => PromptAction::ContinueWith(items),
@@ -208,34 +243,36 @@ impl Interceptor for WorkerInterceptor {
             return Ok(Vec::new());
         }
 
+        let prompts = self.prompts.load_full();
+        let projection = prompts.projection();
+        let provenance = session_store::PromptRenderProvenance {
+            workspace_id: self.prompt_workspace_id.clone(),
+            config_revision: projection.config_revision,
+            source_digest: projection.source_digest.clone(),
+            projection_digest: projection.catalog_digest.clone(),
+            logical_name: "internal.notify_wrapper".to_string(),
+        };
         let mut system_items: Vec<SystemItem> = Vec::with_capacity(drained.len());
         let mut items: Vec<Item> = Vec::with_capacity(drained.len());
-        for entry in drained {
-            match build_system_item(&entry, &self.prompts) {
-                Ok(system_item) => {
-                    items.push(system_item.to_history_item());
-                    system_items.push(system_item);
+        for entry in &drained {
+            let system_item = match build_system_item_with_provenance(
+                entry,
+                &prompts,
+                Some(provenance.clone()),
+            ) {
+                Ok(system_item) => system_item,
+                Err(error) => {
+                    self.pending_notifies.requeue_front(drained);
+                    return Err(format!("failed to render notify_wrapper: {error}"));
                 }
-                Err(e) => {
-                    // A render failure here would starve the LLM of
-                    // the notify text. Fall back to a raw item so the
-                    // trigger still lands in history; the entry will
-                    // simply be skipped from the SystemItem batch.
-                    warn!(error = %e, "failed to render notify_wrapper; using raw message");
-                    let fallback = match &entry {
-                        super::notify_buffer::PendingNotify::Notify { message, .. } => {
-                            message.clone()
-                        }
-                        super::notify_buffer::PendingNotify::WorkerEvent { event } => {
-                            session_store::render_worker_event(event)
-                        }
-                    };
-                    items.push(Item::system_message(fallback));
-                }
-            }
+            };
+            items.push(system_item.to_history_item());
+            system_items.push(system_item);
         }
-        self.commit_system_items(&system_items)
-            .map_err(|error| format!("session persistence failed: {error}"))?;
+        if let Err(error) = self.commit_system_items(&system_items) {
+            self.pending_notifies.requeue_front(drained);
+            return Err(format!("session persistence failed: {error}"));
+        }
         Ok(items)
     }
 
@@ -263,11 +300,12 @@ impl Interceptor for WorkerInterceptor {
             }
         }
 
-        let system_items: Vec<SystemItem> = std::mem::take(
+        let mut system_items: Vec<SystemItem> = std::mem::take(
             &mut *pending_hook_system_items
                 .lock()
                 .expect("pending hook system-item queue poisoned"),
         );
+        self.attach_prompt_provenance(&mut system_items);
         let appended_items: Vec<Item> = system_items
             .iter()
             .map(SystemItem::to_history_item)
@@ -440,6 +478,10 @@ mod tests {
         HookTurnEndAction, OnTurnEnd, PostToolCall, PreLlmRequest, PreToolCall,
     };
 
+    fn test_prompts() -> Arc<ArcSwap<PromptCatalog>> {
+        Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap()))
+    }
+
     struct CountingHook(Arc<AtomicUsize>);
 
     #[async_trait]
@@ -541,7 +583,7 @@ mod tests {
             Some(history),
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         );
         let mut ctx = ctx_items;
@@ -571,7 +613,7 @@ mod tests {
             Some(history),
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             Some(Arc::new(RecordingSystemItemCommitter {
                 committed: Arc::clone(&committed),
             })),
@@ -609,7 +651,7 @@ mod tests {
             Some(history),
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         )
         .with_usage_tracker(usage_tracker);
@@ -634,7 +676,7 @@ mod tests {
             Some(history),
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         );
         let mut ctx = ctx_items;
@@ -675,7 +717,7 @@ mod tests {
             Some(history),
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         );
         let mut ctx = ctx_items;
@@ -702,7 +744,7 @@ mod tests {
             Some(history),
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         );
         let mut ctx = ctx_items;
@@ -723,7 +765,7 @@ mod tests {
             None,
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         );
         let mut ctx: Vec<Item> = Vec::new();
@@ -751,7 +793,7 @@ mod tests {
             None,
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             Some(committer),
         );
 
@@ -798,7 +840,7 @@ mod tests {
             None,
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         );
 
@@ -855,7 +897,7 @@ mod tests {
             None,
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         );
         let mut info = task_tool_call_info("TaskList", serde_json::json!({"scope": "all"}));
@@ -902,7 +944,7 @@ mod tests {
             None,
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         );
         let info = task_tool_call_info("TaskList", serde_json::json!({}));
@@ -953,7 +995,7 @@ mod tests {
             None,
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         );
         let history = vec![Item::user_message("hi"), Item::assistant_message("done")];
@@ -985,7 +1027,7 @@ mod tests {
             None,
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             Some(Arc::new(RecordingSystemItemCommitter {
                 committed: Arc::clone(&committed),
             })),
@@ -1027,10 +1069,114 @@ mod tests {
             .lock()
             .expect("committed system-item list poisoned");
         assert_eq!(committed.len(), 1);
-        let SystemItem::TaskReminder { body, .. } = &committed[0] else {
-            panic!("expected task reminder, got {:?}", committed[0]);
+        let SystemItem::TaskReminder {
+            body,
+            prompt_provenance: Some(provenance),
+            ..
+        } = &committed[0]
+        else {
+            panic!(
+                "expected task reminder with Prompt provenance, got {:?}",
+                committed[0]
+            );
         };
         assert!(body.contains("track active work"));
+        assert_eq!(provenance.logical_name, "internal.task_reminder");
+    }
+
+    #[tokio::test]
+    async fn pending_notifications_use_the_latest_prompt_projection() {
+        let prompts = test_prompts();
+        let buffer = NotifyBuffer::new();
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let interceptor = WorkerInterceptor::new(
+            Arc::new(HookRegistryBuilder::new().build()),
+            None,
+            None,
+            buffer.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            prompts.clone(),
+            Some(Arc::new(RecordingSystemItemCommitter {
+                committed: committed.clone(),
+            })),
+        )
+        .with_prompt_workspace_id(Some("workspace-a".to_string()));
+
+        let current = prompts.load_full();
+        let projection = current.projection();
+        let mut templates = projection.templates.clone();
+        templates.insert(
+            "internal.notify_wrapper".to_string(),
+            "CURRENT-PROJECTION {{ message }}".to_string(),
+        );
+        let mut projection = crate::prompt::catalog::EffectivePromptCatalog::new(
+            templates,
+            2,
+            projection.schema_fingerprint.clone(),
+            projection.toolchain_fingerprint.clone(),
+        )
+        .unwrap();
+        projection.source_digest = "source-2".to_string();
+        prompts.store(Arc::new(
+            PromptCatalog::from_projection(projection).unwrap(),
+        ));
+
+        buffer.push_notify("updated".to_string(), false);
+        let appends = interceptor.pending_history_appends().await.unwrap();
+        assert_eq!(appends.len(), 1);
+        assert!(format!("{:?}", appends[0]).contains("CURRENT-PROJECTION updated"));
+        let committed = committed.lock().unwrap();
+        let SystemItem::Notification {
+            prompt_provenance: Some(provenance),
+            ..
+        } = &committed[0]
+        else {
+            panic!("notification Prompt provenance was not committed");
+        };
+        assert_eq!(provenance.workspace_id.as_deref(), Some("workspace-a"));
+        assert_eq!(provenance.config_revision, 2);
+        assert_eq!(provenance.source_digest, "source-2");
+        assert_eq!(provenance.logical_name, "internal.notify_wrapper");
+    }
+
+    #[tokio::test]
+    async fn notify_render_failure_requeues_without_context_only_fallback() {
+        let prompts = test_prompts();
+        let buffer = NotifyBuffer::new();
+        let interceptor = WorkerInterceptor::new(
+            Arc::new(HookRegistryBuilder::new().build()),
+            None,
+            None,
+            buffer.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            prompts.clone(),
+            None,
+        );
+        let current = prompts.load_full();
+        let projection = current.projection();
+        let mut templates = projection.templates.clone();
+        templates.insert(
+            "internal.notify_wrapper".to_string(),
+            "{{ message | missing_notify_filter }}".to_string(),
+        );
+        let mut projection = crate::prompt::catalog::EffectivePromptCatalog::new(
+            templates,
+            3,
+            projection.schema_fingerprint.clone(),
+            projection.toolchain_fingerprint.clone(),
+        )
+        .unwrap();
+        projection.source_digest = "source-3".to_string();
+        prompts.store(Arc::new(
+            PromptCatalog::from_projection(projection).unwrap(),
+        ));
+        buffer.push_notify("must persist".to_string(), false);
+
+        let error = interceptor.pending_history_appends().await.unwrap_err();
+
+        assert!(error.contains("failed to render notify_wrapper"));
+        let requeued = buffer.drain();
+        assert_eq!(requeued.len(), 1);
     }
 
     #[tokio::test]
@@ -1046,7 +1192,7 @@ mod tests {
             None,
             buffer.clone(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         );
 
@@ -1083,7 +1229,7 @@ mod tests {
             None,
             buffer.clone(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         );
         let mut ctx: Vec<Item> = vec![Item::user_message("hi")];
@@ -1113,7 +1259,7 @@ mod tests {
             None,
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         );
         let mut ctx: Vec<Item> = Vec::new();

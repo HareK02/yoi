@@ -196,6 +196,10 @@ fn runtime_http_router_with_optional_auth(
             get(check_config_bundle),
         )
         .route(
+            "/v1/workspace-prompt-projections",
+            post(observe_workspace_prompt_projection),
+        )
+        .route(
             "/v1/working-directories",
             get(list_working_directories).post(create_working_directory),
         )
@@ -283,6 +287,18 @@ pub struct RuntimeHttpConfigBundlesResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeHttpConfigBundleSyncRequest {
     pub bundle: ConfigBundle,
+}
+
+/// Server-owned notification carrying the Workspace's current immutable Prompt projection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeHttpWorkspacePromptProjectionRequest {
+    pub projection: worker::WorkspacePromptProjection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeHttpWorkspacePromptProjectionResponse {
+    pub workspace_id: String,
+    pub config_revision: u64,
 }
 
 /// Config bundle availability response used by sync/check endpoints.
@@ -428,6 +444,33 @@ async fn store_config_bundle(
         .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpConfigBundleAvailabilityResponse {
         availability,
+    }))
+}
+
+async fn observe_workspace_prompt_projection(
+    State(state): State<RuntimeHttpState>,
+    auth: Option<Extension<RuntimeAuthContext>>,
+    body: Result<Json<RuntimeHttpWorkspacePromptProjectionRequest>, JsonRejection>,
+) -> RestResult<RuntimeHttpWorkspacePromptProjectionResponse> {
+    let Json(request) = body.map_err(RuntimeHttpRestError::json_rejection)?;
+    if let Some(scope) = auth_workspace_scope(&state, auth.as_ref())?
+        && request.projection.workspace_id != scope.workspace_id
+    {
+        return Err(RuntimeHttpRestError::new(
+            StatusCode::FORBIDDEN,
+            "workspace_scope_mismatch",
+            "Workspace Prompt projection is outside the authenticated Workspace scope",
+        ));
+    }
+    let workspace_id = request.projection.workspace_id.clone();
+    let config_revision = request.projection.config_revision;
+    state
+        .runtime
+        .observe_workspace_prompt_projection(request.projection)
+        .map_err(RuntimeHttpRestError::runtime)?;
+    Ok(Json(RuntimeHttpWorkspacePromptProjectionResponse {
+        workspace_id,
+        config_revision,
     }))
 }
 
@@ -1518,7 +1561,10 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     {
         return Some("workdirs:operate");
     }
-    if path.starts_with("/v1/config-bundles") || path.starts_with("/v1/working-directories") {
+    if path.starts_with("/v1/config-bundles")
+        || path.starts_with("/v1/workspace-prompt-projections")
+        || path.starts_with("/v1/working-directories")
+    {
         return Some("workers:create");
     }
     if path.ends_with("/workspace-api") {
