@@ -4711,6 +4711,9 @@ where
         if state.entries_count == 0 {
             return Err(WorkerError::SegmentEmpty { segment_id });
         }
+        if state.system_prompt.is_none() {
+            return Err(WorkerError::SegmentSystemPromptMissing { segment_id });
+        }
         let mirror_entries: Vec<LogEntry> = raw_entries.clone();
         let scope_config = effective_restore_scope_config(&store, &manifest)?;
 
@@ -5454,6 +5457,9 @@ pub enum WorkerError {
 
     #[error("session {segment_id} has no entries to restore")]
     SegmentEmpty { segment_id: SegmentId },
+
+    #[error("session {segment_id} has no committed system prompt to restore")]
+    SegmentSystemPromptMissing { segment_id: SegmentId },
 
     #[error("worker metadata for {worker_name} was not found")]
     WorkerMetadataMissing { worker_name: String },

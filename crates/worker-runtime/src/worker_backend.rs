@@ -245,16 +245,6 @@ impl WorkspacePromptProjectionCache {
         active.insert(workspace_id, projection.clone());
         Ok(projection)
     }
-
-    fn current(
-        &self,
-        workspace_id: &worker::WorkspaceId,
-    ) -> Result<Option<Arc<worker::WorkspacePromptProjection>>, String> {
-        self.active
-            .lock()
-            .map_err(|_| "Workspace Prompt projection cache lock was poisoned".to_string())
-            .map(|active| active.get(workspace_id.as_str()).cloned())
-    }
 }
 
 #[derive(Clone)]
@@ -796,12 +786,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             self.worker_mutation_identity.as_ref(),
             self.embedded_worker_mutation_dispatcher.as_ref(),
         );
-        let (manifest, mut loader) = Self::restore_fallback_manifest(&worker_name)?;
-        if let Some(workspace_id) = workspace_context.workspace_id()
-            && let Some(projection) = self.prompt_projection_cache.current(workspace_id)?
-        {
-            loader = loader.with_effective_catalog(projection.catalog.clone());
-        }
+        let (manifest, loader) = Self::restore_fallback_manifest(&worker_name)?;
 
         let worker_aggregate_dir = self.worker_aggregate_dir(&request.worker_ref)?;
         let session_dir = worker_aggregate_dir.join("session");
@@ -833,6 +818,15 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         .await
         {
             Ok(worker) => worker,
+            Err(WorkerError::WorkerMetadataPending { .. })
+                if workspace_context.workspace_id().is_some()
+                    && request.config_bundle.is_none() =>
+            {
+                return Err(
+                    "pending Workspace Worker restore requires operation-owned launch material; generic restore must not reconstruct it from current Workspace config"
+                        .to_string(),
+                );
+            }
             Err(WorkerError::WorkerMetadataPending { .. })
                 if request.request.initial_input.is_none() =>
             {
@@ -2571,7 +2565,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(worker_allocation)]
-    async fn restore_pending_worker_uses_saved_manifest_snapshot() {
+    async fn restore_pending_workspace_worker_without_system_prompt_fails_closed() {
         let root = tempfile::tempdir().unwrap();
         let runtime_store_dir = root.path().join("runtime");
         let worker_ref = WorkerRef::new(crate::identity::WorkerId::new(1));
@@ -2621,7 +2615,7 @@ mod tests {
             base_url: "http://workspace.invalid".to_string(),
         });
         let identity = RuntimeIdentityMaterial::generate("runtime-restore").unwrap();
-        let controller = ProfileRuntimeWorkerFactory::new(root.path())
+        let error = match ProfileRuntimeWorkerFactory::new(root.path())
             .with_runtime_store_dir(&runtime_store_dir)
             .with_remote_worker_mutation_identity(identity)
             .restore_controller(WorkerExecutionRestoreRequest {
@@ -2638,25 +2632,11 @@ mod tests {
                 config_bundle: None,
             })
             .await
-            .expect("pending restore should use the saved manifest snapshot");
-        assert!(controller.handle.shared_state.flow_transition_enabled());
-        let run_dir = runtime_store_dir.join("workers/1/runs/1");
-        assert!(run_dir.join("worker.sock").exists());
-        assert!(run_dir.join("worker.out.log").is_file());
-        assert!(run_dir.join("worker.err.log").is_file());
-        assert!(run_dir.join("artifacts").is_dir());
-        assert!(run_dir.join("spawned").is_dir());
-
-        let shutdown = controller.shutdown.clone();
-        controller.handle.send(Method::Shutdown).await.unwrap();
-        if let Some(receiver) = shutdown.lock().await.take() {
-            receiver.await.unwrap();
-        }
-        assert!(
-            run_dir.is_dir(),
-            "run evidence remains until a separate retention policy disposes it"
-        );
-        assert!(!run_dir.join("worker.sock").exists());
+        {
+            Ok(_) => panic!("pending Workspace Worker restore unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.contains("requires operation-owned launch material"));
     }
 
     #[tokio::test]
