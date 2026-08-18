@@ -13,8 +13,8 @@ use llm_engine::llm_client::types::Role;
 use llm_engine::state::Mutable;
 use llm_engine::{Engine, EngineError, EngineResult, ToolOutputLimits, UsageRecord};
 use session_store::{
-    LogEntry, SegmentId, SessionExtension, SessionId, Store, StoreError, SystemItem, segment_log,
-    to_logged,
+    LogEntry, PromptRenderProvenance, SegmentId, SessionExtension, SessionId, Store, StoreError,
+    SystemItem, segment_log, to_logged,
 };
 use session_store::{
     WorkerActiveSegmentRef, WorkerMetadata, WorkerMetadataStore, WorkerReclaimedChild,
@@ -1285,6 +1285,21 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         Arc::clone(&self.prompts)
     }
 
+    fn prompt_render_provenance(&self, logical_name: &str) -> PromptRenderProvenance {
+        let prompts = self.prompts.load();
+        let projection = prompts.projection();
+        PromptRenderProvenance {
+            workspace_id: self
+                .workspace_context
+                .workspace_id()
+                .map(|workspace_id| workspace_id.as_str().to_string()),
+            config_revision: projection.config_revision,
+            source_digest: projection.source_digest.clone(),
+            projection_digest: projection.catalog_digest.clone(),
+            logical_name: logical_name.to_string(),
+        }
+    }
+
     fn refresh_prompt_projection_for_future_operations(&self) -> Result<(), WorkerError> {
         // The launch catalog remains authoritative until the initial system
         // Prompt has been rendered and committed. Later operation boundaries
@@ -2037,7 +2052,12 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 self.prompts.clone(),
                 self.log_writer.clone(),
             )
-            .with_usage_tracker(self.usage_tracker.clone());
+            .with_usage_tracker(self.usage_tracker.clone())
+            .with_prompt_workspace_id(
+                self.workspace_context
+                    .workspace_id()
+                    .map(|workspace_id| workspace_id.as_str().to_string()),
+            );
             self.engine_mut().set_interceptor(interceptor);
             self.interceptor_installed = true;
         }
@@ -2527,10 +2547,13 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         if !closures.is_empty() {
             self.engine_mut().append_history(closures)?;
         }
+        let interrupt_prompt_provenance =
+            self.prompt_render_provenance("internal.interrupt_system_note");
         self.commit_entry(LogEntry::SystemItem {
             ts: segment_log::now_millis(),
             item: SystemItem::Interrupt {
                 body: system_note.clone(),
+                prompt_provenance: Some(interrupt_prompt_provenance),
             },
         })?;
         self.engine_mut()
@@ -6879,7 +6902,7 @@ mod build_summary_prompt_tests {
                 matches!(
                     entry,
                     LogEntry::SystemItem {
-                        item: SystemItem::Interrupt { body },
+                        item: SystemItem::Interrupt { body, .. },
                         ..
                     } if body == &interrupt_note
                 )

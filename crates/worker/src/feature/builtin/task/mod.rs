@@ -334,7 +334,7 @@ mod tests {
         }
 
         let queued = pending.lock().expect("pending queue poisoned");
-        let SystemItem::TaskReminder { source, body } = &queued[0] else {
+        let SystemItem::TaskReminder { source, body, .. } = &queued[0] else {
             panic!("unexpected system item: {:?}", queued[0]);
         };
         assert_eq!(*source, SystemReminderSource::TaskInactivity);

@@ -281,6 +281,7 @@ mod tests {
             item: session_store::SystemItem::Notification {
                 message: text.to_owned(),
                 body: format!("[Notification] {text}"),
+                prompt_provenance: None,
             },
         }
     }

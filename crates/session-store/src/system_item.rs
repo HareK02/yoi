@@ -82,6 +82,7 @@ impl SystemReminder {
             SystemReminderSource::TaskInactivity => SystemItem::TaskReminder {
                 source: self.source,
                 body: self.rendered_body(),
+                prompt_provenance: None,
             },
         }
     }
@@ -100,6 +101,16 @@ fn normalize_unwrapped_system_reminder_body(body: String) -> String {
 
 fn render_system_reminder(body: &str) -> String {
     format!("{SYSTEM_REMINDER_OPEN}\n{body}\n{SYSTEM_REMINDER_CLOSE}")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptRenderProvenance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    pub config_revision: u64,
+    pub source_digest: String,
+    pub projection_digest: String,
+    pub logical_name: String,
 }
 
 /// One agent-injected system item, tagged by origin.
@@ -124,13 +135,23 @@ pub enum SystemItem {
     /// `Method::Notify`. `message` is the raw caller-supplied text;
     /// `body` is the wrapped LLM-context form (Worker renders it via
     /// `notify_wrapper` at commit time).
-    Notification { message: String, body: String },
+    Notification {
+        message: String,
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_provenance: Option<PromptRenderProvenance>,
+    },
 
     /// Lifecycle event reported by a child Worker via `Method::WorkerEvent`.
     /// `event` is the typed payload (so the TUI can render per-child
     /// banners without re-parsing); `body` is the wrapped LLM-context
     /// form (same `notify_wrapper` path as `Notification`).
-    WorkerEvent { event: WorkerEvent, body: String },
+    WorkerEvent {
+        event: WorkerEvent,
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_provenance: Option<PromptRenderProvenance>,
+    },
 
     /// `@<path>` file reference resolution. `body` is the rendered
     /// LLM-context text (`[File: <path>]\n…` for regular files,
@@ -162,12 +183,18 @@ pub enum SystemItem {
         #[serde(default = "default_task_reminder_source")]
         source: SystemReminderSource,
         body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_provenance: Option<PromptRenderProvenance>,
     },
 
     /// Synthetic note inserted after an interrupted turn before the next
     /// user input. `body` is the exact LLM-context text explaining that the
     /// previous turn was cut short.
-    Interrupt { body: String },
+    Interrupt {
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_provenance: Option<PromptRenderProvenance>,
+    },
 }
 
 impl SystemItem {
@@ -184,7 +211,7 @@ impl SystemItem {
                 format!("Ignored legacy procedure item: /{slug}")
             }
             SystemItem::TaskReminder { body, .. } => body.clone(),
-            SystemItem::Interrupt { body } => body.clone(),
+            SystemItem::Interrupt { body, .. } => body.clone(),
         }
     }
 
@@ -238,10 +265,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_prompt_rendered_items_default_missing_provenance() {
+        let notification: SystemItem = serde_json::from_str(
+            r#"{"kind":"notification","message":"legacy","body":"legacy body"}"#,
+        )
+        .unwrap();
+        let interrupt: SystemItem =
+            serde_json::from_str(r#"{"kind":"interrupt","body":"legacy interrupt"}"#).unwrap();
+        assert!(matches!(
+            notification,
+            SystemItem::Notification {
+                prompt_provenance: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            interrupt,
+            SystemItem::Interrupt {
+                prompt_provenance: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn notification_history_text_returns_stored_body() {
         let item = SystemItem::Notification {
             message: "child done".into(),
             body: "[Notification]\nchild done\n\n(non-blocking hint…)".into(),
+            prompt_provenance: None,
         };
         assert_eq!(
             item.history_text(),
@@ -256,6 +308,7 @@ mod tests {
                 worker_name: "child".into(),
             },
             body: "[Notification]\npod `child` finished a turn\n\n(non-blocking hint…)".into(),
+            prompt_provenance: None,
         };
         assert!(item.history_text().starts_with("[Notification]\n"));
         assert!(item.history_text().contains("`child`"));
@@ -292,7 +345,7 @@ mod tests {
     fn system_reminder_source_is_retained_in_system_item() {
         let item = SystemReminder::task_inactivity("remember tasks").into_system_item();
         match item {
-            SystemItem::TaskReminder { source, body } => {
+            SystemItem::TaskReminder { source, body, .. } => {
                 assert_eq!(source, SystemReminderSource::TaskInactivity);
                 assert_eq!(
                     body,
@@ -352,6 +405,7 @@ mod tests {
                 worker_name: "child".into(),
             },
             body: "[Notification] worker `child` finished a turn".into(),
+            prompt_provenance: None,
         };
         let json = serde_json::to_string(&item).unwrap();
         let parsed: SystemItem = serde_json::from_str(&json).unwrap();
@@ -359,6 +413,7 @@ mod tests {
             SystemItem::WorkerEvent {
                 event: WorkerEvent::TurnEnded { worker_name },
                 body,
+                ..
             } => {
                 assert_eq!(worker_name, "child");
                 assert!(body.contains("`child`"));

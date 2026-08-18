@@ -53,7 +53,9 @@ pub use segment::{
 };
 pub use segment_log::{LogEntry, RestoredState, SegmentOrigin, SessionExtension, collect_state};
 pub use store::{Store, StoreError};
-pub use system_item::{SystemItem, SystemReminder, SystemReminderSource, render_worker_event};
+pub use system_item::{
+    PromptRenderProvenance, SystemItem, SystemReminder, SystemReminderSource, render_worker_event,
+};
 pub use worker_metadata::{
     CombinedStore, FsWorkerStore, WorkerActiveSegmentRef, WorkerAggregateStore, WorkerMetadata,
     WorkerMetadataStore, WorkerPeer, WorkerReclaimedChild, WorkerSpawnedChild,

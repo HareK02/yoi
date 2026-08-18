@@ -111,9 +111,18 @@ impl NotifyBuffer {
 /// Render one pending entry into a typed `SystemItem`. The
 /// `notify_wrapper` prompt produces the LLM-context body for both
 /// `Notify` (raw message) and `WorkerEvent` (rendered event line).
+#[cfg(test)]
 pub(crate) fn build_system_item(
     entry: &PendingNotify,
     prompts: &PromptCatalog,
+) -> Result<SystemItem, CatalogError> {
+    build_system_item_with_provenance(entry, prompts, None)
+}
+
+pub(crate) fn build_system_item_with_provenance(
+    entry: &PendingNotify,
+    prompts: &PromptCatalog,
+    prompt_provenance: Option<session_store::PromptRenderProvenance>,
 ) -> Result<SystemItem, CatalogError> {
     match entry {
         PendingNotify::Notify { message, .. } => {
@@ -121,6 +130,7 @@ pub(crate) fn build_system_item(
             Ok(SystemItem::Notification {
                 message: message.clone(),
                 body,
+                prompt_provenance,
             })
         }
         PendingNotify::WorkerEvent { event } => {
@@ -129,6 +139,7 @@ pub(crate) fn build_system_item(
             Ok(SystemItem::WorkerEvent {
                 event: event.clone(),
                 body,
+                prompt_provenance,
             })
         }
     }
@@ -178,7 +189,7 @@ mod tests {
         let catalog = PromptCatalog::builtins_only().unwrap();
         let item = build_system_item(&entry, &catalog).unwrap();
         match item {
-            SystemItem::Notification { message, body } => {
+            SystemItem::Notification { message, body, .. } => {
                 assert_eq!(message, "hello");
                 assert!(body.contains("[Notification]"));
                 assert!(body.contains("hello"));
@@ -198,7 +209,7 @@ mod tests {
         let catalog = PromptCatalog::builtins_only().unwrap();
         let item = build_system_item(&entry, &catalog).unwrap();
         match item {
-            SystemItem::WorkerEvent { event, body } => {
+            SystemItem::WorkerEvent { event, body, .. } => {
                 assert!(
                     matches!(event, WorkerEvent::TurnEnded { ref worker_name } if worker_name == "child")
                 );

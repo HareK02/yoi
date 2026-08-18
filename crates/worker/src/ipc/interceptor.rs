@@ -21,7 +21,6 @@ use llm_engine::interceptor::{
 };
 use llm_engine::tool::ToolOutput;
 use tracing::info;
-use tracing::warn;
 
 use crate::compact::state::CompactState;
 use crate::compact::usage_tracker::UsageTracker;
@@ -32,7 +31,7 @@ use crate::hook::{
     HookRegistry, HookTurnEndAction, PreRequestContext, PreRequestInfo, PromptSubmitInfo,
     SystemItemAppendHandle, ToolCallSummary, ToolResultSummary, TurnEndInfo,
 };
-use crate::ipc::notify_buffer::{NotifyBuffer, build_system_item};
+use crate::ipc::notify_buffer::{NotifyBuffer, build_system_item_with_provenance};
 use crate::prompt::catalog::PromptCatalog;
 use crate::worker::SystemItemCommitter;
 use llm_engine::token_counter::total_tokens;
@@ -66,6 +65,8 @@ pub(crate) struct WorkerInterceptor {
     /// Prompt catalog used to render pending notification entries into the
     /// same system-message text that will be persisted in history.
     prompts: Arc<ArcSwap<PromptCatalog>>,
+    /// Workspace scope associated with Prompt projection provenance.
+    prompt_workspace_id: Option<String>,
     /// Type-erased commit handle. The interceptor uses it to commit
     /// `LogEntry::SystemItem` entries directly (sync) before
     /// returning the corresponding `Item::system_message`s up to the
@@ -96,6 +97,7 @@ impl WorkerInterceptor {
             pending_notifies,
             pending_attachments,
             prompts,
+            prompt_workspace_id: None,
             log_writer,
             next_turn_index: AtomicUsize::new(0),
             tool_calls_this_turn: AtomicUsize::new(0),
@@ -104,6 +106,11 @@ impl WorkerInterceptor {
 
     pub(crate) fn with_usage_tracker(mut self, usage_tracker: Arc<UsageTracker>) -> Self {
         self.usage_tracker = Some(usage_tracker);
+        self
+    }
+
+    pub(crate) fn with_prompt_workspace_id(mut self, workspace_id: Option<String>) -> Self {
+        self.prompt_workspace_id = workspace_id;
         self
     }
 
@@ -163,6 +170,32 @@ impl WorkerInterceptor {
         }
         false
     }
+    fn attach_prompt_provenance(&self, items: &mut [SystemItem]) {
+        let prompts = self.prompts.load();
+        let projection = prompts.projection();
+        let provenance = |logical_name: &str| session_store::PromptRenderProvenance {
+            workspace_id: self.prompt_workspace_id.clone(),
+            config_revision: projection.config_revision,
+            source_digest: projection.source_digest.clone(),
+            projection_digest: projection.catalog_digest.clone(),
+            logical_name: logical_name.to_string(),
+        };
+        for item in items {
+            match item {
+                SystemItem::TaskReminder {
+                    prompt_provenance, ..
+                } if prompt_provenance.is_none() => {
+                    *prompt_provenance = Some(provenance("internal.task_reminder"));
+                }
+                SystemItem::Interrupt {
+                    prompt_provenance, ..
+                } if prompt_provenance.is_none() => {
+                    *prompt_provenance = Some(provenance("internal.interrupt_system_note"));
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -181,7 +214,7 @@ impl Interceptor for WorkerInterceptor {
                 return action.into();
             }
         }
-        let extras: Vec<SystemItem> = std::mem::take(
+        let mut extras: Vec<SystemItem> = std::mem::take(
             &mut *self
                 .pending_attachments
                 .lock()
@@ -195,6 +228,7 @@ impl Interceptor for WorkerInterceptor {
             // commits land BEFORE the worker pushes its
             // `Item::system_message`s, so on-disk order matches
             // worker-history order.
+            self.attach_prompt_provenance(&mut extras);
             let items: Vec<Item> = extras.iter().map(SystemItem::to_history_item).collect();
             match self.commit_system_items(&extras) {
                 Ok(()) => PromptAction::ContinueWith(items),
@@ -210,31 +244,22 @@ impl Interceptor for WorkerInterceptor {
         }
 
         let prompts = self.prompts.load_full();
+        let projection = prompts.projection();
+        let provenance = session_store::PromptRenderProvenance {
+            workspace_id: self.prompt_workspace_id.clone(),
+            config_revision: projection.config_revision,
+            source_digest: projection.source_digest.clone(),
+            projection_digest: projection.catalog_digest.clone(),
+            logical_name: "internal.notify_wrapper".to_string(),
+        };
         let mut system_items: Vec<SystemItem> = Vec::with_capacity(drained.len());
         let mut items: Vec<Item> = Vec::with_capacity(drained.len());
         for entry in drained {
-            match build_system_item(&entry, &prompts) {
-                Ok(system_item) => {
-                    items.push(system_item.to_history_item());
-                    system_items.push(system_item);
-                }
-                Err(e) => {
-                    // A render failure here would starve the LLM of
-                    // the notify text. Fall back to a raw item so the
-                    // trigger still lands in history; the entry will
-                    // simply be skipped from the SystemItem batch.
-                    warn!(error = %e, "failed to render notify_wrapper; using raw message");
-                    let fallback = match &entry {
-                        super::notify_buffer::PendingNotify::Notify { message, .. } => {
-                            message.clone()
-                        }
-                        super::notify_buffer::PendingNotify::WorkerEvent { event } => {
-                            session_store::render_worker_event(event)
-                        }
-                    };
-                    items.push(Item::system_message(fallback));
-                }
-            }
+            let system_item =
+                build_system_item_with_provenance(&entry, &prompts, Some(provenance.clone()))
+                    .map_err(|error| format!("failed to render notify_wrapper: {error}"))?;
+            items.push(system_item.to_history_item());
+            system_items.push(system_item);
         }
         self.commit_system_items(&system_items)
             .map_err(|error| format!("session persistence failed: {error}"))?;
@@ -265,11 +290,12 @@ impl Interceptor for WorkerInterceptor {
             }
         }
 
-        let system_items: Vec<SystemItem> = std::mem::take(
+        let mut system_items: Vec<SystemItem> = std::mem::take(
             &mut *pending_hook_system_items
                 .lock()
                 .expect("pending hook system-item queue poisoned"),
         );
+        self.attach_prompt_provenance(&mut system_items);
         let appended_items: Vec<Item> = system_items
             .iter()
             .map(SystemItem::to_history_item)
@@ -1033,16 +1059,26 @@ mod tests {
             .lock()
             .expect("committed system-item list poisoned");
         assert_eq!(committed.len(), 1);
-        let SystemItem::TaskReminder { body, .. } = &committed[0] else {
-            panic!("expected task reminder, got {:?}", committed[0]);
+        let SystemItem::TaskReminder {
+            body,
+            prompt_provenance: Some(provenance),
+            ..
+        } = &committed[0]
+        else {
+            panic!(
+                "expected task reminder with Prompt provenance, got {:?}",
+                committed[0]
+            );
         };
         assert!(body.contains("track active work"));
+        assert_eq!(provenance.logical_name, "internal.task_reminder");
     }
 
     #[tokio::test]
     async fn pending_notifications_use_the_latest_prompt_projection() {
         let prompts = test_prompts();
         let buffer = NotifyBuffer::new();
+        let committed = Arc::new(Mutex::new(Vec::new()));
         let interceptor = WorkerInterceptor::new(
             Arc::new(HookRegistryBuilder::new().build()),
             None,
@@ -1050,8 +1086,11 @@ mod tests {
             buffer.clone(),
             Arc::new(Mutex::new(Vec::new())),
             prompts.clone(),
-            None,
-        );
+            Some(Arc::new(RecordingSystemItemCommitter {
+                committed: committed.clone(),
+            })),
+        )
+        .with_prompt_workspace_id(Some("workspace-a".to_string()));
 
         let current = prompts.load_full();
         let projection = current.projection();
@@ -1076,6 +1115,18 @@ mod tests {
         let appends = interceptor.pending_history_appends().await.unwrap();
         assert_eq!(appends.len(), 1);
         assert!(format!("{:?}", appends[0]).contains("CURRENT-PROJECTION updated"));
+        let committed = committed.lock().unwrap();
+        let SystemItem::Notification {
+            prompt_provenance: Some(provenance),
+            ..
+        } = &committed[0]
+        else {
+            panic!("notification Prompt provenance was not committed");
+        };
+        assert_eq!(provenance.workspace_id.as_deref(), Some("workspace-a"));
+        assert_eq!(provenance.config_revision, 2);
+        assert_eq!(provenance.source_digest, "source-2");
+        assert_eq!(provenance.logical_name, "internal.notify_wrapper");
     }
 
     #[tokio::test]
