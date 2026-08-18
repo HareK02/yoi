@@ -2673,6 +2673,14 @@ async fn scoped_commit_workspace_config_tree(
     let state = api
         .config_store
         .commit_evaluated_workspace_config(&path.workspace_id, &candidate)?;
+    if let Ok(projection) = api
+        .prompt_projection_cache
+        .resolve(&path.workspace_id, &state)
+    {
+        let _diagnostics = api
+            .runtime
+            .observe_workspace_prompt_projection((*projection).clone());
+    }
     Ok((
         StatusCode::CREATED,
         Json(WorkspaceConfigTreeResponse {

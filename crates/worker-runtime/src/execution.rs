@@ -357,6 +357,16 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         ))
     }
 
+    /// Observe a newer immutable Workspace Prompt projection. Profile-backed
+    /// execution uses this as a revision notification; other backends may
+    /// safely ignore it.
+    fn observe_workspace_prompt_projection(
+        &self,
+        _projection: worker::WorkspacePromptProjection,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     fn dispatch_input(
         &self,
         handle: &WorkerExecutionHandle,
@@ -467,6 +477,13 @@ impl WorkerExecutionBackendRef {
         working_directory_id: &str,
     ) -> Result<WorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
         self.backend.cleanup_working_directory(working_directory_id)
+    }
+
+    pub(crate) fn observe_workspace_prompt_projection(
+        &self,
+        projection: worker::WorkspacePromptProjection,
+    ) -> Result<(), String> {
+        self.backend.observe_workspace_prompt_projection(projection)
     }
 
     pub(crate) fn dispatch_input(

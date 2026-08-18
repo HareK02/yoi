@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use worker::{
-    WorkspaceClient, WorkspaceClientError, WorkspaceRequest, WorkspaceRequestMethod,
-    WorkspaceResponse,
+    WorkspaceClient, WorkspaceClientError, WorkspacePromptProjection, WorkspaceRequest,
+    WorkspaceRequestMethod, WorkspaceResponse,
 };
 
 use crate::auth::{
@@ -12,6 +12,7 @@ use crate::auth::{
     WorkerMutationSourceClaims, new_token_id,
 };
 use crate::runtime::RuntimeWorkspaceScope;
+use crate::worker_backend::WorkspacePromptProjectionCache;
 
 pub const DEFAULT_WORKER_MUTATION_SOURCE_TTL_SECONDS: u64 = 60;
 
@@ -293,6 +294,7 @@ pub struct RuntimeOwnedWorkspaceClient {
     worker_id: String,
     request_timeout: Option<Duration>,
     worker_remove: Option<RuntimeWorkerMutationForwarder>,
+    prompt_projection_cache: Option<Arc<WorkspacePromptProjectionCache>>,
 }
 
 impl RuntimeOwnedWorkspaceClient {
@@ -309,11 +311,20 @@ impl RuntimeOwnedWorkspaceClient {
             worker_id: worker_id.into(),
             request_timeout: None,
             worker_remove: None,
+            prompt_projection_cache: None,
         }
     }
 
     pub fn with_worker_remove(mut self, worker_remove: RuntimeWorkerMutationForwarder) -> Self {
         self.worker_remove = Some(worker_remove);
+        self
+    }
+
+    pub(crate) fn with_prompt_projection_cache(
+        mut self,
+        cache: Arc<WorkspacePromptProjectionCache>,
+    ) -> Self {
+        self.prompt_projection_cache = Some(cache);
         self
     }
 
@@ -383,6 +394,40 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
                 request,
             )
         }
+    }
+
+    fn current_prompt_projection(
+        &self,
+    ) -> Result<Option<WorkspacePromptProjection>, WorkspaceClientError> {
+        let Some(cache) = self.prompt_projection_cache.as_ref() else {
+            return Ok(None);
+        };
+        if let Some(projection) = cache
+            .active(&self.workspace_id)
+            .map_err(WorkspaceClientError::Request)?
+        {
+            return Ok(Some((*projection).clone()));
+        }
+        let response = self.execute(WorkspaceRequest::get(format!(
+            "/api/w/{}/config-sources/active/prompt-projection",
+            self.workspace_id
+        )))?;
+        if !(200..300).contains(&response.status) {
+            return Err(WorkspaceClientError::Request(format!(
+                "active Workspace Prompt projection request failed with HTTP {}: {}",
+                response.status, response.body
+            )));
+        }
+        let projection: WorkspacePromptProjection =
+            serde_json::from_str(&response.body).map_err(|error| {
+                WorkspaceClientError::Request(format!(
+                    "invalid active Workspace Prompt projection response: {error}"
+                ))
+            })?;
+        let projection = cache
+            .observe(projection)
+            .map_err(WorkspaceClientError::Request)?;
+        Ok(Some((*projection).clone()))
     }
 
     fn execute_worker_remove(
@@ -520,6 +565,41 @@ mod tests {
         WorkerMutationSourceExpectation, decode_worker_mutation_source_claims,
         verify_worker_mutation_source_proof,
     };
+
+    #[test]
+    fn current_prompt_projection_uses_the_shared_runtime_cache_without_http() {
+        let cache = Arc::new(WorkspacePromptProjectionCache::default());
+        let catalog = worker::EffectivePromptCatalog::new(
+            std::collections::BTreeMap::from([(
+                "default".to_string(),
+                "workspace prompt".to_string(),
+            )]),
+            3,
+            "schema",
+            "toolchain",
+        )
+        .unwrap();
+        let projection = WorkspacePromptProjection::new(
+            "workspace-a",
+            "source-3",
+            catalog.catalog_digest.clone(),
+            catalog,
+        )
+        .unwrap();
+        cache.observe(projection).unwrap();
+        let client = RuntimeOwnedWorkspaceClient::new(
+            "workspace-a",
+            "http://127.0.0.1:1",
+            "runtime-a",
+            "worker-a",
+        )
+        .with_prompt_projection_cache(cache);
+
+        let projection = client.current_prompt_projection().unwrap().unwrap();
+
+        assert_eq!(projection.config_revision, 3);
+        assert_eq!(projection.source_digest, "source-3");
+    }
 
     #[test]
     fn ordinary_workspace_forwarding_stamps_legacy_source_only_inside_runtime() {

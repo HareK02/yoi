@@ -300,6 +300,29 @@ impl Runtime {
         state.check_config_bundle_ref(reference)
     }
 
+    /// Notify the execution backend of the Workspace's current immutable
+    /// Prompt projection. The Runtime keeps this cache outside persisted Worker
+    /// restore authority.
+    pub fn observe_workspace_prompt_projection(
+        &self,
+        projection: worker::WorkspacePromptProjection,
+    ) -> Result<(), RuntimeError> {
+        let backend = {
+            let state = self.lock()?;
+            state.ensure_running()?;
+            state.execution_backend.clone().ok_or_else(|| {
+                RuntimeError::ExecutionBackendUnavailable {
+                    message:
+                        "Workspace Prompt projection notification requires an execution backend"
+                            .to_string(),
+                }
+            })?
+        };
+        backend
+            .observe_workspace_prompt_projection(projection)
+            .map_err(|message| RuntimeError::ExecutionBackendUnavailable { message })
+    }
+
     /// Stop the Runtime.  v0 keeps data readable after stop, but rejects new
     /// create/send/worker lifecycle mutations.
     pub fn stop_runtime(&self) -> Result<(), RuntimeError> {

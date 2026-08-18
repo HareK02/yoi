@@ -45,6 +45,7 @@ use worker_runtime::http_server::{
     RuntimeHttpWorkerLifecycleResponse, RuntimeHttpWorkerResponse,
     RuntimeHttpWorkerWorkspaceApiRequest, RuntimeHttpWorkersResponse,
     RuntimeHttpWorkingDirectoriesResponse, RuntimeHttpWorkingDirectoryResponse,
+    RuntimeHttpWorkspacePromptProjectionRequest, RuntimeHttpWorkspacePromptProjectionResponse,
 };
 use worker_runtime::identity::{
     RuntimeWorkerRef, WorkerId as EmbeddedWorkerId, WorkerRef as EmbeddedWorkerRef,
@@ -778,6 +779,13 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         }
     }
 
+    fn observe_workspace_prompt_projection(
+        &self,
+        _projection: worker::WorkspacePromptProjection,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     fn sync_config_bundle(&self, _bundle: ConfigBundle) -> ConfigBundleSyncResult {
         ConfigBundleSyncResult {
             state: WorkerOperationState::Unsupported,
@@ -1183,6 +1191,36 @@ impl RuntimeRegistry {
         validate_backend_identifier("worker_id", worker_id)?;
         let runtime = self.runtime(runtime_id)?;
         Ok(runtime.replace_worker_workspace_api(worker_id, workspace_api))
+    }
+
+    pub fn observe_workspace_prompt_projection(
+        &self,
+        projection: worker::WorkspacePromptProjection,
+    ) -> Vec<RuntimeDiagnostic> {
+        let runtimes = self
+            .runtimes
+            .read()
+            .map(|runtimes| runtimes.clone())
+            .unwrap_or_default();
+        runtimes
+            .into_iter()
+            .filter_map(|runtime| {
+                runtime
+                    .observe_workspace_prompt_projection(projection.clone())
+                    .err()
+                    .map(|message| {
+                        diagnostic(
+                            "workspace_prompt_projection_notification_failed",
+                            DiagnosticSeverity::Warning,
+                            format!(
+                                "runtime '{}' rejected Workspace Prompt projection revision {}: {message}",
+                                runtime.runtime_id(), projection.config_revision
+                            ),
+                        )
+                    })
+            })
+            .take(MAX_DIAGNOSTICS)
+            .collect()
     }
 
     pub fn spawn_worker(
@@ -2038,6 +2076,15 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 }
             }
         }
+    }
+
+    fn observe_workspace_prompt_projection(
+        &self,
+        projection: worker::WorkspacePromptProjection,
+    ) -> Result<(), String> {
+        self.runtime
+            .observe_workspace_prompt_projection(projection)
+            .map_err(|error| error.to_string())
     }
 
     fn sync_config_bundle(&self, bundle: ConfigBundle) -> ConfigBundleSyncResult {
@@ -3153,6 +3200,18 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 diagnostics: vec![diagnostic],
             },
         }
+    }
+
+    fn observe_workspace_prompt_projection(
+        &self,
+        projection: worker::WorkspacePromptProjection,
+    ) -> Result<(), String> {
+        self.post_json::<_, RuntimeHttpWorkspacePromptProjectionResponse>(
+            "/v1/workspace-prompt-projections",
+            &RuntimeHttpWorkspacePromptProjectionRequest { projection },
+        )
+        .map(|_| ())
+        .map_err(|error| error.message)
     }
 
     fn sync_config_bundle(&self, bundle: ConfigBundle) -> ConfigBundleSyncResult {
@@ -4507,6 +4566,7 @@ mod tests {
         runtime_id: String,
         host_id: String,
         workers: Vec<WorkerSummary>,
+        observed_prompt_revisions: Arc<Mutex<Vec<u64>>>,
     }
 
     impl FixtureRuntime {
@@ -4542,6 +4602,7 @@ mod tests {
                     working_directory: None,
                     diagnostics: Vec::new(),
                 }],
+                observed_prompt_revisions: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -4549,6 +4610,17 @@ mod tests {
     impl WorkspaceWorkerRuntime for FixtureRuntime {
         fn runtime_id(&self) -> &str {
             &self.runtime_id
+        }
+
+        fn observe_workspace_prompt_projection(
+            &self,
+            projection: worker::WorkspacePromptProjection,
+        ) -> Result<(), String> {
+            self.observed_prompt_revisions
+                .lock()
+                .map_err(|_| "prompt projection observations poisoned".to_string())?
+                .push(projection.config_revision);
+            Ok(())
         }
 
         fn runtime_summary(&self, _limit: usize) -> RuntimeSummary {
@@ -4645,6 +4717,36 @@ mod tests {
         assert_eq!(from_runtime_a.worker.runtime_id, "runtime-a");
         assert_eq!(from_runtime_a.host_id, "host-a");
         assert_eq!(from_runtime_a.label, "worker from runtime a");
+    }
+
+    #[test]
+    fn registry_broadcasts_workspace_prompt_projection_revisions() {
+        let runtime =
+            FixtureRuntime::with_worker("runtime-a", "host-a", "worker-a", "worker from runtime a");
+        let observed = runtime.observed_prompt_revisions.clone();
+        let registry = RuntimeRegistry::new(vec![Arc::new(runtime)]);
+        let catalog = worker::EffectivePromptCatalog::new(
+            std::collections::BTreeMap::from([(
+                "default".to_string(),
+                "workspace prompt".to_string(),
+            )]),
+            12,
+            "schema",
+            "toolchain",
+        )
+        .unwrap();
+        let projection = worker::WorkspacePromptProjection::new(
+            "workspace-a",
+            "source-12",
+            catalog.catalog_digest.clone(),
+            catalog,
+        )
+        .unwrap();
+
+        let diagnostics = registry.observe_workspace_prompt_projection(projection);
+
+        assert!(diagnostics.is_empty());
+        assert_eq!(*observed.lock().unwrap(), vec![12]);
     }
 
     #[test]
