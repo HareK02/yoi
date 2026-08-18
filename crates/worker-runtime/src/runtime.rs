@@ -1937,7 +1937,7 @@ impl RuntimeState {
             next_worker_sequence: persisted.next_worker_sequence,
             next_diagnostic_id,
             workers,
-            config_bundles: persisted.config_bundles,
+            config_bundles: BTreeMap::new(),
             workspace_owners: persisted.workspace_owners,
             diagnostics,
             subscription_revision: 0,
@@ -1965,7 +1965,6 @@ impl RuntimeState {
                 .iter()
                 .map(|(worker_id, worker)| (worker_id.clone(), worker.persisted_record()))
                 .collect(),
-            config_bundles: self.config_bundles.clone(),
             workspace_owners: self.workspace_owners.clone(),
             diagnostics: self.diagnostics.clone(),
         }
@@ -4133,7 +4132,10 @@ mod tests {
             runtime.summary().unwrap().backend,
             RuntimeBackendKind::FsStore
         );
-        runtime.store_config_bundle(test_bundle()).unwrap();
+        let transport_bundle = test_bundle();
+        runtime
+            .store_config_bundle(transport_bundle.clone())
+            .unwrap();
 
         let worker = runtime.create_worker(task_request("persist me")).unwrap();
         runtime
@@ -4167,6 +4169,13 @@ mod tests {
         .unwrap();
         let restored_worker = restored.worker_detail(&worker.worker_ref).unwrap();
         assert_eq!(restored_worker.status, WorkerStatus::Stopped);
+        assert!(matches!(
+            restored.check_config_bundle(&ConfigBundleRef {
+                id: transport_bundle.metadata.id.clone(),
+                digest: transport_bundle.metadata.digest.clone(),
+            }),
+            Err(RuntimeError::ConfigBundleMissing { .. })
+        ));
         assert!(!root.join("events.jsonl").exists());
         assert!(!worker_store_dir.join("observations.jsonl").exists());
         #[cfg(feature = "ws-server")]

@@ -1,5 +1,5 @@
 use crate::catalog::{CreateWorkerRequest, WorkingDirectoryStatus};
-use crate::config_bundle::{ConfigBundle, validate_config_bundle};
+use crate::config_bundle::ConfigBundle;
 use crate::diagnostics::{DiagnosticSeverity, RuntimeDiagnostic};
 use crate::error::RuntimeError;
 use crate::identity::{WorkerId, WorkerRef};
@@ -245,7 +245,6 @@ pub(crate) struct PersistedRuntimeState {
     pub(crate) next_diagnostic_id: u64,
     pub(crate) workers: BTreeMap<WorkerId, PersistedWorkerRecord>,
     pub(crate) workspace_owners: BTreeMap<String, String>,
-    pub(crate) config_bundles: BTreeMap<String, ConfigBundle>,
     pub(crate) diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -300,7 +299,7 @@ impl RuntimeSnapshot {
             status: state.status,
             next_worker_sequence: state.next_worker_sequence,
             next_diagnostic_id: state.next_diagnostic_id,
-            config_bundles: state.config_bundles.clone(),
+            config_bundles: BTreeMap::new(),
             workspace_owners: state.workspace_owners.clone(),
             diagnostics: state.diagnostics.clone(),
         }
@@ -324,13 +323,6 @@ impl RuntimeSnapshot {
                 message: format!("runtime snapshot backend is {:?}", self.backend),
             });
         }
-        for bundle in self.config_bundles.values() {
-            validate_config_bundle(bundle).map_err(|error| RuntimeError::StoreCorrupt {
-                operation: "read runtime snapshot",
-                path: path.to_path_buf(),
-                message: format!("invalid config bundle {}: {error}", bundle.metadata.id),
-            })?;
-        }
         Ok(())
     }
 
@@ -344,7 +336,6 @@ impl RuntimeSnapshot {
             next_worker_sequence: self.next_worker_sequence,
             next_diagnostic_id: self.next_diagnostic_id,
             workers,
-            config_bundles: self.config_bundles,
             workspace_owners: self.workspace_owners,
             diagnostics: self.diagnostics,
         }
