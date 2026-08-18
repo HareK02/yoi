@@ -435,7 +435,7 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
             return Ok(Some((*resolution).clone()));
         }
         let response = self.execute(WorkspaceRequest::get(format!(
-            "/api/w/{}/config-sources/active/prompt-projection",
+            "/api/w/{}/config/projections/prompts",
             self.workspace_id
         )))?;
         if !(200..300).contains(&response.status) {
@@ -718,7 +718,12 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request).unwrap();
+            let read = stream.read(&mut request).unwrap();
+            let request = std::str::from_utf8(&request[..read]).unwrap();
+            assert!(
+                request.contains("GET /api/w/workspace-a/config/projections/prompts "),
+                "unexpected Prompt projection request: {request}"
+            );
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
