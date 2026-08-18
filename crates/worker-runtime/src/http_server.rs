@@ -449,9 +449,19 @@ async fn store_config_bundle(
 
 async fn observe_workspace_prompt_projection(
     State(state): State<RuntimeHttpState>,
+    auth: Option<Extension<RuntimeAuthContext>>,
     body: Result<Json<RuntimeHttpWorkspacePromptProjectionRequest>, JsonRejection>,
 ) -> RestResult<RuntimeHttpWorkspacePromptProjectionResponse> {
     let Json(request) = body.map_err(RuntimeHttpRestError::json_rejection)?;
+    if let Some(scope) = auth_workspace_scope(&state, auth.as_ref())?
+        && request.projection.workspace_id != scope.workspace_id
+    {
+        return Err(RuntimeHttpRestError::new(
+            StatusCode::FORBIDDEN,
+            "workspace_scope_mismatch",
+            "Workspace Prompt projection is outside the authenticated Workspace scope",
+        ));
+    }
     let workspace_id = request.projection.workspace_id.clone();
     let config_revision = request.projection.config_revision;
     state
