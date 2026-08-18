@@ -67,7 +67,7 @@ use crate::ipc::alerter::Alerter;
 use crate::ipc::interceptor::WorkerInterceptor;
 use crate::ipc::notify_buffer::NotifyBuffer;
 use crate::prompt::agents_md::read_agents_md;
-use crate::prompt::catalog::{CatalogError, PromptCatalog};
+use crate::prompt::catalog::{CatalogError, PromptCatalog, WorkspacePromptProjection};
 use crate::prompt::source::PromptCatalogSource;
 use crate::prompt::system::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
 use crate::runtime::dir;
@@ -224,6 +224,15 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
     fn execute(&self, request: WorkspaceRequest)
     -> Result<WorkspaceResponse, WorkspaceClientError>;
 
+    /// Resolve the Workspace's current immutable Prompt projection for future
+    /// operation boundaries. Creation and restore continue to use persisted
+    /// launch/session state; this hook never reconstructs historical prompts.
+    fn current_prompt_projection(
+        &self,
+    ) -> Result<Option<WorkspacePromptProjection>, WorkspaceClientError> {
+        Ok(None)
+    }
+
     /// Executes the destructive WorkerRemove operation through Runtime-owned source proof.
     /// Target identity is operation data; source identity and permission are never caller inputs.
     fn execute_worker_remove(
@@ -283,6 +292,12 @@ impl WorkspaceClient for ReviewerChildWorkspaceClient {
     }
     fn reviewer_context(&self) -> Option<&ReviewerContext> {
         Some(&self.context)
+    }
+
+    fn current_prompt_projection(
+        &self,
+    ) -> Result<Option<WorkspacePromptProjection>, WorkspaceClientError> {
+        self.inner.current_prompt_projection()
     }
 
     fn execute(
@@ -872,7 +887,7 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// sections, ...). Built from the 4-layer overlay in
     /// [`Self::from_manifest`], or defaults to the builtin pack when a
     /// Worker is constructed through lower-level paths that have no loader.
-    prompts: Arc<PromptCatalog>,
+    prompts: Arc<ArcSwap<PromptCatalog>>,
     /// When true (default), the system-prompt assembler may append resident
     /// context from the workspace Memory document. Internal disposable
     /// workers disable this so resident memory exposure is opt-in per Worker.
@@ -1146,7 +1161,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         // `set_system_prompt_template`) can be captured by `SegmentStart`.
         let session_id = session_store::new_session_id();
         let segment_id = session_store::new_segment_id();
-        let prompts = PromptCatalog::builtins_only()?;
+        let prompts = Arc::new(ArcSwap::from(PromptCatalog::builtins_only()?));
         let delegation_scope =
             DelegationScope::from_config(&manifest.delegation_scope).map_err(WorkerError::Scope)?;
         let scope = SharedScope::new(scope);
@@ -1232,8 +1247,47 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         self.inject_resident_summary = enabled;
     }
 
-    pub fn prompts(&self) -> Arc<PromptCatalog> {
+    pub fn prompts(&self) -> Arc<ArcSwap<PromptCatalog>> {
         Arc::clone(&self.prompts)
+    }
+
+    fn refresh_prompt_projection_for_future_operations(&self) -> Result<(), WorkerError> {
+        // The launch catalog remains authoritative until the initial system
+        // Prompt has been rendered and committed. Later operation boundaries
+        // may adopt the Workspace's current immutable projection.
+        if self.system_prompt_template.is_some() {
+            return Ok(());
+        }
+        let Some(projection) = self
+            .workspace_context
+            .client()
+            .current_prompt_projection()
+            .map_err(|source| WorkerError::WorkspacePromptProjection {
+                message: source.to_string(),
+            })?
+        else {
+            return Ok(());
+        };
+        projection
+            .validate()
+            .map_err(|source| WorkerError::WorkspacePromptProjection {
+                message: source.to_string(),
+            })?;
+        let current = self.prompts.load();
+        if current.projection().config_revision == projection.config_revision
+            && current.projection().source_digest == projection.source_digest
+            && current.projection().catalog_digest == projection.projection_digest
+        {
+            return Ok(());
+        }
+        let catalog = PromptCatalog::load(
+            &PromptCatalogSource::builtins_only().with_effective_catalog(projection.catalog),
+        )
+        .map_err(|source| WorkerError::WorkspacePromptProjection {
+            message: source.to_string(),
+        })?;
+        self.prompts.store(catalog);
+        Ok(())
     }
 
     /// The current segment ID. Read lock-free from the shared session
@@ -2020,6 +2074,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             .local_working_directory()
             .map(|local| local.cwd.display().to_string())
             .unwrap_or_else(|| "no local working directory".to_string());
+        let prompt_catalog = self.prompts.load_full();
         let ctx = SystemPromptContext {
             now: chrono::Utc::now(),
             cwd: cwd_for_prompt.into(),
@@ -2029,7 +2084,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             feature_instructions: &self.feature_instructions,
             agents_md: agents_md_read.and_then(|read| read.body),
             resident_summary: resident_summary.as_deref(),
-            prompts: &self.prompts,
+            prompts: &prompt_catalog,
         };
         let rendered = template
             .render(&ctx)
@@ -2085,6 +2140,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// store, and runs pre-run compact (joining any in-flight memory task
     /// first so extract sees a stable history range).
     async fn prepare_for_run(&mut self) -> Result<(), WorkerError> {
+        self.refresh_prompt_projection_for_future_operations()?;
         self.ensure_interceptor_installed();
         self.ensure_system_prompt_materialized().await?;
         self.cleanup_finished_memory_task();
@@ -2430,10 +2486,12 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     fn apply_interrupt_prep(&mut self) -> Result<(), WorkerError> {
         let tool_result_summary = self
             .prompts()
+            .load_full()
             .interrupt_tool_result_summary()
             .map_err(WorkerError::from)?;
         let system_note = self
             .prompts()
+            .load_full()
             .interrupt_system_note()
             .map_err(WorkerError::from)?;
 
@@ -3173,6 +3231,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         let summary_client: Box<dyn LlmClient> = self.build_compactor_client()?;
         let summary_system_prompt = self
             .prompts
+            .load_full()
             .compact_system()
             .map_err(WorkerError::PromptCatalog)?;
         let mut summary_worker = Engine::new(summary_client).system_prompt(summary_system_prompt);
@@ -3802,7 +3861,11 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             }
         };
         let memory_language = memory_language(memory_cfg);
-        let extract_system_prompt = match self.prompts.memory_extract_system(memory_language) {
+        let extract_system_prompt = match self
+            .prompts
+            .load_full()
+            .memory_extract_system(memory_language)
+        {
             Ok(prompt) => prompt,
             Err(err) => {
                 audit
@@ -5446,6 +5509,9 @@ pub enum WorkerError {
     #[error(transparent)]
     PromptCatalog(#[from] CatalogError),
 
+    #[error("failed to resolve current Workspace Prompt projection: {message}")]
+    WorkspacePromptProjection { message: String },
+
     #[error(transparent)]
     Skill(#[from] SkillClientError),
 
@@ -5513,7 +5579,7 @@ struct WorkerCommon {
     scope: Scope,
     delegation_scope: DelegationScope,
     client: Box<dyn LlmClient>,
-    prompts: Arc<PromptCatalog>,
+    prompts: Arc<ArcSwap<PromptCatalog>>,
     system_prompt_template: Option<SystemPromptTemplate>,
     feature_instructions: Vec<FeatureInstructionDeclaration>,
 }
@@ -5655,7 +5721,7 @@ fn prepare_worker_common_from_scope(
         DelegationScope::from_config(&manifest.delegation_scope).map_err(WorkerError::Scope)?;
 
     let client = crate::model_client::build_client(&manifest.model)?;
-    let prompts = PromptCatalog::load(loader)?;
+    let prompts = Arc::new(ArcSwap::from(PromptCatalog::load(loader)?));
     let system_prompt_template = if parse_template {
         Some(
             SystemPromptTemplate::parse(&manifest.engine.instruction, loader.clone())

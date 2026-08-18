@@ -11,6 +11,7 @@ use std::borrow::Cow;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use llm_engine::Item;
 use llm_engine::UsageRecord;
@@ -64,7 +65,7 @@ pub(crate) struct WorkerInterceptor {
     pending_attachments: Arc<Mutex<Vec<SystemItem>>>,
     /// Prompt catalog used to render pending notification entries into the
     /// same system-message text that will be persisted in history.
-    prompts: Arc<PromptCatalog>,
+    prompts: Arc<ArcSwap<PromptCatalog>>,
     /// Type-erased commit handle. The interceptor uses it to commit
     /// `LogEntry::SystemItem` entries directly (sync) before
     /// returning the corresponding `Item::system_message`s up to the
@@ -84,7 +85,7 @@ impl WorkerInterceptor {
         usage_history: Option<Arc<Mutex<Vec<UsageRecord>>>>,
         pending_notifies: NotifyBuffer,
         pending_attachments: Arc<Mutex<Vec<SystemItem>>>,
-        prompts: Arc<PromptCatalog>,
+        prompts: Arc<ArcSwap<PromptCatalog>>,
         log_writer: Option<Arc<dyn SystemItemCommitter>>,
     ) -> Self {
         Self {
@@ -208,10 +209,11 @@ impl Interceptor for WorkerInterceptor {
             return Ok(Vec::new());
         }
 
+        let prompts = self.prompts.load_full();
         let mut system_items: Vec<SystemItem> = Vec::with_capacity(drained.len());
         let mut items: Vec<Item> = Vec::with_capacity(drained.len());
         for entry in drained {
-            match build_system_item(&entry, &self.prompts) {
+            match build_system_item(&entry, &prompts) {
                 Ok(system_item) => {
                     items.push(system_item.to_history_item());
                     system_items.push(system_item);
@@ -440,6 +442,10 @@ mod tests {
         HookTurnEndAction, OnTurnEnd, PostToolCall, PreLlmRequest, PreToolCall,
     };
 
+    fn test_prompts() -> Arc<ArcSwap<PromptCatalog>> {
+        Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap()))
+    }
+
     struct CountingHook(Arc<AtomicUsize>);
 
     #[async_trait]
@@ -541,7 +547,7 @@ mod tests {
             Some(history),
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         );
         let mut ctx = ctx_items;
@@ -571,7 +577,7 @@ mod tests {
             Some(history),
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             Some(Arc::new(RecordingSystemItemCommitter {
                 committed: Arc::clone(&committed),
             })),
@@ -609,7 +615,7 @@ mod tests {
             Some(history),
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         )
         .with_usage_tracker(usage_tracker);
@@ -634,7 +640,7 @@ mod tests {
             Some(history),
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         );
         let mut ctx = ctx_items;
@@ -675,7 +681,7 @@ mod tests {
             Some(history),
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         );
         let mut ctx = ctx_items;
@@ -702,7 +708,7 @@ mod tests {
             Some(history),
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         );
         let mut ctx = ctx_items;
@@ -723,7 +729,7 @@ mod tests {
             None,
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         );
         let mut ctx: Vec<Item> = Vec::new();
@@ -751,7 +757,7 @@ mod tests {
             None,
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             Some(committer),
         );
 
@@ -798,7 +804,7 @@ mod tests {
             None,
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         );
 
@@ -855,7 +861,7 @@ mod tests {
             None,
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         );
         let mut info = task_tool_call_info("TaskList", serde_json::json!({"scope": "all"}));
@@ -902,7 +908,7 @@ mod tests {
             None,
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         );
         let info = task_tool_call_info("TaskList", serde_json::json!({}));
@@ -953,7 +959,7 @@ mod tests {
             None,
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         );
         let history = vec![Item::user_message("hi"), Item::assistant_message("done")];
@@ -985,7 +991,7 @@ mod tests {
             None,
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             Some(Arc::new(RecordingSystemItemCommitter {
                 committed: Arc::clone(&committed),
             })),
@@ -1034,6 +1040,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_notifications_use_the_latest_prompt_projection() {
+        let prompts = test_prompts();
+        let buffer = NotifyBuffer::new();
+        let interceptor = WorkerInterceptor::new(
+            Arc::new(HookRegistryBuilder::new().build()),
+            None,
+            None,
+            buffer.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            prompts.clone(),
+            None,
+        );
+
+        let current = prompts.load_full();
+        let projection = current.projection();
+        let mut templates = projection.templates.clone();
+        templates.insert(
+            "internal.notify_wrapper".to_string(),
+            "CURRENT-PROJECTION {{ message }}".to_string(),
+        );
+        let mut projection = crate::prompt::catalog::EffectivePromptCatalog::new(
+            templates,
+            2,
+            projection.schema_fingerprint.clone(),
+            projection.toolchain_fingerprint.clone(),
+        )
+        .unwrap();
+        projection.source_digest = "source-2".to_string();
+        prompts.store(Arc::new(
+            PromptCatalog::from_projection(projection).unwrap(),
+        ));
+
+        buffer.push_notify("updated".to_string(), false);
+        let appends = interceptor.pending_history_appends().await.unwrap();
+        assert_eq!(appends.len(), 1);
+        assert!(format!("{:?}", appends[0]).contains("CURRENT-PROJECTION updated"));
+    }
+
+    #[tokio::test]
     async fn pending_history_appends_drains_buffer_into_items() {
         let registry = Arc::new(HookRegistryBuilder::new().build());
         let buffer = NotifyBuffer::new();
@@ -1046,7 +1091,7 @@ mod tests {
             None,
             buffer.clone(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         );
 
@@ -1083,7 +1128,7 @@ mod tests {
             None,
             buffer.clone(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         );
         let mut ctx: Vec<Item> = vec![Item::user_message("hi")];
@@ -1113,7 +1158,7 @@ mod tests {
             None,
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            PromptCatalog::builtins_only().unwrap(),
+            test_prompts(),
             None,
         );
         let mut ctx: Vec<Item> = Vec::new();
