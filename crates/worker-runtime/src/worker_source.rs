@@ -399,6 +399,7 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
 
     fn current_prompt_projection(
         &self,
+        minimum_revision: Option<u64>,
     ) -> Result<Option<WorkspacePromptCatalogResolution>, WorkspaceClientError> {
         let Some(cache) = self.prompt_projection_cache.as_ref() else {
             return Ok(None);
@@ -406,6 +407,11 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
         if let Some(resolution) = cache
             .active(&self.workspace_id)
             .map_err(WorkspaceClientError::Request)?
+            .filter(|resolution| {
+                minimum_revision
+                    .map(|minimum| resolution.projection.config_revision >= minimum)
+                    .unwrap_or(true)
+            })
         {
             return Ok(Some((*resolution).clone()));
         }
@@ -420,6 +426,11 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
         if let Some(resolution) = cache
             .active(&self.workspace_id)
             .map_err(WorkspaceClientError::Request)?
+            .filter(|resolution| {
+                minimum_revision
+                    .map(|minimum| resolution.projection.config_revision >= minimum)
+                    .unwrap_or(true)
+            })
         {
             return Ok(Some((*resolution).clone()));
         }
@@ -445,10 +456,18 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
                 self.workspace_id, projection.workspace_id
             )));
         }
-        let projection = cache
+        let resolution = cache
             .observe(projection)
             .map_err(WorkspaceClientError::Request)?;
-        Ok(Some((*projection).clone()))
+        if let Some(minimum_revision) = minimum_revision
+            && resolution.projection.config_revision < minimum_revision
+        {
+            return Err(WorkspaceClientError::Request(format!(
+                "active Workspace Prompt projection is stale: required revision {minimum_revision}, got {}",
+                resolution.projection.config_revision
+            )));
+        }
+        Ok(Some((*resolution).clone()))
     }
 
     fn execute_worker_remove(
@@ -616,12 +635,58 @@ mod tests {
         )
         .with_prompt_projection_cache(cache);
 
-        let projection = client.current_prompt_projection().unwrap().unwrap();
-        let second = client.current_prompt_projection().unwrap().unwrap();
+        let projection = client.current_prompt_projection(None).unwrap().unwrap();
+        let second = client.current_prompt_projection(None).unwrap().unwrap();
 
         assert_eq!(projection.projection.config_revision, 3);
         assert_eq!(projection.projection.source_digest, "source-3");
         assert!(Arc::ptr_eq(&projection.catalog, &second.catalog));
+    }
+
+    #[test]
+    fn prompt_projection_minimum_revision_rejects_stale_server_response() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let catalog = worker::EffectivePromptCatalog::new(
+            std::collections::BTreeMap::from([("default".to_string(), "stale prompt".to_string())]),
+            3,
+            "schema",
+            "toolchain",
+        )
+        .unwrap();
+        let projection = WorkspacePromptProjection::new(
+            "workspace-a",
+            "source-3",
+            catalog.catalog_digest.clone(),
+            catalog,
+        )
+        .unwrap();
+        let body = serde_json::to_string(&projection).unwrap();
+        let cache = Arc::new(WorkspacePromptProjectionCache::default());
+        cache.observe(projection).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let client =
+            RuntimeOwnedWorkspaceClient::new("workspace-a", base_url, "runtime-a", "worker-a")
+                .with_prompt_projection_cache(cache);
+
+        let error = client.current_prompt_projection(Some(4)).unwrap_err();
+        server.join().unwrap();
+
+        assert!(error.to_string().contains("required revision 4, got 3"));
     }
 
     #[test]
@@ -673,7 +738,7 @@ mod tests {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    client.current_prompt_projection().unwrap().unwrap()
+                    client.current_prompt_projection(None).unwrap().unwrap()
                 })
             })
             .collect::<Vec<_>>();
@@ -732,7 +797,7 @@ mod tests {
             RuntimeOwnedWorkspaceClient::new("workspace-a", base_url, "runtime-a", "worker-a")
                 .with_prompt_projection_cache(Arc::new(WorkspacePromptProjectionCache::default()));
 
-        let error = client.current_prompt_projection().unwrap_err();
+        let error = client.current_prompt_projection(None).unwrap_err();
         server.join().unwrap();
 
         assert!(error.to_string().contains("scope mismatch"));

@@ -261,6 +261,7 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
     /// launch/session state; this hook never reconstructs historical prompts.
     fn current_prompt_projection(
         &self,
+        _minimum_revision: Option<u64>,
     ) -> Result<Option<WorkspacePromptCatalogResolution>, WorkspaceClientError> {
         Ok(None)
     }
@@ -328,8 +329,9 @@ impl WorkspaceClient for ReviewerChildWorkspaceClient {
 
     fn current_prompt_projection(
         &self,
+        minimum_revision: Option<u64>,
     ) -> Result<Option<WorkspacePromptCatalogResolution>, WorkspaceClientError> {
-        self.inner.current_prompt_projection()
+        self.inner.current_prompt_projection(minimum_revision)
     }
 
     fn execute(
@@ -1293,7 +1295,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         let Some(resolution) = self
             .workspace_context
             .client()
-            .current_prompt_projection()
+            .current_prompt_projection(None)
             .map_err(|source| WorkerError::WorkspacePromptProjection {
                 message: source.to_string(),
             })?
