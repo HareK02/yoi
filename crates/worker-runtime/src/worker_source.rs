@@ -424,6 +424,12 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
                     "invalid active Workspace Prompt projection response: {error}"
                 ))
             })?;
+        if projection.workspace_id != self.workspace_id {
+            return Err(WorkspaceClientError::Request(format!(
+                "active Workspace Prompt projection scope mismatch: expected {}, got {}",
+                self.workspace_id, projection.workspace_id
+            )));
+        }
         let projection = cache
             .observe(projection)
             .map_err(WorkspaceClientError::Request)?;
@@ -599,6 +605,53 @@ mod tests {
 
         assert_eq!(projection.config_revision, 3);
         assert_eq!(projection.source_digest, "source-3");
+    }
+
+    #[test]
+    fn current_prompt_projection_rejects_cross_workspace_response() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let catalog = worker::EffectivePromptCatalog::new(
+            std::collections::BTreeMap::from([(
+                "default".to_string(),
+                "foreign prompt".to_string(),
+            )]),
+            4,
+            "schema",
+            "toolchain",
+        )
+        .unwrap();
+        let projection = WorkspacePromptProjection::new(
+            "workspace-b",
+            "source-4",
+            catalog.catalog_digest.clone(),
+            catalog,
+        )
+        .unwrap();
+        let body = serde_json::to_string(&projection).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let client =
+            RuntimeOwnedWorkspaceClient::new("workspace-a", base_url, "runtime-a", "worker-a")
+                .with_prompt_projection_cache(Arc::new(WorkspacePromptProjectionCache::default()));
+
+        let error = client.current_prompt_projection().unwrap_err();
+        server.join().unwrap();
+
+        assert!(error.to_string().contains("scope mismatch"));
     }
 
     #[test]
