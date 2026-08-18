@@ -13131,7 +13131,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_profile_backend_launches_and_restores_workspace_orchestrator() {
+    async fn production_profile_backend_rejects_unrecoverable_pending_orchestrator_restore() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let config = test_server_config(workspace.path());
@@ -13171,17 +13171,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stopped.state, WorkerOperationState::Accepted);
-        let Json(restored) = scoped_start_workspace_orchestrator(
-            State(api),
-            AxumPath(ScopedWorkspacePath { workspace_id }),
+        let error = scoped_start_workspace_orchestrator(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: workspace_id.clone(),
+            }),
         )
         .await
-        .unwrap();
-        assert_eq!(restored.disposition, "restored");
-        assert!(restored.online);
-        assert_eq!(
-            restored.worker.expect("restored Orchestrator").worker,
-            worker
+        .expect_err("pending Workspace Orchestrator restore without durable Prompt must fail");
+        assert!(
+            format!("{error:?}").contains(
+                "pending Workspace Worker restore requires operation-owned launch material"
+            ),
+            "unexpected restore error: {error:?}"
         );
     }
 
