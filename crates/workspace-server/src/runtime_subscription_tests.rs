@@ -8,6 +8,7 @@ use worker_runtime::execution::{
     WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation, WorkerExecutionResult,
     WorkerExecutionRunState, WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
 };
+use worker_runtime::identity::WorkerId;
 use worker_runtime::profile_archive::{ProfileSourceArchiveRef, ProfileSourceGraphSummary};
 
 #[derive(Debug)]
@@ -57,8 +58,8 @@ const TOKEN: &str = "runtime-subscription-test-token";
 
 fn create_request(name: &str) -> CreateWorkerRequest {
     CreateWorkerRequest {
-        idempotency_key: None,
-        idempotency_fingerprint: None,
+        worker_id: WorkerId::now_v7(),
+        create_fingerprint: "test-create".to_string(),
         profile: ProfileSelector::Builtin("builtin:companion".to_string()),
         display_name: Some(name.to_string()),
         config_bundle: None,

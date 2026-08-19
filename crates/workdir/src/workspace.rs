@@ -126,7 +126,7 @@ pub struct WorkingDirectoryCurrentObservation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanliness: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub primary_worker_id: Option<u64>,
+    pub primary_worker_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occupied_by: Option<WorkingDirectoryOccupancy>,
 }
@@ -151,7 +151,7 @@ pub struct WorkingDirectorySummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanliness: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub primary_worker_id: Option<u64>,
+    pub primary_worker_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occupied_by: Option<WorkingDirectoryOccupancy>,
 }
@@ -177,7 +177,7 @@ impl WorkingDirectorySummary {
             current_ref: self.current_ref.clone(),
             status: self.status.clone(),
             cleanliness: self.cleanliness.clone(),
-            primary_worker_id: self.primary_worker_id,
+            primary_worker_id: self.primary_worker_id.clone(),
             occupied_by: self.occupied_by.clone(),
         }
     }

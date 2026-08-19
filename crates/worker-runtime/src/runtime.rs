@@ -196,7 +196,7 @@ impl Runtime {
         options: FsRuntimeStoreOptions,
         execution_backend: Option<WorkerExecutionBackendRef>,
     ) -> Result<Self, RuntimeError> {
-        let opened = FsRuntimeStore::open_or_create(options.root)?;
+        let opened = FsRuntimeStore::open_or_create(options.root, &options.runtime_id)?;
         let mut state = if let Some(persisted) = opened.state {
             RuntimeState::from_persisted(persisted, opened.store)?
         } else {
@@ -492,7 +492,7 @@ impl Runtime {
         let state = self.lock()?;
         status.summary.primary_worker_id = state
             .primary_worker_id_for_workdir(status.summary.working_directory_id.as_str())
-            .map(|worker_id| worker_id.as_u64());
+            .map(|worker_id| worker_id.to_string());
         Ok(status)
     }
 
@@ -518,11 +518,6 @@ impl Runtime {
         request: CreateWorkerRequest,
         scope: Option<&RuntimeWorkspaceScope>,
     ) -> Result<WorkerDetail, RuntimeError> {
-        if request.idempotency_key.is_some() != request.idempotency_fingerprint.is_some() {
-            return Err(RuntimeError::InvalidRequest(
-                "idempotency_key and idempotency_fingerprint must be provided together".to_string(),
-            ));
-        }
         let (backend, worker_ref, spawn_request) = {
             let mut state = self.lock()?;
             state.ensure_running()?;
@@ -534,19 +529,21 @@ impl Runtime {
             if let Some(scope) = scope {
                 state.ensure_workspace_owner(scope, true)?;
             };
-            if let Some(idempotency_key) = request.idempotency_key.as_deref() {
-                let workspace_id = scope.map(|scope| scope.workspace_id.as_str());
-                if let Some(existing) = state.workers.values().find(|record| {
-                    record.workspace_id.as_deref() == workspace_id
-                        && record.request.idempotency_key.as_deref() == Some(idempotency_key)
-                }) {
-                    if existing.request.idempotency_fingerprint != request.idempotency_fingerprint {
-                        return Err(RuntimeError::InvalidRequest(format!(
-                            "worker creation idempotency key {idempotency_key} was already used with different input"
-                        )));
-                    }
-                    return Ok(existing.detail());
+            let workspace_id = scope.map(|scope| scope.workspace_id.as_str());
+            if let Some(existing) = state.workers.get(&request.worker_id) {
+                if existing.workspace_id.as_deref() != workspace_id {
+                    return Err(RuntimeError::InvalidRequest(format!(
+                        "worker {} already belongs to another Workspace scope",
+                        request.worker_id
+                    )));
                 }
+                if existing.request.create_fingerprint != request.create_fingerprint {
+                    return Err(RuntimeError::InvalidRequest(format!(
+                        "worker {} was already created with a different fingerprint",
+                        request.worker_id
+                    )));
+                }
+                return Ok(existing.detail());
             }
             state.validate_worker_config_boundary(&request)?;
             if let Some(working_directory_id) = requested_primary_workdir_id(&request) {
@@ -565,9 +562,8 @@ impl Runtime {
             })?;
             let config_bundle = state.resolve_config_bundle_ref(request.config_bundle.as_ref())?;
 
-            let worker_id = WorkerId::generated(state.next_worker_sequence);
-            state.next_worker_sequence += 1;
-            let worker_ref = WorkerRef::new(worker_id.clone());
+            let worker_id = request.worker_id;
+            let worker_ref = WorkerRef::new(worker_id);
 
             let record = WorkerRecord {
                 worker_ref: worker_ref.clone(),
@@ -1850,7 +1846,6 @@ struct RuntimeState {
     persistence: RuntimePersistence,
     status: RuntimeStatus,
     execution_backend: Option<WorkerExecutionBackendRef>,
-    next_worker_sequence: u64,
     #[cfg(feature = "fs-store")]
     next_diagnostic_id: u64,
     workers: BTreeMap<WorkerId, WorkerRecord>,
@@ -1878,7 +1873,6 @@ impl RuntimeState {
             persistence: RuntimePersistence::Memory,
             status: RuntimeStatus::Running,
             execution_backend: None,
-            next_worker_sequence: 1,
             #[cfg(feature = "fs-store")]
             next_diagnostic_id: 1,
             workers: BTreeMap::new(),
@@ -1907,7 +1901,6 @@ impl RuntimeState {
             persistence: RuntimePersistence::Fs(store),
             status: RuntimeStatus::Running,
             execution_backend: None,
-            next_worker_sequence: 1,
             #[cfg(feature = "fs-store")]
             next_diagnostic_id: 1,
             workers: BTreeMap::new(),
@@ -1958,7 +1951,6 @@ impl RuntimeState {
             persistence: RuntimePersistence::Fs(store),
             status: persisted.status,
             execution_backend: None,
-            next_worker_sequence: persisted.next_worker_sequence,
             next_diagnostic_id,
             workers,
             config_bundles: BTreeMap::new(),
@@ -1982,7 +1974,6 @@ impl RuntimeState {
         PersistedRuntimeState {
             display_name: self.display_name.clone(),
             status: self.status,
-            next_worker_sequence: self.next_worker_sequence,
             next_diagnostic_id: self.next_diagnostic_id,
             workers: self
                 .workers
@@ -2589,6 +2580,11 @@ fn requested_primary_workdir_id(request: &CreateWorkerRequest) -> Option<&str> {
 }
 
 fn validate_create_worker_request(request: &CreateWorkerRequest) -> Result<(), RuntimeError> {
+    if request.create_fingerprint.trim().is_empty() {
+        return Err(RuntimeError::InvalidRequest(
+            "create_fingerprint must not be empty".to_string(),
+        ));
+    }
     match &request.profile_source {
         crate::catalog::ProfileSourceArchiveSource::Embedded { archive } => {
             archive.verify().map_err(|err| {
@@ -2791,8 +2787,8 @@ mod tests {
         let profile = ProfileSelector::Builtin("builtin:coder".to_string());
         let bundle = test_bundle_for_profile(profile.clone());
         CreateWorkerRequest {
-            idempotency_key: None,
-            idempotency_fingerprint: None,
+            worker_id: WorkerId::now_v7(),
+            create_fingerprint: "test-create".to_string(),
             profile,
             display_name: None,
             profile_source: crate::catalog::ProfileSourceArchiveSource::Http {
@@ -3570,8 +3566,7 @@ mod tests {
     fn create_worker_idempotency_reuses_worker_and_rejects_different_input() {
         let runtime = runtime_with_backend();
         let mut request = task_request("idempotent");
-        request.idempotency_key = Some("operation-1".to_string());
-        request.idempotency_fingerprint = Some("sha256:input-1".to_string());
+        request.create_fingerprint = "sha256:input-1".to_string();
         request.working_directory = Some(WorkingDirectoryClaim {
             working_directory_id: "workdir-idempotent".to_string(),
             relative_cwd: None,
@@ -3587,7 +3582,7 @@ mod tests {
             workdir_count_after_first
         );
 
-        request.idempotency_fingerprint = Some("sha256:different".to_string());
+        request.create_fingerprint = "sha256:different".to_string();
         let error = runtime.create_worker(request).unwrap_err();
         assert!(matches!(error, RuntimeError::InvalidRequest(_)));
         assert_eq!(runtime.list_workers().unwrap().len(), 1);
@@ -4143,11 +4138,91 @@ mod tests {
 
     #[cfg(feature = "fs-store")]
     #[test]
+    fn fs_store_migrates_legacy_numeric_worker_identity_to_workspace_uuid() {
+        let root = fs_store_root("worker-id-v1");
+        let runtime_id = "arcadia";
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            crate::fs_store::FsRuntimeStoreOptions {
+                root: root.clone(),
+                runtime_id: runtime_id.to_string(),
+                display_name: None,
+            },
+            Arc::new(TestExecutionBackend::default()),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker_scoped(
+                &RuntimeWorkspaceScope::new("workspace-a", "server"),
+                task_request("legacy"),
+            )
+            .unwrap();
+        drop(runtime);
+
+        let current_dir = root.join("workers").join(worker.worker_id.to_string());
+        let legacy_dir = root.join("workers").join("7");
+        std::fs::rename(&current_dir, &legacy_dir).unwrap();
+        let worker_path = legacy_dir.join("worker.json");
+        let mut worker_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&worker_path).unwrap()).unwrap();
+        worker_json["schema_version"] = serde_json::json!(1);
+        worker_json["worker_id"] = serde_json::json!(7);
+        worker_json["worker_ref"]["worker_id"] = serde_json::json!(7);
+        let request = worker_json["request"].as_object_mut().unwrap();
+        request.remove("worker_id");
+        request.remove("create_fingerprint");
+        request.insert("idempotency_key".to_string(), serde_json::Value::Null);
+        request.insert(
+            "idempotency_fingerprint".to_string(),
+            serde_json::Value::Null,
+        );
+        std::fs::write(
+            &worker_path,
+            serde_json::to_vec_pretty(&worker_json).unwrap(),
+        )
+        .unwrap();
+
+        let runtime_path = root.join("runtime.json");
+        let mut runtime_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&runtime_path).unwrap()).unwrap();
+        runtime_json["schema_version"] = serde_json::json!(1);
+        runtime_json["workers"] = serde_json::json!([7]);
+        runtime_json["next_worker_sequence"] = serde_json::json!(8);
+        std::fs::write(
+            &runtime_path,
+            serde_json::to_vec_pretty(&runtime_json).unwrap(),
+        )
+        .unwrap();
+
+        let restored = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
+            root: root.clone(),
+            runtime_id: runtime_id.to_string(),
+            display_name: None,
+        })
+        .unwrap();
+        let expected = WorkerId::from_legacy_binding("workspace-a", runtime_id, 7);
+        let detail = restored.worker_detail(&WorkerRef::new(expected)).unwrap();
+        assert_eq!(detail.worker_id, expected);
+        assert_eq!(detail.worker_ref.worker_id, expected);
+        assert!(root.join("workers").join(expected.to_string()).exists());
+        assert!(!legacy_dir.exists());
+        let migrated_runtime: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(runtime_path).unwrap()).unwrap();
+        assert_eq!(migrated_runtime["schema_version"], serde_json::json!(2));
+        assert!(migrated_runtime.get("next_worker_sequence").is_none());
+
+        drop(restored);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
     fn fs_store_restores_workers_without_legacy_event_or_protocol_observation_logs() {
         let root = fs_store_root("restore");
         let runtime = Runtime::with_fs_store_and_execution_backend(
             crate::fs_store::FsRuntimeStoreOptions {
                 root: root.clone(),
+                runtime_id: "test-runtime".to_string(),
                 display_name: Some("filesystem runtime".to_string()),
             },
             Arc::new(TestExecutionBackend::default()),
@@ -4189,6 +4264,7 @@ mod tests {
 
         let restored = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
             root: root.clone(),
+            runtime_id: "test-runtime".to_string(),
             display_name: None,
         })
         .unwrap();
@@ -4239,6 +4315,7 @@ mod tests {
         let runtime = Runtime::with_fs_store_and_execution_backend(
             crate::fs_store::FsRuntimeStoreOptions {
                 root: root.clone(),
+                runtime_id: "test-runtime".to_string(),
                 display_name: None,
             },
             Arc::new(TestExecutionBackend::default()),
@@ -4264,6 +4341,7 @@ mod tests {
 
         let restored = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
             root: root.clone(),
+            runtime_id: "test-runtime".to_string(),
             display_name: None,
         })
         .unwrap();
@@ -4313,6 +4391,7 @@ mod tests {
         let runtime = Runtime::with_fs_store_and_execution_backend(
             crate::fs_store::FsRuntimeStoreOptions {
                 root: root.clone(),
+                runtime_id: "test-runtime".to_string(),
                 display_name: None,
             },
             Arc::new(TestExecutionBackend::default()),
@@ -4326,6 +4405,7 @@ mod tests {
 
         let backendless = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
             root: root.clone(),
+            runtime_id: "test-runtime".to_string(),
             display_name: None,
         })
         .unwrap();
@@ -4337,6 +4417,7 @@ mod tests {
         let restored = Runtime::with_fs_store_and_execution_backend(
             crate::fs_store::FsRuntimeStoreOptions {
                 root: root.clone(),
+                runtime_id: "test-runtime".to_string(),
                 display_name: None,
             },
             restoring_backend.clone(),
@@ -4360,6 +4441,7 @@ mod tests {
         let runtime = Runtime::with_fs_store_and_execution_backend(
             crate::fs_store::FsRuntimeStoreOptions {
                 root: root.clone(),
+                runtime_id: "test-runtime".to_string(),
                 display_name: None,
             },
             Arc::new(TestExecutionBackend::default()),
@@ -4379,6 +4461,7 @@ mod tests {
         let restored = Runtime::with_fs_store_and_execution_backend(
             crate::fs_store::FsRuntimeStoreOptions {
                 root: root.clone(),
+                runtime_id: "test-runtime".to_string(),
                 display_name: None,
             },
             restoring_backend.clone(),
@@ -4415,6 +4498,7 @@ mod tests {
         let corrupt_root = fs_store_root("corrupt");
         let corrupt_runtime = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
             root: corrupt_root.clone(),
+            runtime_id: "test-runtime".to_string(),
             display_name: None,
         })
         .unwrap();
@@ -4427,6 +4511,7 @@ mod tests {
         drop(corrupt_runtime);
         let err = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
             root: corrupt_root.clone(),
+            runtime_id: "test-runtime".to_string(),
             display_name: None,
         })
         .unwrap_err();
@@ -4437,6 +4522,7 @@ mod tests {
         let missing_runtime = Runtime::with_fs_store_and_execution_backend(
             crate::fs_store::FsRuntimeStoreOptions {
                 root: missing_root.clone(),
+                runtime_id: "test-runtime".to_string(),
                 display_name: None,
             },
             Arc::new(TestExecutionBackend::default()),
@@ -4456,6 +4542,7 @@ mod tests {
         drop(missing_runtime);
         let loaded = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
             root: missing_root.clone(),
+            runtime_id: "test-runtime".to_string(),
             display_name: None,
         })
         .expect("invalid worker snapshot should not make runtime store unreadable");

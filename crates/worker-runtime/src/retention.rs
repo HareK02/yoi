@@ -275,14 +275,13 @@ impl FsWorkerRetentionProvider {
                 ));
                 continue;
             }
-            let Ok(worker_number) = raw_id.parse::<u64>() else {
+            let Ok(worker_id) = raw_id.parse::<WorkerId>() else {
                 diagnostics.push(runtime_aggregate_diagnostic(
                     &bounded_id,
                     "aggregate_worker_id_invalid",
                 ));
                 continue;
             };
-            let worker_id = WorkerId::new(worker_number);
             let worker_dir = self.worker_dir(worker_id);
             let snapshot: WorkerGenerationSnapshot = match read_json(
                 &worker_dir.join("worker.json"),
@@ -1315,7 +1314,7 @@ mod tests {
     #[test]
     fn archive_is_verified_before_source_removal_and_retry_converges() {
         let temp = tempfile::tempdir().unwrap();
-        let worker_id = WorkerId::new(7);
+        let worker_id = WorkerId::from_legacy_u64(7);
         source(temp.path(), worker_id, 4);
         let provider = FsWorkerRetentionProvider::new(temp.path());
         let request = request(worker_id, 4, SessionDisposition::Archive);
@@ -1325,7 +1324,7 @@ mod tests {
         let archive = first.archive.as_ref().unwrap();
         assert_eq!(archive.source_session_id, "session-a");
         assert_eq!(archive.segment_ids, vec!["segment-a"]);
-        assert!(!temp.path().join("workers/7").exists());
+        assert!(!temp.path().join(format!("workers/{worker_id}")).exists());
         assert!(
             temp.path()
                 .join("archives/workers/archive-a/session/segments/segment-a.jsonl")
@@ -1346,7 +1345,7 @@ mod tests {
     #[test]
     fn archive_failure_keeps_live_source_for_retry() {
         let temp = tempfile::tempdir().unwrap();
-        let worker_id = WorkerId::new(8);
+        let worker_id = WorkerId::from_legacy_u64(8);
         source(temp.path(), worker_id, 2);
         let collision = temp.path().join("archives/workers/archive-a");
         fs::create_dir_all(&collision).unwrap();
@@ -1358,7 +1357,11 @@ mod tests {
                 .execute(&request(worker_id, 2, SessionDisposition::Archive))
                 .is_err()
         );
-        assert!(temp.path().join("workers/8/session").is_dir());
+        assert!(
+            temp.path()
+                .join(format!("workers/{worker_id}/session"))
+                .is_dir()
+        );
         assert!(
             !temp
                 .path()
@@ -1370,7 +1373,7 @@ mod tests {
     #[test]
     fn target_inventory_and_execute_reject_cross_workspace_aggregate() {
         let temp = tempfile::tempdir().unwrap();
-        let worker_id = WorkerId::new(16);
+        let worker_id = WorkerId::from_legacy_u64(16);
         source(temp.path(), worker_id, 3);
         let provider = FsWorkerRetentionProvider::new(temp.path());
         assert!(matches!(
@@ -1383,7 +1386,11 @@ mod tests {
             provider.execute(&request),
             Err(RuntimeError::WorkerNotFound { .. })
         ));
-        assert!(temp.path().join("workers/16/session").is_dir());
+        assert!(
+            temp.path()
+                .join(format!("workers/{worker_id}/session"))
+                .is_dir()
+        );
         assert!(
             !temp
                 .path()
@@ -1401,18 +1408,22 @@ mod tests {
     fn purge_removes_aggregate_and_rejects_stale_generation() {
         let temp = tempfile::tempdir().unwrap();
         let provider = FsWorkerRetentionProvider::new(temp.path());
-        let worker_id = WorkerId::new(9);
+        let worker_id = WorkerId::from_legacy_u64(9);
         source(temp.path(), worker_id, 5);
         let stale = request(worker_id, 4, SessionDisposition::Purge);
         assert!(provider.execute(&stale).is_err());
-        assert!(temp.path().join("workers/9/session").is_dir());
+        assert!(
+            temp.path()
+                .join(format!("workers/{worker_id}/session"))
+                .is_dir()
+        );
 
         let mut current = request(worker_id, 5, SessionDisposition::Purge);
         current.operation_id = "operation-current".to_string();
         current.input_fingerprint = "fingerprint-current".to_string();
         let result = provider.execute(&current).unwrap();
         assert!(result.archive.is_none());
-        assert!(!temp.path().join("workers/9").exists());
+        assert!(!temp.path().join(format!("workers/{worker_id}")).exists());
         assert!(
             temp.path()
                 .join("retention/operations/operation-current.json")
@@ -1423,7 +1434,7 @@ mod tests {
     #[test]
     fn pending_receipt_recovers_delete_to_receipt_crash_window() {
         let temp = tempfile::tempdir().unwrap();
-        let worker_id = WorkerId::new(11);
+        let worker_id = WorkerId::from_legacy_u64(11);
         source(temp.path(), worker_id, 1);
         let provider = FsWorkerRetentionProvider::new(temp.path());
         let request = request(worker_id, 1, SessionDisposition::Archive);
@@ -1442,10 +1453,15 @@ mod tests {
     #[test]
     fn provider_snapshot_scans_aggregate_storage_independent_of_runtime_catalog() {
         let temp = tempfile::tempdir().unwrap();
-        source(temp.path(), WorkerId::new(13), 2);
-        source(temp.path(), WorkerId::new(14), 1);
+        source(temp.path(), WorkerId::from_legacy_u64(13), 2);
+        let other_worker = WorkerId::from_legacy_u64(14);
+        source(temp.path(), other_worker, 1);
         write_json(
-            &temp.path().join("workers/14/worker.json"),
+            &temp
+                .path()
+                .join("workers")
+                .join(other_worker.to_string())
+                .join("worker.json"),
             &serde_json::json!({"workspace_id": "other-workspace", "run_generation": 1}),
         );
         fs::create_dir_all(temp.path().join("workers/not-a-worker")).unwrap();
@@ -1454,15 +1470,20 @@ mod tests {
             b"not-json",
         )
         .unwrap();
-        fs::create_dir_all(temp.path().join("workers/15")).unwrap();
-        fs::write(temp.path().join("workers/15/worker.json"), b"not-json").unwrap();
+        let corrupt_worker = WorkerId::from_legacy_u64(15);
+        let corrupt_worker_dir = temp.path().join("workers").join(corrupt_worker.to_string());
+        fs::create_dir_all(&corrupt_worker_dir).unwrap();
+        fs::write(corrupt_worker_dir.join("worker.json"), b"not-json").unwrap();
         let provider = FsWorkerRetentionProvider::new(temp.path());
 
         let snapshot = provider.snapshot("workspace-a", "runtime-a").unwrap();
         assert_eq!(snapshot.workers().len(), 1);
-        assert_eq!(snapshot.workers()[0].worker_id, WorkerId::new(13));
+        assert_eq!(
+            snapshot.workers()[0].worker_id,
+            WorkerId::from_legacy_u64(13)
+        );
         assert!(snapshot.diagnostics().iter().any(|diagnostic| {
-            diagnostic.worker_id() == "14"
+            diagnostic.worker_id() == other_worker.to_string()
                 && diagnostic.category() == "aggregate_workspace_mismatch"
         }));
         assert!(snapshot.diagnostics().iter().any(|diagnostic| {
@@ -1470,7 +1491,7 @@ mod tests {
                 && diagnostic.category() == "aggregate_worker_id_invalid"
         }));
         assert!(snapshot.diagnostics().iter().any(|diagnostic| {
-            diagnostic.worker_id() == "15"
+            diagnostic.worker_id() == corrupt_worker.to_string()
                 && diagnostic.category() == "aggregate_worker_record_corrupt"
         }));
     }
@@ -1478,7 +1499,7 @@ mod tests {
     #[test]
     fn diagnostics_retry_rejects_corrupt_existing_archive_before_source_delete() {
         let temp = tempfile::tempdir().unwrap();
-        let worker_id = WorkerId::new(12);
+        let worker_id = WorkerId::from_legacy_u64(12);
         source(temp.path(), worker_id, 1);
         let provider = FsWorkerRetentionProvider::new(temp.path());
         let mut request = request(worker_id, 1, SessionDisposition::Archive);
@@ -1499,14 +1520,18 @@ mod tests {
         .unwrap();
 
         assert!(provider.execute(&request).is_err());
-        assert!(temp.path().join("workers/12/session").is_dir());
+        assert!(
+            temp.path()
+                .join(format!("workers/{worker_id}/session"))
+                .is_dir()
+        );
         assert!(provider.completed_for(&request).unwrap().is_none());
     }
 
     #[test]
     fn concurrent_retry_produces_one_archive() {
         let temp = tempfile::tempdir().unwrap();
-        let worker_id = WorkerId::new(10);
+        let worker_id = WorkerId::from_legacy_u64(10);
         source(temp.path(), worker_id, 1);
         let provider = Arc::new(FsWorkerRetentionProvider::new(temp.path()));
         let request = Arc::new(request(worker_id, 1, SessionDisposition::Archive));

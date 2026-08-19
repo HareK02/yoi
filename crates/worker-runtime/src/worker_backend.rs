@@ -1998,6 +1998,7 @@ mod tests {
         WorkingDirectoryRequest,
     };
     use crate::execution::WorkerExecutionContext;
+    use crate::identity::WorkerId;
     use crate::identity::WorkerRef;
     use crate::management::RuntimeOptions;
     use crate::observation::WorkerObservationCursor;
@@ -2119,7 +2120,7 @@ mod tests {
     #[test]
     fn restart_restore_reconstructs_runtime_owned_worker_mutation_client() {
         let identity = RuntimeIdentityMaterial::generate("runtime-source").unwrap();
-        let worker_ref = WorkerRef::new(crate::identity::WorkerId::new(17));
+        let worker_ref = WorkerRef::new(crate::identity::WorkerId::from_legacy_u64(17));
         let backend = RuntimeWorkspaceBackendRef::Http {
             workspace_id: "workspace-a".to_string(),
             base_url: "https://server.invalid".to_string(),
@@ -2486,8 +2487,8 @@ mod tests {
     fn create_request(_name: &str) -> CreateWorkerRequest {
         let bundle = test_bundle();
         CreateWorkerRequest {
-            idempotency_key: None,
-            idempotency_fingerprint: None,
+            worker_id: WorkerId::now_v7(),
+            create_fingerprint: "test-create".to_string(),
             profile: ProfileSelector::Builtin("builtin:companion".to_string()),
             display_name: None,
             profile_source: crate::catalog::ProfileSourceArchiveSource::Embedded {
@@ -2590,7 +2591,8 @@ mod tests {
     #[tokio::test]
     async fn runtime_provider_projects_only_explicit_live_canonical_grants() {
         let hub = Arc::new(RuntimeWorkerObservationHub::default());
-        let worker_ref = WorkerRef::new(crate::identity::WorkerId::new(7));
+        let worker_id = crate::identity::WorkerId::from_legacy_u64(7);
+        let worker_ref = WorkerRef::new(worker_id);
         let shared_state = Arc::new(WorkerSharedState::new(
             "peer-worker".to_string(),
             session_store::new_segment_id(),
@@ -2614,7 +2616,7 @@ mod tests {
                 sink: SegmentLogSink::new(),
             },
         );
-        let grant = crate::identity::RuntimeWorkerRef::new("runtime-1", "7");
+        let grant = crate::identity::RuntimeWorkerRef::new("runtime-1", worker_id.to_string());
         let provider = RuntimeGrantedWorkerObservationProvider {
             runtime_id: "runtime-1".to_string(),
             workspace_id: "workspace-1".to_string(),
@@ -2628,7 +2630,7 @@ mod tests {
             listed[0].subject,
             WorkerObservationSubjectRef::RuntimeWorker {
                 runtime_id: "runtime-1".to_string(),
-                worker_id: "7".to_string(),
+                worker_id: worker_id.to_string(),
             }
         );
         provider
@@ -2668,8 +2670,9 @@ mod tests {
     }
 
     #[test]
-    fn runtime_worker_name_is_runtime_local() {
-        let worker_ref = crate::identity::WorkerRef::new(crate::identity::WorkerId::new(1));
+    fn runtime_worker_name_uses_workspace_worker_identity() {
+        let worker_ref =
+            crate::identity::WorkerRef::new(crate::identity::WorkerId::from_legacy_u64(1));
         let request = WorkerExecutionSpawnRequest {
             worker_ref: worker_ref.clone(),
             run_generation: 1,
@@ -2682,7 +2685,7 @@ mod tests {
 
         assert_eq!(
             ProfileRuntimeWorkerFactory::runtime_worker_name(&request),
-            "worker-runtime-1"
+            format!("worker-runtime-{}", request.worker_ref.worker_id)
         );
         assert_ne!(
             ProfileRuntimeWorkerFactory::runtime_worker_name(&request),
@@ -2765,8 +2768,10 @@ mod tests {
     async fn restore_pending_workspace_worker_without_system_prompt_fails_closed() {
         let root = tempfile::tempdir().unwrap();
         let runtime_store_dir = root.path().join("runtime");
-        let worker_ref = WorkerRef::new(crate::identity::WorkerId::new(1));
-        let worker_aggregate_dir = runtime_store_dir.join("workers/1");
+        let worker_ref = WorkerRef::new(crate::identity::WorkerId::from_legacy_u64(1));
+        let worker_aggregate_dir = runtime_store_dir
+            .join("workers")
+            .join(worker_ref.worker_id.to_string());
         let worker_name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&worker_ref);
         let session_id = session_store::new_session_id();
         let manifest = manifest::WorkerManifest::from_toml(&format!(
@@ -2842,8 +2847,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let long_component = "embedded-workspace-store-segment".repeat(4);
         let runtime_store_dir = root.path().join(long_component);
-        let worker_ref = WorkerRef::new(crate::identity::WorkerId::new(1));
-        let worker_aggregate_dir = runtime_store_dir.join("workers/1");
+        let worker_ref = WorkerRef::new(crate::identity::WorkerId::from_legacy_u64(1));
+        let worker_aggregate_dir = runtime_store_dir
+            .join("workers")
+            .join(worker_ref.worker_id.to_string());
         let worker_name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&worker_ref);
         let session_id = session_store::new_session_id();
         let manifest = manifest::WorkerManifest::from_toml(&format!(
@@ -2880,7 +2887,10 @@ mod tests {
             )
             .unwrap();
 
-        let run_dir = runtime_store_dir.join("workers/1/runs/2");
+        let run_dir = runtime_store_dir
+            .join("workers")
+            .join(worker_ref.worker_id.to_string())
+            .join("runs/2");
         let socket_path = run_dir.join("worker.sock");
         assert!(
             socket_path.as_os_str().as_encoded_bytes().len() > 107,
@@ -2926,6 +2936,7 @@ mod tests {
         let runtime_store_dir = root.path().join(long_component);
         let runtime_options = crate::fs_store::FsRuntimeStoreOptions {
             root: runtime_store_dir.clone(),
+            runtime_id: "test-runtime".to_string(),
             display_name: Some("embedded".to_string()),
         };
 
@@ -2946,7 +2957,10 @@ mod tests {
         let mut request = create_request("embedded singleton");
         request.profile = ProfileSelector::Builtin("default".to_string());
         let worker = runtime.create_worker(request).unwrap();
-        let first_run_socket = runtime_store_dir.join("workers/1/runs/1/worker.sock");
+        let first_run_socket = runtime_store_dir
+            .join("workers")
+            .join(worker.worker_id.to_string())
+            .join("runs/1/worker.sock");
         assert!(
             first_run_socket.as_os_str().as_encoded_bytes().len() > 107,
             "test path must exceed Linux sockaddr_un.sun_path capacity: {}",
@@ -2998,7 +3012,10 @@ mod tests {
             diagnostic.code == "worker_execution_restore_failed"
                 && diagnostic.worker_ref.as_ref() == Some(&worker.worker_ref)
         }));
-        let restored_run = runtime_store_dir.join("workers/1/runs/2");
+        let restored_run = runtime_store_dir
+            .join("workers")
+            .join(worker.worker_id.to_string())
+            .join("runs/2");
         assert!(!restored_run.join("worker.sock").exists());
         assert!(restored_run.join("worker.out.log").is_file());
         assert!(restored_run.join("worker.err.log").is_file());

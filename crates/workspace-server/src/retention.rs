@@ -285,7 +285,7 @@ impl SqliteWorkspaceStore {
             let worker=match load_worker(&tx,&req.workspace_id,&req.worker)? {
                 Some(v)=>v,
                 None=>{
-                    let other:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM worker_registry WHERE runtime_id=?1 AND runtime_worker_id=?2 AND workspace_id!=?3)",params![req.worker.runtime_id,req.worker.worker_id,req.workspace_id],|r|r.get(0))?;
+                    let other:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM worker_registry WHERE runtime_id=?1 AND worker_id=?2 AND workspace_id!=?3)",params![req.worker.runtime_id,req.worker.worker_id,req.workspace_id],|r|r.get(0))?;
                     return Err(StoreError::InvalidInput(if other{"cross-workspace".into()}else{"worker-missing".into()}));
                 }
             };
@@ -366,11 +366,13 @@ impl SqliteWorkspaceStore {
                 plan_id: plan.plan_id.clone(),
                 reason: "Worker disappeared after execution fence".to_string(),
             })?;
-        let worker_number = plan.worker.worker_id.parse::<u64>().map_err(|_| {
-            WorkerRetentionError::Invalid(
-                "Runtime Worker id is not a canonical unsigned integer".to_string(),
-            )
-        })?;
+        let worker_id = plan
+            .worker
+            .worker_id
+            .parse::<worker_runtime::identity::WorkerId>()
+            .map_err(|_| {
+                WorkerRetentionError::Invalid("Worker id must be a canonical UUIDv7".to_string())
+            })?;
         let removed_at = plan.created_at.clone();
         let prior_failure_category = plan.failure_category.clone();
         Ok(PreparedWorkerRemoval {
@@ -380,7 +382,7 @@ impl SqliteWorkspaceStore {
                 archive_id: plan.archive_id.clone(),
                 workspace_id: plan.workspace_id.clone(),
                 source_runtime_id: plan.worker.runtime_id.clone(),
-                worker_id: worker_runtime::identity::WorkerId::new(worker_number),
+                worker_id: worker_id,
                 expected_worker_revision: plan.worker_revision.clone(),
                 expected_run_generation: plan.run_generation,
                 source_created_at: worker.created_at,
@@ -435,11 +437,13 @@ impl SqliteWorkspaceStore {
             return Ok(None);
         };
         let prior_failure_category = plan.failure_category.clone();
-        let worker_number = plan.worker.worker_id.parse::<u64>().map_err(|_| {
-            WorkerRetentionError::Invalid(
-                "Runtime Worker id is not a canonical unsigned integer".to_string(),
-            )
-        })?;
+        let worker_id = plan
+            .worker
+            .worker_id
+            .parse::<worker_runtime::identity::WorkerId>()
+            .map_err(|_| {
+                WorkerRetentionError::Invalid("Worker id must be a canonical UUIDv7".to_string())
+            })?;
         let worker = if plan.state == WorkerRemovalPlanState::Succeeded {
             None
         } else {
@@ -455,7 +459,7 @@ impl SqliteWorkspaceStore {
                 archive_id: plan.archive_id.clone(),
                 workspace_id: plan.workspace_id.clone(),
                 source_runtime_id: plan.worker.runtime_id.clone(),
-                worker_id: worker_runtime::identity::WorkerId::new(worker_number),
+                worker_id: worker_id,
                 expected_worker_revision: plan.worker_revision.clone(),
                 expected_run_generation: plan.run_generation,
                 source_created_at: worker
@@ -544,7 +548,7 @@ impl SqliteWorkspaceStore {
             if plan.metadata_disposition==MetadataDisposition::Tombstone{
                 tx.execute("INSERT OR IGNORE INTO worker_tombstones(workspace_id,runtime_id,worker_id,display_name,profile,worker_created_at,removed_at,archive_id,policy_id,policy_revision,operation_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,worker.display_name,worker.profile,worker.created_at,now,plan.archive_id,plan.policy_id,plan.policy_revision,operation_id])?;
             }
-            let deleted=tx.execute("DELETE FROM worker_registry WHERE workspace_id=?1 AND runtime_id=?2 AND runtime_worker_id=?3 AND updated_at=?4",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,plan.worker_revision])?;
+            let deleted=tx.execute("DELETE FROM worker_registry WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND updated_at=?4",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,plan.worker_revision])?;
             if deleted!=1{return Err(StoreError::InvalidInput(format!("stale:{}:removal fence changed",plan.plan_id)));}
             tx.execute("UPDATE worker_removal_operations SET state='succeeded',failure_category=NULL,updated_at=?1 WHERE operation_id=?2",params![now,operation_id])?;
             tx.execute("INSERT OR IGNORE INTO worker_retention_audit_events(event_id,operation_id,workspace_id,event_kind,detail,created_at) VALUES(?1,?2,?3,'worker_removed',?4,?5)",params![stable("wre",operation_id),operation_id,workspace_id,format!("runtime_id={} worker_id={} session={} metadata={} diagnostics={}",plan.worker.runtime_id,plan.worker.worker_id,sess(plan.session_disposition),meta(plan.metadata_disposition),diag(plan.diagnostics_disposition)),now])?;
@@ -593,7 +597,7 @@ impl SqliteWorkspaceStore {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let policy_configured = load_policy(&tx, workspace_id)?.is_some();
             let mut statement = tx.prepare(
-                "SELECT CAST(runtime_worker_id AS TEXT), retention_state
+                "SELECT CAST(worker_id AS TEXT), retention_state
                  FROM worker_registry WHERE workspace_id=?1 AND runtime_id=?2",
             )?;
             let registry = statement
@@ -718,7 +722,7 @@ struct WorkerRow {
     updated_at: String,
 }
 fn load_worker(c: &Connection, w: &str, r: &RuntimeWorkerRef) -> crate::Result<Option<WorkerRow>> {
-    c.query_row("SELECT display_name,profile,retention_state,created_at,updated_at FROM worker_registry WHERE workspace_id=?1 AND runtime_id=?2 AND runtime_worker_id=?3",params![w,r.runtime_id,r.worker_id],|x|Ok(WorkerRow{display_name:x.get(0)?,profile:x.get(1)?,retention_state:x.get(2)?,created_at:x.get(3)?,updated_at:x.get(4)?})).optional().map_err(StoreError::from)
+    c.query_row("SELECT display_name,profile,retention_state,created_at,updated_at FROM worker_registry WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",params![w,r.runtime_id,r.worker_id],|x|Ok(WorkerRow{display_name:x.get(0)?,profile:x.get(1)?,retention_state:x.get(2)?,created_at:x.get(3)?,updated_at:x.get(4)?})).optional().map_err(StoreError::from)
 }
 fn load_policy(c: &Connection, w: &str) -> crate::Result<Option<WorkerRetentionPolicy>> {
     c.query_row(
@@ -1042,16 +1046,33 @@ mod tests {
     use super::*;
     use crate::store::{ControlPlaneStore, TicketWorkerAssignmentRecord, WorkerRegistryRecord};
     use worker_runtime::identity::WorkerId;
+    fn worker_id() -> WorkerId {
+        WorkerId::from_legacy_u64(1)
+    }
     fn setup() -> SqliteWorkspaceStore {
         let s = SqliteWorkspaceStore::in_memory().unwrap();
-        s.with_conn(|c|{c.execute("INSERT INTO workspaces(workspace_id,display_name,state,created_at,updated_at)VALUES('w','W','active','t','t')",[])?;c.execute("INSERT INTO worker_registry(workspace_id,runtime_id,runtime_worker_id,display_name,profile,retention_state,created_at,updated_at)VALUES('w','r',1,'one','builtin:coder','normal','created','rev1')",[])?;Ok(())}).unwrap();
+        s.with_conn(|c| {
+            c.execute(
+                "INSERT INTO workspaces(workspace_id,display_name,state,created_at,updated_at) \
+                 VALUES('w','W','active','t','t')",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO worker_registry(\
+                    workspace_id,worker_id,runtime_id,display_name,profile,retention_state,created_at,updated_at\
+                 ) VALUES('w',?1,'r','one','builtin:coder','normal','created','rev1')",
+                [worker_id().to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
         s
     }
     fn inv() -> WorkerRetentionInventory {
         WorkerRetentionInventory {
             workspace_id: "w".into(),
             runtime_id: "r".into(),
-            worker_id: WorkerId::new(1),
+            worker_id: worker_id(),
             run_generation: 2,
             session_id: Some("s".into()),
             segment_ids: vec!["a".into()],
@@ -1064,7 +1085,7 @@ mod tests {
             workspace_id: "w".into(),
             worker: RuntimeWorkerRef {
                 runtime_id: "r".into(),
-                worker_id: "1".into(),
+                worker_id: worker_id().to_string(),
             },
             expected_worker_revision: "rev1".into(),
             reason: "cleanup".into(),
@@ -1213,7 +1234,10 @@ mod tests {
             SessionDisposition::Archive
         );
         assert_eq!(prepared.runtime_request.policy_revision, 1);
-        assert_eq!(prepared.runtime_request.worker_id, WorkerId::new(1));
+        assert_eq!(
+            prepared.runtime_request.worker_id,
+            WorkerId::from_legacy_u64(1)
+        );
         let retry = s
             .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
             .unwrap();
@@ -1234,7 +1258,7 @@ mod tests {
             operation_id: p.operation_id.clone(),
             input_fingerprint: p.input_fingerprint.clone(),
             expected_worker_revision: p.worker_revision.clone(),
-            worker_id: WorkerId::new(1),
+            worker_id: worker_id(),
             session_disposition: p.session_disposition,
             diagnostics_disposition: p.diagnostics_disposition,
             archive: Some(worker_runtime::retention::WorkerSessionArchiveManifest {
@@ -1242,7 +1266,7 @@ mod tests {
                 archive_id: p.archive_id.clone().unwrap(),
                 workspace_id: "w".into(),
                 source_runtime_id: "r".into(),
-                source_worker_id: WorkerId::new(1),
+                source_worker_id: worker_id(),
                 source_session_id: "s".into(),
                 segment_ids: vec!["a".into()],
                 source_created_at: "created".into(),
@@ -1284,7 +1308,23 @@ mod tests {
     #[test]
     fn assignment_and_orphan_are_authoritative() {
         let s = setup();
-        s.with_conn(|c|{c.execute("INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,runtime_id,worker_id,assigned_by,assigned_at)VALUES('w','ticket','assignment','r','1','test','t')",[])?;c.execute("INSERT INTO ticket_current_worker_assignments(workspace_id,ticket_id,assignment_id,runtime_id,worker_id,updated_at)VALUES('w','ticket','assignment','r','1','t')",[])?;Ok(())}).unwrap();
+        s.with_conn(|c| {
+            let stable_worker_id = worker_id().to_string();
+            c.execute(
+                "INSERT INTO ticket_worker_assignments(\
+                    workspace_id,ticket_id,assignment_id,runtime_id,worker_id,assigned_by,assigned_at\
+                 ) VALUES('w','ticket','assignment','r',?1,'test','t')",
+                [&stable_worker_id],
+            )?;
+            c.execute(
+                "INSERT INTO ticket_current_worker_assignments(\
+                    workspace_id,ticket_id,assignment_id,runtime_id,worker_id,updated_at\
+                 ) VALUES('w','ticket','assignment','r',?1,'t')",
+                [&stable_worker_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
         let p = s.plan_worker_removal(&req(), &inv()).unwrap();
         assert!(
             matches!(&p.blockers[..],[WorkerRemovalBlocker::CurrentAssignment{assignment_id,ticket_id}] if assignment_id=="assignment"&&ticket_id=="ticket")
@@ -1292,7 +1332,7 @@ mod tests {
         let runtime_only = WorkerRetentionInventory {
             workspace_id: "w".into(),
             runtime_id: "r".into(),
-            worker_id: WorkerId::new(2),
+            worker_id: WorkerId::from_legacy_u64(2),
             run_generation: 1,
             session_id: Some("orphan-session".into()),
             segment_ids: vec![],
@@ -1304,10 +1344,12 @@ mod tests {
             .unwrap();
         assert_eq!(diagnostics.len(), 2);
         assert!(diagnostics.iter().any(|item| {
-            item.worker_id == "2" && item.category == "runtime_aggregate_without_backend_registry"
+            item.worker_id == WorkerId::from_legacy_u64(2).to_string()
+                && item.category == "runtime_aggregate_without_backend_registry"
         }));
         assert!(diagnostics.iter().any(|item| {
-            item.worker_id == "1" && item.category == "backend_registry_without_runtime_aggregate"
+            item.worker_id == worker_id().to_string()
+                && item.category == "backend_registry_without_runtime_aggregate"
         }));
         let count: i64 = s
             .with_conn(|conn| {
@@ -1375,7 +1417,7 @@ mod tests {
             operation_id: p.operation_id.clone(),
             input_fingerprint: p.input_fingerprint.clone(),
             expected_worker_revision: p.worker_revision.clone(),
-            worker_id: WorkerId::new(1),
+            worker_id: worker_id(),
             session_disposition: SessionDisposition::Purge,
             diagnostics_disposition: DiagnosticsDisposition::Purge,
             archive: None,
@@ -1394,7 +1436,7 @@ mod tests {
             operation_id: plan.operation_id.clone(),
             input_fingerprint: plan.input_fingerprint.clone(),
             expected_worker_revision: plan.worker_revision.clone(),
-            worker_id: WorkerId::new(1),
+            worker_id: worker_id(),
             session_disposition: plan.session_disposition,
             diagnostics_disposition: plan.diagnostics_disposition,
             archive: None,
@@ -1408,15 +1450,15 @@ mod tests {
         store
             .begin_worker_removal("w", &plan.plan_id, &plan.input_fingerprint)
             .unwrap();
-        result.worker_id = WorkerId::new(2);
+        result.worker_id = WorkerId::from_legacy_u64(2);
         assert!(
             store
                 .commit_worker_removal("w", &plan.operation_id, &plan.input_fingerprint, &result)
                 .is_err()
         );
         let count: i64 = store.with_conn(|conn| conn.query_row(
-            "SELECT COUNT(*) FROM worker_registry WHERE workspace_id='w' AND runtime_id='r' AND runtime_worker_id=1",
-            [],
+            "SELECT COUNT(*) FROM worker_registry WHERE workspace_id='w' AND runtime_id='r' AND worker_id=?1",
+            [worker_id().to_string()],
             |row| row.get(0),
         ).map_err(StoreError::from)).unwrap();
         assert_eq!(count, 1);
@@ -1433,7 +1475,7 @@ mod tests {
             workspace_id: "w".into(),
             worker: RuntimeWorkerRef {
                 runtime_id: "r".into(),
-                worker_id: "1".into(),
+                worker_id: worker_id().to_string(),
             },
             display_name: "stale".into(),
             profile: None,
@@ -1447,8 +1489,8 @@ mod tests {
         };
         store.upsert_worker_registry(&stale).unwrap();
         let revision: String = store.with_conn(|conn| conn.query_row(
-            "SELECT updated_at FROM worker_registry WHERE workspace_id='w' AND runtime_id='r' AND runtime_worker_id=1",
-            [],
+            "SELECT updated_at FROM worker_registry WHERE workspace_id='w' AND runtime_id='r' AND worker_id=?1",
+            [worker_id().to_string()],
             |row| row.get(0),
         ).map_err(StoreError::from)).unwrap();
         assert_eq!(revision, "rev1");
@@ -1459,7 +1501,7 @@ mod tests {
             assignment_id: "new-assignment".into(),
             worker: RuntimeWorkerRef {
                 runtime_id: "r".into(),
-                worker_id: "1".into(),
+                worker_id: worker_id().to_string(),
             },
             assigned_by: "test".into(),
             assigned_at: "t".into(),
@@ -1488,7 +1530,7 @@ mod tests {
             operation_id: prepared.plan.operation_id.clone(),
             input_fingerprint: prepared.plan.input_fingerprint.clone(),
             expected_worker_revision: prepared.plan.worker_revision.clone(),
-            worker_id: WorkerId::new(1),
+            worker_id: worker_id(),
             session_disposition: prepared.plan.session_disposition,
             diagnostics_disposition: prepared.plan.diagnostics_disposition,
             archive: None,
@@ -1522,7 +1564,7 @@ mod tests {
             operation_id: prepared.plan.operation_id.clone(),
             input_fingerprint: prepared.plan.input_fingerprint.clone(),
             expected_worker_revision: prepared.plan.worker_revision.clone(),
-            worker_id: WorkerId::new(1),
+            worker_id: worker_id(),
             session_disposition: prepared.plan.session_disposition,
             diagnostics_disposition: prepared.plan.diagnostics_disposition,
             archive: Some(worker_runtime::retention::WorkerSessionArchiveManifest {
@@ -1530,7 +1572,7 @@ mod tests {
                 archive_id: prepared.plan.archive_id.clone().unwrap(),
                 workspace_id: "w".into(),
                 source_runtime_id: "r".into(),
-                source_worker_id: WorkerId::new(1),
+                source_worker_id: worker_id(),
                 source_session_id: "s".into(),
                 segment_ids: vec!["a".into()],
                 source_created_at: "created".into(),

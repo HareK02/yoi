@@ -148,10 +148,10 @@ impl std::fmt::Debug for WorkspaceApiRef {
 /// summarized without exposing raw host paths.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateWorkerRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idempotency_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idempotency_fingerprint: Option<String>,
+    /// Workspace-owned stable identity reserved before this request reaches a Runtime.
+    pub worker_id: WorkerId,
+    /// Canonical create-intent fingerprint bound to `worker_id` for retry recovery.
+    pub create_fingerprint: String,
     pub profile: ProfileSelector,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,

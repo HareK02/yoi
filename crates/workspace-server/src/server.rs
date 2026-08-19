@@ -76,11 +76,12 @@ use crate::hosts::{
     EmbeddedWorkerRuntime, HostSummary, RemoteRuntimeConfig, RemoteWorkerRuntime,
     RuntimeDiagnostic, RuntimeRegistry, RuntimeRegistryError, RuntimeRegistryUnregisterResult,
     RuntimeSummary, TicketWorkerRole, WorkerCapabilitySummary, WorkerCompletionsRequest,
-    WorkerCompletionsResult, WorkerControlOperation, WorkerImplementationSummary, WorkerInputKind,
-    WorkerInputRequest, WorkerInputResult, WorkerLifecycleRequest, WorkerLifecycleResult,
-    WorkerOperationState, WorkerRestoreResult, WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent,
-    WorkerSpawnRequest, WorkerSpawnResult, WorkerSpawnWorkingDirectoryRequest, WorkerSummary,
-    WorkerTicketAssignmentRequest, WorkerWorkspaceSummary,
+    WorkerCompletionsResult, WorkerControlOperation, WorkerCreateBinding,
+    WorkerImplementationSummary, WorkerInputKind, WorkerInputRequest, WorkerInputResult,
+    WorkerLifecycleRequest, WorkerLifecycleResult, WorkerOperationState, WorkerRestoreResult,
+    WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult,
+    WorkerSpawnWorkingDirectoryRequest, WorkerSummary, WorkerTicketAssignmentRequest,
+    WorkerWorkspaceSummary, worker_spawn_create_fingerprint,
 };
 use crate::identity::WorkspaceIdentity;
 use crate::memory_backend::execute_memory_backend_operation_with_authority;
@@ -120,7 +121,7 @@ use worker_runtime::http_server::{
     RuntimeHttpConfigBundleAvailabilityResponse, RuntimeHttpConfigBundlesResponse,
     RuntimeHttpSummaryResponse, RuntimeHttpWorkerResponse, RuntimeHttpWorkersResponse,
 };
-use worker_runtime::identity::RuntimeWorkerRef;
+use worker_runtime::identity::{RuntimeWorkerRef, WorkerId};
 
 const EMBEDDED_WORKER_RUNTIME_ID: &str = "embedded-worker-runtime";
 
@@ -887,7 +888,40 @@ impl WorkspaceApi {
                 &now_registry_timestamp(),
             )?;
         }
-        let result = match self.runtime.spawn_worker(runtime_id, request) {
+        let create_fingerprint = worker_spawn_create_fingerprint(&request)
+            .map_err(|message| Error::Config(message.to_string()))?;
+        let allocation_key = request
+            .resolved_control_operation
+            .as_ref()
+            .map(|operation| operation.operation_id.clone())
+            .or_else(|| {
+                request
+                    .ticket_assignment
+                    .as_ref()
+                    .map(|assignment| assignment.operation_id.clone())
+            })
+            .unwrap_or_else(|| format!("manual:{}", WorkerId::now_v7()));
+        let worker_id = self
+            .config_store
+            .reserve_worker_create(
+                &self.config.workspace_id,
+                runtime_id,
+                &allocation_key,
+                &create_fingerprint,
+            )
+            .map_err(|error| Error::RuntimeOperationFailed {
+                runtime_id: runtime_id.to_string(),
+                code: "workspace_worker_allocation_conflict".to_string(),
+                message: error.to_string(),
+            })?;
+        let create_binding = WorkerCreateBinding {
+            worker_id,
+            create_fingerprint,
+        };
+        let result = match self
+            .runtime
+            .spawn_worker(runtime_id, create_binding, request)
+        {
             Ok(result) => result,
             Err(error) => {
                 if let Some((workdir_id, reservation_id)) = attachment_reservation.as_ref() {
@@ -911,6 +945,24 @@ impl WorkspaceApi {
             return Ok(result);
         };
         let worker_ref = worker.worker.clone();
+        if worker_ref.worker_id != worker_id.to_string() {
+            if let Some((workdir_id, reservation_id)) = attachment_reservation.as_ref() {
+                let _ = self.store.release_worker_workdir_attachment_reservation(
+                    &self.config.workspace_id,
+                    workdir_id,
+                    reservation_id,
+                );
+            }
+            return Err(Error::RuntimeOperationFailed {
+                runtime_id: runtime_id.to_string(),
+                code: "workspace_worker_identity_mismatch".to_string(),
+                message: format!(
+                    "Runtime returned Worker {} for reserved Workspace Worker {}",
+                    worker_ref.worker_id, worker_id
+                ),
+            }
+            .into());
+        }
         let replacement = match self
             .runtime
             .replace_worker_workspace_api(&worker_ref, workspace_api)
@@ -1017,6 +1069,9 @@ impl WorkspaceApi {
                 return Err(error);
             }
         }
+        self.config_store
+            .complete_worker_create_reservation(&self.config.workspace_id, worker_id)
+            .map_err(|error| Error::Config(error.to_string()))?;
         Ok(result)
     }
 
@@ -11889,11 +11944,11 @@ fn working_directory_request_for_browser(
     })
 }
 
-fn parse_runtime_worker_id_for_registry(worker_id: &str) -> ApiResult<u64> {
-    worker_id.parse::<u64>().map_err(|_| {
+fn parse_runtime_worker_id_for_registry(worker_id: &str) -> ApiResult<WorkerId> {
+    worker_id.parse::<WorkerId>().map_err(|_| {
         settings_bad_request(
             "workspace_worker_id_invalid",
-            "Runtime Worker id must be an unsigned integer",
+            "Workspace Worker id must be a UUIDv7",
         )
     })
 }
@@ -12419,6 +12474,13 @@ mod tests {
         MemoryDocumentRecord, MemoryStagingRecord, ObjectiveRecord, ObjectiveResourceRecord,
         ObjectiveTicketLinkRecord, SqliteWorkspaceStore, WorkspaceRecord,
     };
+
+    fn test_create_binding() -> WorkerCreateBinding {
+        WorkerCreateBinding {
+            worker_id: WorkerId::now_v7(),
+            create_fingerprint: "sha256:test-create".to_string(),
+        }
+    }
 
     #[test]
     fn reopen_confirmation_rejects_api_token_actor_before_session_resolution() {
@@ -14084,6 +14146,7 @@ mod tests {
             .runtime
             .spawn_worker(
                 EMBEDDED_WORKER_RUNTIME_ID,
+                test_create_binding(),
                 WorkerSpawnRequest {
                     requested_worker_name: Some(MEMORY_CONSOLIDATION_PROFILE.to_string()),
                     intent: WorkerSpawnIntent::WorkspaceOrchestrator,
@@ -14313,6 +14376,7 @@ mod tests {
             .runtime
             .spawn_worker(
                 EMBEDDED_WORKER_RUNTIME_ID,
+                test_create_binding(),
                 WorkerSpawnRequest {
                     requested_worker_name: Some("notification-source".to_string()),
                     intent: WorkerSpawnIntent::TicketRole {
@@ -14533,13 +14597,21 @@ mod tests {
         };
         let source_worker = api
             .runtime
-            .spawn_worker(EMBEDDED_WORKER_RUNTIME_ID, spawn("source-worker"))
+            .spawn_worker(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                test_create_binding(),
+                spawn("source-worker"),
+            )
             .unwrap()
             .worker
             .unwrap();
         let recipient_worker = api
             .runtime
-            .spawn_worker(EMBEDDED_WORKER_RUNTIME_ID, spawn("recipient-worker"))
+            .spawn_worker(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                test_create_binding(),
+                spawn("recipient-worker"),
+            )
             .unwrap()
             .worker
             .unwrap();
@@ -14727,6 +14799,7 @@ mod tests {
             .runtime
             .spawn_worker(
                 EMBEDDED_WORKER_RUNTIME_ID,
+                test_create_binding(),
                 WorkerSpawnRequest {
                     requested_worker_name: Some("orchestrator-source".to_string()),
                     intent: WorkerSpawnIntent::TicketRole {
@@ -15037,9 +15110,25 @@ mod tests {
                 TEST_CREATED_AT,
             )
             .unwrap();
+        let reserved_worker_id = api
+            .config_store
+            .reserve_worker_create(
+                TEST_WORKSPACE_ID,
+                EMBEDDED_WORKER_RUNTIME_ID,
+                "pending-spawn-operation",
+                &pending_fingerprint,
+            )
+            .unwrap();
         let spawned_before_backend_failure = api
             .runtime
-            .spawn_worker(EMBEDDED_WORKER_RUNTIME_ID, pending_request.clone())
+            .spawn_worker(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                WorkerCreateBinding {
+                    worker_id: reserved_worker_id,
+                    create_fingerprint: pending_fingerprint.clone(),
+                },
+                pending_request.clone(),
+            )
             .unwrap()
             .worker
             .unwrap();
@@ -16632,8 +16721,8 @@ mod tests {
     fn runtime_create_request() -> worker_runtime::catalog::CreateWorkerRequest {
         let bundle = runtime_test_bundle();
         worker_runtime::catalog::CreateWorkerRequest {
-            idempotency_key: None,
-            idempotency_fingerprint: None,
+            worker_id: WorkerId::now_v7(),
+            create_fingerprint: "test-create".to_string(),
             profile: worker_runtime::catalog::ProfileSelector::Builtin(
                 "builtin:companion".to_string(),
             ),
@@ -17847,6 +17936,7 @@ mod tests {
             .runtime
             .spawn_worker(
                 "embedded-worker-runtime",
+                test_create_binding(),
                 WorkerSpawnRequest {
                     intent: WorkerSpawnIntent::TicketRole {
                         ticket_id: "00001KVZSGT0Q".to_string(),

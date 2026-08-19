@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use worker_runtime::identity::RuntimeWorkerRef;
+use worker_runtime::identity::{RuntimeWorkerRef, WorkerId};
 
 use crate::{Error, Result};
 
@@ -200,6 +200,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 36,
         name: "add Objective query indexes",
         apply: add_objective_query_indexes,
+    },
+    Migration {
+        version: 37,
+        name: "promote Workspace Worker UUIDv7 identity",
+        apply: promote_workspace_worker_uuid_identity,
     },
 ];
 
@@ -966,6 +971,95 @@ impl SqliteWorkspaceStore {
             .lock()
             .map_err(|_| Error::Store("sqlite connection lock poisoned".to_string()))?;
         f(&mut conn)
+    }
+
+    pub(crate) fn reserve_worker_create(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        allocation_key: &str,
+        create_fingerprint: &str,
+    ) -> Result<WorkerId> {
+        if allocation_key.trim().is_empty() || create_fingerprint.trim().is_empty() {
+            return Err(Error::InvalidInput(
+                "Worker create allocation key and fingerprint must be non-empty".to_string(),
+            ));
+        }
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let existing = tx
+                .query_row(
+                    "SELECT worker_id, runtime_id, create_fingerprint \
+                     FROM worker_create_reservations \
+                     WHERE workspace_id = ?1 AND allocation_key = ?2",
+                    params![workspace_id, allocation_key],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some((worker_id, reserved_runtime_id, reserved_fingerprint)) = existing {
+                if reserved_runtime_id != runtime_id || reserved_fingerprint != create_fingerprint {
+                    return Err(Error::InvalidInput(format!(
+                        "Worker create allocation `{allocation_key}` was already used with different input"
+                    )));
+                }
+                return worker_id.parse::<WorkerId>().map_err(|_| {
+                    Error::Store(format!(
+                        "Worker create allocation `{allocation_key}` has a non-UUIDv7 worker id"
+                    ))
+                });
+            }
+
+            let worker_id = WorkerId::now_v7();
+            let now = chrono::Utc::now().to_rfc3339();
+            tx.execute(
+                "INSERT INTO worker_create_reservations(\
+                    workspace_id, allocation_key, worker_id, runtime_id, create_fingerprint,\
+                    state, created_at, updated_at\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?6)",
+                params![
+                    workspace_id,
+                    allocation_key,
+                    worker_id.to_string(),
+                    runtime_id,
+                    create_fingerprint,
+                    now
+                ],
+            )?;
+            tx.commit()?;
+            Ok(worker_id)
+        })
+    }
+
+    pub(crate) fn complete_worker_create_reservation(
+        &self,
+        workspace_id: &str,
+        worker_id: WorkerId,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "UPDATE worker_create_reservations \
+                 SET state = 'created', updated_at = ?3 \
+                 WHERE workspace_id = ?1 AND worker_id = ?2",
+                params![
+                    workspace_id,
+                    worker_id.to_string(),
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )?;
+            if changed != 1 {
+                return Err(Error::Store(format!(
+                    "Worker create reservation {} was not found",
+                    worker_id
+                )));
+            }
+            Ok(())
+        })
     }
 
     fn materialize_workspace_config(&self, workspace_id: &str, created_at: &str) -> Result<()> {
@@ -2276,7 +2370,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 "SELECT EXISTS(
                     SELECT 1 FROM worker_removal_operations
                     WHERE workspace_id = ?1 AND runtime_id = ?2
-                      AND CAST(worker_id AS INTEGER) = ?3
+                      AND worker_id = ?3
                       AND state IN ('executing', 'failed', 'succeeded')
                 )",
                 params![
@@ -2291,11 +2385,12 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             }
             conn.execute(
                 r#"INSERT INTO worker_registry (
-                    workspace_id, runtime_id, runtime_worker_id, display_name, profile,
+                    workspace_id, runtime_id, worker_id, display_name, profile,
                     retention_state, transcript_ref, session_ref, summary_ref,
                     diagnostics_ref, created_at, updated_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                ON CONFLICT(workspace_id, runtime_id, runtime_worker_id) DO UPDATE SET
+                ON CONFLICT(workspace_id, worker_id) DO UPDATE SET
+                    runtime_id = excluded.runtime_id,
                     display_name = excluded.display_name,
                     profile = excluded.profile,
                     retention_state = CASE
@@ -2312,7 +2407,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     SELECT 1 FROM worker_removal_operations retention
                     WHERE retention.workspace_id = excluded.workspace_id
                       AND retention.runtime_id = excluded.runtime_id
-                      AND CAST(retention.worker_id AS INTEGER) = excluded.runtime_worker_id
+                      AND retention.worker_id = excluded.worker_id
                       AND retention.state IN ('executing', 'failed', 'succeeded')
                 )"#,
                 params![
@@ -2342,7 +2437,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_conn(|conn| {
             conn.query_row(
                 worker_registry_select_sql(
-                    "WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3",
+                    "WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
                 )
                 .as_str(),
                 params![workspace_id, worker.runtime_id, worker.worker_id],
@@ -2383,11 +2478,11 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let changed = conn.execute(
                 r#"UPDATE worker_registry
                    SET retention_state = ?4, updated_at = ?5
-                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3
+                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
                      AND NOT EXISTS (
                        SELECT 1 FROM worker_removal_operations retention
                        WHERE retention.workspace_id = ?1 AND retention.runtime_id = ?2
-                         AND CAST(retention.worker_id AS INTEGER) = ?3
+                         AND retention.worker_id = ?3
                          AND retention.state IN ('executing', 'failed')
                      )"#,
                 params![
@@ -2412,11 +2507,11 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             tx.execute(
                 r#"UPDATE worker_workdir_links
                    SET unlinked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3 AND unlinked_at IS NULL"#,
+                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3 AND unlinked_at IS NULL"#,
                 params![workspace_id, worker.runtime_id, worker.worker_id],
             )?;
             let changed = tx.execute(
-                "DELETE FROM worker_registry WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3",
+                "DELETE FROM worker_registry WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
                 params![workspace_id, worker.runtime_id, worker.worker_id],
             )?;
             tx.commit()?;
@@ -2440,7 +2535,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                 ON CONFLICT (
                     workspace_id,
-                    controller_runtime_id,
                     controller_worker_id,
                     operation_id
                 ) DO NOTHING"#,
@@ -3281,9 +3375,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             }
             tx.execute(
                 r#"INSERT INTO worker_workdir_links (
-                    workspace_id, runtime_id, runtime_worker_id, workdir_id, role, linked_at, unlinked_at
+                    workspace_id, runtime_id, worker_id, workdir_id, role, linked_at, unlinked_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
-                ON CONFLICT(workspace_id, runtime_id, runtime_worker_id, workdir_id, role) DO UPDATE SET
+                ON CONFLICT(workspace_id, worker_id, workdir_id, role) DO UPDATE SET
                     linked_at = excluded.linked_at,
                     unlinked_at = NULL"#,
                 params![
@@ -3365,9 +3459,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             }
             let active_for_worker = tx
                 .query_row(
-                    r#"SELECT workspace_id, runtime_id, runtime_worker_id, workdir_id, role, linked_at, unlinked_at
+                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, role, linked_at, unlinked_at
                        FROM worker_workdir_links
-                       WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3 AND unlinked_at IS NULL"#,
+                       WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3 AND unlinked_at IS NULL"#,
                     params![
                         record.workspace_id,
                         record.worker.runtime_id,
@@ -3388,7 +3482,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             }
             let active_for_workdir = tx
                 .query_row(
-                    r#"SELECT workspace_id, runtime_id, runtime_worker_id, workdir_id, role, linked_at, unlinked_at
+                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, role, linked_at, unlinked_at
                        FROM worker_workdir_links
                        WHERE workspace_id = ?1 AND workdir_id = ?2 AND unlinked_at IS NULL"#,
                     params![record.workspace_id, record.workdir_id],
@@ -3403,9 +3497,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             }
             let write = tx.execute(
                 r#"INSERT INTO worker_workdir_links (
-                    workspace_id, runtime_id, runtime_worker_id, workdir_id, role, linked_at, unlinked_at
+                    workspace_id, runtime_id, worker_id, workdir_id, role, linked_at, unlinked_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
-                ON CONFLICT(workspace_id, runtime_id, runtime_worker_id, workdir_id, role) DO UPDATE SET
+                ON CONFLICT(workspace_id, worker_id, workdir_id, role) DO UPDATE SET
                     linked_at = excluded.linked_at,
                     unlinked_at = NULL"#,
                 params![
@@ -3445,9 +3539,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )?;
             let active = tx
                 .query_row(
-                    r#"SELECT workspace_id, runtime_id, runtime_worker_id, workdir_id, role, linked_at, unlinked_at
+                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, role, linked_at, unlinked_at
                        FROM worker_workdir_links
-                       WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3 AND unlinked_at IS NULL"#,
+                       WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3 AND unlinked_at IS NULL"#,
                     params![workspace_id, worker.runtime_id, worker.worker_id],
                     read_worker_workdir_link_record,
                 )
@@ -3467,7 +3561,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let changed = tx.execute(
                 r#"UPDATE worker_workdir_links
                    SET unlinked_at = ?4
-                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3 AND unlinked_at IS NULL"#,
+                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3 AND unlinked_at IS NULL"#,
                 params![workspace_id, worker.runtime_id, worker.worker_id, unlinked_at],
             )?;
             if changed != 1 {
@@ -3493,7 +3587,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let exists = conn.query_row(
                 r#"SELECT EXISTS(
                     SELECT 1 FROM worker_workdir_links
-                    WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3
+                    WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
                 )"#,
                 params![workspace_id, worker.runtime_id, worker.worker_id],
                 |row| row.get(0),
@@ -3509,9 +3603,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<Vec<WorkerWorkdirLinkRecord>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                r#"SELECT workspace_id, runtime_id, runtime_worker_id, workdir_id, role, linked_at, unlinked_at
+                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, role, linked_at, unlinked_at
                    FROM worker_workdir_links
-                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3 AND unlinked_at IS NULL
+                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3 AND unlinked_at IS NULL
                    ORDER BY linked_at DESC"#,
             )?;
             let rows = stmt.query_map(
@@ -3530,7 +3624,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<Vec<WorkerWorkdirLinkRecord>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                r#"SELECT workspace_id, runtime_id, runtime_worker_id, workdir_id, role, linked_at, unlinked_at
+                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, role, linked_at, unlinked_at
                    FROM worker_workdir_links
                    WHERE workspace_id = ?1 AND workdir_id = ?2 AND unlinked_at IS NULL
                    ORDER BY linked_at DESC"#,
@@ -3797,7 +3891,7 @@ fn read_worker_workdir_link_record(
 ) -> rusqlite::Result<WorkerWorkdirLinkRecord> {
     Ok(WorkerWorkdirLinkRecord {
         workspace_id: row.get(0)?,
-        worker: RuntimeWorkerRef::new(row.get::<_, String>(1)?, row.get::<_, u64>(2)?.to_string()),
+        worker: RuntimeWorkerRef::new(row.get::<_, String>(1)?, row.get::<_, String>(2)?),
         workdir_id: row.get(3)?,
         role: row.get(4)?,
         linked_at: row.get(5)?,
@@ -3880,7 +3974,7 @@ fn read_memory_staging_resolution_record(
 
 fn worker_registry_select_sql(where_clause: &str) -> String {
     format!(
-        "SELECT workspace_id, runtime_id, runtime_worker_id, display_name, profile, \
+        "SELECT workspace_id, runtime_id, worker_id, display_name, profile, \
          retention_state, transcript_ref, session_ref, summary_ref, diagnostics_ref, \
          created_at, updated_at FROM worker_registry {where_clause}"
     )
@@ -3889,7 +3983,7 @@ fn worker_registry_select_sql(where_clause: &str) -> String {
 fn read_worker_registry_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerRegistryRecord> {
     Ok(WorkerRegistryRecord {
         workspace_id: row.get(0)?,
-        worker: RuntimeWorkerRef::new(row.get::<_, String>(1)?, row.get::<_, u64>(2)?.to_string()),
+        worker: RuntimeWorkerRef::new(row.get::<_, String>(1)?, row.get::<_, String>(2)?),
         display_name: row.get(3)?,
         profile: row.get(4)?,
         retention_state: row.get(5)?,
@@ -3912,11 +4006,8 @@ fn read_worker_control_grant_record(
     Ok(WorkerControlGrantRecord {
         workspace_id: row.get(0)?,
         grant_id: row.get(1)?,
-        controller: RuntimeWorkerRef::new(
-            row.get::<_, String>(2)?,
-            row.get::<_, u64>(3)?.to_string(),
-        ),
-        subject: RuntimeWorkerRef::new(row.get::<_, String>(4)?, row.get::<_, u64>(5)?.to_string()),
+        controller: RuntimeWorkerRef::new(row.get::<_, String>(2)?, row.get::<_, String>(3)?),
+        subject: RuntimeWorkerRef::new(row.get::<_, String>(4)?, row.get::<_, String>(5)?),
         relation: row.get(6)?,
         origin: row.get(7)?,
         permissions,
@@ -5069,6 +5160,201 @@ fn add_objective_query_indexes(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn promote_workspace_worker_uuid_identity(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        PRAGMA defer_foreign_keys = ON;
+        CREATE TEMP TABLE worker_identity_v37 (
+            workspace_id TEXT NOT NULL,
+            runtime_id TEXT NOT NULL,
+            runtime_worker_id INTEGER NOT NULL,
+            worker_id TEXT NOT NULL UNIQUE,
+            PRIMARY KEY (workspace_id, runtime_id, runtime_worker_id)
+        );
+        "#,
+    )?;
+
+    let legacy_workers = {
+        let mut statement = conn.prepare(
+            "SELECT workspace_id, runtime_id, runtime_worker_id FROM worker_registry \
+             ORDER BY workspace_id, runtime_id, runtime_worker_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (workspace_id, runtime_id, runtime_worker_id) in legacy_workers {
+        conn.execute(
+            "INSERT INTO worker_identity_v37(\
+                workspace_id, runtime_id, runtime_worker_id, worker_id\
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                workspace_id,
+                runtime_id,
+                runtime_worker_id,
+                WorkerId::from_legacy_binding(
+                    &workspace_id,
+                    &runtime_id,
+                    u64::try_from(runtime_worker_id).map_err(|_| {
+                        Error::InvalidInput(format!(
+                            "legacy Runtime Worker id {runtime_worker_id} is negative"
+                        ))
+                    })?,
+                )
+                .to_string()
+            ],
+        )?;
+    }
+
+    conn.execute_batch(
+        r#"
+        CREATE TABLE worker_registry_v37 (
+            workspace_id TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            runtime_id TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            profile TEXT,
+            retention_state TEXT NOT NULL CHECK (retention_state IN ('normal', 'pinned')),
+            transcript_ref TEXT,
+            session_ref TEXT,
+            summary_ref TEXT,
+            diagnostics_ref TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (workspace_id, worker_id),
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+        );
+        INSERT INTO worker_registry_v37(
+            workspace_id, worker_id, runtime_id, display_name, profile,
+            retention_state, transcript_ref, session_ref, summary_ref,
+            diagnostics_ref, created_at, updated_at
+        )
+        SELECT r.workspace_id, m.worker_id, r.runtime_id, r.display_name, r.profile,
+               r.retention_state, r.transcript_ref, r.session_ref, r.summary_ref,
+               r.diagnostics_ref, r.created_at, r.updated_at
+        FROM worker_registry r
+        JOIN worker_identity_v37 m
+          ON m.workspace_id = r.workspace_id
+         AND m.runtime_id = r.runtime_id
+         AND m.runtime_worker_id = r.runtime_worker_id;
+
+        CREATE TABLE worker_workdir_links_v37 (
+            workspace_id TEXT NOT NULL,
+            runtime_id TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            workdir_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            linked_at TEXT NOT NULL,
+            unlinked_at TEXT,
+            PRIMARY KEY (workspace_id, worker_id, workdir_id, role),
+            FOREIGN KEY (workspace_id, worker_id)
+                REFERENCES worker_registry_v37(workspace_id, worker_id) ON DELETE CASCADE,
+            FOREIGN KEY (workspace_id, workdir_id)
+                REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE
+        );
+        INSERT INTO worker_workdir_links_v37(
+            workspace_id, runtime_id, worker_id, workdir_id, role, linked_at, unlinked_at
+        )
+        SELECT l.workspace_id, l.runtime_id, m.worker_id, l.workdir_id, l.role, l.linked_at, l.unlinked_at
+        FROM worker_workdir_links l
+        JOIN worker_identity_v37 m
+          ON m.workspace_id = l.workspace_id
+         AND m.runtime_id = l.runtime_id
+         AND m.runtime_worker_id = l.runtime_worker_id;
+
+        CREATE TABLE worker_control_grants_v37 (
+            grant_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            controller_runtime_id TEXT NOT NULL,
+            controller_worker_id TEXT NOT NULL,
+            subject_runtime_id TEXT NOT NULL,
+            subject_worker_id TEXT NOT NULL,
+            relation TEXT NOT NULL,
+            origin TEXT NOT NULL,
+            permissions_json TEXT NOT NULL,
+            operation_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            revoked_at TEXT,
+            PRIMARY KEY (workspace_id, grant_id),
+            UNIQUE (workspace_id, controller_worker_id, operation_id),
+            FOREIGN KEY (workspace_id, controller_worker_id)
+                REFERENCES worker_registry_v37(workspace_id, worker_id) ON DELETE CASCADE,
+            FOREIGN KEY (workspace_id, subject_worker_id)
+                REFERENCES worker_registry_v37(workspace_id, worker_id) ON DELETE CASCADE
+        );
+        INSERT INTO worker_control_grants_v37(
+            grant_id, workspace_id,
+            controller_runtime_id, controller_worker_id,
+            subject_runtime_id, subject_worker_id,
+            relation, origin, permissions_json, operation_id,
+            created_at, revoked_at
+        )
+        SELECT g.grant_id, g.workspace_id,
+               g.controller_runtime_id, controller.worker_id,
+               g.subject_runtime_id, subject.worker_id,
+               g.relation, g.origin, g.permissions_json, g.operation_id,
+               g.created_at, g.revoked_at
+        FROM worker_control_grants g
+        JOIN worker_identity_v37 controller
+          ON controller.workspace_id = g.workspace_id
+         AND controller.runtime_id = g.controller_runtime_id
+         AND controller.runtime_worker_id = g.controller_worker_id
+        JOIN worker_identity_v37 subject
+          ON subject.workspace_id = g.workspace_id
+         AND subject.runtime_id = g.subject_runtime_id
+         AND subject.runtime_worker_id = g.subject_worker_id;
+
+        DROP TABLE worker_control_grants;
+        DROP TABLE worker_workdir_links;
+        DROP TABLE worker_registry;
+        ALTER TABLE worker_registry_v37 RENAME TO worker_registry;
+        ALTER TABLE worker_workdir_links_v37 RENAME TO worker_workdir_links;
+        ALTER TABLE worker_control_grants_v37 RENAME TO worker_control_grants;
+        CREATE INDEX worker_registry_runtime
+            ON worker_registry(workspace_id, runtime_id, worker_id);
+        CREATE INDEX worker_workdir_links_workdir
+            ON worker_workdir_links(workspace_id, workdir_id);
+        CREATE UNIQUE INDEX worker_workdir_links_active_worker_unique
+            ON worker_workdir_links(workspace_id, worker_id)
+            WHERE unlinked_at IS NULL;
+        CREATE UNIQUE INDEX worker_workdir_links_active_workdir_unique
+            ON worker_workdir_links(workspace_id, workdir_id)
+            WHERE unlinked_at IS NULL;
+        CREATE INDEX worker_control_grants_controller
+            ON worker_control_grants(
+                workspace_id, controller_worker_id, revoked_at
+            );
+        CREATE INDEX worker_control_grants_subject
+            ON worker_control_grants(
+                workspace_id, subject_worker_id, revoked_at
+            );
+        CREATE TABLE worker_create_reservations (
+            workspace_id TEXT NOT NULL,
+            allocation_key TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            runtime_id TEXT NOT NULL,
+            create_fingerprint TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('reserved', 'created')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (workspace_id, allocation_key),
+            UNIQUE (workspace_id, worker_id),
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+        );
+        CREATE INDEX worker_create_reservations_worker
+            ON worker_create_reservations(workspace_id, worker_id);
+        DROP TABLE worker_identity_v37;
+        "#,
+    )?;
+    Ok(())
+}
+
 fn remove_worker_control_delegation_authority(conn: &Connection) -> Result<()> {
     let mut statement =
         conn.prepare("SELECT workspace_id, grant_id, permissions_json FROM worker_control_grants")?;
@@ -5822,8 +6108,53 @@ INSERT INTO worker_control_grants (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 36);
+        assert_eq!(current_schema_version(&conn).unwrap(), 37);
         assert!(!table_exists(&conn, "worker_control_delegation_operations").unwrap());
+        let controller_worker_id: String = conn
+            .query_row(
+                "SELECT worker_id FROM worker_registry WHERE display_name = 'Controller'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            controller_worker_id,
+            WorkerId::from_legacy_binding("workspace-a", "runtime-a", 1).to_string()
+        );
+        let (grant_controller, grant_subject): (String, String) = conn
+            .query_row(
+                "SELECT controller_worker_id, subject_worker_id \
+                 FROM worker_control_grants WHERE grant_id = 'spawned'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(grant_controller, controller_worker_id);
+        assert_eq!(
+            grant_subject,
+            WorkerId::from_legacy_binding("workspace-a", "runtime-a", 2).to_string()
+        );
+        let worker_registry_pk = {
+            let mut statement = conn.prepare("PRAGMA table_info(worker_registry)").unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+                })
+                .unwrap()
+                .filter_map(|row| {
+                    let (name, position) = row.unwrap();
+                    (position > 0).then_some((position, name))
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            worker_registry_pk,
+            vec![
+                (1, "workspace_id".to_string()),
+                (2, "worker_id".to_string())
+            ]
+        );
+
         let (permissions_json, revoked_at): (String, Option<String>) = conn
             .query_row(
                 "SELECT permissions_json, revoked_at FROM worker_control_grants WHERE grant_id = 'spawned'",
@@ -5870,7 +6201,7 @@ INSERT INTO worker_control_grants (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 36);
+        assert_eq!(current_schema_version(&conn).unwrap(), 37);
         assert!(table_exists(&conn, "worker_workdir_attachment_reservations").unwrap());
     }
 
@@ -5903,7 +6234,7 @@ CREATE TABLE flow_events (event_id TEXT PRIMARY KEY);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 36);
+        assert_eq!(current_schema_version(&conn).unwrap(), 37);
         assert!(table_exists(&conn, "flow_sources").unwrap());
         assert!(table_exists(&conn, "flow_source_revisions").unwrap());
         assert!(!table_exists(&conn, "flow_instances").unwrap());
@@ -5970,7 +6301,7 @@ INSERT INTO worker_workdir_attachment_reservations (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 36);
+        assert_eq!(current_schema_version(&conn).unwrap(), 37);
         let repositories_sql: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'repositories'",
@@ -6150,7 +6481,7 @@ INSERT INTO workdir_registry (
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 36);
+        assert_eq!(store.schema_version().await.unwrap(), 37);
         assert!(
             !store
                 .with_conn(|conn| table_exists(conn, "worker_workspace_credentials"))
@@ -6167,11 +6498,62 @@ INSERT INTO workdir_registry (
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 36);
+        assert_eq!(reopened.schema_version().await.unwrap(), 37);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
         );
+    }
+
+    #[tokio::test]
+    async fn worker_create_reservation_allocates_uuid_before_runtime_and_replays_exact_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteWorkspaceStore::open(dir.path().join("server.db")).unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "workspace-a".to_string(),
+                owner_account_id: None,
+                display_name: "Workspace A".to_string(),
+                state: "active".to_string(),
+                created_at: "2026-08-06T00:00:00Z".to_string(),
+                updated_at: "2026-08-06T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let reserved = store
+            .reserve_worker_create("workspace-a", "arcadia", "operation-1", "sha256:one")
+            .unwrap();
+        assert_eq!(
+            reserved.as_uuid().get_version(),
+            Some(uuid::Version::SortRand)
+        );
+        assert_eq!(
+            store
+                .reserve_worker_create("workspace-a", "arcadia", "operation-1", "sha256:one")
+                .unwrap(),
+            reserved
+        );
+        assert!(
+            store
+                .reserve_worker_create("workspace-a", "arcadia", "operation-1", "sha256:different")
+                .is_err()
+        );
+        store
+            .complete_worker_create_reservation("workspace-a", reserved)
+            .unwrap();
+        let state: String = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT state FROM worker_create_reservations \
+                     WHERE workspace_id = 'workspace-a' AND worker_id = ?1",
+                    [reserved.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(Error::from)
+            })
+            .unwrap();
+        assert_eq!(state, "created");
     }
 
     #[tokio::test]
@@ -6528,6 +6910,7 @@ INSERT INTO workdir_registry (
             "artifacts",
             "audit_events",
             "worker_registry",
+            "worker_create_reservations",
             "ticket_worker_assignments",
             "ticket_current_worker_assignments",
             "ticket_worker_assignment_events",
@@ -6607,8 +6990,8 @@ INSERT INTO workdir_registry (
             "worker_registry",
             [
                 "workspace_id",
+                "worker_id",
                 "runtime_id",
-                "runtime_worker_id",
                 "display_name",
                 "profile",
                 "retention_state",
@@ -6714,7 +7097,7 @@ INSERT INTO workdir_registry (
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 36);
+        assert_eq!(store.schema_version().await.unwrap(), 37);
 
         store
             .with_conn(|conn| {
@@ -6903,7 +7286,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 36);
+        assert_eq!(store.schema_version().await.unwrap(), 37);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -6969,7 +7352,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 36);
+        assert_eq!(store.schema_version().await.unwrap(), 37);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -7360,7 +7743,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 36);
+        assert_eq!(store.schema_version().await.unwrap(), 37);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),

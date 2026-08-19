@@ -112,7 +112,14 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
                 .map_err(ProcessError::Runtime)
         }
         RuntimeHttpStoreSelection::Fs { root } => {
-            let mut options = FsRuntimeStoreOptions::new(root.clone());
+            let mut options = FsRuntimeStoreOptions::new(root.clone()).with_runtime_id(
+                config
+                    .http
+                    .auth
+                    .as_ref()
+                    .map(|auth| auth.runtime_id.as_str())
+                    .unwrap_or("local"),
+            );
             options.display_name = config.http.display_name.clone();
             Runtime::with_fs_store_and_execution_backend(options, backend)
                 .map_err(ProcessError::Runtime)

@@ -340,6 +340,14 @@ pub struct WorkerTicketAssignmentRequest {
     pub operation_id: String,
 }
 
+pub(crate) fn worker_spawn_create_fingerprint(
+    request: &WorkerSpawnRequest,
+) -> Result<String, String> {
+    let encoded = serde_json::to_vec(request)
+        .map_err(|error| format!("serialize Worker create input: {error}"))?;
+    Ok(format!("sha256:{}", digest_hex(&encoded, 64)))
+}
+
 pub(crate) fn worker_spawn_idempotency(
     request: &WorkerSpawnRequest,
 ) -> Result<Option<(String, String)>, String> {
@@ -364,6 +372,12 @@ pub(crate) fn worker_spawn_idempotency(
 pub struct WorkerControlOperation {
     pub operation_id: String,
     pub input_fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerCreateBinding {
+    pub worker_id: EmbeddedWorkerId,
+    pub create_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -763,7 +777,11 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         }
     }
 
-    fn spawn_worker(&self, request: WorkerSpawnRequest) -> WorkerSpawnResult {
+    fn spawn_worker(
+        &self,
+        _binding: WorkerCreateBinding,
+        request: WorkerSpawnRequest,
+    ) -> WorkerSpawnResult {
         WorkerSpawnResult {
             state: WorkerOperationState::Unsupported,
             worker: None,
@@ -1226,6 +1244,7 @@ impl RuntimeRegistry {
     pub fn spawn_worker(
         &self,
         runtime_id: &str,
+        binding: WorkerCreateBinding,
         request: WorkerSpawnRequest,
     ) -> Result<WorkerSpawnResult, RuntimeRegistryError> {
         validate_backend_identifier("runtime_id", runtime_id)?;
@@ -1269,7 +1288,7 @@ impl RuntimeRegistry {
                 });
             }
         }
-        Ok(runtime.spawn_worker(request))
+        Ok(runtime.spawn_worker(binding, request))
     }
 
     pub fn create_working_directory(
@@ -1606,6 +1625,7 @@ impl EmbeddedWorkerRuntime {
         let runtime = worker_runtime::Runtime::with_fs_store_and_execution_backend(
             FsRuntimeStoreOptions {
                 root: store_root.into(),
+                runtime_id: EMBEDDED_RUNTIME_ID.to_string(),
                 display_name: Some("embedded".to_string()),
             },
             backend,
@@ -1948,7 +1968,11 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         }
     }
 
-    fn spawn_worker(&self, request: WorkerSpawnRequest) -> WorkerSpawnResult {
+    fn spawn_worker(
+        &self,
+        binding: WorkerCreateBinding,
+        request: WorkerSpawnRequest,
+    ) -> WorkerSpawnResult {
         let mut diagnostics = Vec::new();
         if request.resolved_working_directory_request.is_some()
             || request.resolved_working_directory.is_some()
@@ -1981,7 +2005,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             diagnostics.push(diagnostic(
                 "embedded_worker_name_display_only",
                 DiagnosticSeverity::Info,
-                "requested_worker_name is used only as display_name; embedded Runtime allocates opaque runtime-local worker ids".to_string(),
+                "requested_worker_name is used only as display_name; Worker identity is allocated by Workspace authority".to_string(),
             ));
         }
         if matches!(request.acceptance, WorkerSpawnAcceptanceRequirement::RunAccepted { expected_segments } if expected_segments > 0)
@@ -2010,11 +2034,6 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 };
             }
         };
-        let (idempotency_key, idempotency_fingerprint) = worker_spawn_idempotency(&request)
-            .expect("WorkerSpawnRequest serialization is infallible")
-            .map_or((None, None), |(key, fingerprint)| {
-                (Some(key), Some(fingerprint))
-            });
         let workspace_api = match required_worker_workspace_api(&request) {
             Ok(workspace_api) => workspace_api,
             Err(diagnostic) => {
@@ -2030,8 +2049,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         let workspace_id = workspace_api.workspace_id.clone();
         let config_bundle = spawn_config_bundle_ref(&request);
         let create_request = CreateWorkerRequest {
-            idempotency_key,
-            idempotency_fingerprint,
+            worker_id: binding.worker_id,
+            create_fingerprint: binding.create_fingerprint,
             profile,
             display_name: request.requested_worker_name.clone(),
             config_bundle,
@@ -3113,7 +3132,11 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         }
     }
 
-    fn spawn_worker(&self, request: WorkerSpawnRequest) -> WorkerSpawnResult {
+    fn spawn_worker(
+        &self,
+        binding: WorkerCreateBinding,
+        request: WorkerSpawnRequest,
+    ) -> WorkerSpawnResult {
         if matches!(
             request.acceptance,
             WorkerSpawnAcceptanceRequirement::SocketReady
@@ -3152,11 +3175,6 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 };
             }
         };
-        let (idempotency_key, idempotency_fingerprint) = worker_spawn_idempotency(&request)
-            .expect("WorkerSpawnRequest serialization is infallible")
-            .map_or((None, None), |(key, fingerprint)| {
-                (Some(key), Some(fingerprint))
-            });
         let workspace_api = match required_worker_workspace_api(&request) {
             Ok(workspace_api) => workspace_api,
             Err(diagnostic) => {
@@ -3170,8 +3188,8 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         };
         let config_bundle = spawn_config_bundle_ref(&request);
         let create = CreateWorkerRequest {
-            idempotency_key,
-            idempotency_fingerprint,
+            worker_id: binding.worker_id,
+            create_fingerprint: binding.create_fingerprint,
             profile,
             display_name: request.requested_worker_name.clone(),
             config_bundle,
@@ -4245,6 +4263,13 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
 
+    fn test_create_binding() -> WorkerCreateBinding {
+        WorkerCreateBinding {
+            worker_id: EmbeddedWorkerId::now_v7(),
+            create_fingerprint: "sha256:test-create".to_string(),
+        }
+    }
+
     fn test_workspace_api() -> WorkspaceApiRef {
         WorkspaceApiRef {
             workspace_id: "workspace-test".to_string(),
@@ -4899,11 +4924,16 @@ mod tests {
             digest: bundle.metadata.digest.clone(),
         };
         request.resolved_config_bundle = Some(bundle);
+        let binding = test_create_binding();
 
         let result = registry
-            .spawn_worker("embedded-worker-runtime", request)
+            .spawn_worker("embedded-worker-runtime", binding.clone(), request)
             .expect("spawn request");
         assert_eq!(result.state, WorkerOperationState::Accepted);
+        assert_eq!(
+            result.worker.as_ref().unwrap().worker.worker_id,
+            binding.worker_id.to_string()
+        );
         let check = registry
             .check_config_bundle("embedded-worker-runtime", bundle_ref)
             .expect("bundle check");
@@ -4921,7 +4951,7 @@ mod tests {
         let mut request = embedded_spawn_request();
         request.resolved_workspace_api = None;
 
-        let spawned = runtime.spawn_worker(request);
+        let spawned = runtime.spawn_worker(test_create_binding(), request);
 
         assert_eq!(spawned.state, WorkerOperationState::Rejected);
         assert!(
@@ -4939,7 +4969,7 @@ mod tests {
             Arc::new(FailingSpawnBackend),
         )
         .expect("test backend should connect");
-        let spawned = runtime.spawn_worker(embedded_spawn_request());
+        let spawned = runtime.spawn_worker(test_create_binding(), embedded_spawn_request());
         assert_eq!(spawned.state, WorkerOperationState::Rejected);
         assert!(spawned.acceptance_evidence.is_empty());
         assert!(spawned.diagnostics.iter().any(|diagnostic| {
@@ -5006,7 +5036,7 @@ mod tests {
             Arc::new(AcceptingExecutionBackend::default()),
         )
         .expect("test backend should connect");
-        let spawned = runtime.spawn_worker(embedded_spawn_request());
+        let spawned = runtime.spawn_worker(test_create_binding(), embedded_spawn_request());
         assert_eq!(spawned.state, WorkerOperationState::Accepted);
         let worker = spawned.worker.expect("created embedded worker");
         assert!(worker.capabilities.can_stop);
@@ -5064,6 +5094,7 @@ mod tests {
         let spawned = registry
             .spawn_worker(
                 EMBEDDED_RUNTIME_ID,
+                test_create_binding(),
                 WorkerSpawnRequest {
                     intent: WorkerSpawnIntent::TicketRole {
                         ticket_id: "00001KVZSGT0Q".to_string(),
@@ -5162,6 +5193,7 @@ mod tests {
         let spawned = registry
             .spawn_worker(
                 EMBEDDED_RUNTIME_ID,
+                test_create_binding(),
                 WorkerSpawnRequest {
                     intent: WorkerSpawnIntent::TicketRole {
                         ticket_id: "00001KVZSGT0Q".to_string(),
@@ -5204,6 +5236,7 @@ mod tests {
         let result = registry
             .spawn_worker(
                 EMBEDDED_RUNTIME_ID,
+                test_create_binding(),
                 WorkerSpawnRequest {
                     intent: WorkerSpawnIntent::WorkspaceCompanion,
                     requested_worker_name: None,
@@ -5251,7 +5284,8 @@ mod tests {
 
     #[test]
     fn remote_runtime_registry_routes_commands_without_browser_secret_leaks() {
-        let worker_json = worker_json("remote:primary", "1");
+        let worker_id = EmbeddedWorkerId::from_legacy_u64(1).to_string();
+        let worker_json = worker_json("remote:primary", &worker_id);
         let (base_url, server) = serve_mock_http(vec![
             mock_response(
                 "GET",
@@ -5262,19 +5296,19 @@ mod tests {
             ),
             mock_response(
                 "GET",
-                "/v1/workers/1",
+                format!("/v1/workers/{worker_id}"),
                 true,
                 200,
                 json!({ "worker": worker_json.clone() }).to_string(),
             ),
             mock_response(
                 "POST",
-                "/v1/workers/1/input",
+                format!("/v1/workers/{worker_id}/input"),
                 true,
                 200,
                 json!({
                     "ack": {
-                        "worker_ref": { "runtime_id": "remote:primary", "worker_id": 1 },
+                        "worker_ref": { "runtime_id": "remote:primary", "worker_id": worker_id.clone() },
                         "status": "running"
                     }
                 })
@@ -5298,20 +5332,24 @@ mod tests {
         );
 
         let observation = registry
-            .observation_source(&RuntimeWorkerRef::new("remote:primary", "1"))
+            .observation_source(&RuntimeWorkerRef::new("remote:primary", &worker_id))
             .expect("remote runtime exposes backend-owned WS observation source");
         let crate::observation::RuntimeObservationSource::RemoteWs(observation) = observation
         else {
             panic!("remote runtime should expose a remote WS observation source");
         };
         assert!(observation.endpoint.starts_with("ws://127.0.0.1:"));
-        assert!(observation.endpoint.ends_with("/v1/workers/1/protocol/ws"));
+        assert!(
+            observation
+                .endpoint
+                .ends_with(&format!("/v1/workers/{worker_id}/protocol/ws"))
+        );
         assert_eq!(observation.bearer_token.as_deref(), Some(secret.as_str()));
 
         let workers = registry.list_workers(10);
         assert_eq!(workers.items.len(), 1);
         assert_eq!(workers.items[0].worker.runtime_id, "remote:primary");
-        assert_eq!(workers.items[0].worker.worker_id, "1");
+        assert_eq!(workers.items[0].worker.worker_id, worker_id.as_str());
         assert_eq!(
             workers.items[0].implementation.kind,
             "remote_worker_runtime"
@@ -5324,7 +5362,7 @@ mod tests {
 
         let input = registry
             .send_input(
-                &RuntimeWorkerRef::new("remote:primary", "1"),
+                &RuntimeWorkerRef::new("remote:primary", &worker_id),
                 WorkerInputRequest {
                     kind: WorkerInputKind::User,
                     content: "hello remote".to_string(),
@@ -5350,6 +5388,10 @@ mod tests {
 
     #[test]
     fn remote_runtime_projection_uses_canonical_worker_status_for_stop_capability() {
+        let worker_ids = (1..=4)
+            .map(|value| EmbeddedWorkerId::from_legacy_u64(value).to_string())
+            .collect::<Vec<_>>();
+        let worker_id = worker_ids[0].clone();
         let (base_url, server) = serve_mock_http(vec![
             mock_response(
                 "GET",
@@ -5358,21 +5400,26 @@ mod tests {
                 200,
                 json!({
                     "workers": [
-                    worker_json_with_status("remote:primary", "1", "stopped"),
-                    worker_json_with_status("remote:primary", "2", "cancelled"),
-                    worker_json_with_status("remote:primary", "3", "paused"),
-                    worker_json_with_status("remote:primary", "4", "idle")
+                        worker_json_with_status("remote:primary", &worker_ids[0], "stopped"),
+                        worker_json_with_status("remote:primary", &worker_ids[1], "cancelled"),
+                        worker_json_with_status("remote:primary", &worker_ids[2], "paused"),
+                        worker_json_with_status("remote:primary", &worker_ids[3], "idle")
                     ]
                 })
                 .to_string(),
             ),
             mock_response(
                 "GET",
-                "/v1/workers/1",
+                format!("/v1/workers/{worker_id}"),
                 true,
                 200,
                 json!({
-                    "worker": worker_json_with_status("remote:primary", "1", "stopped")})
+                    "worker": worker_json_with_status(
+                        "remote:primary",
+                        &worker_ids[0],
+                        "stopped"
+                    )
+                })
                 .to_string(),
             ),
         ]);
@@ -5402,7 +5449,7 @@ mod tests {
         assert_eq!(workers.items[3].state, "idle");
 
         let stopped_detail = registry
-            .worker(&RuntimeWorkerRef::new("remote:primary", "1"))
+            .worker(&RuntimeWorkerRef::new("remote:primary", &worker_id))
             .unwrap();
         assert!(!stopped_detail.capabilities.can_stop);
         assert_eq!(stopped_detail.state, "stopped");
@@ -5595,7 +5642,7 @@ mod tests {
     #[derive(Clone)]
     struct MockResponse {
         method: &'static str,
-        path: &'static str,
+        path: String,
         require_auth: bool,
         status: u16,
         body: String,
@@ -5603,14 +5650,14 @@ mod tests {
 
     fn mock_response(
         method: &'static str,
-        path: &'static str,
+        path: impl Into<String>,
         require_auth: bool,
         status: u16,
         body: String,
     ) -> MockResponse {
         MockResponse {
             method,
-            path,
+            path: path.into(),
             require_auth,
             status,
             body,
@@ -5667,7 +5714,6 @@ mod tests {
         worker_id: &str,
         status: &str,
     ) -> serde_json::Value {
-        let worker_id = worker_id.parse::<u64>().unwrap();
         json!({
             "worker_ref": { "runtime_id": runtime_id, "worker_id": worker_id },
             "runtime_id": runtime_id,

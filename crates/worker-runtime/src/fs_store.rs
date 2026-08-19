@@ -11,7 +11,7 @@ use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const RUNTIME_FILE: &str = "runtime.json";
 const WORKERS_DIR: &str = "workers";
 const WORKER_FILE: &str = "worker.json";
@@ -24,6 +24,7 @@ static NEXT_TMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 pub struct FsRuntimeStoreOptions {
     /// Root directory containing this Runtime's store data.
     pub root: PathBuf,
+    pub runtime_id: String,
     pub display_name: Option<String>,
 }
 
@@ -31,14 +32,19 @@ impl FsRuntimeStoreOptions {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
+            runtime_id: "local".to_string(),
             display_name: None,
         }
+    }
+    pub fn with_runtime_id(mut self, runtime_id: impl Into<String>) -> Self {
+        self.runtime_id = runtime_id.into();
+        self
     }
 }
 
 /// Filesystem persistence boundary for one Worker Runtime state.
 ///
-/// Authority is Runtime-local typed Worker identity. Legacy pod paths, socket
+/// Authority is the Workspace-owned typed Worker identity. Legacy pod paths, socket
 /// paths, and session paths are deliberately not part of the layout or lookup API.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FsRuntimeStore {
@@ -54,7 +60,10 @@ impl FsRuntimeStore {
         &self.root
     }
 
-    pub(crate) fn open_or_create(root: PathBuf) -> Result<OpenedFsRuntimeStore, RuntimeError> {
+    pub(crate) fn open_or_create(
+        root: PathBuf,
+        runtime_id: &str,
+    ) -> Result<OpenedFsRuntimeStore, RuntimeError> {
         let existed = root.exists();
         if existed && !root.is_dir() {
             return Err(RuntimeError::StoreCorrupt {
@@ -82,6 +91,9 @@ impl FsRuntimeStore {
             }
         }
 
+        if existed {
+            migrate_v1_worker_identity(&root, runtime_id)?;
+        }
         let store = Self { root };
         let state = if existed {
             Some(store.load_runtime_state()?)
@@ -241,7 +253,6 @@ pub(crate) struct OpenedFsRuntimeStore {
 pub(crate) struct PersistedRuntimeState {
     pub(crate) display_name: Option<String>,
     pub(crate) status: RuntimeStatus,
-    pub(crate) next_worker_sequence: u64,
     pub(crate) next_diagnostic_id: u64,
     pub(crate) workers: BTreeMap<WorkerId, PersistedWorkerRecord>,
     pub(crate) workspace_owners: BTreeMap<String, String>,
@@ -259,13 +270,151 @@ pub(crate) struct PersistedWorkerRecord {
     pub(crate) working_directory: Option<WorkingDirectoryStatus>,
 }
 
+fn runtime_io_error(operation: &'static str, path: &Path, source: std::io::Error) -> RuntimeError {
+    RuntimeError::StoreIo {
+        operation,
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+fn runtime_store_corrupt(path: &Path, message: String) -> RuntimeError {
+    RuntimeError::StoreCorrupt {
+        operation: "migrate Worker identity",
+        path: path.to_path_buf(),
+        message,
+    }
+}
+
+fn migrate_v1_worker_identity(root: &Path, runtime_id: &str) -> Result<(), RuntimeError> {
+    let runtime_path = root.join(RUNTIME_FILE);
+    let bytes =
+        fs::read(&runtime_path).map_err(|error| runtime_io_error("read", &runtime_path, error))?;
+    let mut document: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        runtime_store_corrupt(
+            &runtime_path,
+            format!("decode Runtime state {}: {error}", runtime_path.display()),
+        )
+    })?;
+    let schema_version = document
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            runtime_store_corrupt(
+                &runtime_path,
+                "Runtime state is missing schema_version".to_string(),
+            )
+        })?;
+    if schema_version == u64::from(SCHEMA_VERSION) {
+        return Ok(());
+    }
+    if schema_version != 1 {
+        return Err(runtime_store_corrupt(
+            &runtime_path,
+            format!(
+                "unsupported Runtime store schema version {schema_version}; expected 1 or {SCHEMA_VERSION}"
+            ),
+        ));
+    }
+
+    let legacy_ids = document
+        .get("workers")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            runtime_store_corrupt(
+                &runtime_path,
+                "Runtime state workers must be an array".to_string(),
+            )
+        })?
+        .iter()
+        .map(|value| {
+            value.as_u64().ok_or_else(|| {
+                runtime_store_corrupt(
+                    &runtime_path,
+                    "legacy Worker id must be unsigned".to_string(),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut migrated_ids = Vec::with_capacity(legacy_ids.len());
+    for legacy_id in legacy_ids {
+        let legacy_dir = root.join("workers").join(legacy_id.to_string());
+        let legacy_snapshot_path = legacy_dir.join(WORKER_FILE);
+        let bytes = fs::read(&legacy_snapshot_path)
+            .map_err(|error| runtime_io_error("read", &legacy_snapshot_path, error))?;
+        let mut snapshot: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+            runtime_store_corrupt(
+                &runtime_path,
+                format!(
+                    "decode Worker snapshot {}: {error}",
+                    legacy_snapshot_path.display()
+                ),
+            )
+        })?;
+        let workspace_id = snapshot
+            .get("workspace_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("local")
+            .to_string();
+        let worker_id = WorkerId::from_legacy_binding(&workspace_id, runtime_id, legacy_id);
+        let worker_id_text = worker_id.to_string();
+        snapshot["schema_version"] = serde_json::Value::from(SCHEMA_VERSION);
+        snapshot["worker_id"] = serde_json::Value::String(worker_id_text.clone());
+        snapshot["worker_ref"]["worker_id"] = serde_json::Value::String(worker_id_text.clone());
+        let request = snapshot
+            .get_mut("request")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| {
+                runtime_store_corrupt(
+                    &runtime_path,
+                    "Worker snapshot request must be an object".to_string(),
+                )
+            })?;
+        let fingerprint = request
+            .remove("idempotency_fingerprint")
+            .and_then(|value| value.as_str().map(ToOwned::to_owned))
+            .unwrap_or_else(|| format!("legacy:{workspace_id}:{runtime_id}:{legacy_id}"));
+        request.remove("idempotency_key");
+        request.insert(
+            "worker_id".to_string(),
+            serde_json::Value::String(worker_id_text.clone()),
+        );
+        request.insert(
+            "create_fingerprint".to_string(),
+            serde_json::Value::String(fingerprint),
+        );
+
+        let migrated_dir = root.join("workers").join(&worker_id_text);
+        fs::rename(&legacy_dir, &migrated_dir)
+            .map_err(|error| runtime_io_error("rename", &legacy_dir, error))?;
+        let migrated_snapshot_path = migrated_dir.join(WORKER_FILE);
+        atomic_write_json(
+            &migrated_snapshot_path,
+            &snapshot,
+            "migrate Worker identity",
+        )?;
+        migrated_ids.push(serde_json::Value::String(worker_id_text));
+    }
+
+    document["schema_version"] = serde_json::Value::from(SCHEMA_VERSION);
+    document["workers"] = serde_json::Value::Array(migrated_ids);
+    if let Some(object) = document.as_object_mut() {
+        object.remove("next_worker_sequence");
+    }
+    atomic_write_json(
+        &runtime_path,
+        &document,
+        "migrate Runtime Worker identities",
+    )
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RuntimeSnapshot {
     schema_version: u32,
     display_name: Option<String>,
     backend: RuntimeBackendKind,
     status: RuntimeStatus,
-    next_worker_sequence: u64,
     next_diagnostic_id: u64,
     #[serde(default)]
     config_bundles: BTreeMap<String, ConfigBundle>,
@@ -297,7 +446,6 @@ impl RuntimeSnapshot {
             display_name: state.display_name.clone(),
             backend: RuntimeBackendKind::FsStore,
             status: state.status,
-            next_worker_sequence: state.next_worker_sequence,
             next_diagnostic_id: state.next_diagnostic_id,
             config_bundles: BTreeMap::new(),
             workspace_owners: state.workspace_owners.clone(),
@@ -333,7 +481,6 @@ impl RuntimeSnapshot {
         PersistedRuntimeState {
             display_name: self.display_name,
             status: self.status,
-            next_worker_sequence: self.next_worker_sequence,
             next_diagnostic_id: self.next_diagnostic_id,
             workers,
             workspace_owners: self.workspace_owners,

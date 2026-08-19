@@ -803,7 +803,7 @@ mod tests {
     }
 
     fn worker_ref(sequence: u64) -> WorkerRef {
-        WorkerRef::new(WorkerId::generated(sequence))
+        WorkerRef::new(WorkerId::from_legacy_u64(sequence))
     }
 
     #[test]

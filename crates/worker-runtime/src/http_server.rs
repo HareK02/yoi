@@ -2162,8 +2162,8 @@ mod tests {
         let profile = ProfileSelector::Builtin("builtin:coder".to_string());
         let bundle = test_bundle(profile.clone());
         CreateWorkerRequest {
-            idempotency_key: None,
-            idempotency_fingerprint: None,
+            worker_id: WorkerId::now_v7(),
+            create_fingerprint: "test-create".to_string(),
             profile,
             display_name: None,
             profile_source: crate::catalog::ProfileSourceArchiveSource::Http {
@@ -2659,12 +2659,14 @@ mod tests {
     async fn runtime_errors_use_typed_rest_error_shape() {
         let token = "local-token";
         let app = runtime_http_router(Runtime::new_memory(), token.to_string());
-        let response = authed_empty_request(app, Method::GET, "/v1/workers/999", token).await;
+        let missing = crate::identity::WorkerId::from_legacy_u64(999);
+        let response =
+            authed_empty_request(app, Method::GET, &format!("/v1/workers/{missing}"), token).await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let error: RuntimeHttpErrorResponse = read_json(response).await;
         assert_eq!(error.error.code, "worker_not_found");
-        assert!(error.error.message.contains("999"));
+        assert!(error.error.message.contains(&missing.to_string()));
     }
 
     #[tokio::test]
@@ -2795,8 +2797,8 @@ mod ws_tests {
     fn ws_create_request() -> CreateWorkerRequest {
         let bundle = ws_test_bundle(ProfileSelector::Builtin("builtin:companion".to_string()));
         CreateWorkerRequest {
-            idempotency_key: None,
-            idempotency_fingerprint: None,
+            worker_id: WorkerId::now_v7(),
+            create_fingerprint: "test-create".to_string(),
             profile: ProfileSelector::Builtin("builtin:companion".to_string()),
             display_name: None,
             profile_source: crate::catalog::ProfileSourceArchiveSource::Http {
