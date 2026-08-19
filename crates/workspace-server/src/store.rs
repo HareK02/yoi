@@ -4,11 +4,15 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use flow::{CompiledFlowDefinition, FlowSourceKind, compile_flow_source};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, TransactionBehavior, backup::Backup, params,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use worker_runtime::identity::{RuntimeWorkerRef, WorkerId};
+use worker_runtime::identity::{
+    LegacyWorkerIdentityMapping, RuntimeWorkerRef, WorkerId, legacy_worker_identity_mapping_digest,
+};
 
 use crate::{Error, Result};
 
@@ -204,7 +208,7 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 37,
         name: "promote Workspace Worker UUIDv7 identity",
-        apply: promote_workspace_worker_uuid_identity,
+        apply: apply_workspace_worker_uuid_identity_migration,
     },
     Migration {
         version: 38,
@@ -217,6 +221,17 @@ struct Migration {
     version: i64,
     name: &'static str,
     apply: fn(&Connection) -> Result<()>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkspaceStoreMigrationPlan {
+    pub current_schema_version: i64,
+    pub target_schema_version: i64,
+    pub migration_required: bool,
+    pub worker_count: usize,
+    pub mapping_digest: String,
+    pub mappings: Vec<LegacyWorkerIdentityMapping>,
+    pub repairs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -976,6 +991,66 @@ pub struct SqliteWorkspaceStore {
 }
 
 impl SqliteWorkspaceStore {
+    pub fn migration_plan(path: impl AsRef<Path>) -> Result<WorkspaceStoreMigrationPlan> {
+        let path = path.as_ref();
+        let source = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        let current_schema_version = current_schema_version(&source)?;
+        let target_schema_version = MIGRATIONS
+            .last()
+            .map(|migration| i64::from(migration.version))
+            .unwrap_or(current_schema_version);
+        let mut repairs = Vec::new();
+        if current_schema_version < 37 && !table_exists(&source, "worker_diagnostics_archives")? {
+            repairs.push("create missing worker_diagnostics_archives table".to_string());
+        }
+
+        let mut candidate = Connection::open_in_memory()?;
+        {
+            let backup = Backup::new(&source, &mut candidate)?;
+            backup.run_to_completion(5, Duration::from_millis(10), None)?;
+        }
+        configure_sqlite(&candidate)?;
+        let mappings = if current_schema_version < 37 {
+            apply_migrations_through(&candidate, 36)?;
+            let tx = candidate.unchecked_transaction()?;
+            crate::retention::repair_worker_diagnostics_archive_table(&tx)?;
+            let mappings = promote_workspace_worker_uuid_identity(&tx)?;
+            tx.execute(
+                "INSERT INTO __yoi_schema_migrations (version, name) VALUES (37, ?1)",
+                ["promote Workspace Worker UUIDv7 identity"],
+            )?;
+            tx.commit()?;
+            mappings
+        } else {
+            Vec::new()
+        };
+        apply_migrations_through(&candidate, i64::MAX)?;
+        ticket::migrate_sqlite_ticket_schema(&candidate)?;
+        merge_request::migrate(&candidate).map_err(|error| Error::Store(error.to_string()))?;
+        validate_workspace_repository_references(&candidate)?;
+        let foreign_key_failures: i64 =
+            candidate.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })?;
+        if foreign_key_failures != 0 {
+            return Err(Error::Store(format!(
+                "migration dry-run found {foreign_key_failures} foreign key violation(s)"
+            )));
+        }
+        Ok(WorkspaceStoreMigrationPlan {
+            current_schema_version,
+            target_schema_version,
+            migration_required: current_schema_version < target_schema_version,
+            worker_count: mappings.len(),
+            mapping_digest: legacy_worker_identity_mapping_digest(&mappings),
+            mappings,
+            repairs,
+        })
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
         Self::from_connection(conn)
@@ -5310,7 +5385,13 @@ fn collect_legacy_text_worker_bindings(
     Ok(())
 }
 
-fn promote_workspace_worker_uuid_identity(conn: &Connection) -> Result<()> {
+fn apply_workspace_worker_uuid_identity_migration(conn: &Connection) -> Result<()> {
+    promote_workspace_worker_uuid_identity(conn).map(|_| ())
+}
+
+fn promote_workspace_worker_uuid_identity(
+    conn: &Connection,
+) -> Result<Vec<LegacyWorkerIdentityMapping>> {
     conn.execute_batch(
         r#"
         PRAGMA defer_foreign_keys = ON;
@@ -5367,7 +5448,9 @@ fn promote_workspace_worker_uuid_identity(conn: &Connection) -> Result<()> {
         collect_legacy_text_worker_bindings(conn, table, &mut legacy_workers)?;
     }
 
-    for (workspace_id, runtime_id, runtime_worker_id) in legacy_workers {
+    let mut mappings = Vec::with_capacity(legacy_workers.len());
+    for (workspace_id, runtime_id, runtime_worker_id) in &legacy_workers {
+        let worker_id = WorkerId::from_legacy_binding(workspace_id, runtime_id, *runtime_worker_id);
         conn.execute(
             "INSERT INTO worker_identity_v37(\
                 workspace_id, runtime_id, runtime_worker_id, worker_id\
@@ -5376,10 +5459,15 @@ fn promote_workspace_worker_uuid_identity(conn: &Connection) -> Result<()> {
                 workspace_id,
                 runtime_id,
                 runtime_worker_id,
-                WorkerId::from_legacy_binding(&workspace_id, &runtime_id, runtime_worker_id)
-                    .to_string()
+                worker_id.to_string()
             ],
         )?;
+        mappings.push(LegacyWorkerIdentityMapping {
+            workspace_id: workspace_id.clone(),
+            runtime_id: runtime_id.clone(),
+            legacy_worker_id: *runtime_worker_id,
+            worker_id,
+        });
     }
 
     conn.execute_batch(
@@ -5581,7 +5669,7 @@ fn promote_workspace_worker_uuid_identity(conn: &Connection) -> Result<()> {
         DROP TABLE worker_identity_v37;
         "#,
     )?;
-    Ok(())
+    Ok(mappings)
 }
 
 fn allocate_resource_human_key(
@@ -5852,6 +5940,9 @@ pub(crate) fn apply_migrations_through(conn: &Connection, through_version: i64) 
         i64::from(migration.version) > current && i64::from(migration.version) <= through_version
     }) {
         let tx = conn.unchecked_transaction()?;
+        if migration.version == 37 {
+            crate::retention::repair_worker_diagnostics_archive_table(&tx)?;
+        }
         (migration.apply)(&tx)?;
         tx.execute(
             "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
@@ -6364,6 +6455,48 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )?;
                 assert_eq!(latest, ticket::LATEST_SQLITE_TICKET_SCHEMA_VERSION);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn migration_dry_run_repairs_missing_diagnostics_archive_without_mutating_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            configure_sqlite(&conn).unwrap();
+            apply_migrations_through(&conn, 36).unwrap();
+            conn.execute_batch(
+                "DROP TABLE worker_diagnostics_archives;
+                 INSERT INTO workspaces(workspace_id, display_name, state, created_at, updated_at)
+                 VALUES ('workspace-a', 'Workspace A', 'active', '1', '1');
+                 INSERT INTO worker_registry(
+                    workspace_id, runtime_id, runtime_worker_id, display_name,
+                    retention_state, created_at, updated_at
+                 ) VALUES ('workspace-a', 'runtime-a', 7, 'Worker 7', 'normal', '1', '1');",
+            )
+            .unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
+        assert_eq!(plan.current_schema_version, 36);
+        assert_eq!(plan.target_schema_version, 38);
+        assert!(plan.migration_required);
+        assert_eq!(plan.worker_count, 1);
+        assert_eq!(plan.mappings[0].legacy_worker_id, 7);
+        assert_eq!(
+            plan.repairs,
+            vec!["create missing worker_diagnostics_archives table"]
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        store
+            .with_conn(|conn| {
+                assert!(table_exists(conn, "worker_diagnostics_archives")?);
+                assert_eq!(current_schema_version(conn)?, 38);
                 Ok(())
             })
             .unwrap();

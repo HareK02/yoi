@@ -2,7 +2,9 @@ use crate::catalog::{CreateWorkerRequest, WorkingDirectoryStatus};
 use crate::config_bundle::ConfigBundle;
 use crate::diagnostics::{DiagnosticSeverity, RuntimeDiagnostic};
 use crate::error::RuntimeError;
-use crate::identity::{WorkerId, WorkerRef};
+use crate::identity::{
+    LegacyWorkerIdentityMapping, WorkerId, WorkerRef, legacy_worker_identity_mapping_digest,
+};
 use crate::management::{RuntimeBackendKind, RuntimeStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -52,6 +54,18 @@ pub struct FsRuntimeStore {
 }
 
 impl FsRuntimeStore {
+    pub fn migration_plan(
+        options: &FsRuntimeStoreOptions,
+    ) -> Result<FsRuntimeStoreMigrationPlan, RuntimeError> {
+        plan_v1_worker_identity(&options.root, &options.runtime_id).map(|(plan, _)| plan)
+    }
+
+    pub fn migrate(
+        options: &FsRuntimeStoreOptions,
+    ) -> Result<FsRuntimeStoreMigrationPlan, RuntimeError> {
+        migrate_v1_worker_identity(&options.root, &options.runtime_id)
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -286,11 +300,36 @@ fn runtime_store_corrupt(path: &Path, message: String) -> RuntimeError {
     }
 }
 
-fn migrate_v1_worker_identity(root: &Path, runtime_id: &str) -> Result<(), RuntimeError> {
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsRuntimeStoreMigrationPlan {
+    pub current_schema_version: u32,
+    pub target_schema_version: u32,
+    pub migration_required: bool,
+    pub worker_count: usize,
+    pub mapping_digest: String,
+    pub mappings: Vec<LegacyWorkerIdentityMapping>,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedRuntimeWorkerMigration {
+    mapping: LegacyWorkerIdentityMapping,
+    legacy_dir: PathBuf,
+}
+
+fn plan_v1_worker_identity(
+    root: &Path,
+    runtime_id: &str,
+) -> Result<
+    (
+        FsRuntimeStoreMigrationPlan,
+        Vec<PlannedRuntimeWorkerMigration>,
+    ),
+    RuntimeError,
+> {
     let runtime_path = root.join(RUNTIME_FILE);
     let bytes =
         fs::read(&runtime_path).map_err(|error| runtime_io_error("read", &runtime_path, error))?;
-    let mut document: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+    let document: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
         runtime_store_corrupt(
             &runtime_path,
             format!("decode Runtime state {}: {error}", runtime_path.display()),
@@ -305,10 +344,36 @@ fn migrate_v1_worker_identity(root: &Path, runtime_id: &str) -> Result<(), Runti
                 "Runtime state is missing schema_version".to_string(),
             )
         })?;
-    if schema_version == u64::from(SCHEMA_VERSION) {
-        return Ok(());
+    let current_schema_version = u32::try_from(schema_version).map_err(|_| {
+        runtime_store_corrupt(
+            &runtime_path,
+            format!("Runtime store schema version {schema_version} is out of range"),
+        )
+    })?;
+    let staging = migration_sibling(root, "schema-v2-staging")?;
+    let backup = migration_sibling(root, "schema-v1-backup")?;
+    if staging.exists() || backup.exists() {
+        return Err(runtime_store_corrupt(
+            root,
+            format!(
+                "unfinished Runtime migration artifact exists (staging={}, backup={})",
+                staging.display(),
+                backup.display()
+            ),
+        ));
     }
-    if schema_version != 1 {
+    if current_schema_version == SCHEMA_VERSION {
+        let plan = FsRuntimeStoreMigrationPlan {
+            current_schema_version,
+            target_schema_version: SCHEMA_VERSION,
+            migration_required: false,
+            worker_count: 0,
+            mapping_digest: legacy_worker_identity_mapping_digest(&[]),
+            mappings: Vec::new(),
+        };
+        return Ok((plan, Vec::new()));
+    }
+    if current_schema_version != 1 {
         return Err(runtime_store_corrupt(
             &runtime_path,
             format!(
@@ -316,30 +381,256 @@ fn migrate_v1_worker_identity(root: &Path, runtime_id: &str) -> Result<(), Runti
             ),
         ));
     }
+    validate_runtime_tree_copyable(root)?;
 
-    let legacy_ids = document
-        .get("workers")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| {
+    let workers_dir = root.join(WORKERS_DIR);
+    let mut entries = fs::read_dir(&workers_dir)
+        .map_err(|error| runtime_io_error("read workers", &workers_dir, error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| runtime_io_error("read workers", &workers_dir, error))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    let mut planned = Vec::with_capacity(entries.len());
+    let mut target_ids = std::collections::BTreeSet::new();
+    for entry in entries {
+        let legacy_dir = entry.path();
+        if !legacy_dir.is_dir() {
+            return Err(runtime_store_corrupt(
+                &legacy_dir,
+                "legacy workers directory contains a non-directory entry".to_string(),
+            ));
+        }
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
             runtime_store_corrupt(
-                &runtime_path,
-                "Runtime state workers must be an array".to_string(),
+                &legacy_dir,
+                "legacy Worker directory is not UTF-8".to_string(),
             )
-        })?
-        .iter()
-        .map(|value| {
-            value.as_u64().ok_or_else(|| {
+        })?;
+        let legacy_worker_id = name.parse::<u64>().map_err(|_| {
+            runtime_store_corrupt(
+                &legacy_dir,
+                format!("legacy Worker directory name must be numeric, found {name}"),
+            )
+        })?;
+        let snapshot_path = legacy_dir.join(WORKER_FILE);
+        let snapshot: serde_json::Value = read_json(&snapshot_path, "read legacy worker snapshot")?;
+        let workspace_id = snapshot
+            .get("workspace_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|workspace_id| !workspace_id.is_empty())
+            .ok_or_else(|| {
                 runtime_store_corrupt(
-                    &runtime_path,
-                    "legacy Worker id must be unsigned".to_string(),
+                    &snapshot_path,
+                    "legacy Worker snapshot is missing workspace_id; unscoped Workers require an explicit migration disposition"
+                        .to_string(),
                 )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+            })?
+            .to_string();
+        let worker_id = WorkerId::from_legacy_binding(&workspace_id, runtime_id, legacy_worker_id);
+        if !target_ids.insert(worker_id) {
+            return Err(runtime_store_corrupt(
+                &snapshot_path,
+                format!("legacy Worker identity maps to duplicate target {worker_id}"),
+            ));
+        }
+        let target_dir = workers_dir.join(worker_id.to_string());
+        if target_dir.exists() && target_dir != legacy_dir {
+            return Err(runtime_store_corrupt(
+                &target_dir,
+                format!("target Worker directory {worker_id} already exists"),
+            ));
+        }
+        let request = snapshot
+            .get("request")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                runtime_store_corrupt(
+                    &snapshot_path,
+                    "Worker snapshot request must be an object".to_string(),
+                )
+            })?;
+        if request.get("profile").is_none() {
+            return Err(runtime_store_corrupt(
+                &snapshot_path,
+                "Worker snapshot request is missing profile".to_string(),
+            ));
+        }
+        planned.push(PlannedRuntimeWorkerMigration {
+            mapping: LegacyWorkerIdentityMapping {
+                workspace_id,
+                runtime_id: runtime_id.to_string(),
+                legacy_worker_id,
+                worker_id,
+            },
+            legacy_dir,
+        });
+    }
+    let mappings = planned
+        .iter()
+        .map(|worker| worker.mapping.clone())
+        .collect::<Vec<_>>();
+    let plan = FsRuntimeStoreMigrationPlan {
+        current_schema_version,
+        target_schema_version: SCHEMA_VERSION,
+        migration_required: true,
+        worker_count: mappings.len(),
+        mapping_digest: legacy_worker_identity_mapping_digest(&mappings),
+        mappings,
+    };
+    Ok((plan, planned))
+}
 
-    let mut migrated_ids = Vec::with_capacity(legacy_ids.len());
-    for legacy_id in legacy_ids {
-        let legacy_dir = root.join("workers").join(legacy_id.to_string());
+fn migration_sibling(root: &Path, suffix: &str) -> Result<PathBuf, RuntimeError> {
+    let parent = root.parent().ok_or_else(|| {
+        runtime_store_corrupt(
+            root,
+            "Runtime store root has no parent directory".to_string(),
+        )
+    })?;
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            runtime_store_corrupt(root, "Runtime store root name is not UTF-8".to_string())
+        })?;
+    Ok(parent.join(format!(".{name}.{suffix}")))
+}
+
+fn validate_runtime_tree_copyable(source: &Path) -> Result<(), RuntimeError> {
+    let entries = fs::read_dir(source)
+        .map_err(|error| runtime_io_error("read migration source", source, error))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| runtime_io_error("read migration source", source, error))?;
+        let source_path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| runtime_io_error("inspect migration source", &source_path, error))?;
+        if file_type.is_dir() {
+            validate_runtime_tree_copyable(&source_path)?;
+        } else if !file_type.is_file() {
+            return Err(runtime_store_corrupt(
+                &source_path,
+                "Runtime migration refuses symlinks and special files".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn copy_runtime_tree(source: &Path, target: &Path) -> Result<(), RuntimeError> {
+    fs::create_dir(target)
+        .map_err(|error| runtime_io_error("create migration staging", target, error))?;
+    let mut entries = fs::read_dir(source)
+        .map_err(|error| runtime_io_error("read migration source", source, error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| runtime_io_error("read migration source", source, error))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .map_err(|error| runtime_io_error("inspect migration source", &source_path, error))?;
+        if file_type.is_dir() {
+            copy_runtime_tree(&source_path, &target_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&source_path, &target_path)
+                .map_err(|error| runtime_io_error("copy migration source", &source_path, error))?;
+        } else {
+            return Err(runtime_store_corrupt(
+                &source_path,
+                "Runtime migration refuses symlinks and special files".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn migrate_v1_worker_identity(
+    root: &Path,
+    runtime_id: &str,
+) -> Result<FsRuntimeStoreMigrationPlan, RuntimeError> {
+    let (plan, _) = plan_v1_worker_identity(root, runtime_id)?;
+    if !plan.migration_required {
+        return Ok(plan);
+    }
+    let staging = migration_sibling(root, "schema-v2-staging")?;
+    let backup = migration_sibling(root, "schema-v1-backup")?;
+    if staging.exists() || backup.exists() {
+        return Err(runtime_store_corrupt(
+            root,
+            format!(
+                "unfinished Runtime migration artifact exists (staging={}, backup={}); recover or remove it before retrying",
+                staging.display(),
+                backup.display()
+            ),
+        ));
+    }
+    if let Err(error) = copy_runtime_tree(root, &staging) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    let staged_plan = match migrate_v1_worker_identity_in_place(&staging, runtime_id) {
+        Ok(plan) => plan,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+    };
+    let staged_store = FsRuntimeStore {
+        root: staging.clone(),
+    };
+    if let Err(error) = staged_store.load_runtime_state() {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    fs::rename(root, &backup)
+        .map_err(|error| runtime_io_error("backup runtime store", root, error))?;
+    if let Err(error) = fs::rename(&staging, root) {
+        let rollback = fs::rename(&backup, root);
+        return match rollback {
+            Ok(()) => Err(runtime_io_error(
+                "activate migrated runtime store",
+                &staging,
+                error,
+            )),
+            Err(rollback_error) => Err(runtime_store_corrupt(
+                root,
+                format!(
+                    "activate migrated Runtime store failed: {error}; rollback failed: {rollback_error}; backup remains at {}",
+                    backup.display()
+                ),
+            )),
+        };
+    }
+    fs::remove_dir_all(&backup)
+        .map_err(|error| runtime_io_error("remove runtime migration backup", &backup, error))?;
+    debug_assert_eq!(plan.mapping_digest, staged_plan.mapping_digest);
+    Ok(plan)
+}
+
+fn migrate_v1_worker_identity_in_place(
+    root: &Path,
+    runtime_id: &str,
+) -> Result<FsRuntimeStoreMigrationPlan, RuntimeError> {
+    let (plan, planned_workers) = plan_v1_worker_identity(root, runtime_id)?;
+    if !plan.migration_required {
+        return Ok(plan);
+    }
+    let runtime_path = root.join(RUNTIME_FILE);
+    let bytes =
+        fs::read(&runtime_path).map_err(|error| runtime_io_error("read", &runtime_path, error))?;
+    let mut document: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        runtime_store_corrupt(
+            &runtime_path,
+            format!("decode Runtime state {}: {error}", runtime_path.display()),
+        )
+    })?;
+
+    for planned_worker in &planned_workers {
+        let legacy_id = planned_worker.mapping.legacy_worker_id;
+        let legacy_dir = &planned_worker.legacy_dir;
         let legacy_snapshot_path = legacy_dir.join(WORKER_FILE);
         let bytes = fs::read(&legacy_snapshot_path)
             .map_err(|error| runtime_io_error("read", &legacy_snapshot_path, error))?;
@@ -352,12 +643,8 @@ fn migrate_v1_worker_identity(root: &Path, runtime_id: &str) -> Result<(), Runti
                 ),
             )
         })?;
-        let workspace_id = snapshot
-            .get("workspace_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("local")
-            .to_string();
-        let worker_id = WorkerId::from_legacy_binding(&workspace_id, runtime_id, legacy_id);
+        let workspace_id = planned_worker.mapping.workspace_id.clone();
+        let worker_id = planned_worker.mapping.worker_id;
         let worker_id_text = worker_id.to_string();
         snapshot["schema_version"] = serde_json::Value::from(SCHEMA_VERSION);
         snapshot["worker_id"] = serde_json::Value::String(worker_id_text.clone());
@@ -394,19 +681,19 @@ fn migrate_v1_worker_identity(root: &Path, runtime_id: &str) -> Result<(), Runti
             &snapshot,
             "migrate Worker identity",
         )?;
-        migrated_ids.push(serde_json::Value::String(worker_id_text));
     }
 
     document["schema_version"] = serde_json::Value::from(SCHEMA_VERSION);
-    document["workers"] = serde_json::Value::Array(migrated_ids);
     if let Some(object) = document.as_object_mut() {
+        object.remove("workers");
         object.remove("next_worker_sequence");
     }
     atomic_write_json(
         &runtime_path,
         &document,
         "migrate Runtime Worker identities",
-    )
+    )?;
+    Ok(plan)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

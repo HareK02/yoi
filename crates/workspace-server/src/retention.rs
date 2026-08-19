@@ -166,6 +166,25 @@ pub enum WorkerRetentionError {
     Invalid(String),
 }
 
+pub(crate) fn repair_worker_diagnostics_archive_table(conn: &Connection) -> crate::Result<bool> {
+    let existed: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_diagnostics_archives')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !existed {
+        conn.execute_batch(
+            "CREATE TABLE worker_diagnostics_archives (
+              operation_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, runtime_id TEXT NOT NULL,
+              worker_id TEXT NOT NULL, policy_id TEXT NOT NULL, policy_revision INTEGER NOT NULL,
+              committed_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+              FOREIGN KEY(operation_id) REFERENCES worker_removal_operations(operation_id),
+              FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE);",
+        )?;
+    }
+    Ok(!existed)
+}
+
 pub(crate) fn create_worker_retention_tables(conn: &Connection) -> crate::Result<()> {
     conn.execute_batch(r#"
       CREATE TABLE workspace_worker_retention_policy_revisions (

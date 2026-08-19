@@ -18,7 +18,7 @@ use worker_runtime::auth::{
     RuntimeHttpAuthConfig, RuntimeIdentityMaterial, TrustedServerKey, decode_public_key,
 };
 use worker_runtime::error::RuntimeError;
-use worker_runtime::fs_store::FsRuntimeStoreOptions;
+use worker_runtime::fs_store::{FsRuntimeStore, FsRuntimeStoreOptions};
 use worker_runtime::http_server::{
     RuntimeHttpServerConfig, RuntimeHttpServerError, RuntimeHttpStoreSelection,
 };
@@ -44,6 +44,9 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), ProcessError> {
     let args = env::args().skip(1).collect::<Vec<_>>();
+    if matches!(args.first().map(String::as_str), Some("migrate")) {
+        return run_migration_command(args);
+    }
     if matches!(
         args.first().map(String::as_str),
         Some("identity" | "trust-server")
@@ -75,6 +78,76 @@ fn run() -> Result<(), ProcessError> {
         .await
         .map_err(ProcessError::from)
     })?;
+    Ok(())
+}
+
+fn run_migration_command(mut args: Vec<String>) -> Result<(), ProcessError> {
+    args.remove(0);
+    let dry_run_index = args
+        .iter()
+        .position(|argument| argument == "--dry-run")
+        .ok_or_else(|| ProcessError::usage("migrate currently requires --dry-run".to_string()))?;
+    args.remove(dry_run_index);
+    let explicit_runtime_id =
+        if let Some(index) = args.iter().position(|argument| argument == "--runtime-id") {
+            if index + 1 >= args.len() {
+                return Err(ProcessError::usage(
+                    "--runtime-id requires a value".to_string(),
+                ));
+            }
+            let runtime_id = args.remove(index + 1);
+            args.remove(index);
+            Some(runtime_id)
+        } else {
+            None
+        };
+    let config = parse_args(args)?.ok_or_else(|| {
+        ProcessError::usage("migrate requires a Runtime store configuration".to_string())
+    })?;
+    let root = match &config.http.store {
+        RuntimeHttpStoreSelection::Fs { root } => root.clone(),
+        RuntimeHttpStoreSelection::Memory => {
+            return Err(ProcessError::usage(
+                "migration dry-run requires the fs Runtime store".to_string(),
+            ));
+        }
+        _ => {
+            return Err(ProcessError::usage(
+                "unsupported Runtime catalog store selection".to_string(),
+            ));
+        }
+    };
+    let persisted_runtime_id = read_runtime_auth_file(&runtime_auth_path(&config))?
+        .identity
+        .map(|identity| identity.identity_id);
+    let runtime_id = match (persisted_runtime_id, explicit_runtime_id) {
+        (Some(persisted), Some(explicit)) if persisted != explicit => {
+            return Err(ProcessError::usage(format!(
+                "--runtime-id {explicit} does not match persisted Runtime identity {persisted}"
+            )));
+        }
+        (Some(persisted), _) => persisted,
+        (None, Some(explicit)) if !explicit.is_empty() => explicit,
+        (None, Some(_)) => {
+            return Err(ProcessError::usage(
+                "--runtime-id must not be empty".to_string(),
+            ));
+        }
+        (None, None) => {
+            return Err(ProcessError::usage(
+                "migration dry-run requires a persisted Runtime identity or explicit --runtime-id"
+                    .to_string(),
+            ));
+        }
+    };
+    let mut options = FsRuntimeStoreOptions::new(root).with_runtime_id(runtime_id);
+    options.display_name = config.http.display_name.clone();
+    let plan = FsRuntimeStore::migration_plan(&options).map_err(ProcessError::Runtime)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&plan)
+            .map_err(|error| ProcessError::Auth(format!("encode migration plan: {error}")))?
+    );
     Ok(())
 }
 
@@ -791,6 +864,7 @@ fn run_trust_server_command(mut args: VecDeque<String>) -> Result<(), ProcessErr
 
 fn usage() -> &'static str {
     r#"Usage: yoi-runtime [OPTIONS]
+       yoi-runtime migrate --dry-run [--runtime-id <ID>] [OPTIONS]
 
 Starts a worker-backed Runtime REST command API for a trusted backend/proxy.
 Browsers must not connect to this Runtime process directly.
@@ -909,6 +983,39 @@ mod tests {
         let paths = config.resolved_fs_paths();
         assert_eq!(paths.worker_dir, PathBuf::from("/tmp/yoi-worker"));
         assert_eq!(paths.workdir_target, PathBuf::from("/tmp/yoi-workdirs"));
+    }
+
+    #[test]
+    fn migration_dry_run_accepts_real_v1_document_without_workers_field() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("runtime");
+        std::fs::create_dir_all(root.join("workers")).unwrap();
+        std::fs::write(
+            root.join("runtime.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "assignments": [],
+                "execution": [],
+                "diagnostics": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let before = std::fs::read(root.join("runtime.json")).unwrap();
+        run_migration_command(vec![
+            "migrate".to_string(),
+            "--dry-run".to_string(),
+            "--runtime-id".to_string(),
+            "local".to_string(),
+            "--store".to_string(),
+            "fs".to_string(),
+            "--fs-root".to_string(),
+            temp.path().display().to_string(),
+            "--fs-runtime-dir".to_string(),
+            root.display().to_string(),
+        ])
+        .unwrap();
+        assert_eq!(std::fs::read(root.join("runtime.json")).unwrap(), before);
     }
 
     #[test]

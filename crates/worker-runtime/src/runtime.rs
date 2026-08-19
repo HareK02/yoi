@@ -4186,7 +4186,7 @@ mod tests {
         let mut runtime_json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&runtime_path).unwrap()).unwrap();
         runtime_json["schema_version"] = serde_json::json!(1);
-        runtime_json["workers"] = serde_json::json!([7]);
+        runtime_json["workers"] = serde_json::json!({"legacy": "ignored"});
         runtime_json["next_worker_sequence"] = serde_json::json!(8);
         std::fs::write(
             &runtime_path,
@@ -4194,12 +4194,23 @@ mod tests {
         )
         .unwrap();
 
-        let restored = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
+        let runtime_options = crate::fs_store::FsRuntimeStoreOptions {
             root: root.clone(),
             runtime_id: runtime_id.to_string(),
             display_name: None,
-        })
-        .unwrap();
+        };
+        let runtime_before_dry_run = std::fs::read(&runtime_path).unwrap();
+        let plan = crate::fs_store::FsRuntimeStore::migration_plan(&runtime_options).unwrap();
+        assert!(plan.migration_required);
+        assert_eq!(plan.worker_count, 1);
+        assert_eq!(plan.mappings[0].legacy_worker_id, 7);
+        assert_eq!(
+            std::fs::read(&runtime_path).unwrap(),
+            runtime_before_dry_run
+        );
+        assert!(legacy_dir.exists());
+
+        let restored = Runtime::with_fs_store(runtime_options).unwrap();
         let expected = WorkerId::from_legacy_binding("workspace-a", runtime_id, 7);
         let detail = restored.worker_detail(&WorkerRef::new(expected)).unwrap();
         assert_eq!(detail.worker_id, expected);
@@ -4209,6 +4220,7 @@ mod tests {
         let migrated_runtime: serde_json::Value =
             serde_json::from_slice(&std::fs::read(runtime_path).unwrap()).unwrap();
         assert_eq!(migrated_runtime["schema_version"], serde_json::json!(2));
+        assert!(migrated_runtime.get("workers").is_none());
         assert!(migrated_runtime.get("next_worker_sequence").is_none());
 
         drop(restored);
