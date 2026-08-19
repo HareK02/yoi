@@ -120,7 +120,10 @@ impl WorkdirTransportError {
             WorkdirError::UnknownCommand(_) => {
                 (Code::UnknownCommand, "Workdir command was not found")
             }
-            WorkdirError::Unavailable(_) => (Code::Unavailable, "Workdir session is unavailable"),
+            WorkdirError::Unavailable(_) | WorkdirError::SessionClosed => {
+                (Code::Unavailable, "Workdir session is unavailable")
+            }
+            WorkdirError::Denied(_) => (Code::InvalidRequest, "Workdir operation was denied"),
             WorkdirError::Transport(_) => (Code::Internal, "Workdir transport failed"),
             WorkdirError::InvalidPath(_)
             | WorkdirError::RelativePath(_)
@@ -169,7 +172,7 @@ mod client {
     use reqwest::{Client, StatusCode, Url};
 
     use super::*;
-    use crate::{Workdir, WorkdirSession};
+    use crate::{Workdir, WorkdirSession, WorkdirSessionHandle};
 
     /// Provides a fresh bearer token for each Runtime request. Backend
     /// implementations can mint short-lived capability tokens without making a
@@ -308,6 +311,21 @@ mod client {
 
         fn capabilities(&self) -> WorkdirSessionCapabilities {
             self.capabilities
+        }
+
+        async fn capture_delegation_source(&self) -> Result<WorkdirSessionHandle, WorkdirError> {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(WorkdirError::SessionClosed);
+            }
+            Ok(Arc::new(Self {
+                client: self.client.clone(),
+                base_url: self.base_url.clone(),
+                authorization: self.authorization.clone(),
+                workdir: self.workdir.clone(),
+                session_id: self.session_id.clone(),
+                capabilities: self.capabilities,
+                closed: AtomicBool::new(false),
+            }))
         }
 
         async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {

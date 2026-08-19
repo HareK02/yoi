@@ -314,3 +314,17 @@ mod tests {
         assert_eq!(decoded, detail);
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceWorkdirSessionOperationRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_session_fence: Option<String>,
+    pub operation: crate::http::WorkdirSessionOperation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceWorkdirSessionFence {
+    pub value: String,
+}

@@ -29,8 +29,8 @@ use crate::{
     CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest, CommandStatus, EditRequest,
     EditResult, GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest, ListResult,
     ReadRequest, ReadResult, StatRequest, StatResult, Workdir, WorkdirError, WorkdirPath,
-    WorkdirSession, WorkdirSessionCapabilities, WorkdirSessionCapability, WriteRequest,
-    WriteResult,
+    WorkdirSession, WorkdirSessionCapabilities, WorkdirSessionCapability, WorkdirSessionHandle,
+    WriteRequest, WriteResult,
 };
 #[cfg(test)]
 use crate::{EntryKind, WriteOutcome};
@@ -369,6 +369,10 @@ impl WorkdirSession for LocalWorkdirSession {
 
     fn capabilities(&self) -> WorkdirSessionCapabilities {
         self.inner.capabilities
+    }
+
+    async fn capture_delegation_source(&self) -> Result<WorkdirSessionHandle, WorkdirError> {
+        Ok(Arc::new(self.clone()))
     }
 
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {
