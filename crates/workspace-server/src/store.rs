@@ -5160,6 +5160,41 @@ fn add_objective_query_indexes(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn collect_legacy_text_worker_bindings(
+    conn: &Connection,
+    table: &str,
+    bindings: &mut std::collections::BTreeSet<(String, String, u64)>,
+) -> Result<()> {
+    if !table_exists(conn, table)? {
+        return Ok(());
+    }
+    let sql = format!(
+        "SELECT workspace_id, runtime_id, worker_id FROM {table} WHERE worker_id IS NOT NULL"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (workspace_id, runtime_id, worker_id) = row?;
+        let legacy_id = worker_id
+            .strip_prefix("worker-")
+            .unwrap_or(&worker_id)
+            .parse::<u64>()
+            .map_err(|_| {
+                Error::InvalidInput(format!(
+                    "{table} contains non-legacy Worker id `{worker_id}` before schema v37"
+                ))
+            })?;
+        bindings.insert((workspace_id, runtime_id, legacy_id));
+    }
+    Ok(())
+}
+
 fn promote_workspace_worker_uuid_identity(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -5174,21 +5209,49 @@ fn promote_workspace_worker_uuid_identity(conn: &Connection) -> Result<()> {
         "#,
     )?;
 
-    let legacy_workers = {
+    let mut legacy_workers = std::collections::BTreeSet::new();
+    {
         let mut statement = conn.prepare(
             "SELECT workspace_id, runtime_id, runtime_worker_id FROM worker_registry \
              ORDER BY workspace_id, runtime_id, runtime_worker_id",
         )?;
-        statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-    };
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (workspace_id, runtime_id, runtime_worker_id) = row?;
+            legacy_workers.insert((
+                workspace_id,
+                runtime_id,
+                u64::try_from(runtime_worker_id).map_err(|_| {
+                    Error::InvalidInput(format!(
+                        "legacy Runtime Worker id {runtime_worker_id} is negative"
+                    ))
+                })?,
+            ));
+        }
+    }
+    // v21/v22 removed the legacy per-Worker credential and Ticket notification
+    // tables. Every Worker-reference table that still exists at the v36 boundary
+    // participates in this map, including retention-only Workers no longer present
+    // in worker_registry.
+    for table in [
+        "ticket_worker_assignments",
+        "ticket_current_worker_assignments",
+        "ticket_assignment_operations",
+        "worker_removal_operations",
+        "worker_session_archives",
+        "worker_diagnostics_archives",
+        "worker_tombstones",
+        "worker_orphan_diagnostics",
+    ] {
+        collect_legacy_text_worker_bindings(conn, table, &mut legacy_workers)?;
+    }
+
     for (workspace_id, runtime_id, runtime_worker_id) in legacy_workers {
         conn.execute(
             "INSERT INTO worker_identity_v37(\
@@ -5198,16 +5261,8 @@ fn promote_workspace_worker_uuid_identity(conn: &Connection) -> Result<()> {
                 workspace_id,
                 runtime_id,
                 runtime_worker_id,
-                WorkerId::from_legacy_binding(
-                    &workspace_id,
-                    &runtime_id,
-                    u64::try_from(runtime_worker_id).map_err(|_| {
-                        Error::InvalidInput(format!(
-                            "legacy Runtime Worker id {runtime_worker_id} is negative"
-                        ))
-                    })?,
-                )
-                .to_string()
+                WorkerId::from_legacy_binding(&workspace_id, &runtime_id, runtime_worker_id)
+                    .to_string()
             ],
         )?;
     }
@@ -5309,6 +5364,65 @@ fn promote_workspace_worker_uuid_identity(conn: &Connection) -> Result<()> {
           ON subject.workspace_id = g.workspace_id
          AND subject.runtime_id = g.subject_runtime_id
          AND subject.runtime_worker_id = g.subject_worker_id;
+
+        UPDATE ticket_worker_assignments
+        SET worker_id = (
+            SELECT m.worker_id FROM worker_identity_v37 m
+            WHERE m.workspace_id = ticket_worker_assignments.workspace_id
+              AND m.runtime_id = ticket_worker_assignments.runtime_id
+              AND CAST(m.runtime_worker_id AS TEXT) = ticket_worker_assignments.worker_id
+        );
+        UPDATE ticket_current_worker_assignments
+        SET worker_id = (
+            SELECT m.worker_id FROM worker_identity_v37 m
+            WHERE m.workspace_id = ticket_current_worker_assignments.workspace_id
+              AND m.runtime_id = ticket_current_worker_assignments.runtime_id
+              AND CAST(m.runtime_worker_id AS TEXT) = ticket_current_worker_assignments.worker_id
+        );
+        UPDATE ticket_assignment_operations
+        SET worker_id = (
+            SELECT m.worker_id FROM worker_identity_v37 m
+            WHERE m.workspace_id = ticket_assignment_operations.workspace_id
+              AND m.runtime_id = ticket_assignment_operations.runtime_id
+              AND CAST(m.runtime_worker_id AS TEXT) = ticket_assignment_operations.worker_id
+        )
+        WHERE worker_id IS NOT NULL;
+
+        UPDATE worker_removal_operations
+        SET worker_id = (
+            SELECT m.worker_id FROM worker_identity_v37 m
+            WHERE m.workspace_id = worker_removal_operations.workspace_id
+              AND m.runtime_id = worker_removal_operations.runtime_id
+              AND CAST(m.runtime_worker_id AS TEXT) = worker_removal_operations.worker_id
+        );
+        UPDATE worker_session_archives
+        SET worker_id = (
+            SELECT m.worker_id FROM worker_identity_v37 m
+            WHERE m.workspace_id = worker_session_archives.workspace_id
+              AND m.runtime_id = worker_session_archives.runtime_id
+              AND CAST(m.runtime_worker_id AS TEXT) = worker_session_archives.worker_id
+        );
+        UPDATE worker_diagnostics_archives
+        SET worker_id = (
+            SELECT m.worker_id FROM worker_identity_v37 m
+            WHERE m.workspace_id = worker_diagnostics_archives.workspace_id
+              AND m.runtime_id = worker_diagnostics_archives.runtime_id
+              AND CAST(m.runtime_worker_id AS TEXT) = worker_diagnostics_archives.worker_id
+        );
+        UPDATE worker_tombstones
+        SET worker_id = (
+            SELECT m.worker_id FROM worker_identity_v37 m
+            WHERE m.workspace_id = worker_tombstones.workspace_id
+              AND m.runtime_id = worker_tombstones.runtime_id
+              AND CAST(m.runtime_worker_id AS TEXT) = worker_tombstones.worker_id
+        );
+        UPDATE worker_orphan_diagnostics
+        SET worker_id = (
+            SELECT m.worker_id FROM worker_identity_v37 m
+            WHERE m.workspace_id = worker_orphan_diagnostics.workspace_id
+              AND m.runtime_id = worker_orphan_diagnostics.runtime_id
+              AND CAST(m.runtime_worker_id AS TEXT) = worker_orphan_diagnostics.worker_id
+        );
 
         DROP TABLE worker_control_grants;
         DROP TABLE worker_workdir_links;
@@ -6100,6 +6214,25 @@ INSERT INTO worker_control_grants (
      'shared', 'share', '["observe"]', 'share-op', '1', NULL),
     ('workspace-a', 'transferred', 'runtime-a', 1, 'runtime-a', 4,
      'transferred', 'transfer', '["observe"]', 'transfer-op', '1', NULL);
+INSERT INTO ticket_worker_assignments (
+    workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at
+) VALUES ('workspace-a', 'ticket-a', 'assignment-a', 'runtime-a', '1', 'test', '1');
+INSERT INTO ticket_current_worker_assignments (
+    workspace_id, ticket_id, assignment_id, runtime_id, worker_id, updated_at
+) VALUES ('workspace-a', 'ticket-a', 'assignment-a', 'runtime-a', '1', '1');
+INSERT INTO ticket_assignment_operations (
+    workspace_id, operation_id, action, ticket_id, runtime_id, worker_id,
+    assignment_id, request_fingerprint, created_at
+) VALUES (
+    'workspace-a', 'assignment-operation-a', 'assign', 'ticket-a',
+    'runtime-a', '1', 'assignment-a', 'sha256:test', '1'
+);
+INSERT INTO worker_orphan_diagnostics (
+    diagnostic_id, workspace_id, runtime_id, worker_id, category, detail, observed_at
+) VALUES (
+    'orphan-a', 'workspace-a', 'runtime-a', '9', 'runtime_aggregate_without_backend_registry',
+    'legacy orphan', '1'
+);
 "#,
         )
         .unwrap();
@@ -6133,6 +6266,31 @@ INSERT INTO worker_control_grants (
         assert_eq!(
             grant_subject,
             WorkerId::from_legacy_binding("workspace-a", "runtime-a", 2).to_string()
+        );
+        let expected_assignment_worker =
+            WorkerId::from_legacy_binding("workspace-a", "runtime-a", 1).to_string();
+        for table in [
+            "ticket_worker_assignments",
+            "ticket_current_worker_assignments",
+            "ticket_assignment_operations",
+        ] {
+            let sql = format!("SELECT worker_id FROM {table} WHERE ticket_id = 'ticket-a'");
+            let migrated_worker_id: String = conn.query_row(&sql, [], |row| row.get(0)).unwrap();
+            assert_eq!(
+                migrated_worker_id, expected_assignment_worker,
+                "{table} retained a legacy Worker id"
+            );
+        }
+        let orphan_worker_id: String = conn
+            .query_row(
+                "SELECT worker_id FROM worker_orphan_diagnostics WHERE diagnostic_id = 'orphan-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            orphan_worker_id,
+            WorkerId::from_legacy_binding("workspace-a", "runtime-a", 9).to_string()
         );
         let worker_registry_pk = {
             let mut statement = conn.prepare("PRAGMA table_info(worker_registry)").unwrap();
