@@ -16,7 +16,8 @@ use serde_json::json;
 use workdir::http::{WorkdirSessionOperation, WorkdirSessionOperationResult};
 use workdir::workspace::{
     WorkingDirectoryDetailResponse as WorkdirDetailResponse,
-    WorkingDirectoryListResponse as WorkdirListResponse,
+    WorkingDirectoryListResponse as WorkdirListResponse, WorkspaceWorkdirSessionFence,
+    WorkspaceWorkdirSessionOperationRequest,
 };
 use workdir::{
     CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest, CommandStatus, EditRequest,
@@ -153,6 +154,7 @@ struct WorkspaceHttpWorkdirBackend {
 pub struct WorkspaceAttachedWorkdirSession {
     client: Arc<dyn WorkspaceClient>,
     workdir: Workdir,
+    expected_session_fence: Option<String>,
 }
 
 impl WorkspaceAttachedWorkdirSession {
@@ -160,6 +162,7 @@ impl WorkspaceAttachedWorkdirSession {
         Arc::new(Self {
             client,
             workdir: Workdir::new("workspace-attachment"),
+            expected_session_fence: None,
         })
     }
 
@@ -176,7 +179,11 @@ impl WorkspaceAttachedWorkdirSession {
                 "/api/w/{}/workers/self/workdir-session/operations",
                 encode_path_segment(workspace_id)
             ),
-            serde_json::to_string(&operation).map_err(|error| {
+            serde_json::to_string(&WorkspaceWorkdirSessionOperationRequest {
+                expected_session_fence: self.expected_session_fence.clone(),
+                operation,
+            })
+            .map_err(|error| {
                 WorkdirError::Transport(format!(
                     "failed to encode Workspace Workdir operation: {error}"
                 ))
@@ -222,6 +229,43 @@ impl WorkdirSession for WorkspaceAttachedWorkdirSession {
 
     fn capabilities(&self) -> WorkdirSessionCapabilities {
         WorkdirSessionCapabilities::ALL
+    }
+
+    async fn capture_delegation_source(&self) -> Result<WorkdirSessionHandle, WorkdirError> {
+        let expected_session_fence = if let Some(fence) = &self.expected_session_fence {
+            fence.clone()
+        } else {
+            let workspace_id = self.client.workspace_id().ok_or_else(|| {
+                WorkdirError::Unavailable("Workspace identity is unavailable".to_string())
+            })?;
+            let response = self
+                .client
+                .execute(WorkspaceRequest {
+                    method: WorkspaceRequestMethod::Get,
+                    path: format!(
+                        "/api/w/{}/workers/self/workdir-session/fence",
+                        encode_path_segment(workspace_id)
+                    ),
+                    body: None,
+                })
+                .map_err(|error| {
+                    WorkdirError::Unavailable(format!(
+                        "failed to capture Workdir attachment fence: {error}"
+                    ))
+                })?;
+            let fence: WorkspaceWorkdirSessionFence = serde_json::from_str(&response.body)
+                .map_err(|error| {
+                    WorkdirError::Unavailable(format!(
+                        "invalid Workdir attachment fence response: {error}"
+                    ))
+                })?;
+            fence.value
+        };
+        Ok(Arc::new(Self {
+            client: self.client.clone(),
+            workdir: self.workdir.clone(),
+            expected_session_fence: Some(expected_session_fence),
+        }))
     }
 
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {
@@ -1002,9 +1046,53 @@ mod tests {
         );
         let body: serde_json::Value =
             serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
-        assert_eq!(body["operation"], "stat");
+        assert_eq!(body["operation"]["operation"], "stat");
+        assert!(body.get("expected_session_fence").is_none());
         assert!(body.get("runtime_id").is_none());
         assert!(body.get("session_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn delegated_attached_session_carries_captured_fence_on_operations() {
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![
+            response(json!({"value": "attachment-fence"})),
+            response(json!({
+                "operation": "stat",
+                "result": {"path": "visible.txt", "kind": "file", "size": 8}
+            })),
+        ]));
+        let parent = workdir::delegation_capable_session(WorkspaceAttachedWorkdirSession::handle(
+            client.clone(),
+        ));
+        let delegation = parent
+            .delegate(workdir::WorkdirDelegationRequest {
+                rules: vec![workdir::WorkdirDelegationRule {
+                    target: workdir::WorkdirPath::new("visible.txt").unwrap(),
+                    permission: workdir::WorkdirDelegationPermission::Read,
+                    recursive: false,
+                }],
+                cwd: workdir::WorkdirPath::new("visible.txt").unwrap(),
+            })
+            .await
+            .unwrap();
+        delegation
+            .scoped_session
+            .stat(StatRequest {
+                path: workdir::WorkdirPath::new("visible.txt").unwrap(),
+            })
+            .await
+            .unwrap();
+
+        let requests = client.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].path,
+            "/api/w/workspace%2Ftest/workers/self/workdir-session/fence"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(requests[1].body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["expected_session_fence"], "attachment-fence");
+        assert_eq!(body["operation"]["operation"], "stat");
     }
 
     #[test]

@@ -681,18 +681,20 @@ where
 {
     // Worker-immutable snapshots taken before the mutable worker borrow
     // below so the worker borrow doesn't conflict with reads on `worker`.
-    let scope_handle = worker.scope().clone();
     let feature_config = worker.manifest().feature.clone();
-    if feature_config.manage_workdir.enabled {
-        if let Some(existing) = worker.workdir_session().cloned() {
-            existing.close().await.map_err(std::io::Error::other)?;
-        }
+    if feature_config.manage_workdir.enabled && worker.workdir_session().is_none() {
         let workspace_client = worker.workspace_client_handle();
-        worker.bind_workdir_session(Some(
+        worker.bind_workdir_session(Some(workdir::delegation_capable_session(
             crate::feature::builtin::manage_workdir::WorkspaceAttachedWorkdirSession::handle(
                 workspace_client,
             ),
-        ));
+        )));
+    }
+    if feature_config.sub_worker.enabled
+        && let Some(existing) = worker.workdir_session().cloned()
+        && !existing.is_delegation_capable()
+    {
+        worker.bind_workdir_session(Some(workdir::delegation_capable_session(existing)));
     }
     let worker_workdir = worker.workdir_session().cloned();
     let local_filesystem = worker.local_working_directory().cloned();
@@ -844,6 +846,7 @@ where
     }
 
     let host_worker_observation_provider = worker.worker_observation_provider();
+    let source_workdir_session = worker.workdir_session().cloned();
     {
         let workspace_client = worker.workspace_client_handle();
         let engine = worker.engine_mut();
@@ -902,27 +905,18 @@ where
             Arc<dyn crate::feature::builtin::worker_observation::WorkerObservationProvider>,
         > = Vec::new();
 
-        // Worker-orchestration tools (SubWorkerSpawn + three control tools) share
-        // the Worker-scoped `SpawnedWorkerRegistry` (also consumed by the main
-        // loop's `WorkerEvent` handler). Expose them only behind the explicit
-        // profile feature and require delegation authority up front so enabling
-        // the surface cannot imply broad child scope by accident.
+        // Worker-orchestration tools derive child filesystem authority from the
+        // active provider-backed Workdir session. The tool remains registered
+        // without one so invocation fails deterministically until the parent
+        // attaches a Workdir.
         if feature_config.sub_worker.enabled {
             let spawner_cwd = local_filesystem
                 .as_ref()
                 .map(|local| local.cwd.clone())
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "worker spawn tools require local Worker filesystem authority",
-                    )
-                })?;
-            let spawner_workspace_root = local_workspace_root.clone().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "worker spawn tools require local Worker filesystem authority",
-                )
-            })?;
+                .unwrap_or_else(|| PathBuf::from("/"));
+            let spawner_workspace_root = local_workspace_root
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("/"));
             engine.register_tool(sub_worker_spawn_tool(
                 spawner_name.clone(),
                 spawner_workspace_context,
@@ -930,9 +924,9 @@ where
                 runtime_base.clone(),
                 spawner_workspace_root,
                 spawner_cwd.clone(),
+                source_workdir_session,
                 spawned_registry.clone(),
                 spawner_manifest,
-                scope_handle,
                 prompts,
             ));
             observation_providers.push(Arc::new(

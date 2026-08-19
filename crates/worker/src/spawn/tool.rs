@@ -10,16 +10,21 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use fs_operation::FsPath;
 use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use manifest::{
-    CompactionConfigPartial, DelegationScope, EngineManifestConfig, FileUploadLimitsPartial,
-    Permission, PermissionConfigPartial, ProfileDiscovery, ProfileError, ProfileRegistry,
-    ProfileRegistrySource, ProfileResolveOptions, ProfileResolver, ProfileSelector, Scope,
-    ScopeConfig, ScopeRule, SessionConfigPartial, SharedScope, ToolOutputLimitsPartial,
-    WorkerManifest, WorkerManifestConfig, WorkerMetaConfig,
+    CompactionConfigPartial, EngineManifestConfig, FileUploadLimitsPartial, Permission,
+    PermissionConfigPartial, ProfileDiscovery, ProfileError, ProfileRegistry,
+    ProfileRegistrySource, ProfileResolveOptions, ProfileResolver, ProfileSelector, ScopeConfig,
+    ScopeRule, SessionConfigPartial, ToolOutputLimitsPartial, WorkerManifest, WorkerManifestConfig,
+    WorkerMetaConfig,
 };
 use serde::Deserialize;
 use tokio::sync::mpsc;
+use workdir::{
+    WorkdirDelegationPermission, WorkdirDelegationRequest, WorkdirDelegationRule,
+    WorkdirSessionHandle,
+};
 
 use crate::PromptCatalogSource;
 use crate::controller::register_worker_tools;
@@ -270,6 +275,8 @@ pub struct SubWorkerSpawnTool {
     /// Directory the spawned SubWorker's tools should use when the LLM did not
     /// override it. Defaults to the spawner's cwd.
     spawner_cwd: PathBuf,
+    /// Active provider-backed Workdir session from which child leases are captured.
+    source_workdir_session: Option<WorkdirSessionHandle>,
     /// Parent-owned in-memory registry shared by the five SubWorker tools.
     registry: Arc<SpawnedWorkerRegistry>,
     /// Spawner's resolved Manifest. `profile = "inherit"` derives the
@@ -279,18 +286,6 @@ pub struct SubWorkerSpawnTool {
     prompt_loader: PromptCatalogSource,
     /// Compact selector list shared by tool description and diagnostics.
     available_profiles: AvailableProfiles,
-    /// Spawner's runtime scope. After a successful spawn, the
-    /// `Permission::Write` rules in the delegated scope are revoked
-    /// from the spawner's in-memory view (a `deny(Write, target)` is
-    /// pushed on top, downgrading the spawner's effective access on
-    /// those paths to `Read`). Mirrors the worker-allocation's
-    /// `effective_write` semantics: Write is the only permission
-    /// tracked across Workers, so revocation only touches Write.
-    spawner_scope: SharedScope,
-    /// Filesystem scope this Worker is allowed to subdelegate to children.
-    /// This is intentionally separate from `spawner_scope`, which authorizes
-    /// the current Worker's own direct tools.
-    delegation_scope: DelegationScope,
     internal_client_override: Option<Box<dyn llm_engine::llm_client::LlmClient>>,
 }
 
@@ -308,12 +303,11 @@ impl SubWorkerSpawnTool {
         runtime_base: PathBuf,
         workspace_root: PathBuf,
         spawner_cwd: PathBuf,
+        source_workdir_session: Option<WorkdirSessionHandle>,
         registry: Arc<SpawnedWorkerRegistry>,
         spawner_manifest: WorkerManifest,
         prompt_loader: PromptCatalogSource,
         available_profiles: AvailableProfiles,
-        spawner_scope: SharedScope,
-        delegation_scope: DelegationScope,
     ) -> Self {
         Self {
             spawner_name,
@@ -322,12 +316,11 @@ impl SubWorkerSpawnTool {
             runtime_base,
             workspace_root,
             spawner_cwd,
+            source_workdir_session,
             registry,
             spawner_manifest,
             prompt_loader,
             available_profiles,
-            spawner_scope,
-            delegation_scope,
             internal_client_override: None,
         }
     }
@@ -386,8 +379,16 @@ impl Tool for SubWorkerSpawnTool {
             .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
 
         let scope_allow = parse_scope(&input.scope)?;
-        self.validate_delegation_scope(&scope_allow)?;
-        let child_cwd = validate_spawn_cwd(input.cwd.as_deref(), &scope_allow, &self.spawner_cwd)?;
+        let source_workdir_session =
+            require_active_workdir_session(self.source_workdir_session.as_ref())?;
+        let delegation_request =
+            self.workdir_delegation_request(input.cwd.as_deref(), &scope_allow)?;
+        let workdir_delegation = source_workdir_session
+            .delegate(delegation_request)
+            .await
+            .map_err(|error| {
+                ToolError::InvalidArgument(format!("delegate Workdir session: {error}"))
+            })?;
 
         let spawn_selector =
             parse_spawn_profile_selector(input.profile.as_deref()).map_err(|msg| {
@@ -413,11 +414,14 @@ impl Tool for SubWorkerSpawnTool {
             allow: scope_allow.clone(),
             deny: Vec::new(),
         };
-        let child_manifest =
+        let mut child_manifest =
             WorkerManifest::try_from(WorkerManifestConfig::builtin_defaults().merge(child_config))
                 .map_err(|error| {
                     ToolError::ExecutionFailed(format!("resolve child manifest: {error}"))
                 })?;
+        // Delegated children stay bound to their scoped session and cannot use
+        // Workspace attachment tools to replace it with parent-level authority.
+        child_manifest.feature.manage_workdir.enabled = false;
         let reviewer_capability = input.review.as_ref().map(|review| {
             (
                 review.ticket_id.clone(),
@@ -458,8 +462,7 @@ impl Tool for SubWorkerSpawnTool {
                 self.workspace_context.clone()
             };
         let store = EphemeralSessionStore::default();
-        let filesystem_authority =
-            WorkerFilesystemAuthority::local(self.workspace_root.clone(), child_cwd.clone());
+        let filesystem_authority = WorkerFilesystemAuthority::None;
         let mut child = Worker::<Box<dyn llm_engine::llm_client::LlmClient>, EphemeralSessionStore>::from_internal_manifest_with_context(
             child_manifest,
             store.clone(),
@@ -472,6 +475,7 @@ impl Tool for SubWorkerSpawnTool {
         )
         .await
         .map_err(|error| ToolError::ExecutionFailed(format!("build Internal Worker: {error}")))?;
+        child.bind_workdir_session(Some(workdir_delegation.scoped_session.clone()));
         let child_scope = child.scope().clone();
         let child_registry = SpawnedWorkerRegistry::new_internal(input.name.clone(), child_scope);
         register_worker_tools(
@@ -488,23 +492,14 @@ impl Tool for SubWorkerSpawnTool {
         .map_err(|error| {
             ToolError::ExecutionFailed(format!("install Internal Worker features: {error}"))
         })?;
-        // Transfer delegated Write authority before the child accepts its first turn. This closes
-        // the parallel-tool window where parent and child could otherwise both write the same path.
-        // The machine-wide allocation remains owned by the parent Worker; no fake child PID/socket
-        // identity is introduced.
-        let revoke_write: Vec<ScopeRule> = scope_allow
-            .iter()
-            .filter(|rule| rule.permission == Permission::Write)
-            .cloned()
+        #[cfg(test)]
+        let installed_tools = child
+            .engine()
+            .tool_server_handle()
+            .tool_definitions_sorted()
+            .into_iter()
+            .map(|definition| definition.name)
             .collect();
-        if !revoke_write.is_empty() {
-            self.spawner_scope
-                .update(|current| current.with_added_deny_rules(revoke_write.clone()))
-                .map_err(|error| {
-                    ToolError::ExecutionFailed(format!("revoke spawner scope: {error}"))
-                })?;
-        }
-
         let child_name = input.name.clone();
         let registry = Arc::downgrade(&self.registry);
         let parent_notifications = self.parent_notifications.clone();
@@ -530,19 +525,9 @@ impl Tool for SubWorkerSpawnTool {
             })),
         )
         .await;
-        let session = match session_result {
-            Ok(session) => session,
-            Err(error) => {
-                if !revoke_write.is_empty() {
-                    let _ = self
-                        .spawner_scope
-                        .update(|current| current.with_removed_deny_rules(revoke_write.clone()));
-                }
-                return Err(ToolError::ExecutionFailed(format!(
-                    "prepare Internal Worker session: {error}"
-                )));
-            }
-        };
+        let session = session_result.map_err(|error| {
+            ToolError::ExecutionFailed(format!("prepare Internal Worker session: {error}"))
+        })?;
 
         if let Some((ticket_id, capability_token)) = &reviewer_capability {
             let workspace_id = self.workspace_context.workspace_id().ok_or_else(|| {
@@ -605,15 +590,13 @@ impl Tool for SubWorkerSpawnTool {
         let record = crate::spawn::registry::InternalSpawnedWorkerRecord::new(
             input.name.clone(),
             scope_allow,
+            workdir_delegation,
+            #[cfg(test)]
+            installed_tools,
             session.clone(),
         );
         if let Err(error) = name_reservation.commit(record) {
             let _ = session.stop().await;
-            if !revoke_write.is_empty() {
-                let _ = self
-                    .spawner_scope
-                    .update(|current| current.with_removed_deny_rules(revoke_write));
-            }
             return Err(ToolError::ExecutionFailed(format!(
                 "register Internal Worker session: {error}"
             )));
@@ -636,27 +619,73 @@ impl Tool for SubWorkerSpawnTool {
 }
 
 impl SubWorkerSpawnTool {
-    fn validate_delegation_scope(&self, scope_allow: &[ScopeRule]) -> Result<(), ToolError> {
-        if self.delegation_scope.is_empty() && !scope_allow.is_empty() {
-            return Err(ToolError::InvalidArgument(
-                "SubWorkerSpawn requires delegation authority, but this Worker has no delegation scope grant; direct filesystem scope only authorizes this Worker's own tools".into(),
-            ));
+    fn workdir_delegation_request(
+        &self,
+        cwd: Option<&Path>,
+        scope_allow: &[ScopeRule],
+    ) -> Result<WorkdirDelegationRequest, ToolError> {
+        let rules = scope_allow
+            .iter()
+            .map(|rule| {
+                Ok(WorkdirDelegationRule {
+                    target: self.logical_workdir_path(&rule.target)?,
+                    permission: match rule.permission {
+                        Permission::Read => WorkdirDelegationPermission::Read,
+                        Permission::Write => WorkdirDelegationPermission::Write,
+                    },
+                    recursive: rule.recursive,
+                })
+            })
+            .collect::<Result<Vec<_>, ToolError>>()?;
+        let cwd = cwd.unwrap_or(&self.spawner_cwd);
+        if !cwd.is_absolute() {
+            return Err(ToolError::InvalidArgument(format!(
+                "cwd must be absolute, got `{}`",
+                cwd.display()
+            )));
         }
-        for rule in scope_allow {
-            let allowed = self
-                .delegation_scope
-                .allows_rule(rule)
-                .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
-            if !allowed {
-                return Err(ToolError::InvalidArgument(format!(
-                    "requested child scope {} {:?} is outside this Worker's delegation scope grant",
-                    rule.target.display(),
-                    rule.permission
-                )));
-            }
-        }
-        Ok(())
+        Ok(WorkdirDelegationRequest {
+            rules,
+            cwd: self.logical_workdir_path(cwd)?,
+        })
     }
+
+    fn logical_workdir_path(&self, path: &Path) -> Result<FsPath, ToolError> {
+        let logical = if self.workspace_root == Path::new("/") {
+            path.strip_prefix(Path::new("/"))
+        } else {
+            path.strip_prefix(&self.workspace_root)
+        }
+        .map_err(|_| {
+            ToolError::InvalidArgument(format!(
+                "scope target `{}` is not a Workdir-owned logical path",
+                path.display()
+            ))
+        })?;
+        let logical = logical.to_str().ok_or_else(|| {
+            ToolError::InvalidArgument(format!(
+                "scope target `{}` is not valid UTF-8",
+                path.display()
+            ))
+        })?;
+        FsPath::new(logical).map_err(|error| {
+            ToolError::InvalidArgument(format!(
+                "scope target `{}` is not a valid logical Workdir path: {error}",
+                path.display()
+            ))
+        })
+    }
+}
+
+fn require_active_workdir_session(
+    session: Option<&WorkdirSessionHandle>,
+) -> Result<&WorkdirSessionHandle, ToolError> {
+    session.ok_or_else(|| {
+        ToolError::InvalidArgument(
+            "SubWorkerSpawn requires an active Workdir session; attach a Workdir before delegating filesystem access"
+                .to_string(),
+        )
+    })
 }
 
 fn parse_scope(rules: &[ScopeRuleInput]) -> Result<Vec<ScopeRule>, ToolError> {
@@ -679,63 +708,6 @@ fn parse_scope(rules: &[ScopeRuleInput]) -> Result<Vec<ScopeRule>, ToolError> {
             })
         })
         .collect()
-}
-
-fn validate_spawn_cwd(
-    cwd: Option<&Path>,
-    scope_allow: &[ScopeRule],
-    default_cwd: &Path,
-) -> Result<PathBuf, ToolError> {
-    let Some(cwd) = cwd else {
-        return Ok(default_cwd.to_path_buf());
-    };
-    if !cwd.is_absolute() {
-        return Err(ToolError::InvalidArgument(format!(
-            "SubWorkerSpawn.cwd must be absolute: {}",
-            cwd.display()
-        )));
-    }
-    let metadata = std::fs::metadata(cwd).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            ToolError::InvalidArgument(format!(
-                "SubWorkerSpawn.cwd does not exist: {}",
-                cwd.display()
-            ))
-        } else {
-            ToolError::InvalidArgument(format!(
-                "SubWorkerSpawn.cwd is not usable: {}: {e}",
-                cwd.display()
-            ))
-        }
-    })?;
-    if !metadata.is_dir() {
-        return Err(ToolError::InvalidArgument(format!(
-            "SubWorkerSpawn.cwd must be a directory: {}",
-            cwd.display()
-        )));
-    }
-    let canonical = std::fs::canonicalize(cwd).map_err(|e| {
-        ToolError::InvalidArgument(format!(
-            "SubWorkerSpawn.cwd is not usable: {}: {e}",
-            cwd.display()
-        ))
-    })?;
-    let child_scope = Scope::from_config(&ScopeConfig {
-        allow: scope_allow.to_vec(),
-        deny: Vec::new(),
-    })
-    .map_err(|e| {
-        ToolError::InvalidArgument(format!(
-            "requested child scope cannot validate SubWorkerSpawn.cwd: {e}"
-        ))
-    })?;
-    if !child_scope.is_readable(&canonical) {
-        return Err(ToolError::InvalidArgument(format!(
-            "SubWorkerSpawn.cwd {} is outside the child's delegated readable scope; cwd grants no authority, so add an explicit read or write scope rule covering it",
-            cwd.display()
-        )));
-    }
-    Ok(canonical)
 }
 
 /// Serialise the internal manifest config that gets handed to the child
@@ -944,9 +916,9 @@ pub(crate) fn sub_worker_spawn_tool(
     runtime_base: PathBuf,
     workspace_root: PathBuf,
     spawner_cwd: PathBuf,
+    source_workdir_session: Option<WorkdirSessionHandle>,
     registry: Arc<SpawnedWorkerRegistry>,
     spawner_manifest: WorkerManifest,
-    spawner_scope: SharedScope,
     prompts: Arc<ArcSwap<PromptCatalog>>,
 ) -> ToolDefinition {
     sub_worker_spawn_tool_impl(
@@ -956,9 +928,9 @@ pub(crate) fn sub_worker_spawn_tool(
         runtime_base,
         workspace_root,
         spawner_cwd,
+        source_workdir_session,
         registry,
         spawner_manifest,
-        spawner_scope,
         prompts,
     )
 }
@@ -970,9 +942,9 @@ fn sub_worker_spawn_tool_impl(
     runtime_base: PathBuf,
     workspace_root: PathBuf,
     spawner_cwd: PathBuf,
+    source_workdir_session: Option<WorkdirSessionHandle>,
     registry: Arc<SpawnedWorkerRegistry>,
     spawner_manifest: WorkerManifest,
-    spawner_scope: SharedScope,
     prompts: Arc<ArcSwap<PromptCatalog>>,
 ) -> ToolDefinition {
     Arc::new(move || {
@@ -1002,13 +974,11 @@ fn sub_worker_spawn_tool_impl(
             runtime_base.clone(),
             workspace_root.clone(),
             spawner_cwd.clone(),
+            source_workdir_session.clone(),
             registry.clone(),
             spawner_manifest.clone(),
             prompts.load_full().source(),
             available_profiles,
-            spawner_scope.clone(),
-            DelegationScope::from_config(&spawner_manifest.delegation_scope)
-                .expect("resolved Worker manifest has a valid delegation scope"),
         ));
         (meta, tool)
     })
@@ -1017,6 +987,7 @@ fn sub_worker_spawn_tool_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use manifest::{DelegationScope, Scope, SharedScope};
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
@@ -1034,6 +1005,16 @@ mod tests {
     use crate::worker::{
         WorkspaceClient, WorkspaceClientError, WorkspaceRequest, WorkspaceResponse,
     };
+
+    #[test]
+    fn missing_active_workdir_session_fails_deterministically() {
+        let error = require_active_workdir_session(None).unwrap_err();
+        assert!(matches!(
+            error,
+            ToolError::InvalidArgument(message)
+                if message.contains("requires an active Workdir session")
+        ));
+    }
 
     #[test]
     fn reviewer_handoff_requires_explicit_builtin_profile_and_read_only_scope() {
@@ -1132,6 +1113,15 @@ extract_threshold = 4000
         let fail_requests = Arc::new(AtomicBool::new(false));
         let prompt_loader = PromptCatalogSource::builtins_only();
         let (parent_method_tx, mut parent_method_rx) = mpsc::channel(8);
+        let source_workdir_session = workdir::delegation_capable_session(Arc::new(
+            workdir::LocalWorkdirSession::materialized_bound(
+                workdir::Workdir::new("test-workdir"),
+                workspace_root.clone(),
+                workspace_root.clone(),
+                spawner_scope.clone(),
+                workdir::WorkdirSessionCapabilities::ALL,
+            ),
+        ));
         let tool = SubWorkerSpawnTool::new(
             "parent".into(),
             workspace_context,
@@ -1139,12 +1129,11 @@ extract_threshold = 4000
             runtime.path().to_path_buf(),
             workspace_root.clone(),
             workspace_root.clone(),
+            Some(source_workdir_session),
             registry.clone(),
             manifest.clone(),
             prompt_loader,
             available_profiles,
-            spawner_scope.clone(),
-            DelegationScope::from_config(&manifest.delegation_scope).unwrap(),
         )
         .with_internal_client(Box::new(ScriptedInternalClient {
             calls: calls.clone(),
@@ -1161,7 +1150,7 @@ extract_threshold = 4000
             "task": "review immutable commit",
             "scope": [{
                 "target": workspace_root.clone(),
-                "permission": "write",
+                "permission": "read",
                 "recursive": true
             }]
         });
@@ -1188,16 +1177,30 @@ extract_threshold = 4000
             .await
             .expect("spawn project reviewer as Internal Worker");
         assert!(output.summary.contains("internal worker `reviewer-child`"));
-        assert!(!spawner_scope.snapshot().is_writable(&workspace_root));
+        assert!(spawner_scope.snapshot().is_writable(&workspace_root));
         let record = registry
             .get_internal("reviewer-child")
             .expect("Internal reviewer registry record");
+        assert!(record.installed_tools.iter().any(|name| name == "Read"));
+        for denied in ["Write", "Edit", "Bash"] {
+            assert!(
+                !record.installed_tools.iter().any(|name| name == denied),
+                "read-only child unexpectedly received {denied}: {:?}",
+                record.installed_tools
+            );
+        }
+        assert!(
+            !record
+                .installed_tools
+                .iter()
+                .any(|name| matches!(name.as_str(), "WorkdirAttachSelf" | "WorkdirDetachSelf"))
+        );
         assert_eq!(
             record.session.wait_until_idle().await,
             crate::internal_worker::InternalWorkerSessionStatus::Idle
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(observed_parent_write_revoked.load(Ordering::SeqCst));
+        assert!(!observed_parent_write_revoked.load(Ordering::SeqCst));
         assert!(observed_instruction_override.load(Ordering::SeqCst));
         let completion = tokio::time::timeout(Duration::from_secs(1), parent_method_rx.recv())
             .await
@@ -1295,7 +1298,11 @@ extract_threshold = 4000
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert!(
             spawner_scope.snapshot().is_writable(&workspace_root),
-            "Failed terminal child must automatically reclaim its delegated write scope"
+            "Failed terminal child must release its delegated Workdir session"
+        );
+        assert!(
+            !record.workdir_delegation.is_active(),
+            "failed child must revoke cloned scoped sessions"
         );
         assert!(registry.get_internal("reviewer-child").is_some());
 
@@ -1315,7 +1322,7 @@ extract_threshold = 4000
         )
         .await
         .unwrap();
-        assert!(!spawner_scope.snapshot().is_writable(&workspace_root));
+        assert!(spawner_scope.snapshot().is_writable(&workspace_root));
         drop(list);
         drop(send);
         drop(stop);
@@ -1341,45 +1348,6 @@ extract_threshold = 4000
             !required.iter().any(|value| value.as_str() == Some("cwd")),
             "cwd must remain optional: {schema}"
         );
-    }
-
-    #[test]
-    fn spawn_worker_validate_cwd_requires_absolute_existing_directory_in_child_scope() {
-        let root = TempDir::new().unwrap();
-        let child_cwd = root.path().join("child");
-        std::fs::create_dir(&child_cwd).unwrap();
-        let file_path = root.path().join("file.txt");
-        std::fs::write(&file_path, "not a dir").unwrap();
-        let outside = TempDir::new().unwrap();
-        let missing = root.path().join("missing");
-        let rules = vec![abs_rule(root.path(), Permission::Write)];
-
-        assert_eq!(
-            validate_spawn_cwd(None, &rules, root.path()).unwrap(),
-            root.path()
-        );
-        assert_eq!(
-            validate_spawn_cwd(Some(&child_cwd), &rules, root.path()).unwrap(),
-            std::fs::canonicalize(&child_cwd).unwrap()
-        );
-
-        for (cwd, expected) in [
-            (Path::new("relative"), "must be absolute"),
-            (missing.as_path(), "does not exist"),
-            (file_path.as_path(), "must be a directory"),
-            (
-                outside.path(),
-                "outside the child's delegated readable scope",
-            ),
-        ] {
-            let err = validate_spawn_cwd(Some(cwd), &rules, root.path()).unwrap_err();
-            match err {
-                ToolError::InvalidArgument(message) => {
-                    assert!(message.contains(expected), "{message}")
-                }
-                other => panic!("expected InvalidArgument, got {other:?}"),
-            }
-        }
     }
 
     #[test]

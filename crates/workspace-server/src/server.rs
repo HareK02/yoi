@@ -49,7 +49,8 @@ use workdir::workspace::{
     WorkingDirectoryDetailResponse as BrowserWorkingDirectoryDetailResponse,
     WorkingDirectoryDiagnostic, WorkingDirectoryDiagnosticSeverity,
     WorkingDirectoryListResponse as BrowserWorkingDirectoryListResponse, WorkingDirectoryOccupancy,
-    WorkingDirectoryStatusKind, WorkingDirectorySummary,
+    WorkingDirectoryStatusKind, WorkingDirectorySummary, WorkspaceWorkdirSessionFence,
+    WorkspaceWorkdirSessionOperationRequest,
 };
 use worker::feature::builtin::{WorkerObservationSubject, WorkerObservationSubjectRef};
 use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest};
@@ -1522,6 +1523,10 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             "/api/w/{workspace_id}/workers/self/workdir-attachment",
             post(scoped_attach_current_worker_workdir)
                 .delete(scoped_detach_current_worker_workdir),
+        )
+        .route(
+            "/api/w/{workspace_id}/workers/self/workdir-session/fence",
+            get(scoped_current_worker_workdir_session_fence),
         )
         .route(
             "/api/w/{workspace_id}/workers/self/workdir-session/operations",
@@ -5043,7 +5048,7 @@ async fn scoped_attach_current_worker_workdir(
         worker: worker.clone(),
         workdir_id: workdir_id.to_string(),
         role: "attachment".to_string(),
-        linked_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        linked_at: Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
         unlinked_at: None,
     })?;
     if let Err(error) = open_current_worker_workdir_session_locked(&api, &worker, &link).await {
@@ -5086,19 +5091,55 @@ async fn scoped_detach_current_worker_workdir(
     }))
 }
 
+async fn scoped_current_worker_workdir_session_fence(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    headers: HeaderMap,
+) -> ApiResult<Json<WorkspaceWorkdirSessionFence>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let worker = current_worker_identity(&api, &path.workspace_id, &headers)?;
+    let session_lock = current_worker_session_lock(&api, &worker);
+    let _session_guard = session_lock.lock().await;
+    let link = current_worker_active_attachment(&api, &worker)?;
+    Ok(Json(WorkspaceWorkdirSessionFence {
+        value: current_worker_workdir_session_fence(&link),
+    }))
+}
+
+fn current_worker_workdir_session_fence(link: &WorkerWorkdirLinkRecord) -> String {
+    format!("v1:{}\0{}", link.workdir_id, link.linked_at)
+}
+
+fn validate_current_worker_workdir_session_fence(
+    link: &WorkerWorkdirLinkRecord,
+    expected: Option<&str>,
+) -> Result<()> {
+    if expected.is_some_and(|expected| expected != current_worker_workdir_session_fence(link)) {
+        Err(Error::WorkdirAttachmentConflict(
+            "delegated Workdir session attachment changed".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 async fn scoped_execute_current_worker_workdir_operation(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
     headers: HeaderMap,
-    Json(operation): Json<WorkdirSessionOperation>,
+    Json(request): Json<WorkspaceWorkdirSessionOperationRequest>,
 ) -> ApiResult<Json<WorkdirSessionOperationResult>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let worker = current_worker_identity(&api, &path.workspace_id, &headers)?;
     let session_lock = current_worker_session_lock(&api, &worker);
     let _session_guard = session_lock.lock().await;
     let link = current_worker_active_attachment(&api, &worker)?;
+    validate_current_worker_workdir_session_fence(
+        &link,
+        request.expected_session_fence.as_deref(),
+    )?;
     let session = open_current_worker_workdir_session_locked(&api, &worker, &link).await?;
-    let result = execute_workdir_session_operation(&session, operation)
+    let result = execute_workdir_session_operation(&session, request.operation)
         .await
         .map_err(|error| Error::RuntimeOperationFailed {
             runtime_id: worker.runtime_id.clone(),
@@ -16165,6 +16206,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn delegated_workdir_session_fence_rejects_reattached_link() {
+        let first = WorkerWorkdirLinkRecord {
+            workspace_id: "workspace-a".to_string(),
+            worker: workdir::workspace::RuntimeWorkerRef::new("runtime-a", "worker-a"),
+            workdir_id: "workdir-a".to_string(),
+            role: "primary".to_string(),
+            linked_at: "2026-01-01T00:00:00Z".to_string(),
+            unlinked_at: None,
+        };
+        let expected = current_worker_workdir_session_fence(&first);
+        assert!(validate_current_worker_workdir_session_fence(&first, None).is_ok());
+        assert!(validate_current_worker_workdir_session_fence(&first, Some(&expected)).is_ok());
+
+        let reattached = WorkerWorkdirLinkRecord {
+            linked_at: "2026-01-01T00:00:01Z".to_string(),
+            ..first
+        };
+        assert!(matches!(
+            validate_current_worker_workdir_session_fence(&reattached, Some(&expected)),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
     }
 
     #[tokio::test]

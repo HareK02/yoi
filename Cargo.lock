@@ -6067,6 +6067,7 @@ dependencies = [
  "config-source",
  "dotenv",
  "flow",
+ "fs-operation",
  "fs4",
  "futures",
  "futures-util",

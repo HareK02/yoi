@@ -19,6 +19,7 @@ use session_store::{
     WorkerMetadataStore, WorkerReclaimedChild, WorkerSpawnedChild, WorkerStoreError,
 };
 use tracing::warn;
+use workdir::WorkdirDelegation;
 
 use crate::internal_worker::InternalWorkerSessionHandle;
 use crate::runtime::dir::{RuntimeDir, SpawnedWorkerRecord};
@@ -28,6 +29,9 @@ use crate::runtime::worker_allocation;
 pub(crate) struct InternalSpawnedWorkerRecord {
     pub worker_name: String,
     pub scope_delegated: Vec<ScopeRule>,
+    pub workdir_delegation: Arc<WorkdirDelegation>,
+    #[cfg(test)]
+    pub installed_tools: Arc<[String]>,
     pub session: InternalWorkerSessionHandle,
     scope_reclaimed: Arc<AtomicBool>,
 }
@@ -36,11 +40,16 @@ impl InternalSpawnedWorkerRecord {
     pub(crate) fn new(
         worker_name: String,
         scope_delegated: Vec<ScopeRule>,
+        workdir_delegation: WorkdirDelegation,
+        #[cfg(test)] installed_tools: Vec<String>,
         session: InternalWorkerSessionHandle,
     ) -> Self {
         Self {
             worker_name,
             scope_delegated,
+            workdir_delegation: Arc::new(workdir_delegation),
+            #[cfg(test)]
+            installed_tools: installed_tools.into(),
             session,
             scope_reclaimed: Arc::new(AtomicBool::new(false)),
         }
@@ -247,6 +256,7 @@ impl SpawnedWorkerRegistry {
         if !record.claim_scope_reclaim() {
             return Ok(false);
         }
+        record.workdir_delegation.release();
         let result = if let Some(parent_scope) = &self.parent_scope {
             parent_scope
                 .update(|current| current.with_removed_deny_rules(delegated_write_rules(record)))
