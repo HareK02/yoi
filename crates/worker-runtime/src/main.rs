@@ -994,6 +994,12 @@ mod tests {
             root.join("runtime.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
                 "schema_version": 1,
+                "display_name": "local",
+                "backend": "fs_store",
+                "status": "running",
+                "next_diagnostic_id": 1,
+                "config_bundles": {},
+                "workspace_owners": {},
                 "assignments": [],
                 "execution": [],
                 "diagnostics": []
@@ -1015,6 +1021,48 @@ mod tests {
             root.display().to_string(),
         ])
         .unwrap();
+        assert_eq!(std::fs::read(root.join("runtime.json")).unwrap(), before);
+    }
+
+    #[test]
+    fn migration_dry_run_rejects_v1_document_that_cannot_decode_as_v3() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("runtime");
+        std::fs::create_dir_all(root.join("workers")).unwrap();
+        std::fs::write(
+            root.join("runtime.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "display_name": "local",
+                "backend": "fs_store",
+                "status": 3,
+                "next_diagnostic_id": 1,
+                "config_bundles": {},
+                "workspace_owners": {},
+                "diagnostics": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let before = std::fs::read(root.join("runtime.json")).unwrap();
+        let error = run_migration_command(vec![
+            "migrate".to_string(),
+            "--dry-run".to_string(),
+            "--runtime-id".to_string(),
+            "local".to_string(),
+            "--store".to_string(),
+            "fs".to_string(),
+            "--fs-root".to_string(),
+            temp.path().display().to_string(),
+            "--fs-runtime-dir".to_string(),
+            root.display().to_string(),
+        ])
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("decode migrated Runtime snapshot")
+        );
         assert_eq!(std::fs::read(root.join("runtime.json")).unwrap(), before);
     }
 

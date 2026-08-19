@@ -13,10 +13,11 @@ use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const RUNTIME_FILE: &str = "runtime.json";
 const WORKERS_DIR: &str = "workers";
 const WORKER_FILE: &str = "worker.json";
+const WORKER_METADATA_FILE: &str = "metadata.json";
 const LEGACY_OBSERVATIONS_FILE: &str = "observations.jsonl";
 
 static NEXT_TMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -57,13 +58,13 @@ impl FsRuntimeStore {
     pub fn migration_plan(
         options: &FsRuntimeStoreOptions,
     ) -> Result<FsRuntimeStoreMigrationPlan, RuntimeError> {
-        plan_v1_worker_identity(&options.root, &options.runtime_id).map(|(plan, _)| plan)
+        plan_runtime_store_migration(&options.root, &options.runtime_id).map(|(plan, _)| plan)
     }
 
     pub fn migrate(
         options: &FsRuntimeStoreOptions,
     ) -> Result<FsRuntimeStoreMigrationPlan, RuntimeError> {
-        migrate_v1_worker_identity(&options.root, &options.runtime_id)
+        migrate_runtime_store(&options.root, &options.runtime_id)
     }
 
     pub fn root(&self) -> &Path {
@@ -106,7 +107,7 @@ impl FsRuntimeStore {
         }
 
         if existed {
-            migrate_v1_worker_identity(&root, runtime_id)?;
+            migrate_runtime_store(&root, runtime_id)?;
         }
         let store = Self { root };
         let state = if existed {
@@ -306,6 +307,9 @@ pub struct FsRuntimeStoreMigrationPlan {
     pub target_schema_version: u32,
     pub migration_required: bool,
     pub worker_count: usize,
+    pub migrated_worker_aggregate_count: usize,
+    pub migrated_diagnostic_worker_ref_count: usize,
+    pub cleared_diagnostic_worker_ref_count: usize,
     pub mapping_digest: String,
     pub mappings: Vec<LegacyWorkerIdentityMapping>,
     pub excluded_ephemeral_paths: Vec<String>,
@@ -313,11 +317,13 @@ pub struct FsRuntimeStoreMigrationPlan {
 
 #[derive(Clone, Debug)]
 struct PlannedRuntimeWorkerMigration {
-    mapping: LegacyWorkerIdentityMapping,
-    legacy_dir: PathBuf,
+    worker_id: WorkerId,
+    source_dir: PathBuf,
+    workspace_id: Option<String>,
+    legacy_mapping: Option<LegacyWorkerIdentityMapping>,
 }
 
-fn plan_v1_worker_identity(
+fn plan_runtime_store_migration(
     root: &Path,
     runtime_id: &str,
 ) -> Result<
@@ -351,8 +357,8 @@ fn plan_v1_worker_identity(
             format!("Runtime store schema version {schema_version} is out of range"),
         )
     })?;
-    let staging = migration_sibling(root, "schema-v2-staging")?;
-    let backup = migration_sibling(root, "schema-v1-backup")?;
+    let staging = migration_sibling(root, "schema-v3-staging")?;
+    let backup = migration_sibling(root, "pre-schema-v3-backup")?;
     if staging.exists() || backup.exists() {
         return Err(runtime_store_corrupt(
             root,
@@ -369,17 +375,20 @@ fn plan_v1_worker_identity(
             target_schema_version: SCHEMA_VERSION,
             migration_required: false,
             worker_count: 0,
+            migrated_worker_aggregate_count: 0,
+            migrated_diagnostic_worker_ref_count: 0,
+            cleared_diagnostic_worker_ref_count: 0,
             mapping_digest: legacy_worker_identity_mapping_digest(&[]),
             mappings: Vec::new(),
             excluded_ephemeral_paths: Vec::new(),
         };
         return Ok((plan, Vec::new()));
     }
-    if current_schema_version != 1 {
+    if !matches!(current_schema_version, 1 | 2) {
         return Err(runtime_store_corrupt(
             &runtime_path,
             format!(
-                "unsupported Runtime store schema version {schema_version}; expected 1 or {SCHEMA_VERSION}"
+                "unsupported Runtime store schema version {schema_version}; expected 1, 2, or {SCHEMA_VERSION}"
             ),
         ));
     }
@@ -394,93 +403,466 @@ fn plan_v1_worker_identity(
     let mut planned = Vec::with_capacity(entries.len());
     let mut target_ids = std::collections::BTreeSet::new();
     for entry in entries {
-        let legacy_dir = entry.path();
-        if !legacy_dir.is_dir() {
+        let source_dir = entry.path();
+        if !source_dir.is_dir() {
             return Err(runtime_store_corrupt(
-                &legacy_dir,
-                "legacy workers directory contains a non-directory entry".to_string(),
+                &source_dir,
+                "workers directory contains a non-directory entry".to_string(),
             ));
         }
         let name = entry.file_name();
         let name = name.to_str().ok_or_else(|| {
-            runtime_store_corrupt(
-                &legacy_dir,
-                "legacy Worker directory is not UTF-8".to_string(),
-            )
+            runtime_store_corrupt(&source_dir, "Worker directory is not UTF-8".to_string())
         })?;
-        let legacy_worker_id = name.parse::<u64>().map_err(|_| {
-            runtime_store_corrupt(
-                &legacy_dir,
-                format!("legacy Worker directory name must be numeric, found {name}"),
-            )
-        })?;
-        let snapshot_path = legacy_dir.join(WORKER_FILE);
-        let snapshot: serde_json::Value = read_json(&snapshot_path, "read legacy worker snapshot")?;
-        let workspace_id = snapshot
-            .get("workspace_id")
-            .and_then(serde_json::Value::as_str)
-            .filter(|workspace_id| !workspace_id.is_empty())
-            .ok_or_else(|| {
+        let snapshot_path = source_dir.join(WORKER_FILE);
+        let snapshot: serde_json::Value = read_json(&snapshot_path, "read Worker snapshot")?;
+        let (worker_id, workspace_id, legacy_mapping) = if current_schema_version == 1 {
+            let legacy_worker_id = name.parse::<u64>().map_err(|_| {
                 runtime_store_corrupt(
-                    &snapshot_path,
-                    "legacy Worker snapshot is missing workspace_id; unscoped Workers require an explicit migration disposition"
-                        .to_string(),
+                    &source_dir,
+                    format!("legacy Worker directory name must be numeric, found {name}"),
                 )
-            })?
-            .to_string();
-        let worker_id = WorkerId::from_legacy_binding(&workspace_id, runtime_id, legacy_worker_id);
+            })?;
+            let workspace_id = snapshot
+                .get("workspace_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|workspace_id| !workspace_id.is_empty())
+                .ok_or_else(|| {
+                    runtime_store_corrupt(
+                        &snapshot_path,
+                        "legacy Worker snapshot is missing workspace_id; unscoped Workers require an explicit migration disposition"
+                            .to_string(),
+                    )
+                })?
+                .to_string();
+            let worker_id =
+                WorkerId::from_legacy_binding(&workspace_id, runtime_id, legacy_worker_id);
+            let mapping = LegacyWorkerIdentityMapping {
+                workspace_id: workspace_id.clone(),
+                runtime_id: runtime_id.to_string(),
+                legacy_worker_id,
+                worker_id,
+            };
+            (worker_id, Some(workspace_id), Some(mapping))
+        } else {
+            let worker_id = name.parse::<WorkerId>().map_err(|_| {
+                runtime_store_corrupt(
+                    &source_dir,
+                    format!("schema-v2 Worker directory name must be a UUIDv7, found {name}"),
+                )
+            })?;
+            (worker_id, None, None)
+        };
         if !target_ids.insert(worker_id) {
             return Err(runtime_store_corrupt(
                 &snapshot_path,
-                format!("legacy Worker identity maps to duplicate target {worker_id}"),
+                format!("Worker identity maps to duplicate target {worker_id}"),
             ));
         }
         let target_dir = workers_dir.join(worker_id.to_string());
-        if target_dir.exists() && target_dir != legacy_dir {
+        if target_dir.exists() && target_dir != source_dir {
             return Err(runtime_store_corrupt(
                 &target_dir,
                 format!("target Worker directory {worker_id} already exists"),
             ));
         }
-        let request = snapshot
-            .get("request")
-            .and_then(serde_json::Value::as_object)
-            .ok_or_else(|| {
-                runtime_store_corrupt(
-                    &snapshot_path,
-                    "Worker snapshot request must be an object".to_string(),
-                )
-            })?;
-        if request.get("profile").is_none() {
-            return Err(runtime_store_corrupt(
-                &snapshot_path,
-                "Worker snapshot request is missing profile".to_string(),
-            ));
-        }
         planned.push(PlannedRuntimeWorkerMigration {
-            mapping: LegacyWorkerIdentityMapping {
-                workspace_id,
-                runtime_id: runtime_id.to_string(),
-                legacy_worker_id,
-                worker_id,
-            },
-            legacy_dir,
+            worker_id,
+            source_dir,
+            workspace_id,
+            legacy_mapping,
         });
     }
     let mappings = planned
         .iter()
-        .map(|worker| worker.mapping.clone())
+        .filter_map(|worker| worker.legacy_mapping.clone())
         .collect::<Vec<_>>();
+    let mut migrated_worker_aggregate_count = 0;
+    for worker in &mut planned {
+        let snapshot_path = worker.source_dir.join(WORKER_FILE);
+        let snapshot: serde_json::Value = read_json(&snapshot_path, "read Worker snapshot")?;
+        let migrated = migrate_worker_document(
+            snapshot,
+            current_schema_version,
+            worker.legacy_mapping.as_ref(),
+            &snapshot_path,
+        )?;
+        let snapshot = validate_migrated_worker_document(&migrated, &snapshot_path)?;
+        if snapshot.worker_id != worker.worker_id {
+            return Err(runtime_store_corrupt(
+                &snapshot_path,
+                format!(
+                    "Worker snapshot id {} does not match directory identity {}",
+                    snapshot.worker_id, worker.worker_id
+                ),
+            ));
+        }
+        worker.workspace_id = worker
+            .workspace_id
+            .clone()
+            .or(snapshot.workspace_id)
+            .or_else(|| {
+                snapshot
+                    .request
+                    .workspace_api
+                    .map(|workspace_api| workspace_api.workspace_id)
+            });
+
+        let metadata_path = worker.source_dir.join(WORKER_METADATA_FILE);
+        if metadata_path.is_file() {
+            let metadata: serde_json::Value =
+                read_json(&metadata_path, "read Worker aggregate metadata")?;
+            let (_, migrated) =
+                migrate_worker_aggregate_document(metadata, worker, runtime_id, &metadata_path)?;
+            migrated_worker_aggregate_count += usize::from(migrated);
+        }
+    }
+    let (_, diagnostic_refs) =
+        migrate_runtime_document(document, current_schema_version, &mappings, &runtime_path)?;
     let plan = FsRuntimeStoreMigrationPlan {
         current_schema_version,
         target_schema_version: SCHEMA_VERSION,
         migration_required: true,
-        worker_count: mappings.len(),
+        worker_count: planned.len(),
+        migrated_worker_aggregate_count,
+        migrated_diagnostic_worker_ref_count: diagnostic_refs.migrated,
+        cleared_diagnostic_worker_ref_count: diagnostic_refs.cleared,
         mapping_digest: legacy_worker_identity_mapping_digest(&mappings),
         mappings,
         excluded_ephemeral_paths,
     };
     Ok((plan, planned))
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DiagnosticWorkerRefMigrationCounts {
+    migrated: usize,
+    cleared: usize,
+}
+
+fn migrate_v1_worker_document(
+    mut snapshot: serde_json::Value,
+    mapping: &LegacyWorkerIdentityMapping,
+    snapshot_path: &Path,
+) -> Result<serde_json::Value, RuntimeError> {
+    let worker_id_text = mapping.worker_id.to_string();
+    let snapshot_object = snapshot.as_object_mut().ok_or_else(|| {
+        runtime_store_corrupt(
+            snapshot_path,
+            "Worker snapshot must be an object".to_string(),
+        )
+    })?;
+    snapshot_object.insert(
+        "schema_version".to_string(),
+        serde_json::Value::from(SCHEMA_VERSION),
+    );
+    snapshot_object.insert(
+        "worker_id".to_string(),
+        serde_json::Value::String(worker_id_text.clone()),
+    );
+    snapshot_object
+        .get_mut("worker_ref")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| {
+            runtime_store_corrupt(
+                snapshot_path,
+                "Worker snapshot worker_ref must be an object".to_string(),
+            )
+        })?
+        .insert(
+            "worker_id".to_string(),
+            serde_json::Value::String(worker_id_text.clone()),
+        );
+    let request = snapshot_object
+        .get_mut("request")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| {
+            runtime_store_corrupt(
+                snapshot_path,
+                "Worker snapshot request must be an object".to_string(),
+            )
+        })?;
+    let fingerprint = request
+        .remove("idempotency_fingerprint")
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| {
+            format!(
+                "legacy:{}:{}:{}",
+                mapping.workspace_id, mapping.runtime_id, mapping.legacy_worker_id
+            )
+        });
+    request.remove("idempotency_key");
+    request.insert(
+        "worker_id".to_string(),
+        serde_json::Value::String(worker_id_text),
+    );
+    request.insert(
+        "create_fingerprint".to_string(),
+        serde_json::Value::String(fingerprint),
+    );
+    Ok(snapshot)
+}
+
+fn migrate_worker_document(
+    mut document: serde_json::Value,
+    source_schema_version: u32,
+    mapping: Option<&LegacyWorkerIdentityMapping>,
+    snapshot_path: &Path,
+) -> Result<serde_json::Value, RuntimeError> {
+    if source_schema_version == 1 {
+        return migrate_v1_worker_document(
+            document,
+            mapping.ok_or_else(|| {
+                runtime_store_corrupt(
+                    snapshot_path,
+                    "schema-v1 Worker migration is missing its identity mapping".to_string(),
+                )
+            })?,
+            snapshot_path,
+        );
+    }
+    let object = document.as_object_mut().ok_or_else(|| {
+        runtime_store_corrupt(
+            snapshot_path,
+            "Worker snapshot must be an object".to_string(),
+        )
+    })?;
+    object.insert(
+        "schema_version".to_string(),
+        serde_json::Value::from(SCHEMA_VERSION),
+    );
+    Ok(document)
+}
+
+fn validate_migrated_worker_document(
+    document: &serde_json::Value,
+    snapshot_path: &Path,
+) -> Result<WorkerSnapshot, RuntimeError> {
+    let snapshot: WorkerSnapshot = serde_json::from_value(document.clone()).map_err(|error| {
+        runtime_store_corrupt(
+            snapshot_path,
+            format!("decode migrated Worker snapshot: {error}"),
+        )
+    })?;
+    snapshot.validate(snapshot_path)?;
+    Ok(snapshot)
+}
+
+fn runtime_worker_name(worker_id: WorkerId) -> String {
+    format!("worker-runtime-{worker_id}")
+}
+
+fn migrate_worker_aggregate_document(
+    mut document: serde_json::Value,
+    worker: &PlannedRuntimeWorkerMigration,
+    runtime_id: &str,
+    metadata_path: &Path,
+) -> Result<(serde_json::Value, bool), RuntimeError> {
+    let expected_name = runtime_worker_name(worker.worker_id);
+    let metadata = document.as_object_mut().ok_or_else(|| {
+        runtime_store_corrupt(
+            metadata_path,
+            "Worker aggregate metadata must be an object".to_string(),
+        )
+    })?;
+    let actual_name = metadata
+        .get("worker_name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            runtime_store_corrupt(
+                metadata_path,
+                "Worker aggregate metadata is missing worker_name".to_string(),
+            )
+        })?
+        .to_string();
+    let migrated = actual_name != expected_name;
+    if migrated {
+        let legacy_worker_id = actual_name
+            .strip_prefix("worker-runtime-")
+            .and_then(|worker_id| worker_id.parse::<u64>().ok())
+            .ok_or_else(|| {
+                runtime_store_corrupt(
+                    metadata_path,
+                    format!(
+                        "Worker aggregate identity {actual_name} is neither the expected UUID identity nor a legacy numeric identity"
+                    ),
+                )
+            })?;
+        let workspace_id = worker.workspace_id.as_deref().ok_or_else(|| {
+            runtime_store_corrupt(
+                metadata_path,
+                "legacy Worker aggregate identity has no Workspace binding".to_string(),
+            )
+        })?;
+        let mapped = WorkerId::from_legacy_binding(workspace_id, runtime_id, legacy_worker_id);
+        if mapped != worker.worker_id {
+            return Err(runtime_store_corrupt(
+                metadata_path,
+                format!(
+                    "legacy Worker aggregate identity {actual_name} maps to {mapped}, expected {}",
+                    worker.worker_id
+                ),
+            ));
+        }
+    }
+
+    if let Some(snapshot) = metadata
+        .get_mut("resolved_manifest_snapshot")
+        .filter(|snapshot| !snapshot.is_null())
+    {
+        let manifest: manifest::WorkerManifest =
+            serde_json::from_value(snapshot.clone()).map_err(|error| {
+                runtime_store_corrupt(
+                    metadata_path,
+                    format!("decode Worker aggregate resolved manifest snapshot: {error}"),
+                )
+            })?;
+        if manifest.worker.name != actual_name {
+            return Err(runtime_store_corrupt(
+                metadata_path,
+                format!(
+                    "Worker aggregate manifest identity {} does not match metadata identity {actual_name}",
+                    manifest.worker.name
+                ),
+            ));
+        }
+        snapshot
+            .as_object_mut()
+            .and_then(|manifest| manifest.get_mut("worker"))
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| {
+                runtime_store_corrupt(
+                    metadata_path,
+                    "Worker aggregate resolved manifest is missing worker metadata".to_string(),
+                )
+            })?
+            .insert(
+                "name".to_string(),
+                serde_json::Value::String(expected_name.clone()),
+            );
+    }
+    metadata.insert(
+        "worker_name".to_string(),
+        serde_json::Value::String(expected_name.clone()),
+    );
+
+    let metadata: session_store::WorkerMetadata = serde_json::from_value(document.clone())
+        .map_err(|error| {
+            runtime_store_corrupt(
+                metadata_path,
+                format!("decode migrated Worker aggregate metadata: {error}"),
+            )
+        })?;
+    if metadata.worker_name != expected_name {
+        return Err(runtime_store_corrupt(
+            metadata_path,
+            "migrated Worker aggregate identity does not match its Worker UUID".to_string(),
+        ));
+    }
+    if let Some(snapshot) = metadata.resolved_manifest_snapshot {
+        let manifest: manifest::WorkerManifest =
+            serde_json::from_value(snapshot).map_err(|error| {
+                runtime_store_corrupt(
+                    metadata_path,
+                    format!("decode migrated Worker aggregate resolved manifest: {error}"),
+                )
+            })?;
+        if manifest.worker.name != expected_name {
+            return Err(runtime_store_corrupt(
+                metadata_path,
+                "migrated Worker aggregate manifest identity does not match its Worker UUID"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok((document, migrated))
+}
+
+fn migrate_runtime_document(
+    mut document: serde_json::Value,
+    source_schema_version: u32,
+    mappings: &[LegacyWorkerIdentityMapping],
+    runtime_path: &Path,
+) -> Result<(serde_json::Value, DiagnosticWorkerRefMigrationCounts), RuntimeError> {
+    let mapped_worker_ids = mappings
+        .iter()
+        .map(|mapping| (mapping.legacy_worker_id, mapping.worker_id))
+        .collect::<BTreeMap<_, _>>();
+    let mut counts = DiagnosticWorkerRefMigrationCounts::default();
+    if source_schema_version == 1
+        && let Some(diagnostics) = document.get_mut("diagnostics")
+    {
+        let diagnostics = diagnostics.as_array_mut().ok_or_else(|| {
+            runtime_store_corrupt(
+                runtime_path,
+                "Runtime snapshot diagnostics must be an array".to_string(),
+            )
+        })?;
+        for (index, diagnostic) in diagnostics.iter_mut().enumerate() {
+            let diagnostic = diagnostic.as_object_mut().ok_or_else(|| {
+                runtime_store_corrupt(
+                    runtime_path,
+                    format!("Runtime diagnostic {index} must be an object"),
+                )
+            })?;
+            let Some(worker_ref) = diagnostic.get("worker_ref") else {
+                continue;
+            };
+            if worker_ref.is_null() {
+                continue;
+            }
+            let legacy_worker_id = worker_ref
+                .as_object()
+                .and_then(|worker_ref| worker_ref.get("worker_id"))
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    runtime_store_corrupt(
+                        runtime_path,
+                        format!(
+                            "Runtime diagnostic {index} worker_ref.worker_id must be an unsigned legacy Worker id"
+                        ),
+                    )
+                })?;
+            if let Some(worker_id) = mapped_worker_ids.get(&legacy_worker_id) {
+                diagnostic
+                    .get_mut("worker_ref")
+                    .and_then(serde_json::Value::as_object_mut)
+                    .expect("validated diagnostic Worker reference")
+                    .insert(
+                        "worker_id".to_string(),
+                        serde_json::Value::String(worker_id.to_string()),
+                    );
+                counts.migrated += 1;
+            } else {
+                // The diagnostic remains useful historical evidence, but a deleted
+                // legacy Worker has no Workspace binding from which a stable UUID
+                // can be reconstructed.
+                diagnostic.remove("worker_ref");
+                counts.cleared += 1;
+            }
+        }
+    }
+
+    let object = document.as_object_mut().ok_or_else(|| {
+        runtime_store_corrupt(
+            runtime_path,
+            "Runtime snapshot must be an object".to_string(),
+        )
+    })?;
+    object.insert(
+        "schema_version".to_string(),
+        serde_json::Value::from(SCHEMA_VERSION),
+    );
+    object.remove("workers");
+    object.remove("next_worker_sequence");
+    let snapshot: RuntimeSnapshot = serde_json::from_value(document.clone()).map_err(|error| {
+        runtime_store_corrupt(
+            runtime_path,
+            format!("decode migrated Runtime snapshot: {error}"),
+        )
+    })?;
+    snapshot.validate(runtime_path)?;
+    Ok((document, counts))
 }
 
 fn migration_sibling(root: &Path, suffix: &str) -> Result<PathBuf, RuntimeError> {
@@ -512,7 +894,7 @@ fn runtime_ephemeral_socket(root: &Path, path: &Path) -> Result<bool, RuntimeErr
         .collect::<Vec<_>>();
     let known_path = components.len() == 5
         && components[0] == WORKERS_DIR
-        && components[1].parse::<u64>().is_ok()
+        && (components[1].parse::<u64>().is_ok() || WorkerId::parse(&components[1]).is_some())
         && components[2] == "runs"
         && components[3].parse::<u64>().is_ok()
         && components[4] == "worker.sock";
@@ -615,16 +997,16 @@ fn copy_runtime_tree(root: &Path, source: &Path, target: &Path) -> Result<(), Ru
     Ok(())
 }
 
-fn migrate_v1_worker_identity(
+fn migrate_runtime_store(
     root: &Path,
     runtime_id: &str,
 ) -> Result<FsRuntimeStoreMigrationPlan, RuntimeError> {
-    let (plan, _) = plan_v1_worker_identity(root, runtime_id)?;
+    let (plan, _) = plan_runtime_store_migration(root, runtime_id)?;
     if !plan.migration_required {
         return Ok(plan);
     }
-    let staging = migration_sibling(root, "schema-v2-staging")?;
-    let backup = migration_sibling(root, "schema-v1-backup")?;
+    let staging = migration_sibling(root, "schema-v3-staging")?;
+    let backup = migration_sibling(root, "pre-schema-v3-backup")?;
     if staging.exists() || backup.exists() {
         return Err(runtime_store_corrupt(
             root,
@@ -639,7 +1021,7 @@ fn migrate_v1_worker_identity(
         let _ = fs::remove_dir_all(&staging);
         return Err(error);
     }
-    let staged_plan = match migrate_v1_worker_identity_in_place(&staging, runtime_id) {
+    let staged_plan = match migrate_runtime_store_in_place(&staging, runtime_id) {
         Ok(plan) => plan,
         Err(error) => {
             let _ = fs::remove_dir_all(&staging);
@@ -678,18 +1060,18 @@ fn migrate_v1_worker_identity(
     Ok(plan)
 }
 
-fn migrate_v1_worker_identity_in_place(
+fn migrate_runtime_store_in_place(
     root: &Path,
     runtime_id: &str,
 ) -> Result<FsRuntimeStoreMigrationPlan, RuntimeError> {
-    let (plan, planned_workers) = plan_v1_worker_identity(root, runtime_id)?;
+    let (plan, planned_workers) = plan_runtime_store_migration(root, runtime_id)?;
     if !plan.migration_required {
         return Ok(plan);
     }
     let runtime_path = root.join(RUNTIME_FILE);
     let bytes =
         fs::read(&runtime_path).map_err(|error| runtime_io_error("read", &runtime_path, error))?;
-    let mut document: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+    let document: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
         runtime_store_corrupt(
             &runtime_path,
             format!("decode Runtime state {}: {error}", runtime_path.display()),
@@ -697,65 +1079,69 @@ fn migrate_v1_worker_identity_in_place(
     })?;
 
     for planned_worker in &planned_workers {
-        let legacy_id = planned_worker.mapping.legacy_worker_id;
-        let legacy_dir = &planned_worker.legacy_dir;
-        let legacy_snapshot_path = legacy_dir.join(WORKER_FILE);
-        let bytes = fs::read(&legacy_snapshot_path)
-            .map_err(|error| runtime_io_error("read", &legacy_snapshot_path, error))?;
-        let mut snapshot: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        let source_dir = &planned_worker.source_dir;
+        let source_snapshot_path = source_dir.join(WORKER_FILE);
+        let bytes = fs::read(&source_snapshot_path)
+            .map_err(|error| runtime_io_error("read", &source_snapshot_path, error))?;
+        let snapshot: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
             runtime_store_corrupt(
-                &runtime_path,
+                &source_snapshot_path,
                 format!(
                     "decode Worker snapshot {}: {error}",
-                    legacy_snapshot_path.display()
+                    source_snapshot_path.display()
                 ),
             )
         })?;
-        let workspace_id = planned_worker.mapping.workspace_id.clone();
-        let worker_id = planned_worker.mapping.worker_id;
-        let worker_id_text = worker_id.to_string();
-        snapshot["schema_version"] = serde_json::Value::from(SCHEMA_VERSION);
-        snapshot["worker_id"] = serde_json::Value::String(worker_id_text.clone());
-        snapshot["worker_ref"]["worker_id"] = serde_json::Value::String(worker_id_text.clone());
-        let request = snapshot
-            .get_mut("request")
-            .and_then(serde_json::Value::as_object_mut)
-            .ok_or_else(|| {
-                runtime_store_corrupt(
-                    &runtime_path,
-                    "Worker snapshot request must be an object".to_string(),
-                )
-            })?;
-        let fingerprint = request
-            .remove("idempotency_fingerprint")
-            .and_then(|value| value.as_str().map(ToOwned::to_owned))
-            .unwrap_or_else(|| format!("legacy:{workspace_id}:{runtime_id}:{legacy_id}"));
-        request.remove("idempotency_key");
-        request.insert(
-            "worker_id".to_string(),
-            serde_json::Value::String(worker_id_text.clone()),
-        );
-        request.insert(
-            "create_fingerprint".to_string(),
-            serde_json::Value::String(fingerprint),
-        );
+        let snapshot = migrate_worker_document(
+            snapshot,
+            plan.current_schema_version,
+            planned_worker.legacy_mapping.as_ref(),
+            &source_snapshot_path,
+        )?;
+        let metadata_path = source_dir.join(WORKER_METADATA_FILE);
+        let metadata = if metadata_path.is_file() {
+            let metadata: serde_json::Value =
+                read_json(&metadata_path, "read Worker aggregate metadata")?;
+            Some(
+                migrate_worker_aggregate_document(
+                    metadata,
+                    planned_worker,
+                    runtime_id,
+                    &metadata_path,
+                )?
+                .0,
+            )
+        } else {
+            None
+        };
 
+        let worker_id_text = planned_worker.worker_id.to_string();
         let migrated_dir = root.join("workers").join(&worker_id_text);
-        fs::rename(&legacy_dir, &migrated_dir)
-            .map_err(|error| runtime_io_error("rename", &legacy_dir, error))?;
+        if source_dir != &migrated_dir {
+            fs::rename(source_dir, &migrated_dir)
+                .map_err(|error| runtime_io_error("rename", source_dir, error))?;
+        }
         let migrated_snapshot_path = migrated_dir.join(WORKER_FILE);
         atomic_write_json(
             &migrated_snapshot_path,
             &snapshot,
             "migrate Worker identity",
         )?;
+        if let Some(metadata) = metadata {
+            atomic_write_json(
+                &migrated_dir.join(WORKER_METADATA_FILE),
+                &metadata,
+                "migrate Worker aggregate identity",
+            )?;
+        }
     }
 
-    document["schema_version"] = serde_json::Value::from(SCHEMA_VERSION);
-    if let Some(object) = document.as_object_mut() {
-        object.remove("workers");
-        object.remove("next_worker_sequence");
-    }
+    let (document, _) = migrate_runtime_document(
+        document,
+        plan.current_schema_version,
+        &plan.mappings,
+        &runtime_path,
+    )?;
     atomic_write_json(
         &runtime_path,
         &document,

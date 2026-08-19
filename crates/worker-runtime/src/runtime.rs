@@ -4181,6 +4181,34 @@ mod tests {
             serde_json::to_vec_pretty(&worker_json).unwrap(),
         )
         .unwrap();
+        let legacy_worker_name = "worker-runtime-7";
+        let legacy_manifest = manifest::WorkerManifest::from_toml(&format!(
+            r#"
+                [worker]
+                name = "{legacy_worker_name}"
+
+                [model]
+                scheme = "anthropic"
+                model_id = "test-model"
+
+                [engine]
+
+                [[scope.allow]]
+                target = "/tmp"
+                permission = "write"
+            "#,
+        ))
+        .unwrap();
+        std::fs::write(
+            legacy_dir.join("metadata.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "worker_name": legacy_worker_name,
+                "workspace_id": "workspace-a",
+                "resolved_manifest_snapshot": legacy_manifest
+            }))
+            .unwrap(),
+        )
+        .unwrap();
 
         let runtime_path = root.join("runtime.json");
         let mut runtime_json: serde_json::Value =
@@ -4188,6 +4216,23 @@ mod tests {
         runtime_json["schema_version"] = serde_json::json!(1);
         runtime_json["workers"] = serde_json::json!({"legacy": "ignored"});
         runtime_json["next_worker_sequence"] = serde_json::json!(8);
+        runtime_json["next_diagnostic_id"] = serde_json::json!(3);
+        runtime_json["diagnostics"] = serde_json::json!([
+            {
+                "id": 1,
+                "severity": "warning",
+                "code": "mapped_legacy_worker",
+                "message": "mapped diagnostic",
+                "worker_ref": {"worker_id": 7}
+            },
+            {
+                "id": 2,
+                "severity": "warning",
+                "code": "deleted_legacy_worker",
+                "message": "unmapped diagnostic",
+                "worker_ref": {"worker_id": 6}
+            }
+        ]);
         std::fs::write(
             &runtime_path,
             serde_json::to_vec_pretty(&runtime_json).unwrap(),
@@ -4211,6 +4256,9 @@ mod tests {
         let plan = crate::fs_store::FsRuntimeStore::migration_plan(&runtime_options).unwrap();
         assert!(plan.migration_required);
         assert_eq!(plan.worker_count, 1);
+        assert_eq!(plan.migrated_worker_aggregate_count, 1);
+        assert_eq!(plan.migrated_diagnostic_worker_ref_count, 1);
+        assert_eq!(plan.cleared_diagnostic_worker_ref_count, 1);
         assert_eq!(plan.mappings[0].legacy_worker_id, 7);
         #[cfg(unix)]
         assert_eq!(
@@ -4223,7 +4271,7 @@ mod tests {
         );
         assert!(legacy_dir.exists());
 
-        let restored = Runtime::with_fs_store(runtime_options).unwrap();
+        let restored = Runtime::with_fs_store(runtime_options.clone()).unwrap();
         let expected = WorkerId::from_legacy_binding("workspace-a", runtime_id, 7);
         let detail = restored.worker_detail(&WorkerRef::new(expected)).unwrap();
         assert_eq!(detail.worker_id, expected);
@@ -4234,12 +4282,95 @@ mod tests {
         assert!(!expected_worker_dir.join("runs/6/worker.sock").exists());
         assert!(!legacy_dir.exists());
         let migrated_runtime: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(runtime_path).unwrap()).unwrap();
-        assert_eq!(migrated_runtime["schema_version"], serde_json::json!(2));
+            serde_json::from_slice(&std::fs::read(&runtime_path).unwrap()).unwrap();
+        assert_eq!(migrated_runtime["schema_version"], serde_json::json!(3));
         assert!(migrated_runtime.get("workers").is_none());
         assert!(migrated_runtime.get("next_worker_sequence").is_none());
+        assert_eq!(
+            migrated_runtime["diagnostics"][0]["worker_ref"]["worker_id"],
+            serde_json::json!(expected.to_string())
+        );
+        assert!(
+            migrated_runtime["diagnostics"][1]
+                .get("worker_ref")
+                .is_none()
+        );
+        let diagnostics = restored.diagnostics().unwrap();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == "mapped_legacy_worker")
+                .and_then(|diagnostic| diagnostic.worker_ref.as_ref()),
+            Some(&WorkerRef::new(expected))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == "deleted_legacy_worker")
+                .is_some_and(|diagnostic| diagnostic.worker_ref.is_none())
+        );
+        let metadata_path = expected_worker_dir.join("metadata.json");
+        let mut migrated_metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
+        let expected_worker_name = format!("worker-runtime-{expected}");
+        assert_eq!(
+            migrated_metadata["worker_name"],
+            serde_json::json!(expected_worker_name)
+        );
+        assert_eq!(
+            migrated_metadata["resolved_manifest_snapshot"]["worker"]["name"],
+            serde_json::json!(expected_worker_name)
+        );
 
         drop(restored);
+
+        let mut schema_v2_runtime: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&runtime_path).unwrap()).unwrap();
+        schema_v2_runtime["schema_version"] = serde_json::json!(2);
+        std::fs::write(
+            &runtime_path,
+            serde_json::to_vec_pretty(&schema_v2_runtime).unwrap(),
+        )
+        .unwrap();
+        let migrated_worker_path = expected_worker_dir.join("worker.json");
+        let mut schema_v2_worker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&migrated_worker_path).unwrap()).unwrap();
+        schema_v2_worker["schema_version"] = serde_json::json!(2);
+        std::fs::write(
+            &migrated_worker_path,
+            serde_json::to_vec_pretty(&schema_v2_worker).unwrap(),
+        )
+        .unwrap();
+        migrated_metadata["worker_name"] = serde_json::json!(legacy_worker_name);
+        migrated_metadata["resolved_manifest_snapshot"]["worker"]["name"] =
+            serde_json::json!(legacy_worker_name);
+        std::fs::write(
+            &metadata_path,
+            serde_json::to_vec_pretty(&migrated_metadata).unwrap(),
+        )
+        .unwrap();
+
+        let recovery_plan =
+            crate::fs_store::FsRuntimeStore::migration_plan(&runtime_options).unwrap();
+        assert_eq!(recovery_plan.current_schema_version, 2);
+        assert_eq!(recovery_plan.target_schema_version, 3);
+        assert!(recovery_plan.migration_required);
+        assert_eq!(recovery_plan.worker_count, 1);
+        assert_eq!(recovery_plan.migrated_worker_aggregate_count, 1);
+        assert!(recovery_plan.mappings.is_empty());
+
+        let recovered = Runtime::with_fs_store(runtime_options).unwrap();
+        let recovered_metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(metadata_path).unwrap()).unwrap();
+        assert_eq!(
+            recovered_metadata["worker_name"],
+            serde_json::json!(expected_worker_name)
+        );
+        assert_eq!(
+            recovered_metadata["resolved_manifest_snapshot"]["worker"]["name"],
+            serde_json::json!(expected_worker_name)
+        );
+        drop(recovered);
         let _ = std::fs::remove_dir_all(root);
     }
 
