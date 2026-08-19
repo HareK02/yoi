@@ -1737,6 +1737,7 @@ fn panel_ticket_rows_render_state_title_then_detail_line() {
     let state_start = 2;
     let title_start = state_start + TICKET_STATE_COLUMN_WIDTH + 1;
     let row_id = row.ticket.as_ref().unwrap().id.as_str();
+    let human_key = row.ticket.as_ref().unwrap().human_key.as_deref().unwrap();
 
     assert!(title_line.starts_with("▶ "));
     assert!(detail_line.starts_with("│ meta "));
@@ -1746,7 +1747,7 @@ fn panel_ticket_rows_render_state_title_then_detail_line() {
         display_column(&title_line, "Workspace Dashboard composer targets"),
         title_start
     );
-    assert!(detail_line.contains(row_id));
+    assert!(detail_line.contains(human_key));
     assert!(detail_line.contains("Gate: clear"));
     assert!(detail_line.contains("Action: Wait"));
 }
@@ -1769,7 +1770,7 @@ fn panel_ticket_non_selected_rows_align_with_selected_marker_space() {
     let title_start = state_start + TICKET_STATE_COLUMN_WIDTH + 1;
 
     assert!(title_line.starts_with("  ready"));
-    assert!(detail_line.starts_with("  meta 00001KTTB479X"));
+    assert!(detail_line.starts_with("  meta T-1"));
     assert_eq!(display_column(&title_line, "ready"), state_start);
     assert_eq!(
         display_column(&title_line, "Long Ticket title"),
@@ -1797,7 +1798,7 @@ fn panel_ticket_title_truncates_after_state_column() {
     assert_eq!(display_column(&title_line, "Very long Ticket"), title_start);
     assert!(title_line.ends_with('…'));
     assert_eq!(detail_line.width(), 42);
-    assert!(detail_line.starts_with("  meta 00001KTTB479X · Gate: clear"));
+    assert!(detail_line.starts_with("  meta T-1 · Gate: clear"));
     assert!(detail_line.ends_with('…'));
 }
 
@@ -3259,6 +3260,7 @@ fn panel_test_ticket_row(
 ) -> PanelRow {
     let ticket = crate::workspace_panel::TicketPanelEntry {
         id: id.to_string(),
+        human_key: Some("T-1".to_string()),
         title: title.to_string(),
         priority: "P2".to_string(),
         workflow_state: TicketWorkflowState::parse(state).unwrap_or(TicketWorkflowState::Planning),

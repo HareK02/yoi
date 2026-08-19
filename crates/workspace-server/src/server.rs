@@ -109,7 +109,7 @@ use crate::store::{
     AccountRecord, ApiTokenRecord, AuthChallengeRecord, BrowserSessionRecord, ControlPlaneStore,
     DeviceLoginFlowRecord, FlowSourceRecord, PasskeyCredentialRecord, RepositoryRecord,
     TicketWorkerAssignmentRecord, UserRecord, WorkdirRegistryRecord, WorkerControlGrantRecord,
-    WorkerRegistryRecord, WorkerWorkdirLinkRecord, WorkspaceRecord,
+    WorkerRegistryRecord, WorkerWorkdirLinkRecord, WorkspaceRecord, WorkspaceResourceKind,
 };
 use crate::{Error, Result};
 use worker_runtime::catalog::{
@@ -1639,6 +1639,10 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             get(scoped_list_workers).post(scoped_create_workspace_worker),
         )
         .route(
+            "/api/w/{workspace_id}/workers/{worker_ref}",
+            get(scoped_get_workspace_worker),
+        )
+        .route(
             "/api/w/{workspace_id}/protocol/ws",
             get(scoped_workspace_protocol_ws),
         )
@@ -2462,6 +2466,12 @@ struct ScopedConfigBundlePath {
     workspace_id: String,
     runtime_id: String,
     bundle_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScopedWorkspaceWorkerReferencePath {
+    workspace_id: String,
+    worker_ref: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6235,6 +6245,35 @@ async fn scoped_worker_remove_source_boundary(
     }
 }
 
+async fn scoped_get_workspace_worker(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspaceWorkerReferencePath>,
+) -> ApiResult<Json<WorkerSummary>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let worker_id = api
+        .store
+        .resolve_resource_reference(
+            &api.config.workspace_id,
+            WorkspaceResourceKind::Worker,
+            &path.worker_ref,
+        )?
+        .ok_or_else(|| Error::UnknownWorker {
+            worker: RuntimeWorkerRef::new("unknown", &path.worker_ref),
+        })?;
+    let workers = workers_response(api.clone())?;
+    workers
+        .items
+        .into_iter()
+        .find(|worker| worker.worker.worker_id == worker_id)
+        .map(Json)
+        .ok_or_else(|| {
+            Error::UnknownWorker {
+                worker: RuntimeWorkerRef::new("unknown", worker_id),
+            }
+            .into()
+        })
+}
+
 async fn scoped_list_workers(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
@@ -9511,11 +9550,36 @@ struct WorkerShowProjection {
     updated_at: String,
 }
 
+fn resolve_workspace_worker_reference(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+    reference: &str,
+) -> ApiResult<RuntimeWorkerRef> {
+    let worker_id = api
+        .store
+        .resolve_resource_reference(
+            &api.config.workspace_id,
+            WorkspaceResourceKind::Worker,
+            reference,
+        )?
+        .ok_or_else(|| Error::UnknownWorker {
+            worker: RuntimeWorkerRef::new(runtime_id, reference),
+        })?;
+    let worker = RuntimeWorkerRef::new(runtime_id, worker_id);
+    let record = api
+        .store
+        .get_worker_registry(&api.config.workspace_id, &worker)?
+        .ok_or_else(|| Error::UnknownWorker {
+            worker: RuntimeWorkerRef::new(runtime_id, reference),
+        })?;
+    Ok(record.worker)
+}
+
 async fn get_runtime_worker(
     State(api): State<WorkspaceApi>,
     AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
 ) -> ApiResult<Json<WorkerShowProjection>> {
-    let worker_ref = RuntimeWorkerRef::new(runtime_id, worker_id);
+    let worker_ref = resolve_workspace_worker_reference(&api, &runtime_id, &worker_id)?;
     let worker = api
         .runtime
         .worker(&worker_ref)
@@ -9528,17 +9592,20 @@ async fn get_runtime_worker(
         .store
         .list_workdir_registry(&api.config.workspace_id, 500)?;
     let updated_at = record.updated_at.clone();
-    Ok(Json(WorkerShowProjection {
-        worker: merge_worker_registry_projection(Some(&worker), &record, links, &workdirs),
-        updated_at,
-    }))
+    let mut worker = merge_worker_registry_projection(Some(&worker), &record, links, &workdirs);
+    worker.human_key = api.store.resource_human_key(
+        &api.config.workspace_id,
+        WorkspaceResourceKind::Worker,
+        &worker_ref.worker_id,
+    )?;
+    Ok(Json(WorkerShowProjection { worker, updated_at }))
 }
 
 async fn restore_runtime_worker(
     State(api): State<WorkspaceApi>,
     AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
 ) -> ApiResult<Json<WorkerRestoreResponse>> {
-    let worker = RuntimeWorkerRef::new(&runtime_id, &worker_id);
+    let worker = resolve_workspace_worker_reference(&api, &runtime_id, &worker_id)?;
     let mut result = api.restore_workspace_worker(&worker)?;
     if let Some(worker) = result.worker.as_ref() {
         let record = sync_worker_observation(&api, worker)?;
@@ -10145,7 +10212,7 @@ async fn send_runtime_worker_input(
     AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
     Json(request): Json<WorkerInputRequest>,
 ) -> ApiResult<Json<WorkerInputResult>> {
-    let worker = RuntimeWorkerRef::new(&runtime_id, &worker_id);
+    let worker = resolve_workspace_worker_reference(&api, &runtime_id, &worker_id)?;
     let result = api
         .runtime
         .send_input(&worker, request)
@@ -10158,7 +10225,7 @@ async fn runtime_worker_completions(
     AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
     Json(request): Json<WorkerCompletionsRequest>,
 ) -> ApiResult<Json<WorkerCompletionsResult>> {
-    let worker = RuntimeWorkerRef::new(&runtime_id, &worker_id);
+    let worker = resolve_workspace_worker_reference(&api, &runtime_id, &worker_id)?;
     let result = api
         .runtime
         .worker_completions(&worker, request)
@@ -10171,7 +10238,7 @@ async fn stop_runtime_worker(
     AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
     Json(request): Json<WorkerLifecycleRequest>,
 ) -> ApiResult<Json<WorkerLifecycleResult>> {
-    let worker = RuntimeWorkerRef::new(&runtime_id, &worker_id);
+    let worker = resolve_workspace_worker_reference(&api, &runtime_id, &worker_id)?;
     let result = api
         .runtime
         .stop_worker(&worker, request)
@@ -10194,7 +10261,7 @@ async fn cancel_runtime_worker(
     AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
     Json(request): Json<WorkerLifecycleRequest>,
 ) -> ApiResult<Json<WorkerLifecycleResult>> {
-    let worker = RuntimeWorkerRef::new(&runtime_id, &worker_id);
+    let worker = resolve_workspace_worker_reference(&api, &runtime_id, &worker_id)?;
     let result = api
         .runtime
         .cancel_worker(&worker, request)
@@ -10631,12 +10698,18 @@ fn workers_response(api: WorkspaceApi) -> ApiResult<RuntimeListResponse<WorkerSu
         let links = api
             .store
             .list_worker_workdir_links(&api.config.workspace_id, &record.worker)?;
-        items.push(merge_worker_registry_projection(
+        let mut summary = merge_worker_registry_projection(
             observed.get(&record.worker),
             &record,
             links,
             &workdir_records,
-        ));
+        );
+        summary.human_key = api.store.resource_human_key(
+            &api.config.workspace_id,
+            WorkspaceResourceKind::Worker,
+            &record.worker.worker_id,
+        )?;
+        items.push(summary);
     }
     Ok(RuntimeListResponse {
         workspace_id: api.config.workspace_id,
@@ -11504,6 +11577,7 @@ fn record_worker_summary(
 fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> WorkerSummary {
     WorkerSummary {
         worker: record.worker.clone(),
+        human_key: None,
         host_id: "backend-registry".to_string(),
         display_name: record.display_name.clone(),
         label: record.display_name.clone(),

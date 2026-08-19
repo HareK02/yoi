@@ -20,12 +20,13 @@ use crate::records::{
     ObjectiveShowRequest, ObjectiveSummary, ProjectRecordList, QueryPage, TicketAssignmentSummary,
     TicketDetail, TicketEventDetail, TicketEvidenceEvent, TicketEvidenceSummary,
     TicketListPageRequest, TicketMergeRequestSummary, TicketQueryItem, TicketQueryRequest,
-    TicketQueryResponse, TicketShowRequest, TicketSummary, TicketSummaryPage, summarize_body,
-    truncate_body, validate_project_id,
+    TicketQueryResponse, TicketRelationView, TicketShowRequest, TicketSummary, TicketSummaryPage,
+    summarize_body, truncate_body, validate_project_id,
 };
 use crate::store::{
     ControlPlaneStore, MemoryDocumentRecord, MemoryStagingRecord, MemoryStagingResolutionRecord,
     ObjectiveEventRecord, ObjectiveRecord, ObjectiveTicketLinkRecord, SqliteWorkspaceStore,
+    WorkspaceResourceKind,
 };
 use crate::{Error, Result};
 
@@ -227,10 +228,24 @@ impl SqliteWorkspaceAuthority {
         self
     }
 
-    fn objective_record(&self, id: &str) -> Result<ObjectiveRecord> {
+    fn human_key(&self, kind: WorkspaceResourceKind, resource_id: &str) -> Result<String> {
         self.store
-            .get_objective(&self.workspace_id, id)?
-            .ok_or_else(|| unknown_objective_error(id))
+            .resource_human_key(&self.workspace_id, kind, resource_id)?
+            .ok_or_else(|| Error::Store(format!("missing human key for {resource_id}")))
+    }
+
+    fn objective_record(&self, reference: &str) -> Result<ObjectiveRecord> {
+        let id = self
+            .store
+            .resolve_resource_reference(
+                &self.workspace_id,
+                WorkspaceResourceKind::Objective,
+                reference,
+            )?
+            .ok_or_else(|| unknown_objective_error(reference))?;
+        self.store
+            .get_objective(&self.workspace_id, &id)?
+            .ok_or_else(|| unknown_objective_error(reference))
     }
 
     fn objective_detail_from_record(&self, record: ObjectiveRecord) -> Result<ObjectiveDetail> {
@@ -247,6 +262,7 @@ impl SqliteWorkspaceAuthority {
             .filter(|ticket| linked_tickets.iter().any(|id| id == &ticket.id))
             .map(|ticket| ObjectiveLinkedTicketSummary {
                 id: ticket.id,
+                human_key: ticket.human_key,
                 title: ticket.title,
                 state: ticket.state,
             })
@@ -288,6 +304,7 @@ impl SqliteWorkspaceAuthority {
                 .unwrap_or("none")
         );
         Ok(ObjectiveDetail {
+            human_key: self.human_key(WorkspaceResourceKind::Objective, &record.objective_id)?,
             id: record.objective_id,
             title: record.title,
             state: record.state,
@@ -718,12 +735,16 @@ impl SqliteWorkspaceAuthority {
             .store
             .list_objectives_for_ticket(&self.workspace_id, id, 1_000)?
             .into_iter()
-            .map(|objective| ObjectiveLinkSummary {
-                id: objective.objective_id,
-                title: objective.title,
-                state: objective.state,
+            .map(|objective| {
+                Ok::<_, Error>(ObjectiveLinkSummary {
+                    human_key: self
+                        .human_key(WorkspaceResourceKind::Objective, &objective.objective_id)?,
+                    id: objective.objective_id,
+                    title: objective.title,
+                    state: objective.state,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let implementation_reports = ticket
             .events
             .iter()
@@ -734,11 +755,20 @@ impl SqliteWorkspaceAuthority {
         let current_assignment = self
             .store
             .get_current_ticket_worker_assignment(&self.workspace_id, id)?
-            .map(|assignment| TicketAssignmentSummary {
-                assignment_id: assignment.assignment_id,
-                runtime_id: assignment.worker.runtime_id,
-                worker_id: assignment.worker.worker_id,
-            });
+            .map(|assignment| {
+                let worker_human_key = self.store.resource_human_key(
+                    &self.workspace_id,
+                    WorkspaceResourceKind::Worker,
+                    &assignment.worker.worker_id,
+                )?;
+                Ok::<_, Error>(TicketAssignmentSummary {
+                    assignment_id: assignment.assignment_id,
+                    runtime_id: assignment.worker.runtime_id,
+                    worker_id: assignment.worker.worker_id,
+                    worker_human_key,
+                })
+            })
+            .transpose()?;
         let merge_request = match self.merge_request_store.get(&self.workspace_id, id) {
             Ok(request) => {
                 let current_subject_ref = request.selector_from.as_deref().and_then(|selector| {
@@ -763,8 +793,41 @@ impl SqliteWorkspaceAuthority {
             .and_then(|event| event.attributes.get("event_id").cloned())
             .or_else(|| ticket.meta.updated_at.clone())
             .unwrap_or_else(|| format!("{}:0", ticket.meta.id));
+        let human_key = ticket
+            .meta
+            .human_key
+            .clone()
+            .or(self.store.resource_human_key(
+                &self.workspace_id,
+                WorkspaceResourceKind::Ticket,
+                &ticket.meta.id,
+            )?)
+            .ok_or_else(|| Error::Store(format!("missing human key for {}", ticket.meta.id)))?;
+        let mut relations: TicketRelationView = ticket.relations.into();
+        for relation in &mut relations.outgoing {
+            relation.target_human_key = self.store.resource_human_key(
+                &self.workspace_id,
+                WorkspaceResourceKind::Ticket,
+                &relation.target,
+            )?;
+        }
+        for relation in &mut relations.incoming {
+            relation.source_human_key = self.store.resource_human_key(
+                &self.workspace_id,
+                WorkspaceResourceKind::Ticket,
+                &relation.source_ticket,
+            )?;
+        }
+        for blocker in &mut relations.blockers {
+            blocker.blocking_human_key = self.store.resource_human_key(
+                &self.workspace_id,
+                WorkspaceResourceKind::Ticket,
+                &blocker.blocking_ticket,
+            )?;
+        }
         Ok(TicketDetail {
             id: ticket.meta.id,
+            human_key,
             title: ticket.meta.title,
             state: ticket.meta.workflow_state.as_str().to_string(),
             readiness: ticket.meta.readiness,
@@ -797,7 +860,7 @@ impl SqliteWorkspaceAuthority {
                 .into_iter()
                 .map(|artifact| artifact.relative_path.display().to_string())
                 .collect(),
-            relations: ticket.relations.into(),
+            relations,
             linked_objectives,
             implementation_reports,
             current_assignment,
@@ -820,7 +883,11 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
             .map(|item| {
                 let projection =
                     project_ticket_workspace_item(&item.summary, &item.relation_blockers, None);
-                TicketSummary {
+                let human_key = item.summary.human_key.clone().ok_or_else(|| {
+                    Error::Store(format!("missing human key for {}", item.summary.id))
+                })?;
+                Ok::<_, Error>(TicketSummary {
+                    human_key,
                     id: item.summary.id,
                     title: item.summary.title,
                     state: item.summary.workflow_state.as_str().to_string(),
@@ -831,9 +898,9 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
                     workspace_action_priority: workspace_action_priority_name(projection.priority)
                         .to_string(),
                     record_source: "sqlite_yoi_ticket".to_string(),
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         Ok(ProjectRecordList {
             items,
             invalid_records: Vec::new(),
@@ -874,7 +941,7 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
             .items
             .into_iter()
             .map(ticket_summary_from_sqlite_item)
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let next_cursor = page
             .next
             .map(|position| make_ticket_summary_cursor(&fingerprint, position));
@@ -913,7 +980,7 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
             let authoritative = self
                 .ticket_backend
                 .show(TicketIdOrSlug::Id(ticket_id.clone()))?;
-            let summary = ticket_summary_from_ticket(&authoritative);
+            let summary = ticket_summary_from_ticket(&authoritative)?;
             let authoritative_body = authoritative.document.body.clone();
             let authoritative_events = authoritative.events.clone();
             let detail = self.ticket_detail_from_ticket(
@@ -987,6 +1054,8 @@ impl ObjectiveAuthority for SqliteWorkspaceAuthority {
                 .map(|link| link.ticket_id)
                 .collect::<Vec<_>>();
             items.push(ObjectiveSummary {
+                human_key: self
+                    .human_key(WorkspaceResourceKind::Objective, &record.objective_id)?,
                 id: record.objective_id,
                 title: record.title,
                 state: record.state,
@@ -1032,6 +1101,8 @@ impl ObjectiveAuthority for SqliteWorkspaceAuthority {
                 .collect::<Vec<_>>();
             let body_md = record.body_md.clone();
             let objective = ObjectiveSummary {
+                human_key: self
+                    .human_key(WorkspaceResourceKind::Objective, &record.objective_id)?,
                 id: record.objective_id,
                 title: record.title,
                 state: record.state,
@@ -2023,6 +2094,7 @@ fn ticket_query_item(
     }
     TicketQueryItem {
         id: summary.id,
+        human_key: summary.human_key,
         title: summary.title,
         state: summary.state,
         readiness: detail.readiness.clone(),
@@ -2362,9 +2434,10 @@ fn memory_resolution_from_record(record: MemoryStagingResolutionRecord) -> Memor
     }
 }
 
-fn ticket_summary_from_ticket(ticket: &ticket::Ticket) -> TicketSummary {
+fn ticket_summary_from_ticket(ticket: &ticket::Ticket) -> Result<TicketSummary> {
     let summary = ticket::TicketSummary {
         id: ticket.meta.id.clone(),
+        human_key: ticket.meta.human_key.clone(),
         slug: ticket.meta.slug.clone(),
         title: ticket.meta.title.clone(),
         status: ticket.meta.status.clone(),
@@ -2384,9 +2457,15 @@ fn ticket_summary_from_ticket(ticket: &ticket::Ticket) -> TicketSummary {
     })
 }
 
-fn ticket_summary_from_sqlite_item(item: SqliteTicketListItem) -> TicketSummary {
+fn ticket_summary_from_sqlite_item(item: SqliteTicketListItem) -> Result<TicketSummary> {
     let projection = project_ticket_workspace_item(&item.summary, &item.relation_blockers, None);
-    TicketSummary {
+    let human_key = item
+        .summary
+        .human_key
+        .clone()
+        .ok_or_else(|| Error::Store(format!("missing human key for {}", item.summary.id)))?;
+    Ok(TicketSummary {
+        human_key,
         id: item.summary.id,
         title: item.summary.title,
         state: item.summary.workflow_state.as_str().to_string(),
@@ -2396,7 +2475,7 @@ fn ticket_summary_from_sqlite_item(item: SqliteTicketListItem) -> TicketSummary 
         queued_at: item.summary.queued_at,
         workspace_action_priority: workspace_action_priority_name(projection.priority).to_string(),
         record_source: "sqlite_yoi_ticket".to_string(),
-    }
+    })
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

@@ -103,6 +103,8 @@ pub struct BackendWorkerCapabilitySummary {
 pub struct BackendWorkerSummary {
     pub runtime_id: String,
     pub worker_id: String,
+    #[serde(default)]
+    pub human_key: Option<String>,
     pub host_id: String,
     #[serde(default)]
     pub display_name: String,

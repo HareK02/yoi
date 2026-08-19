@@ -246,6 +246,8 @@ pub struct WorkerCapabilitySummary {
 pub struct WorkerSummary {
     #[serde(flatten)]
     pub worker: RuntimeWorkerRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_key: Option<String>,
     pub host_id: String,
     /// Human-readable display name. This is not identity and may be duplicated.
     pub display_name: String,
@@ -1678,6 +1680,7 @@ impl EmbeddedWorkerRuntime {
         );
         WorkerSummary {
             worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
+            human_key: None,
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
             label: display.display_name,
@@ -1717,6 +1720,7 @@ impl EmbeddedWorkerRuntime {
         );
         WorkerSummary {
             worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
+            human_key: None,
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
             label: display.display_name,
@@ -2794,6 +2798,7 @@ impl RemoteWorkerRuntime {
         );
         WorkerSummary {
             worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
+            human_key: None,
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
             label: display.display_name,
@@ -2837,6 +2842,7 @@ impl RemoteWorkerRuntime {
         );
         WorkerSummary {
             worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
+            human_key: None,
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
             label: display.display_name,
@@ -4208,6 +4214,7 @@ pub fn placeholder_worker(host_id: impl Into<String>) -> WorkerSummary {
     let host_id = host_id.into();
     WorkerSummary {
         worker: RuntimeWorkerRef::new("placeholder", "worker-placeholder"),
+        human_key: None,
         host_id,
         display_name: "Worker runtime actions are not implemented".to_string(),
         label: "Worker runtime actions are not implemented".to_string(),
@@ -4601,6 +4608,7 @@ mod tests {
                 host_id: host_id.to_string(),
                 workers: vec![WorkerSummary {
                     worker: RuntimeWorkerRef::new(runtime_id, worker_id),
+                    human_key: None,
                     host_id: host_id.to_string(),
                     display_name: label.to_string(),
                     label: label.to_string(),

@@ -317,6 +317,9 @@ fn state_style(state: &str) -> Style {
 }
 
 fn short_worker_id(worker: &BackendWorkerSummary) -> String {
+    if let Some(human_key) = worker.human_key.as_ref() {
+        return human_key.clone();
+    }
     format!(
         "{}:{}",
         short_text(&worker.runtime_id),
@@ -358,6 +361,7 @@ mod tests {
         BackendWorkerSummary {
             runtime_id: runtime_id.to_string(),
             worker_id: worker_id.to_string(),
+            human_key: None,
             host_id: "host".to_string(),
             label: "label".to_string(),
             display_name: "label".to_string(),

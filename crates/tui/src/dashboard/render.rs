@@ -535,7 +535,12 @@ pub(super) fn ticket_detail_style(row: &PanelRow) -> Style {
 pub(super) fn panel_ticket_reference(row: &PanelRow) -> String {
     row.ticket
         .as_ref()
-        .map(|ticket| ticket.id.clone())
+        .map(|ticket| {
+            ticket
+                .human_key
+                .clone()
+                .unwrap_or_else(|| ticket.id.clone())
+        })
         .unwrap_or_else(|| match &row.key {
             PanelRowKey::Ticket(id) | PanelRowKey::InvalidTicket(id) => id.clone(),
             PanelRowKey::TicketIntakeWorker { ticket_id, .. } => ticket_id.clone(),

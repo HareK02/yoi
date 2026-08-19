@@ -253,6 +253,7 @@ impl NextUserAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TicketPanelEntry {
     pub(crate) id: String,
+    pub(crate) human_key: Option<String>,
     pub(crate) title: String,
     pub(crate) priority: String,
     pub(crate) workflow_state: TicketWorkflowState,
@@ -1063,6 +1064,7 @@ pub(crate) fn build_current_ticket_row(
 fn ticket_summary_from_meta(meta: &TicketMeta) -> TicketSummary {
     TicketSummary {
         id: meta.id.clone(),
+        human_key: meta.human_key.clone(),
         slug: meta.slug.clone(),
         title: meta.title.clone(),
         status: meta.status.clone(),
@@ -1238,6 +1240,7 @@ fn ticket_row(
     let next_action = projection.next_action.map(next_user_action_from_workspace);
     let entry = TicketPanelEntry {
         id: summary.id.clone(),
+        human_key: summary.human_key.clone(),
         title: summary.title.clone(),
         priority: summary.priority.clone(),
         workflow_state: summary.workflow_state,

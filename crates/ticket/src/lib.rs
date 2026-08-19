@@ -124,6 +124,7 @@ fn read_ticket_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TicketSu
     let workflow_state = row.get::<_, String>(7)?;
     Ok(TicketSummary {
         id: row.get(0)?,
+        human_key: None,
         slug: row.get(1)?,
         title: row.get(2)?,
         status: ExtensibleTicketStatus::from(row.get::<_, String>(3)?.as_str()),
@@ -926,6 +927,8 @@ impl TicketListQuery {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketRef {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_key: Option<String>,
     pub slug: String,
     pub status: TicketStatus,
 }
@@ -1540,6 +1543,8 @@ pub struct OrchestrationPlanRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketMeta {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_key: Option<String>,
     pub slug: String,
     pub title: String,
     pub status: ExtensibleTicketStatus,
@@ -1563,6 +1568,8 @@ pub struct TicketMeta {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketSummary {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_key: Option<String>,
     pub slug: String,
     pub title: String,
     pub status: ExtensibleTicketStatus,
@@ -2669,6 +2676,9 @@ impl SqliteTicketBackend {
             let mut summaries = rows
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(sqlite_err)?;
+            for summary in &mut summaries {
+                summary.human_key = Self::human_key_for(conn, &self.workspace_id, &summary.id)?;
+            }
             let has_more = summaries.len() > query.limit;
             summaries.truncate(query.limit);
             let next = has_more.then(|| {
@@ -2752,6 +2762,7 @@ impl SqliteTicketBackend {
                 updated_at,
             ) = row.map_err(sqlite_err)?;
             summaries.push(TicketSummary {
+                human_key: Self::human_key_for(conn, &self.workspace_id, &id)?,
                 id,
                 slug,
                 title,
@@ -2928,7 +2939,16 @@ impl SqliteTicketBackend {
 
     fn resolve_ticket_id(&self, conn: &Connection, id: TicketIdOrSlug) -> Result<String> {
         let query = id.as_query().to_string();
-        let mut stmt = conn.prepare("SELECT ticket_id FROM typed_tickets WHERE workspace_id = ?1 AND (ticket_id = ?2 OR slug = ?2) ORDER BY ticket_id").map_err(sqlite_err)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT ticket_id FROM typed_tickets
+             WHERE workspace_id = ?1 AND (ticket_id = ?2 OR slug = ?2)
+             UNION
+             SELECT resource_id FROM workspace_resource_human_keys
+             WHERE workspace_id = ?1 AND resource_kind = 'ticket' AND human_key = ?2
+             ORDER BY 1",
+            )
+            .map_err(sqlite_err)?;
         let rows = stmt
             .query_map(params![self.workspace_id, query], |row| {
                 row.get::<_, String>(0)
@@ -2945,6 +2965,61 @@ impl SqliteTicketBackend {
                 matches: matches.into_iter().map(PathBuf::from).collect(),
             }),
         }
+    }
+
+    fn human_key_for(
+        conn: &Connection,
+        workspace_id: &str,
+        ticket_id: &str,
+    ) -> Result<Option<String>> {
+        conn.query_row(
+            "SELECT human_key FROM workspace_resource_human_keys
+             WHERE workspace_id = ?1 AND resource_kind = 'ticket' AND resource_id = ?2",
+            params![workspace_id, ticket_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite_err)
+    }
+
+    fn allocate_human_key(
+        conn: &Connection,
+        workspace_id: &str,
+        ticket_id: &str,
+        allocated_at: &str,
+    ) -> Result<String> {
+        if let Some(existing) = Self::human_key_for(conn, workspace_id, ticket_id)? {
+            return Ok(existing);
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO workspace_resource_human_key_counters
+             (workspace_id, resource_kind, next_sequence) VALUES (?1, 'ticket', 1)",
+            params![workspace_id],
+        )
+        .map_err(sqlite_err)?;
+        let sequence: i64 = conn
+            .query_row(
+                "SELECT next_sequence FROM workspace_resource_human_key_counters
+                 WHERE workspace_id = ?1 AND resource_kind = 'ticket'",
+                params![workspace_id],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_err)?;
+        conn.execute(
+            "UPDATE workspace_resource_human_key_counters SET next_sequence = ?3
+             WHERE workspace_id = ?1 AND resource_kind = 'ticket' AND next_sequence = ?2",
+            params![workspace_id, sequence, sequence + 1],
+        )
+        .map_err(sqlite_err)?;
+        let human_key = format!("T-{sequence}");
+        conn.execute(
+            "INSERT INTO workspace_resource_human_keys
+             (workspace_id, resource_kind, resource_id, sequence, human_key, allocated_at)
+             VALUES (?1, 'ticket', ?2, ?3, ?4, ?5)",
+            params![workspace_id, ticket_id, sequence, human_key, allocated_at],
+        )
+        .map_err(sqlite_err)?;
+        Ok(human_key)
     }
 
     fn ticket_exists(&self, conn: &Connection, id: &str) -> Result<bool> {
@@ -3090,6 +3165,7 @@ impl SqliteTicketBackend {
         let state_raw: String = row.get(12)?;
         Ok(TicketMeta {
             id: row.get(0)?,
+            human_key: None,
             slug: row.get(1)?,
             title: row.get(2)?,
             status: ExtensibleTicketStatus::from(row.get::<_, String>(3)?.as_str()),
@@ -3117,6 +3193,7 @@ impl SqliteTicketBackend {
         self.full_ticket_load_count.fetch_add(1, Ordering::SeqCst);
         let (mut meta, body, resolution): (TicketMeta, String, Option<String>) = conn.query_row(r#"SELECT ticket_id, slug, title, status, kind, priority, created_at, updated_at, assignee, readiness, body, resolution, workflow_state, workflow_state_explicit, queued_by, queued_at, repository_id, ref_selector FROM typed_tickets WHERE workspace_id = ?1 AND ticket_id = ?2"#,
             params![self.workspace_id, ticket_id], |row| Ok((Self::ticket_meta_from_row(row)?, row.get(10)?, row.get(11)?))).optional().map_err(sqlite_err)?.ok_or_else(|| TicketError::NotFound(ticket_id.to_string()))?;
+        meta.human_key = Self::human_key_for(conn, &self.workspace_id, ticket_id)?;
         meta.labels = self.load_ordered_values(conn, "typed_ticket_labels", "label", ticket_id)?;
         meta.risk_flags =
             self.load_ordered_values(conn, "typed_ticket_risk_flags", "risk_flag", ticket_id)?;
@@ -3288,6 +3365,7 @@ impl SqliteTicketBackend {
         let mut summaries = Vec::new();
         for row in rows {
             let mut meta = row.map_err(sqlite_err)?;
+            meta.human_key = Self::human_key_for(conn, &self.workspace_id, &meta.id)?;
             if !filter.matches_state(meta.workflow_state) {
                 continue;
             }
@@ -3437,6 +3515,7 @@ impl TicketBackend for SqliteTicketBackend {
             };
             let meta = TicketMeta {
                 id: id.clone(),
+                human_key: None,
                 slug: input.slug.clone().unwrap_or_else(|| id.clone()),
                 title: input.title,
                 status,
@@ -3473,7 +3552,7 @@ impl TicketBackend for SqliteTicketBackend {
                 events: vec![TicketEvent {
                     kind: TicketEventKind::Create,
                     author: Some(author),
-                    at: Some(now),
+                    at: Some(now.clone()),
                     status: None,
                     from: None,
                     to: None,
@@ -3488,9 +3567,11 @@ impl TicketBackend for SqliteTicketBackend {
                 relations: TicketRelationView::default(),
                 resolution: None,
             };
+            let human_key = Self::allocate_human_key(conn, &self.workspace_id, &id, &now)?;
             self.insert_ticket(conn, &ticket)?;
             Ok(TicketRef {
                 id: id.clone(),
+                human_key: Some(human_key),
                 slug: id,
                 status: TicketStatus::Open,
             })
@@ -4137,6 +4218,7 @@ impl TicketBackend for LocalTicketBackend {
         atomic_write(&dir.join("thread.md"), thread.as_bytes())?;
         Ok(TicketRef {
             id: id.clone(),
+            human_key: None,
             slug: id,
             status: TicketStatus::Open,
         })
@@ -5174,6 +5256,7 @@ fn ticket_meta(frontmatter: TicketItemFrontmatter, id: String) -> TicketMeta {
     };
     TicketMeta {
         id: id.clone(),
+        human_key: None,
         slug: id,
         title: frontmatter.title.unwrap_or_default(),
         status,
@@ -5198,6 +5281,7 @@ fn ticket_meta(frontmatter: TicketItemFrontmatter, id: String) -> TicketMeta {
 fn ticket_summary_from_meta(meta: TicketMeta) -> TicketSummary {
     TicketSummary {
         id: meta.id,
+        human_key: meta.human_key,
         slug: meta.slug,
         title: meta.title,
         status: meta.status,
@@ -6806,6 +6890,7 @@ mod tests {
     fn summary_with_state(state: TicketWorkflowState) -> TicketSummary {
         TicketSummary {
             id: "000TEST".to_string(),
+            human_key: Some("T-1".to_string()),
             slug: "000TEST".to_string(),
             title: "Test Ticket".to_string(),
             status: ExtensibleTicketStatus::Open,
@@ -7208,6 +7293,59 @@ state: planning
                 .workflow_state,
             TicketWorkflowState::Queued
         );
+    }
+
+    #[test]
+    fn sqlite_human_keys_are_workspace_scoped_monotonic_and_resolvable() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("workspace.db");
+        let backend = SqliteTicketBackend::open(&db_path, "workspace-a").unwrap();
+        let first = backend.create(NewTicket::new("First")).unwrap();
+        let second = backend.create(NewTicket::new("Second")).unwrap();
+        assert_eq!(first.human_key.as_deref(), Some("T-1"));
+        assert_eq!(second.human_key.as_deref(), Some("T-2"));
+        assert_eq!(backend.show("T-1".into()).unwrap().meta.id, first.id);
+        let projection = backend.list_workspace_projection(100).unwrap();
+        let projected_second = projection
+            .items
+            .iter()
+            .find(|item| item.summary.id == second.id)
+            .unwrap();
+        assert_eq!(projected_second.summary.human_key.as_deref(), Some("T-2"));
+
+        let other = SqliteTicketBackend::open(&db_path, "workspace-b").unwrap();
+        let other_first = other.create(NewTicket::new("Other")).unwrap();
+        assert_eq!(other_first.human_key.as_deref(), Some("T-1"));
+        assert_eq!(other.show("T-1".into()).unwrap().meta.id, other_first.id);
+    }
+
+    #[test]
+    fn sqlite_human_key_allocation_is_concurrency_safe() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("workspace.db");
+        SqliteTicketBackend::open(&db_path, "workspace-a").unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let handles = (0..8)
+            .map(|index| {
+                let db_path = db_path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let backend = SqliteTicketBackend::open(db_path, "workspace-a").unwrap();
+                    barrier.wait();
+                    backend
+                        .create(NewTicket::new(format!("Ticket {index}")))
+                        .unwrap()
+                        .human_key
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut keys = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        keys.sort_by_key(|key| key.trim_start_matches("T-").parse::<u64>().unwrap());
+        assert_eq!(keys, (1..=8).map(|n| format!("T-{n}")).collect::<Vec<_>>());
     }
 
     #[test]

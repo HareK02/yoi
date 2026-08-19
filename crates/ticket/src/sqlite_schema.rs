@@ -7,7 +7,7 @@ use crate::{Result, TicketError, sqlite_err};
 
 const MIGRATION_TABLE: &str = "ticket_schema_migrations";
 const MAX_SCHEMA_DIAGNOSTICS: usize = 32;
-pub const LATEST_SQLITE_TICKET_SCHEMA_VERSION: i64 = 4;
+pub const LATEST_SQLITE_TICKET_SCHEMA_VERSION: i64 = 5;
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -36,6 +36,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 4,
         name: "add_ticket_query_indexes",
         apply: add_ticket_query_indexes,
+    },
+    Migration {
+        version: 5,
+        name: "add_workspace_human_keys",
+        apply: add_workspace_human_keys,
     },
 ];
 
@@ -535,6 +540,57 @@ fn add_ticket_query_indexes(connection: &Connection) -> Result<()> {
         .map_err(sqlite_err)
 }
 
+fn add_workspace_human_keys(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(
+            r#"
+        CREATE TABLE IF NOT EXISTS workspace_resource_human_keys (
+            workspace_id TEXT NOT NULL,
+            resource_kind TEXT NOT NULL CHECK (resource_kind IN ('ticket', 'objective', 'worker')),
+            resource_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL CHECK (sequence > 0),
+            human_key TEXT NOT NULL,
+            allocated_at TEXT NOT NULL,
+            PRIMARY KEY (workspace_id, resource_kind, resource_id),
+            UNIQUE (workspace_id, resource_kind, sequence),
+            UNIQUE (workspace_id, human_key)
+        );
+        CREATE TABLE IF NOT EXISTS workspace_resource_human_key_counters (
+            workspace_id TEXT NOT NULL,
+            resource_kind TEXT NOT NULL CHECK (resource_kind IN ('ticket', 'objective', 'worker')),
+            next_sequence INTEGER NOT NULL CHECK (next_sequence > 0),
+            PRIMARY KEY (workspace_id, resource_kind)
+        );
+
+        INSERT OR IGNORE INTO workspace_resource_human_keys (
+            workspace_id, resource_kind, resource_id, sequence, human_key, allocated_at
+        )
+        SELECT workspace_id,
+               'ticket',
+               ticket_id,
+               ROW_NUMBER() OVER (
+                   PARTITION BY workspace_id ORDER BY created_at ASC, ticket_id ASC
+               ),
+               'T-' || ROW_NUMBER() OVER (
+                   PARTITION BY workspace_id ORDER BY created_at ASC, ticket_id ASC
+               ),
+               COALESCE(created_at, updated_at)
+        FROM typed_tickets;
+
+        INSERT INTO workspace_resource_human_key_counters (
+            workspace_id, resource_kind, next_sequence
+        )
+        SELECT workspace_id, 'ticket', MAX(sequence) + 1
+        FROM workspace_resource_human_keys
+        WHERE resource_kind = 'ticket'
+        GROUP BY workspace_id
+        ON CONFLICT(workspace_id, resource_kind) DO UPDATE SET
+            next_sequence = MAX(next_sequence, excluded.next_sequence);
+        "#,
+        )
+        .map_err(sqlite_err)
+}
+
 fn add_column_if_missing(
     connection: &Connection,
     table: &str,
@@ -869,10 +925,10 @@ mod tests {
         verify_sqlite_ticket_schema(&connection).unwrap();
 
         let versions = load_applied_migrations(&connection).unwrap();
-        assert_eq!(versions.len(), 4);
+        assert_eq!(versions.len(), 5);
         assert_eq!(
             versions.get(&LATEST_SQLITE_TICKET_SCHEMA_VERSION),
-            Some(&"add_ticket_query_indexes".to_string())
+            Some(&"add_workspace_human_keys".to_string())
         );
     }
 
@@ -960,6 +1016,54 @@ mod tests {
     }
 
     #[test]
+    fn v5_backfills_ticket_keys_by_creation_order_and_advances_counter() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate_sqlite_ticket_schema(&connection).unwrap();
+        connection.execute_batch(
+            "DROP TABLE workspace_resource_human_key_counters;
+             DROP TABLE workspace_resource_human_keys;
+             DELETE FROM ticket_schema_migrations WHERE version = 5;
+             INSERT INTO typed_tickets (
+                 workspace_id, ticket_id, slug, title, status, kind, priority, body,
+                 workflow_state, workflow_state_explicit, created_at, updated_at
+             ) VALUES
+                 ('workspace-1', 'later', 'later', 'Later', 'open', 'task', 'medium', '', 'ready', 1, '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z'),
+                 ('workspace-1', 'earlier', 'earlier', 'Earlier', 'open', 'task', 'medium', '', 'ready', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');"
+        ).unwrap();
+
+        migrate_sqlite_ticket_schema(&connection).unwrap();
+        let keys = connection
+            .prepare(
+                "SELECT resource_id, human_key FROM workspace_resource_human_keys
+             WHERE workspace_id = 'workspace-1' AND resource_kind = 'ticket'
+             ORDER BY sequence",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            keys,
+            vec![
+                ("earlier".into(), "T-1".into()),
+                ("later".into(), "T-2".into())
+            ]
+        );
+        let next: i64 = connection
+            .query_row(
+                "SELECT next_sequence FROM workspace_resource_human_key_counters
+             WHERE workspace_id = 'workspace-1' AND resource_kind = 'ticket'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(next, 3);
+    }
+
+    #[test]
     fn upgrades_legacy_schema_without_repository_target_columns() {
         let connection = Connection::open_in_memory().unwrap();
         create_typed_ticket_tables(&connection).unwrap();
@@ -1017,7 +1121,7 @@ mod tests {
                 .to_string()
                 .contains("unsupported Ticket schema migration version 99")
         );
-        assert_eq!(load_applied_migrations(&connection).unwrap().len(), 5);
+        assert_eq!(load_applied_migrations(&connection).unwrap().len(), 6);
     }
 
     #[test]
@@ -1157,6 +1261,6 @@ mod tests {
 
         let connection = Connection::open(database).unwrap();
         verify_sqlite_ticket_schema(&connection).unwrap();
-        assert_eq!(load_applied_migrations(&connection).unwrap().len(), 4);
+        assert_eq!(load_applied_migrations(&connection).unwrap().len(), 5);
     }
 }
