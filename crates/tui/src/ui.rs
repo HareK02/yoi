@@ -381,6 +381,28 @@ pub fn compute_history(app: &App, width: u16) -> HistoryLayout {
         i += 1;
     }
 
+    for internal in &app.internal_workers {
+        logical.push((Line::from(""), false));
+        logical.push((
+            Line::from(vec![
+                Span::styled("SubWorker ", Style::default().bold()),
+                Span::raw(internal.worker.name.clone()),
+                Span::styled(
+                    format!("  {:?}", internal.app.worker_status),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+            false,
+        ));
+        let child_width = width.saturating_sub(2).max(1);
+        let child_history = compute_history(&internal.app, child_width);
+        logical.extend(child_history.rows.into_iter().map(|row| {
+            let mut spans = vec![Span::raw("  ")];
+            spans.extend(row.line.spans);
+            (Line::from(spans), row.selectable)
+        }));
+    }
+
     // Step 2: pre-wrap every logical line to char-based terminal rows so
     // scroll math is exact. Track the logical → wrapped mapping so
     // turn-start indices get translated into wrapped-row coordinates.

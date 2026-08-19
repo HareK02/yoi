@@ -18,6 +18,7 @@
     import { fitTextarea } from "$lib/workspace/console/textarea-fit";
     import {
         createConsoleProjector,
+        flattenInternalWorkers,
         isConsoleProjectionEvent,
         selectConsoleTimelineLines,
         type ConsoleEventInput,
@@ -152,6 +153,9 @@
 
     const lines = $derived(consoleProjection.lines);
     const tasks = $derived(consoleProjection.tasks);
+    const internalWorkers = $derived(
+        flattenInternalWorkers(consoleProjection.internalWorkers),
+    );
     const timelineLayout = $derived(
         buildTimelineLayout(lines, eventObservedAtVersion, consoleScroll),
     );
@@ -1245,6 +1249,28 @@
                     </ol>
                 {/if}
             </article>
+
+            {#each internalWorkers as internal (internal.worker.session_id)}
+                <section
+                    class="card internal-worker-pane"
+                    style={`--internal-worker-depth: ${internal.depth}`}
+                    aria-label={`SubWorker ${internal.worker.name}`}
+                >
+                    <header class="internal-worker-header">
+                        <strong>{internal.worker.name}</strong>
+                        <span>{internal.console.status ?? "unknown"}</span>
+                    </header>
+                    {#if internal.console.lines.length === 0}
+                        <p>No output yet.</p>
+                    {:else}
+                        <ol class="console-log">
+                            {#each internal.console.lines as item (item.id)}
+                                <ConsoleLineItem {item} />
+                            {/each}
+                        </ol>
+                    {/if}
+                </section>
+            {/each}
         </div>
 
             <ConsoleTimeline
@@ -1769,6 +1795,23 @@
 
     .composer-actions .composer-notice {
         margin-right: auto;
+    }
+
+    .internal-worker-pane {
+        margin: 0.75rem 0 0 calc((var(--internal-worker-depth) + 1) * 1rem);
+        border-left: 3px solid var(--color-border-strong, currentColor);
+    }
+
+    .internal-worker-header {
+        display: flex;
+        justify-content: space-between;
+        gap: 1rem;
+        margin-bottom: 0.5rem;
+        font-family: var(--font-mono);
+    }
+
+    .internal-worker-header span {
+        color: var(--color-text-muted);
     }
 
     @media (max-width: 960px) {

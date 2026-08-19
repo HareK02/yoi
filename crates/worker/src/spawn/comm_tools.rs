@@ -284,6 +284,7 @@ mod tests {
             },
             status: WorkerStatus::Idle,
             in_flight: Default::default(),
+            internal_workers: Vec::new(),
         }
     }
 

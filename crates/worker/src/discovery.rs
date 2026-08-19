@@ -1494,6 +1494,7 @@ mod tests {
                     },
                     status: WorkerStatus::Idle,
                     in_flight: Default::default(),
+                    internal_workers: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -1526,6 +1527,7 @@ mod tests {
                     },
                     status: WorkerStatus::Idle,
                     in_flight: Default::default(),
+                    internal_workers: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -1614,6 +1616,7 @@ mod tests {
                     },
                     status: WorkerStatus::Idle,
                     in_flight: Default::default(),
+                    internal_workers: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -1637,6 +1640,7 @@ mod tests {
                     },
                     status: WorkerStatus::Idle,
                     in_flight: Default::default(),
+                    internal_workers: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -1738,6 +1742,7 @@ mod tests {
                     },
                     status: WorkerStatus::Paused,
                     in_flight: Default::default(),
+                    internal_workers: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -1787,6 +1792,7 @@ mod tests {
                             },
                             status: WorkerStatus::Idle,
                             in_flight: Default::default(),
+                            internal_workers: Vec::new(),
                         })
                         .await;
                 });

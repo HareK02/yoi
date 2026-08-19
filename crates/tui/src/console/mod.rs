@@ -2019,6 +2019,7 @@ mod tests {
             entries: vec![],
             status: WorkerStatus::Idle,
             in_flight: Default::default(),
+            internal_workers: Vec::new(),
         });
         app.handle_worker_event(Event::RewindApplied {
             entries: vec![],
@@ -2045,6 +2046,7 @@ mod tests {
             entries: vec![],
             status: WorkerStatus::Idle,
             in_flight: Default::default(),
+            internal_workers: Vec::new(),
         });
         type_keys(&mut app, "draft");
 

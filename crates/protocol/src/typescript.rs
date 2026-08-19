@@ -4,9 +4,10 @@ use ts_rs::{Config, TS};
 
 use crate::{
     Alert, AlertLevel, AlertSource, CompletionEntry, CompletionKind, ErrorCode, Event, Greeting,
-    InFlightBlock, InFlightSnapshot, InFlightToolCallState, InvokeKind, MemoryWorkerEvent, Method,
-    Permission, RewindSummary, RewindTarget, RewindTargetId, RunResult, ScopeRule, Segment,
-    TurnResult, WorkerEvent, WorkerStatus,
+    InFlightBlock, InFlightSnapshot, InFlightToolCallState, InternalWorkerKind, InternalWorkerRef,
+    InternalWorkerSnapshot, InvokeKind, MemoryWorkerEvent, Method, Permission, RewindSummary,
+    RewindTarget, RewindTargetId, RunResult, ScopeRule, Segment, TurnResult, WorkerEvent,
+    WorkerStatus,
     subscription::{
         EventSubscriptionSelector, SubscriptionEvent, SubscriptionEventPayload, SubscriptionFrame,
         SubscriptionFramePayload, SubscriptionId, SubscriptionRejectionCode, SubscriptionRequest,
@@ -53,6 +54,9 @@ pub fn generated_protocol_types() -> String {
     push_decl::<RewindSummary>(&cfg, &mut output);
     push_decl::<InFlightBlock>(&cfg, &mut output);
     push_decl::<InFlightSnapshot>(&cfg, &mut output);
+    push_decl::<InternalWorkerKind>(&cfg, &mut output);
+    push_decl::<InternalWorkerRef>(&cfg, &mut output);
+    push_decl::<InternalWorkerSnapshot>(&cfg, &mut output);
     push_decl::<Greeting>(&cfg, &mut output);
     push_decl::<Alert>(&cfg, &mut output);
     push_decl::<MemoryWorkerEvent>(&cfg, &mut output);

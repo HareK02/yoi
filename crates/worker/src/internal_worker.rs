@@ -12,10 +12,18 @@ use std::sync::{Arc, Mutex};
 use llm_engine::timeline::event::UsageEvent;
 use llm_engine::{Engine, llm_client::LlmClient};
 use manifest::{Scope, WorkerManifest};
+use protocol::{Event, InFlightSnapshot, WorkerStatus};
 use session_store::{LogEntry, SegmentId, SessionId, Store, StoreError, TraceEntry};
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use crate::controller::wire_event_bridges_on_engine;
 use crate::feature::FeatureRegistryBuilder;
+use crate::in_flight::{InFlightEvents, snapshot_from_guard};
+use crate::ipc::alerter::Alerter;
+use crate::ipc::protocol_session::live_log_entry_event;
+use crate::segment_log_sink::SegmentLogSink;
+use crate::spawn::registry::SpawnedWorkerRegistry;
 use crate::worker::{
     Worker, WorkerError, WorkerFilesystemAuthority, WorkerRunResult, WorkerWorkspaceContext,
 };
@@ -196,6 +204,20 @@ where
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InternalWorkerVisibility {
+    /// Output may be projected only through the owning parent's protocol stream.
+    ParentClient,
+    /// Backend-owned helper output remains private to the service authority.
+    ServicePrivate,
+}
+
+impl Default for InternalWorkerVisibility {
+    fn default() -> Self {
+        Self::ServicePrivate
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InternalWorkerSessionStatus {
     Idle,
     Running,
@@ -246,8 +268,18 @@ enum InternalWorkerSessionCommand {
 
 /// Parent-owned handle for a long-lived Internal Worker session.
 ///
-/// The handle exposes only typed turn, history, status, and stop operations. The underlying Worker,
-/// Engine, ephemeral Store, and cancellation sender remain inside the actor task.
+/// The handle exposes typed turn, history, status, presentation snapshot, event subscription, and
+/// stop operations. The underlying Worker, Engine, and cancellation sender remain inside the actor
+/// task; protocol access is consumed only by the owning parent registry.
+#[derive(Debug, Clone)]
+pub(crate) struct InternalWorkerSessionSnapshot {
+    pub entries: Vec<LogEntry>,
+    pub status: WorkerStatus,
+    pub error: Option<String>,
+    pub in_flight: InFlightSnapshot,
+    pub internal_workers: Vec<protocol::InternalWorkerSnapshot>,
+}
+
 #[derive(Clone)]
 pub(crate) struct InternalWorkerSessionHandle {
     command_tx: tokio::sync::mpsc::Sender<InternalWorkerSessionCommand>,
@@ -256,6 +288,12 @@ pub(crate) struct InternalWorkerSessionHandle {
     session_id: SessionId,
     segment_id: SegmentId,
     state_changed: Arc<tokio::sync::Notify>,
+    in_flight: InFlightEvents,
+    event_tx: broadcast::Sender<Event>,
+    visibility: InternalWorkerVisibility,
+    last_error: Arc<Mutex<Option<String>>>,
+    child_registry: Option<Arc<SpawnedWorkerRegistry>>,
+    sink: SegmentLogSink,
 }
 
 impl InternalWorkerSessionHandle {
@@ -265,6 +303,54 @@ impl InternalWorkerSessionHandle {
 
     pub(crate) fn status(&self) -> InternalWorkerSessionStatus {
         InternalWorkerSessionStatus::decode(self.status.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    pub(crate) fn visibility(&self) -> InternalWorkerVisibility {
+        self.visibility
+    }
+
+    pub(crate) fn subscribe_events(&self) -> broadcast::Receiver<Event> {
+        self.event_tx.subscribe()
+    }
+
+    pub(crate) fn protocol_sender(&self) -> broadcast::Sender<Event> {
+        self.event_tx.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_test_entry(&self, entry: LogEntry) {
+        self.sink.publish(entry);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn emit_test_text_delta(&self, text: &str) {
+        let block_id = self.in_flight.start_text_block();
+        self.in_flight.text_delta(block_id, text.to_owned());
+    }
+
+    pub(crate) fn protocol_snapshot(&self) -> InternalWorkerSessionSnapshot {
+        let (entries, in_flight) = {
+            let guard = self.in_flight.snapshot_guard();
+            let (entries, _) = self.sink.subscribe_with_snapshot();
+            (entries, snapshot_from_guard(&guard))
+        };
+        InternalWorkerSessionSnapshot {
+            entries,
+            status: match self.status() {
+                InternalWorkerSessionStatus::Running => WorkerStatus::Running,
+                InternalWorkerSessionStatus::Idle => WorkerStatus::Idle,
+                InternalWorkerSessionStatus::Stopping
+                | InternalWorkerSessionStatus::Stopped
+                | InternalWorkerSessionStatus::Failed => WorkerStatus::Paused,
+            },
+            error: self.last_error.lock().unwrap().clone(),
+            in_flight,
+            internal_workers: self
+                .child_registry
+                .as_ref()
+                .map(|registry| registry.internal_worker_snapshots())
+                .unwrap_or_default(),
+        }
     }
 
     pub(crate) fn entries(&self) -> Vec<LogEntry> {
@@ -305,8 +391,17 @@ impl InternalWorkerSessionHandle {
                 std::sync::atomic::Ordering::Release,
             );
             self.state_changed.notify_waiters();
+            let message = "internal Worker session actor is unavailable".to_owned();
+            *self.last_error.lock().unwrap() = Some(message.clone());
+            let _ = self.event_tx.send(Event::Error {
+                code: protocol::ErrorCode::Internal,
+                message,
+            });
             return Err(InternalWorkerSessionError::Unavailable);
         }
+        let _ = self.event_tx.send(Event::Status {
+            status: WorkerStatus::Running,
+        });
         Ok(())
     }
 
@@ -423,11 +518,48 @@ pub(crate) async fn spawn_internal_worker_session(
     spawn_prepared_internal_worker_session(worker, store, input, None).await
 }
 
+fn spawn_internal_log_event_bridge(sink: SegmentLogSink, event_tx: broadcast::Sender<Event>) {
+    let (_, mut log_rx) = sink.subscribe_with_snapshot();
+    tokio::spawn(async move {
+        loop {
+            match log_rx.recv().await {
+                Ok(entry) => {
+                    if let Some(event) = live_log_entry_event(entry) {
+                        let _ = event_tx.send(event);
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    let _ = event_tx.send(Event::Error {
+                        code: protocol::ErrorCode::Internal,
+                        message: format!(
+                            "internal Worker session-log output lagged by {skipped} entries; reconnect to resynchronize"
+                        ),
+                    });
+                    break;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
 pub(crate) async fn prepare_internal_worker_session(
     mut worker: Worker<Box<dyn LlmClient>, EphemeralSessionStore>,
     store: EphemeralSessionStore,
+    visibility: InternalWorkerVisibility,
+    child_registry: Option<Arc<SpawnedWorkerRegistry>>,
     on_turn_end: Option<Arc<dyn Fn(InternalWorkerSessionStatus) + Send + Sync>>,
 ) -> Result<InternalWorkerSessionHandle, InternalWorkerSessionError> {
+    let (event_tx, _event_rx) = broadcast::channel(256);
+    let sink = worker.sink();
+    spawn_internal_log_event_bridge(sink.clone(), event_tx.clone());
+    let alerter = Alerter::new(event_tx.clone());
+    let in_flight = InFlightEvents::new(event_tx.clone());
+    worker.attach_alerter(alerter.clone());
+    worker.attach_event_tx(event_tx.clone());
+    worker.attach_in_flight_events(in_flight.clone());
+    wire_event_bridges_on_engine(&mut worker, &event_tx, &alerter, &in_flight);
+
     let session_id = worker.session_id();
     let segment_id = worker.segment_id();
     let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(8);
@@ -435,6 +567,7 @@ pub(crate) async fn prepare_internal_worker_session(
         InternalWorkerSessionStatus::Idle.encode(),
     ));
     let state_changed = Arc::new(tokio::sync::Notify::new());
+    let last_error = Arc::new(Mutex::new(None));
     let handle = InternalWorkerSessionHandle {
         command_tx,
         status: status.clone(),
@@ -442,6 +575,12 @@ pub(crate) async fn prepare_internal_worker_session(
         session_id,
         segment_id,
         state_changed: state_changed.clone(),
+        in_flight,
+        event_tx: event_tx.clone(),
+        visibility,
+        last_error: last_error.clone(),
+        child_registry,
+        sink,
     };
 
     tokio::spawn(async move {
@@ -453,11 +592,25 @@ pub(crate) async fn prepare_internal_worker_session(
                     loop {
                         tokio::select! {
                             result = &mut run => {
-                                let turn_status = match result {
-                                    Ok(_) => InternalWorkerSessionStatus::Idle,
-                                    Err(_) => InternalWorkerSessionStatus::Failed,
+                                let (turn_status, error) = match result {
+                                    Ok(_) => (InternalWorkerSessionStatus::Idle, None),
+                                    Err(error) => (
+                                        InternalWorkerSessionStatus::Failed,
+                                        Some(error.to_string()),
+                                    ),
                                 };
                                 status.store(turn_status.encode(), std::sync::atomic::Ordering::Release);
+                                if let Some(message) = error {
+                                    *last_error.lock().unwrap() = Some(message.clone());
+                                    let _ = event_tx.send(Event::Error {
+                                        code: protocol::ErrorCode::Internal,
+                                        message,
+                                    });
+                                } else {
+                                    let _ = event_tx.send(Event::Status {
+                                        status: WorkerStatus::Idle,
+                                    });
+                                }
                                 if let Some(callback) = &on_turn_end {
                                     callback(turn_status);
                                 }
@@ -470,6 +623,8 @@ pub(crate) async fn prepare_internal_worker_session(
                                         let _ = cancel_sender.send(()).await;
                                         let _ = (&mut run).await;
                                         status.store(InternalWorkerSessionStatus::Stopped.encode(), std::sync::atomic::Ordering::Release);
+                                        let _ = event_tx.send(Event::Status { status: WorkerStatus::Paused });
+                                        let _ = event_tx.send(Event::Shutdown);
                                         state_changed.notify_waiters();
                                         let _ = done.send(());
                                         return;
@@ -491,6 +646,10 @@ pub(crate) async fn prepare_internal_worker_session(
                         InternalWorkerSessionStatus::Stopped.encode(),
                         std::sync::atomic::Ordering::Release,
                     );
+                    let _ = event_tx.send(Event::Status {
+                        status: WorkerStatus::Paused,
+                    });
+                    let _ = event_tx.send(Event::Shutdown);
                     state_changed.notify_waiters();
                     let _ = done.send(());
                     return;
@@ -509,7 +668,14 @@ pub(crate) async fn spawn_prepared_internal_worker_session(
     input: String,
     on_turn_end: Option<Arc<dyn Fn(InternalWorkerSessionStatus) + Send + Sync>>,
 ) -> Result<InternalWorkerSessionHandle, InternalWorkerSessionError> {
-    let handle = prepare_internal_worker_session(worker, store, on_turn_end).await?;
+    let handle = prepare_internal_worker_session(
+        worker,
+        store,
+        InternalWorkerVisibility::ServicePrivate,
+        None,
+        on_turn_end,
+    )
+    .await?;
     handle.send(input).await?;
     Ok(handle)
 }
@@ -707,6 +873,37 @@ impl session_store::WorkerMetadataStore for EphemeralSessionStore {
             .remove(worker_name);
         Ok(())
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_internal_worker_session(
+    visibility: InternalWorkerVisibility,
+) -> (InternalWorkerSessionHandle, broadcast::Sender<Event>) {
+    let store = EphemeralSessionStore::default();
+    let session_id = session_store::new_session_id();
+    let segment_id = session_store::new_segment_id();
+    let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(1);
+    tokio::spawn(async move { while command_rx.recv().await.is_some() {} });
+    let (event_tx, _) = broadcast::channel(256);
+    let sink = SegmentLogSink::new();
+    spawn_internal_log_event_bridge(sink.clone(), event_tx.clone());
+    let handle = InternalWorkerSessionHandle {
+        command_tx,
+        status: Arc::new(std::sync::atomic::AtomicU8::new(
+            InternalWorkerSessionStatus::Idle.encode(),
+        )),
+        store,
+        session_id,
+        segment_id,
+        state_changed: Arc::new(tokio::sync::Notify::new()),
+        in_flight: InFlightEvents::new(event_tx.clone()),
+        event_tx: event_tx.clone(),
+        visibility,
+        last_error: Arc::new(Mutex::new(None)),
+        child_registry: None,
+        sink,
+    };
+    (handle, event_tx)
 }
 
 #[cfg(test)]
