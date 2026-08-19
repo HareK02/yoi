@@ -69,6 +69,42 @@ impl Drop for WorkdirDelegation {
     }
 }
 
+pub struct AppliedWorkdirDelegation {
+    pub scoped_session: WorkdirSessionHandle,
+    _leases: Vec<WorkdirDelegation>,
+}
+
+impl std::fmt::Debug for AppliedWorkdirDelegation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppliedWorkdirDelegation")
+            .field("workdir", self.scoped_session.workdir())
+            .field("lease_count", &self._leases.len())
+            .finish()
+    }
+}
+
+pub async fn apply_delegation_chain(
+    source: WorkdirSessionHandle,
+    requests: impl IntoIterator<Item = WorkdirDelegationRequest>,
+) -> Result<AppliedWorkdirDelegation, WorkdirError> {
+    let mut current = source;
+    let mut leases = Vec::new();
+    for request in requests {
+        let authority = if current.is_delegation_capable() {
+            current.clone()
+        } else {
+            delegation_capable_session(current.clone())
+        };
+        let lease = authority.delegate(request).await?;
+        current = lease.scoped_session.clone();
+        leases.push(lease);
+    }
+    Ok(AppliedWorkdirDelegation {
+        scoped_session: current,
+        _leases: leases,
+    })
+}
+
 #[derive(Debug)]
 struct SessionValidity {
     active: AtomicBool,
@@ -833,6 +869,38 @@ mod tests {
             nested.scoped_session.read(read("a")).await,
             Err(WorkdirError::SessionClosed)
         ));
+    }
+
+    #[tokio::test]
+    async fn applied_chain_cannot_replace_outer_provider_attenuation() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("outer")).unwrap();
+        fs::create_dir_all(root.path().join("outside")).unwrap();
+        let result = apply_delegation_chain(
+            Arc::new(LocalWorkdirSession::materialized_bound(
+                Workdir::new("delegation-chain-test"),
+                root.path().to_path_buf(),
+                root.path().to_path_buf(),
+                SharedScope::new(
+                    Scope::from_config(&ScopeConfig {
+                        allow: vec![ScopeRule {
+                            target: root.path().to_path_buf(),
+                            permission: Permission::Write,
+                            recursive: true,
+                        }],
+                        deny: Vec::new(),
+                    })
+                    .unwrap(),
+                ),
+                WorkdirSessionCapabilities::ALL,
+            )),
+            [
+                request("outer", WorkdirDelegationPermission::Read),
+                request("outside", WorkdirDelegationPermission::Read),
+            ],
+        )
+        .await;
+        assert!(matches!(result, Err(WorkdirError::Denied(_))));
     }
 
     #[tokio::test]

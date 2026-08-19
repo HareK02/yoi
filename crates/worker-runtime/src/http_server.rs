@@ -611,18 +611,8 @@ async fn run_workdir_session_operation(
             .ok_or_else(RuntimeHttpWorkdirError::not_found)?;
         record.session.clone()
     };
-    let delegation = if let Some(delegation) = request.delegation {
-        Some(
-            workdir::delegation_capable_session(source.clone())
-                .delegate(delegation)
-                .await?,
-        )
-    } else {
-        None
-    };
-    let session = delegation.as_ref().map_or(source.as_ref(), |delegation| {
-        delegation.scoped_session.as_ref()
-    });
+    let applied = workdir::apply_delegation_chain(source, request.delegations).await?;
+    let session = applied.scoped_session.as_ref();
     let operation = request.operation;
 
     let result = match operation {
@@ -2279,7 +2269,7 @@ mod tests {
             expires_at: u64::MAX,
         };
         let operation = WorkdirSessionOperationRequest {
-            delegation: None,
+            delegations: Vec::new(),
             operation: WorkdirSessionOperation::Stat(StatRequest {
                 path: WorkdirPath::new("hello.txt").expect("logical path"),
             }),
@@ -2298,14 +2288,14 @@ mod tests {
         #[cfg(unix)]
         {
             let delegated_read = WorkdirSessionOperationRequest {
-                delegation: Some(workdir::WorkdirDelegationRequest {
+                delegations: vec![workdir::WorkdirDelegationRequest {
                     rules: vec![workdir::WorkdirDelegationRule {
                         target: WorkdirPath::new("granted").unwrap(),
                         permission: workdir::WorkdirDelegationPermission::Read,
                         recursive: true,
                     }],
                     cwd: WorkdirPath::new("granted").unwrap(),
-                }),
+                }],
                 operation: WorkdirSessionOperation::Read(ReadRequest {
                     path: WorkdirPath::new("link").unwrap(),
                     offset: 0,

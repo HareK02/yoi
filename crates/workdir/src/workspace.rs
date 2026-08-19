@@ -320,8 +320,8 @@ mod tests {
 pub struct WorkspaceWorkdirSessionOperationRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_session_fence: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delegation: Option<crate::WorkdirDelegationRequest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delegations: Vec<crate::WorkdirDelegationRequest>,
     pub operation: crate::http::WorkdirSessionOperation,
 }
 

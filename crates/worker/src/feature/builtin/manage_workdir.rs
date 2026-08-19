@@ -155,7 +155,7 @@ pub struct WorkspaceAttachedWorkdirSession {
     client: Arc<dyn WorkspaceClient>,
     workdir: Workdir,
     expected_session_fence: Option<String>,
-    delegation: Option<workdir::WorkdirDelegationRequest>,
+    delegations: Vec<workdir::WorkdirDelegationRequest>,
 }
 
 impl WorkspaceAttachedWorkdirSession {
@@ -164,7 +164,7 @@ impl WorkspaceAttachedWorkdirSession {
             client,
             workdir: Workdir::new("workspace-attachment"),
             expected_session_fence: None,
-            delegation: None,
+            delegations: Vec::new(),
         })
     }
 
@@ -183,7 +183,7 @@ impl WorkspaceAttachedWorkdirSession {
             ),
             serde_json::to_string(&WorkspaceWorkdirSessionOperationRequest {
                 expected_session_fence: self.expected_session_fence.clone(),
-                delegation: self.delegation.clone(),
+                delegations: self.delegations.clone(),
                 operation,
             })
             .map_err(|error| {
@@ -267,11 +267,13 @@ impl WorkdirSession for WorkspaceAttachedWorkdirSession {
                 })?;
             fence.value
         };
+        let mut delegations = self.delegations.clone();
+        delegations.push(request.clone());
         Ok(Arc::new(Self {
             client: self.client.clone(),
             workdir: self.workdir.clone(),
             expected_session_fence: Some(expected_session_fence),
-            delegation: Some(request.clone()),
+            delegations,
         }))
     }
 
@@ -1100,7 +1102,60 @@ mod tests {
             serde_json::from_str(requests[1].body.as_deref().unwrap()).unwrap();
         assert_eq!(body["expected_session_fence"], "attachment-fence");
         assert_eq!(body["operation"]["operation"], "stat");
-        assert_eq!(body["delegation"]["rules"][0]["target"], "");
+        assert_eq!(body["delegations"][0]["rules"][0]["target"], "");
+    }
+
+    #[tokio::test]
+    async fn nested_attached_session_preserves_full_delegation_chain() {
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![
+            response(json!({"value": "attachment-fence"})),
+            response(json!({
+                "operation": "stat",
+                "result": {"path": "nested/file", "kind": "file", "size": 1}
+            })),
+        ]));
+        let parent = workdir::delegation_capable_session(WorkspaceAttachedWorkdirSession::handle(
+            client.clone(),
+        ));
+        let outer = parent
+            .delegate(workdir::WorkdirDelegationRequest {
+                rules: vec![workdir::WorkdirDelegationRule {
+                    target: workdir::WorkdirPath::new("").unwrap(),
+                    permission: workdir::WorkdirDelegationPermission::Read,
+                    recursive: true,
+                }],
+                cwd: workdir::WorkdirPath::new("").unwrap(),
+            })
+            .await
+            .unwrap();
+        let nested = outer
+            .scoped_session
+            .delegate(workdir::WorkdirDelegationRequest {
+                rules: vec![workdir::WorkdirDelegationRule {
+                    target: workdir::WorkdirPath::new("nested").unwrap(),
+                    permission: workdir::WorkdirDelegationPermission::Read,
+                    recursive: true,
+                }],
+                cwd: workdir::WorkdirPath::new("nested").unwrap(),
+            })
+            .await
+            .unwrap();
+        nested
+            .scoped_session
+            .stat(StatRequest {
+                path: workdir::WorkdirPath::new("file").unwrap(),
+            })
+            .await
+            .unwrap();
+
+        let requests = client.requests();
+        assert_eq!(requests.len(), 2);
+        let body: serde_json::Value =
+            serde_json::from_str(requests[1].body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["delegations"].as_array().unwrap().len(), 2);
+        assert_eq!(body["delegations"][0]["rules"][0]["target"], "");
+        assert_eq!(body["delegations"][1]["rules"][0]["target"], "nested");
+        assert_eq!(body["operation"]["request"]["path"], "nested/file");
     }
 
     #[test]

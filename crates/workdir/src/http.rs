@@ -72,8 +72,8 @@ pub enum WorkdirSessionOperation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkdirSessionOperationRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delegation: Option<crate::WorkdirDelegationRequest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delegations: Vec<crate::WorkdirDelegationRequest>,
     pub operation: WorkdirSessionOperation,
 }
 
@@ -216,7 +216,7 @@ mod client {
         workdir: Workdir,
         session_id: WorkdirSessionId,
         capabilities: WorkdirSessionCapabilities,
-        delegation: Option<crate::WorkdirDelegationRequest>,
+        delegations: Vec<crate::WorkdirDelegationRequest>,
         closed: AtomicBool,
     }
 
@@ -269,7 +269,7 @@ mod client {
                 workdir: Workdir::new(opened.workdir_id.as_str()),
                 session_id: opened.session_id,
                 capabilities: opened.capabilities,
-                delegation: None,
+                delegations: Vec::new(),
                 closed: AtomicBool::new(false),
             })
         }
@@ -297,7 +297,7 @@ mod client {
                 ],
             )?;
             let operation = WorkdirSessionOperationRequest {
-                delegation: self.delegation.clone(),
+                delegations: self.delegations.clone(),
                 operation,
             };
             let response = self
@@ -335,6 +335,8 @@ mod client {
             if self.closed.load(Ordering::Acquire) {
                 return Err(WorkdirError::SessionClosed);
             }
+            let mut delegations = self.delegations.clone();
+            delegations.push(request.clone());
             Ok(Arc::new(Self {
                 client: self.client.clone(),
                 base_url: self.base_url.clone(),
@@ -342,7 +344,7 @@ mod client {
                 workdir: self.workdir.clone(),
                 session_id: self.session_id.clone(),
                 capabilities: self.capabilities,
-                delegation: Some(request.clone()),
+                delegations,
                 closed: AtomicBool::new(false),
             }))
         }

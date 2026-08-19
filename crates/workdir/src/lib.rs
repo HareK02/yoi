@@ -18,8 +18,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 pub use delegation::{
-    ReadOnlyWorkdirSession, WorkdirDelegation, WorkdirDelegationPermission,
-    WorkdirDelegationRequest, WorkdirDelegationRule, delegation_capable_session,
+    AppliedWorkdirDelegation, ReadOnlyWorkdirSession, WorkdirDelegation,
+    WorkdirDelegationPermission, WorkdirDelegationRequest, WorkdirDelegationRule,
+    apply_delegation_chain, delegation_capable_session,
 };
 pub use fs_operation::{
     ContentHash, EditRequest, EditResult, EntryKind, FsPath as WorkdirPath, GlobRequest,
