@@ -146,7 +146,7 @@
               <td>
                 {#if workdir.occupied_by}
                   <span>{workdir.occupied_by.display_name}</span>
-                  <small>{workdir.occupied_by.runtime_id}:{workdir.occupied_by.runtime_worker_id}</small>
+                  <small>{workdir.occupied_by.runtime_id}:{workdir.occupied_by.worker_id}</small>
                 {:else}
                   <span class="muted">—</span>
                 {/if}

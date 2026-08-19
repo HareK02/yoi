@@ -120,8 +120,7 @@ Deno.test("defaultWorkerLaunchForm skips occupied working directories", () => {
           ...options.working_directories[0],
           occupied_by: {
             runtime_id: "embedded",
-            runtime_worker_id: 12,
-            worker_id: "embedded:12",
+            worker_id: "0198f82e-6d90-7f15-a121-174a02e10e77",
             display_name: "Worker 12",
             linked_at: "2026-07-24T00:00:00Z",
           },

@@ -119,7 +119,6 @@ export type WorkingDirectoryRepositoryOption = {
 
 export type WorkingDirectoryOccupancy = {
   runtime_id: string;
-  runtime_worker_id: number;
   worker_id: string;
   display_name: string;
   linked_at: string;
@@ -135,7 +134,7 @@ export type WorkingDirectorySummary = {
   materializer_kind: string;
   status: string;
   cleanliness?: string | null;
-  primary_worker_id?: number | null;
+  primary_worker_id?: string | null;
   occupied_by?: WorkingDirectoryOccupancy | null;
   cleanup_target: {
     kind: string;
