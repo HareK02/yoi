@@ -224,6 +224,21 @@ function projectVisibleConsole(
   };
 }
 
+function appendSnapshotInFlightLines(
+  projection: ConsoleProjection,
+  blocks: InFlightBlock[],
+  eventId: string,
+  cwd: string | null,
+): void {
+  const lineIds = new Set(projection.lines.map((line) => line.id));
+  blocks.forEach((block, index) => {
+    const pending = inFlightLine(`${eventId}:${index}`, block, cwd);
+    if (lineIds.has(pending.id)) return;
+    projection.lines.push(pending);
+    lineIds.add(pending.id);
+  });
+}
+
 function projectInternalWorkerSnapshot(
   snapshot: InternalWorkerSnapshot,
   eventId: string,
@@ -235,15 +250,12 @@ function projectInternalWorkerSnapshot(
     cwd,
   );
   console.status = snapshot.status;
-  for (const block of snapshot.in_flight?.blocks ?? []) {
-    console.lines.push(
-      inFlightLine(
-        `${eventId}:internal:${snapshot.worker.session_id}:in-flight`,
-        block,
-        cwd,
-      ),
-    );
-  }
+  appendSnapshotInFlightLines(
+    console,
+    snapshot.in_flight?.blocks ?? [],
+    `${eventId}:internal:${snapshot.worker.session_id}:in-flight`,
+    cwd,
+  );
   if (snapshot.error) {
     console.lines.push({
       id: `${eventId}:internal:${snapshot.worker.session_id}:error`,
@@ -385,9 +397,12 @@ export function applyProtocolEvent(
       next.lines = snapshot.lines;
       next.tasks = snapshot.tasks;
       next.taskNextId = snapshot.taskNextId;
-      for (const block of event.data.in_flight?.blocks ?? []) {
-        next.lines.push(inFlightLine(envelope.eventId, block, next.cwd));
-      }
+      appendSnapshotInFlightLines(
+        next,
+        event.data.in_flight?.blocks ?? [],
+        `${envelope.eventId}:snapshot-in-flight`,
+        next.cwd,
+      );
       next.internalWorkers = (event.data.internal_workers ?? []).map((worker) =>
         projectInternalWorkerSnapshot(worker, envelope.eventId, next.cwd)
       );

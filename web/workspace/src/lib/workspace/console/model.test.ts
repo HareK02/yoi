@@ -1314,9 +1314,36 @@ Deno.test("parent snapshot authoritatively replaces Internal Worker projections"
       kind: "sub_worker",
     },
     revision: 4,
-    entries: [],
+    entries: [{
+      kind: "assistant_item",
+      ts: 1,
+      item: {
+        kind: "tool_call",
+        call_id: "committed-call",
+        name: "Read",
+        arguments: JSON.stringify({ file_path: "/repo/a.md" }),
+      },
+    }, {
+      kind: "tool_result",
+      ts: 2,
+      item: {
+        kind: "tool_result",
+        call_id: "committed-call",
+        summary: "read file",
+        content: "content",
+        is_error: false,
+      },
+    }],
     status: "idle",
-    in_flight: { blocks: [] },
+    in_flight: {
+      blocks: [{
+        kind: "tool_call",
+        id: "committed-call",
+        name: "Read",
+        args: JSON.stringify({ file_path: "/repo/a.md" }),
+        state: "done",
+      }],
+    },
     internal_workers: [],
   }];
   const projector = createConsoleProjector();
@@ -1340,6 +1367,10 @@ Deno.test("parent snapshot authoritatively replaces Internal Worker projections"
   assertEquals(projection.internalWorkers.map((worker) => worker.worker.session_id), [
     "replacement",
   ]);
+  const childLines = projection.internalWorkers[0].console.lines;
+  assertEquals(childLines.length, 1);
+  assertEquals(new Set(childLines.map((line) => line.id)).size, 1);
+  assertEquals(childLines[0].kind, "tool");
 });
 
 Deno.test("snapshot restores TaskStore state from system history", () => {

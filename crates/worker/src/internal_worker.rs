@@ -555,6 +555,7 @@ pub(crate) async fn prepare_internal_worker_session(
     spawn_internal_log_event_bridge(sink.clone(), event_tx.clone());
     let alerter = Alerter::new(event_tx.clone());
     let in_flight = InFlightEvents::new(event_tx.clone());
+    let actor_in_flight = in_flight.clone();
     worker.attach_alerter(alerter.clone());
     worker.attach_event_tx(event_tx.clone());
     worker.attach_in_flight_events(in_flight.clone());
@@ -587,6 +588,7 @@ pub(crate) async fn prepare_internal_worker_session(
         while let Some(command) = command_rx.recv().await {
             match command {
                 InternalWorkerSessionCommand::Run(input) => {
+                    actor_in_flight.clear();
                     let cancel_sender = worker.engine_mut().cancel_sender();
                     let mut run = std::pin::pin!(worker.run_text(&input));
                     loop {
@@ -599,6 +601,7 @@ pub(crate) async fn prepare_internal_worker_session(
                                         Some(error.to_string()),
                                     ),
                                 };
+                                actor_in_flight.clear();
                                 status.store(turn_status.encode(), std::sync::atomic::Ordering::Release);
                                 if let Some(message) = error {
                                     *last_error.lock().unwrap() = Some(message.clone());
@@ -622,6 +625,7 @@ pub(crate) async fn prepare_internal_worker_session(
                                     Some(InternalWorkerSessionCommand::Stop(done)) => {
                                         let _ = cancel_sender.send(()).await;
                                         let _ = (&mut run).await;
+                                        actor_in_flight.clear();
                                         status.store(InternalWorkerSessionStatus::Stopped.encode(), std::sync::atomic::Ordering::Release);
                                         let _ = event_tx.send(Event::Status { status: WorkerStatus::Paused });
                                         let _ = event_tx.send(Event::Shutdown);
@@ -634,6 +638,7 @@ pub(crate) async fn prepare_internal_worker_session(
                                     }
                                     None => {
                                         let _ = cancel_sender.send(()).await;
+                                        actor_in_flight.clear();
                                         return;
                                     }
                                 }
@@ -642,6 +647,7 @@ pub(crate) async fn prepare_internal_worker_session(
                     }
                 }
                 InternalWorkerSessionCommand::Stop(done) => {
+                    actor_in_flight.clear();
                     status.store(
                         InternalWorkerSessionStatus::Stopped.encode(),
                         std::sync::atomic::Ordering::Release,
@@ -656,6 +662,7 @@ pub(crate) async fn prepare_internal_worker_session(
                 }
             }
         }
+        actor_in_flight.clear();
     });
 
     Ok(handle)
@@ -1068,6 +1075,10 @@ permission = "write"
             handle.wait_until_idle().await,
             InternalWorkerSessionStatus::Idle
         );
+        handle
+            .in_flight
+            .tool_call_start("stale-call".to_string(), "Read".to_string());
+        assert_eq!(handle.protocol_snapshot().in_flight.blocks.len(), 1);
         let entries_after_first = handle.entries().len();
         assert!(entries_after_first >= 4);
         handle.send("follow-up").await.expect("send follow-up turn");
@@ -1075,6 +1086,7 @@ permission = "write"
             handle.wait_until_idle().await,
             InternalWorkerSessionStatus::Idle
         );
+        assert!(handle.protocol_snapshot().in_flight.blocks.is_empty());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(handle.entries().len() > entries_after_first);
 
