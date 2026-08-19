@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use fs_operation::FsPath;
 use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use manifest::{
-    CompactionConfigPartial, EngineManifestConfig, FileUploadLimitsPartial, Permission,
+    CompactionConfigPartial, EngineManifestConfig, FileUploadLimitsPartial,
     PermissionConfigPartial, ProfileDiscovery, ProfileError, ProfileRegistry,
     ProfileRegistrySource, ProfileResolveOptions, ProfileResolver, ProfileSelector, ScopeConfig,
     ScopeRule, SessionConfigPartial, ToolOutputLimitsPartial, WorkerManifest, WorkerManifestConfig,
@@ -53,11 +53,10 @@ struct SubWorkerSpawnInput {
     /// Exact catalog-root dotted Prompt name (for example `default` or `role.coder`).
     #[serde(default)]
     instruction: Option<String>,
-    /// Child process/tool working directory. This is not the runtime workspace
-    /// root and grants no filesystem authority. When omitted, the spawned SubWorker
-    /// starts in the spawner's current working directory.
+    /// Logical Workdir-relative child tool working directory. This path is not
+    /// a host path and grants no authority. When omitted, the Workdir root is used.
     #[serde(default)]
-    cwd: Option<PathBuf>,
+    cwd: Option<String>,
     /// First message sent to the spawned SubWorker via `Method::Run`.
     task: String,
     /// Allow rules delegated to the spawned SubWorker. Must be a subset of the
@@ -77,8 +76,9 @@ struct ReviewerHandoffInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ScopeRuleInput {
-    /// Absolute target path. Relative paths are rejected.
-    target: PathBuf,
+    /// Logical Workdir-relative target such as `.` or `src`. Absolute host
+    /// paths and parent traversal are rejected.
+    target: String,
     /// `"read"` or `"write"`.
     permission: PermissionInput,
     /// When `false`, the rule matches the target itself and its direct
@@ -96,15 +96,6 @@ enum PermissionInput {
 
 fn default_true() -> bool {
     true
-}
-
-impl From<PermissionInput> for Permission {
-    fn from(p: PermissionInput) -> Self {
-        match p {
-            PermissionInput::Read => Permission::Read,
-            PermissionInput::Write => Permission::Write,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -274,7 +265,6 @@ pub struct SubWorkerSpawnTool {
     workspace_root: PathBuf,
     /// Directory the spawned SubWorker's tools should use when the LLM did not
     /// override it. Defaults to the spawner's cwd.
-    spawner_cwd: PathBuf,
     /// Active provider-backed Workdir session from which child leases are captured.
     source_workdir_session: Option<WorkdirSessionHandle>,
     /// Parent-owned in-memory registry shared by the five SubWorker tools.
@@ -302,7 +292,6 @@ impl SubWorkerSpawnTool {
         parent_notifications: ParentNotificationTarget,
         runtime_base: PathBuf,
         workspace_root: PathBuf,
-        spawner_cwd: PathBuf,
         source_workdir_session: Option<WorkdirSessionHandle>,
         registry: Arc<SpawnedWorkerRegistry>,
         spawner_manifest: WorkerManifest,
@@ -315,7 +304,6 @@ impl SubWorkerSpawnTool {
             parent_notifications,
             runtime_base,
             workspace_root,
-            spawner_cwd,
             source_workdir_session,
             registry,
             spawner_manifest,
@@ -378,11 +366,10 @@ impl Tool for SubWorkerSpawnTool {
             .reserve_internal_name(input.name.clone())
             .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
 
-        let scope_allow = parse_scope(&input.scope)?;
+        let workdir_rules = parse_workdir_scope(&input.scope)?;
         let source_workdir_session =
             require_active_workdir_session(self.source_workdir_session.as_ref())?;
-        let delegation_request =
-            self.workdir_delegation_request(input.cwd.as_deref(), &scope_allow)?;
+        let delegation_request = workdir_delegation_request(input.cwd.as_deref(), workdir_rules)?;
         let workdir_delegation = source_workdir_session
             .delegate(delegation_request)
             .await
@@ -397,6 +384,7 @@ impl Tool for SubWorkerSpawnTool {
                     self.available_profiles.error_suffix()
                 ))
             })?;
+        let scope_allow = Vec::new();
         let spawn_config_json = self
             .build_spawn_config_json(
                 &input.name,
@@ -618,63 +606,57 @@ impl Tool for SubWorkerSpawnTool {
     }
 }
 
-impl SubWorkerSpawnTool {
-    fn workdir_delegation_request(
-        &self,
-        cwd: Option<&Path>,
-        scope_allow: &[ScopeRule],
-    ) -> Result<WorkdirDelegationRequest, ToolError> {
-        let rules = scope_allow
-            .iter()
-            .map(|rule| {
-                Ok(WorkdirDelegationRule {
-                    target: self.logical_workdir_path(&rule.target)?,
-                    permission: match rule.permission {
-                        Permission::Read => WorkdirDelegationPermission::Read,
-                        Permission::Write => WorkdirDelegationPermission::Write,
-                    },
-                    recursive: rule.recursive,
-                })
-            })
-            .collect::<Result<Vec<_>, ToolError>>()?;
-        let cwd = cwd.unwrap_or(&self.spawner_cwd);
-        if !cwd.is_absolute() {
-            return Err(ToolError::InvalidArgument(format!(
-                "cwd must be absolute, got `{}`",
-                cwd.display()
-            )));
-        }
-        Ok(WorkdirDelegationRequest {
-            rules,
-            cwd: self.logical_workdir_path(cwd)?,
-        })
+fn logical_workdir_path(value: &str, field: &str) -> Result<FsPath, ToolError> {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return Err(ToolError::InvalidArgument(format!(
+            "{field} must be Workdir-relative, got `{value}`"
+        )));
     }
+    let normalized = path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::CurDir => None,
+            other => Some(other.as_os_str()),
+        })
+        .collect::<PathBuf>();
+    let normalized = normalized.to_str().ok_or_else(|| {
+        ToolError::InvalidArgument(format!("{field} `{value}` is not valid UTF-8"))
+    })?;
+    FsPath::new(normalized).map_err(|error| {
+        ToolError::InvalidArgument(format!(
+            "{field} `{value}` is not a valid logical Workdir path: {error}"
+        ))
+    })
+}
 
-    fn logical_workdir_path(&self, path: &Path) -> Result<FsPath, ToolError> {
-        let logical = if self.workspace_root == Path::new("/") {
-            path.strip_prefix(Path::new("/"))
-        } else {
-            path.strip_prefix(&self.workspace_root)
-        }
-        .map_err(|_| {
-            ToolError::InvalidArgument(format!(
-                "scope target `{}` is not a Workdir-owned logical path",
-                path.display()
-            ))
-        })?;
-        let logical = logical.to_str().ok_or_else(|| {
-            ToolError::InvalidArgument(format!(
-                "scope target `{}` is not valid UTF-8",
-                path.display()
-            ))
-        })?;
-        FsPath::new(logical).map_err(|error| {
-            ToolError::InvalidArgument(format!(
-                "scope target `{}` is not a valid logical Workdir path: {error}",
-                path.display()
-            ))
-        })
+fn parse_workdir_scope(rules: &[ScopeRuleInput]) -> Result<Vec<WorkdirDelegationRule>, ToolError> {
+    if rules.is_empty() {
+        return Err(ToolError::InvalidArgument("scope must not be empty".into()));
     }
+    rules
+        .iter()
+        .map(|rule| {
+            Ok(WorkdirDelegationRule {
+                target: logical_workdir_path(&rule.target, "scope.target")?,
+                permission: match rule.permission {
+                    PermissionInput::Read => WorkdirDelegationPermission::Read,
+                    PermissionInput::Write => WorkdirDelegationPermission::Write,
+                },
+                recursive: rule.recursive,
+            })
+        })
+        .collect()
+}
+
+fn workdir_delegation_request(
+    cwd: Option<&str>,
+    rules: Vec<WorkdirDelegationRule>,
+) -> Result<WorkdirDelegationRequest, ToolError> {
+    Ok(WorkdirDelegationRequest {
+        rules,
+        cwd: logical_workdir_path(cwd.unwrap_or("."), "cwd")?,
+    })
 }
 
 fn require_active_workdir_session(
@@ -686,28 +668,6 @@ fn require_active_workdir_session(
                 .to_string(),
         )
     })
-}
-
-fn parse_scope(rules: &[ScopeRuleInput]) -> Result<Vec<ScopeRule>, ToolError> {
-    if rules.is_empty() {
-        return Err(ToolError::InvalidArgument("scope must not be empty".into()));
-    }
-    rules
-        .iter()
-        .map(|r| {
-            if !r.target.is_absolute() {
-                return Err(ToolError::InvalidArgument(format!(
-                    "scope.target must be absolute: {}",
-                    r.target.display()
-                )));
-            }
-            Ok(ScopeRule {
-                target: r.target.clone(),
-                permission: r.permission.into(),
-                recursive: r.recursive,
-            })
-        })
-        .collect()
 }
 
 /// Serialise the internal manifest config that gets handed to the child
@@ -915,7 +875,6 @@ pub(crate) fn sub_worker_spawn_tool(
     parent_notifications: ParentNotificationTarget,
     runtime_base: PathBuf,
     workspace_root: PathBuf,
-    spawner_cwd: PathBuf,
     source_workdir_session: Option<WorkdirSessionHandle>,
     registry: Arc<SpawnedWorkerRegistry>,
     spawner_manifest: WorkerManifest,
@@ -927,7 +886,6 @@ pub(crate) fn sub_worker_spawn_tool(
         parent_notifications,
         runtime_base,
         workspace_root,
-        spawner_cwd,
         source_workdir_session,
         registry,
         spawner_manifest,
@@ -941,7 +899,6 @@ fn sub_worker_spawn_tool_impl(
     parent_notifications: ParentNotificationTarget,
     runtime_base: PathBuf,
     workspace_root: PathBuf,
-    spawner_cwd: PathBuf,
     source_workdir_session: Option<WorkdirSessionHandle>,
     registry: Arc<SpawnedWorkerRegistry>,
     spawner_manifest: WorkerManifest,
@@ -973,7 +930,6 @@ fn sub_worker_spawn_tool_impl(
             parent_notifications.clone(),
             runtime_base.clone(),
             workspace_root.clone(),
-            spawner_cwd.clone(),
             source_workdir_session.clone(),
             registry.clone(),
             spawner_manifest.clone(),
@@ -987,7 +943,7 @@ fn sub_worker_spawn_tool_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use manifest::{DelegationScope, Scope, SharedScope};
+    use manifest::{DelegationScope, Permission, Scope, SharedScope};
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
@@ -1017,24 +973,52 @@ mod tests {
     }
 
     #[test]
+    fn workdir_scope_uses_logical_relative_paths() {
+        let rules = parse_workdir_scope(&[
+            ScopeRuleInput {
+                target: ".".to_string(),
+                permission: PermissionInput::Read,
+                recursive: true,
+            },
+            ScopeRuleInput {
+                target: "src".to_string(),
+                permission: PermissionInput::Write,
+                recursive: false,
+            },
+        ])
+        .unwrap();
+        assert_eq!(rules[0].target.as_str(), "");
+        assert_eq!(rules[1].target.as_str(), "src");
+        for target in ["/host/path", "../escape"] {
+            let error = parse_workdir_scope(&[ScopeRuleInput {
+                target: target.to_string(),
+                permission: PermissionInput::Read,
+                recursive: true,
+            }])
+            .unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArgument(_)));
+        }
+    }
+
+    #[test]
     fn reviewer_handoff_requires_explicit_builtin_profile_and_read_only_scope() {
         let valid: SubWorkerSpawnInput = serde_json::from_value(serde_json::json!({
             "name":"reviewer","task":"review","profile":"builtin:reviewer",
-            "scope":[{"target":"/tmp/work","permission":"read"}],
+            "scope":[{"target":"work","permission":"read"}],
             "review":{"ticket_id":"T1"}
         }))
         .unwrap();
         assert!(validate_reviewer_handoff(&valid).is_ok());
         let wrong_profile: SubWorkerSpawnInput = serde_json::from_value(serde_json::json!({
             "name":"reviewer","task":"review","profile":"builtin:coder",
-            "scope":[{"target":"/tmp/work","permission":"read"}],
+            "scope":[{"target":"work","permission":"read"}],
             "review":{"ticket_id":"T1"}
         }))
         .unwrap();
         assert!(validate_reviewer_handoff(&wrong_profile).is_err());
         let writable: SubWorkerSpawnInput = serde_json::from_value(serde_json::json!({
             "name":"reviewer","task":"review","profile":"builtin:reviewer",
-            "scope":[{"target":"/tmp/work","permission":"write"}],
+            "scope":[{"target":"work","permission":"write"}],
             "review":{"ticket_id":"T1"}
         }))
         .unwrap();
@@ -1128,7 +1112,6 @@ extract_threshold = 4000
             ParentNotificationTarget::Controller(parent_method_tx.downgrade()),
             runtime.path().to_path_buf(),
             workspace_root.clone(),
-            workspace_root.clone(),
             Some(source_workdir_session),
             registry.clone(),
             manifest.clone(),
@@ -1149,7 +1132,7 @@ extract_threshold = 4000
             "instruction": "role.reviewer",
             "task": "review immutable commit",
             "scope": [{
-                "target": workspace_root.clone(),
+                "target": ".",
                 "permission": "read",
                 "recursive": true
             }]

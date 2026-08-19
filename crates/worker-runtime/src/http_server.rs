@@ -59,8 +59,8 @@ use workdir::{
     CommandOutput, CommandStatus, WorkdirSessionHandle,
     http::{
         OpenWorkdirSessionRequest, OpenWorkdirSessionResponse, WorkdirSessionId,
-        WorkdirSessionOperation, WorkdirSessionOperationResult, WorkdirTransportError,
-        WorkdirTransportErrorCode,
+        WorkdirSessionOperation, WorkdirSessionOperationRequest, WorkdirSessionOperationResult,
+        WorkdirTransportError, WorkdirTransportErrorCode,
     },
 };
 
@@ -596,11 +596,11 @@ async fn run_workdir_session_operation(
     State(state): State<RuntimeHttpState>,
     Path(session_id): Path<String>,
     auth: Option<Extension<RuntimeAuthContext>>,
-    body: Result<Json<WorkdirSessionOperation>, JsonRejection>,
+    body: Result<Json<WorkdirSessionOperationRequest>, JsonRejection>,
 ) -> Result<Json<WorkdirSessionOperationResult>, RuntimeHttpWorkdirError> {
-    let Json(operation) = body.map_err(|_| RuntimeHttpWorkdirError::invalid_request())?;
+    let Json(request) = body.map_err(|_| RuntimeHttpWorkdirError::invalid_request())?;
     let owner = required_workdir_owner(auth)?;
-    let session = {
+    let source = {
         let sessions = state
             .workdir_sessions
             .lock()
@@ -611,6 +611,19 @@ async fn run_workdir_session_operation(
             .ok_or_else(RuntimeHttpWorkdirError::not_found)?;
         record.session.clone()
     };
+    let delegation = if let Some(delegation) = request.delegation {
+        Some(
+            workdir::delegation_capable_session(source.clone())
+                .delegate(delegation)
+                .await?,
+        )
+    } else {
+        None
+    };
+    let session = delegation.as_ref().map_or(source.as_ref(), |delegation| {
+        delegation.scoped_session.as_ref()
+    });
+    let operation = request.operation;
 
     let result = match operation {
         WorkdirSessionOperation::Stat(request) => {
@@ -1836,7 +1849,8 @@ mod tests {
     use manifest::{Scope, SharedScope};
     use tower::ServiceExt;
     use workdir::{
-        LocalWorkdirSession, StatRequest, Workdir, WorkdirPath, WorkdirSessionCapabilities,
+        LocalWorkdirSession, ReadRequest, StatRequest, Workdir, WorkdirPath,
+        WorkdirSessionCapabilities,
     };
 
     fn test_bundle(profile: ProfileSelector) -> ConfigBundle {
@@ -2224,6 +2238,14 @@ mod tests {
     async fn workdir_session_operations_enforce_owner_and_close_terminally() {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("hello.txt"), "hello").expect("write fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            std::fs::create_dir(temp.path().join("granted")).expect("granted directory");
+            std::fs::create_dir(temp.path().join("secret")).expect("secret directory");
+            std::fs::write(temp.path().join("secret/key"), "hidden").expect("secret fixture");
+            symlink("../secret/key", temp.path().join("granted/link")).expect("symlink fixture");
+        }
         let scope = SharedScope::new(Scope::writable(temp.path()).expect("scope"));
         let session: WorkdirSessionHandle = Arc::new(LocalWorkdirSession::materialized_bound(
             Workdir::new("wd-1"),
@@ -2256,9 +2278,12 @@ mod tests {
             token_id: "token-a".to_string(),
             expires_at: u64::MAX,
         };
-        let operation = WorkdirSessionOperation::Stat(StatRequest {
-            path: WorkdirPath::new("hello.txt").expect("logical path"),
-        });
+        let operation = WorkdirSessionOperationRequest {
+            delegation: None,
+            operation: WorkdirSessionOperation::Stat(StatRequest {
+                path: WorkdirPath::new("hello.txt").expect("logical path"),
+            }),
+        };
 
         let Json(result) = run_workdir_session_operation(
             State(state.clone()),
@@ -2269,6 +2294,39 @@ mod tests {
         .await
         .expect("owned operation");
         assert!(matches!(result, WorkdirSessionOperationResult::Stat(_)));
+
+        #[cfg(unix)]
+        {
+            let delegated_read = WorkdirSessionOperationRequest {
+                delegation: Some(workdir::WorkdirDelegationRequest {
+                    rules: vec![workdir::WorkdirDelegationRule {
+                        target: WorkdirPath::new("granted").unwrap(),
+                        permission: workdir::WorkdirDelegationPermission::Read,
+                        recursive: true,
+                    }],
+                    cwd: WorkdirPath::new("granted").unwrap(),
+                }),
+                operation: WorkdirSessionOperation::Read(ReadRequest {
+                    path: WorkdirPath::new("link").unwrap(),
+                    offset: 0,
+                    limit: 20,
+                    max_bytes: 1024,
+                }),
+            };
+            let error = run_workdir_session_operation(
+                State(state.clone()),
+                Path("session-1".to_string()),
+                Some(Extension(auth.clone())),
+                Ok(Json(delegated_read)),
+            )
+            .await
+            .expect_err("provider must reject delegated symlink escape");
+            assert_ne!(error.status, StatusCode::OK);
+            assert_eq!(
+                std::fs::read_to_string(temp.path().join("secret/key")).unwrap(),
+                "hidden"
+            );
+        }
 
         let wrong_owner = RuntimeAuthContext {
             workspace_id: "workspace-b".to_string(),

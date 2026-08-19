@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use manifest::{Scope, SharedScope};
+use manifest::{Permission, Scope, ScopeConfig, ScopeRule, SharedScope};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tokio::sync::{Mutex, Notify};
@@ -28,9 +28,10 @@ use tokio::task::JoinHandle;
 use crate::{
     CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest, CommandStatus, EditRequest,
     EditResult, GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest, ListResult,
-    ReadRequest, ReadResult, StatRequest, StatResult, Workdir, WorkdirError, WorkdirPath,
-    WorkdirSession, WorkdirSessionCapabilities, WorkdirSessionCapability, WorkdirSessionHandle,
-    WriteRequest, WriteResult,
+    ReadRequest, ReadResult, StatRequest, StatResult, Workdir, WorkdirDelegationPermission,
+    WorkdirDelegationRequest, WorkdirError, WorkdirPath, WorkdirSession,
+    WorkdirSessionCapabilities, WorkdirSessionCapability, WorkdirSessionHandle, WriteRequest,
+    WriteResult,
 };
 #[cfg(test)]
 use crate::{EntryKind, WriteOutcome};
@@ -371,8 +372,46 @@ impl WorkdirSession for LocalWorkdirSession {
         self.inner.capabilities
     }
 
-    async fn capture_delegation_source(&self) -> Result<WorkdirSessionHandle, WorkdirError> {
-        Ok(Arc::new(self.clone()))
+    async fn capture_delegation_source(
+        &self,
+        request: &WorkdirDelegationRequest,
+    ) -> Result<WorkdirSessionHandle, WorkdirError> {
+        let host_rules = request
+            .rules
+            .iter()
+            .map(|rule| ScopeRule {
+                target: self.inner.root.join(rule.target.as_str()),
+                permission: match rule.permission {
+                    WorkdirDelegationPermission::Read => Permission::Read,
+                    WorkdirDelegationPermission::Write => Permission::Write,
+                },
+                recursive: rule.recursive,
+            })
+            .collect::<Vec<_>>();
+        let parent_scope = self.inner.scope.snapshot();
+        for rule in &host_rules {
+            if !parent_scope
+                .allows_rule(rule)
+                .map_err(|error| WorkdirError::Denied(error.to_string()))?
+            {
+                return Err(WorkdirError::Denied(format!(
+                    "delegated provider scope `{}` exceeds the parent session",
+                    rule.target.display()
+                )));
+            }
+        }
+        let child_scope = Scope::from_config(&ScopeConfig {
+            allow: host_rules,
+            deny: Vec::new(),
+        })
+        .map_err(|error| WorkdirError::Denied(error.to_string()))?;
+        Ok(Arc::new(LocalWorkdirSession::materialized_bound(
+            self.inner.workdir.clone(),
+            self.inner.root.clone(),
+            self.inner.cwd.clone(),
+            SharedScope::new(child_scope),
+            self.inner.capabilities,
+        )))
     }
 
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {

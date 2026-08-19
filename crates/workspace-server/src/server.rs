@@ -5138,8 +5138,25 @@ async fn scoped_execute_current_worker_workdir_operation(
         &link,
         request.expected_session_fence.as_deref(),
     )?;
-    let session = open_current_worker_workdir_session_locked(&api, &worker, &link).await?;
-    let result = execute_workdir_session_operation(&session, request.operation)
+    let source = open_current_worker_workdir_session_locked(&api, &worker, &link).await?;
+    let delegation = if let Some(delegation) = request.delegation {
+        Some(
+            workdir::delegation_capable_session(source.clone())
+                .delegate(delegation)
+                .await
+                .map_err(|error| Error::RuntimeOperationFailed {
+                    runtime_id: worker.runtime_id.clone(),
+                    code: "workdir_session_delegation_failed".to_string(),
+                    message: error.to_string(),
+                })?,
+        )
+    } else {
+        None
+    };
+    let session = delegation
+        .as_ref()
+        .map_or(&source, |delegation| &delegation.scoped_session);
+    let result = execute_workdir_session_operation(session, request.operation)
         .await
         .map_err(|error| Error::RuntimeOperationFailed {
             runtime_id: worker.runtime_id.clone(),

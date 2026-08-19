@@ -214,6 +214,25 @@ impl Scope {
         })
     }
 
+    /// Return whether this effective scope fully contains a requested rule.
+    /// This is used when attenuating provider authority without mutating the
+    /// parent scope.
+    pub fn allows_rule(&self, requested: &ScopeRule) -> Result<bool, ScopeError> {
+        let requested = resolve_rule(requested)?;
+        let covered = self
+            .allow
+            .iter()
+            .any(|candidate| rule_covers(candidate, &requested));
+        if !covered {
+            return Ok(false);
+        }
+        let denied = self
+            .deny
+            .iter()
+            .any(|deny| denial_overlaps_requested(deny, &requested));
+        Ok(!denied)
+    }
+
     /// Effective permission for `path`.
     ///
     /// Returns `None` when `path` is outside every allow rule, or when

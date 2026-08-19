@@ -910,10 +910,6 @@ where
         // without one so invocation fails deterministically until the parent
         // attaches a Workdir.
         if feature_config.sub_worker.enabled {
-            let spawner_cwd = local_filesystem
-                .as_ref()
-                .map(|local| local.cwd.clone())
-                .unwrap_or_else(|| PathBuf::from("/"));
             let spawner_workspace_root = local_workspace_root
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("/"));
@@ -923,7 +919,6 @@ where
                 parent_notifications,
                 runtime_base.clone(),
                 spawner_workspace_root,
-                spawner_cwd.clone(),
                 source_workdir_session,
                 spawned_registry.clone(),
                 spawner_manifest,

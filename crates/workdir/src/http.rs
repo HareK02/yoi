@@ -68,6 +68,15 @@ pub enum WorkdirSessionOperation {
     CommandCancel(CommandHandle),
 }
 
+/// Wire envelope for an operation and its optional provider-enforced child scope.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkdirSessionOperationRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<crate::WorkdirDelegationRequest>,
+    pub operation: WorkdirSessionOperation,
+}
+
 /// Typed result paired with [`WorkdirSessionOperation`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "result", rename_all = "snake_case")]
@@ -207,6 +216,7 @@ mod client {
         workdir: Workdir,
         session_id: WorkdirSessionId,
         capabilities: WorkdirSessionCapabilities,
+        delegation: Option<crate::WorkdirDelegationRequest>,
         closed: AtomicBool,
     }
 
@@ -259,6 +269,7 @@ mod client {
                 workdir: Workdir::new(opened.workdir_id.as_str()),
                 session_id: opened.session_id,
                 capabilities: opened.capabilities,
+                delegation: None,
                 closed: AtomicBool::new(false),
             })
         }
@@ -285,6 +296,10 @@ mod client {
                     "operations",
                 ],
             )?;
+            let operation = WorkdirSessionOperationRequest {
+                delegation: self.delegation.clone(),
+                operation,
+            };
             let response = self
                 .client
                 .post(url)
@@ -313,7 +328,10 @@ mod client {
             self.capabilities
         }
 
-        async fn capture_delegation_source(&self) -> Result<WorkdirSessionHandle, WorkdirError> {
+        async fn capture_delegation_source(
+            &self,
+            request: &crate::WorkdirDelegationRequest,
+        ) -> Result<WorkdirSessionHandle, WorkdirError> {
             if self.closed.load(Ordering::Acquire) {
                 return Err(WorkdirError::SessionClosed);
             }
@@ -324,6 +342,7 @@ mod client {
                 workdir: self.workdir.clone(),
                 session_id: self.session_id.clone(),
                 capabilities: self.capabilities,
+                delegation: Some(request.clone()),
                 closed: AtomicBool::new(false),
             }))
         }

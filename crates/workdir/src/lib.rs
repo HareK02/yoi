@@ -151,7 +151,10 @@ pub trait WorkdirSession: std::fmt::Debug + Send + Sync {
     /// Capture a provider-specific source for a delegated child session.
     /// Remote providers use this boundary to pin attachment identity without
     /// exposing transport handles or host paths.
-    async fn capture_delegation_source(&self) -> Result<WorkdirSessionHandle, WorkdirError> {
+    async fn capture_delegation_source(
+        &self,
+        _request: &WorkdirDelegationRequest,
+    ) -> Result<WorkdirSessionHandle, WorkdirError> {
         Err(WorkdirError::Denied(
             "workdir provider does not support delegated sessions".into(),
         ))

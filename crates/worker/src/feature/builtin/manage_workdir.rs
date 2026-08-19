@@ -155,6 +155,7 @@ pub struct WorkspaceAttachedWorkdirSession {
     client: Arc<dyn WorkspaceClient>,
     workdir: Workdir,
     expected_session_fence: Option<String>,
+    delegation: Option<workdir::WorkdirDelegationRequest>,
 }
 
 impl WorkspaceAttachedWorkdirSession {
@@ -163,6 +164,7 @@ impl WorkspaceAttachedWorkdirSession {
             client,
             workdir: Workdir::new("workspace-attachment"),
             expected_session_fence: None,
+            delegation: None,
         })
     }
 
@@ -181,6 +183,7 @@ impl WorkspaceAttachedWorkdirSession {
             ),
             serde_json::to_string(&WorkspaceWorkdirSessionOperationRequest {
                 expected_session_fence: self.expected_session_fence.clone(),
+                delegation: self.delegation.clone(),
                 operation,
             })
             .map_err(|error| {
@@ -231,7 +234,10 @@ impl WorkdirSession for WorkspaceAttachedWorkdirSession {
         WorkdirSessionCapabilities::ALL
     }
 
-    async fn capture_delegation_source(&self) -> Result<WorkdirSessionHandle, WorkdirError> {
+    async fn capture_delegation_source(
+        &self,
+        request: &workdir::WorkdirDelegationRequest,
+    ) -> Result<WorkdirSessionHandle, WorkdirError> {
         let expected_session_fence = if let Some(fence) = &self.expected_session_fence {
             fence.clone()
         } else {
@@ -265,6 +271,7 @@ impl WorkdirSession for WorkspaceAttachedWorkdirSession {
             client: self.client.clone(),
             workdir: self.workdir.clone(),
             expected_session_fence: Some(expected_session_fence),
+            delegation: Some(request.clone()),
         }))
     }
 
@@ -1067,11 +1074,11 @@ mod tests {
         let delegation = parent
             .delegate(workdir::WorkdirDelegationRequest {
                 rules: vec![workdir::WorkdirDelegationRule {
-                    target: workdir::WorkdirPath::new("visible.txt").unwrap(),
+                    target: workdir::WorkdirPath::new("").unwrap(),
                     permission: workdir::WorkdirDelegationPermission::Read,
                     recursive: false,
                 }],
-                cwd: workdir::WorkdirPath::new("visible.txt").unwrap(),
+                cwd: workdir::WorkdirPath::new("").unwrap(),
             })
             .await
             .unwrap();
@@ -1093,6 +1100,7 @@ mod tests {
             serde_json::from_str(requests[1].body.as_deref().unwrap()).unwrap();
         assert_eq!(body["expected_session_fence"], "attachment-fence");
         assert_eq!(body["operation"]["operation"], "stat");
+        assert_eq!(body["delegation"]["rules"][0]["target"], "");
     }
 
     #[test]

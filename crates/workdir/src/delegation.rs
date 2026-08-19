@@ -15,20 +15,23 @@ use crate::{
     WorkdirSessionHandle,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WorkdirDelegationPermission {
     Read,
     Write,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkdirDelegationRule {
     pub target: FsPath,
     pub permission: WorkdirDelegationPermission,
     pub recursive: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkdirDelegationRequest {
     pub rules: Vec<WorkdirDelegationRule>,
     pub cwd: FsPath,
@@ -101,6 +104,7 @@ struct ActiveWriteLease {
 
 struct DelegatingWorkdirSession {
     source: WorkdirSessionHandle,
+    cwd: FsPath,
     scope: Option<Vec<WorkdirDelegationRule>>,
     capabilities: WorkdirSessionCapabilities,
     validity: Arc<SessionValidity>,
@@ -125,6 +129,7 @@ pub fn delegation_capable_session(source: WorkdirSessionHandle) -> WorkdirSessio
     let capabilities = source.capabilities();
     Arc::new(DelegatingWorkdirSession {
         source,
+        cwd: FsPath::new("").expect("empty Workdir path is valid"),
         scope: None,
         capabilities,
         validity: SessionValidity::root(),
@@ -178,6 +183,17 @@ impl DelegatingWorkdirSession {
             self.ensure_parent_write_available(path)?;
         }
         Ok(())
+    }
+
+    fn resolve_path(&self, path: &FsPath) -> Result<FsPath, WorkdirError> {
+        if self.cwd.as_str().is_empty() {
+            return Ok(path.clone());
+        }
+        let joined = Path::new(self.cwd.as_str()).join(path.as_str());
+        let joined = joined.to_str().ok_or_else(|| {
+            WorkdirError::Denied("logical Workdir path is not valid UTF-8".into())
+        })?;
+        FsPath::new(joined).map_err(|error| WorkdirError::Denied(error.to_string()))
     }
 
     fn ensure_read(
@@ -308,14 +324,17 @@ impl WorkdirSession for DelegatingWorkdirSession {
         true
     }
 
-    async fn capture_delegation_source(&self) -> Result<WorkdirSessionHandle, WorkdirError> {
+    async fn capture_delegation_source(
+        &self,
+        request: &WorkdirDelegationRequest,
+    ) -> Result<WorkdirSessionHandle, WorkdirError> {
         self.ensure_active()?;
         if self.scope.is_some() {
             return Err(WorkdirError::Denied(
                 "scoped Workdir sessions cannot expose their provider source".into(),
             ));
         }
-        self.source.capture_delegation_source().await
+        self.source.capture_delegation_source(request).await
     }
 
     async fn delegate(
@@ -333,7 +352,7 @@ impl WorkdirSession for DelegatingWorkdirSession {
                 request.cwd
             )));
         }
-        let source = self.source.capture_delegation_source().await?;
+        let source = self.source.capture_delegation_source(&request).await?;
         let validity = SessionValidity::child(self.validity.clone());
         let id = self.next_lease_id.fetch_add(1, Ordering::Relaxed);
         if request
@@ -354,6 +373,7 @@ impl WorkdirSession for DelegatingWorkdirSession {
         }
         let child: WorkdirSessionHandle = Arc::new(DelegatingWorkdirSession {
             source,
+            cwd: request.cwd,
             scope: Some(request.rules),
             capabilities,
             validity: validity.clone(),
@@ -374,37 +394,44 @@ impl WorkdirSession for DelegatingWorkdirSession {
         })
     }
 
-    async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {
+    async fn stat(&self, mut request: StatRequest) -> Result<StatResult, WorkdirError> {
+        request.path = self.resolve_path(&request.path)?;
         self.ensure_read(&request.path, WorkdirSessionCapability::Read)?;
         self.source.stat(request).await
     }
 
-    async fn read(&self, request: ReadRequest) -> Result<ReadResult, WorkdirError> {
+    async fn read(&self, mut request: ReadRequest) -> Result<ReadResult, WorkdirError> {
+        request.path = self.resolve_path(&request.path)?;
         self.ensure_read(&request.path, WorkdirSessionCapability::Read)?;
         self.source.read(request).await
     }
 
-    async fn write(&self, request: WriteRequest) -> Result<WriteResult, WorkdirError> {
+    async fn write(&self, mut request: WriteRequest) -> Result<WriteResult, WorkdirError> {
+        request.path = self.resolve_path(&request.path)?;
         self.ensure_write(&request.path, WorkdirSessionCapability::Write)?;
         self.source.write(request).await
     }
 
-    async fn edit(&self, request: EditRequest) -> Result<EditResult, WorkdirError> {
+    async fn edit(&self, mut request: EditRequest) -> Result<EditResult, WorkdirError> {
+        request.path = self.resolve_path(&request.path)?;
         self.ensure_write(&request.path, WorkdirSessionCapability::Edit)?;
         self.source.edit(request).await
     }
 
-    async fn list(&self, request: ListRequest) -> Result<ListResult, WorkdirError> {
+    async fn list(&self, mut request: ListRequest) -> Result<ListResult, WorkdirError> {
+        request.path = self.resolve_path(&request.path)?;
         self.ensure_read(&request.path, WorkdirSessionCapability::Read)?;
         self.source.list(request).await
     }
 
-    async fn glob(&self, request: GlobRequest) -> Result<GlobResult, WorkdirError> {
+    async fn glob(&self, mut request: GlobRequest) -> Result<GlobResult, WorkdirError> {
+        request.path = self.resolve_path(&request.path)?;
         self.ensure_read(&request.path, WorkdirSessionCapability::Glob)?;
         self.source.glob(request).await
     }
 
-    async fn grep(&self, request: GrepRequest) -> Result<GrepResult, WorkdirError> {
+    async fn grep(&self, mut request: GrepRequest) -> Result<GrepResult, WorkdirError> {
+        request.path = self.resolve_path(&request.path)?;
         self.ensure_read(&request.path, WorkdirSessionCapability::Grep)?;
         self.source.grep(request).await
     }
@@ -571,7 +598,10 @@ fn rule_contains_rule(parent: &WorkdirDelegationRule, child: &WorkdirDelegationR
     if !path_in_rule(parent, &child.target) {
         return false;
     }
-    parent.recursive || !child.recursive
+    if parent.recursive {
+        return true;
+    }
+    !child.recursive && parent.target == child.target
 }
 
 #[cfg(test)]
@@ -650,7 +680,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_only_delegation_allows_prefix_and_denies_siblings_and_mutation() {
+    async fn read_only_delegation_allows_prefix_and_denies_mutation() {
         let root = TempDir::new().unwrap();
         fs::create_dir_all(root.path().join("docs")).unwrap();
         fs::create_dir_all(root.path().join("secret")).unwrap();
@@ -666,18 +696,14 @@ mod tests {
         assert_eq!(
             child
                 .scoped_session
-                .read(read("docs/readme.md"))
+                .read(read("readme.md"))
                 .await
                 .unwrap()
                 .bytes,
             b"visible"
         );
         assert!(matches!(
-            child.scoped_session.read(read("secret/key")).await,
-            Err(WorkdirError::Denied(_))
-        ));
-        assert!(matches!(
-            child.scoped_session.write(write("docs/new.md", "no")).await,
+            child.scoped_session.write(write("new.md", "no")).await,
             Err(WorkdirError::Denied(_))
         ));
         assert!(
@@ -685,6 +711,55 @@ mod tests {
                 .capabilities
                 .supports(WorkdirSessionCapability::Command)
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_scope_denies_read_through_symlink_outside_grant() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("granted")).unwrap();
+        fs::create_dir_all(root.path().join("secret")).unwrap();
+        fs::write(root.path().join("secret/key"), "hidden").unwrap();
+        symlink("../secret/key", root.path().join("granted/link")).unwrap();
+        let parent = session(root.path());
+        let child = parent
+            .delegate(request("granted", WorkdirDelegationPermission::Read))
+            .await
+            .unwrap();
+
+        let result = child.scoped_session.read(read("link")).await;
+        assert!(
+            result.is_err(),
+            "symlink read escaped provider scope: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_scope_denies_write_through_symlink_outside_grant() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("granted")).unwrap();
+        fs::create_dir_all(root.path().join("secret")).unwrap();
+        symlink("../secret", root.path().join("granted/outside")).unwrap();
+        let parent = session(root.path());
+        let child = parent
+            .delegate(request("granted", WorkdirDelegationPermission::Write))
+            .await
+            .unwrap();
+
+        let result = child
+            .scoped_session
+            .write(write("outside/new", "forbidden"))
+            .await;
+        assert!(
+            result.is_err(),
+            "symlink write escaped provider scope: {result:?}"
+        );
+        assert!(!root.path().join("secret/new").exists());
     }
 
     #[tokio::test]
@@ -705,7 +780,7 @@ mod tests {
         parent.write(write("other/file", "parent")).await.unwrap();
         child
             .scoped_session
-            .write(write("leased/file", "child"))
+            .write(write("file", "child"))
             .await
             .unwrap();
         child.release();
@@ -714,7 +789,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            child.scoped_session.read(read("leased/file")).await,
+            child.scoped_session.read(read("file")).await,
             Err(WorkdirError::SessionClosed)
         ));
     }
@@ -737,15 +812,14 @@ mod tests {
             .await
             .unwrap();
 
-        nested
-            .scoped_session
-            .read(read("docs/sub/a"))
-            .await
-            .unwrap();
-        assert!(matches!(
-            nested.scoped_session.read(read("docs/peer/b")).await,
-            Err(WorkdirError::Denied(_))
-        ));
+        nested.scoped_session.read(read("a")).await.unwrap();
+        assert!(
+            child
+                .scoped_session
+                .delegate(request("other", WorkdirDelegationPermission::Read))
+                .await
+                .is_err()
+        );
         assert!(
             child
                 .scoped_session
@@ -756,7 +830,7 @@ mod tests {
 
         child.release();
         assert!(matches!(
-            nested.scoped_session.read(read("docs/sub/a")).await,
+            nested.scoped_session.read(read("a")).await,
             Err(WorkdirError::SessionClosed)
         ));
     }
@@ -774,7 +848,7 @@ mod tests {
 
         parent.close().await.unwrap();
         assert!(matches!(
-            child.scoped_session.read(read("docs/a")).await,
+            child.scoped_session.read(read("a")).await,
             Err(WorkdirError::SessionClosed)
         ));
     }
