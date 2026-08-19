@@ -2,6 +2,7 @@ import type { Event } from "$lib/generated/protocol";
 import {
   type ConsoleLine,
   createConsoleProjector,
+  isConsoleProjectionEvent,
   projectConsole,
   segmentsToText,
   selectConsoleTimelineLines,
@@ -36,11 +37,11 @@ function consoleLine(id: string, kind: ConsoleLine["kind"]): ConsoleLine {
   };
 }
 
-function snapshotEvent(cwd: string): Event {
+function snapshotEvent(cwd: string, entries: unknown[] = []): Event {
   return {
     event: "snapshot",
     data: {
-      entries: [],
+      entries,
       greeting: {
         worker_name: "Worker",
         cwd,
@@ -56,6 +57,107 @@ function snapshotEvent(cwd: string): Event {
     },
   };
 }
+
+Deno.test("console routing projects live errors but not completion replies", () => {
+  const errorEvent = {
+    event: "error",
+    data: { code: "provider_error", message: "provider unavailable" },
+  } satisfies Event;
+  const completionEvent = {
+    event: "completions",
+    data: { kind: "file", entries: [] },
+  } satisfies Event;
+
+  assert(
+    isConsoleProjectionEvent(errorEvent),
+    "live errors must reach the timeline projector",
+  );
+  assert(
+    !isConsoleProjectionEvent(completionEvent),
+    "completion replies should remain control-only events",
+  );
+});
+
+Deno.test("snapshot replaces a live error with one durable run_errored row", () => {
+  const projector = createConsoleProjector();
+  let projection = projector.append([
+    {
+      eventId: "live-error",
+      event: {
+        event: "error",
+        data: { code: "provider_error", message: "provider unavailable" },
+      } satisfies Event,
+    },
+    {
+      eventId: "idle-after-error",
+      event: { event: "status", data: { status: "idle" } } satisfies Event,
+    },
+  ]);
+
+  assertEquals(projection.status, "idle");
+  const liveErrors = projection.lines.filter((line) => line.kind === "error");
+  assertEquals(liveErrors.length, 1);
+  assertEquals(liveErrors[0].title, "error · provider_error");
+  assertEquals(liveErrors[0].body, "provider unavailable");
+
+  projection = projector.append([{
+    eventId: "reconnected-snapshot",
+    event: snapshotEvent("/repo", [{
+      kind: "run_errored",
+      ts: 3,
+      interrupted: false,
+      message: "provider unavailable",
+    }]),
+  }]);
+
+  const errors = projection.lines.filter((line) => line.kind === "error");
+  assertEquals(errors.length, 1);
+  assertEquals(errors[0].title, "Run error");
+  assertEquals(errors[0].body, "provider unavailable");
+  assertEquals(errors[0].error, true);
+});
+
+Deno.test("segment rotation retains a live error beside the real SegmentStart history", () => {
+  const projector = createConsoleProjector();
+  const projection = projector.append([
+    {
+      eventId: "live-error",
+      event: {
+        event: "error",
+        data: { code: "provider_error", message: "provider unavailable" },
+      } satisfies Event,
+    },
+    {
+      eventId: "segment-rotated",
+      event: {
+        event: "segment_rotated",
+        data: {
+          entry: {
+            kind: "segment_start",
+            ts: 5,
+            session_id: "session-1",
+            system_prompt: null,
+            config: {},
+            history: [{
+              kind: "message",
+              role: "user",
+              content: [{ kind: "text", text: "retained conversation" }],
+            }],
+          },
+        },
+      } satisfies Event,
+    },
+  ]);
+
+  const errors = projection.lines.filter((line) => line.kind === "error");
+  assertEquals(errors.length, 1);
+  assertEquals(errors[0].title, "error · provider_error");
+  assertEquals(errors[0].body, "provider unavailable");
+  assert(
+    projection.lines.some((line) => line.body === "retained conversation"),
+    "SegmentStart history should still seed the rotated projection",
+  );
+});
 
 Deno.test("workerConsoleHref encodes runtime and worker target authority", () => {
   assert(

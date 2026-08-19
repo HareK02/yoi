@@ -142,6 +142,10 @@ export type ConsoleEventInput = {
   observedAtMs?: number;
 };
 
+export function isConsoleProjectionEvent(event: ProtocolEvent): boolean {
+  return event.event !== "completions";
+}
+
 export function emptyConsoleProjection(): ConsoleProjection {
   return {
     lines: [],
@@ -324,12 +328,13 @@ export function applyProtocolEvent(
       next.status = event.data.status;
       break;
     case "segment_rotated": {
+      const retainedErrors = next.lines.filter((line) => line.kind === "error");
       const segment = snapshotProjectionFromEntries(
         envelope.eventId,
         [event.data.entry],
         next.cwd,
       );
-      next.lines = segment.lines;
+      next.lines = [...segment.lines, ...retainedErrors];
       next.tasks = segment.tasks;
       next.taskNextId = segment.taskNextId;
       break;
@@ -1215,6 +1220,19 @@ function applyLogEntry(
     case "assistant_item":
     case "tool_result":
       applyLoggedItem(projection, eventId, entry["item"]);
+      break;
+    case "run_errored":
+      projection.lines.push(
+        line(
+          eventId,
+          "error",
+          "Run error",
+          stringField(entry, "message") ?? "Worker run failed.",
+          undefined,
+          false,
+          true,
+        ),
+      );
       break;
     case "extension":
       applyExtensionEntry(projection, eventId, entry);

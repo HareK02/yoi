@@ -18,6 +18,7 @@
     import { fitTextarea } from "$lib/workspace/console/textarea-fit";
     import {
         createConsoleProjector,
+        isConsoleProjectionEvent,
         selectConsoleTimelineLines,
         type ConsoleEventInput,
         type ConsoleLine,
@@ -266,14 +267,14 @@
 
     function handleIncomingProtocolEvent(payload: ProtocolEvent) {
         handleProtocolCommandEvent(payload);
-        if (payload.event === "completions" || payload.event === "error") {
-            if (payload.event === "error") {
-                queueObservationDiagnostic({
-                    code: payload.data.code,
-                    severity: "error",
-                    message: payload.data.message,
-                });
-            }
+        if (payload.event === "error") {
+            queueObservationDiagnostic({
+                code: payload.data.code,
+                severity: "error",
+                message: payload.data.message,
+            });
+        }
+        if (!isConsoleProjectionEvent(payload)) {
             return;
         }
 
