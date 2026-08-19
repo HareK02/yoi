@@ -308,6 +308,7 @@ pub struct FsRuntimeStoreMigrationPlan {
     pub worker_count: usize,
     pub mapping_digest: String,
     pub mappings: Vec<LegacyWorkerIdentityMapping>,
+    pub excluded_ephemeral_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -370,6 +371,7 @@ fn plan_v1_worker_identity(
             worker_count: 0,
             mapping_digest: legacy_worker_identity_mapping_digest(&[]),
             mappings: Vec::new(),
+            excluded_ephemeral_paths: Vec::new(),
         };
         return Ok((plan, Vec::new()));
     }
@@ -381,7 +383,7 @@ fn plan_v1_worker_identity(
             ),
         ));
     }
-    validate_runtime_tree_copyable(root)?;
+    let excluded_ephemeral_paths = runtime_tree_exclusions(root)?;
 
     let workers_dir = root.join(WORKERS_DIR);
     let mut entries = fs::read_dir(&workers_dir)
@@ -476,6 +478,7 @@ fn plan_v1_worker_identity(
         worker_count: mappings.len(),
         mapping_digest: legacy_worker_identity_mapping_digest(&mappings),
         mappings,
+        excluded_ephemeral_paths,
     };
     Ok((plan, planned))
 }
@@ -496,7 +499,54 @@ fn migration_sibling(root: &Path, suffix: &str) -> Result<PathBuf, RuntimeError>
     Ok(parent.join(format!(".{name}.{suffix}")))
 }
 
-fn validate_runtime_tree_copyable(source: &Path) -> Result<(), RuntimeError> {
+fn runtime_ephemeral_socket(root: &Path, path: &Path) -> Result<bool, RuntimeError> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        runtime_store_corrupt(
+            path,
+            format!("Runtime migration path escaped root {}", root.display()),
+        )
+    })?;
+    let components = relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let known_path = components.len() == 5
+        && components[0] == WORKERS_DIR
+        && components[1].parse::<u64>().is_ok()
+        && components[2] == "runs"
+        && components[3].parse::<u64>().is_ok()
+        && components[4] == "worker.sock";
+    if !known_path {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        match std::os::unix::net::UnixStream::connect(path) {
+            Ok(_) => Err(runtime_store_corrupt(
+                path,
+                "Runtime migration found an active Worker socket; stop the legacy Runtime and Worker before migrating"
+                    .to_string(),
+            )),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) => Ok(true),
+            Err(error) => Err(runtime_store_corrupt(
+                path,
+                format!("Runtime migration could not verify Worker socket liveness: {error}"),
+            )),
+        }
+    }
+    #[cfg(not(unix))]
+    Ok(false)
+}
+
+fn collect_runtime_tree_exclusions(
+    root: &Path,
+    source: &Path,
+    excluded: &mut Vec<String>,
+) -> Result<(), RuntimeError> {
     let entries = fs::read_dir(source)
         .map_err(|error| runtime_io_error("read migration source", source, error))?;
     for entry in entries {
@@ -507,18 +557,34 @@ fn validate_runtime_tree_copyable(source: &Path) -> Result<(), RuntimeError> {
             .file_type()
             .map_err(|error| runtime_io_error("inspect migration source", &source_path, error))?;
         if file_type.is_dir() {
-            validate_runtime_tree_copyable(&source_path)?;
-        } else if !file_type.is_file() {
+            collect_runtime_tree_exclusions(root, &source_path, excluded)?;
+        } else if file_type.is_file() {
+        } else if runtime_ephemeral_socket(root, &source_path)? {
+            excluded.push(
+                source_path
+                    .strip_prefix(root)
+                    .expect("validated Runtime migration path")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        } else {
             return Err(runtime_store_corrupt(
                 &source_path,
-                "Runtime migration refuses symlinks and special files".to_string(),
+                "Runtime migration refuses unknown symlinks and special files".to_string(),
             ));
         }
     }
     Ok(())
 }
 
-fn copy_runtime_tree(source: &Path, target: &Path) -> Result<(), RuntimeError> {
+fn runtime_tree_exclusions(root: &Path) -> Result<Vec<String>, RuntimeError> {
+    let mut excluded = Vec::new();
+    collect_runtime_tree_exclusions(root, root, &mut excluded)?;
+    excluded.sort();
+    Ok(excluded)
+}
+
+fn copy_runtime_tree(root: &Path, source: &Path, target: &Path) -> Result<(), RuntimeError> {
     fs::create_dir(target)
         .map_err(|error| runtime_io_error("create migration staging", target, error))?;
     let mut entries = fs::read_dir(source)
@@ -533,14 +599,16 @@ fn copy_runtime_tree(source: &Path, target: &Path) -> Result<(), RuntimeError> {
             .file_type()
             .map_err(|error| runtime_io_error("inspect migration source", &source_path, error))?;
         if file_type.is_dir() {
-            copy_runtime_tree(&source_path, &target_path)?;
+            copy_runtime_tree(root, &source_path, &target_path)?;
         } else if file_type.is_file() {
             fs::copy(&source_path, &target_path)
                 .map_err(|error| runtime_io_error("copy migration source", &source_path, error))?;
+        } else if runtime_ephemeral_socket(root, &source_path)? {
+            continue;
         } else {
             return Err(runtime_store_corrupt(
                 &source_path,
-                "Runtime migration refuses symlinks and special files".to_string(),
+                "Runtime migration refuses unknown symlinks and special files".to_string(),
             ));
         }
     }
@@ -567,7 +635,7 @@ fn migrate_v1_worker_identity(
             ),
         ));
     }
-    if let Err(error) = copy_runtime_tree(root, &staging) {
+    if let Err(error) = copy_runtime_tree(root, root, &staging) {
         let _ = fs::remove_dir_all(&staging);
         return Err(error);
     }

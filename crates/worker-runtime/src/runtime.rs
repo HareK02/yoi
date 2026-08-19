@@ -4193,6 +4193,14 @@ mod tests {
             serde_json::to_vec_pretty(&runtime_json).unwrap(),
         )
         .unwrap();
+        #[cfg(unix)]
+        {
+            let run_dir = legacy_dir.join("runs").join("6");
+            std::fs::create_dir_all(&run_dir).unwrap();
+            let socket =
+                std::os::unix::net::UnixListener::bind(run_dir.join("worker.sock")).unwrap();
+            drop(socket);
+        }
 
         let runtime_options = crate::fs_store::FsRuntimeStoreOptions {
             root: root.clone(),
@@ -4204,6 +4212,11 @@ mod tests {
         assert!(plan.migration_required);
         assert_eq!(plan.worker_count, 1);
         assert_eq!(plan.mappings[0].legacy_worker_id, 7);
+        #[cfg(unix)]
+        assert_eq!(
+            plan.excluded_ephemeral_paths,
+            vec!["workers/7/runs/6/worker.sock"]
+        );
         assert_eq!(
             std::fs::read(&runtime_path).unwrap(),
             runtime_before_dry_run
@@ -4215,7 +4228,10 @@ mod tests {
         let detail = restored.worker_detail(&WorkerRef::new(expected)).unwrap();
         assert_eq!(detail.worker_id, expected);
         assert_eq!(detail.worker_ref.worker_id, expected);
-        assert!(root.join("workers").join(expected.to_string()).exists());
+        let expected_worker_dir = root.join("workers").join(expected.to_string());
+        assert!(expected_worker_dir.exists());
+        #[cfg(unix)]
+        assert!(!expected_worker_dir.join("runs/6/worker.sock").exists());
         assert!(!legacy_dir.exists());
         let migrated_runtime: serde_json::Value =
             serde_json::from_slice(&std::fs::read(runtime_path).unwrap()).unwrap();
