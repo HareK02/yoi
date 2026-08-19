@@ -596,6 +596,20 @@ mod tests {
     }
 
     #[test]
+    fn orchestrator_prompt_uses_normal_branch_integration_before_escalation() {
+        let catalog = PromptCatalog::builtins_only().unwrap();
+        let prompt = &catalog.projection.templates["role.orchestrator"];
+
+        assert!(prompt.contains("`merge_from`"));
+        assert!(prompt.contains("`merge_to`"));
+        assert!(prompt.contains("normal source-control operations"));
+        assert!(prompt.contains("switch to `merge_to`"));
+        assert!(prompt.contains("concrete source-control or provider failure"));
+        assert!(prompt.contains("does not update the branch itself"));
+        assert!(!prompt.contains("use the Ticket repository `origin` transport"));
+    }
+
+    #[test]
     fn graph_rejects_dynamic_legacy_missing_and_cycles() {
         let invalid = BTreeMap::from([
             ("a".into(), "{%- include target -%}".into()),
