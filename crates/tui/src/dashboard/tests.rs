@@ -859,6 +859,7 @@ async fn ticket_queue_notification_sends_notify_when_socket_available() {
                 },
                 status: WorkerStatus::Idle,
                 in_flight: Default::default(),
+                internal_workers: Vec::new(),
             })
             .await
             .unwrap();
@@ -900,6 +901,7 @@ async fn send_notify_only_can_deliver_weak_notification_without_auto_run() {
                 },
                 status: WorkerStatus::Idle,
                 in_flight: Default::default(),
+                internal_workers: Vec::new(),
             })
             .await
             .unwrap();

@@ -3,6 +3,8 @@ import type {
   Event as ProtocolEvent,
   InFlightBlock,
   InFlightToolCallState,
+  InternalWorkerRef,
+  InternalWorkerSnapshot,
   Segment,
 } from "$lib/generated/protocol";
 import { workspaceRoute } from "$lib/workspace/api/http";
@@ -63,6 +65,26 @@ export type ConsoleLine = {
   toolCall?: ToolCallView;
 };
 
+export type InternalWorkerProjection = {
+  worker: InternalWorkerRef;
+  revision: number;
+  console: ConsoleProjection;
+};
+
+export type FlattenedInternalWorkerProjection = InternalWorkerProjection & {
+  depth: number;
+};
+
+export function flattenInternalWorkers(
+  workers: InternalWorkerProjection[],
+  depth = 0,
+): FlattenedInternalWorkerProjection[] {
+  return workers.flatMap((worker) => [
+    { ...worker, depth },
+    ...flattenInternalWorkers(worker.console.internalWorkers, depth + 1),
+  ]);
+}
+
 export type ConsoleProjection = {
   lines: ConsoleLine[];
   tasks: ConsoleTask[];
@@ -71,6 +93,7 @@ export type ConsoleProjection = {
   usage: string | null;
   cwd: string | null;
   lastEventId: string | null;
+  internalWorkers: InternalWorkerProjection[];
 };
 
 export type ConsoleTimelineLineSelection = {
@@ -155,6 +178,7 @@ export function emptyConsoleProjection(): ConsoleProjection {
     usage: null,
     cwd: null,
     lastEventId: null,
+    internalWorkers: [],
   };
 }
 
@@ -193,7 +217,48 @@ function projectVisibleConsole(
   return {
     ...projection,
     lines: aggregateReadToolLines(projection.lines),
+    internalWorkers: projection.internalWorkers.map((worker) => ({
+      ...worker,
+      console: projectVisibleConsole(worker.console),
+    })),
   };
+}
+
+function projectInternalWorkerSnapshot(
+  snapshot: InternalWorkerSnapshot,
+  eventId: string,
+  cwd: string | null,
+): InternalWorkerProjection {
+  const console = snapshotProjectionFromEntries(
+    `${eventId}:internal:${snapshot.worker.session_id}:snapshot`,
+    snapshot.entries,
+    cwd,
+  );
+  console.status = snapshot.status;
+  for (const block of snapshot.in_flight?.blocks ?? []) {
+    console.lines.push(
+      inFlightLine(
+        `${eventId}:internal:${snapshot.worker.session_id}:in-flight`,
+        block,
+        cwd,
+      ),
+    );
+  }
+  if (snapshot.error) {
+    console.lines.push({
+      id: `${eventId}:internal:${snapshot.worker.session_id}:error`,
+      kind: "error",
+      title: "Error",
+      body: snapshot.error,
+      eventId,
+      source: "event",
+      error: true,
+    });
+  }
+  console.internalWorkers = (snapshot.internal_workers ?? []).map((child) =>
+    projectInternalWorkerSnapshot(child, eventId, cwd)
+  );
+  return { worker: snapshot.worker, revision: snapshot.revision, console };
 }
 
 export function applyProtocolEvent(
@@ -208,6 +273,7 @@ export function applyProtocolEvent(
     usage: projection.usage,
     cwd: projection.cwd,
     lastEventId: envelope.eventId,
+    internalWorkers: [...projection.internalWorkers],
   };
   const event = envelope.event;
 
@@ -322,6 +388,34 @@ export function applyProtocolEvent(
       for (const block of event.data.in_flight?.blocks ?? []) {
         next.lines.push(inFlightLine(envelope.eventId, block, next.cwd));
       }
+      next.internalWorkers = (event.data.internal_workers ?? []).map((worker) =>
+        projectInternalWorkerSnapshot(worker, envelope.eventId, next.cwd)
+      );
+      break;
+    }
+    case "internal_worker": {
+      const existingIndex = next.internalWorkers.findIndex((worker) =>
+        worker.worker.session_id === event.data.worker.session_id
+      );
+      const existing = existingIndex >= 0
+        ? next.internalWorkers[existingIndex]
+        : {
+          worker: event.data.worker,
+          revision: 0,
+          console: emptyConsoleProjection(),
+        };
+      if (event.data.revision <= existing.revision) break;
+      const updated: InternalWorkerProjection = {
+        worker: event.data.worker,
+        revision: event.data.revision,
+        console: applyProtocolEvent(existing.console, {
+          eventId:
+            `${envelope.eventId}:internal:${event.data.worker.session_id}:${event.data.revision}`,
+          event: event.data.event,
+        }),
+      };
+      if (existingIndex >= 0) next.internalWorkers[existingIndex] = updated;
+      else next.internalWorkers.push(updated);
       break;
     }
     case "status":
@@ -1184,6 +1278,7 @@ function snapshotProjectionFromEntries(
     usage: null,
     cwd,
     lastEventId: eventId,
+    internalWorkers: [],
   };
   entries.forEach((entry, index) =>
     applyLogEntry(projection, `${eventId}-snapshot-${index}`, entry)

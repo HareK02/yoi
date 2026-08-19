@@ -53,6 +53,12 @@ export type InFlightBlock = { "kind": "text", text: string, finished?: boolean, 
 
 export type InFlightSnapshot = { blocks?: Array<InFlightBlock>, };
 
+export type InternalWorkerKind = "sub_worker";
+
+export type InternalWorkerRef = { session_id: string, name: string, parent_session_id?: string | null, kind: InternalWorkerKind, };
+
+export type InternalWorkerSnapshot = { worker: InternalWorkerRef, revision: number, entries: Array<unknown>, status: WorkerStatus, error?: string | null, in_flight?: InFlightSnapshot, internal_workers?: Array<InternalWorkerSnapshot>, };
+
 export type Greeting = { worker_name: string, cwd: string, provider: string, model: string, scope_summary: string, tools: Array<string>,
 /**
  * Model context window in tokens. Always filled by the Worker greeting.
@@ -167,4 +173,9 @@ output?: string | null, is_error: boolean, } } | { "event": "usage", "data": { i
  * Unfinished model output that has already streamed in the current
  * run but is not yet represented by committed snapshot entries.
  */
-in_flight?: InFlightSnapshot, } } | { "event": "segment_rotated", "data": { entry: unknown, } } | { "event": "status", "data": { status: WorkerStatus, } } | { "event": "completions", "data": { kind: CompletionKind, entries: Array<CompletionEntry>, } } | { "event": "rewind_targets", "data": { head_entries: number, targets: Array<RewindTarget>, } } | { "event": "rewind_applied", "data": { entries: Array<unknown>, input: Array<Segment>, summary: RewindSummary, } } | { "event": "workers_listed", "data": { workers: unknown, } } | { "event": "worker_restored", "data": { result: unknown, } } | { "event": "peer_registered", "data": { result: unknown, } } | { "event": "alert", "data": Alert } | { "event": "memory_worker", "data": MemoryWorkerEvent } | { "event": "compact_start" } | { "event": "compact_done", "data": { new_segment_id: string, } } | { "event": "compact_failed", "data": { error: string, } } | { "event": "shutdown" };
+in_flight?: InFlightSnapshot,
+/**
+ * Parent-owned Internal Worker sessions visible to this client.
+ * Service-private Internal Workers are deliberately excluded.
+ */
+internal_workers?: Array<InternalWorkerSnapshot>, } } | { "event": "internal_worker", "data": { worker: InternalWorkerRef, revision: number, event: Event, } } | { "event": "segment_rotated", "data": { entry: unknown, } } | { "event": "status", "data": { status: WorkerStatus, } } | { "event": "completions", "data": { kind: CompletionKind, entries: Array<CompletionEntry>, } } | { "event": "rewind_targets", "data": { head_entries: number, targets: Array<RewindTarget>, } } | { "event": "rewind_applied", "data": { entries: Array<unknown>, input: Array<Segment>, summary: RewindSummary, } } | { "event": "workers_listed", "data": { workers: unknown, } } | { "event": "worker_restored", "data": { result: unknown, } } | { "event": "peer_registered", "data": { result: unknown, } } | { "event": "alert", "data": Alert } | { "event": "memory_worker", "data": MemoryWorkerEvent } | { "event": "compact_start" } | { "event": "compact_done", "data": { new_segment_id: string, } } | { "event": "compact_failed", "data": { error: string, } } | { "event": "shutdown" };

@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use protocol::{
     AlertLevel, AlertSource, CompletionEntry, CompletionKind, ErrorCode, Event, InFlightBlock,
-    InFlightSnapshot, InFlightToolCallState, Method, RewindTarget, RunResult, Segment,
-    WorkerStatus,
+    InFlightSnapshot, InFlightToolCallState, InternalWorkerRef, InternalWorkerSnapshot, Method,
+    RewindTarget, RunResult, Segment, WorkerStatus,
 };
 
 use crate::block::{
@@ -227,6 +227,12 @@ impl ActionbarNotice {
     }
 }
 
+pub struct InternalWorkerView {
+    pub worker: InternalWorkerRef,
+    pub revision: u64,
+    pub app: Box<App>,
+}
+
 pub struct App {
     pub worker_name: String,
     pub connected: bool,
@@ -274,6 +280,9 @@ pub struct App {
     /// Turn/protocol errors retained when a real `SegmentStart` replaces the
     /// replayable conversation rows during segment rotation.
     run_error_messages: Vec<String>,
+    /// Presentation-only Internal Worker projections keyed by session identity.
+    /// They are rendered in separate sub-panes and never mixed into `blocks`.
+    pub internal_workers: Vec<InternalWorkerView>,
     pub scroll: Scroll,
     pub mode: Mode,
     pub cache: FileCache,
@@ -351,6 +360,7 @@ impl App {
             quit_confirm: None,
             blocks: Vec::new(),
             run_error_messages: Vec::new(),
+            internal_workers: Vec::new(),
             scroll: Scroll::default(),
             mode: Mode::Normal,
             cache: FileCache::new(),
@@ -1296,11 +1306,18 @@ impl App {
                 greeting,
                 status,
                 in_flight,
+                internal_workers,
             } => {
                 self.rewind_refresh_fence = false;
                 self.restore_snapshot(&entries, greeting, in_flight);
+                self.replace_internal_worker_snapshots(internal_workers);
                 self.set_worker_status(status);
             }
+            Event::InternalWorker {
+                worker,
+                revision,
+                event,
+            } => self.apply_internal_worker_event(worker, revision, *event),
             Event::Status { status } => {
                 self.rewind_refresh_fence = false;
                 self.set_worker_status(status);
@@ -1980,6 +1997,60 @@ impl App {
     /// LogEntry variant into the same blocks live events would have
     /// produced. Followed by `Event::Entry` updates for anything
     /// committed after the snapshot.
+    fn replace_internal_worker_snapshots(&mut self, snapshots: Vec<InternalWorkerSnapshot>) {
+        self.internal_workers = snapshots
+            .into_iter()
+            .map(Self::internal_worker_view_from_snapshot)
+            .collect();
+    }
+
+    fn internal_worker_view_from_snapshot(snapshot: InternalWorkerSnapshot) -> InternalWorkerView {
+        let mut app = App::new(snapshot.worker.name.clone());
+        app.restore_entries(&snapshot.entries, None);
+        app.apply_in_flight_snapshot(snapshot.in_flight);
+        app.set_worker_status(snapshot.status);
+        if let Some(error) = snapshot.error {
+            let _ = app.handle_worker_event(Event::Error {
+                code: protocol::ErrorCode::Internal,
+                message: error,
+            });
+        }
+        app.replace_internal_worker_snapshots(snapshot.internal_workers);
+        InternalWorkerView {
+            worker: snapshot.worker,
+            revision: snapshot.revision,
+            app: Box::new(app),
+        }
+    }
+
+    fn apply_internal_worker_event(
+        &mut self,
+        worker: InternalWorkerRef,
+        revision: u64,
+        event: Event,
+    ) {
+        let index = self
+            .internal_workers
+            .iter()
+            .position(|candidate| candidate.worker.session_id == worker.session_id);
+        let target = if let Some(index) = index {
+            &mut self.internal_workers[index]
+        } else {
+            self.internal_workers.push(InternalWorkerView {
+                worker: worker.clone(),
+                revision: 0,
+                app: Box::new(App::new(worker.name.clone())),
+            });
+            self.internal_workers.last_mut().unwrap()
+        };
+        if revision <= target.revision {
+            return;
+        }
+        target.worker = worker;
+        target.revision = revision;
+        let _ = target.app.handle_worker_event(event);
+    }
+
     fn restore_snapshot(
         &mut self,
         entries: &[serde_json::Value],
@@ -3276,6 +3347,7 @@ mod completion_flow_tests {
             entries: vec![session_start_value],
             status: WorkerStatus::Running,
             in_flight: Default::default(),
+            internal_workers: Vec::new(),
         });
 
         assert!(matches!(app.worker_status, WorkerStatus::Running));
@@ -3321,6 +3393,7 @@ mod completion_flow_tests {
             entries: vec![serde_json::to_value(run_errored).unwrap()],
             status: WorkerStatus::Idle,
             in_flight: Default::default(),
+            internal_workers: Vec::new(),
         });
 
         let errors = app
@@ -3398,6 +3471,7 @@ mod completion_flow_tests {
                     },
                 ],
             },
+            internal_workers: Vec::new(),
         });
 
         app.handle_worker_event(Event::TextDelta { text: "lo".into() });
@@ -3432,6 +3506,83 @@ mod completion_flow_tests {
         app.handle_worker_event(Event::SystemItem { item });
 
         assert!(app.blocks.is_empty());
+    }
+
+    #[test]
+    fn internal_worker_events_project_by_session_without_mixing_parent_blocks() {
+        let mut app = App::new("parent".into());
+        let worker = InternalWorkerRef {
+            session_id: "child-session".into(),
+            name: "research".into(),
+            parent_session_id: Some("parent-session".into()),
+            kind: protocol::InternalWorkerKind::SubWorker,
+        };
+        app.handle_worker_event(Event::InternalWorker {
+            worker: worker.clone(),
+            revision: 2,
+            event: Box::new(Event::TextDelta {
+                text: "child output".into(),
+            }),
+        });
+        app.handle_worker_event(Event::InternalWorker {
+            worker,
+            revision: 1,
+            event: Box::new(Event::TextDelta {
+                text: "stale".into(),
+            }),
+        });
+
+        assert!(app.blocks.is_empty());
+        assert_eq!(app.internal_workers.len(), 1);
+        assert_eq!(app.internal_workers[0].revision, 2);
+        assert!(
+            app.internal_workers[0].app.blocks.iter().any(
+                |block| matches!(block, Block::AssistantText { text } if text == "child output")
+            )
+        );
+    }
+
+    #[test]
+    fn snapshot_authoritatively_replaces_internal_worker_views() {
+        let mut app = App::new("parent".into());
+        app.internal_workers.push(InternalWorkerView {
+            worker: InternalWorkerRef {
+                session_id: "old".into(),
+                name: "old".into(),
+                parent_session_id: None,
+                kind: protocol::InternalWorkerKind::SubWorker,
+            },
+            revision: 1,
+            app: Box::new(App::new("old".into())),
+        });
+        app.handle_worker_event(Event::Snapshot {
+            greeting: test_greeting(),
+            entries: Vec::new(),
+            status: WorkerStatus::Idle,
+            in_flight: Default::default(),
+            internal_workers: vec![InternalWorkerSnapshot {
+                worker: InternalWorkerRef {
+                    session_id: "replacement".into(),
+                    name: "replacement".into(),
+                    parent_session_id: Some("parent-session".into()),
+                    kind: protocol::InternalWorkerKind::SubWorker,
+                },
+                revision: 4,
+                entries: Vec::new(),
+                status: WorkerStatus::Running,
+                error: None,
+                in_flight: Default::default(),
+                internal_workers: Vec::new(),
+            }],
+        });
+
+        assert_eq!(app.internal_workers.len(), 1);
+        assert_eq!(app.internal_workers[0].worker.session_id, "replacement");
+        assert_eq!(app.internal_workers[0].revision, 4);
+        assert_eq!(
+            app.internal_workers[0].app.worker_status,
+            WorkerStatus::Running
+        );
     }
 
     #[test]
@@ -3552,6 +3703,7 @@ mod completion_flow_tests {
             greeting,
             status: WorkerStatus::Idle,
             in_flight: Default::default(),
+            internal_workers: Vec::new(),
         });
 
         assert_eq!(app.context_window, 123_000);
@@ -3749,6 +3901,7 @@ mod completion_flow_tests {
             entries: assistant_item_entries,
             status: WorkerStatus::Running,
             in_flight: Default::default(),
+            internal_workers: Vec::new(),
         });
 
         let tasks = app.task_store.tasks();

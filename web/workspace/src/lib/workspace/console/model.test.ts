@@ -1266,6 +1266,82 @@ Deno.test("projectConsole mirrors live TaskCreate and TaskUpdate calls", () => {
   }]);
 });
 
+Deno.test("Internal Worker output stays separate and revision-fenced", () => {
+  const worker = {
+    session_id: "child-session",
+    name: "research",
+    parent_session_id: "parent-session",
+    kind: "sub_worker" as const,
+  };
+  const projector = createConsoleProjector();
+  let projection = projector.append([{
+    eventId: "1",
+    event: {
+      event: "internal_worker",
+      data: {
+        worker,
+        revision: 2,
+        event: { event: "text_done", data: { text: "child output" } },
+      },
+    },
+  }]);
+  assertEquals(projection.lines, []);
+  assertEquals(projection.internalWorkers.length, 1);
+  assertEquals(projection.internalWorkers[0].console.lines[0].body, "child output");
+
+  projection = projector.append([{
+    eventId: "2",
+    event: {
+      event: "internal_worker",
+      data: {
+        worker,
+        revision: 1,
+        event: { event: "text_done", data: { text: "stale" } },
+      },
+    },
+  }]);
+  assertEquals(projection.internalWorkers[0].console.lines.length, 1);
+});
+
+Deno.test("parent snapshot authoritatively replaces Internal Worker projections", () => {
+  const event = snapshotEvent("/repo");
+  if (event.event !== "snapshot") throw new Error("snapshot fixture expected");
+  event.data.internal_workers = [{
+    worker: {
+      session_id: "replacement",
+      name: "replacement",
+      parent_session_id: "parent-session",
+      kind: "sub_worker",
+    },
+    revision: 4,
+    entries: [],
+    status: "idle",
+    in_flight: { blocks: [] },
+    internal_workers: [],
+  }];
+  const projector = createConsoleProjector();
+  projector.append([{
+    eventId: "old",
+    event: {
+      event: "internal_worker",
+      data: {
+        worker: {
+          session_id: "old",
+          name: "old",
+          parent_session_id: "parent-session",
+          kind: "sub_worker",
+        },
+        revision: 1,
+        event: { event: "status", data: { status: "running" } },
+      },
+    },
+  }]);
+  const projection = projector.append([{ eventId: "snapshot", event }]);
+  assertEquals(projection.internalWorkers.map((worker) => worker.worker.session_id), [
+    "replacement",
+  ]);
+});
+
 Deno.test("snapshot restores TaskStore state from system history", () => {
   const taskSnapshot =
     `[Session TaskStore snapshot]\n\n\`\`\`json\n{\n  "tasks": [{"taskid": 3, "status": "pending", "subject": "Restored", "description": "From compaction"}]\n}\n\`\`\``;

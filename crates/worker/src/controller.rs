@@ -48,6 +48,7 @@ pub struct WorkerHandle {
     /// it on every new connection (Event::Snapshot) and forwards
     /// subsequent commits (Event::Entry) on the receiver.
     pub sink: SegmentLogSink,
+    spawned_registry: Arc<SpawnedWorkerRegistry>,
 }
 
 impl WorkerHandle {
@@ -84,6 +85,7 @@ impl WorkerHandle {
             greeting: self.shared_state.greeting.clone(),
             status: self.shared_state.get_status(),
             in_flight,
+            internal_workers: self.spawned_registry.internal_worker_snapshots(),
         };
         (event, entry_rx)
     }
@@ -413,6 +415,7 @@ impl WorkerController {
         wire_event_bridges_on_engine(&mut worker, &event_tx, &alerter, &in_flight);
 
         // === 3. Tool registration (builtin / memory / spawn-orchestration) ===
+        spawned_registry.attach_parent_protocol(event_tx.clone(), worker.session_id().to_string());
         let fs_for_view = register_worker_tools(
             &mut worker,
             bash_output_dir,
@@ -460,6 +463,7 @@ impl WorkerController {
             alerter: alerter.clone(),
             in_flight: in_flight.clone(),
             sink: worker.sink(),
+            spawned_registry: spawned_registry.clone(),
         };
 
         let socket_server = match transport {
@@ -502,7 +506,7 @@ impl WorkerController {
 /// per-item history commit callback so every assistant / tool item
 /// landing in `worker.history` becomes a singular `LogEntry::AssistantItem`
 /// / `ToolResult` commit through the sync writer.
-fn wire_event_bridges_on_engine<C, St>(
+pub(crate) fn wire_event_bridges_on_engine<C, St>(
     worker: &mut Worker<C, St>,
     event_tx: &broadcast::Sender<Event>,
     alerter: &Alerter,
@@ -1877,6 +1881,7 @@ mod tests {
                     },
                     status: WorkerStatus::Idle,
                     in_flight: Default::default(),
+                    internal_workers: Vec::new(),
                 })
                 .await
                 .ok()?;

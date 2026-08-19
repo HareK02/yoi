@@ -1435,6 +1435,7 @@ impl Runtime {
             },
             status: protocol::WorkerStatus::Idle,
             in_flight: protocol::InFlightSnapshot { blocks: Vec::new() },
+            internal_workers: Vec::new(),
         })
     }
 
@@ -3770,6 +3771,7 @@ mod tests {
                 },
                 status: protocol::WorkerStatus::Running,
                 in_flight: protocol::InFlightSnapshot { blocks: Vec::new() },
+                internal_workers: Vec::new(),
             },
         );
 

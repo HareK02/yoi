@@ -29,7 +29,8 @@ use workdir::{
 use crate::PromptCatalogSource;
 use crate::controller::register_worker_tools;
 use crate::internal_worker::{
-    EphemeralSessionStore, InternalWorkerSessionStatus, prepare_internal_worker_session,
+    EphemeralSessionStore, InternalWorkerSessionStatus, InternalWorkerVisibility,
+    prepare_internal_worker_session,
 };
 use crate::prompt::catalog::PromptCatalog;
 use crate::spawn::registry::SpawnedWorkerRegistry;
@@ -473,7 +474,7 @@ impl Tool for SubWorkerSpawnTool {
                 .join(&input.name)
                 .join("bash-output"),
             self.runtime_base.clone(),
-            child_registry,
+            child_registry.clone(),
             None,
         )
         .await
@@ -494,6 +495,8 @@ impl Tool for SubWorkerSpawnTool {
         let session_result = prepare_internal_worker_session(
             child,
             store,
+            InternalWorkerVisibility::ParentClient,
+            Some(child_registry.clone()),
             Some(Arc::new(move |status| {
                 if status == InternalWorkerSessionStatus::Failed {
                     if let Some(registry) = registry.upgrade() {
@@ -516,6 +519,8 @@ impl Tool for SubWorkerSpawnTool {
         let session = session_result.map_err(|error| {
             ToolError::ExecutionFailed(format!("prepare Internal Worker session: {error}"))
         })?;
+        child_registry
+            .attach_parent_protocol(session.protocol_sender(), session.session_id_string());
 
         if let Some((ticket_id, capability_token)) = &reviewer_capability {
             let workspace_id = self.workspace_context.workspace_id().ok_or_else(|| {

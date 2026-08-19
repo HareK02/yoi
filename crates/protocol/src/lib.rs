@@ -278,6 +278,47 @@ impl Method {
 // Event (Worker → Client via Unix Socket broadcast)
 // ---------------------------------------------------------------------------
 
+/// Presentation category for an Internal Worker exposed through its parent's
+/// protocol stream. Internal Workers never become independently addressable
+/// protocol subjects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum InternalWorkerKind {
+    SubWorker,
+}
+
+/// Stable presentation identity for one parent-owned Internal Worker session.
+/// `name` is display-only; `session_id` is the identity used by clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct InternalWorkerRef {
+    pub session_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    pub kind: InternalWorkerKind,
+}
+
+/// Reconnect state for one visible Internal Worker. The revision fences live
+/// `Event::InternalWorker` updates that raced with parent snapshot assembly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct InternalWorkerSnapshot {
+    pub worker: InternalWorkerRef,
+    pub revision: u64,
+    #[cfg_attr(feature = "typescript", ts(type = "Array<unknown>"))]
+    pub entries: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub status: WorkerStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "InFlightSnapshot::is_empty")]
+    pub in_flight: InFlightSnapshot,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub internal_workers: Vec<InternalWorkerSnapshot>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
@@ -476,6 +517,18 @@ pub enum Event {
         /// run but is not yet represented by committed snapshot entries.
         #[serde(default, skip_serializing_if = "InFlightSnapshot::is_empty")]
         in_flight: InFlightSnapshot,
+        /// Parent-owned Internal Worker sessions visible to this client.
+        /// Service-private Internal Workers are deliberately excluded.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        internal_workers: Vec<InternalWorkerSnapshot>,
+    },
+    /// A live event from a parent-owned Internal Worker. The payload reuses the
+    /// normal Worker event vocabulary while the wrapper carries stable origin
+    /// identity and a per-child revision fence.
+    InternalWorker {
+        worker: InternalWorkerRef,
+        revision: u64,
+        event: Box<Event>,
     },
     /// Server-side segment log rotated to a fresh `SegmentStart`.
     ///
@@ -1269,6 +1322,7 @@ mod tests {
             },
             status: WorkerStatus::Paused,
             in_flight: InFlightSnapshot::default(),
+            internal_workers: Vec::new(),
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1322,6 +1376,7 @@ mod tests {
                     },
                 ],
             },
+            internal_workers: Vec::new(),
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1714,6 +1769,61 @@ mod tests {
                 (decoded, expected) => panic!("decoded {decoded:?}, expected {expected:?}"),
             }
         }
+    }
+
+    #[test]
+    fn internal_worker_event_roundtrip_preserves_origin_and_payload() {
+        let event = Event::InternalWorker {
+            worker: InternalWorkerRef {
+                session_id: "session-1".into(),
+                name: "research".into(),
+                parent_session_id: Some("parent-session".into()),
+                kind: InternalWorkerKind::SubWorker,
+            },
+            revision: 7,
+            event: Box::new(Event::TextDone {
+                text: "result".into(),
+            }),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: Event = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Event::InternalWorker {
+                worker,
+                revision,
+                event,
+            } => {
+                assert_eq!(worker.session_id, "session-1");
+                assert_eq!(worker.parent_session_id.as_deref(), Some("parent-session"));
+                assert_eq!(revision, 7);
+                assert!(matches!(*event, Event::TextDone { ref text } if text == "result"));
+            }
+            other => panic!("expected internal Worker event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_snapshot_defaults_internal_workers_to_empty() {
+        let snapshot: Event = serde_json::from_value(serde_json::json!({
+            "event": "snapshot",
+            "data": {
+                "entries": [],
+                "greeting": {
+                    "worker_name": "parent",
+                    "cwd": ".",
+                    "provider": "provider",
+                    "model": "model",
+                    "scope_summary": "scope",
+                    "tools": []
+                },
+                "status": "idle"
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            snapshot,
+            Event::Snapshot { internal_workers, .. } if internal_workers.is_empty()
+        ));
     }
 
     #[test]
