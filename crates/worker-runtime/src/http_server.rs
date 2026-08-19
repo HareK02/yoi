@@ -2232,6 +2232,8 @@ mod tests {
         {
             use std::os::unix::fs::symlink;
             std::fs::create_dir(temp.path().join("granted")).expect("granted directory");
+            std::fs::write(temp.path().join("granted/visible"), "visible")
+                .expect("visible fixture");
             std::fs::create_dir(temp.path().join("secret")).expect("secret directory");
             std::fs::write(temp.path().join("secret/key"), "hidden").expect("secret fixture");
             symlink("../secret/key", temp.path().join("granted/link")).expect("symlink fixture");
@@ -2287,6 +2289,36 @@ mod tests {
 
         #[cfg(unix)]
         {
+            let delegated_visible = WorkdirSessionOperationRequest {
+                delegations: vec![workdir::WorkdirDelegationRequest {
+                    rules: vec![workdir::WorkdirDelegationRule {
+                        target: WorkdirPath::new("granted").unwrap(),
+                        permission: workdir::WorkdirDelegationPermission::Read,
+                        recursive: true,
+                    }],
+                    cwd: WorkdirPath::new("granted").unwrap(),
+                }],
+                operation: WorkdirSessionOperation::Read(ReadRequest {
+                    path: WorkdirPath::new("visible").unwrap(),
+                    offset: 0,
+                    limit: 20,
+                    max_bytes: 1024,
+                }),
+            };
+            let visible = run_workdir_session_operation(
+                State(state.clone()),
+                Path("session-1".to_string()),
+                Some(Extension(auth.clone())),
+                Ok(Json(delegated_visible)),
+            )
+            .await
+            .expect("non-root delegated cwd should resolve once")
+            .0;
+            assert!(matches!(
+                visible,
+                WorkdirSessionOperationResult::Read(result) if result.bytes == b"visible"
+            ));
+
             let delegated_read = WorkdirSessionOperationRequest {
                 delegations: vec![workdir::WorkdirDelegationRequest {
                     rules: vec![workdir::WorkdirDelegationRule {

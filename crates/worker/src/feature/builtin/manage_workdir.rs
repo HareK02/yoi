@@ -234,6 +234,10 @@ impl WorkdirSession for WorkspaceAttachedWorkdirSession {
         WorkdirSessionCapabilities::ALL
     }
 
+    fn transports_delegation_context(&self) -> bool {
+        true
+    }
+
     async fn capture_delegation_source(
         &self,
         request: &workdir::WorkdirDelegationRequest,
@@ -1155,7 +1159,7 @@ mod tests {
         assert_eq!(body["delegations"].as_array().unwrap().len(), 2);
         assert_eq!(body["delegations"][0]["rules"][0]["target"], "");
         assert_eq!(body["delegations"][1]["rules"][0]["target"], "nested");
-        assert_eq!(body["operation"]["request"]["path"], "nested/file");
+        assert_eq!(body["operation"]["request"]["path"], "file");
     }
 
     #[test]

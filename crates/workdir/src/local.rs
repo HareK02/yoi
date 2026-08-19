@@ -388,6 +388,18 @@ impl WorkdirSession for LocalWorkdirSession {
                 recursive: rule.recursive,
             })
             .collect::<Vec<_>>();
+        for (logical, host) in request.rules.iter().zip(&host_rules) {
+            if logical.permission == WorkdirDelegationPermission::Write {
+                let resolved = Scope::resolved_target(host)
+                    .map_err(|error| WorkdirError::Denied(error.to_string()))?;
+                if resolved != host.target {
+                    return Err(WorkdirError::Denied(format!(
+                        "write delegation target `{}` traverses a symlink",
+                        logical.target
+                    )));
+                }
+            }
+        }
         let parent_scope = self.inner.scope.snapshot();
         for rule in &host_rules {
             if !parent_scope
@@ -405,10 +417,19 @@ impl WorkdirSession for LocalWorkdirSession {
             deny: Vec::new(),
         })
         .map_err(|error| WorkdirError::Denied(error.to_string()))?;
+        let child_cwd = self.inner.root.join(request.cwd.as_str());
+        if !child_scope.is_readable(&child_cwd)
+            || !std::fs::metadata(&child_cwd).is_ok_and(|metadata| metadata.is_dir())
+        {
+            return Err(WorkdirError::Denied(format!(
+                "delegated cwd `{}` is not a readable Workdir directory",
+                request.cwd
+            )));
+        }
         Ok(Arc::new(LocalWorkdirSession::materialized_bound(
             self.inner.workdir.clone(),
             self.inner.root.clone(),
-            self.inner.cwd.clone(),
+            self.inner.root.clone(),
             SharedScope::new(child_scope),
             self.inner.capabilities,
         )))

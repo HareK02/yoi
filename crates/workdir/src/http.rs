@@ -328,6 +328,10 @@ mod client {
             self.capabilities
         }
 
+        fn transports_delegation_context(&self) -> bool {
+            true
+        }
+
         async fn capture_delegation_source(
             &self,
             request: &crate::WorkdirDelegationRequest,

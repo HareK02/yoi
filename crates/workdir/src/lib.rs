@@ -149,6 +149,12 @@ pub trait WorkdirSession: std::fmt::Debug + Send + Sync {
         false
     }
 
+    /// Whether this session transports the delegation chain to another
+    /// provider boundary that will apply logical cwd/path resolution there.
+    fn transports_delegation_context(&self) -> bool {
+        false
+    }
+
     /// Capture a provider-specific source for a delegated child session.
     /// Remote providers use this boundary to pin attachment identity without
     /// exposing transport handles or host paths.

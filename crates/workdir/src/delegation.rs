@@ -360,6 +360,10 @@ impl WorkdirSession for DelegatingWorkdirSession {
         true
     }
 
+    fn transports_delegation_context(&self) -> bool {
+        self.source.transports_delegation_context()
+    }
+
     async fn capture_delegation_source(
         &self,
         request: &WorkdirDelegationRequest,
@@ -431,44 +435,65 @@ impl WorkdirSession for DelegatingWorkdirSession {
     }
 
     async fn stat(&self, mut request: StatRequest) -> Result<StatResult, WorkdirError> {
-        request.path = self.resolve_path(&request.path)?;
-        self.ensure_read(&request.path, WorkdirSessionCapability::Read)?;
+        let path = self.resolve_path(&request.path)?;
+        self.ensure_read(&path, WorkdirSessionCapability::Read)?;
+        if !self.source.transports_delegation_context() {
+            request.path = path;
+        }
         self.source.stat(request).await
     }
 
     async fn read(&self, mut request: ReadRequest) -> Result<ReadResult, WorkdirError> {
-        request.path = self.resolve_path(&request.path)?;
-        self.ensure_read(&request.path, WorkdirSessionCapability::Read)?;
+        let path = self.resolve_path(&request.path)?;
+        self.ensure_read(&path, WorkdirSessionCapability::Read)?;
+        if !self.source.transports_delegation_context() {
+            request.path = path;
+        }
         self.source.read(request).await
     }
 
     async fn write(&self, mut request: WriteRequest) -> Result<WriteResult, WorkdirError> {
-        request.path = self.resolve_path(&request.path)?;
-        self.ensure_write(&request.path, WorkdirSessionCapability::Write)?;
+        let path = self.resolve_path(&request.path)?;
+        self.ensure_write(&path, WorkdirSessionCapability::Write)?;
+        if !self.source.transports_delegation_context() {
+            request.path = path;
+        }
         self.source.write(request).await
     }
 
     async fn edit(&self, mut request: EditRequest) -> Result<EditResult, WorkdirError> {
-        request.path = self.resolve_path(&request.path)?;
-        self.ensure_write(&request.path, WorkdirSessionCapability::Edit)?;
+        let path = self.resolve_path(&request.path)?;
+        self.ensure_write(&path, WorkdirSessionCapability::Edit)?;
+        if !self.source.transports_delegation_context() {
+            request.path = path;
+        }
         self.source.edit(request).await
     }
 
     async fn list(&self, mut request: ListRequest) -> Result<ListResult, WorkdirError> {
-        request.path = self.resolve_path(&request.path)?;
-        self.ensure_read(&request.path, WorkdirSessionCapability::Read)?;
+        let path = self.resolve_path(&request.path)?;
+        self.ensure_read(&path, WorkdirSessionCapability::Read)?;
+        if !self.source.transports_delegation_context() {
+            request.path = path;
+        }
         self.source.list(request).await
     }
 
     async fn glob(&self, mut request: GlobRequest) -> Result<GlobResult, WorkdirError> {
-        request.path = self.resolve_path(&request.path)?;
-        self.ensure_read(&request.path, WorkdirSessionCapability::Glob)?;
+        let path = self.resolve_path(&request.path)?;
+        self.ensure_read(&path, WorkdirSessionCapability::Glob)?;
+        if !self.source.transports_delegation_context() {
+            request.path = path;
+        }
         self.source.glob(request).await
     }
 
     async fn grep(&self, mut request: GrepRequest) -> Result<GrepResult, WorkdirError> {
-        request.path = self.resolve_path(&request.path)?;
-        self.ensure_read(&request.path, WorkdirSessionCapability::Grep)?;
+        let path = self.resolve_path(&request.path)?;
+        self.ensure_read(&path, WorkdirSessionCapability::Grep)?;
+        if !self.source.transports_delegation_context() {
+            request.path = path;
+        }
         self.source.grep(request).await
     }
 
@@ -529,6 +554,10 @@ impl WorkdirSession for ReadOnlyWorkdirSession {
 
     fn is_delegation_capable(&self) -> bool {
         true
+    }
+
+    fn transports_delegation_context(&self) -> bool {
+        self.inner.transports_delegation_context()
     }
 
     async fn delegate(
@@ -796,6 +825,32 @@ mod tests {
             "symlink write escaped provider scope: {result:?}"
         );
         assert!(!root.path().join("secret/new").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_delegation_rejects_symlink_target_before_lease() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("granted")).unwrap();
+        fs::create_dir_all(root.path().join("secret")).unwrap();
+        symlink("../secret", root.path().join("granted/outside")).unwrap();
+        let parent = session(root.path());
+
+        assert!(matches!(
+            parent
+                .delegate(request(
+                    "granted/outside",
+                    WorkdirDelegationPermission::Write
+                ))
+                .await,
+            Err(WorkdirError::Denied(_))
+        ));
+        parent
+            .write(write("secret/parent", "still-authoritative"))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

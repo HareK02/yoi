@@ -214,6 +214,12 @@ impl Scope {
         })
     }
 
+    /// Resolve one rule target with the same symlink and missing-tail semantics
+    /// used by scope matching.
+    pub fn resolved_target(rule: &ScopeRule) -> Result<PathBuf, ScopeError> {
+        Ok(resolve_rule(rule)?.target)
+    }
+
     /// Return whether this effective scope fully contains a requested rule.
     /// This is used when attenuating provider authority without mutating the
     /// parent scope.
