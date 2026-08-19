@@ -341,7 +341,7 @@ mod client {
             }
             let mut delegations = self.delegations.clone();
             delegations.push(request.clone());
-            Ok(Arc::new(Self {
+            let candidate = Arc::new(Self {
                 client: self.client.clone(),
                 base_url: self.base_url.clone(),
                 authorization: self.authorization.clone(),
@@ -350,7 +350,13 @@ mod client {
                 capabilities: self.capabilities,
                 delegations,
                 closed: AtomicBool::new(false),
-            }))
+            });
+            candidate
+                .stat(StatRequest {
+                    path: fs_operation::FsPath::new("").expect("empty Workdir path is valid"),
+                })
+                .await?;
+            Ok(candidate)
         }
 
         async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {

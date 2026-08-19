@@ -273,12 +273,18 @@ impl WorkdirSession for WorkspaceAttachedWorkdirSession {
         };
         let mut delegations = self.delegations.clone();
         delegations.push(request.clone());
-        Ok(Arc::new(Self {
+        let candidate = Arc::new(Self {
             client: self.client.clone(),
             workdir: self.workdir.clone(),
             expected_session_fence: Some(expected_session_fence),
             delegations,
-        }))
+        });
+        candidate
+            .stat(StatRequest {
+                path: workdir::WorkdirPath::new("").expect("empty Workdir path is valid"),
+            })
+            .await?;
+        Ok(candidate)
     }
 
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {
@@ -1071,6 +1077,10 @@ mod tests {
             response(json!({"value": "attachment-fence"})),
             response(json!({
                 "operation": "stat",
+                "result": {"path": "", "kind": "directory", "size": 0}
+            })),
+            response(json!({
+                "operation": "stat",
                 "result": {"path": "visible.txt", "kind": "file", "size": 8}
             })),
         ]));
@@ -1097,22 +1107,59 @@ mod tests {
             .unwrap();
 
         let requests = client.requests();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         assert_eq!(
             requests[0].path,
             "/api/w/workspace%2Ftest/workers/self/workdir-session/fence"
         );
         let body: serde_json::Value =
-            serde_json::from_str(requests[1].body.as_deref().unwrap()).unwrap();
+            serde_json::from_str(requests[2].body.as_deref().unwrap()).unwrap();
         assert_eq!(body["expected_session_fence"], "attachment-fence");
         assert_eq!(body["operation"]["operation"], "stat");
         assert_eq!(body["delegations"][0]["rules"][0]["target"], "");
     }
 
     #[tokio::test]
+    async fn attached_provider_rejection_happens_before_delegation_is_returned() {
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![
+            response(json!({"value": "attachment-fence"})),
+            response(json!({"error": "provider rejected delegated write target"})),
+        ]));
+        let parent = workdir::delegation_capable_session(WorkspaceAttachedWorkdirSession::handle(
+            client.clone(),
+        ));
+        let result = parent
+            .delegate(workdir::WorkdirDelegationRequest {
+                rules: vec![workdir::WorkdirDelegationRule {
+                    target: workdir::WorkdirPath::new("linked-target").unwrap(),
+                    permission: workdir::WorkdirDelegationPermission::Write,
+                    recursive: true,
+                }],
+                cwd: workdir::WorkdirPath::new("linked-target").unwrap(),
+            })
+            .await;
+
+        assert!(result.is_err(), "provider rejection must fail before lease");
+        let requests = client.requests();
+        assert_eq!(requests.len(), 2);
+        let validation: serde_json::Value =
+            serde_json::from_str(requests[1].body.as_deref().unwrap()).unwrap();
+        assert_eq!(validation["operation"]["operation"], "stat");
+        assert_eq!(validation["delegations"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn nested_attached_session_preserves_full_delegation_chain() {
         let client = Arc::new(RecordingWorkspaceClient::new(vec![
             response(json!({"value": "attachment-fence"})),
+            response(json!({
+                "operation": "stat",
+                "result": {"path": "", "kind": "directory", "size": 0}
+            })),
+            response(json!({
+                "operation": "stat",
+                "result": {"path": "nested", "kind": "directory", "size": 0}
+            })),
             response(json!({
                 "operation": "stat",
                 "result": {"path": "nested/file", "kind": "file", "size": 1}
@@ -1153,9 +1200,18 @@ mod tests {
             .unwrap();
 
         let requests = client.requests();
-        assert_eq!(requests.len(), 2);
-        let body: serde_json::Value =
+        assert_eq!(requests.len(), 4);
+        let outer_validation: serde_json::Value =
             serde_json::from_str(requests[1].body.as_deref().unwrap()).unwrap();
+        let nested_validation: serde_json::Value =
+            serde_json::from_str(requests[2].body.as_deref().unwrap()).unwrap();
+        assert_eq!(outer_validation["delegations"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            nested_validation["delegations"].as_array().unwrap().len(),
+            2
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(requests[3].body.as_deref().unwrap()).unwrap();
         assert_eq!(body["delegations"].as_array().unwrap().len(), 2);
         assert_eq!(body["delegations"][0]["rules"][0]["target"], "");
         assert_eq!(body["delegations"][1]["rules"][0]["target"], "nested");
