@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { formatDate, workspaceRoute } from '$lib/workspace/api/http';
+  import { formatDate } from '$lib/workspace/api/http';
+  import { objectiveHref } from '$lib/workspace/resource-links';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
@@ -18,7 +19,7 @@
     {:else}
       <div class="objective-list">
         {#each data.objectives.items as objective (objective.id)}
-          <a class="objective-row" href={workspaceRoute(data.workspaceId, `/objectives/${objective.id}`)}>
+          <a class="objective-row" href={objectiveHref(data.workspaceId, objective)}>
             <div class="objective-main">
               <div class="objective-title-row">
                 <strong class="objective-title">{objective.title}</strong>
@@ -29,7 +30,7 @@
             <div class="objective-meta" aria-label="Objective metadata">
               <span>Updated {objective.updated_at ? formatDate(objective.updated_at) : 'unknown'}</span>
               <span>{objective.linked_tickets?.length ? `${objective.linked_tickets.length} linked ticket(s)` : 'No linked tickets'}</span>
-              <code>{objective.id}</code>
+              <code>{objective.human_key}</code>
             </div>
           </a>
         {/each}

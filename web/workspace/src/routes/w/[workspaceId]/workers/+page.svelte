@@ -1,7 +1,7 @@
 <script lang="ts">
   import { pushWorkspaceAlert } from '$lib/workspace/alerts/store';
   import { workspaceApiPath } from '$lib/workspace/api/http';
-  import { workerConsoleHref } from '$lib/workspace/console/model';
+  import { workerHref } from '$lib/workspace/resource-links';
   import { formatCurrentWorkdirRevision } from '$lib/workspace/settings/workdir-revision';
   import { canOpenWorkerConsole } from '$lib/workspace/sidebar/workers';
   import type { CleanupWorkerCandidate, RuntimeCleanupExecutionResponse, RuntimeCleanupPlanResponse, Worker } from '$lib/workspace/sidebar/types';
@@ -195,11 +195,11 @@
             <tr>
               <td>
                 {#if canOpenWorkerConsole(worker)}
-                  <a class="worker-title-link" href={workerConsoleHref(worker, data.workspaceId)}><strong>{workerDisplayName}</strong></a>
+                  <a class="worker-title-link" href={workerHref(data.workspaceId, worker)}><strong>{workerDisplayName}</strong></a>
                 {:else}
                   <strong>{workerDisplayName}</strong>
                 {/if}
-                <small>worker <code>{worker.worker_id}</code></small>
+                <small>worker <code>{worker.human_key ?? worker.worker_id}</code></small>
               </td>
               <td><code>{worker.runtime_id}</code></td>
               <td>{workerProfile(worker)}</td>

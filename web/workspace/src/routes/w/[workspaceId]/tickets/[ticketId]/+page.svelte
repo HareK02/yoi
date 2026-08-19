@@ -320,8 +320,8 @@
         {#if ticket.relations.blockers.length > 0}
           <div class="ticket-blocker-list">
             {#each ticket.relations.blockers as blocker}
-              <a href={`/w/${encodeURIComponent(data.workspaceId)}/tickets/${encodeURIComponent(blocker.blocking_ticket)}`}>
-                <strong>Blocked by {blocker.blocking_ticket}</strong>
+              <a href={`/w/${encodeURIComponent(data.workspaceId)}/tickets/${encodeURIComponent(blocker.blocking_human_key ?? blocker.blocking_ticket)}`}>
+                <strong>Blocked by {blocker.blocking_human_key ?? blocker.blocking_ticket}</strong>
                 <span>{relationLabel(blocker.relation_kind)} · {blocker.blocking_state}</span>
               </a>
             {/each}
@@ -329,16 +329,16 @@
         {/if}
         <div class="ticket-relations-list">
           {#each ticket.relations.outgoing as relation}
-            <a href={`/w/${encodeURIComponent(data.workspaceId)}/tickets/${encodeURIComponent(relation.target)}`}>
+            <a href={`/w/${encodeURIComponent(data.workspaceId)}/tickets/${encodeURIComponent(relation.target_human_key ?? relation.target)}`}>
               <span>{relationLabel(relation.kind)}</span>
-              <strong>{relation.target}</strong>
+              <strong>{relation.target_human_key ?? relation.target}</strong>
               {#if relation.note}<small>{relation.note}</small>{/if}
             </a>
           {/each}
           {#each ticket.relations.incoming as relation}
-            <a href={`/w/${encodeURIComponent(data.workspaceId)}/tickets/${encodeURIComponent(relation.source_ticket)}`}>
+            <a href={`/w/${encodeURIComponent(data.workspaceId)}/tickets/${encodeURIComponent(relation.source_human_key ?? relation.source_ticket)}`}>
               <span>{relationLabel(relation.inverse_kind)}</span>
-              <strong>{relation.source_ticket}</strong>
+              <strong>{relation.source_human_key ?? relation.source_ticket}</strong>
               {#if relation.note}<small>{relation.note}</small>{/if}
             </a>
           {/each}

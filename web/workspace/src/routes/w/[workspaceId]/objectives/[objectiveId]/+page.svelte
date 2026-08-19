@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { formatDate, workspaceRoute } from '$lib/workspace/api/http';
+  import { formatDate } from '$lib/workspace/api/http';
+  import { objectiveHref, ticketHref } from '$lib/workspace/resource-links';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
@@ -14,7 +15,7 @@
   {#if data.objectives}
     <div class="objective-list compact">
       {#each data.objectives.items as objective (objective.id)}
-        <a class="objective-row" class:active={objective.id === data.objectiveId} href={workspaceRoute(data.workspaceId, `/objectives/${objective.id}`)}>
+        <a class="objective-row" class:active={objective.id === data.objectiveId} href={objectiveHref(data.workspaceId, objective)}>
           <div class="objective-main">
             <div class="objective-title-row">
               <strong class="objective-title">{objective.title}</strong>
@@ -24,7 +25,7 @@
           </div>
           <div class="objective-meta" aria-label="Objective metadata">
             <span>Updated {objective.updated_at ? formatDate(objective.updated_at) : 'unknown'}</span>
-            <code>{objective.id}</code>
+            <code>{objective.human_key}</code>
           </div>
         </a>
       {/each}
@@ -60,7 +61,15 @@
       </div>
       <div>
         <dt>Linked tickets</dt>
-        <dd>{data.objective.linked_tickets.length ? data.objective.linked_tickets.join(', ') : 'none'}</dd>
+        <dd>
+          {#if data.objective.linked_ticket_summaries.length}
+            {#each data.objective.linked_ticket_summaries as ticket, index}
+              {#if index}, {/if}<a href={ticketHref(data.workspaceId, ticket)}>{ticket.human_key}</a>
+            {/each}
+          {:else}
+            none
+          {/if}
+        </dd>
       </div>
     </dl>
     <pre class="objective-body">{data.objective.body}</pre>

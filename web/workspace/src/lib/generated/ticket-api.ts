@@ -5,6 +5,7 @@ export type InvalidProjectRecord = { label: string; reason: string };
 
 export type TicketSummary = {
   id: string;
+  human_key: string;
   title: string;
   state: string;
   priority: string;
@@ -51,7 +52,12 @@ export type TicketEventDetail = {
   references: Array<string>;
 };
 
-export type ObjectiveLinkSummary = { id: string; title: string; state: string };
+export type ObjectiveLinkSummary = {
+  id: string;
+  human_key: string;
+  title: string;
+  state: string;
+};
 
 export type TicketEvidenceEvent = {
   event_ref: string;
@@ -66,6 +72,7 @@ export type TicketAssignmentSummary = {
   assignment_id: string;
   runtime_id: string;
   worker_id: string;
+  worker_human_key?: string | null;
 };
 
 export type TicketMergeRequestSummary = {
@@ -115,6 +122,7 @@ export type TicketQueryRequest = {
 
 export type TicketQueryItem = {
   id: string;
+  human_key: string;
   title: string;
   state: string;
   readiness: string | null;
@@ -150,6 +158,7 @@ export type TicketRelation = {
   ticket_id: string;
   kind: string;
   target: string;
+  target_human_key?: string | null;
   note: string | null;
   author: string;
   at: string;
@@ -157,6 +166,7 @@ export type TicketRelation = {
 
 export type DerivedTicketRelation = {
   source_ticket: string;
+  source_human_key?: string | null;
   inverse_kind: string;
   forward_kind: string;
   note: string | null;
@@ -166,6 +176,7 @@ export type DerivedTicketRelation = {
 
 export type TicketRelationBlocker = {
   blocking_ticket: string;
+  blocking_human_key?: string | null;
   reason_kind: string;
   relation_kind: string;
   note: string | null;
@@ -187,6 +198,7 @@ export type TicketRelationView = {
 
 export type TicketDetail = {
   id: string;
+  human_key: string;
   title: string;
   state: string;
   readiness: string | null;

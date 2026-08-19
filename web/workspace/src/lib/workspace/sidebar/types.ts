@@ -76,6 +76,7 @@ export type WorkerCapabilities = {
 export type Worker = {
   runtime_id: string;
   worker_id: string;
+  human_key?: string;
   host_id: string;
   display_name: string;
   label: string;
@@ -403,6 +404,7 @@ export type {
 
 export type ObjectiveSummary = {
   id: string;
+  human_key: string;
   title: string;
   state: string;
   updated_at?: string | null;
@@ -411,13 +413,22 @@ export type ObjectiveSummary = {
   record_source?: string;
 };
 
+export type ObjectiveLinkedTicketSummary = {
+  id: string;
+  human_key: string;
+  title: string;
+  state: string;
+};
+
 export type ObjectiveDetail = {
   id: string;
+  human_key: string;
   title: string;
   state: string;
   created_at?: string | null;
   updated_at?: string | null;
   linked_tickets: string[];
+  linked_ticket_summaries: ObjectiveLinkedTicketSummary[];
   body: string;
   body_truncated: boolean;
   record_source: string;

@@ -7,6 +7,7 @@
     TicketListResponse,
     TicketSummary,
   } from "$lib/generated/ticket-api";
+  import { ticketHref } from "$lib/workspace/resource-links";
   import {
     ticketLanes,
     type WorkspaceOrchestratorStatus,
@@ -176,9 +177,9 @@
           {#each lane.tickets as ticket (ticket.id)}
             <a
               class="ticket-card"
-              href={`/w/${encodeURIComponent(data.workspaceId)}/tickets/${encodeURIComponent(ticket.id)}`}
+              href={ticketHref(data.workspaceId, ticket)}
             >
-              <span class="ticket-card-id">{ticket.id}</span>
+              <span class="ticket-card-id">{ticket.human_key}</span>
               <strong>{ticket.title}</strong>
               <div class="ticket-card-meta">
                 <span>{ticket.state} · {ticket.priority}</span>
