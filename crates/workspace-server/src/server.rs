@@ -4075,11 +4075,22 @@ fn require_completed_target_observation(
     Err(Error::InvalidInput("target selector moved outside completion evidence".into()).into())
 }
 
+fn resolve_workspace_ticket_reference(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    reference: &str,
+) -> ApiResult<String> {
+    api.store
+        .resolve_resource_reference(workspace_id, WorkspaceResourceKind::Ticket, reference)?
+        .ok_or_else(|| Error::Ticket(ticket::TicketError::NotFound(reference.to_string())).into())
+}
+
 async fn scoped_show_merge_request(
     State(api): State<WorkspaceApi>,
     AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
+    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     let store = merge_request_store(&api, &workspace_id)?;
     let mut mr = store.get(&workspace_id, &ticket_id)?;
     mr.thread = store.thread_page(&workspace_id, &ticket_id, None, 100)?;
@@ -4114,6 +4125,7 @@ async fn scoped_merge_request_readiness(
     AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
 ) -> ApiResult<Json<merge_request::ReadinessReport>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
+    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     let store = merge_request_store(&api, &workspace_id)?;
     let mr = store.get(&workspace_id, &ticket_id)?;
     let current_subject_ref = mr.selector_from.as_deref().and_then(|selector| {
@@ -4142,6 +4154,7 @@ async fn scoped_open_merge_request(
     Json(input): Json<OpenMergeRequestRequest>,
 ) -> ApiResult<Json<merge_request::MergeRequest>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
+    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     require_workspace_access(&workspace_id, &api)?;
     let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
     let assignment = api
@@ -4204,6 +4217,7 @@ async fn scoped_merge_request_thread(
     Query(query): Query<MergeRequestThreadQuery>,
 ) -> ApiResult<Json<Vec<merge_request::MergeRequestThreadEvent>>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
+    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     Ok(Json(
         merge_request_store(&api, &workspace_id)?.thread_page(
             &workspace_id,
@@ -4221,6 +4235,7 @@ async fn scoped_repair_merge_request_selector(
     Json(input): Json<RepairMergeRequestSelectorRequest>,
 ) -> ApiResult<Json<merge_request::MergeRequest>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
+    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     require_workspace_access(&workspace_id, &api)?;
     reject_non_browser_reopen_auth(&headers)?;
     let _actor = require_actor(&api, &headers).await?;
@@ -4279,6 +4294,7 @@ async fn scoped_register_merge_request_review_capability(
     Json(input): Json<RegisterMergeRequestReviewCapabilityRequest>,
 ) -> ApiResult<StatusCode> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
+    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     require_workspace_access(&workspace_id, &api)?;
     let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
     let assignment = api
@@ -4329,6 +4345,7 @@ async fn scoped_submit_merge_request_review(
     Json(input): Json<SubmitMergeRequestReviewRequest>,
 ) -> ApiResult<Json<merge_request::ReviewEvent>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
+    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     let store = merge_request_store(&api, &workspace_id)?;
     let mr = store.get(&workspace_id, &ticket_id)?;
     let selector = mr
@@ -4360,6 +4377,7 @@ async fn scoped_revoke_merge_request_review(
     Json(input): Json<RevokeMergeRequestReviewRequest>,
 ) -> ApiResult<Json<merge_request::ReviewRevokedEvent>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
+    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     require_workspace_access(&workspace_id, &api)?;
     if !input.explicit_confirmation {
         return Err(Error::BrowserReopenConfirmationRequired.into());
@@ -4405,6 +4423,7 @@ async fn scoped_complete_merge_request(
     Json(input): Json<CompleteMergeRequestRequest>,
 ) -> ApiResult<Json<merge_request::MergeEvent>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
+    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     require_workspace_access(&workspace_id, &api)?;
     let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
     require_online_workspace_orchestrator_source(&api, &source)?;
@@ -15386,7 +15405,12 @@ mod tests {
             .unwrap()
             .create(ticket::NewTicket::new("Browser Ticket API"))
             .unwrap();
+        let ticket_human_key = ticket_ref.human_key.clone().unwrap();
         let ticket_id = ticket_ref.id;
+        assert_eq!(
+            resolve_workspace_ticket_reference(&api, TEST_WORKSPACE_ID, &ticket_human_key).unwrap(),
+            ticket_id
+        );
         let path = || ScopedRecordPath {
             workspace_id: TEST_WORKSPACE_ID.to_string(),
             id: ticket_id.clone(),
