@@ -698,11 +698,20 @@ impl SqliteWorkspaceAuthority {
         })
     }
 
-    fn read_ticket_detail(&self, id: &str, request: TicketShowRequest) -> Result<TicketDetail> {
-        validate_project_id(id)?;
-        let ticket = self
-            .ticket_backend
-            .show(TicketIdOrSlug::Id(id.to_string()))?;
+    fn read_ticket_detail(
+        &self,
+        reference: &str,
+        request: TicketShowRequest,
+    ) -> Result<TicketDetail> {
+        let id = self
+            .store
+            .resolve_resource_reference(
+                &self.workspace_id,
+                WorkspaceResourceKind::Ticket,
+                reference,
+            )?
+            .ok_or_else(|| Error::Ticket(ticket::TicketError::NotFound(reference.to_string())))?;
+        let ticket = self.ticket_backend.show(TicketIdOrSlug::Id(id))?;
         self.ticket_detail_from_ticket(ticket, request)
     }
 
@@ -1147,15 +1156,21 @@ impl ObjectiveAuthority for SqliteWorkspaceAuthority {
         })
     }
 
-    fn objective(&self, id: &str) -> Result<ObjectiveDetail> {
-        validate_project_id(id)?;
-        let record = self.objective_record(id)?;
+    fn objective(&self, reference: &str) -> Result<ObjectiveDetail> {
+        let record = self.objective_record(reference)?;
         self.objective_detail_from_record(record)
     }
 
-    fn show_objective(&self, id: &str, query: ObjectiveShowRequest) -> Result<ObjectiveDetail> {
-        let mut detail = self.objective(id)?;
-        let all_events = self.store.list_objective_events(&self.workspace_id, id)?;
+    fn show_objective(
+        &self,
+        reference: &str,
+        query: ObjectiveShowRequest,
+    ) -> Result<ObjectiveDetail> {
+        let mut detail = self.objective(reference)?;
+        let objective_id = detail.id.clone();
+        let all_events = self
+            .store
+            .list_objective_events(&self.workspace_id, &objective_id)?;
         let event_limit = query
             .event_limit
             .unwrap_or(TICKET_EVENT_LIMIT)
@@ -1240,9 +1255,12 @@ impl ObjectiveAuthority for SqliteWorkspaceAuthority {
         self.objective(&objective_id)
     }
 
-    fn edit_objective(&self, id: &str, input: ObjectiveEditInput) -> Result<ObjectiveDetail> {
-        validate_project_id(id)?;
-        let mut record = self.objective_record(id)?;
+    fn edit_objective(
+        &self,
+        reference: &str,
+        input: ObjectiveEditInput,
+    ) -> Result<ObjectiveDetail> {
+        let mut record = self.objective_record(reference)?;
         let mut changed = false;
         if let Some(title) = input.title {
             validate_objective_title(&title)?;
@@ -1288,60 +1306,85 @@ impl ObjectiveAuthority for SqliteWorkspaceAuthority {
             ));
         }
         record.updated_at = now_rfc3339();
+        let objective_id = record.objective_id.clone();
         self.store.upsert_objective(&record)?;
-        self.insert_objective_event(id, "edit", None)?;
-        self.objective(id)
+        self.insert_objective_event(&objective_id, "edit", None)?;
+        self.objective(&objective_id)
     }
 
-    fn set_objective_state(&self, id: &str, state: &str) -> Result<ObjectiveDetail> {
-        validate_project_id(id)?;
+    fn set_objective_state(&self, reference: &str, state: &str) -> Result<ObjectiveDetail> {
         validate_objective_state(state)?;
-        let mut record = self.objective_record(id)?;
+        let mut record = self.objective_record(reference)?;
         record.state = state.trim().to_string();
         record.updated_at = now_rfc3339();
+        let objective_id = record.objective_id.clone();
         self.store.upsert_objective(&record)?;
-        self.insert_objective_event(id, "state", Some(&record.state))?;
-        self.objective(id)
+        self.insert_objective_event(&objective_id, "state", Some(&record.state))?;
+        self.objective(&objective_id)
     }
 
-    fn link_objective_ticket(&self, id: &str, ticket_id: &str) -> Result<ObjectiveDetail> {
-        validate_project_id(id)?;
-        validate_project_id(ticket_id)?;
-        let _record = self.objective_record(id)?;
+    fn link_objective_ticket(
+        &self,
+        objective_reference: &str,
+        ticket_reference: &str,
+    ) -> Result<ObjectiveDetail> {
+        let objective_id = self.objective_record(objective_reference)?.objective_id;
+        let ticket_id = self
+            .store
+            .resolve_resource_reference(
+                &self.workspace_id,
+                WorkspaceResourceKind::Ticket,
+                ticket_reference,
+            )?
+            .ok_or_else(|| {
+                Error::Ticket(ticket::TicketError::NotFound(ticket_reference.to_string()))
+            })?;
         let now = now_rfc3339();
         let mut links = self
             .store
-            .list_objective_ticket_links(&self.workspace_id, id)?;
+            .list_objective_ticket_links(&self.workspace_id, &objective_id)?;
         if !links.iter().any(|link| link.ticket_id == ticket_id) {
             links.push(ObjectiveTicketLinkRecord {
                 workspace_id: self.workspace_id.clone(),
-                objective_id: id.to_string(),
-                ticket_id: ticket_id.to_string(),
+                objective_id: objective_id.clone(),
+                ticket_id: ticket_id.clone(),
                 kind: "linked".to_string(),
                 created_at: now,
             });
             self.store
-                .replace_objective_ticket_links(&self.workspace_id, id, &links)?;
-            self.insert_objective_event(id, "link_ticket", Some(ticket_id))?;
+                .replace_objective_ticket_links(&self.workspace_id, &objective_id, &links)?;
+            self.insert_objective_event(&objective_id, "link_ticket", Some(&ticket_id))?;
         }
-        self.objective(id)
+        self.objective(&objective_id)
     }
 
-    fn unlink_objective_ticket(&self, id: &str, ticket_id: &str) -> Result<ObjectiveDetail> {
-        validate_project_id(id)?;
-        validate_project_id(ticket_id)?;
-        let _record = self.objective_record(id)?;
+    fn unlink_objective_ticket(
+        &self,
+        objective_reference: &str,
+        ticket_reference: &str,
+    ) -> Result<ObjectiveDetail> {
+        let objective_id = self.objective_record(objective_reference)?.objective_id;
+        let ticket_id = self
+            .store
+            .resolve_resource_reference(
+                &self.workspace_id,
+                WorkspaceResourceKind::Ticket,
+                ticket_reference,
+            )?
+            .ok_or_else(|| {
+                Error::Ticket(ticket::TicketError::NotFound(ticket_reference.to_string()))
+            })?;
         let mut links = self
             .store
-            .list_objective_ticket_links(&self.workspace_id, id)?;
+            .list_objective_ticket_links(&self.workspace_id, &objective_id)?;
         let original_len = links.len();
         links.retain(|link| link.ticket_id != ticket_id);
         if links.len() != original_len {
             self.store
-                .replace_objective_ticket_links(&self.workspace_id, id, &links)?;
-            self.insert_objective_event(id, "unlink_ticket", Some(ticket_id))?;
+                .replace_objective_ticket_links(&self.workspace_id, &objective_id, &links)?;
+            self.insert_objective_event(&objective_id, "unlink_ticket", Some(&ticket_id))?;
         }
-        self.objective(id)
+        self.objective(&objective_id)
     }
 }
 
@@ -2907,6 +2950,8 @@ mod tests {
         assert_eq!(tickets.items[0].id, "00000000001J2");
         assert_eq!(tickets.items[0].state, "ready");
         assert_eq!(tickets.items[0].workspace_action_priority, "background");
+        let ticket_by_key = authority.ticket(&tickets.items[0].human_key).unwrap();
+        assert_eq!(ticket_by_key.id, tickets.items[0].id);
 
         let ticket = authority.ticket("00000000001J2").unwrap();
         assert!(ticket.body.contains("Ticket body"));
@@ -3078,6 +3123,18 @@ mod tests {
         assert_eq!(objectives.items.len(), 1);
         assert_eq!(objectives.items[0].id, "00000000001J3");
         assert_eq!(objectives.items[0].linked_tickets, vec!["00000000001J2"]);
+        let objective_by_key = authority.objective(&objectives.items[0].human_key).unwrap();
+        assert_eq!(objective_by_key.id, objectives.items[0].id);
+        assert_eq!(
+            authority
+                .show_objective(
+                    &objectives.items[0].human_key,
+                    ObjectiveShowRequest::default(),
+                )
+                .unwrap()
+                .id,
+            objectives.items[0].id
+        );
 
         let objective = authority.objective("00000000001J3").unwrap();
         assert!(objective.body.contains("Objective body"));
