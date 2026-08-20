@@ -32,9 +32,11 @@ use ticket::{
     execute_ticket_backend_operation,
 };
 use tokio::net::TcpListener;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tower::ServiceExt;
 use url::Url;
 use uuid::Uuid;
 use webauthn_rs::prelude::{
@@ -111,6 +113,7 @@ use crate::store::{
     TicketWorkerAssignmentRecord, UserRecord, WorkdirRegistryRecord, WorkerControlGrantRecord,
     WorkerRegistryRecord, WorkerWorkdirLinkRecord, WorkspaceRecord, WorkspaceResourceKind,
 };
+use crate::workspace_catalog::{WorkspaceCatalogService, WorkspaceCreateRequest};
 use crate::{Error, Result};
 use worker_runtime::catalog::{
     ConfigBundleRef, ProfileSelector, RepositorySelector as RuntimeRepositorySelector,
@@ -158,6 +161,9 @@ pub struct ServerConfig {
     pub remote_runtime_sources: Vec<RemoteRuntimeConfig>,
     pub runtime_config_path: Option<PathBuf>,
     pub backend_base_url: Option<String>,
+    /// Allows the first ownerless Workspace to be created without a session.
+    /// This must only be enabled for a loopback-bound local Server.
+    pub allow_local_workspace_bootstrap: bool,
 }
 
 impl ServerConfig {
@@ -187,6 +193,7 @@ impl ServerConfig {
             remote_runtime_sources: Vec::new(),
             runtime_config_path: BackendRuntimesConfigFile::default_path(),
             backend_base_url: None,
+            allow_local_workspace_bootstrap: false,
         }
     }
 
@@ -243,9 +250,68 @@ impl ServerConfig {
         Self::default_workspace_backend_data_root(workspace_id).join("embedded-runtime")
     }
 
+    pub fn with_local_workspace_bootstrap(mut self, enabled: bool) -> Self {
+        self.allow_local_workspace_bootstrap = enabled;
+        self
+    }
+
     pub fn with_embedded_runtime_store_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.embedded_runtime_store_root = root.into();
         self
+    }
+
+    fn for_catalog_workspace(
+        &self,
+        workspace: &WorkspaceRecord,
+        repositories: Vec<RepositoryRecord>,
+    ) -> Result<Self> {
+        let primary = repositories
+            .iter()
+            .find(|repository| repository.repository_id == "main")
+            .or_else(|| repositories.first())
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "Workspace {} has no registered repository",
+                    workspace.workspace_id
+                ))
+            })?;
+        let workspace_root = PathBuf::from(&primary.uri);
+        if !workspace_root.is_absolute() {
+            return Err(Error::Config(format!(
+                "Workspace {} repository uri is not an absolute local path",
+                workspace.workspace_id
+            )));
+        }
+        let repositories = repositories
+            .into_iter()
+            .map(|repository| ConfiguredRepository {
+                id: repository.repository_id,
+                provider: repository.provider.unwrap_or(repository.kind),
+                path: PathBuf::from(&repository.uri),
+                uri: repository.uri,
+                display_name: Some(repository.name),
+                default_selector: repository.default_ref,
+            })
+            .collect();
+        let mut scoped = self.clone();
+        scoped.workspace_id.clone_from(&workspace.workspace_id);
+        scoped
+            .workspace_display_name
+            .clone_from(&workspace.display_name);
+        scoped
+            .workspace_created_at
+            .clone_from(&workspace.created_at);
+        scoped.workspace_root = workspace_root;
+        scoped.embedded_runtime_store_root =
+            Self::default_embedded_runtime_store_root(&workspace.workspace_id);
+        scoped.repositories = repositories;
+        // Runtime trust is server-global. Only explicitly assigned sources enter
+        // this Workspace's registry and receive Workspace-scoped capabilities.
+        scoped.remote_runtime_sources.retain(|runtime| {
+            runtime.workspace_id.as_deref() == Some(workspace.workspace_id.as_str())
+        });
+        scoped.runtime_event_sources.clear();
+        Ok(scoped)
     }
 }
 
@@ -680,6 +746,216 @@ impl crate::worker_source::VerifiedWorkerRemoveExecutor for WorkspaceWorkerRemov
         .join()
         .map_err(|_| "embedded WorkerRemove executor thread panicked".to_string())?
     }
+}
+
+#[derive(Clone)]
+pub struct WorkspaceServerApi {
+    template: Arc<ServerConfig>,
+    store: Arc<dyn ControlPlaneStore>,
+    catalog: WorkspaceCatalogService,
+    routers: Arc<AsyncMutex<HashMap<String, Router>>>,
+}
+
+impl WorkspaceServerApi {
+    pub fn new(template: ServerConfig, store: Arc<dyn ControlPlaneStore>) -> Self {
+        Self {
+            template: Arc::new(template),
+            catalog: WorkspaceCatalogService::new(store.clone()),
+            store,
+            routers: Arc::new(AsyncMutex::new(HashMap::new())),
+        }
+    }
+
+    async fn router_for_workspace(&self, workspace_id: &str) -> Result<Option<Router>> {
+        let mut routers = self.routers.lock().await;
+        if let Some(router) = routers.get(workspace_id) {
+            return Ok(Some(router.clone()));
+        }
+        let Some(workspace) = self.store.get_workspace(workspace_id).await? else {
+            return Ok(None);
+        };
+        let repositories = self.store.list_repositories(workspace_id)?;
+        let config = self
+            .template
+            .for_catalog_workspace(&workspace, repositories)?;
+        let api = WorkspaceApi::new(config, self.store.clone()).await?;
+        tokio::spawn(run_orchestrator_turn_end_hook(api.clone()));
+        let router = build_router(api);
+        routers.insert(workspace_id.to_string(), router.clone());
+        Ok(Some(router))
+    }
+
+    async fn preload(&self) -> Result<()> {
+        for workspace in self.store.list_workspaces()? {
+            let _ = self
+                .router_for_workspace(&workspace.workspace_id)
+                .await?
+                .ok_or_else(|| {
+                    Error::Config(format!(
+                        "Workspace {} disappeared while loading",
+                        workspace.workspace_id
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+}
+
+fn server_error_response(error: Error) -> Response {
+    ApiError::from(error).into_response()
+}
+
+fn forbidden_server_response(message: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({ "error": message })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceListQuery {
+    limit: Option<usize>,
+}
+
+async fn list_server_workspaces(
+    State(api): State<WorkspaceServerApi>,
+    headers: HeaderMap,
+    Query(query): Query<WorkspaceListQuery>,
+) -> Response {
+    let owner = match resolve_server_actor(&api, &headers).await {
+        Ok(Some(actor)) => Some(actor.account_id),
+        Ok(None) => None,
+        Err(error) => return server_error_response(error),
+    };
+    match api
+        .catalog
+        .list(owner.as_deref(), query.limit.unwrap_or(100))
+    {
+        Ok(workspaces) => Json(workspaces).into_response(),
+        Err(error) => server_error_response(error),
+    }
+}
+
+async fn create_server_workspace(
+    State(api): State<WorkspaceServerApi>,
+    headers: HeaderMap,
+    Json(request): Json<WorkspaceCreateRequest>,
+) -> Response {
+    let owner_account_id = match resolve_server_actor(&api, &headers).await {
+        Ok(Some(actor)) => Some(actor.account_id),
+        Ok(None) if api.template.allow_local_workspace_bootstrap => {
+            match api.store.list_workspaces() {
+                Ok(workspaces) if workspaces.is_empty() => None,
+                Ok(_) => {
+                    return forbidden_server_response(
+                        "Workspace creation requires an authenticated owner",
+                    );
+                }
+                Err(error) => return server_error_response(error),
+            }
+        }
+        Ok(None) => {
+            return forbidden_server_response("Workspace creation requires an authenticated owner");
+        }
+        Err(error) => return server_error_response(error),
+    };
+    let created = match api.catalog.create(request, owner_account_id) {
+        Ok(created) => created,
+        Err(error) => return server_error_response(error),
+    };
+    if let Err(error) = api
+        .router_for_workspace(&created.workspace.workspace_id)
+        .await
+    {
+        return server_error_response(error);
+    }
+    let status = if created.replayed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    (status, Json(created)).into_response()
+}
+
+async fn resolve_server_actor(
+    api: &WorkspaceServerApi,
+    headers: &HeaderMap,
+) -> std::result::Result<Option<RequestActor>, Error> {
+    let cookie_name = auth_public_config(api.template.as_ref()).cookie_name;
+    resolve_request_actor(api.store.as_ref(), headers, &cookie_name).await
+}
+
+async fn dispatch_workspace_request(
+    State(api): State<WorkspaceServerApi>,
+    request: Request,
+) -> Response {
+    let path = request.uri().path();
+    let workspace_id = scoped_workspace_id(path);
+    let router = if let Some(workspace_id) = workspace_id {
+        match api.router_for_workspace(workspace_id).await {
+            Ok(Some(router)) => Some(router),
+            Ok(None) => None,
+            Err(error) => return server_error_response(error),
+        }
+    } else {
+        let workspaces = match api.store.list_workspaces() {
+            Ok(workspaces) => workspaces,
+            Err(error) => return server_error_response(error),
+        };
+        if workspaces.len() == 1 || is_server_global_forward(path) {
+            match workspaces.first() {
+                Some(workspace) => match api.router_for_workspace(&workspace.workspace_id).await {
+                    Ok(router) => router,
+                    Err(error) => return server_error_response(error),
+                },
+                None => None,
+            }
+        } else {
+            None
+        }
+    };
+    let Some(router) = router else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match router.oneshot(request).await {
+        Ok(response) => response,
+        Err(error) => match error {},
+    }
+}
+
+fn is_server_global_forward(path: &str) -> bool {
+    path == "/api/auth"
+        || path.starts_with("/api/auth/")
+        || path == "/health"
+        || path == "/"
+        || path.starts_with("/assets/")
+}
+
+fn scoped_workspace_id(path: &str) -> Option<&str> {
+    let mut segments = path.trim_start_matches('/').split('/');
+    match (segments.next(), segments.next(), segments.next()) {
+        (Some("api"), Some("w"), Some(workspace_id)) if !workspace_id.is_empty() => {
+            Some(workspace_id)
+        }
+        (Some("w"), Some(workspace_id), _) if !workspace_id.is_empty() => Some(workspace_id),
+        _ => None,
+    }
+}
+
+pub async fn build_workspace_server_router(
+    template: ServerConfig,
+    store: Arc<dyn ControlPlaneStore>,
+) -> Result<Router> {
+    let api = WorkspaceServerApi::new(template, store);
+    api.preload().await?;
+    Ok(Router::new()
+        .route(
+            "/api/workspaces",
+            get(list_server_workspaces).post(create_server_workspace),
+        )
+        .fallback(dispatch_workspace_request)
+        .with_state(api))
 }
 
 impl WorkspaceApi {
@@ -1870,6 +2146,16 @@ struct ApiFailureLogEvent<'a> {
     message: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostics: Option<&'a [RuntimeDiagnostic]>,
+}
+
+pub async fn serve_workspace_catalog(
+    template: ServerConfig,
+    store: Arc<dyn ControlPlaneStore>,
+    listener: TcpListener,
+) -> Result<()> {
+    let router = build_workspace_server_router(template, store).await?;
+    axum::serve(listener, router).await?;
+    Ok(())
 }
 
 pub async fn serve(
@@ -14130,6 +14416,139 @@ mod tests {
         config
     }
 
+    #[tokio::test]
+    async fn server_router_dispatches_two_workspace_contexts_without_state_leakage() {
+        let dir = tempfile::tempdir().unwrap();
+        let repository_a = dir.path().join("repository-a");
+        let repository_b = dir.path().join("repository-b");
+        std::fs::create_dir_all(repository_a.join(".git")).unwrap();
+        std::fs::create_dir_all(repository_b.join(".git")).unwrap();
+        let template = test_server_config(dir.path());
+        let store = Arc::new(SqliteWorkspaceStore::open(&template.database_path).unwrap());
+        let catalog = WorkspaceCatalogService::new(store.clone());
+        let workspace_a = catalog
+            .create(
+                WorkspaceCreateRequest {
+                    operation_key: "create-a".to_string(),
+                    display_name: "Workspace A".to_string(),
+                    repository: crate::workspace_catalog::InitialRepositoryIntent {
+                        uri: repository_a.display().to_string(),
+                        display_name: None,
+                        default_ref: None,
+                    },
+                },
+                None,
+            )
+            .unwrap();
+        let workspace_b = catalog
+            .create(
+                WorkspaceCreateRequest {
+                    operation_key: "create-b".to_string(),
+                    display_name: "Workspace B".to_string(),
+                    repository: crate::workspace_catalog::InitialRepositoryIntent {
+                        uri: repository_b.display().to_string(),
+                        display_name: None,
+                        default_ref: None,
+                    },
+                },
+                None,
+            )
+            .unwrap();
+        let app = build_workspace_server_router(template, store)
+            .await
+            .unwrap();
+
+        let uri_a = format!("/api/w/{}/workspace", workspace_a.workspace.workspace_id);
+        let uri_b = format!("/api/w/{}/workspace", workspace_b.workspace.workspace_id);
+        let (a, b) = tokio::join!(get_json(app.clone(), &uri_a), get_json(app.clone(), &uri_b));
+        assert_eq!(a["workspace_id"], workspace_a.workspace.workspace_id);
+        assert_eq!(a["display_name"], "Workspace A");
+        assert_eq!(b["workspace_id"], workspace_b.workspace.workspace_id);
+        assert_eq!(b["display_name"], "Workspace B");
+
+        let missing = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/w/00000000-0000-0000-0000-000000000001/workspace")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn local_bootstrap_create_activates_workspace_without_server_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let repository = dir.path().join("repository");
+        std::fs::create_dir_all(repository.join(".git")).unwrap();
+        let template = test_server_config(dir.path()).with_local_workspace_bootstrap(true);
+        let store = Arc::new(SqliteWorkspaceStore::open(&template.database_path).unwrap());
+        let app = build_workspace_server_router(template, store)
+            .await
+            .unwrap();
+        let payload = json!({
+            "operation_key": "bootstrap-1",
+            "display_name": "Created Workspace",
+            "repository": {
+                "uri": repository,
+                "display_name": "Repository",
+                "default_ref": "HEAD"
+            }
+        });
+
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/workspaces")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let body = to_bytes(created.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let workspace_id = body["workspace"]["workspace_id"].as_str().unwrap();
+
+        let workspace = get_json(app.clone(), &format!("/api/w/{workspace_id}/workspace")).await;
+        assert_eq!(workspace["display_name"], "Created Workspace");
+
+        let replayed = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/workspaces")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Local bootstrap authority is consumed after the first Workspace; even
+        // an exact HTTP retry must authenticate rather than creating another
+        // ownerless Workspace accidentally.
+        assert_eq!(replayed.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn scoped_workspace_path_requires_an_explicit_workspace_segment() {
+        assert_eq!(
+            scoped_workspace_id("/api/w/workspace-a/tickets"),
+            Some("workspace-a")
+        );
+        assert_eq!(
+            scoped_workspace_id("/w/workspace-b/workers"),
+            Some("workspace-b")
+        );
+        assert_eq!(scoped_workspace_id("/api/workspaces"), None);
+        assert_eq!(scoped_workspace_id("/api/workspace"), None);
+    }
+
     fn memory_staging_record_json(id: &str, claim: &str) -> String {
         json!({
             "schema_version": 1,
@@ -16022,6 +16441,7 @@ mod tests {
         let mut config = test_server_config(temp.path());
         config.remote_runtime_sources.push(RemoteRuntimeConfig {
             runtime_id: "runtime-remote".to_string(),
+            workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
             display_name: "Remote Runtime".to_string(),
             base_url: "https://runtime.invalid".to_string(),
             bearer_token: None,
@@ -16049,8 +16469,20 @@ mod tests {
             timeout: std::time::Duration::from_secs(1),
         });
         let store = SqliteWorkspaceStore::open(config.database_path.clone()).unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                owner_account_id: None,
+                display_name: "Test Workspace".to_string(),
+                state: "active".to_string(),
+                created_at: "2026-08-11T00:00:00Z".to_string(),
+                updated_at: "2026-08-11T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
         let trust = crate::store::TrustedRuntimeRecord {
             runtime_id: "runtime-remote".to_string(),
+            workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
             display_name: "Remote Runtime".to_string(),
             base_url: "https://runtime.invalid".to_string(),
             public_key: identity.public_key.clone(),

@@ -9,10 +9,11 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use worker_runtime::auth::{RuntimeIdentityMaterial, decode_public_key};
 use yoi_workspace_server::hosts::{RemoteRuntimeAuthConfig, RemoteRuntimeConfig};
-use yoi_workspace_server::store::{RepositoryRecord, SqliteWorkspaceStore, TrustedRuntimeRecord};
+use yoi_workspace_server::store::{SqliteWorkspaceStore, TrustedRuntimeRecord};
 use yoi_workspace_server::{
-    BackendRuntimesConfigFile, ControlPlaneStore, ServerConfig, WORKSPACE_BACKEND_CONFIG_TEMPLATE,
-    WorkspaceBackendConfigFile, WorkspaceIdentity, WorkspaceRecord, serve,
+    BackendRuntimesConfigFile, ControlPlaneStore, InitialRepositoryIntent, ServerConfig,
+    WORKSPACE_BACKEND_CONFIG_TEMPLATE, WorkspaceBackendConfigFile, WorkspaceCatalogService,
+    WorkspaceCreateRequest, WorkspaceIdentity, WorkspaceRecord, serve_workspace_catalog,
 };
 
 #[derive(Debug)]
@@ -152,30 +153,21 @@ async fn run_init_with_database_path(
     if let Some(parent) = database_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let store = SqliteWorkspaceStore::open(&database_path)?;
-    store
-        .upsert_workspace(&WorkspaceRecord {
-            workspace_id: identity.workspace_id.clone(),
-            owner_account_id: None,
+    let store = Arc::new(SqliteWorkspaceStore::open(&database_path)?);
+    let service = WorkspaceCatalogService::new(store);
+    service.create_with_workspace_id(
+        WorkspaceCreateRequest {
+            operation_key: format!("cli-init:{}", identity.workspace_id),
             display_name: identity.display_name.clone(),
-            state: "active".to_string(),
-            created_at: identity.created_at.clone(),
-            updated_at: identity.created_at.clone(),
-        })
-        .await?;
-    store.upsert_repository(&RepositoryRecord {
-        workspace_id: identity.workspace_id.clone(),
-        repository_id: "main".to_string(),
-        name: "Main repository".to_string(),
-        kind: "git".to_string(),
-        provider: Some("git".to_string()),
-        uri: options.workspace.display().to_string(),
-        default_ref: Some("HEAD".to_string()),
-        auth_ref_kind: None,
-        auth_ref_key: None,
-        created_at: identity.created_at.clone(),
-        updated_at: identity.created_at.clone(),
-    })?;
+            repository: InitialRepositoryIntent {
+                uri: options.workspace.display().to_string(),
+                display_name: Some("Main repository".to_string()),
+                default_ref: Some("HEAD".to_string()),
+            },
+        },
+        None,
+        Some(identity.workspace_id.clone()),
+    )?;
 
     eprintln!(
         "yoi-server: initialized workspace `{}` ({}) in server DB `{}`",
@@ -358,6 +350,7 @@ fn run_trust_runtime_command(args: Vec<String>) -> Result<(), Box<dyn std::error
     match subcommand.as_str() {
         "add" => {
             let mut runtime_id = None;
+            let mut workspace_id = None;
             let mut base_url = None;
             let mut public_key = None;
             let mut display_name = None;
@@ -367,6 +360,9 @@ fn run_trust_runtime_command(args: Vec<String>) -> Result<(), Box<dyn std::error
                 match flag.as_str() {
                     "--runtime-id" => {
                         runtime_id = Some(take_value(&flag, inline_value, &mut args)?)
+                    }
+                    "--workspace-id" => {
+                        workspace_id = Some(take_value(&flag, inline_value, &mut args)?)
                     }
                     "--base-url" | "--endpoint" => {
                         base_url = Some(take_value(&flag, inline_value, &mut args)?)
@@ -390,15 +386,39 @@ fn run_trust_runtime_command(args: Vec<String>) -> Result<(), Box<dyn std::error
             }
             let runtime_id = runtime_id
                 .ok_or_else(|| CliError("trust-runtime add requires --runtime-id".to_string()))?;
+            let workspace_id = workspace_id
+                .ok_or_else(|| CliError("trust-runtime add requires --workspace-id".to_string()))?;
+            if !store
+                .list_workspaces()?
+                .iter()
+                .any(|workspace| workspace.workspace_id == workspace_id)
+            {
+                return Err(Box::new(CliError(format!(
+                    "Workspace `{workspace_id}` is not registered"
+                ))));
+            }
             let base_url = base_url
                 .ok_or_else(|| CliError("trust-runtime add requires --base-url".to_string()))?;
             let public_key = public_key
                 .ok_or_else(|| CliError("trust-runtime add requires --public-key".to_string()))?;
             decode_public_key(&public_key)?;
             ensure_trusted_runtime_replace_allowed(&store, &runtime_id, replace)?;
+            if let Some(existing) = store
+                .list_trusted_runtimes(true)?
+                .into_iter()
+                .find(|runtime| runtime.runtime_id == runtime_id)
+            {
+                if existing.workspace_id.as_deref() != Some(workspace_id.as_str()) {
+                    return Err(Box::new(CliError(format!(
+                        "runtime `{runtime_id}` is already assigned to Workspace `{}` and cannot be reparented",
+                        existing.workspace_id.as_deref().unwrap_or("unassigned")
+                    ))));
+                }
+            }
             let now = Utc::now().to_rfc3339();
             store.upsert_trusted_runtime(&TrustedRuntimeRecord {
                 runtime_id: runtime_id.clone(),
+                workspace_id: Some(workspace_id.clone()),
                 display_name: display_name.unwrap_or_else(|| runtime_id.clone()),
                 base_url,
                 public_key,
@@ -437,8 +457,9 @@ fn run_trust_runtime_command(args: Vec<String>) -> Result<(), Box<dyn std::error
             } else {
                 for runtime in records {
                     println!(
-                        "runtime_id={} base_url={} public_key={} revoked_at={}",
+                        "runtime_id={} workspace_id={} base_url={} public_key={} revoked_at={}",
                         runtime.runtime_id,
+                        runtime.workspace_id.unwrap_or_default(),
                         runtime.base_url,
                         runtime.public_key,
                         runtime.revoked_at.unwrap_or_default()
@@ -582,12 +603,28 @@ async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Erro
     }
 
     let store = Arc::new(SqliteWorkspaceStore::open(&database_path)?);
-    let workspace = select_serve_workspace(store.as_ref())?;
-    let workspace_root = infer_workspace_root_from_repositories(store.as_ref(), &workspace)?;
-    let identity = WorkspaceIdentity {
-        workspace_id: workspace.workspace_id.clone(),
-        created_at: workspace.created_at.clone(),
-        display_name: workspace.display_name.clone(),
+    let workspaces = store.list_workspaces()?;
+    let (identity, workspace_root) = if let Some(workspace) = workspaces.first() {
+        (
+            WorkspaceIdentity {
+                workspace_id: workspace.workspace_id.clone(),
+                created_at: workspace.created_at.clone(),
+                display_name: workspace.display_name.clone(),
+            },
+            infer_workspace_root_from_repositories(store.as_ref(), workspace)?,
+        )
+    } else {
+        (
+            WorkspaceIdentity {
+                workspace_id: "00000000-0000-0000-0000-000000000000".to_string(),
+                created_at: Utc::now().to_rfc3339(),
+                display_name: "Server bootstrap".to_string(),
+            },
+            database_path
+                .parent()
+                .ok_or_else(|| CliError("server database path has no parent".to_string()))?
+                .to_path_buf(),
+        )
     };
     let runtime_config = BackendRuntimesConfigFile::load_default()?;
     let mut resolved = WorkspaceBackendConfigFile::default().resolve_with_runtime_config(
@@ -601,6 +638,7 @@ async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Erro
     if let Some(listen) = options.listen {
         resolved = resolved.with_listen(listen);
     }
+    resolved.server.allow_local_workspace_bootstrap = resolved.listen.ip().is_loopback();
 
     let listener = TcpListener::bind(resolved.listen).await?;
     let local_addr = listener.local_addr()?;
@@ -608,12 +646,12 @@ async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Erro
         resolved = resolved.with_backend_base_url(format!("http://{local_addr}"));
     }
     eprintln!(
-        "yoi-server: serving workspace `{}` from server DB `{}` on http://{}",
-        workspace.workspace_id,
+        "yoi-server: serving {} workspace(s) from server DB `{}` on http://{}",
+        workspaces.len(),
         database_path.display(),
         local_addr
     );
-    serve(resolved.server, store, listener).await?;
+    serve_workspace_catalog(resolved.server, store, listener).await?;
     Ok(())
 }
 
@@ -630,6 +668,9 @@ fn append_trusted_runtime_sources(
         return Ok(());
     };
     for runtime in store.list_trusted_runtimes(false)? {
+        let Some(workspace_id) = runtime.workspace_id.clone() else {
+            continue;
+        };
         let auth = RemoteRuntimeAuthConfig {
             server_id: server_identity.identity.identity_id.clone(),
             server_private_key: server_identity.identity.private_key.clone(),
@@ -640,28 +681,12 @@ fn append_trusted_runtime_sources(
             runtime.base_url,
             None,
         )
+        .with_workspace_id(workspace_id)
         .with_auth(auth);
         remote_runtime_sources.retain(|existing| existing.runtime_id != runtime.runtime_id);
         remote_runtime_sources.push(remote);
     }
     Ok(())
-}
-
-fn select_serve_workspace(store: &SqliteWorkspaceStore) -> Result<WorkspaceRecord, CliError> {
-    let workspaces = store
-        .list_workspaces()
-        .map_err(|error| CliError(format!("failed to list workspaces from server DB: {error}")))?;
-    match workspaces.as_slice() {
-        [] => Err(CliError(
-            "server DB has no workspace records; run `yoi-server init --workspace <PATH>`"
-                .to_string(),
-        )),
-        [workspace] => Ok(workspace.clone()),
-        _ => Err(CliError(format!(
-            "server DB contains {} workspaces; serve workspace selection is not implemented yet",
-            workspaces.len()
-        ))),
-    }
 }
 
 fn infer_workspace_root_from_repositories(
@@ -914,7 +939,7 @@ fn parse_listen(value: &str) -> Result<SocketAddr, CliError> {
 
 fn print_help() {
     println!(
-        "yoi-server\n\nUsage:\n  yoi-server init [OPTIONS]\n  yoi-server config <COMMAND> [OPTIONS]\n  yoi-server identity init --server-id <SERVER_ID> [--replace]\n  yoi-server identity show [--json]\n  yoi-server trust-runtime add --runtime-id <RUNTIME_ID> --base-url <URL> --public-key <KEY> [--display-name <NAME>] [--replace]\n  yoi-server trust-runtime list [--json] [--include-revoked]\n  yoi-server trust-runtime revoke --runtime-id <RUNTIME_ID>\n  yoi-server skills <COMMAND> [OPTIONS]\n  yoi-server migrate --dry-run [--database <PATH>]
+        "yoi-server\n\nUsage:\n  yoi-server init [OPTIONS]\n  yoi-server config <COMMAND> [OPTIONS]\n  yoi-server identity init --server-id <SERVER_ID> [--replace]\n  yoi-server identity show [--json]\n  yoi-server trust-runtime add --runtime-id <RUNTIME_ID> --workspace-id <WORKSPACE_ID> --base-url <URL> --public-key <KEY> [--display-name <NAME>] [--replace]\n  yoi-server trust-runtime list [--json] [--include-revoked]\n  yoi-server trust-runtime revoke --runtime-id <RUNTIME_ID>\n  yoi-server skills <COMMAND> [OPTIONS]\n  yoi-server migrate --dry-run [--database <PATH>]
   yoi-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
     );
 }
@@ -1038,6 +1063,7 @@ mod tests {
         store
             .upsert_trusted_runtime(&TrustedRuntimeRecord {
                 runtime_id: "runtime-a".to_string(),
+                workspace_id: None,
                 display_name: "Runtime A".to_string(),
                 base_url: "http://127.0.0.1:18080".to_string(),
                 public_key,
@@ -1059,6 +1085,7 @@ mod tests {
     async fn init_creates_identity_local_config_and_server_records() {
         let temp = tempfile::tempdir().unwrap();
         let database_path = temp.path().join("data").join("server").join("server.db");
+        std::fs::create_dir(temp.path().join(".git")).unwrap();
         run_init_with_database_path(
             InitOptions {
                 workspace: temp.path().canonicalize().unwrap(),

@@ -220,6 +220,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "enforce Workspace resource foreign keys",
         apply: enforce_workspace_resource_foreign_keys,
     },
+    Migration {
+        version: 40,
+        name: "create atomic Workspace catalog operations",
+        apply: create_workspace_catalog_operations,
+    },
 ];
 
 struct Migration {
@@ -267,8 +272,25 @@ pub struct RepositoryRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceBootstrapRecord {
+    pub operation_key: String,
+    pub request_fingerprint: String,
+    pub workspace: WorkspaceRecord,
+    pub repository: RepositoryRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceBootstrapResult {
+    pub workspace: WorkspaceRecord,
+    pub repository: RepositoryRecord,
+    pub config_revision: u64,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TrustedRuntimeRecord {
     pub runtime_id: String,
+    pub workspace_id: Option<String>,
     pub display_name: String,
     pub base_url: String,
     pub public_key: String,
@@ -584,6 +606,10 @@ pub trait ControlPlaneStore: Send + Sync {
     ) -> Result<Option<String>>;
     async fn upsert_workspace(&self, record: &WorkspaceRecord) -> Result<()>;
     async fn get_workspace(&self, workspace_id: &str) -> Result<Option<WorkspaceRecord>>;
+    fn create_workspace_bootstrap(
+        &self,
+        record: &WorkspaceBootstrapRecord,
+    ) -> Result<WorkspaceBootstrapResult>;
     async fn get_trusted_runtime(&self, runtime_id: &str) -> Result<Option<TrustedRuntimeRecord>>;
     async fn consume_worker_mutation_source_jti(
         &self,
@@ -1217,8 +1243,8 @@ impl SqliteWorkspaceStore {
         self.with_conn(|conn| {
             conn.execute(
                 r#"INSERT INTO trusted_runtime_records (
-                    runtime_id, display_name, base_url, public_key, created_at, updated_at, revoked_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    runtime_id, workspace_id, display_name, base_url, public_key, created_at, updated_at, revoked_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                 ON CONFLICT(runtime_id) DO UPDATE SET
                     display_name = excluded.display_name,
                     base_url = excluded.base_url,
@@ -1227,6 +1253,7 @@ impl SqliteWorkspaceStore {
                     revoked_at = excluded.revoked_at"#,
                 params![
                     record.runtime_id,
+                    record.workspace_id,
                     record.display_name,
                     record.base_url,
                     record.public_key,
@@ -1245,10 +1272,10 @@ impl SqliteWorkspaceStore {
     ) -> Result<Vec<TrustedRuntimeRecord>> {
         self.with_conn(|conn| {
             let sql = if include_revoked {
-                r#"SELECT runtime_id, display_name, base_url, public_key, created_at, updated_at, revoked_at
+                r#"SELECT runtime_id, workspace_id, display_name, base_url, public_key, created_at, updated_at, revoked_at
                    FROM trusted_runtime_records ORDER BY runtime_id ASC"#
             } else {
-                r#"SELECT runtime_id, display_name, base_url, public_key, created_at, updated_at, revoked_at
+                r#"SELECT runtime_id, workspace_id, display_name, base_url, public_key, created_at, updated_at, revoked_at
                    FROM trusted_runtime_records WHERE revoked_at IS NULL ORDER BY runtime_id ASC"#
             };
             let mut stmt = conn.prepare(sql)?;
@@ -1371,10 +1398,167 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn create_workspace_bootstrap(
+        &self,
+        record: &WorkspaceBootstrapRecord,
+    ) -> Result<WorkspaceBootstrapResult> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some((fingerprint, workspace_id)) = tx
+                .query_row(
+                    "SELECT request_fingerprint, workspace_id FROM workspace_create_operations WHERE operation_key = ?1",
+                    params![record.operation_key],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+            {
+                if fingerprint != record.request_fingerprint {
+                    return Err(Error::WorkspaceConfigConflict(
+                        "Workspace create operation key was already used with different input"
+                            .to_string(),
+                    ));
+                }
+                let workspace = tx.query_row(
+                    r#"SELECT workspace_id, owner_account_id, display_name, state, created_at, updated_at
+                       FROM workspaces WHERE workspace_id = ?1"#,
+                    params![workspace_id],
+                    read_workspace_record,
+                )?;
+                let repository = tx.query_row(
+                    r#"SELECT workspace_id, repository_id, name, kind, provider, uri, default_ref,
+                              auth_ref_kind, auth_ref_key, created_at, updated_at
+                       FROM repositories WHERE workspace_id = ?1 AND repository_id = ?2"#,
+                    params![workspace.workspace_id, record.repository.repository_id],
+                    read_repository_record,
+                )?;
+                let config_revision = crate::config_source::load_state(&tx, &workspace.workspace_id)?
+                    .ok_or_else(|| Error::Store("Workspace config is missing".to_string()))?
+                    .snapshot
+                    .revision;
+                tx.commit()?;
+                return Ok(WorkspaceBootstrapResult {
+                    workspace,
+                    repository,
+                    config_revision,
+                    replayed: true,
+                });
+            }
+
+            if let Some(existing) = tx
+                .query_row(
+                    r#"SELECT workspace_id, owner_account_id, display_name, state, created_at, updated_at
+                       FROM workspaces WHERE workspace_id = ?1"#,
+                    params![record.workspace.workspace_id],
+                    read_workspace_record,
+                )
+                .optional()?
+            {
+                if existing.owner_account_id != record.workspace.owner_account_id
+                    || existing.display_name != record.workspace.display_name
+                    || existing.state != record.workspace.state
+                {
+                    return Err(Error::WorkspaceConfigConflict(
+                        "Workspace identity already exists with different metadata".to_string(),
+                    ));
+                }
+                let existing_repository = tx
+                    .query_row(
+                        r#"SELECT workspace_id, repository_id, name, kind, provider, uri, default_ref,
+                                  auth_ref_kind, auth_ref_key, created_at, updated_at
+                           FROM repositories WHERE workspace_id = ?1 AND repository_id = ?2"#,
+                        params![record.repository.workspace_id, record.repository.repository_id],
+                        read_repository_record,
+                    )
+                    .optional()?;
+                if existing_repository.as_ref() != Some(&record.repository) {
+                    return Err(Error::WorkspaceConfigConflict(
+                        "Workspace initial repository already exists with different metadata"
+                            .to_string(),
+                    ));
+                }
+            } else {
+                tx.execute(
+                    r#"INSERT INTO workspaces (
+                        workspace_id, owner_account_id, display_name, state, created_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+                    params![
+                        record.workspace.workspace_id,
+                        record.workspace.owner_account_id,
+                        record.workspace.display_name,
+                        record.workspace.state,
+                        record.workspace.created_at,
+                        record.workspace.updated_at,
+                    ],
+                )?;
+                tx.execute(
+                    r#"INSERT INTO repositories (
+                        workspace_id, repository_id, name, kind, provider, uri, default_ref,
+                        auth_ref_kind, auth_ref_key, created_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
+                    params![
+                        record.repository.workspace_id,
+                        record.repository.repository_id,
+                        record.repository.name,
+                        record.repository.kind,
+                        record.repository.provider,
+                        record.repository.uri,
+                        record.repository.default_ref,
+                        record.repository.auth_ref_kind,
+                        record.repository.auth_ref_key,
+                        record.repository.created_at,
+                        record.repository.updated_at,
+                    ],
+                )?;
+            }
+            if crate::config_source::load_state(&tx, &record.workspace.workspace_id)?.is_none() {
+                let state = crate::config_source::initial_state()?;
+                crate::config_source::insert_materialized_state(
+                    &tx,
+                    &record.workspace.workspace_id,
+                    &state,
+                    &record.workspace.created_at,
+                )?;
+            }
+            for resource_kind in ["ticket", "objective", "worker"] {
+                tx.execute(
+                    r#"INSERT OR IGNORE INTO workspace_resource_human_key_counters (
+                        workspace_id, resource_kind, next_sequence
+                    ) VALUES (?1, ?2, 1)"#,
+                    params![record.workspace.workspace_id, resource_kind],
+                )?;
+            }
+            let config_revision = crate::config_source::load_state(
+                &tx,
+                &record.workspace.workspace_id,
+            )?
+            .ok_or_else(|| Error::Store("Workspace config is missing".to_string()))?
+            .snapshot
+            .revision;
+            tx.execute(
+                r#"INSERT INTO workspace_create_operations (
+                    operation_key, request_fingerprint, workspace_id, created_at
+                ) VALUES (?1, ?2, ?3, ?4)"#,
+                params![
+                    record.operation_key,
+                    record.request_fingerprint,
+                    record.workspace.workspace_id,
+                    record.workspace.created_at,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(WorkspaceBootstrapResult {
+                workspace: record.workspace.clone(),
+                repository: record.repository.clone(),
+                config_revision,
+                replayed: false,
+            })
+        })
+    }
+
     async fn get_trusted_runtime(&self, runtime_id: &str) -> Result<Option<TrustedRuntimeRecord>> {
         self.with_conn(|conn| {
             conn.query_row(
-                r#"SELECT runtime_id, display_name, base_url, public_key, created_at, updated_at, revoked_at
+                r#"SELECT runtime_id, workspace_id, display_name, base_url, public_key, created_at, updated_at, revoked_at
                    FROM trusted_runtime_records WHERE runtime_id = ?1"#,
                 params![runtime_id],
                 read_trusted_runtime_record,
@@ -3948,12 +4132,13 @@ fn account_select_sql(where_clause: &str) -> String {
 fn read_trusted_runtime_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrustedRuntimeRecord> {
     Ok(TrustedRuntimeRecord {
         runtime_id: row.get(0)?,
-        display_name: row.get(1)?,
-        base_url: row.get(2)?,
-        public_key: row.get(3)?,
-        created_at: row.get(4)?,
-        updated_at: row.get(5)?,
-        revoked_at: row.get(6)?,
+        workspace_id: row.get(1)?,
+        display_name: row.get(2)?,
+        base_url: row.get(3)?,
+        public_key: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+        revoked_at: row.get(7)?,
     })
 }
 
@@ -5125,6 +5310,26 @@ CREATE UNIQUE INDEX ux_worker_workdir_links_active_workdir
 CREATE UNIQUE INDEX ux_worker_workdir_attachment_reservation_id
     ON worker_workdir_attachment_reservations(workspace_id, reservation_id);
 "#,
+    )?;
+    Ok(())
+}
+
+fn create_workspace_catalog_operations(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        ALTER TABLE trusted_runtime_records
+            ADD COLUMN workspace_id TEXT REFERENCES workspaces(workspace_id) ON DELETE RESTRICT;
+        CREATE INDEX idx_trusted_runtime_records_workspace
+            ON trusted_runtime_records(workspace_id, revoked_at, runtime_id);
+
+        CREATE TABLE workspace_create_operations (
+            operation_key TEXT PRIMARY KEY,
+            request_fingerprint TEXT NOT NULL,
+            workspace_id TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+        );
+        "#,
     )?;
     Ok(())
 }
@@ -7249,7 +7454,7 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
         assert_eq!(plan.current_schema_version, 36);
-        assert_eq!(plan.target_schema_version, 39);
+        assert_eq!(plan.target_schema_version, 40);
         assert!(plan.migration_required);
         assert_eq!(plan.worker_count, 1);
         assert_eq!(plan.mappings[0].legacy_worker_id, 7);
@@ -7263,7 +7468,7 @@ mod tests {
         store
             .with_conn(|conn| {
                 assert!(table_exists(conn, "worker_diagnostics_archives")?);
-                assert_eq!(current_schema_version(conn)?, 39);
+                assert_eq!(current_schema_version(conn)?, 40);
                 Ok(())
             })
             .unwrap();
@@ -7342,7 +7547,7 @@ mod tests {
                 ),
             ]
         );
-        assert_eq!(current_schema_version(&conn).unwrap(), 39);
+        assert_eq!(current_schema_version(&conn).unwrap(), 40);
         let foreign_key_error: Option<String> = conn
             .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
             .optional()
@@ -7471,7 +7676,7 @@ INSERT INTO worker_orphan_diagnostics (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 39);
+        assert_eq!(current_schema_version(&conn).unwrap(), 40);
         assert!(!table_exists(&conn, "worker_control_delegation_operations").unwrap());
         let controller_worker_id: String = conn
             .query_row(
@@ -7589,7 +7794,7 @@ INSERT INTO worker_orphan_diagnostics (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 39);
+        assert_eq!(current_schema_version(&conn).unwrap(), 40);
         assert!(table_exists(&conn, "worker_workdir_attachment_reservations").unwrap());
     }
 
@@ -7622,7 +7827,7 @@ CREATE TABLE flow_events (event_id TEXT PRIMARY KEY);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 39);
+        assert_eq!(current_schema_version(&conn).unwrap(), 40);
         assert!(table_exists(&conn, "flow_sources").unwrap());
         assert!(table_exists(&conn, "flow_source_revisions").unwrap());
         assert!(!table_exists(&conn, "flow_instances").unwrap());
@@ -7689,7 +7894,7 @@ INSERT INTO worker_workdir_attachment_reservations (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 39);
+        assert_eq!(current_schema_version(&conn).unwrap(), 40);
         let repositories_sql: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'repositories'",
@@ -7867,7 +8072,7 @@ INSERT INTO workdir_registry (
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 39);
+        assert_eq!(store.schema_version().await.unwrap(), 40);
         assert!(
             !store
                 .with_conn(|conn| table_exists(conn, "worker_workspace_credentials"))
@@ -7884,7 +8089,7 @@ INSERT INTO workdir_registry (
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 39);
+        assert_eq!(reopened.schema_version().await.unwrap(), 40);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -8383,13 +8588,13 @@ INSERT INTO worker_registry (
         configure_sqlite(&conn).unwrap();
         apply_migrations(&conn).unwrap();
         conn.execute(
-            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (40, 'future')",
+            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (41, 'future')",
             [],
         )
         .unwrap();
 
         let error = apply_migrations(&conn).unwrap_err().to_string();
-        assert!(error.contains("schema version 40 is newer"), "{error}");
+        assert!(error.contains("schema version 41 is newer"), "{error}");
         assert!(error.contains("refusing to serve"), "{error}");
     }
 
@@ -8585,6 +8790,41 @@ VALUES ('workspace-b', 'ticket-b', 'related', 'ticket-a', NULL, 'tester', '2026-
             .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
             .unwrap();
         assert_eq!(foreign_keys_enabled, 1);
+    }
+
+    #[test]
+    fn schema_v40_adds_workspace_create_operations_and_fail_closed_runtime_assignment() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_sqlite(&conn).unwrap();
+        apply_migrations_through(&conn, 39).unwrap();
+        let now = "2026-01-01T00:00:00Z";
+        conn.execute(
+            r#"INSERT INTO workspaces (
+                workspace_id, display_name, state, created_at, updated_at
+            ) VALUES ('workspace-a', 'Workspace A', 'active', ?1, ?1)"#,
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            r#"INSERT INTO trusted_runtime_records (
+                runtime_id, display_name, base_url, public_key, created_at, updated_at
+            ) VALUES ('runtime-a', 'Runtime A', 'http://runtime-a.test', 'key', ?1, ?1)"#,
+            params![now],
+        )
+        .unwrap();
+
+        apply_migrations(&mut conn).unwrap();
+
+        assert_eq!(current_schema_version(&conn).unwrap(), 40);
+        let workspace_id: Option<String> = conn
+            .query_row(
+                "SELECT workspace_id FROM trusted_runtime_records WHERE runtime_id = 'runtime-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(workspace_id, None);
+        assert!(table_exists(&conn, "workspace_create_operations").unwrap());
     }
 
     #[test]
@@ -9076,7 +9316,7 @@ INSERT INTO ticket_worker_assignment_events (
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 39);
+        assert_eq!(store.schema_version().await.unwrap(), 40);
 
         store
             .with_conn(|conn| {
@@ -9265,7 +9505,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 39);
+        assert_eq!(store.schema_version().await.unwrap(), 40);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -9331,7 +9571,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 39);
+        assert_eq!(store.schema_version().await.unwrap(), 40);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -9722,7 +9962,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 39);
+        assert_eq!(store.schema_version().await.unwrap(), 40);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),
@@ -9908,6 +10148,7 @@ CREATE TABLE ticket_assignment_operations (
         store
             .upsert_trusted_runtime(&TrustedRuntimeRecord {
                 runtime_id: "runtime-a".to_string(),
+                workspace_id: None,
                 display_name: "Runtime A".to_string(),
                 base_url: "https://runtime.invalid".to_string(),
                 public_key: "public-key".to_string(),
