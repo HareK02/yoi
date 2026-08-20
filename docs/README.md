@@ -22,6 +22,7 @@ It is not a dumping ground for external research, old plans, API inventories, or
 14. [`development/work-items.md`](development/work-items.md) — how project work is recorded and reviewed.
 15. [`development/rust-testing-strategy.md`](development/rust-testing-strategy.md) — what Yoi Rust tests should prove, where they belong, and how to name them.
 16. [`development/validation.md`](development/validation.md) — how to check changes.
+17. [`development/workspace-schema-migrations.md`](development/workspace-schema-migrations.md) — how to preflight, apply, verify, and roll back control-plane SQLite schema changes.
 
 ## What belongs here
 
