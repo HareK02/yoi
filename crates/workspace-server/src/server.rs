@@ -14556,6 +14556,21 @@ mod tests {
             .create(ticket::NewTicket::new("Assigned Ticket"))
             .unwrap();
         let ticket_id = created.id;
+        api.store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                worker: RuntimeWorkerRef::new("embedded", "42"),
+                display_name: "Worker 42".to_string(),
+                profile: Some("builtin:coder".to_string()),
+                retention_state: "normal".to_string(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: TEST_CREATED_AT.to_string(),
+                updated_at: TEST_CREATED_AT.to_string(),
+            })
+            .unwrap();
         let assignment = TicketWorkerAssignmentRecord {
             workspace_id: TEST_WORKSPACE_ID.to_string(),
             ticket_id: ticket_id.clone(),
@@ -14650,6 +14665,24 @@ mod tests {
             .unwrap()
             .worker
             .unwrap();
+        api.store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                worker: RuntimeWorkerRef::new(
+                    EMBEDDED_WORKER_RUNTIME_ID,
+                    source_worker.worker.worker_id.clone(),
+                ),
+                display_name: "Source Worker".to_string(),
+                profile: Some("builtin:coder".to_string()),
+                retention_state: "normal".to_string(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: TEST_CREATED_AT.to_string(),
+                updated_at: TEST_CREATED_AT.to_string(),
+            })
+            .unwrap();
         let recipient_worker = api
             .runtime
             .spawn_worker(
@@ -14659,6 +14692,24 @@ mod tests {
             )
             .unwrap()
             .worker
+            .unwrap();
+        api.store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                worker: RuntimeWorkerRef::new(
+                    EMBEDDED_WORKER_RUNTIME_ID,
+                    recipient_worker.worker.worker_id.clone(),
+                ),
+                display_name: "Recipient Worker".to_string(),
+                profile: Some("builtin:coder".to_string()),
+                retention_state: "normal".to_string(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: TEST_CREATED_AT.to_string(),
+                updated_at: TEST_CREATED_AT.to_string(),
+            })
             .unwrap();
         let backend = browser_ticket_backend(&api).unwrap();
         let ticket_ref = backend

@@ -1075,6 +1075,7 @@ impl SqliteWorkspaceStore {
             Error::Store(format!("Merge Request schema verification failed: {error}"))
         })?;
         validate_workspace_resource_references(&conn)?;
+        verify_workspace_resource_constraints(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -5128,6 +5129,30 @@ CREATE UNIQUE INDEX ux_worker_workdir_attachment_reservation_id
     Ok(())
 }
 
+fn verify_workspace_resource_constraints(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? < 39 {
+        return Ok(());
+    }
+    for trigger in [
+        "ticket_worker_assignments_validate_insert",
+        "ticket_worker_assignments_validate_update",
+        "ticket_worker_assignment_events_validate_insert",
+        "ticket_assignment_operations_validate_insert",
+    ] {
+        let exists = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'trigger' AND name = ?1)",
+            [trigger],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exists {
+            return Err(Error::Store(format!(
+                "Workspace resource constraint trigger `{trigger}` is missing"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_workspace_resource_references(conn: &Connection) -> Result<()> {
     let diagnostics = workspace_resource_reference_diagnostics(conn)?;
     if diagnostics.is_empty() {
@@ -5212,6 +5237,55 @@ fn workspace_resource_reference_diagnostics(conn: &Connection) -> Result<Vec<Str
                    AND ticket.ticket_id = link.ticket_id) LIMIT 100",
         ),
         (
+            "ticket_worker_assignments.ticket_id",
+            "SELECT assignment.workspace_id || '/' || assignment.assignment_id || ' -> ' || assignment.ticket_id \
+             FROM ticket_worker_assignments AS assignment \
+             WHERE NOT EXISTS (SELECT 1 FROM typed_tickets AS ticket \
+                 WHERE ticket.workspace_id = assignment.workspace_id \
+                   AND ticket.ticket_id = assignment.ticket_id) LIMIT 100",
+        ),
+        (
+            "ticket_worker_assignments.worker_id",
+            "SELECT assignment.workspace_id || '/' || assignment.assignment_id || ' -> ' || assignment.runtime_id || '/' || assignment.worker_id \
+             FROM ticket_worker_assignments AS assignment \
+             WHERE NOT EXISTS (SELECT 1 FROM worker_registry AS worker \
+                 WHERE worker.workspace_id = assignment.workspace_id \
+                   AND worker.runtime_id = assignment.runtime_id \
+                   AND worker.worker_id = assignment.worker_id) LIMIT 100",
+        ),
+        (
+            "ticket_current_worker_assignments.assignment_id",
+            "SELECT current.workspace_id || '/' || current.assignment_id \
+             FROM ticket_current_worker_assignments AS current \
+             WHERE NOT EXISTS (SELECT 1 FROM ticket_worker_assignments AS assignment \
+                 WHERE assignment.workspace_id = current.workspace_id \
+                   AND assignment.ticket_id = current.ticket_id \
+                   AND assignment.assignment_id = current.assignment_id \
+                   AND assignment.runtime_id = current.runtime_id \
+                   AND assignment.worker_id = current.worker_id) LIMIT 100",
+        ),
+        (
+            "ticket_worker_assignment_events.assignment_id",
+            "SELECT event.workspace_id || '/' || event.event_id \
+             FROM ticket_worker_assignment_events AS event \
+             WHERE (event.assignment_id IS NOT NULL AND NOT EXISTS (\
+                       SELECT 1 FROM ticket_worker_assignments AS assignment \
+                       WHERE assignment.workspace_id = event.workspace_id \
+                         AND assignment.assignment_id = event.assignment_id)) \
+                OR (event.previous_assignment_id IS NOT NULL AND NOT EXISTS (\
+                       SELECT 1 FROM ticket_worker_assignments AS assignment \
+                       WHERE assignment.workspace_id = event.workspace_id \
+                         AND assignment.assignment_id = event.previous_assignment_id)) LIMIT 100",
+        ),
+        (
+            "ticket_assignment_operations.ticket_id",
+            "SELECT operation.workspace_id || '/' || operation.operation_id || ' -> ' || operation.ticket_id \
+             FROM ticket_assignment_operations AS operation \
+             WHERE NOT EXISTS (SELECT 1 FROM typed_tickets AS ticket \
+                 WHERE ticket.workspace_id = operation.workspace_id \
+                   AND ticket.ticket_id = operation.ticket_id) LIMIT 100",
+        ),
+        (
             "artifacts.ticket_id",
             "SELECT artifact.workspace_id || '/' || artifact.artifact_id || ' -> ' || artifact.ticket_id \
              FROM artifacts AS artifact WHERE artifact.ticket_id IS NOT NULL \
@@ -5244,6 +5318,16 @@ fn workspace_resource_reference_diagnostics(conn: &Connection) -> Result<Vec<Str
             continue;
         }
         if sql.contains("worker.worker_id") && !column_exists(conn, "worker_registry", "worker_id")?
+        {
+            continue;
+        }
+        if sql.contains("assignment.worker_id")
+            && !column_exists(conn, "ticket_worker_assignments", "worker_id")?
+        {
+            continue;
+        }
+        if sql.contains("current.worker_id")
+            && !column_exists(conn, "ticket_current_worker_assignments", "worker_id")?
         {
             continue;
         }
@@ -6156,7 +6240,9 @@ CREATE TABLE ticket_worker_assignments_v39 (
     assigned_by TEXT NOT NULL,
     assigned_at TEXT NOT NULL,
     PRIMARY KEY (workspace_id, assignment_id),
-    UNIQUE (workspace_id, ticket_id, assignment_id)
+    UNIQUE (workspace_id, ticket_id, assignment_id),
+    UNIQUE (workspace_id, ticket_id, assignment_id, runtime_id, worker_id),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
 );
 INSERT INTO ticket_worker_assignments_v39 SELECT * FROM ticket_worker_assignments;
 
@@ -6169,7 +6255,8 @@ CREATE TABLE ticket_worker_assignment_events_v39 (
     previous_assignment_id TEXT,
     actor TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, event_id)
+    PRIMARY KEY (workspace_id, event_id),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
 );
 INSERT INTO ticket_worker_assignment_events_v39 SELECT * FROM ticket_worker_assignment_events;
 
@@ -6182,9 +6269,10 @@ CREATE TABLE ticket_current_worker_assignments_v39 (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (workspace_id, ticket_id),
     UNIQUE (workspace_id, runtime_id, worker_id),
-    FOREIGN KEY (workspace_id, ticket_id, assignment_id)
-        REFERENCES ticket_worker_assignments(workspace_id, ticket_id, assignment_id)
-        ON DELETE CASCADE
+    FOREIGN KEY (workspace_id, ticket_id, assignment_id, runtime_id, worker_id)
+        REFERENCES ticket_worker_assignments(
+            workspace_id, ticket_id, assignment_id, runtime_id, worker_id
+        ) ON DELETE CASCADE
 );
 INSERT INTO ticket_current_worker_assignments_v39 SELECT * FROM ticket_current_worker_assignments;
 
@@ -6199,7 +6287,8 @@ CREATE TABLE ticket_assignment_operations_v39 (
     expected_assignment_id TEXT,
     created_at TEXT NOT NULL,
     request_fingerprint TEXT,
-    PRIMARY KEY (workspace_id, operation_id)
+    PRIMARY KEY (workspace_id, operation_id),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
 );
 INSERT INTO ticket_assignment_operations_v39 SELECT * FROM ticket_assignment_operations;
 
@@ -6336,6 +6425,73 @@ CREATE INDEX IF NOT EXISTS idx_workspace_resource_human_keys_reverse
             ))
         })?;
     }
+    // Assignment rows and events are historical evidence and intentionally survive Ticket or
+    // Worker retention deletion, so parent FKs would impose the wrong delete semantics. These
+    // triggers provide the equivalent database-layer insertion boundary: every new assignment
+    // resolves both authorities in the same Workspace, and event references resolve a committed
+    // assignment. Operation assignment/Worker ids remain unconstrained because reservations are
+    // persisted before assignment/Worker creation and expected ids may intentionally be stale.
+    conn.execute_batch(
+        r#"
+CREATE TRIGGER ticket_worker_assignments_validate_insert
+BEFORE INSERT ON ticket_worker_assignments
+WHEN NOT EXISTS (
+        SELECT 1 FROM typed_tickets AS ticket
+        WHERE ticket.workspace_id = NEW.workspace_id AND ticket.ticket_id = NEW.ticket_id
+    )
+    OR NOT EXISTS (
+        SELECT 1 FROM worker_registry AS worker
+        WHERE worker.workspace_id = NEW.workspace_id
+          AND worker.runtime_id = NEW.runtime_id
+          AND worker.worker_id = NEW.worker_id
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'ticket_worker_assignments must reference a Ticket and Worker in the same Workspace');
+END;
+
+CREATE TRIGGER ticket_worker_assignments_validate_update
+BEFORE UPDATE OF workspace_id, ticket_id, runtime_id, worker_id ON ticket_worker_assignments
+WHEN NOT EXISTS (
+        SELECT 1 FROM typed_tickets AS ticket
+        WHERE ticket.workspace_id = NEW.workspace_id AND ticket.ticket_id = NEW.ticket_id
+    )
+    OR NOT EXISTS (
+        SELECT 1 FROM worker_registry AS worker
+        WHERE worker.workspace_id = NEW.workspace_id
+          AND worker.runtime_id = NEW.runtime_id
+          AND worker.worker_id = NEW.worker_id
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'ticket_worker_assignments must reference a Ticket and Worker in the same Workspace');
+END;
+
+CREATE TRIGGER ticket_worker_assignment_events_validate_insert
+BEFORE INSERT ON ticket_worker_assignment_events
+WHEN (NEW.assignment_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM ticket_worker_assignments AS assignment
+        WHERE assignment.workspace_id = NEW.workspace_id
+          AND assignment.assignment_id = NEW.assignment_id
+    ))
+    OR (NEW.previous_assignment_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM ticket_worker_assignments AS assignment
+        WHERE assignment.workspace_id = NEW.workspace_id
+          AND assignment.assignment_id = NEW.previous_assignment_id
+    ))
+BEGIN
+    SELECT RAISE(ABORT, 'ticket_worker_assignment_events must reference assignments in the same Workspace');
+END;
+
+CREATE TRIGGER ticket_assignment_operations_validate_insert
+BEFORE INSERT ON ticket_assignment_operations
+WHEN NOT EXISTS (
+    SELECT 1 FROM typed_tickets AS ticket
+    WHERE ticket.workspace_id = NEW.workspace_id AND ticket.ticket_id = NEW.ticket_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'ticket_assignment_operations must reference a Ticket in the same Workspace');
+END;
+"#,
+    )?;
     Ok(())
 }
 
@@ -8115,6 +8271,31 @@ INSERT INTO worker_registry (
     }
 
     #[test]
+    fn startup_rejects_missing_workspace_resource_constraint_trigger() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER ticket_worker_assignments_validate_insert")?;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+
+        let error = match SqliteWorkspaceStore::open(&path) {
+            Ok(_) => panic!("missing assignment constraint trigger must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("ticket_worker_assignments_validate_insert"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn migration_plan_lists_workspace_reference_violations_without_mutating_source() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("server.db");
@@ -8243,6 +8424,17 @@ INSERT INTO typed_ticket_relations (
 INSERT INTO objective_ticket_links (
     workspace_id, objective_id, ticket_id, kind, created_at
 ) VALUES ('workspace-b', 'objective-a', 'ticket-b', 'tracks', '2026-01-01');
+INSERT INTO worker_registry (
+    workspace_id, runtime_id, worker_id, display_name, retention_state, created_at, updated_at
+) VALUES
+    ('workspace-a', 'runtime-a', '00000000-0000-7000-8000-000000000001', 'Worker A', 'normal', '2026-01-01', '2026-01-01'),
+    ('workspace-b', 'runtime-b', '00000000-0000-7000-8000-000000000002', 'Worker B', 'normal', '2026-01-01', '2026-01-01');
+INSERT INTO ticket_worker_assignments (
+    workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at
+) VALUES (
+    'workspace-b', 'ticket-b', 'assignment-cross-worker', 'runtime-a',
+    '00000000-0000-7000-8000-000000000001', 'tester', '2026-01-01'
+);
 "#,
         )
         .unwrap();
@@ -8257,11 +8449,18 @@ INSERT INTO objective_ticket_links (
             error.contains("objective_ticket_links.objective_id"),
             "{error}"
         );
+        assert!(
+            error.contains("ticket_worker_assignments.worker_id"),
+            "{error}"
+        );
+        assert!(error.contains("assignment-cross-worker"), "{error}");
         assert_eq!(current_schema_version(&conn).unwrap(), 38);
 
         conn.execute("DELETE FROM typed_ticket_relations", [])
             .unwrap();
         conn.execute("DELETE FROM objective_ticket_links", [])
+            .unwrap();
+        conn.execute("DELETE FROM ticket_worker_assignments", [])
             .unwrap();
         apply_migrations_through(&conn, 39).unwrap();
         assert_eq!(current_schema_version(&conn).unwrap(), 39);
@@ -8286,6 +8485,53 @@ INSERT INTO objective_ticket_links (
             [],
         );
         assert!(cross_objective_link.is_err());
+        let cross_ticket_assignment = conn.execute(
+            "INSERT INTO ticket_worker_assignments \
+             (workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at) \
+             VALUES ('workspace-b', 'ticket-a', 'assignment-cross-ticket', 'runtime-b', \
+             '00000000-0000-7000-8000-000000000002', 'tester', '2026-01-01')",
+            [],
+        );
+        assert!(cross_ticket_assignment.is_err());
+        let cross_worker_assignment = conn.execute(
+            "INSERT INTO ticket_worker_assignments \
+             (workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at) \
+             VALUES ('workspace-b', 'ticket-b', 'assignment-cross-worker', 'runtime-a', \
+             '00000000-0000-7000-8000-000000000001', 'tester', '2026-01-01')",
+            [],
+        );
+        assert!(cross_worker_assignment.is_err());
+        conn.execute(
+            "INSERT INTO ticket_worker_assignments \
+             (workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at) \
+             VALUES ('workspace-b', 'ticket-b', 'assignment-b', 'runtime-b', \
+             '00000000-0000-7000-8000-000000000002', 'tester', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        let mismatched_current_assignment = conn.execute(
+            "INSERT INTO ticket_current_worker_assignments \
+             (workspace_id, ticket_id, assignment_id, runtime_id, worker_id, updated_at) \
+             VALUES ('workspace-b', 'ticket-b', 'assignment-b', 'runtime-a', \
+             '00000000-0000-7000-8000-000000000001', '2026-01-01')",
+            [],
+        );
+        assert!(mismatched_current_assignment.is_err());
+        let cross_assignment_event = conn.execute(
+            "INSERT INTO ticket_worker_assignment_events \
+             (workspace_id, ticket_id, event_id, action, assignment_id, actor, created_at) \
+             VALUES ('workspace-a', 'ticket-a', 'event-cross-assignment', 'assigned', \
+             'assignment-b', 'tester', '2026-01-01')",
+            [],
+        );
+        assert!(cross_assignment_event.is_err());
+        let cross_operation_ticket = conn.execute(
+            "INSERT INTO ticket_assignment_operations \
+             (workspace_id, operation_id, action, ticket_id, created_at) \
+             VALUES ('workspace-b', 'operation-cross-ticket', 'assign', 'ticket-a', '2026-01-01')",
+            [],
+        );
+        assert!(cross_operation_ticket.is_err());
         assert!(
             conn.execute(
                 "DELETE FROM repositories WHERE workspace_id = 'workspace-a' AND repository_id = 'repo-a'",
@@ -8322,6 +8568,26 @@ INSERT INTO objective_ticket_links (
             0
         );
         conn.execute(
+            "DELETE FROM worker_registry WHERE workspace_id = 'workspace-b' AND worker_id = '00000000-0000-7000-8000-000000000002'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM typed_tickets WHERE workspace_id = 'workspace-b' AND ticket_id = 'ticket-b'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM ticket_worker_assignments WHERE workspace_id = 'workspace-b'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "historical assignments survive Worker and Ticket retention deletion"
+        );
+        conn.execute(
             "DELETE FROM workspaces WHERE workspace_id = 'workspace-b'",
             [],
         )
@@ -8329,6 +8595,15 @@ INSERT INTO objective_ticket_links (
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM typed_tickets WHERE workspace_id = 'workspace-b'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM ticket_worker_assignments WHERE workspace_id = 'workspace-b'",
                 [],
                 |row| row.get::<_, i64>(0),
             )
