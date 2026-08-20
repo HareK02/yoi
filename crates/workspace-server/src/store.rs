@@ -5237,8 +5237,9 @@ fn workspace_resource_reference_diagnostics(conn: &Connection) -> Result<Vec<Str
                    AND ticket.ticket_id = link.ticket_id) LIMIT 100",
         ),
         // Historical assignment/operation rows intentionally survive Ticket or Worker
-        // retention deletion. A parent missing from every Workspace is therefore a retained
-        // soft reference; a matching id that exists only in another Workspace is corruption.
+        // retention deletion. A parent id missing from every Workspace is therefore a retained
+        // soft reference; a matching Ticket id in another Workspace, or a live Worker id whose
+        // Workspace/Runtime placement does not match the snapshot, is corruption.
         (
             "ticket_worker_assignments.ticket_id",
             "SELECT assignment.workspace_id || '/' || assignment.assignment_id || ' -> ' || assignment.ticket_id \
@@ -5255,9 +5256,10 @@ fn workspace_resource_reference_diagnostics(conn: &Connection) -> Result<Vec<Str
              FROM ticket_worker_assignments AS assignment \
              WHERE NOT EXISTS (SELECT 1 FROM worker_registry AS worker \
                  WHERE worker.workspace_id = assignment.workspace_id \
+                   AND worker.runtime_id = assignment.runtime_id \
                    AND worker.worker_id = assignment.worker_id) \
-               AND EXISTS (SELECT 1 FROM worker_registry AS foreign_worker \
-                 WHERE foreign_worker.worker_id = assignment.worker_id) LIMIT 100",
+               AND EXISTS (SELECT 1 FROM worker_registry AS live_worker \
+                 WHERE live_worker.worker_id = assignment.worker_id) LIMIT 100",
         ),
         (
             "ticket_current_worker_assignments.assignment_id",
@@ -8504,6 +8506,12 @@ INSERT INTO ticket_worker_assignments (
 INSERT INTO ticket_worker_assignments (
     workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at
 ) VALUES (
+    'workspace-b', 'ticket-b', 'assignment-runtime-mismatch', 'runtime-wrong',
+    '00000000-0000-7000-8000-000000000002', 'tester', '2026-01-01'
+);
+INSERT INTO ticket_worker_assignments (
+    workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at
+) VALUES (
     'workspace-b', 'ticket-a', 'assignment-cross-ticket', 'runtime-b',
     '00000000-0000-7000-8000-000000000002', 'tester', '2026-01-01'
 );
@@ -8543,6 +8551,7 @@ INSERT INTO ticket_worker_assignment_events (
             "{error}"
         );
         assert!(error.contains("assignment-cross-worker"), "{error}");
+        assert!(error.contains("assignment-runtime-mismatch"), "{error}");
         assert!(
             error.contains("ticket_worker_assignment_events.assignment_id"),
             "{error}"
@@ -8597,6 +8606,14 @@ INSERT INTO ticket_worker_assignment_events (
             [],
         );
         assert!(cross_worker_assignment.is_err());
+        let runtime_mismatch_assignment = conn.execute(
+            "INSERT INTO ticket_worker_assignments \
+             (workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at) \
+             VALUES ('workspace-b', 'ticket-b', 'assignment-runtime-mismatch', 'runtime-wrong', \
+             '00000000-0000-7000-8000-000000000002', 'tester', '2026-01-01')",
+            [],
+        );
+        assert!(runtime_mismatch_assignment.is_err());
         conn.execute(
             "INSERT INTO ticket_worker_assignments \
              (workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at) \
