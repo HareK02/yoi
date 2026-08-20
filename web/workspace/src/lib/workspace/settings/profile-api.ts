@@ -14,7 +14,10 @@ export type WorkspaceProfileApi = {
   getProfiles(workspaceId: string): Promise<ProfileSettingsResponse>;
 };
 
-async function requestJson<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
+async function requestJson<T>(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): Promise<T> {
   const response = await fetch(input, init);
   if (!response.ok) {
     throw new Error(`request failed: ${response.status}`);
@@ -44,7 +47,9 @@ export async function updateWorkspaceMetadataSettings(
   );
 }
 
-export async function fetchProfileSettings(workspaceId: string): Promise<ProfileSettingsResponse> {
+export async function fetchProfileSettings(
+  workspaceId: string,
+): Promise<ProfileSettingsResponse> {
   return await requestJson<ProfileSettingsResponse>(
     `/api/w/${encodeURIComponent(workspaceId)}/settings/profiles`,
   );
@@ -52,20 +57,12 @@ export async function fetchProfileSettings(workspaceId: string): Promise<Profile
 
 export function createWorkspaceProfileApi(): WorkspaceProfileApi {
   return {
-    async getMetadata(workspaceId) {
-      return await requestJson<WorkspaceMetadataSettingsResponse>(
-        `/api/w/${encodeURIComponent(workspaceId)}/settings/metadata`,
-      );
-    },
+    getMetadata: fetchWorkspaceMetadataSettings,
     async updateMetadata(workspaceId, displayName, expectedRevision) {
-      return await requestJson<WorkspaceMetadataMutationResponse>(
-        `/api/w/${encodeURIComponent(workspaceId)}/settings/metadata`,
-        {
-          method: "PUT",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ display_name: displayName, expected_revision: expectedRevision }),
-        },
-      );
+      return await updateWorkspaceMetadataSettings(workspaceId, {
+        display_name: displayName,
+        revision: expectedRevision,
+      });
     },
     getProfiles: fetchProfileSettings,
   };

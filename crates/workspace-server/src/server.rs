@@ -923,6 +923,7 @@ fn is_server_global_forward(path: &str) -> bool {
         || path.starts_with("/api/auth/")
         || path == "/health"
         || path == "/"
+        || path.starts_with("/_app/")
         || path.starts_with("/assets/")
 }
 
@@ -12502,7 +12503,7 @@ async fn static_or_spa_fallback(State(api): State<WorkspaceApi>, uri: Uri) -> Re
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    match read_static_or_index(static_root, uri.path()).await {
+    match read_static_or_index(static_root, scoped_workspace_static_path(uri.path())).await {
         Ok(StaticAsset {
             bytes,
             content_type,
@@ -12551,6 +12552,16 @@ fn workspace_id_from_ui_path(path: &str) -> Option<&str> {
 struct StaticAsset {
     bytes: Vec<u8>,
     content_type: &'static str,
+}
+
+fn scoped_workspace_static_path(path: &str) -> &str {
+    let Some(scoped) = path.strip_prefix("/w/") else {
+        return path;
+    };
+    match scoped.find('/') {
+        Some(index) => &scoped[index..],
+        None => "/",
+    }
 }
 
 async fn read_static_or_index(root: &Path, request_path: &str) -> Result<StaticAsset> {
@@ -14427,7 +14438,20 @@ mod tests {
         let repository_b = dir.path().join("repository-b");
         std::fs::create_dir_all(repository_a.join(".git")).unwrap();
         std::fs::create_dir_all(repository_b.join(".git")).unwrap();
-        let template = test_server_config(dir.path());
+        let static_dir = dir.path().join("static");
+        std::fs::create_dir_all(static_dir.join("_app/immutable/entry")).unwrap();
+        std::fs::write(
+            static_dir.join("index.html"),
+            "<main>Workspace chooser</main>",
+        )
+        .unwrap();
+        std::fs::write(
+            static_dir.join("_app/immutable/entry/start.js"),
+            "console.log('workspace app');",
+        )
+        .unwrap();
+        let mut template = test_server_config(dir.path());
+        template.static_assets_dir = Some(static_dir);
         let store = Arc::new(SqliteWorkspaceStore::open(&template.database_path).unwrap());
         let catalog = WorkspaceCatalogService::new(store.clone());
         let workspace_a = catalog
@@ -14469,6 +14493,36 @@ mod tests {
         assert_eq!(a["display_name"], "Workspace A");
         assert_eq!(b["workspace_id"], workspace_b.workspace.workspace_id);
         assert_eq!(b["display_name"], "Workspace B");
+
+        for asset_uri in [
+            "/_app/immutable/entry/start.js".to_string(),
+            format!(
+                "/w/{}/_app/immutable/entry/start.js",
+                workspace_a.workspace.workspace_id
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(asset_uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                String::from_utf8(
+                    to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap()
+                        .to_vec(),
+                )
+                .unwrap(),
+                "console.log('workspace app');"
+            );
+        }
 
         let handle = missing_resource_handle();
         let resource_response = app
