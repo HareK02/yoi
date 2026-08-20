@@ -132,6 +132,12 @@ impl TargetError {
         }
     }
 
+    fn invalid(target: TargetKind, message: impl Into<String>) -> Self {
+        Self {
+            message: format!("invalid {target} target: {}", message.into()),
+        }
+    }
+
     fn local_runtime_command(error: std::io::Error) -> Self {
         Self {
             message: format!("failed to resolve local Worker runtime command: {error}"),
@@ -260,9 +266,16 @@ impl Target for BackendTarget {
         &self,
         selector: WorkerConnectionSelector,
     ) -> Result<WorkerConnection, TargetError> {
+        let workspace_id = self.workspace_id.clone().ok_or_else(|| {
+            TargetError::invalid(
+                self.kind(),
+                "workspace selection is required before connecting to a Backend Worker",
+            )
+        })?;
         Ok(WorkerConnection {
             target: BackendRuntimeTarget::new(
                 self.base_url.clone(),
+                workspace_id,
                 selector.runtime_id,
                 selector.worker_id,
             ),
@@ -313,8 +326,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(connection.target.base_url, "http://127.0.0.1:8787");
+        assert_eq!(connection.target.workspace_id, "workspace-a");
         assert_eq!(connection.target.runtime_id, "runtime-a");
         assert_eq!(connection.target.worker_id, "worker-b");
+    }
+
+    #[test]
+    fn backend_target_rejects_worker_connection_before_workspace_selection() {
+        let target = BackendTarget::new("http://127.0.0.1:8787", None::<String>);
+        let error =
+            match target.connect_worker(WorkerConnectionSelector::new("runtime-a", "worker-b")) {
+                Ok(_) => panic!("unscoped connection must fail"),
+                Err(error) => error,
+            };
+
+        assert!(
+            error
+                .to_string()
+                .contains("workspace selection is required")
+        );
     }
 
     #[test]
