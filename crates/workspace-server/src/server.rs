@@ -12520,9 +12520,7 @@ fn unscoped_workspace_ui_redirect(
     query: Option<&str>,
     workspace_id: &str,
 ) -> Option<String> {
-    let scoped_tail = if path == "/" {
-        ""
-    } else if ["/repositories", "/objectives", "/settings", "/runtimes"]
+    let scoped_tail = if ["/repositories", "/objectives", "/settings", "/runtimes"]
         .iter()
         .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
     {
@@ -14493,6 +14491,23 @@ mod tests {
         assert_eq!(a["display_name"], "Workspace A");
         assert_eq!(b["workspace_id"], workspace_b.workspace.workspace_id);
         assert_eq!(b["display_name"], "Workspace B");
+
+        let chooser = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(chooser.status(), StatusCode::OK);
+        assert_eq!(
+            String::from_utf8(
+                to_bytes(chooser.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap(),
+            "<main>Workspace chooser</main>"
+        );
 
         for asset_uri in [
             "/_app/immutable/entry/start.js".to_string(),
