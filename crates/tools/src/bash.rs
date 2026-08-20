@@ -43,7 +43,7 @@ impl Tool for BashTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_engine::tool::ToolExecutionContext,
+        ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: BashParams = serde_json::from_str(input_json)
             .map_err(|error| ToolError::InvalidArgument(format!("invalid Bash input: {error}")))?;
@@ -58,6 +58,7 @@ impl Tool for BashTool {
                 command: params.command,
                 timeout_secs,
                 output_limit: INLINE_BYTE_BUDGET,
+                tool_call_id: Some(ctx.call_id),
             })
             .await
             .map_err(crate::ToolsError::from)?;

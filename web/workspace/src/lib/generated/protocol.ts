@@ -22,6 +22,16 @@ export type Permission = "read" | "write";
 
 export type InFlightToolCallState = "pending" | "streaming_args" | "done";
 
+export type CommandStatus = "running" | "completed" | "failed" | "timed_out" | "cancelled";
+
+export type CommandStream = "stdout" | "stderr";
+
+export type CommandStreamSlice = { start_offset: number, end_offset: number, content: string, truncated: boolean, };
+
+export type CommandSnapshot = { command_id: string, tool_call_id: string | null, status: CommandStatus, started_at_ms: number, observed_at_ms: number, last_output_at_ms: number | null, stdout: CommandStreamSlice, stderr: CommandStreamSlice, exit_code: number | null, };
+
+export type CommandEvent = { "kind": "started", command_id: string, tool_call_id: string | null, observed_at_ms: number, } | { "kind": "output", command_id: string, stream: CommandStream, start_offset: number, end_offset: number, content: string, observed_at_ms: number, } | { "kind": "terminal", command_id: string, status: CommandStatus, exit_code: number | null, stdout_end_offset: number, stderr_end_offset: number, observed_at_ms: number, };
+
 export type ScopeRule = {
 /**
  * Target path. Must be absolute by the time a `Scope` is built from
@@ -51,7 +61,7 @@ export type RewindSummary = { truncated_to_entries: number, discarded_entries: n
 
 export type InFlightBlock = { "kind": "text", text: string, finished?: boolean, } | { "kind": "thinking", text: string, finished?: boolean, } | { "kind": "tool_call", id: string, name: string, args: string, state?: InFlightToolCallState, };
 
-export type InFlightSnapshot = { blocks?: Array<InFlightBlock>, };
+export type InFlightSnapshot = { blocks?: Array<InFlightBlock>, commands?: Array<CommandSnapshot>, };
 
 export type InternalWorkerKind = "sub_worker";
 
@@ -178,4 +188,4 @@ in_flight?: InFlightSnapshot,
  * Parent-owned Internal Worker sessions visible to this client.
  * Service-private Internal Workers are deliberately excluded.
  */
-internal_workers?: Array<InternalWorkerSnapshot>, } } | { "event": "internal_worker", "data": { worker: InternalWorkerRef, revision: number, event: Event, } } | { "event": "segment_rotated", "data": { entry: unknown, } } | { "event": "status", "data": { status: WorkerStatus, } } | { "event": "completions", "data": { kind: CompletionKind, entries: Array<CompletionEntry>, } } | { "event": "rewind_targets", "data": { head_entries: number, targets: Array<RewindTarget>, } } | { "event": "rewind_applied", "data": { entries: Array<unknown>, input: Array<Segment>, summary: RewindSummary, } } | { "event": "workers_listed", "data": { workers: unknown, } } | { "event": "worker_restored", "data": { result: unknown, } } | { "event": "peer_registered", "data": { result: unknown, } } | { "event": "alert", "data": Alert } | { "event": "memory_worker", "data": MemoryWorkerEvent } | { "event": "compact_start" } | { "event": "compact_done", "data": { new_segment_id: string, } } | { "event": "compact_failed", "data": { error: string, } } | { "event": "shutdown" };
+internal_workers?: Array<InternalWorkerSnapshot>, } } | { "event": "internal_worker", "data": { worker: InternalWorkerRef, revision: number, event: Event, } } | { "event": "internal_worker_removed", "data": { worker: InternalWorkerRef, revision: number, } } | { "event": "segment_rotated", "data": { entry: unknown, } } | { "event": "status", "data": { status: WorkerStatus, } } | { "event": "command", "data": { event: CommandEvent, } } | { "event": "completions", "data": { kind: CompletionKind, entries: Array<CompletionEntry>, } } | { "event": "rewind_targets", "data": { head_entries: number, targets: Array<RewindTarget>, } } | { "event": "rewind_applied", "data": { entries: Array<unknown>, input: Array<Segment>, summary: RewindSummary, } } | { "event": "workers_listed", "data": { workers: unknown, } } | { "event": "worker_restored", "data": { result: unknown, } } | { "event": "peer_registered", "data": { result: unknown, } } | { "event": "alert", "data": Alert } | { "event": "memory_worker", "data": MemoryWorkerEvent } | { "event": "compact_start" } | { "event": "compact_done", "data": { new_segment_id: string, } } | { "event": "compact_failed", "data": { error: string, } } | { "event": "shutdown" };

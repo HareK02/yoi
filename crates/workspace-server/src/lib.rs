@@ -27,6 +27,7 @@ pub mod server;
 pub mod skills;
 pub mod store;
 pub mod worker_source;
+pub mod workspace_catalog;
 mod workspace_subscription;
 
 pub use authority::{
@@ -45,8 +46,15 @@ pub use repositories::{
     ConfiguredRepository, GitCommitSummary, GitRemoteSummary, GitRepositorySummary,
     RepositoryLogRead, RepositoryRegistryReader, RepositorySummary,
 };
-pub use server::{AuthConfig, ServerConfig, WorkspaceApi, build_router, serve};
+pub use server::{
+    AuthConfig, ServerConfig, WorkspaceApi, WorkspaceServerApi, build_router,
+    build_workspace_server_router, serve, serve_workspace_catalog,
+};
 pub use store::{ControlPlaneStore, SqliteWorkspaceStore, WorkspaceRecord};
+pub use workspace_catalog::{
+    InitialRepositoryIntent, WorkspaceCatalogService, WorkspaceCreateRequest,
+    WorkspaceCreateResponse,
+};
 
 use worker_runtime::identity::RuntimeWorkerRef;
 

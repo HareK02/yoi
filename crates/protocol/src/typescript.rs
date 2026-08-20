@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use ts_rs::{Config, TS};
 
 use crate::{
-    Alert, AlertLevel, AlertSource, CompletionEntry, CompletionKind, ErrorCode, Event, Greeting,
-    InFlightBlock, InFlightSnapshot, InFlightToolCallState, InternalWorkerKind, InternalWorkerRef,
+    Alert, AlertLevel, AlertSource, CommandEvent, CommandSnapshot, CommandStatus, CommandStream,
+    CommandStreamSlice, CompletionEntry, CompletionKind, ErrorCode, Event, Greeting, InFlightBlock,
+    InFlightSnapshot, InFlightToolCallState, InternalWorkerKind, InternalWorkerRef,
     InternalWorkerSnapshot, InvokeKind, MemoryWorkerEvent, Method, Permission, RewindSummary,
     RewindTarget, RewindTargetId, RunResult, ScopeRule, Segment, TurnResult, WorkerEvent,
     WorkerStatus,
@@ -47,6 +48,11 @@ pub fn generated_protocol_types() -> String {
     push_decl::<ErrorCode>(&cfg, &mut output);
     push_decl::<Permission>(&cfg, &mut output);
     push_decl::<InFlightToolCallState>(&cfg, &mut output);
+    push_decl::<CommandStatus>(&cfg, &mut output);
+    push_decl::<CommandStream>(&cfg, &mut output);
+    push_decl::<CommandStreamSlice>(&cfg, &mut output);
+    push_decl::<CommandSnapshot>(&cfg, &mut output);
+    push_decl::<CommandEvent>(&cfg, &mut output);
     push_decl::<ScopeRule>(&cfg, &mut output);
     push_decl::<CompletionEntry>(&cfg, &mut output);
     push_decl::<RewindTargetId>(&cfg, &mut output);

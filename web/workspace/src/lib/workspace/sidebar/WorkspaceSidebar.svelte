@@ -6,6 +6,7 @@
   import RepositoriesNavSection from './RepositoriesNavSection.svelte';
   import TicketsNavSection from './TicketsNavSection.svelte';
   import WorkersNavSection from './WorkersNavSection.svelte';
+  import WorkspaceSwitcher from './WorkspaceSwitcher.svelte';
   import type { RepositoryListResponse, WorkspaceResponse } from './types';
 
   type Props = {
@@ -75,6 +76,8 @@
       </a>
     </div>
   </header>
+
+  {#if workspaceId}<WorkspaceSwitcher currentWorkspaceId={workspaceId} />{/if}
 
   <nav class="sidebar-sections" aria-label="Workspace sections">
     <RepositoriesNavSection {repositories} {repositoriesError} {currentPath} {workspaceId} />

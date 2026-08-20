@@ -170,20 +170,27 @@ impl Tool for SubWorkerStopTool {
     ) -> Result<ToolOutput, ToolError> {
         let input: NameInput = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid SubWorkerStop input: {e}")))?;
-        if let Some(record) = self.registry.get_internal(&input.name) {
-            record.session.stop().await.map_err(|error| {
-                ToolError::ExecutionFailed(format!("stop `{}`: {error}", input.name))
-            })?;
-            self.registry
-                .remove_internal(&input.name)
-                .await
-                .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+        if let Some(summary) = self
+            .registry
+            .remove_internal(&input.name)
+            .await
+            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?
+        {
             return Ok(ToolOutput {
                 summary: format!(
-                    "stopped worker `{}` and reclaimed delegated scope",
-                    input.name
+                    "SubWorkerStop - done\n  {} tool kind{}\n  {}ms",
+                    summary.tool_counts.len(),
+                    if summary.tool_counts.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                    summary.elapsed_ms,
                 ),
-                content: None,
+                content: Some(
+                    serde_json::to_string(&summary)
+                        .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?,
+                ),
                 attachments: Vec::new(),
             });
         }

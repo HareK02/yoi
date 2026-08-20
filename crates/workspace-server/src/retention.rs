@@ -1066,6 +1066,11 @@ mod tests {
                  ) VALUES('w',?1,'r','one','builtin:coder','normal','created','rev1')",
                 [worker_id().to_string()],
             )?;
+            c.execute(
+                "INSERT INTO typed_tickets (workspace_id, ticket_id, slug, title, status, kind, priority, body, workflow_state, workflow_state_explicit) \
+                 VALUES ('w', 'ticket', 'ticket', 'Ticket', 'open', 'task', 'normal', '', 'planning', 1)",
+                [],
+            )?;
             Ok(())
         })
         .unwrap();
@@ -1249,7 +1254,11 @@ mod tests {
     fn purge_tombstone_commit_is_idempotent() {
         let s = setup();
         s.with_conn(|conn| {
+            conn.execute("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit) VALUES('w','ticket-old','ticket-old','Old Ticket','open','task','normal','','planning',1)", [])?;
+            conn.execute("INSERT INTO worker_registry(workspace_id,worker_id,runtime_id,display_name,profile,retention_state,created_at,updated_at) VALUES('w','1','r','old worker','builtin:coder','normal','created','rev1')", [])?;
             conn.execute("INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,runtime_id,worker_id,assigned_by,assigned_at) VALUES('w','ticket-old','assignment-old','r','1','test','t')", [])?;
+            conn.execute("DELETE FROM worker_registry WHERE workspace_id='w' AND runtime_id='r' AND worker_id='1'", [])?;
+            conn.execute("DELETE FROM typed_tickets WHERE workspace_id='w' AND ticket_id='ticket-old'", [])?;
             Ok(())
         }).unwrap();
         let p = s.plan_worker_removal(&req(), &inv()).unwrap();

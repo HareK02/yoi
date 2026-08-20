@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
 
 pub use delegation::{
     AppliedWorkdirDelegation, ReadOnlyWorkdirSession, WorkdirDelegation,
@@ -192,6 +193,19 @@ pub trait WorkdirSession: std::fmt::Debug + Send + Sync {
         request: CommandOutputRequest,
     ) -> Result<CommandOutput, WorkdirError>;
     async fn cancel_command(&self, handle: CommandHandle) -> Result<(), WorkdirError>;
+
+    /// Subscribe to bounded provider-owned command telemetry. Implementations
+    /// that do not expose live command observation may keep the default.
+    fn subscribe_command_events(&self) -> Option<broadcast::Receiver<CommandEvent>> {
+        None
+    }
+
+    /// Return the bounded current command state used to recover from a lagged
+    /// provider subscription without replaying command output into history.
+    fn command_snapshot(&self) -> Vec<CommandSnapshot> {
+        Vec::new()
+    }
+
     /// Terminal, idempotent release of this Worker-bound operation session.
     async fn close(&self) -> Result<(), WorkdirError>;
 }

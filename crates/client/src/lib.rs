@@ -10,6 +10,7 @@
 
 pub mod backend_auth;
 pub mod backend_runtime;
+pub mod backend_workspace;
 pub mod runtime_command;
 pub mod spawn;
 pub mod target;
@@ -27,6 +28,11 @@ pub use backend_runtime::{
     BackendWorkerRestoreResponse, BackendWorkerRestoreResult, BackendWorkerSummary,
     BackendWorkerWorkspaceSummary, BackendWorkingDirectorySummary, list_backend_stopped_workers,
     list_backend_workers, restore_backend_worker,
+};
+pub use backend_workspace::{
+    BackendWorkspace, BackendWorkspaceCatalogTarget, BackendWorkspaceClientError,
+    CreateBackendWorkspaceRepository, CreateBackendWorkspaceRequest,
+    CreateBackendWorkspaceResponse, create_backend_workspace, list_backend_workspaces,
 };
 pub use runtime_command::WorkerRuntimeCommand;
 pub use target::{
