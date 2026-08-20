@@ -175,7 +175,6 @@ pub(crate) trait VerifiedWorkerRemoveExecutor: Send + Sync {
         source: VerifiedWorkerMutationSource,
         target_runtime_id: &str,
         target_worker_id: &str,
-        expected_worker_revision: &str,
         reason: &str,
     ) -> Result<worker::WorkspaceResponse, String>;
 }
@@ -217,7 +216,6 @@ impl worker_runtime::worker_source::EmbeddedWorkerMutationDispatcher
         proof: InProcessWorkerMutationProof,
         target_runtime_id: &str,
         target_worker_id: &str,
-        expected_worker_revision: &str,
         reason: &str,
     ) -> Result<
         worker::WorkspaceResponse,
@@ -241,13 +239,7 @@ impl worker_runtime::worker_source::EmbeddedWorkerMutationDispatcher
             )
         })?;
         executor
-            .execute(
-                source,
-                target_runtime_id,
-                target_worker_id,
-                expected_worker_revision,
-                reason,
-            )
+            .execute(source, target_runtime_id, target_worker_id, reason)
             .map_err(worker_runtime::worker_source::RuntimeWorkerMutationForwardError::Embedded)
     }
 }

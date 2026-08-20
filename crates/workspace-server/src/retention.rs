@@ -59,7 +59,6 @@ pub struct WorkerRetentionPolicyUpdate {
 pub struct WorkerRemovalPlanRequest {
     pub workspace_id: String,
     pub worker: RuntimeWorkerRef,
-    pub expected_worker_revision: String,
     pub reason: String,
 }
 
@@ -154,8 +153,6 @@ pub enum WorkerRetentionError {
     WorkerNotFound,
     #[error("Worker belongs to a different Workspace")]
     CrossWorkspace,
-    #[error("Worker revision changed: expected {expected}, current {actual}")]
-    WorkerRevisionConflict { expected: String, actual: String },
     #[error("Worker removal is blocked: {0:?}")]
     Blocked(Vec<WorkerRemovalBlocker>),
     #[error("Worker removal plan {plan_id} is stale: {reason}")]
@@ -308,17 +305,16 @@ impl SqliteWorkspaceStore {
                     return Err(StoreError::InvalidInput(if other{"cross-workspace".into()}else{"worker-missing".into()}));
                 }
             };
-            if worker.updated_at!=req.expected_worker_revision { return Err(StoreError::InvalidInput(format!("worker-conflict:{}:{}",req.expected_worker_revision,worker.updated_at))); }
             let mut blockers=Vec::new();
             if worker.retention_state=="pinned" { blockers.push(WorkerRemovalBlocker::Hold); }
             if let Some((assignment_id,ticket_id))=tx.query_row("SELECT a.assignment_id,a.ticket_id FROM ticket_current_worker_assignments c JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.ticket_id=c.ticket_id AND a.assignment_id=c.assignment_id WHERE a.workspace_id=?1 AND a.runtime_id=?2 AND a.worker_id=?3",params![req.workspace_id,req.worker.runtime_id,req.worker.worker_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()? {
                 blockers.push(WorkerRemovalBlocker::CurrentAssignment{assignment_id,ticket_id});
             }
-            let fp=fingerprint(req,inv,&policy,&blockers)?;
+            let fp=fingerprint(req,&worker.updated_at,inv,&policy,&blockers)?;
             let plan_id=stable("wrp",&fp); let operation_id=stable("wro",&fp);
             let archive_id=(policy.session_disposition==SessionDisposition::Archive).then(||stable("wra",&fp));
             let state=if blockers.is_empty(){WorkerRemovalPlanState::Planned}else{WorkerRemovalPlanState::Blocked};
-            tx.execute("INSERT OR IGNORE INTO worker_removal_operations(operation_id,plan_id,input_fingerprint,workspace_id,runtime_id,worker_id,worker_revision,run_generation,policy_id,policy_revision,session_disposition,metadata_disposition,archive_retention_kind,archive_retention_seconds,diagnostics_disposition,diagnostics_retention_seconds,archive_id,blockers_json,state,reason,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?21)",params![operation_id,plan_id,fp,req.workspace_id,req.worker.runtime_id,req.worker.worker_id,req.expected_worker_revision,inv.run_generation,policy.policy_id,policy.revision,sess(policy.session_disposition),meta(policy.metadata_disposition),archive_kind(policy.archive_retention),archive_seconds(policy.archive_retention),diag(policy.diagnostics_disposition),policy.diagnostics_retention_seconds,archive_id,serde_json::to_string(&blockers).map_err(|e|StoreError::InvalidInput(e.to_string()))?,state_s(state),req.reason,now])?;
+            tx.execute("INSERT OR IGNORE INTO worker_removal_operations(operation_id,plan_id,input_fingerprint,workspace_id,runtime_id,worker_id,worker_revision,run_generation,policy_id,policy_revision,session_disposition,metadata_disposition,archive_retention_kind,archive_retention_seconds,diagnostics_disposition,diagnostics_retention_seconds,archive_id,blockers_json,state,reason,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?21)",params![operation_id,plan_id,fp,req.workspace_id,req.worker.runtime_id,req.worker.worker_id,worker.updated_at,inv.run_generation,policy.policy_id,policy.revision,sess(policy.session_disposition),meta(policy.metadata_disposition),archive_kind(policy.archive_retention),archive_seconds(policy.archive_retention),diag(policy.diagnostics_disposition),policy.diagnostics_retention_seconds,archive_id,serde_json::to_string(&blockers).map_err(|e|StoreError::InvalidInput(e.to_string()))?,state_s(state),req.reason,now])?;
             let plan=load_plan(&tx,&plan_id)?.ok_or_else(||StoreError::InvalidInput("plan missing".into()))?;
             if plan.input_fingerprint!=fp{return Err(StoreError::InvalidInput(format!("fingerprint:{}",plan.operation_id)));}
             tx.commit()?; Ok(plan)
@@ -422,27 +418,22 @@ impl SqliteWorkspaceStore {
         &self,
         workspace_id: &str,
         worker: &RuntimeWorkerRef,
-        expected_worker_revision: &str,
-        reason: &str,
     ) -> Result<Option<PreparedWorkerRemoval>, WorkerRetentionError> {
         bounded("workspace", workspace_id, 160)?;
-        bounded("revision", expected_worker_revision, 256)?;
-        bounded("reason", reason, 512)?;
         let plan = self.with_conn(|conn| {
             conn.query_row(
                 "SELECT plan_id FROM worker_removal_operations
                  WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3
-                   AND worker_revision=?4 AND reason=?5
-                   AND state IN ('executing','failed','succeeded')
+                   AND state IN ('planned','executing','failed','succeeded')
+                   AND (
+                     state='succeeded' OR worker_revision=(
+                       SELECT updated_at FROM worker_registry
+                       WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3
+                     )
+                   )
                  ORDER BY CASE state WHEN 'succeeded' THEN 0 ELSE 1 END,
                           created_at DESC LIMIT 1",
-                params![
-                    workspace_id,
-                    worker.runtime_id,
-                    worker.worker_id,
-                    expected_worker_revision,
-                    reason,
-                ],
+                params![workspace_id, worker.runtime_id, worker.worker_id],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -848,6 +839,7 @@ fn stale_error(plan: &WorkerRemovalPlan, reason: &str) -> StoreError {
 }
 fn fingerprint(
     r: &WorkerRemovalPlanRequest,
+    worker_revision: &str,
     i: &WorkerRetentionInventory,
     p: &WorkerRetentionPolicy,
     b: &[WorkerRemovalBlocker],
@@ -856,7 +848,7 @@ fn fingerprint(
         r.workspace_id,
         r.worker.runtime_id,
         r.worker.worker_id,
-        r.expected_worker_revision,
+        worker_revision,
         i.run_generation,
         i.session_id,
         i.segment_ids,
@@ -887,7 +879,6 @@ fn validate_plan(
     i: &WorkerRetentionInventory,
 ) -> Result<(), WorkerRetentionError> {
     bounded("workspace", &r.workspace_id, 160)?;
-    bounded("revision", &r.expected_worker_revision, 256)?;
     bounded("reason", &r.reason, 2000)?;
     if i.workspace_id != r.workspace_id
         || i.runtime_id != r.worker.runtime_id
@@ -946,13 +937,6 @@ fn map_error(e: StoreError) -> WorkerRetentionError {
     }
     if m == "worker-missing" {
         return WorkerRetentionError::WorkerNotFound;
-    }
-    if let Some(x) = m.strip_prefix("worker-conflict:") {
-        let mut s = x.splitn(2, ':');
-        return WorkerRetentionError::WorkerRevisionConflict {
-            expected: s.next().unwrap_or_default().into(),
-            actual: s.next().unwrap_or_default().into(),
-        };
     }
     if let Some(x) = m.strip_prefix("fingerprint:") {
         return WorkerRetentionError::OperationFingerprintConflict {
@@ -1106,7 +1090,6 @@ mod tests {
                 runtime_id: "r".into(),
                 worker_id: worker_id().to_string(),
             },
-            expected_worker_revision: "rev1".into(),
             reason: "cleanup".into(),
         }
     }
@@ -1141,6 +1124,7 @@ mod tests {
         let a = s.plan_worker_removal(&req(), &inv()).unwrap();
         let b = s.plan_worker_removal(&req(), &inv()).unwrap();
         assert_eq!(a.plan_id, b.plan_id);
+        assert_eq!(a.worker_revision, "rev1");
         s.with_conn(|c| {
             c.execute(
                 "UPDATE worker_registry SET retention_state='pinned' WHERE workspace_id='w'",
@@ -1149,9 +1133,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        let mut q = req();
-        q.expected_worker_revision = "rev1".into();
-        let p = s.plan_worker_removal(&q, &inv()).unwrap();
+        let p = s.plan_worker_removal(&req(), &inv()).unwrap();
         assert_eq!(p.blockers, vec![WorkerRemovalBlocker::Hold]);
         assert!(matches!(
             s.begin_worker_removal("w", &p.plan_id, &p.input_fingerprint),
@@ -1572,6 +1554,77 @@ mod tests {
     }
 
     #[test]
+    fn worker_removal_recovery_is_target_keyed_and_preserves_original_reason() {
+        let store = setup();
+        let request = req();
+        let plan = store.plan_worker_removal(&request, &inv()).unwrap();
+        let recovered_planned = store
+            .recover_worker_removal_execution("w", &request.worker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovered_planned.plan.state,
+            WorkerRemovalPlanState::Planned
+        );
+        assert_eq!(recovered_planned.plan.plan_id, plan.plan_id);
+        store
+            .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
+            .unwrap();
+        store
+            .fail_worker_removal(
+                "w",
+                &plan.operation_id,
+                &plan.input_fingerprint,
+                "runtime_remove_failed",
+            )
+            .unwrap();
+
+        let recovered = store
+            .recover_worker_removal_execution("w", &request.worker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.plan.plan_id, plan.plan_id);
+        assert_eq!(recovered.plan.reason, request.reason);
+    }
+
+    #[test]
+    fn stale_failed_removal_is_not_recovered_after_worker_authority_changes() {
+        let store = setup();
+        let request = req();
+        let plan = store.plan_worker_removal(&request, &inv()).unwrap();
+        store
+            .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
+            .unwrap();
+        store
+            .fail_worker_removal(
+                "w",
+                &plan.operation_id,
+                &plan.input_fingerprint,
+                "runtime_remove_failed",
+            )
+            .unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE worker_registry SET updated_at='rev2' WHERE workspace_id='w' AND runtime_id='r' AND worker_id=?1",
+                    [worker_id().to_string()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(
+            store
+                .recover_worker_removal_execution("w", &request.worker)
+                .unwrap()
+                .is_none()
+        );
+        let replacement = store.plan_worker_removal(&request, &inv()).unwrap();
+        assert_eq!(replacement.worker_revision, "rev2");
+        assert_ne!(replacement.plan_id, plan.plan_id);
+    }
+
+    #[test]
     fn succeeded_worker_removal_recovers_after_registry_purge() {
         let s = setup();
         let request = req();
@@ -1623,18 +1676,13 @@ mod tests {
                 .is_none()
         );
         let recovered = s
-            .recover_worker_removal_execution(
-                "w",
-                &request.worker,
-                &request.expected_worker_revision,
-                &request.reason,
-            )
+            .recover_worker_removal_execution("w", &request.worker)
             .unwrap()
             .unwrap();
         assert_eq!(recovered.plan.state, WorkerRemovalPlanState::Succeeded);
         assert_eq!(
             recovered.runtime_request.expected_worker_revision,
-            request.expected_worker_revision
+            plan.worker_revision
         );
     }
 
@@ -1653,12 +1701,7 @@ mod tests {
         )
         .unwrap();
         let recovered = s
-            .recover_worker_removal_execution(
-                "w",
-                &request.worker,
-                &request.expected_worker_revision,
-                &request.reason,
-            )
+            .recover_worker_removal_execution("w", &request.worker)
             .unwrap()
             .unwrap();
         assert_eq!(

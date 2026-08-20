@@ -330,7 +330,6 @@ impl WorkspaceWorkerRemoveExecutor {
         source: crate::worker_source::VerifiedWorkerMutationSource,
         target_runtime_id: &str,
         target_worker_id: &str,
-        expected_worker_revision: &str,
         reason: &str,
     ) -> std::result::Result<worker::WorkspaceResponse, String> {
         let reason = reason.trim();
@@ -428,73 +427,63 @@ impl WorkspaceWorkerRemoveExecutor {
 
         let prepared = self
             .store
-            .recover_worker_removal_execution(
-                &self.workspace_id,
-                &target,
-                expected_worker_revision,
-                reason,
-            )
+            .recover_worker_removal_execution(&self.workspace_id, &target)
             .map_err(|_| "Worker removal recovery authority is unavailable".to_string())?;
         if let Some(prepared) = prepared {
             if prepared.plan.state == crate::retention::WorkerRemovalPlanState::Succeeded {
                 return Ok(worker_remove_success_response(&target));
             }
-            let must_close_session =
-                prepared.prior_failure_category.as_deref() == Some("workdir_session_close_failed");
-            let must_release_attachment = must_close_session
-                || prepared.prior_failure_category.as_deref()
-                    == Some("workdir_attachment_release_failed");
-            let prepared =
-                if prepared.plan.state == crate::retention::WorkerRemovalPlanState::Failed {
-                    match self.store.prepare_worker_removal_execution(
-                        &self.workspace_id,
-                        &prepared.plan.plan_id,
-                        &prepared.plan.input_fingerprint,
-                    ) {
-                        Ok(prepared) => prepared,
-                        Err(error) => return Ok(worker_retention_error_response(error)),
-                    }
-                } else {
-                    prepared
-                };
-            if must_close_session {
-                let session = {
-                    self.workdir_sessions
-                        .lock()
-                        .map_err(|_| "Workdir session registry was poisoned".to_string())?
-                        .get(&target)
-                        .cloned()
-                };
-                if let Some(session) = session {
-                    if session.close().await.is_err() {
-                        let _ = self.store.fail_worker_removal(
-                            &self.workspace_id,
-                            &prepared.plan.operation_id,
-                            &prepared.plan.input_fingerprint,
-                            "workdir_session_close_failed",
-                        );
-                        return Ok(worker_remove_error_response(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "attachment_close_failed",
-                            "Worker Workdir session could not be closed; removal can be retried",
-                        ));
-                    }
-                    self.workdir_sessions
-                        .lock()
-                        .map_err(|_| "Workdir session registry was poisoned".to_string())?
-                        .remove(&target);
+            let prepared = if matches!(
+                prepared.plan.state,
+                crate::retention::WorkerRemovalPlanState::Planned
+                    | crate::retention::WorkerRemovalPlanState::Failed
+            ) {
+                match self.store.prepare_worker_removal_execution(
+                    &self.workspace_id,
+                    &prepared.plan.plan_id,
+                    &prepared.plan.input_fingerprint,
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(error) => return Ok(worker_retention_error_response(error)),
                 }
-            }
-            if must_release_attachment
-                && self
-                    .store
-                    .detach_worker_workdir(
+            } else {
+                prepared
+            };
+            let session = {
+                self.workdir_sessions
+                    .lock()
+                    .map_err(|_| "Workdir session registry was poisoned".to_string())?
+                    .get(&target)
+                    .cloned()
+            };
+            if let Some(session) = session {
+                if session.close().await.is_err() {
+                    let _ = self.store.fail_worker_removal(
                         &self.workspace_id,
-                        &target,
-                        None,
-                        &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-                    )
-                    .is_err()
+                        &prepared.plan.operation_id,
+                        &prepared.plan.input_fingerprint,
+                        "workdir_session_close_failed",
+                    );
+                    return Ok(worker_remove_error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "attachment_close_failed",
+                        "Worker Workdir session could not be closed; removal can be retried",
+                    ));
+                }
+                self.workdir_sessions
+                    .lock()
+                    .map_err(|_| "Workdir session registry was poisoned".to_string())?
+                    .remove(&target);
+            }
+            if self
+                .store
+                .detach_worker_workdir(
+                    &self.workspace_id,
+                    &target,
+                    None,
+                    &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                )
+                .is_err()
             {
                 let _ = self.store.fail_worker_removal(
                     &self.workspace_id,
@@ -551,7 +540,6 @@ impl WorkspaceWorkerRemoveExecutor {
         let request = crate::retention::WorkerRemovalPlanRequest {
             workspace_id: self.workspace_id.clone(),
             worker: target.clone(),
-            expected_worker_revision: expected_worker_revision.to_string(),
             reason: reason.to_string(),
         };
         let plan = match self.store.plan_worker_removal(&request, &inventory) {
@@ -656,13 +644,11 @@ impl crate::worker_source::VerifiedWorkerRemoveExecutor for WorkspaceWorkerRemov
         source: crate::worker_source::VerifiedWorkerMutationSource,
         target_runtime_id: &str,
         target_worker_id: &str,
-        expected_worker_revision: &str,
         reason: &str,
     ) -> std::result::Result<worker::WorkspaceResponse, String> {
         let executor = self.clone();
         let target_runtime_id = target_runtime_id.to_string();
         let target_worker_id = target_worker_id.to_string();
-        let expected_worker_revision = expected_worker_revision.to_string();
         let reason = reason.to_string();
         std::thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread()
@@ -673,7 +659,6 @@ impl crate::worker_source::VerifiedWorkerRemoveExecutor for WorkspaceWorkerRemov
                     source,
                     &target_runtime_id,
                     &target_worker_id,
-                    &expected_worker_revision,
                     &reason,
                 ))
         })
@@ -6145,14 +6130,13 @@ fn worker_retention_error_response(
             "worker_not_found",
             "Worker was not found in this Workspace",
         ),
-        crate::retention::WorkerRetentionError::WorkerRevisionConflict { .. }
-        | crate::retention::WorkerRetentionError::PolicyRevisionConflict { .. }
+        crate::retention::WorkerRetentionError::PolicyRevisionConflict { .. }
         | crate::retention::WorkerRetentionError::StalePlan { .. }
         | crate::retention::WorkerRetentionError::OperationFingerprintConflict { .. } => {
             worker_remove_error_response(
                 StatusCode::CONFLICT,
-                "worker_revision_conflict",
-                "Worker removal state changed; reread the Worker and retry",
+                "worker_removal_conflict",
+                "Worker removal state changed; retry the operation",
             )
         }
         crate::retention::WorkerRetentionError::Blocked(_) => worker_remove_error_response(
@@ -6179,7 +6163,6 @@ fn worker_retention_error_response(
 struct WorkerRemoveBoundaryRequest {
     target_runtime_id: String,
     target_worker_id: String,
-    expected_worker_revision: String,
     reason: String,
 }
 
@@ -6217,7 +6200,6 @@ async fn scoped_worker_remove_source_boundary(
                     source,
                     &request.target_runtime_id,
                     &request.target_worker_id,
-                    &request.expected_worker_revision,
                     &request.reason,
                 )
                 .await
@@ -15674,7 +15656,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let app = build_router(test_api(temp.path()).await);
-        let body = r#"{"target_runtime_id":"runtime-target","target_worker_id":"target-worker","expected_worker_revision":"revision-1","reason":"retire target Worker"}"#;
+        let body = r#"{"target_runtime_id":"runtime-target","target_worker_id":"target-worker","reason":"retire target Worker"}"#;
         let browser = app
             .clone()
             .oneshot(
@@ -15791,7 +15773,6 @@ mod tests {
                 fresh_proof,
                 "runtime-target",
                 "target-worker",
-                "revision-1",
                 "retire target Worker",
             )
             .unwrap_err();
@@ -15799,7 +15780,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_remove_rejects_self_running_and_stale_revision_at_caller_boundary() {
+    async fn worker_remove_rejects_self_and_running_at_caller_boundary() {
         let temp = tempfile::tempdir().unwrap();
         let api = test_api(temp.path()).await;
         let Json(orchestrator) = scoped_start_workspace_orchestrator(
@@ -15824,7 +15805,6 @@ mod tests {
                 verified_source(),
                 &source.runtime_id,
                 &source.worker_id,
-                "irrelevant",
                 "must reject self",
             )
             .await
@@ -15866,37 +15846,12 @@ mod tests {
                 verified_source(),
                 &target.runtime_id,
                 &target.worker_id,
-                "irrelevant",
                 "must reject a live Worker",
             )
             .await
             .unwrap();
         assert_eq!(running_response.status, StatusCode::CONFLICT.as_u16());
         assert!(running_response.body.contains("worker_not_stopped"));
-
-        api.runtime
-            .stop_worker(
-                &target,
-                WorkerLifecycleRequest {
-                    reason: Some("prepare stale revision guard".to_string()),
-                    ticket_assignment: None,
-                },
-            )
-            .unwrap();
-        let summary = api.runtime.worker(&target).unwrap();
-        let record = sync_worker_observation(&api, &summary).unwrap();
-        let stale_response = executor
-            .execute_async(
-                verified_source(),
-                &target.runtime_id,
-                &target.worker_id,
-                &format!("{}-stale", record.updated_at),
-                "must reject stale revision",
-            )
-            .await
-            .unwrap();
-        assert_eq!(stale_response.status, StatusCode::CONFLICT.as_u16());
-        assert!(stale_response.body.contains("worker_revision_conflict"));
     }
 
     #[tokio::test]
@@ -15970,7 +15925,7 @@ mod tests {
         )
         .unwrap();
         let summary = api.runtime.worker(&target).unwrap();
-        let record = sync_worker_observation(&api, &summary).unwrap();
+        sync_worker_observation(&api, &summary).unwrap();
         seed_worker_control_grant(&api, &source, &target, "embedded-valid-proof");
 
         let response = WorkspaceWorkerRemoveExecutor::new(&api)
@@ -15984,7 +15939,6 @@ mod tests {
                 },
                 &target.runtime_id,
                 &target.worker_id,
-                &record.updated_at,
                 "retire completed Worker",
             )
             .await
@@ -16182,7 +16136,7 @@ mod tests {
                         route_token,
                     )
                     .body(Body::from(
-                        r#"{"target_runtime_id":"runtime-target","target_worker_id":"target-worker","expected_worker_revision":"revision-1","reason":"retire target Worker"}"#,
+                        r#"{"target_runtime_id":"runtime-target","target_worker_id":"target-worker","reason":"retire target Worker"}"#,
                     ))
                     .unwrap(),
             )
