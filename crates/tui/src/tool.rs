@@ -6,6 +6,8 @@
 //! `Read`) consume multiple consecutive blocks to produce a single
 //! aggregate display.
 
+use std::collections::BTreeMap;
+
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -38,6 +40,9 @@ pub fn render_tool(
             consumed: 1,
         };
     };
+    if mode == Mode::Overview {
+        return render_overview_activity(blocks, start);
+    }
 
     match tc.name.as_str() {
         "Read" => render_read_aggregate(blocks, start, mode),
@@ -46,6 +51,154 @@ pub fn render_tool(
         "Glob" => single(render_search(tc, mode, "Glob")),
         "Grep" => single(render_search(tc, mode, "Grep")),
         _ => single(render_default(tc, mode)),
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ActivityCount {
+    total: usize,
+    active: bool,
+}
+
+impl ActivityCount {
+    fn add(&mut self, state: &ToolCallState) {
+        self.total += 1;
+        self.active |= matches!(
+            state,
+            ToolCallState::Pending | ToolCallState::Streaming | ToolCallState::Executing
+        );
+    }
+}
+
+fn render_overview_activity(blocks: &[Block], start: usize) -> ToolRenderOutput {
+    let mut end = start;
+    let mut tools = Vec::new();
+    while let Some(block) = blocks.get(end) {
+        match block {
+            Block::ToolCall(tool) => tools.push(tool),
+            Block::Thinking(_) | Block::TaskReminder { .. } => {}
+            _ => break,
+        }
+        end += 1;
+    }
+
+    let mut reads = ActivityCount::default();
+    let mut searches = ActivityCount::default();
+    let mut commands = ActivityCount::default();
+    let mut edits = ActivityCount::default();
+    let mut writes = ActivityCount::default();
+    let mut additions = 0;
+    let mut deletions = 0;
+    let mut failed = 0;
+    let mut incomplete = 0;
+    let mut others = BTreeMap::<String, ActivityCount>::new();
+
+    for tool in tools {
+        if matches!(tool.state, ToolCallState::Error { .. }) {
+            failed += 1;
+        }
+        if matches!(tool.state, ToolCallState::Incomplete) {
+            incomplete += 1;
+        }
+        match tool.name.as_str() {
+            "Read" => reads.add(&tool.state),
+            "Glob" | "Grep" | "WebSearch" | "SearchSessionEntries" => searches.add(&tool.state),
+            "Bash" => commands.add(&tool.state),
+            "Edit" => {
+                edits.add(&tool.state);
+                if matches!(tool.state, ToolCallState::Done { .. })
+                    && let Some(arguments) = tool.arguments.as_deref()
+                    && let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments)
+                {
+                    if let Some(old) = args.get("old_string").and_then(|value| value.as_str()) {
+                        deletions += old.lines().count().max(1);
+                    }
+                    if let Some(new) = args.get("new_string").and_then(|value| value.as_str()) {
+                        additions += new.lines().count().max(1);
+                    }
+                }
+            }
+            "Write" => writes.add(&tool.state),
+            name => others.entry(name.to_owned()).or_default().add(&tool.state),
+        }
+    }
+
+    let mut primary = Vec::new();
+    if reads.total > 0 {
+        primary.push(if reads.active {
+            format!("reading {} file{}", reads.total, plural(reads.total))
+        } else {
+            format!("{} file{} read", reads.total, plural(reads.total))
+        });
+    }
+    if searches.total > 0 {
+        primary.push(if searches.active {
+            format!(
+                "searching {} time{}",
+                searches.total,
+                plural(searches.total)
+            )
+        } else {
+            format!("searched {} time{}", searches.total, plural(searches.total))
+        });
+    }
+    if commands.total > 0 {
+        primary.push(if commands.active {
+            format!(
+                "running {} command{}",
+                commands.total,
+                plural(commands.total)
+            )
+        } else {
+            format!("ran {} command{}", commands.total, plural(commands.total))
+        });
+    }
+    for (name, count) in others {
+        primary.push(if count.total == 1 {
+            name
+        } else {
+            format!("{} {name}", count.total)
+        });
+    }
+
+    let mut summary = Vec::new();
+    if !primary.is_empty() {
+        summary.push(primary.join("・"));
+    }
+    if edits.total > 0 {
+        summary.push(if edits.active {
+            format!("editing {} file{}", edits.total, plural(edits.total))
+        } else if additions > 0 || deletions > 0 {
+            format!("edited +{additions}/-{deletions}")
+        } else {
+            format!("edited {} file{}", edits.total, plural(edits.total))
+        });
+    }
+    if writes.total > 0 {
+        summary.push(if writes.active {
+            format!("writing {} file{}", writes.total, plural(writes.total))
+        } else {
+            format!("wrote {} file{}", writes.total, plural(writes.total))
+        });
+    }
+    if failed > 0 {
+        summary.push(format!("{failed} failed"));
+    }
+    if incomplete > 0 {
+        summary.push(format!("{incomplete} incomplete"));
+    }
+
+    let color = if failed > 0 {
+        Color::Red
+    } else {
+        Color::DarkGray
+    };
+    ToolRenderOutput {
+        lines: summary
+            .into_iter()
+            .map(|text| Line::from(Span::styled(text, Style::default().fg(color))))
+            .collect(),
+        consumed: end.saturating_sub(start).max(1),
     }
 }
 

@@ -2260,10 +2260,13 @@ impl App {
             }
             session_store::SystemItem::FileAttachment { body, .. }
             | session_store::SystemItem::SkillActivation { body, .. }
-            | session_store::SystemItem::TaskReminder { body, .. }
             | session_store::SystemItem::Interrupt { body, .. } => {
                 self.task_store.apply_system_message_text(&body);
                 self.blocks.push(Block::SystemMessage { text: body });
+            }
+            session_store::SystemItem::TaskReminder { body, .. } => {
+                self.task_store.apply_system_message_text(&body);
+                self.blocks.push(Block::TaskReminder { text: body });
             }
             session_store::SystemItem::LegacyIgnored { .. } => {}
             session_store::SystemItem::LegacyKnowledgeIgnored { .. } => {}
@@ -2609,6 +2612,7 @@ mod rewind_refresh_tests {
         app.blocks.iter().any(|block| match block {
             Block::AssistantText { text }
             | Block::SystemMessage { text }
+            | Block::TaskReminder { text }
             | Block::Alert { message: text, .. } => text.contains(needle),
             Block::UserMessage { segments } => Segment::flatten_to_text(segments).contains(needle),
             _ => false,
@@ -3847,6 +3851,10 @@ mod completion_flow_tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].taskid, 4);
         assert_eq!(tasks[0].subject, "from snapshot");
+        assert!(matches!(
+            app.blocks.last(),
+            Some(Block::TaskReminder { text }) if text == snapshot
+        ));
     }
 
     #[test]

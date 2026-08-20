@@ -344,6 +344,12 @@ pub fn compute_history(app: &App, width: u16) -> HistoryLayout {
     let mut i = 0;
     while i < app.blocks.len() {
         let block = &app.blocks[i];
+        if app.mode == Mode::Overview
+            && matches!(block, Block::TaskReminder { .. } | Block::Thinking(_))
+        {
+            i += 1;
+            continue;
+        }
         let current_selectable = block_is_selectable_text(block);
         if !first {
             // Preserve a deterministic blank-line separator when copying
@@ -885,7 +891,10 @@ fn highlight_line_selection(line: &Line<'static>, start: usize, end: usize) -> L
 fn block_is_selectable_text(block: &Block) -> bool {
     matches!(
         block,
-        Block::UserMessage { .. } | Block::SystemMessage { .. } | Block::AssistantText { .. }
+        Block::UserMessage { .. }
+            | Block::SystemMessage { .. }
+            | Block::TaskReminder { .. }
+            | Block::AssistantText { .. }
     )
 }
 
@@ -909,6 +918,7 @@ fn render_block_into(lines: &mut Vec<Line<'static>>, block: &Block, width: u16, 
         }
         Block::UserMessage { segments } => render_user_message(lines, segments, width, mode),
         Block::SystemMessage { text } => render_system_message(lines, text, width, mode),
+        Block::TaskReminder { text } => render_task_reminder(lines, text, width, mode),
         Block::Notify { message } => {
             let text = format!("[notify] {message}");
             match mode {
@@ -1072,6 +1082,33 @@ fn render_system_message(lines: &mut Vec<Line<'static>>, text: &str, width: u16,
                         format!("… ({} more lines)", preview.omitted_lines),
                         body_style.add_modifier(Modifier::ITALIC),
                     ),
+                ]));
+            }
+        }
+    }
+}
+
+fn render_task_reminder(lines: &mut Vec<Line<'static>>, text: &str, width: u16, mode: Mode) {
+    match mode {
+        Mode::Overview => {}
+        Mode::Normal => {
+            let first = text
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("");
+            let summary = format!("task reminder: {first}");
+            push_overview_line(lines, &summary, width, MessageKind::System, "");
+        }
+        Mode::Detail => {
+            lines.push(Line::from(Span::styled(
+                "task reminder",
+                kind_style(MessageKind::System),
+            )));
+            let body_style = Style::default().fg(Color::DarkGray);
+            for raw in text.lines() {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", body_style),
+                    Span::styled(raw.to_owned(), body_style),
                 ]));
             }
         }
@@ -1944,6 +1981,7 @@ fn format_worker_event(event: &WorkerEvent) -> String {
 mod tests {
     use super::*;
     use crate::app::{ActionbarNoticeLevel, ActionbarNoticeSource, App};
+    use crate::block::{ToolCallBlock, ToolCallState};
     use protocol::WorkerStatus;
     use std::time::{Duration, Instant};
 
@@ -2030,6 +2068,92 @@ mod tests {
             .into_iter()
             .map(|row| row.text)
             .collect()
+    }
+
+    #[test]
+    fn overview_omits_task_reminders_without_leaving_a_gap() {
+        let mut app = App::new("worker".to_string());
+        app.mode = Mode::Overview;
+        app.blocks = vec![
+            Block::AssistantText {
+                text: "before".to_string(),
+            },
+            Block::TaskReminder {
+                text: "Current session steps are listed below.\nsecond line".to_string(),
+            },
+            Block::AssistantText {
+                text: "after".to_string(),
+            },
+        ];
+
+        assert_eq!(row_texts(&app), ["before", "", "after"]);
+    }
+
+    #[test]
+    fn normal_renders_task_reminder_as_one_summary_line() {
+        let mut app = App::new("worker".to_string());
+        app.mode = Mode::Normal;
+        app.blocks = vec![Block::TaskReminder {
+            text: "Current session steps are listed below.\nsecond line".to_string(),
+        }];
+
+        assert_eq!(
+            row_texts(&app),
+            ["task reminder: Current session steps are listed below."]
+        );
+    }
+
+    fn done_tool(id: &str, name: &str, arguments: Option<&str>) -> Block {
+        Block::ToolCall(ToolCallBlock {
+            id: id.to_string(),
+            name: name.to_string(),
+            args_stream: String::new(),
+            arguments: arguments.map(str::to_string),
+            state: ToolCallState::Done {
+                summary: "done".to_string(),
+                output: None,
+            },
+            edit_snapshot: None,
+        })
+    }
+
+    #[test]
+    fn overview_aggregates_tools_across_hidden_thinking() {
+        let mut app = App::new("worker".to_string());
+        app.mode = Mode::Overview;
+        app.blocks = vec![
+            done_tool("read", "Read", Some(r#"{"file_path":"a.rs"}"#)),
+            finished_thinking("private reasoning"),
+            done_tool("bash", "Bash", Some(r#"{"command":"cargo check"}"#)),
+            done_tool(
+                "edit",
+                "Edit",
+                Some(r#"{"old_string":"old","new_string":"new\nnext"}"#),
+            ),
+        ];
+
+        assert_eq!(
+            row_texts(&app),
+            ["1 file read・ran 1 command", "edited +2/-1"]
+        );
+    }
+
+    #[test]
+    fn overview_starts_a_new_activity_after_visible_output() {
+        let mut app = App::new("worker".to_string());
+        app.mode = Mode::Overview;
+        app.blocks = vec![
+            done_tool("read", "Read", None),
+            Block::AssistantText {
+                text: "finding".to_string(),
+            },
+            done_tool("bash", "Bash", None),
+        ];
+
+        assert_eq!(
+            row_texts(&app),
+            ["1 file read", "", "finding", "", "ran 1 command"]
+        );
     }
 
     fn finished_thinking(text: &str) -> Block {

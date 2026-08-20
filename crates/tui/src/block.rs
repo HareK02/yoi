@@ -25,6 +25,11 @@ pub enum Block {
     SystemMessage {
         text: String,
     },
+    /// Typed task reminder. Its presentation depends on the selected history
+    /// mode rather than exposing the full reminder in compact views.
+    TaskReminder {
+        text: String,
+    },
     /// Echo of `Method::Notify` received by this Worker, surfaced as a log
     /// element so subscribers see the external input that drove any
     /// following auto-kicked turn.
