@@ -20,7 +20,8 @@ The Workspace Server owns one control-plane SQLite database. Schema changes are 
 Start exactly one instance of the new Server binary against the database. Startup applies migration 39 in one SQLite transaction after the Ticket and Merge Request component schemas are available. The migration:
 
 - rebuilds Ticket, Objective, assignment, Artifact, and human-key tables with Workspace-scoped composite identity;
-- adds composite foreign keys for repository, Ticket, Objective, Worker, relation-target, and assignment references;
+- adds composite foreign keys for repository, Ticket, Objective, Worker, relation-target, and current-assignment references;
+- validates new historical assignment/event references with SQLite triggers while allowing those audit rows to survive later Ticket or Worker retention deletion; reservation operation ids remain intentionally unconstrained until their resources exist;
 - checks the rebuilt schema with `PRAGMA foreign_key_check` before recording the schema version; and
 - restores `PRAGMA foreign_keys = ON` whether the transaction commits or rolls back.
 
