@@ -2843,12 +2843,6 @@ mod tests {
         write_ticket(dir.path(), "00000000001J5", "Second ticket", "planning");
         write_ticket(dir.path(), "00000000001J6", "Third ticket", "planning");
         let db_path = dir.path().join("workspace.db");
-        SqliteTicketBackend::open(&db_path, "workspace-test")
-            .unwrap()
-            .import_from_local_backend(&ticket::LocalTicketBackend::new(
-                dir.path().join(".yoi/tickets"),
-            ))
-            .unwrap();
         let store = SqliteWorkspaceStore::open(&db_path).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
@@ -2860,6 +2854,27 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
             })
             .await
+            .unwrap();
+        SqliteTicketBackend::open(&db_path, "workspace-test")
+            .unwrap()
+            .import_from_local_backend(&ticket::LocalTicketBackend::new(
+                dir.path().join(".yoi/tickets"),
+            ))
+            .unwrap();
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute_batch(
+                r#"
+INSERT INTO workspace_resource_human_keys (
+    workspace_id, resource_kind, resource_id, sequence, human_key, allocated_at
+) VALUES
+    ('workspace-test', 'ticket', '00000000001J2', 1, 'T-1', '2026-01-01T00:00:00Z'),
+    ('workspace-test', 'ticket', '00000000001J5', 2, 'T-2', '2026-01-01T00:00:00Z'),
+    ('workspace-test', 'ticket', '00000000001J6', 3, 'T-3', '2026-01-01T00:00:00Z');
+INSERT INTO workspace_resource_human_key_counters (workspace_id, resource_kind, next_sequence)
+VALUES ('workspace-test', 'ticket', 4);
+"#,
+            )
             .unwrap();
         store
             .upsert_objective(&ObjectiveRecord {
@@ -3215,6 +3230,26 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
             })
             .await
+            .unwrap();
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute_batch(
+                r#"
+INSERT INTO typed_tickets (
+    workspace_id, ticket_id, slug, title, status, kind, priority, body,
+    workflow_state, workflow_state_explicit
+) VALUES
+    ('workspace-test', '00000000001J2', 'ticket-j2', 'Ticket J2', 'open', 'task', 'normal', '', 'planning', 1),
+    ('workspace-test', '00000000001J3', 'ticket-j3', 'Ticket J3', 'open', 'task', 'normal', '', 'planning', 1);
+INSERT INTO workspace_resource_human_keys (
+    workspace_id, resource_kind, resource_id, sequence, human_key, allocated_at
+) VALUES
+    ('workspace-test', 'ticket', '00000000001J2', 1, 'T-1', '2026-01-01T00:00:00Z'),
+    ('workspace-test', 'ticket', '00000000001J3', 2, 'T-2', '2026-01-01T00:00:00Z');
+INSERT INTO workspace_resource_human_key_counters (workspace_id, resource_kind, next_sequence)
+VALUES ('workspace-test', 'ticket', 3);
+"#,
+            )
             .unwrap();
         let authority = SqliteWorkspaceAuthority::new(&db_path, "workspace-test").unwrap();
 
