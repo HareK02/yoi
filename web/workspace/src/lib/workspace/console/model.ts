@@ -1,5 +1,8 @@
 import type {
   Alert,
+  CommandEvent,
+  CommandSnapshot,
+  CommandStreamSlice,
   Event as ProtocolEvent,
   InFlightBlock,
   InFlightToolCallState,
@@ -42,6 +45,7 @@ type ToolCallView = {
   output?: string | null;
   isError?: boolean;
   cwd?: string | null;
+  command?: CommandSnapshot;
 };
 
 export type ConsoleDiffLine = {
@@ -239,6 +243,126 @@ function appendSnapshotInFlightLines(
   });
 }
 
+const COMMAND_STREAM_DISPLAY_BYTES = 32 * 1024;
+
+function appendSnapshotCommands(
+  projection: ConsoleProjection,
+  commands: CommandSnapshot[],
+  eventId: string,
+): void {
+  commands.forEach((command) => upsertCommandSnapshot(projection, eventId, command));
+}
+
+function upsertCommandSnapshot(
+  projection: ConsoleProjection,
+  eventId: string,
+  command: CommandSnapshot,
+): void {
+  const toolCallId = command.tool_call_id ?? `command:${command.command_id}`;
+  const existingIndex = findToolCallLineIndex(projection, toolCallId);
+  const existing = existingIndex >= 0
+    ? projection.lines[existingIndex].toolCall
+    : undefined;
+  upsertToolCall(projection, eventId, toolCallId, {
+    name: existing?.name ?? "Bash",
+    state: existing?.state ?? "running",
+    command,
+  });
+}
+
+function applyCommandEvent(
+  projection: ConsoleProjection,
+  eventId: string,
+  event: CommandEvent,
+): void {
+  if (event.kind === "started") {
+    upsertCommandSnapshot(projection, eventId, {
+      command_id: event.command_id,
+      tool_call_id: event.tool_call_id,
+      status: "running",
+      stdout: emptyCommandStream(),
+      stderr: emptyCommandStream(),
+      exit_code: null,
+    });
+    return;
+  }
+
+  const index = projection.lines.findIndex((line) =>
+    line.toolCall?.command?.command_id === event.command_id
+  );
+  if (index < 0) {
+    if (event.kind === "output") {
+      const stream = commandStreamFromEvent(event);
+      upsertCommandSnapshot(projection, eventId, {
+        command_id: event.command_id,
+        tool_call_id: null,
+        status: "running",
+        stdout: event.stream === "stdout" ? stream : emptyCommandStream(),
+        stderr: event.stream === "stderr" ? stream : emptyCommandStream(),
+        exit_code: null,
+      });
+    }
+    return;
+  }
+
+  const existing = projection.lines[index].toolCall!.command!;
+  if (event.kind === "terminal") {
+    upsertCommandSnapshot(projection, eventId, {
+      ...existing,
+      status: event.status,
+      exit_code: event.exit_code,
+    });
+    return;
+  }
+  const updatedStream = appendCommandStream(
+    event.stream === "stdout" ? existing.stdout : existing.stderr,
+    event.start_offset,
+    event.end_offset,
+    event.content,
+  );
+  upsertCommandSnapshot(projection, eventId, {
+    ...existing,
+    stdout: event.stream === "stdout" ? updatedStream : existing.stdout,
+    stderr: event.stream === "stderr" ? updatedStream : existing.stderr,
+  });
+}
+
+function emptyCommandStream(): CommandStreamSlice {
+  return { start_offset: 0, end_offset: 0, content: "", truncated: false };
+}
+
+function commandStreamFromEvent(
+  event: Extract<CommandEvent, { kind: "output" }>,
+): CommandStreamSlice {
+  return appendCommandStream(
+    emptyCommandStream(),
+    event.start_offset,
+    event.end_offset,
+    event.content,
+  );
+}
+
+function appendCommandStream(
+  existing: CommandStreamSlice,
+  startOffset: number,
+  endOffset: number,
+  content: string,
+): CommandStreamSlice {
+  if (endOffset <= existing.end_offset) return existing;
+  const contiguous = startOffset === existing.end_offset;
+  const combined = contiguous ? `${existing.content}${content}` : content;
+  const tail = combined.length > COMMAND_STREAM_DISPLAY_BYTES
+    ? combined.slice(-COMMAND_STREAM_DISPLAY_BYTES)
+    : combined;
+  return {
+    start_offset: endOffset - tail.length,
+    end_offset: endOffset,
+    content: tail,
+    truncated: existing.truncated || !contiguous || tail.length < combined.length ||
+      startOffset > 0,
+  };
+}
+
 function projectInternalWorkerSnapshot(
   snapshot: InternalWorkerSnapshot,
   eventId: string,
@@ -255,6 +379,11 @@ function projectInternalWorkerSnapshot(
     snapshot.in_flight?.blocks ?? [],
     `${eventId}:internal:${snapshot.worker.session_id}:in-flight`,
     cwd,
+  );
+  appendSnapshotCommands(
+    console,
+    snapshot.in_flight?.commands ?? [],
+    `${eventId}:internal:${snapshot.worker.session_id}:command`,
   );
   if (snapshot.error) {
     console.lines.push({
@@ -403,6 +532,11 @@ export function applyProtocolEvent(
         `${envelope.eventId}:snapshot-in-flight`,
         next.cwd,
       );
+      appendSnapshotCommands(
+        next,
+        event.data.in_flight?.commands ?? [],
+        `${envelope.eventId}:snapshot-command`,
+      );
       next.internalWorkers = (event.data.internal_workers ?? []).map((worker) =>
         projectInternalWorkerSnapshot(worker, envelope.eventId, next.cwd)
       );
@@ -435,6 +569,9 @@ export function applyProtocolEvent(
     }
     case "status":
       next.status = event.data.status;
+      break;
+    case "command":
+      applyCommandEvent(next, envelope.eventId, event.data.event);
       break;
     case "segment_rotated": {
       const retainedErrors = next.lines.filter((line) => line.kind === "error");
@@ -786,6 +923,10 @@ function refreshedToolLine(item: ConsoleLine): ConsoleLine {
   if (!toolCall) {
     return item;
   }
+  const commandTerminal = toolCall.command !== undefined &&
+    toolCall.command.status !== "running";
+  const commandError = toolCall.command !== undefined &&
+    ["failed", "timed_out", "cancelled"].includes(toolCall.command.status);
   return {
     ...item,
     title: item.title.startsWith("Call · Tool result")
@@ -794,8 +935,8 @@ function refreshedToolLine(item: ConsoleLine): ConsoleLine {
     body: renderToolCall(toolCall),
     detail: toolCallDetail(toolCall),
     diff: toolCall.name === "Edit" ? editDiff(toolCall) : undefined,
-    streaming: !["done", "error"].includes(toolCall.state),
-    error: toolCall.state === "error",
+    streaming: !["done", "error"].includes(toolCall.state) && !commandTerminal,
+    error: toolCall.state === "error" || commandError,
   };
 }
 
@@ -1040,9 +1181,37 @@ function renderBashTool(toolCall: ToolCallView): string {
   const args = parsedArgs(toolCall);
   const command = stringField(args, "command");
   return compactLines([
-    `Bash — ${stateSuffix(toolCall.state)}`,
+    `Bash — ${commandStateSuffix(toolCall)}`,
     command ? `$ ${command}` : argsText(toolCall),
-    cappedDisplaySection(resultText(toolCall), 10),
+    ["done", "error"].includes(toolCall.state)
+      ? cappedDisplaySection(resultText(toolCall), 10)
+      : renderLiveCommandOutput(toolCall.command),
+  ]);
+}
+
+function commandStateSuffix(toolCall: ToolCallView): string {
+  const command = toolCall.command;
+  if (!command) return stateSuffix(toolCall.state);
+  if (command.status === "completed") {
+    return command.exit_code === null
+      ? "completed"
+      : `completed (exit ${command.exit_code})`;
+  }
+  if (command.status === "failed") {
+    return command.exit_code === null ? "failed" : `failed (exit ${command.exit_code})`;
+  }
+  if (command.status === "timed_out") return "timed out";
+  if (command.status === "cancelled") return "cancelled";
+  return "running…";
+}
+
+function renderLiveCommandOutput(command?: CommandSnapshot): string | undefined {
+  if (!command) return undefined;
+  return compactLines([
+    command.stdout.truncated ? "[stdout tail; earlier output omitted]" : undefined,
+    command.stdout.content ? `stdout:\n${command.stdout.content}` : undefined,
+    command.stderr.truncated ? "[stderr tail; earlier output omitted]" : undefined,
+    command.stderr.content ? `stderr:\n${command.stderr.content}` : undefined,
   ]);
 }
 

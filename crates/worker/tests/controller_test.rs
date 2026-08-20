@@ -12,8 +12,8 @@ use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use session_store::{CombinedStore, FsWorkerStore};
 use session_store::{FsStore, LogEntry};
 use workdir::{
-    CommandRequest, LocalWorkdirSession, Workdir, WorkdirError, WorkdirSessionCapabilities,
-    WorkdirSessionHandle,
+    CommandOutputRequest, CommandRequest, LocalWorkdirSession, Workdir, WorkdirError,
+    WorkdirSessionCapabilities, WorkdirSessionHandle,
 };
 
 use worker::{
@@ -232,6 +232,7 @@ async fn shutdown_closes_bound_workdir_session() {
             command: "sleep 30".to_owned(),
             timeout_secs: 60,
             output_limit: 1024,
+            tool_call_id: None,
         })
         .await
         .unwrap();
@@ -251,6 +252,108 @@ async fn shutdown_closes_bound_workdir_session() {
         session.command_status(command).await,
         Err(WorkdirError::Unavailable(_))
     ));
+}
+
+#[tokio::test]
+async fn controller_projects_workdir_command_events_and_snapshot_state() {
+    let (mut worker, pwd) = make_worker_with_pwd(MockClient::new(simple_text_events())).await;
+    let session: WorkdirSessionHandle = Arc::new(LocalWorkdirSession::materialized_bound(
+        Workdir::new("controller-command-observation-workdir"),
+        pwd.clone(),
+        pwd,
+        worker.scope().clone(),
+        WorkdirSessionCapabilities::ALL,
+    ));
+    worker.bind_workdir_session(Some(Arc::clone(&session)));
+    let handle = spawn_controller(worker).await;
+    let mut events = handle.subscribe();
+
+    let command = session
+        .start_command(CommandRequest {
+            command: "printf ready; sleep 0.3; printf done".to_owned(),
+            timeout_secs: 5,
+            output_limit: 1024,
+            tool_call_id: Some("tool-command-1".into()),
+        })
+        .await
+        .unwrap();
+
+    let mut saw_started = false;
+    let mut saw_output = false;
+    while !saw_output {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .expect("command event should arrive")
+            .unwrap();
+        match event {
+            Event::Command {
+                event:
+                    protocol::CommandEvent::Started {
+                        command_id,
+                        tool_call_id,
+                    },
+            } => {
+                assert_eq!(command_id, command.0);
+                assert_eq!(tool_call_id.as_deref(), Some("tool-command-1"));
+                saw_started = true;
+            }
+            Event::Command {
+                event:
+                    protocol::CommandEvent::Output {
+                        command_id,
+                        stream: protocol::CommandStream::Stdout,
+                        content,
+                        ..
+                    },
+            } if command_id == command.0 && content.contains("ready") => saw_output = true,
+            _ => {}
+        }
+    }
+    assert!(saw_started);
+
+    let Event::Snapshot { in_flight, .. } = handle.snapshot_event() else {
+        panic!("worker snapshot expected");
+    };
+    assert_eq!(in_flight.commands.len(), 1);
+    assert_eq!(in_flight.commands[0].command_id, command.0);
+    assert_eq!(in_flight.commands[0].stdout.content, "ready");
+    assert_eq!(
+        in_flight.commands[0].status,
+        protocol::CommandStatus::Running
+    );
+
+    let saw_terminal = drain_until(&mut events, std::time::Duration::from_secs(2), |event| {
+        matches!(
+            event,
+            Event::Command {
+                event: protocol::CommandEvent::Terminal {
+                    command_id,
+                    status: protocol::CommandStatus::Completed,
+                    exit_code: Some(0),
+                }
+            } if command_id == &command.0
+        )
+    })
+    .await;
+    assert!(saw_terminal, "completed command event should arrive");
+
+    let output = session
+        .command_output(CommandOutputRequest {
+            handle: command,
+            cursor: 0,
+            limit: 1024,
+            wait: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(output.status, workdir::CommandStatus::Completed);
+    let (entries, _) = handle.sink.subscribe_with_snapshot();
+    let durable_history = serde_json::to_string(&entries).unwrap();
+    assert!(
+        !durable_history.contains("ready") && !durable_history.contains("done"),
+        "operational command chunks must not be appended to Worker history: {durable_history}"
+    );
+    handle.send(Method::Shutdown).await.unwrap();
 }
 
 #[tokio::test]
@@ -279,6 +382,7 @@ async fn controller_startup_failure_closes_bound_workdir_session() {
                 command: "printf unreachable".to_owned(),
                 timeout_secs: 5,
                 output_limit: 1024,
+                tool_call_id: None,
             })
             .await,
         Err(WorkdirError::Unavailable(_))

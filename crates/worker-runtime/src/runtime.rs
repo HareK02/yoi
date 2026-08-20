@@ -1430,7 +1430,10 @@ impl Runtime {
                 context_tokens: 0,
             },
             status: protocol::WorkerStatus::Idle,
-            in_flight: protocol::InFlightSnapshot { blocks: Vec::new() },
+            in_flight: protocol::InFlightSnapshot {
+                blocks: Vec::new(),
+                commands: Vec::new(),
+            },
             internal_workers: Vec::new(),
         })
     }
@@ -3765,7 +3768,10 @@ mod tests {
                     context_tokens: 64,
                 },
                 status: protocol::WorkerStatus::Running,
-                in_flight: protocol::InFlightSnapshot { blocks: Vec::new() },
+                in_flight: protocol::InFlightSnapshot {
+                    blocks: Vec::new(),
+                    commands: Vec::new(),
+                },
                 internal_workers: Vec::new(),
             },
         );

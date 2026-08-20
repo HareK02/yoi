@@ -1322,6 +1322,9 @@ impl App {
                 self.rewind_refresh_fence = false;
                 self.set_worker_status(status);
             }
+            // Command telemetry is an operational Web Console surface. The
+            // TUI continues to render the final Bash ToolResult from history.
+            Event::Command { .. } => {}
             Event::Completions { kind, entries } => {
                 // Apply only if the popup is still on the same
                 // (kind, prefix) the request was issued for; an
