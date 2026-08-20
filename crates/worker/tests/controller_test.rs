@@ -359,6 +359,76 @@ async fn controller_projects_workdir_command_events_and_snapshot_state() {
 }
 
 #[tokio::test]
+async fn controller_refreshes_command_snapshot_after_high_output_provider_lag() {
+    let (mut worker, pwd) = make_worker_with_pwd(MockClient::new(simple_text_events())).await;
+    let session: WorkdirSessionHandle = Arc::new(LocalWorkdirSession::materialized_bound(
+        Workdir::new("controller-command-lag-recovery-workdir"),
+        pwd.clone(),
+        pwd,
+        worker.scope().clone(),
+        WorkdirSessionCapabilities::ALL,
+    ));
+    worker.bind_workdir_session(Some(Arc::clone(&session)));
+    let handle = spawn_controller(worker).await;
+
+    // Local command telemetry uses 8 KiB chunks and a 256-event channel. One
+    // synchronous file-poll burst with 300 chunks deterministically makes the
+    // worker-side receiver observe `Lagged` before this command terminates.
+    let command = session
+        .start_command(CommandRequest {
+            command: "dd if=/dev/zero bs=8192 count=300 2>/dev/null | tr '\\0' x; sleep 5"
+                .to_owned(),
+            timeout_secs: 10,
+            output_limit: 1024,
+            tool_call_id: Some("tool-high-output".into()),
+        })
+        .await
+        .unwrap();
+
+    let expected_end_offset = 300_u64 * 8192;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let recovered = loop {
+        let Event::Snapshot { in_flight, .. } = handle.snapshot_event() else {
+            panic!("worker snapshot expected");
+        };
+        if let Some(snapshot) = in_flight
+            .commands
+            .iter()
+            .find(|snapshot| snapshot.command_id == command.0)
+            && snapshot.stdout.end_offset >= expected_end_offset
+        {
+            break snapshot.clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for lag recovery snapshot"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+
+    assert_eq!(recovered.tool_call_id.as_deref(), Some("tool-high-output"));
+    assert_eq!(recovered.status, protocol::CommandStatus::Running);
+    assert!(recovered.stdout.truncated);
+    assert!(recovered.stdout.start_offset > 0);
+    assert_eq!(recovered.stdout.end_offset, expected_end_offset);
+    assert!(recovered.stdout.content.len() <= 32 * 1024);
+    assert!(recovered.stdout.content.bytes().all(|byte| byte == b'x'));
+
+    session.cancel_command(command.clone()).await.unwrap();
+    let output = session
+        .command_output(CommandOutputRequest {
+            handle: command,
+            cursor: 0,
+            limit: 1024,
+            wait: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(output.status, workdir::CommandStatus::Cancelled);
+    handle.send(Method::Shutdown).await.unwrap();
+}
+
+#[tokio::test]
 async fn controller_startup_failure_closes_bound_workdir_session() {
     let (mut worker, pwd) = make_worker_with_pwd(MockClient::new(simple_text_events())).await;
     let session: WorkdirSessionHandle = Arc::new(LocalWorkdirSession::materialized_bound(

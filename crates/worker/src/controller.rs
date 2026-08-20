@@ -511,31 +511,38 @@ pub(crate) fn wire_workdir_command_events(
     session: &Arc<dyn WorkdirSession>,
     in_flight: &InFlightEvents,
 ) {
-    in_flight.replace_command_snapshot(
-        session
-            .command_snapshot()
-            .into_iter()
-            .map(protocol_command_snapshot)
-            .collect(),
-    );
+    in_flight.replace_command_snapshot(protocol_command_snapshots(session.as_ref()));
     let Some(mut events) = session.subscribe_command_events() else {
         return;
     };
+    // Keep only a weak reference in the observer task. Holding the session
+    // strongly here would keep its broadcast sender alive forever and prevent
+    // the receiver from observing closure during Worker teardown.
+    let session = Arc::downgrade(session);
     let in_flight = in_flight.clone();
     tokio::spawn(async move {
         loop {
             match events.recv().await {
                 Ok(event) => in_flight.publish_command_event(protocol_command_event(event)),
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    // Never retain stale command output after a provider-local
-                    // observer lag. The next chunk reconstructs a bounded tail
-                    // with its absolute offset and marks the gap truncated.
-                    in_flight.replace_command_snapshot(Vec::new());
+                    let Some(session) = session.upgrade() else {
+                        break;
+                    };
+                    in_flight
+                        .replace_command_snapshot(protocol_command_snapshots(session.as_ref()));
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     });
+}
+
+fn protocol_command_snapshots(session: &dyn WorkdirSession) -> Vec<ProtocolCommandSnapshot> {
+    session
+        .command_snapshot()
+        .into_iter()
+        .map(protocol_command_snapshot)
+        .collect()
 }
 
 fn protocol_command_snapshot(snapshot: WorkdirCommandSnapshot) -> ProtocolCommandSnapshot {
