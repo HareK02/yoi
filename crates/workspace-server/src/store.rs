@@ -5134,6 +5134,9 @@ fn verify_workspace_resource_constraints(conn: &Connection) -> Result<()> {
         return Ok(());
     }
     for trigger in [
+        "ticket_assignment_ticket_parent_tombstone",
+        "ticket_assignment_worker_parent_tombstone_delete",
+        "ticket_assignment_worker_parent_tombstone_move",
         "ticket_worker_assignments_validate_insert",
         "ticket_worker_assignments_validate_update",
         "ticket_worker_assignment_events_validate_insert",
@@ -5236,31 +5239,6 @@ fn workspace_resource_reference_diagnostics(conn: &Connection) -> Result<Vec<Str
                  WHERE ticket.workspace_id = link.workspace_id \
                    AND ticket.ticket_id = link.ticket_id) LIMIT 100",
         ),
-        // Historical assignment/operation rows intentionally survive Ticket or Worker
-        // retention deletion. A parent id missing from every Workspace is therefore a retained
-        // soft reference; a matching Ticket id in another Workspace, or a live Worker id whose
-        // Workspace/Runtime placement does not match the snapshot, is corruption.
-        (
-            "ticket_worker_assignments.ticket_id",
-            "SELECT assignment.workspace_id || '/' || assignment.assignment_id || ' -> ' || assignment.ticket_id \
-             FROM ticket_worker_assignments AS assignment \
-             WHERE NOT EXISTS (SELECT 1 FROM typed_tickets AS ticket \
-                 WHERE ticket.workspace_id = assignment.workspace_id \
-                   AND ticket.ticket_id = assignment.ticket_id) \
-               AND EXISTS (SELECT 1 FROM typed_tickets AS foreign_ticket \
-                 WHERE foreign_ticket.ticket_id = assignment.ticket_id) LIMIT 100",
-        ),
-        (
-            "ticket_worker_assignments.worker_id",
-            "SELECT assignment.workspace_id || '/' || assignment.assignment_id || ' -> ' || assignment.runtime_id || '/' || assignment.worker_id \
-             FROM ticket_worker_assignments AS assignment \
-             WHERE NOT EXISTS (SELECT 1 FROM worker_registry AS worker \
-                 WHERE worker.workspace_id = assignment.workspace_id \
-                   AND worker.runtime_id = assignment.runtime_id \
-                   AND worker.worker_id = assignment.worker_id) \
-               AND EXISTS (SELECT 1 FROM worker_registry AS live_worker \
-                 WHERE live_worker.worker_id = assignment.worker_id) LIMIT 100",
-        ),
         (
             "ticket_current_worker_assignments.assignment_id",
             "SELECT current.workspace_id || '/' || current.assignment_id \
@@ -5286,16 +5264,6 @@ fn workspace_resource_reference_diagnostics(conn: &Connection) -> Result<Vec<Str
                        WHERE assignment.workspace_id = event.workspace_id \
                          AND assignment.ticket_id = event.ticket_id \
                          AND assignment.assignment_id = event.previous_assignment_id)) LIMIT 100",
-        ),
-        (
-            "ticket_assignment_operations.ticket_id",
-            "SELECT operation.workspace_id || '/' || operation.operation_id || ' -> ' || operation.ticket_id \
-             FROM ticket_assignment_operations AS operation \
-             WHERE NOT EXISTS (SELECT 1 FROM typed_tickets AS ticket \
-                 WHERE ticket.workspace_id = operation.workspace_id \
-                   AND ticket.ticket_id = operation.ticket_id) \
-               AND EXISTS (SELECT 1 FROM typed_tickets AS foreign_ticket \
-                 WHERE foreign_ticket.ticket_id = operation.ticket_id) LIMIT 100",
         ),
         (
             "artifacts.ticket_id",
@@ -5344,6 +5312,82 @@ fn workspace_resource_reference_diagnostics(conn: &Connection) -> Result<Vec<Str
             continue;
         }
         collect_reference_diagnostics(conn, sql, label, &mut diagnostics)?;
+    }
+
+    // Assignment and operation rows are historical soft references. Schema v39 records an
+    // explicit tombstone before a live Ticket or Worker parent is deleted/moved; older schemas
+    // have no tombstone authority, so every missing live parent remains migration-blocking drift.
+    if table_exists(conn, "ticket_worker_assignments")? && table_exists(conn, "typed_tickets")? {
+        let tombstone_filter = if table_exists(conn, "ticket_assignment_ticket_tombstones")? {
+            "AND NOT EXISTS (SELECT 1 FROM ticket_assignment_ticket_tombstones AS tombstone \
+             WHERE tombstone.workspace_id = assignment.workspace_id \
+               AND tombstone.ticket_id = assignment.ticket_id)"
+        } else {
+            ""
+        };
+        collect_reference_diagnostics(
+            conn,
+            &format!(
+                "SELECT assignment.workspace_id || '/' || assignment.assignment_id || ' -> ' || assignment.ticket_id \
+                 FROM ticket_worker_assignments AS assignment \
+                 WHERE NOT EXISTS (SELECT 1 FROM typed_tickets AS ticket \
+                     WHERE ticket.workspace_id = assignment.workspace_id \
+                       AND ticket.ticket_id = assignment.ticket_id) \
+                 {tombstone_filter} LIMIT 100"
+            ),
+            "ticket_worker_assignments.ticket_id",
+            &mut diagnostics,
+        )?;
+    }
+    if table_exists(conn, "ticket_worker_assignments")?
+        && table_exists(conn, "worker_registry")?
+        && column_exists(conn, "ticket_worker_assignments", "worker_id")?
+        && column_exists(conn, "worker_registry", "worker_id")?
+    {
+        let tombstone_filter = if table_exists(conn, "ticket_assignment_worker_tombstones")? {
+            "AND NOT EXISTS (SELECT 1 FROM ticket_assignment_worker_tombstones AS tombstone \
+             WHERE tombstone.workspace_id = assignment.workspace_id \
+               AND tombstone.runtime_id = assignment.runtime_id \
+               AND tombstone.worker_id = assignment.worker_id)"
+        } else {
+            ""
+        };
+        collect_reference_diagnostics(
+            conn,
+            &format!(
+                "SELECT assignment.workspace_id || '/' || assignment.assignment_id || ' -> ' || assignment.runtime_id || '/' || assignment.worker_id \
+                 FROM ticket_worker_assignments AS assignment \
+                 WHERE NOT EXISTS (SELECT 1 FROM worker_registry AS worker \
+                     WHERE worker.workspace_id = assignment.workspace_id \
+                       AND worker.runtime_id = assignment.runtime_id \
+                       AND worker.worker_id = assignment.worker_id) \
+                 {tombstone_filter} LIMIT 100"
+            ),
+            "ticket_worker_assignments.worker_id",
+            &mut diagnostics,
+        )?;
+    }
+    if table_exists(conn, "ticket_assignment_operations")? && table_exists(conn, "typed_tickets")? {
+        let tombstone_filter = if table_exists(conn, "ticket_assignment_ticket_tombstones")? {
+            "AND NOT EXISTS (SELECT 1 FROM ticket_assignment_ticket_tombstones AS tombstone \
+             WHERE tombstone.workspace_id = operation.workspace_id \
+               AND tombstone.ticket_id = operation.ticket_id)"
+        } else {
+            ""
+        };
+        collect_reference_diagnostics(
+            conn,
+            &format!(
+                "SELECT operation.workspace_id || '/' || operation.operation_id || ' -> ' || operation.ticket_id \
+                 FROM ticket_assignment_operations AS operation \
+                 WHERE NOT EXISTS (SELECT 1 FROM typed_tickets AS ticket \
+                     WHERE ticket.workspace_id = operation.workspace_id \
+                       AND ticket.ticket_id = operation.ticket_id) \
+                 {tombstone_filter} LIMIT 100"
+            ),
+            "ticket_assignment_operations.ticket_id",
+            &mut diagnostics,
+        )?;
     }
     Ok(diagnostics)
 }
@@ -6243,6 +6287,23 @@ CREATE TABLE objective_ticket_links_v39 (
 );
 INSERT INTO objective_ticket_links_v39 SELECT * FROM objective_ticket_links;
 
+CREATE TABLE ticket_assignment_ticket_tombstones (
+    workspace_id TEXT NOT NULL,
+    ticket_id TEXT NOT NULL,
+    deleted_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, ticket_id),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+);
+
+CREATE TABLE ticket_assignment_worker_tombstones (
+    workspace_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    deleted_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, runtime_id, worker_id),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+);
+
 CREATE TABLE ticket_worker_assignments_v39 (
     workspace_id TEXT NOT NULL,
     ticket_id TEXT NOT NULL,
@@ -6438,13 +6499,61 @@ CREATE INDEX IF NOT EXISTS idx_workspace_resource_human_keys_reverse
         })?;
     }
     // Assignment rows and events are historical evidence and intentionally survive Ticket or
-    // Worker retention deletion, so parent FKs would impose the wrong delete semantics. These
-    // triggers provide the equivalent database-layer insertion boundary: every new assignment
-    // resolves both authorities in the same Workspace, and event references resolve a committed
-    // assignment for the same Ticket. Operation assignment/Worker ids remain unconstrained because reservations are
-    // persisted before assignment/Worker creation and expected ids may intentionally be stale.
+    // Worker retention deletion, so parent FKs would impose the wrong delete semantics. Parent
+    // delete/move triggers record an exact tombstone before authority disappears; insertion
+    // triggers require every new assignment to resolve both authorities in the same Workspace,
+    // and event references resolve a committed assignment for the same Ticket. Operation
+    // assignment/Worker ids remain unconstrained because reservations are persisted before
+    // assignment/Worker creation and expected ids may intentionally be stale.
     conn.execute_batch(
         r#"
+CREATE TRIGGER ticket_assignment_ticket_parent_tombstone
+BEFORE DELETE ON typed_tickets
+WHEN EXISTS (
+        SELECT 1 FROM ticket_worker_assignments AS assignment
+        WHERE assignment.workspace_id = OLD.workspace_id
+          AND assignment.ticket_id = OLD.ticket_id
+    )
+    OR EXISTS (
+        SELECT 1 FROM ticket_assignment_operations AS operation
+        WHERE operation.workspace_id = OLD.workspace_id
+          AND operation.ticket_id = OLD.ticket_id
+    )
+BEGIN
+    INSERT OR IGNORE INTO ticket_assignment_ticket_tombstones (
+        workspace_id, ticket_id, deleted_at
+    ) VALUES (OLD.workspace_id, OLD.ticket_id, CURRENT_TIMESTAMP);
+END;
+
+CREATE TRIGGER ticket_assignment_worker_parent_tombstone_delete
+BEFORE DELETE ON worker_registry
+WHEN EXISTS (
+    SELECT 1 FROM ticket_worker_assignments AS assignment
+    WHERE assignment.workspace_id = OLD.workspace_id
+      AND assignment.runtime_id = OLD.runtime_id
+      AND assignment.worker_id = OLD.worker_id
+)
+BEGIN
+    INSERT OR IGNORE INTO ticket_assignment_worker_tombstones (
+        workspace_id, runtime_id, worker_id, deleted_at
+    ) VALUES (OLD.workspace_id, OLD.runtime_id, OLD.worker_id, CURRENT_TIMESTAMP);
+END;
+
+CREATE TRIGGER ticket_assignment_worker_parent_tombstone_move
+BEFORE UPDATE OF runtime_id ON worker_registry
+WHEN OLD.runtime_id != NEW.runtime_id
+ AND EXISTS (
+    SELECT 1 FROM ticket_worker_assignments AS assignment
+    WHERE assignment.workspace_id = OLD.workspace_id
+      AND assignment.runtime_id = OLD.runtime_id
+      AND assignment.worker_id = OLD.worker_id
+)
+BEGIN
+    INSERT OR IGNORE INTO ticket_assignment_worker_tombstones (
+        workspace_id, runtime_id, worker_id, deleted_at
+    ) VALUES (OLD.workspace_id, OLD.runtime_id, OLD.worker_id, CURRENT_TIMESTAMP);
+END;
+
 CREATE TRIGGER ticket_worker_assignments_validate_insert
 BEFORE INSERT ON ticket_worker_assignments
 WHEN NOT EXISTS (
@@ -8340,6 +8449,18 @@ DELETE FROM worker_registry
 WHERE workspace_id = 'workspace-a' AND worker_id = '00000000-0000-7000-8000-000000000001';
 DELETE FROM typed_tickets
 WHERE workspace_id = 'workspace-a' AND ticket_id = 'ticket-a';
+INSERT INTO workspaces (workspace_id, display_name, state, created_at, updated_at)
+VALUES ('workspace-b', 'B', 'active', '2026-01-01', '2026-01-01');
+INSERT INTO typed_tickets (
+    workspace_id, ticket_id, slug, title, status, kind, priority, body,
+    workflow_state, workflow_state_explicit
+) VALUES ('workspace-b', 'ticket-a', 'ticket-a-b', 'B', 'open', 'task', 'normal', '', 'planning', 1);
+INSERT INTO worker_registry (
+    workspace_id, runtime_id, worker_id, display_name, retention_state, created_at, updated_at
+) VALUES (
+    'workspace-b', 'runtime-b', '00000000-0000-7000-8000-000000000001',
+    'Worker B', 'normal', '2026-01-01', '2026-01-01'
+);
 "#,
                 )?;
                 Ok(())
@@ -8356,6 +8477,18 @@ WHERE workspace_id = 'workspace-a' AND ticket_id = 'ticket-a';
                     |row| row.get(0),
                 )?;
                 assert_eq!(retained, 1);
+                let ticket_tombstones: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM ticket_assignment_ticket_tombstones WHERE workspace_id = 'workspace-a' AND ticket_id = 'ticket-a'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let worker_tombstones: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM ticket_assignment_worker_tombstones WHERE workspace_id = 'workspace-a' AND runtime_id = 'runtime-a' AND worker_id = '00000000-0000-7000-8000-000000000001'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(ticket_tombstones, 1);
+                assert_eq!(worker_tombstones, 1);
                 Ok(())
             })
             .unwrap();
@@ -8512,6 +8645,12 @@ INSERT INTO ticket_worker_assignments (
 INSERT INTO ticket_worker_assignments (
     workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at
 ) VALUES (
+    'workspace-b', 'ticket-missing', 'assignment-missing-parents', 'runtime-missing',
+    '00000000-0000-7000-8000-000000000003', 'tester', '2026-01-01'
+);
+INSERT INTO ticket_worker_assignments (
+    workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at
+) VALUES (
     'workspace-b', 'ticket-a', 'assignment-cross-ticket', 'runtime-b',
     '00000000-0000-7000-8000-000000000002', 'tester', '2026-01-01'
 );
@@ -8552,6 +8691,7 @@ INSERT INTO ticket_worker_assignment_events (
         );
         assert!(error.contains("assignment-cross-worker"), "{error}");
         assert!(error.contains("assignment-runtime-mismatch"), "{error}");
+        assert!(error.contains("assignment-missing-parents"), "{error}");
         assert!(
             error.contains("ticket_worker_assignment_events.assignment_id"),
             "{error}"
