@@ -94,6 +94,8 @@ export type ConsoleProjection = {
   cwd: string | null;
   lastEventId: string | null;
   internalWorkers: InternalWorkerProjection[];
+  /** Terminal child-session fences, reset only by an authoritative snapshot. */
+  removedInternalWorkers: Record<string, number>;
 };
 
 export type ConsoleTimelineLineSelection = {
@@ -179,6 +181,7 @@ export function emptyConsoleProjection(): ConsoleProjection {
     cwd: null,
     lastEventId: null,
     internalWorkers: [],
+    removedInternalWorkers: {},
   };
 }
 
@@ -286,6 +289,7 @@ export function applyProtocolEvent(
     cwd: projection.cwd,
     lastEventId: envelope.eventId,
     internalWorkers: [...projection.internalWorkers],
+    removedInternalWorkers: { ...projection.removedInternalWorkers },
   };
   const event = envelope.event;
 
@@ -406,9 +410,16 @@ export function applyProtocolEvent(
       next.internalWorkers = (event.data.internal_workers ?? []).map((worker) =>
         projectInternalWorkerSnapshot(worker, envelope.eventId, next.cwd)
       );
+      next.removedInternalWorkers = {};
       break;
     }
     case "internal_worker": {
+      if (
+        Object.hasOwn(
+          next.removedInternalWorkers,
+          event.data.worker.session_id,
+        )
+      ) break;
       const existingIndex = next.internalWorkers.findIndex((worker) =>
         worker.worker.session_id === event.data.worker.session_id
       );
@@ -431,6 +442,19 @@ export function applyProtocolEvent(
       };
       if (existingIndex >= 0) next.internalWorkers[existingIndex] = updated;
       else next.internalWorkers.push(updated);
+      break;
+    }
+    case "internal_worker_removed": {
+      const existingIndex = next.internalWorkers.findIndex((worker) =>
+        worker.worker.session_id === event.data.worker.session_id
+      );
+      const existingRevision = existingIndex >= 0
+        ? next.internalWorkers[existingIndex].revision
+        : 0;
+      if (event.data.revision <= existingRevision) break;
+      next.removedInternalWorkers[event.data.worker.session_id] =
+        event.data.revision;
+      if (existingIndex >= 0) next.internalWorkers.splice(existingIndex, 1);
       break;
     }
     case "status":
@@ -1294,6 +1318,7 @@ function snapshotProjectionFromEntries(
     cwd,
     lastEventId: eventId,
     internalWorkers: [],
+    removedInternalWorkers: {},
   };
   entries.forEach((entry, index) =>
     applyLogEntry(projection, `${eventId}-snapshot-${index}`, entry)

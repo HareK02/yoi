@@ -1287,7 +1287,10 @@ Deno.test("Internal Worker output stays separate and revision-fenced", () => {
   }]);
   assertEquals(projection.lines, []);
   assertEquals(projection.internalWorkers.length, 1);
-  assertEquals(projection.internalWorkers[0].console.lines[0].body, "child output");
+  assertEquals(
+    projection.internalWorkers[0].console.lines[0].body,
+    "child output",
+  );
 
   projection = projector.append([{
     eventId: "2",
@@ -1364,13 +1367,110 @@ Deno.test("parent snapshot authoritatively replaces Internal Worker projections"
     },
   }]);
   const projection = projector.append([{ eventId: "snapshot", event }]);
-  assertEquals(projection.internalWorkers.map((worker) => worker.worker.session_id), [
-    "replacement",
-  ]);
+  assertEquals(
+    projection.internalWorkers.map((worker) => worker.worker.session_id),
+    [
+      "replacement",
+    ],
+  );
   const childLines = projection.internalWorkers[0].console.lines;
   assertEquals(childLines.length, 1);
   assertEquals(new Set(childLines.map((line) => line.id)).size, 1);
   assertEquals(childLines[0].kind, "tool");
+});
+
+Deno.test("terminal Internal Worker removal drops descendants and fences late events", () => {
+  const worker = {
+    session_id: "child-session",
+    name: "child",
+    parent_session_id: "parent-session",
+    kind: "sub_worker" as const,
+  };
+  const nestedWorker = {
+    session_id: "grandchild-session",
+    name: "grandchild",
+    parent_session_id: "child-session",
+    kind: "sub_worker" as const,
+  };
+  const projector = createConsoleProjector();
+  let projection = projector.append([{
+    eventId: "child",
+    event: {
+      event: "internal_worker",
+      data: {
+        worker,
+        revision: 2,
+        event: {
+          event: "internal_worker",
+          data: {
+            worker: nestedWorker,
+            revision: 1,
+            event: { event: "text_done", data: { text: "nested" } },
+          },
+        },
+      },
+    },
+  }]);
+  assertEquals(projection.internalWorkers.length, 1);
+  assertEquals(
+    projection.internalWorkers[0].console.internalWorkers.length,
+    1,
+  );
+
+  projection = projector.append([{
+    eventId: "removed",
+    event: {
+      event: "internal_worker_removed",
+      data: { worker, revision: 3 },
+    },
+  }, {
+    eventId: "late",
+    event: {
+      event: "internal_worker",
+      data: {
+        worker,
+        revision: 4,
+        event: { event: "text_done", data: { text: "must stay removed" } },
+      },
+    },
+  }]);
+  assertEquals(projection.internalWorkers, []);
+
+  const snapshot = snapshotEvent("/repo");
+  projection = projector.append([{ eventId: "snapshot", event: snapshot }]);
+  assertEquals(projection.internalWorkers, []);
+  assertEquals(projection.removedInternalWorkers, {});
+});
+
+Deno.test("stale Internal Worker removal cannot discard a newer projection", () => {
+  const worker = {
+    session_id: "child-session",
+    name: "child",
+    parent_session_id: "parent-session",
+    kind: "sub_worker" as const,
+  };
+  const projector = createConsoleProjector();
+  projector.append([{
+    eventId: "current",
+    event: {
+      event: "internal_worker",
+      data: {
+        worker,
+        revision: 4,
+        event: { event: "text_done", data: { text: "current" } },
+      },
+    },
+  }]);
+
+  const projection = projector.append([{
+    eventId: "stale-removal",
+    event: {
+      event: "internal_worker_removed",
+      data: { worker, revision: 3 },
+    },
+  }]);
+  assertEquals(projection.internalWorkers.length, 1);
+  assertEquals(projection.internalWorkers[0].revision, 4);
 });
 
 Deno.test("snapshot restores TaskStore state from system history", () => {

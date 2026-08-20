@@ -530,6 +530,15 @@ pub enum Event {
         revision: u64,
         event: Box<Event>,
     },
+    /// Terminal removal fence for one parent-owned Internal Worker session.
+    ///
+    /// Clients discard the matching child and descendants, then ignore later
+    /// nested events for this identity until an authoritative snapshot replaces
+    /// the projection.
+    InternalWorkerRemoved {
+        worker: InternalWorkerRef,
+        revision: u64,
+    },
     /// Server-side segment log rotated to a fresh `SegmentStart`.
     ///
     /// Fires on compaction and on auto-fork when the store head drifts
@@ -1800,6 +1809,26 @@ mod tests {
             }
             other => panic!("expected internal Worker event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn internal_worker_removal_roundtrip_preserves_terminal_fence() {
+        let event = Event::InternalWorkerRemoved {
+            worker: InternalWorkerRef {
+                session_id: "session-1".into(),
+                name: "research".into(),
+                parent_session_id: Some("parent-session".into()),
+                kind: InternalWorkerKind::SubWorker,
+            },
+            revision: 8,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: Event = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            Event::InternalWorkerRemoved { worker, revision }
+                if worker.session_id == "session-1" && revision == 8
+        ));
     }
 
     #[test]

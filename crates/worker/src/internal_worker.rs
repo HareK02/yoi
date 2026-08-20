@@ -294,6 +294,8 @@ pub(crate) struct InternalWorkerSessionHandle {
     last_error: Arc<Mutex<Option<String>>>,
     child_registry: Option<Arc<SpawnedWorkerRegistry>>,
     sink: SegmentLogSink,
+    #[cfg(test)]
+    fail_stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl InternalWorkerSessionHandle {
@@ -319,6 +321,9 @@ impl InternalWorkerSessionHandle {
 
     #[cfg(test)]
     pub(crate) fn publish_test_entry(&self, entry: LogEntry) {
+        self.store
+            .append(self.session_id, self.segment_id, &entry)
+            .expect("append test Internal Worker entry");
         self.sink.publish(entry);
     }
 
@@ -419,7 +424,23 @@ impl InternalWorkerSessionHandle {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn force_status(&self, status: InternalWorkerSessionStatus) {
+        self.status
+            .store(status.encode(), std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_stop_failure(&self) {
+        self.fail_stop
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     pub(crate) async fn stop(&self) -> Result<(), InternalWorkerSessionError> {
+        #[cfg(test)]
+        if self.fail_stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(InternalWorkerSessionError::Unavailable);
+        }
         let prior = self.status.swap(
             InternalWorkerSessionStatus::Stopping.encode(),
             std::sync::atomic::Ordering::AcqRel,
@@ -582,6 +603,8 @@ pub(crate) async fn prepare_internal_worker_session(
         last_error: last_error.clone(),
         child_registry,
         sink,
+        #[cfg(test)]
+        fail_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     tokio::spawn(async move {
@@ -890,8 +913,17 @@ pub(crate) fn test_internal_worker_session(
     let session_id = session_store::new_session_id();
     let segment_id = session_store::new_segment_id();
     let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(1);
-    tokio::spawn(async move { while command_rx.recv().await.is_some() {} });
     let (event_tx, _) = broadcast::channel(256);
+    let command_event_tx = event_tx.clone();
+    tokio::spawn(async move {
+        while let Some(command) = command_rx.recv().await {
+            if let InternalWorkerSessionCommand::Stop(done_tx) = command {
+                let _ = command_event_tx.send(Event::Shutdown);
+                let _ = done_tx.send(());
+                break;
+            }
+        }
+    });
     let sink = SegmentLogSink::new();
     spawn_internal_log_event_bridge(sink.clone(), event_tx.clone());
     let handle = InternalWorkerSessionHandle {
@@ -909,6 +941,7 @@ pub(crate) fn test_internal_worker_session(
         last_error: Arc::new(Mutex::new(None)),
         child_registry: None,
         sink,
+        fail_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     (handle, event_tx)
 }

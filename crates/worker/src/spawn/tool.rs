@@ -481,6 +481,7 @@ impl Tool for SubWorkerSpawnTool {
         .map_err(|error| {
             ToolError::ExecutionFailed(format!("install Internal Worker features: {error}"))
         })?;
+        let child_change_tracker = child.tracker().cloned();
         #[cfg(test)]
         let installed_tools = child
             .engine()
@@ -587,6 +588,7 @@ impl Tool for SubWorkerSpawnTool {
             #[cfg(test)]
             installed_tools,
             session.clone(),
+            child_change_tracker,
         );
         if let Err(error) = name_reservation.commit(record) {
             let _ = session.stop().await;

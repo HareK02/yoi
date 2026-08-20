@@ -16,7 +16,7 @@ use crate::feature::{
     FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureModule,
     ServiceDeclaration, ServiceId, ToolContribution, ToolDeclaration,
 };
-use crate::spawn::registry::SpawnedWorkerRegistry;
+use crate::spawn::registry::{SpawnedWorkerRegistry, SubWorkerStopSummary};
 use crate::worker::{
     WorkspaceClient, WorkspaceClientError, WorkspaceRequest, WorkspaceRequestMethod,
     WorkspaceResponse,
@@ -138,14 +138,19 @@ impl WorkerControlService for WorkspaceWorkerControlService {
         let registry = self.registry.as_ref().ok_or_else(|| {
             WorkspaceClientError::Request("unknown Worker or permission not granted".to_string())
         })?;
-        registry
+        let summary = registry
             .remove_internal(name)
             .await
-            .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
+            .map_err(|error| WorkspaceClientError::Request(error.to_string()))?
+            .ok_or_else(|| {
+                WorkspaceClientError::Request(
+                    "unknown Worker or permission not granted".to_string(),
+                )
+            })?;
         Ok(WorkspaceResponse {
             status: 200,
-            body: serde_json::json!({ "subject": { "kind": "sub_worker", "name": name } })
-                .to_string(),
+            body: serde_json::to_string(&summary)
+                .map_err(|error| WorkspaceClientError::Request(error.to_string()))?,
         })
     }
 
@@ -839,11 +844,51 @@ fn tool_output(
             response.status, response.body
         )));
     }
+    if operation == WorkerOperation::Stop
+        && let Ok(summary) = serde_json::from_str::<SubWorkerStopSummary>(&response.body)
+    {
+        return Ok(ToolOutput {
+            summary: render_subworker_stop_summary(&summary),
+            content: Some(response.body),
+            attachments: Vec::new(),
+        });
+    }
     Ok(ToolOutput {
         summary: format!("{} completed", operation.tool_name()),
         content: Some(response.body),
         attachments: Vec::new(),
     })
+}
+
+fn render_subworker_stop_summary(summary: &SubWorkerStopSummary) -> String {
+    let tools = if summary.tool_counts.is_empty() {
+        "No tool calls".to_string()
+    } else {
+        summary
+            .tool_counts
+            .iter()
+            .map(|tool| format!("{} {}", tool.count, tool.name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let elapsed = format_elapsed(summary.elapsed_ms);
+    let changes = summary
+        .change_stat
+        .as_ref()
+        .map(|stat| format!("+{}/-{} Changes · ", stat.added, stat.deleted))
+        .unwrap_or_default();
+    format!("SubWorkerStop - done\n  {tools}\n  {changes}{elapsed}",)
+}
+
+fn format_elapsed(elapsed_ms: u64) -> String {
+    let seconds = elapsed_ms / 1_000;
+    let minutes = seconds / 60;
+    let seconds = seconds % 60;
+    if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn definition<I: JsonSchema + 'static>(
@@ -1250,6 +1295,47 @@ mod tests {
             .await
             .unwrap_err();
         assert!(client.removals.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn subworker_stop_output_is_compact_and_keeps_typed_evidence() {
+        let summary = SubWorkerStopSummary {
+            session_id: "session-1".to_string(),
+            display_name: "research".to_string(),
+            outcome: crate::spawn::registry::SubWorkerFinalOutcome::Done,
+            elapsed_ms: 78_000,
+            tool_counts: vec![
+                crate::spawn::registry::SubWorkerToolCount {
+                    name: "Read".to_string(),
+                    count: 26,
+                },
+                crate::spawn::registry::SubWorkerToolCount {
+                    name: "Grep".to_string(),
+                    count: 5,
+                },
+            ],
+            change_stat: Some(crate::spawn::registry::SubWorkerChangeStat {
+                added: 215,
+                deleted: 148,
+                source: "tracked_write_edit_tools".to_string(),
+            }),
+        };
+        let response = WorkspaceResponse {
+            status: 200,
+            body: serde_json::to_string(&summary).unwrap(),
+        };
+
+        let output = tool_output(WorkerOperation::Stop, response).unwrap();
+
+        assert_eq!(
+            output.summary,
+            "SubWorkerStop - done\n  26 Read, 5 Grep\n  +215/-148 Changes · 1m 18s"
+        );
+        assert_eq!(
+            serde_json::from_str::<SubWorkerStopSummary>(output.content.as_deref().unwrap())
+                .unwrap(),
+            summary
+        );
     }
 
     #[test]

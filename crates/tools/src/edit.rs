@@ -72,13 +72,20 @@ impl Tool for EditTool {
             })
             .await
             .map_err(ToolsError::from)?;
-        self.tracker.record_workdir_hash(&path, result.content_hash);
+        let replacements = result.replacements;
+        self.tracker.record_workdir_edit(
+            &path,
+            result.content_hash,
+            replacements,
+            params.new_string.lines().count(),
+            params.old_string.lines().count(),
+        );
 
         let summary = format!(
             "Edited {} ({} replacement{})",
             path,
-            result.replacements,
-            if result.replacements == 1 { "" } else { "s" }
+            replacements,
+            if replacements == 1 { "" } else { "s" }
         );
         let preview = make_preview(&params.new_string, &params.new_string);
 
