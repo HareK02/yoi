@@ -28,9 +28,9 @@ export type CommandStream = "stdout" | "stderr";
 
 export type CommandStreamSlice = { start_offset: number, end_offset: number, content: string, truncated: boolean, };
 
-export type CommandSnapshot = { command_id: string, tool_call_id: string | null, status: CommandStatus, stdout: CommandStreamSlice, stderr: CommandStreamSlice, exit_code: number | null, };
+export type CommandSnapshot = { command_id: string, tool_call_id: string | null, status: CommandStatus, started_at_ms: number, observed_at_ms: number, last_output_at_ms: number | null, stdout: CommandStreamSlice, stderr: CommandStreamSlice, exit_code: number | null, };
 
-export type CommandEvent = { "kind": "started", command_id: string, tool_call_id: string | null, } | { "kind": "output", command_id: string, stream: CommandStream, start_offset: number, end_offset: number, content: string, } | { "kind": "terminal", command_id: string, status: CommandStatus, exit_code: number | null, };
+export type CommandEvent = { "kind": "started", command_id: string, tool_call_id: string | null, observed_at_ms: number, } | { "kind": "output", command_id: string, stream: CommandStream, start_offset: number, end_offset: number, content: string, observed_at_ms: number, } | { "kind": "terminal", command_id: string, status: CommandStatus, exit_code: number | null, stdout_end_offset: number, stderr_end_offset: number, observed_at_ms: number, };
 
 export type ScopeRule = {
 /**

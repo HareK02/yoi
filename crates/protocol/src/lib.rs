@@ -756,6 +756,9 @@ pub struct CommandSnapshot {
     pub command_id: String,
     pub tool_call_id: Option<String>,
     pub status: CommandStatus,
+    pub started_at_ms: u64,
+    pub observed_at_ms: u64,
+    pub last_output_at_ms: Option<u64>,
     pub stdout: CommandStreamSlice,
     pub stderr: CommandStreamSlice,
     pub exit_code: Option<i32>,
@@ -768,6 +771,7 @@ pub enum CommandEvent {
     Started {
         command_id: String,
         tool_call_id: Option<String>,
+        observed_at_ms: u64,
     },
     Output {
         command_id: String,
@@ -775,11 +779,15 @@ pub enum CommandEvent {
         start_offset: u64,
         end_offset: u64,
         content: String,
+        observed_at_ms: u64,
     },
     Terminal {
         command_id: String,
         status: CommandStatus,
         exit_code: Option<i32>,
+        stdout_end_offset: u64,
+        stderr_end_offset: u64,
+        observed_at_ms: u64,
     },
 }
 
@@ -1450,6 +1458,9 @@ mod tests {
                     command_id: "command-1".into(),
                     tool_call_id: Some("call_1".into()),
                     status: CommandStatus::Running,
+                    started_at_ms: 100,
+                    observed_at_ms: 120,
+                    last_output_at_ms: Some(120),
                     stdout: CommandStreamSlice {
                         start_offset: 4,
                         end_offset: 8,
@@ -1537,6 +1548,7 @@ mod tests {
                 start_offset: 8,
                 end_offset: 12,
                 content: "warn".into(),
+                observed_at_ms: 42,
             },
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -1546,6 +1558,7 @@ mod tests {
         assert_eq!(parsed["data"]["event"]["stream"], "stderr");
         assert_eq!(parsed["data"]["event"]["start_offset"], 8);
         assert_eq!(parsed["data"]["event"]["end_offset"], 12);
+        assert_eq!(parsed["data"]["event"]["observed_at_ms"], 42);
         assert!(matches!(
             serde_json::from_str::<Event>(&json).unwrap(),
             Event::Command {
@@ -1555,6 +1568,7 @@ mod tests {
                     start_offset: 8,
                     end_offset: 12,
                     content,
+                    observed_at_ms: 42,
                 }
             } if command_id == "command-1" && content == "warn"
         ));

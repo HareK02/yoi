@@ -356,6 +356,7 @@ Deno.test("projectConsole streams distinct Bash stdout and stderr through termin
             kind: "started",
             command_id: "command-1",
             tool_call_id: "bash-stream",
+            observed_at_ms: 1000,
           },
         },
       } satisfies Event,
@@ -372,6 +373,7 @@ Deno.test("projectConsole streams distinct Bash stdout and stderr through termin
             start_offset: 0,
             end_offset: 6,
             content: "ready\n",
+            observed_at_ms: 1100,
           },
         },
       } satisfies Event,
@@ -388,6 +390,7 @@ Deno.test("projectConsole streams distinct Bash stdout and stderr through termin
             start_offset: 0,
             end_offset: 5,
             content: "warn\n",
+            observed_at_ms: 1200,
           },
         },
       } satisfies Event,
@@ -402,6 +405,9 @@ Deno.test("projectConsole streams distinct Bash stdout and stderr through termin
             command_id: "command-1",
             status: "failed",
             exit_code: 7,
+            stdout_end_offset: 6,
+            stderr_end_offset: 5,
+            observed_at_ms: 1300,
           },
         },
       } satisfies Event,
@@ -410,6 +416,7 @@ Deno.test("projectConsole streams distinct Bash stdout and stderr through termin
 
   const [line] = projection.lines.filter((line) => line.kind === "tool");
   assert(line.body.includes("Bash — failed (exit 7)"), line.body);
+  assert(line.body.includes("elapsed 300ms"), line.body);
   assert(line.body.includes("stdout:\nready\n"), line.body);
   assert(line.body.includes("stderr:\nwarn\n"), line.body);
   assertEquals(line.streaming, false);
@@ -432,6 +439,9 @@ Deno.test("snapshot restores bounded in-flight Bash command output", () => {
       command_id: "command-2",
       tool_call_id: "bash-snapshot",
       status: "running",
+      started_at_ms: 1000,
+      observed_at_ms: 1250,
+      last_output_at_ms: 1200,
       stdout: {
         start_offset: 1024,
         end_offset: 1031,
@@ -446,6 +456,10 @@ Deno.test("snapshot restores bounded in-flight Bash command output", () => {
   const projection = projectConsole([{ eventId: "snapshot-command", event: snapshot }]);
   const [line] = projection.lines.filter((line) => line.kind === "tool");
   assert(line.body.includes("Bash — running…"), line.body);
+  assert(
+    line.body.includes("elapsed 250ms · last output at +200ms"),
+    line.body,
+  );
   assert(line.body.includes("[stdout tail; earlier output omitted]"), line.body);
   assert(line.body.includes("stdout:\ntail\n"), line.body);
   assertEquals(line.streaming, true);

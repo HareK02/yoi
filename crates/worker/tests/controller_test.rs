@@ -291,6 +291,7 @@ async fn controller_projects_workdir_command_events_and_snapshot_state() {
                     protocol::CommandEvent::Started {
                         command_id,
                         tool_call_id,
+                        ..
                     },
             } => {
                 assert_eq!(command_id, command.0);
@@ -330,6 +331,7 @@ async fn controller_projects_workdir_command_events_and_snapshot_state() {
                     command_id,
                     status: protocol::CommandStatus::Completed,
                     exit_code: Some(0),
+                    ..
                 }
             } if command_id == &command.0
         )

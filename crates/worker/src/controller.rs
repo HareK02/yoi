@@ -543,6 +543,9 @@ fn protocol_command_snapshot(snapshot: WorkdirCommandSnapshot) -> ProtocolComman
         command_id: snapshot.command_id,
         tool_call_id: snapshot.tool_call_id,
         status: protocol_command_status(snapshot.status),
+        started_at_ms: snapshot.started_at_ms,
+        observed_at_ms: snapshot.observed_at_ms,
+        last_output_at_ms: snapshot.last_output_at_ms,
         stdout: ProtocolCommandStreamSlice {
             start_offset: snapshot.stdout.start_offset,
             end_offset: snapshot.stdout.end_offset,
@@ -564,9 +567,11 @@ fn protocol_command_event(event: WorkdirCommandEvent) -> ProtocolCommandEvent {
         WorkdirCommandEvent::Started {
             command_id,
             tool_call_id,
+            observed_at_ms,
         } => ProtocolCommandEvent::Started {
             command_id,
             tool_call_id,
+            observed_at_ms,
         },
         WorkdirCommandEvent::Output {
             command_id,
@@ -574,6 +579,7 @@ fn protocol_command_event(event: WorkdirCommandEvent) -> ProtocolCommandEvent {
             start_offset,
             end_offset,
             content,
+            observed_at_ms,
         } => ProtocolCommandEvent::Output {
             command_id,
             stream: match stream {
@@ -583,15 +589,22 @@ fn protocol_command_event(event: WorkdirCommandEvent) -> ProtocolCommandEvent {
             start_offset,
             end_offset,
             content,
+            observed_at_ms,
         },
         WorkdirCommandEvent::Terminal {
             command_id,
             status,
             exit_code,
+            stdout_end_offset,
+            stderr_end_offset,
+            observed_at_ms,
         } => ProtocolCommandEvent::Terminal {
             command_id,
             status: protocol_command_status(status),
             exit_code,
+            stdout_end_offset,
+            stderr_end_offset,
+            observed_at_ms,
         },
     }
 }

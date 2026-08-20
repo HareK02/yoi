@@ -54,6 +54,9 @@ pub struct CommandSnapshot {
     pub command_id: String,
     pub tool_call_id: Option<String>,
     pub status: CommandStatus,
+    pub started_at_ms: u64,
+    pub observed_at_ms: u64,
+    pub last_output_at_ms: Option<u64>,
     pub stdout: CommandStreamSlice,
     pub stderr: CommandStreamSlice,
     pub exit_code: Option<i32>,
@@ -65,6 +68,7 @@ pub enum CommandEvent {
     Started {
         command_id: String,
         tool_call_id: Option<String>,
+        observed_at_ms: u64,
     },
     Output {
         command_id: String,
@@ -72,11 +76,15 @@ pub enum CommandEvent {
         start_offset: u64,
         end_offset: u64,
         content: String,
+        observed_at_ms: u64,
     },
     Terminal {
         command_id: String,
         status: CommandStatus,
         exit_code: Option<i32>,
+        stdout_end_offset: u64,
+        stderr_end_offset: u64,
+        observed_at_ms: u64,
     },
 }
 

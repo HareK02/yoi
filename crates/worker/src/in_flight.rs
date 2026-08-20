@@ -245,6 +245,7 @@ impl InFlightInner {
             CommandEvent::Started {
                 command_id,
                 tool_call_id,
+                observed_at_ms,
             } => {
                 self.commands
                     .retain(|command| command.command_id != *command_id);
@@ -252,6 +253,9 @@ impl InFlightInner {
                     command_id: command_id.clone(),
                     tool_call_id: tool_call_id.clone(),
                     status: CommandStatus::Running,
+                    started_at_ms: *observed_at_ms,
+                    observed_at_ms: *observed_at_ms,
+                    last_output_at_ms: None,
                     stdout: CommandStreamSlice::default(),
                     stderr: CommandStreamSlice::default(),
                     exit_code: None,
@@ -263,6 +267,7 @@ impl InFlightInner {
                 start_offset,
                 end_offset,
                 content,
+                observed_at_ms,
             } => {
                 let command = match self
                     .commands
@@ -275,6 +280,9 @@ impl InFlightInner {
                             command_id: command_id.clone(),
                             tool_call_id: None,
                             status: CommandStatus::Running,
+                            started_at_ms: *observed_at_ms,
+                            observed_at_ms: *observed_at_ms,
+                            last_output_at_ms: Some(*observed_at_ms),
                             stdout: CommandStreamSlice::default(),
                             stderr: CommandStreamSlice::default(),
                             exit_code: None,
@@ -282,6 +290,8 @@ impl InFlightInner {
                         self.commands.last_mut().expect("command was inserted")
                     }
                 };
+                command.observed_at_ms = *observed_at_ms;
+                command.last_output_at_ms = Some(*observed_at_ms);
                 let target = match stream {
                     CommandStream::Stdout => &mut command.stdout,
                     CommandStream::Stderr => &mut command.stderr,
@@ -685,6 +695,7 @@ mod tests {
         in_flight.publish_command_event(CommandEvent::Started {
             command_id: "command-1".into(),
             tool_call_id: Some("tool-1".into()),
+            observed_at_ms: 100,
         });
         in_flight.publish_command_event(CommandEvent::Output {
             command_id: "command-1".into(),
@@ -692,6 +703,7 @@ mod tests {
             start_offset: 0,
             end_offset: 5,
             content: "ready".into(),
+            observed_at_ms: 110,
         });
 
         let guard = in_flight.snapshot_guard();
@@ -718,6 +730,9 @@ mod tests {
             command_id: "command-1".into(),
             status: CommandStatus::TimedOut,
             exit_code: None,
+            stdout_end_offset: 5,
+            stderr_end_offset: 0,
+            observed_at_ms: 200,
         });
         let guard = in_flight.snapshot_guard();
         assert!(snapshot_from_guard(&guard).commands.is_empty());

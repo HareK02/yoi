@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use manifest::{Permission, Scope, ScopeConfig, ScopeRule, SharedScope};
@@ -40,6 +40,15 @@ use crate::{EntryKind, WriteOutcome};
 const COMMAND_EVENT_CHANNEL_CAPACITY: usize = 256;
 const COMMAND_EVENT_CHUNK_BYTES: usize = 8 * 1024;
 const COMMAND_SNAPSHOT_STREAM_BYTES: usize = 32 * 1024;
+
+fn command_observed_at_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
 
 #[derive(Debug)]
 enum LocalCommand {
@@ -91,6 +100,7 @@ impl CommandTelemetry {
     }
 
     fn started(&self, command_id: &str, tool_call_id: Option<String>) {
+        let observed_at_ms = command_observed_at_ms();
         self.inner
             .snapshots
             .lock()
@@ -101,6 +111,9 @@ impl CommandTelemetry {
                     command_id: command_id.to_string(),
                     tool_call_id: tool_call_id.clone(),
                     status: CommandStatus::Running,
+                    started_at_ms: observed_at_ms,
+                    observed_at_ms,
+                    last_output_at_ms: None,
                     stdout: CommandStreamSlice::default(),
                     stderr: CommandStreamSlice::default(),
                     exit_code: None,
@@ -109,6 +122,7 @@ impl CommandTelemetry {
         let _ = self.inner.events.send(CommandEvent::Started {
             command_id: command_id.to_string(),
             tool_call_id,
+            observed_at_ms,
         });
     }
 
@@ -118,6 +132,7 @@ impl CommandTelemetry {
         }
         let end_offset = start_offset.saturating_add(bytes.len() as u64);
         let content = String::from_utf8_lossy(bytes).into_owned();
+        let observed_at_ms = command_observed_at_ms();
         if let Some(snapshot) = self
             .inner
             .snapshots
@@ -125,6 +140,8 @@ impl CommandTelemetry {
             .expect("command telemetry mutex poisoned")
             .get_mut(command_id)
         {
+            snapshot.observed_at_ms = observed_at_ms;
+            snapshot.last_output_at_ms = Some(observed_at_ms);
             let target = match stream {
                 CommandStream::Stdout => &mut snapshot.stdout,
                 CommandStream::Stderr => &mut snapshot.stderr,
@@ -147,11 +164,13 @@ impl CommandTelemetry {
             start_offset,
             end_offset,
             content,
+            observed_at_ms,
         });
     }
 
     fn terminal(&self, command_id: &str, status: CommandStatus, exit_code: Option<i32>) {
-        if let Some(snapshot) = self
+        let observed_at_ms = command_observed_at_ms();
+        let (stdout_end_offset, stderr_end_offset) = if let Some(snapshot) = self
             .inner
             .snapshots
             .lock()
@@ -160,11 +179,18 @@ impl CommandTelemetry {
         {
             snapshot.status = status;
             snapshot.exit_code = exit_code;
-        }
+            snapshot.observed_at_ms = observed_at_ms;
+            (snapshot.stdout.end_offset, snapshot.stderr.end_offset)
+        } else {
+            (0, 0)
+        };
         let _ = self.inner.events.send(CommandEvent::Terminal {
             command_id: command_id.to_string(),
             status,
             exit_code,
+            stdout_end_offset,
+            stderr_end_offset,
+            observed_at_ms,
         });
     }
 
@@ -909,8 +935,8 @@ async fn run_command(
         std::fs::File::open(&stdout_path).map_err(|error| WorkdirError::io(&stdout_path, error))?;
     let mut stderr_reader =
         std::fs::File::open(&stderr_path).map_err(|error| WorkdirError::io(&stderr_path, error))?;
-    let mut stdout_offset = 0;
-    let mut stderr_offset = 0;
+    let mut stdout_decoder = CommandOutputDecoder::default();
+    let mut stderr_decoder = CommandOutputDecoder::default();
     let mut timeout = Box::pin(tokio::time::sleep(Duration::from_secs(
         request.timeout_secs.max(1),
     )));
@@ -942,19 +968,21 @@ async fn run_command(
             _ = interval.tick() => {
                 publish_available_output(
                     &mut stdout_reader,
-                    &mut stdout_offset,
+                    &mut stdout_decoder,
                     &telemetry,
                     &command_id,
                     CommandStream::Stdout,
                     &stdout_path,
+                    false,
                 )?;
                 publish_available_output(
                     &mut stderr_reader,
-                    &mut stderr_offset,
+                    &mut stderr_decoder,
                     &telemetry,
                     &command_id,
                     CommandStream::Stderr,
                     &stderr_path,
+                    false,
                 )?;
             }
         }
@@ -962,19 +990,21 @@ async fn run_command(
 
     publish_available_output(
         &mut stdout_reader,
-        &mut stdout_offset,
+        &mut stdout_decoder,
         &telemetry,
         &command_id,
         CommandStream::Stdout,
         &stdout_path,
+        true,
     )?;
     publish_available_output(
         &mut stderr_reader,
-        &mut stderr_offset,
+        &mut stderr_decoder,
         &telemetry,
         &command_id,
         CommandStream::Stderr,
         &stderr_path,
+        true,
     )?;
     telemetry.terminal(&command_id, status, exit_code);
 
@@ -990,15 +1020,23 @@ async fn run_command(
     })
 }
 
+#[derive(Debug, Default)]
+struct CommandOutputDecoder {
+    read_offset: u64,
+    emitted_offset: u64,
+    pending: Vec<u8>,
+}
+
 fn publish_available_output(
     file: &mut std::fs::File,
-    offset: &mut u64,
+    decoder: &mut CommandOutputDecoder,
     telemetry: &CommandTelemetry,
     command_id: &str,
     stream: CommandStream,
     path: &Path,
+    flush: bool,
 ) -> Result<(), WorkdirError> {
-    file.seek(SeekFrom::Start(*offset))
+    file.seek(SeekFrom::Start(decoder.read_offset))
         .map_err(|error| WorkdirError::io(path, error))?;
     loop {
         let mut buffer = vec![0; COMMAND_EVENT_CHUNK_BYTES];
@@ -1006,15 +1044,65 @@ fn publish_available_output(
             .read(&mut buffer)
             .map_err(|error| WorkdirError::io(path, error))?;
         if read == 0 {
+            publish_decoded_output(decoder, telemetry, command_id, stream, flush);
             return Ok(());
         }
-        buffer.truncate(read);
-        telemetry.output(command_id, stream, *offset, &buffer);
-        *offset = offset.saturating_add(read as u64);
+        decoder.pending.extend_from_slice(&buffer[..read]);
+        decoder.read_offset = decoder.read_offset.saturating_add(read as u64);
+        publish_decoded_output(decoder, telemetry, command_id, stream, false);
         if read < COMMAND_EVENT_CHUNK_BYTES {
+            if flush {
+                publish_decoded_output(decoder, telemetry, command_id, stream, true);
+            }
             return Ok(());
         }
     }
+}
+
+fn publish_decoded_output(
+    decoder: &mut CommandOutputDecoder,
+    telemetry: &CommandTelemetry,
+    command_id: &str,
+    stream: CommandStream,
+    flush: bool,
+) {
+    let prefix_len = if flush {
+        decoder.pending.len()
+    } else {
+        stable_utf8_prefix_len(&decoder.pending)
+    };
+    if prefix_len == 0 {
+        return;
+    }
+    telemetry.output(
+        command_id,
+        stream,
+        decoder.emitted_offset,
+        &decoder.pending[..prefix_len],
+    );
+    decoder.emitted_offset = decoder.emitted_offset.saturating_add(prefix_len as u64);
+    decoder.pending.drain(..prefix_len);
+}
+
+/// Return the byte prefix that can be decoded now without replacing a valid
+/// UTF-8 scalar whose remaining bytes may arrive in a later file read. Definite
+/// invalid sequences remain in the prefix and are rendered lossily, preserving
+/// the existing arbitrary-byte output behavior.
+fn stable_utf8_prefix_len(bytes: &[u8]) -> usize {
+    let mut inspected = 0;
+    while inspected < bytes.len() {
+        match std::str::from_utf8(&bytes[inspected..]) {
+            Ok(_) => return bytes.len(),
+            Err(error) => {
+                inspected += error.valid_up_to();
+                match error.error_len() {
+                    Some(invalid_len) => inspected += invalid_len,
+                    None => return inspected,
+                }
+            }
+        }
+    }
+    inspected
 }
 
 fn read_command_output_files(
@@ -1902,6 +1990,64 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn command_output_decoder_preserves_utf8_split_across_file_reads() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("command.out");
+        let mut first_write = vec![b'a'; COMMAND_EVENT_CHUNK_BYTES - 1];
+        first_write.push(0xe2);
+        std::fs::write(&path, first_write).unwrap();
+
+        let telemetry = CommandTelemetry::new();
+        let mut events = telemetry.subscribe();
+        telemetry.started("command-utf8", None);
+        let mut decoder = CommandOutputDecoder::default();
+        let mut reader = std::fs::File::open(&path).unwrap();
+        publish_available_output(
+            &mut reader,
+            &mut decoder,
+            &telemetry,
+            "command-utf8",
+            CommandStream::Stdout,
+            &path,
+            false,
+        )
+        .unwrap();
+        assert_eq!(decoder.pending, vec![0xe2]);
+
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writer.write_all(&[0x82, 0xac]).unwrap();
+        writer.flush().unwrap();
+        publish_available_output(
+            &mut reader,
+            &mut decoder,
+            &telemetry,
+            "command-utf8",
+            CommandStream::Stdout,
+            &path,
+            false,
+        )
+        .unwrap();
+
+        let output = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                CommandEvent::Output {
+                    stream: CommandStream::Stdout,
+                    content,
+                    ..
+                } => Some(content),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(output.len(), COMMAND_EVENT_CHUNK_BYTES - 1 + "€".len());
+        assert!(output.ends_with('€'));
+        assert!(!output.contains('\u{fffd}'));
+        assert!(decoder.pending.is_empty());
+    }
+
     #[tokio::test]
     async fn provider_streams_bounded_command_lifecycle_and_distinct_output() {
         let dir = TempDir::new().unwrap();
@@ -1921,6 +2067,7 @@ mod tests {
         .unwrap();
 
         let mut stdout = String::new();
+        let mut stdout_chunks = 0;
         let mut stderr = String::new();
         let mut terminal = None;
         while terminal.is_none() {
@@ -1932,6 +2079,7 @@ mod tests {
                 CommandEvent::Started {
                     command_id,
                     tool_call_id,
+                    ..
                 } => {
                     assert_eq!(command_id, handle.0);
                     assert_eq!(tool_call_id.as_deref(), Some("tool-7"));
@@ -1944,7 +2092,10 @@ mod tests {
                 } => {
                     assert_eq!(command_id, handle.0);
                     match stream {
-                        CommandStream::Stdout => stdout.push_str(&content),
+                        CommandStream::Stdout => {
+                            stdout_chunks += 1;
+                            stdout.push_str(&content);
+                        }
                         CommandStream::Stderr => stderr.push_str(&content),
                     }
                 }
@@ -1952,13 +2103,32 @@ mod tests {
                     command_id,
                     status,
                     exit_code,
+                    stdout_end_offset,
+                    stderr_end_offset,
+                    observed_at_ms,
                 } => {
                     assert_eq!(command_id, handle.0);
-                    terminal = Some((status, exit_code));
+                    terminal = Some((
+                        status,
+                        exit_code,
+                        stdout_end_offset,
+                        stderr_end_offset,
+                        observed_at_ms,
+                    ));
                 }
             }
         }
-        assert_eq!(terminal, Some((CommandStatus::Completed, Some(0))));
+        let (status, exit_code, stdout_end_offset, stderr_end_offset, observed_at_ms) =
+            terminal.unwrap();
+        assert_eq!(status, CommandStatus::Completed);
+        assert_eq!(exit_code, Some(0));
+        assert_eq!(stdout_end_offset, "readydone".len() as u64);
+        assert_eq!(stderr_end_offset, "warning".len() as u64);
+        assert!(observed_at_ms > 0);
+        assert!(
+            stdout_chunks >= 2,
+            "long-running output should stream incrementally"
+        );
         assert_eq!(stdout, "readydone");
         assert_eq!(stderr, "warning");
         let snapshot = WorkdirSession::command_snapshot(&workdir);
@@ -2018,6 +2188,7 @@ mod tests {
                 command_id,
                 status,
                 exit_code,
+                ..
             } = event
             {
                 terminal = Some((command_id, status, exit_code));

@@ -280,6 +280,9 @@ function applyCommandEvent(
       command_id: event.command_id,
       tool_call_id: event.tool_call_id,
       status: "running",
+      started_at_ms: event.observed_at_ms,
+      observed_at_ms: event.observed_at_ms,
+      last_output_at_ms: null,
       stdout: emptyCommandStream(),
       stderr: emptyCommandStream(),
       exit_code: null,
@@ -297,6 +300,9 @@ function applyCommandEvent(
         command_id: event.command_id,
         tool_call_id: null,
         status: "running",
+        started_at_ms: event.observed_at_ms,
+        observed_at_ms: event.observed_at_ms,
+        last_output_at_ms: event.observed_at_ms,
         stdout: event.stream === "stdout" ? stream : emptyCommandStream(),
         stderr: event.stream === "stderr" ? stream : emptyCommandStream(),
         exit_code: null,
@@ -311,6 +317,7 @@ function applyCommandEvent(
       ...existing,
       status: event.status,
       exit_code: event.exit_code,
+      observed_at_ms: event.observed_at_ms,
     });
     return;
   }
@@ -322,6 +329,8 @@ function applyCommandEvent(
   );
   upsertCommandSnapshot(projection, eventId, {
     ...existing,
+    observed_at_ms: event.observed_at_ms,
+    last_output_at_ms: event.observed_at_ms,
     stdout: event.stream === "stdout" ? updatedStream : existing.stdout,
     stderr: event.stream === "stderr" ? updatedStream : existing.stderr,
   });
@@ -1183,6 +1192,7 @@ function renderBashTool(toolCall: ToolCallView): string {
   return compactLines([
     `Bash — ${commandStateSuffix(toolCall)}`,
     command ? `$ ${command}` : argsText(toolCall),
+    commandTiming(toolCall.command),
     ["done", "error"].includes(toolCall.state)
       ? cappedDisplaySection(resultText(toolCall), 10)
       : renderLiveCommandOutput(toolCall.command),
@@ -1203,6 +1213,25 @@ function commandStateSuffix(toolCall: ToolCallView): string {
   if (command.status === "timed_out") return "timed out";
   if (command.status === "cancelled") return "cancelled";
   return "running…";
+}
+
+function commandTiming(command?: CommandSnapshot): string | undefined {
+  if (!command) return undefined;
+  const elapsed = Math.max(0, command.observed_at_ms - command.started_at_ms);
+  if (command.status !== "running") return `elapsed ${durationLabel(elapsed)}`;
+  if (command.last_output_at_ms === null) {
+    return `elapsed ${durationLabel(elapsed)} · awaiting first output`;
+  }
+  const lastOutputElapsed = Math.max(
+    0,
+    command.last_output_at_ms - command.started_at_ms,
+  );
+  return `elapsed ${durationLabel(elapsed)} · last output at +${durationLabel(lastOutputElapsed)}`;
+}
+
+function durationLabel(milliseconds: number): string {
+  if (milliseconds < 1000) return `${milliseconds}ms`;
+  return `${(milliseconds / 1000).toFixed(milliseconds < 10_000 ? 1 : 0)}s`;
 }
 
 function renderLiveCommandOutput(command?: CommandSnapshot): string | undefined {
