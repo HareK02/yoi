@@ -98,10 +98,12 @@ Deno.test("running status is Composer-side above mini Tasks", async () => {
     ),
   );
   const status = page.indexOf("<WorkerRunStatus");
-  const tasks = page.indexOf('<ConsoleTasks {tasks} mode="mini"');
+  const miniMode = page.indexOf('mode="mini"');
+  const tasks = page.lastIndexOf("<ConsoleTasks", miniMode);
   const composer = page.indexOf('<form class="console-composer card"');
 
   assert(status >= 0, "WorkerRunStatus should be rendered");
+  assert(miniMode >= 0 && tasks >= 0, "mini Tasks should be rendered");
   assert(status < tasks, "WorkerRunStatus should be above mini Tasks");
   assert(tasks < composer, "mini Tasks should remain above Composer");
   assert(
