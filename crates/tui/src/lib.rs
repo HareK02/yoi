@@ -1,5 +1,6 @@
 mod app;
 mod backend_worker_picker;
+mod backend_workspace_picker;
 mod block;
 mod cache;
 mod command;

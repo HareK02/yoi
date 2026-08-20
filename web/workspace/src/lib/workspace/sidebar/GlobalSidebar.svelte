@@ -8,6 +8,8 @@
   const { currentPath }: Props = $props();
 
   const items = [
+    { href: '/', label: 'Workspaces' },
+    { href: '/#workspace-create-title', label: 'Create Workspace' },
     { href: '/account', label: 'Account' },
     { href: '/login/device', label: 'Device Login' },
   ];

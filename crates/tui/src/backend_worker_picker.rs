@@ -3,8 +3,8 @@ use std::io;
 use std::time::Duration;
 
 use client::{
-    BackendRuntimeListTarget, BackendRuntimeTarget, BackendWorkerSummary,
-    list_backend_stopped_workers, list_backend_workers, restore_backend_worker,
+    BackendRuntimeListTarget, BackendWorkerSummary, list_backend_stopped_workers,
+    list_backend_workers, restore_backend_worker,
 };
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::backend::CrosstermBackend;
@@ -14,77 +14,94 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
+use crate::backend_workspace_picker::select_backend_workspace;
 use crate::console;
 
 const MAX_ROWS: usize = 10;
 const VIEWPORT_LINES: u16 = MAX_ROWS as u16 + 4;
 
 pub(crate) async fn run(
-    target: BackendRuntimeListTarget,
+    mut target: BackendRuntimeListTarget,
     include_stopped: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let mut response = list_backend_workers(&target).await.map_err(|error| {
-        io::Error::other(format!(
-            "failed to list Backend runtime workers from {}: {error}",
-            target.base_url
-        ))
-    })?;
-    if include_stopped {
-        match list_backend_stopped_workers(&target).await {
-            Ok(stopped) => {
-                response.items.extend(stopped.items);
-                response.diagnostics.extend(stopped.diagnostics);
-            }
-            Err(error) => response.diagnostics.push(client::BackendDiagnostic {
-                code: "backend_stopped_workers_list_failed".to_string(),
-                severity: Some("error".to_string()),
-                message: error.to_string(),
-            }),
+    loop {
+        if target.workspace_id().is_none() {
+            let workspace_id = select_backend_workspace(&target.base_url)
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?
+                .ok_or_else(|| io::Error::other("Backend workspace picker cancelled"))?;
+            target.select_workspace(workspace_id);
         }
-    }
-    dedup_workers(&mut response.items);
-    if response.items.is_empty() {
-        let diagnostics = response
-            .diagnostics
-            .iter()
-            .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
-            .collect::<Vec<_>>()
-            .join("; ");
-        let detail = if diagnostics.is_empty() {
-            "no backend diagnostics".to_string()
-        } else {
-            diagnostics
-        };
-        return Err(Box::new(io::Error::other(format!(
-            "Backend returned no runtime workers for workspace {} ({detail})",
-            response.workspace_id
-        ))));
-    }
+        let mut response = list_backend_workers(&target).await.map_err(|error| {
+            io::Error::other(format!(
+                "failed to list Backend runtime workers from {}: {error}",
+                target.base_url
+            ))
+        })?;
+        if include_stopped {
+            match list_backend_stopped_workers(&target).await {
+                Ok(stopped) => {
+                    response.items.extend(stopped.items);
+                    response.diagnostics.extend(stopped.diagnostics);
+                }
+                Err(error) => response.diagnostics.push(client::BackendDiagnostic {
+                    code: "backend_stopped_workers_list_failed".to_string(),
+                    severity: Some("error".to_string()),
+                    message: error.to_string(),
+                }),
+            }
+        }
+        dedup_workers(&mut response.items);
+        if response.items.is_empty() {
+            let diagnostics = response
+                .diagnostics
+                .iter()
+                .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let detail = if diagnostics.is_empty() {
+                "no backend diagnostics".to_string()
+            } else {
+                diagnostics
+            };
+            eprintln!(
+                "Backend returned no runtime workers for workspace {} ({detail}); choose another Workspace",
+                response.workspace_id
+            );
+            target.clear_workspace();
+            continue;
+        }
 
-    let selected = pick_worker(target.clone(), response.items)?;
-    let worker = if selected.state == "stopped" {
-        let restore_target = BackendRuntimeTarget::new(
-            target.base_url.clone(),
-            selected.runtime_id.clone(),
-            selected.worker_id.clone(),
-        );
-        restore_backend_worker(&restore_target)
-            .await
-            .map_err(|error| {
-                io::Error::other(format!(
-                    "failed to restore Backend worker {}/{}: {error}",
-                    selected.runtime_id, selected.worker_id
-                ))
-            })?
-            .result
-            .worker
-            .unwrap_or(selected)
-    } else {
-        selected
-    };
-    let attach_target =
-        BackendRuntimeTarget::new(target.base_url, worker.runtime_id, worker.worker_id);
-    console::run_backend_runtime(attach_target).await
+        let selected = match pick_worker(target.clone(), response.items)? {
+            WorkerPickerResult::SwitchWorkspace => {
+                target.clear_workspace();
+                continue;
+            }
+            WorkerPickerResult::Selected(selected) => selected,
+        };
+        let worker = if selected.state == "stopped" {
+            let restore_target = target
+                .runtime_target(selected.runtime_id.clone(), selected.worker_id.clone())
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            restore_backend_worker(&restore_target)
+                .await
+                .map_err(|error| {
+                    io::Error::other(format!(
+                        "failed to restore Backend worker {}/{}: {error}",
+                        selected.runtime_id, selected.worker_id
+                    ))
+                })?
+                .result
+                .worker
+                .unwrap_or(selected)
+        } else {
+            selected
+        };
+        let attach_target = target
+            .runtime_target(worker.runtime_id, worker.worker_id)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        return console::run_backend_runtime(attach_target).await;
+    }
 }
 
 fn dedup_workers(workers: &mut Vec<BackendWorkerSummary>) {
@@ -92,10 +109,15 @@ fn dedup_workers(workers: &mut Vec<BackendWorkerSummary>) {
     workers.retain(|worker| seen.insert((worker.runtime_id.clone(), worker.worker_id.clone())));
 }
 
+enum WorkerPickerResult {
+    Selected(BackendWorkerSummary),
+    SwitchWorkspace,
+}
+
 fn pick_worker(
     target: BackendRuntimeListTarget,
     mut workers: Vec<BackendWorkerSummary>,
-) -> Result<BackendWorkerSummary, Box<dyn Error>> {
+) -> Result<WorkerPickerResult, Box<dyn Error>> {
     workers.sort_by(|a, b| {
         a.runtime_id
             .cmp(&b.runtime_id)
@@ -114,7 +136,13 @@ fn pick_worker(
             Some(Action::Down) => state.next(),
             Some(Action::Submit) => {
                 close_viewport(&mut terminal)?;
-                return Ok(state.selected_worker().clone());
+                return Ok(WorkerPickerResult::Selected(
+                    state.selected_worker().clone(),
+                ));
+            }
+            Some(Action::SwitchWorkspace) => {
+                close_viewport(&mut terminal)?;
+                return Ok(WorkerPickerResult::SwitchWorkspace);
             }
             Some(Action::Cancel) => {
                 close_viewport(&mut terminal)?;
@@ -181,6 +209,7 @@ enum Action {
     Up,
     Down,
     Submit,
+    SwitchWorkspace,
     Cancel,
 }
 
@@ -197,6 +226,7 @@ fn poll_event() -> io::Result<Option<Action>> {
                 KeyCode::Char('k') if !ctrl => Some(Action::Up),
                 KeyCode::Char('j') if !ctrl => Some(Action::Down),
                 KeyCode::Enter => Some(Action::Submit),
+                KeyCode::Char('w') if !ctrl => Some(Action::SwitchWorkspace),
                 KeyCode::Esc => Some(Action::Cancel),
                 KeyCode::Char('c') if ctrl => Some(Action::Cancel),
                 _ => None,
@@ -239,6 +269,8 @@ fn draw(frame: &mut Frame<'_>, state: &BackendWorkerPickerState) {
             Span::raw(" select   "),
             Span::styled("[enter]", Style::default().fg(Color::Green)),
             Span::raw(" attach   "),
+            Span::styled("[w]", Style::default().fg(Color::Cyan)),
+            Span::raw(" switch Workspace   "),
             Span::styled("[esc]", Style::default().fg(Color::Yellow)),
             Span::raw(" cancel"),
         ])),
