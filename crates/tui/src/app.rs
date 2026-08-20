@@ -3506,6 +3506,7 @@ mod completion_flow_tests {
                         finished: false,
                     },
                 ],
+                commands: Vec::new(),
             },
             internal_workers: Vec::new(),
         });
