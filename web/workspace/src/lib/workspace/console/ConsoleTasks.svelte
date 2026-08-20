@@ -1,12 +1,26 @@
 <script lang="ts">
   import { taskCounts, type ConsoleTask } from "./tasks.ts";
 
+  type WorkerViewTab = {
+    sessionId: string | null;
+    label: string;
+  };
+
   type Props = {
     tasks: ConsoleTask[];
     mode: "mini" | "pane";
+    workerViews?: WorkerViewTab[];
+    selectedWorkerViewSessionId?: string | null;
+    onSelectWorkerView?: (sessionId: string | null) => void;
   };
 
-  let { tasks, mode }: Props = $props();
+  let {
+    tasks,
+    mode,
+    workerViews = [],
+    selectedWorkerViewSessionId = null,
+    onSelectWorkerView = () => {},
+  }: Props = $props();
   const counts = $derived(taskCounts(tasks));
   const activeTasks = $derived(
     tasks
@@ -28,7 +42,7 @@
   }
 </script>
 
-{#if mode === "mini" && tasks.length > 0}
+{#if mode === "mini" && (tasks.length > 0 || workerViews.length > 1)}
   <section class="task-mini" aria-label="Worker task summary">
     {#each activeTasks as task (task.taskid)}
       <div class="task-mini-row">
@@ -38,8 +52,25 @@
         <span class="task-subject">{task.subject.split("\n", 1)[0]}</span>
       </div>
     {/each}
-    <div class="task-summary">
-      {counts.total} task(s) — pending: {counts.pending}, inprogress: {counts.inprogress}, completed: {counts.completed}, deleted: {counts.deleted}
+    <div class="task-summary-row">
+      <span class="task-summary">
+        {counts.total} task(s) — pending: {counts.pending}, inprogress: {counts.inprogress}, completed: {counts.completed}, deleted: {counts.deleted}
+      </span>
+      {#if workerViews.length > 1}
+        <span class="worker-view-tabs" role="group" aria-label="Worker transcript view">
+          <span aria-hidden="true">[ </span>
+          {#each workerViews as view, index (view.sessionId ?? "main")}
+            {#if index > 0}<span aria-hidden="true"> | </span>{/if}
+            <button
+              type="button"
+              aria-pressed={view.sessionId === selectedWorkerViewSessionId}
+              class:active={view.sessionId === selectedWorkerViewSessionId}
+              onclick={() => onSelectWorkerView(view.sessionId)}
+            >{view.label}</button>
+          {/each}
+          <span aria-hidden="true"> ]</span>
+        </span>
+      {/if}
     </div>
   </section>
 {:else if mode === "pane"}
@@ -95,10 +126,67 @@
   }
 
   .task-mini-row,
-  .task-heading {
+  .task-heading,
+  .task-summary-row {
     display: flex;
     min-width: 0;
     gap: 0.5rem;
+  }
+
+  .task-summary-row {
+    align-items: baseline;
+  }
+
+  .task-summary {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .worker-view-tabs {
+    display: flex;
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 60%;
+    margin-left: auto;
+    overflow-x: auto;
+    color: var(--text-muted);
+    scrollbar-width: none;
+    white-space: nowrap;
+  }
+
+  .worker-view-tabs::-webkit-scrollbar {
+    display: none;
+  }
+
+  .worker-view-tabs button {
+    flex: 0 0 auto;
+    min-width: 0;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    line-height: inherit;
+    cursor: pointer;
+  }
+
+  .worker-view-tabs button:hover,
+  .worker-view-tabs button:focus-visible {
+    color: var(--text);
+  }
+
+  .worker-view-tabs button:focus-visible {
+    outline: 1px solid currentcolor;
+    outline-offset: 2px;
+  }
+
+  .worker-view-tabs button.active {
+    color: var(--accent);
+    font-weight: 700;
   }
 
   .task-mark,

@@ -653,13 +653,11 @@ pub trait ControlPlaneStore: Send + Sync {
         &self,
         workspace_id: &str,
         worker: &RuntimeWorkerRef,
-        expected_worker_revision: &str,
-        reason: &str,
     ) -> std::result::Result<
         Option<crate::retention::PreparedWorkerRemoval>,
         crate::retention::WorkerRetentionError,
     > {
-        let _ = (workspace_id, worker, expected_worker_revision, reason);
+        let _ = (workspace_id, worker);
         Ok(None)
     }
     fn fail_worker_removal(
@@ -1650,19 +1648,11 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         &self,
         workspace_id: &str,
         worker: &RuntimeWorkerRef,
-        expected_worker_revision: &str,
-        reason: &str,
     ) -> std::result::Result<
         Option<crate::retention::PreparedWorkerRemoval>,
         crate::retention::WorkerRetentionError,
     > {
-        SqliteWorkspaceStore::recover_worker_removal_execution(
-            self,
-            workspace_id,
-            worker,
-            expected_worker_revision,
-            reason,
-        )
+        SqliteWorkspaceStore::recover_worker_removal_execution(self, workspace_id, worker)
     }
 
     fn fail_worker_removal(

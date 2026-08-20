@@ -797,7 +797,7 @@ Deno.test("Web Console renders the client-projected Worker task store", async ()
 
   assert(
     consolePage.includes("ConsoleTasks") &&
-      consolePage.includes("consoleProjection.tasks") &&
+      consolePage.includes("selectedConsoleProjection.tasks") &&
       consolePage.includes("taskPaneOpen"),
     "Console should expose the projected task store through its existing client model",
   );
@@ -816,5 +816,46 @@ Deno.test("Web Console renders the client-projected Worker task store", async ()
       tasksModel.includes("[Session TaskStore snapshot]") &&
       !consolePage.includes("fetchTasks"),
     "Task projection should replay the protocol client-side without adding a task API",
+  );
+});
+
+Deno.test("Web Console switches main and direct SubWorker views from the Tasks row", async () => {
+  const consolePage = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      import.meta.url,
+    ),
+  );
+  const tasksComponent = await Deno.readTextFile(
+    new URL("./ConsoleTasks.svelte", import.meta.url),
+  );
+  const consoleModel = await Deno.readTextFile(
+    new URL("./model.ts", import.meta.url),
+  );
+
+  assert(
+    consolePage.includes("selectedWorkerViewSessionId") &&
+      consolePage.includes("selectConsoleWorkerView") &&
+      consolePage.includes("selectedConsoleProjection.lines") &&
+      consolePage.includes("selectedConsoleProjection.tasks") &&
+      consolePage.includes("onSelectWorkerView") &&
+      consolePage.includes("selectConsoleWorkerView(resolvedSessionId, false)") &&
+      consolePage.includes("consoleWorkerViewSelectionIsResolved") &&
+      !consolePage.includes("internal-worker-pane") &&
+      !consolePage.includes("flattenInternalWorkers"),
+    "Console should render one selected transcript/task projection without appending Internal Worker panes",
+  );
+  assert(
+    tasksComponent.includes('role="group"') &&
+      tasksComponent.includes("aria-pressed") &&
+      tasksComponent.includes("onclick") &&
+      tasksComponent.includes("tasks.length > 0 || workerViews.length > 1"),
+    "Tasks summary should expose a clickable and accessible Worker view selector even with zero tasks",
+  );
+  assert(
+    consoleModel.includes("consoleWorkerViews") &&
+      consoleModel.includes("projection.internalWorkers.map") &&
+      consoleModel.includes("resolveConsoleWorkerView"),
+    "Worker view selection should use direct Internal Worker session identities with main fallback",
   );
 });

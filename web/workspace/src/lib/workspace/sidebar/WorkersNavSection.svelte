@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Spinner from '$lib/workspace/console/Spinner.svelte';
   import { workerConsoleHref } from '$lib/workspace/console/model';
   import {
     workspaceWorkersStore,
@@ -76,10 +77,12 @@
             aria-current={currentPath === href ? 'page' : undefined}
           >
             <span class="worker-status-indicator">
-              {#if worker.state === 'idle'}
+              {#if worker.state === 'running'}
+                <span class="worker-status-spinner"><Spinner label="Running" /></span>
+              {:else if worker.has_running_internal_workers}
+                <span class="worker-status-spinner is-subworker"><Spinner label="SubWorker running" /></span>
+              {:else if worker.state === 'idle'}
                 <span class="worker-status-dot" aria-label="Idle"></span>
-              {:else if worker.state === 'running'}
-                <span class="worker-status-spinner" aria-label="Running"></span>
               {/if}
             </span>
             <span class="worker-nav-label">{worker.display_name || worker.label}</span>

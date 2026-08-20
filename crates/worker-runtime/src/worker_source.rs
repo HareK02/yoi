@@ -125,7 +125,6 @@ pub trait EmbeddedWorkerMutationDispatcher: Send + Sync {
         proof: InProcessWorkerMutationProof,
         target_runtime_id: &str,
         target_worker_id: &str,
-        expected_worker_revision: &str,
         reason: &str,
     ) -> Result<WorkspaceResponse, RuntimeWorkerMutationForwardError>;
 }
@@ -187,7 +186,6 @@ impl RuntimeWorkerMutationForwarder {
         &self,
         target_runtime_id: &str,
         target_worker_id: &str,
-        expected_worker_revision: &str,
         reason: &str,
     ) -> Result<WorkspaceResponse, RuntimeWorkerMutationForwardError> {
         let proof = self.authority.issue_worker_remove(
@@ -206,7 +204,6 @@ impl RuntimeWorkerMutationForwarder {
                 token,
                 target_runtime_id: target_runtime_id.to_string(),
                 target_worker_id: target_worker_id.to_string(),
-                expected_worker_revision: expected_worker_revision.to_string(),
                 reason: reason.to_string(),
             }),
             (
@@ -216,7 +213,6 @@ impl RuntimeWorkerMutationForwarder {
                 claims,
                 target_runtime_id,
                 target_worker_id,
-                expected_worker_revision,
                 reason,
             ),
             _ => Err(RuntimeWorkerMutationForwardError::AuthorityTransportMismatch),
@@ -230,7 +226,6 @@ struct RemoteWorkerRemoveHttpRequest {
     token: String,
     target_runtime_id: String,
     target_worker_id: String,
-    expected_worker_revision: String,
     reason: String,
 }
 
@@ -267,7 +262,6 @@ fn execute_remote_worker_remove_http_blocking(
     let body = serde_json::json!({
         "target_runtime_id": request.target_runtime_id,
         "target_worker_id": request.target_worker_id,
-        "expected_worker_revision": request.expected_worker_revision,
         "reason": request.reason,
     });
     let client = reqwest::blocking::Client::new();
@@ -474,7 +468,6 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
         &self,
         target_runtime_id: &str,
         target_worker_id: &str,
-        expected_worker_revision: &str,
         reason: &str,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         self.worker_remove
@@ -484,12 +477,7 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
                     "Runtime-owned WorkerRemove forwarding is unavailable".to_string(),
                 )
             })?
-            .execute_worker_remove(
-                target_runtime_id,
-                target_worker_id,
-                expected_worker_revision,
-                reason,
-            )
+            .execute_worker_remove(target_runtime_id, target_worker_id, reason)
             .map_err(|error| WorkspaceClientError::Request(error.to_string()))
     }
 }
@@ -915,12 +903,7 @@ mod tests {
             format!("http://{address}"),
         );
         let response = forwarder
-            .execute_worker_remove(
-                "runtime-target",
-                "worker-target",
-                "revision-7",
-                "retire obsolete Worker",
-            )
+            .execute_worker_remove("runtime-target", "worker-target", "retire obsolete Worker")
             .unwrap();
         assert_eq!(response.status, 204);
         server.join().unwrap();
@@ -929,7 +912,7 @@ mod tests {
         assert!(request.starts_with("POST /api/w/workspace-a/workers/remove HTTP/1.1"));
         assert!(request.contains("\"target_runtime_id\":\"runtime-target\""));
         assert!(request.contains("\"target_worker_id\":\"worker-target\""));
-        assert!(request.contains("\"expected_worker_revision\":\"revision-7\""));
+        assert!(!request.contains("expected_worker_revision"));
         assert!(request.contains("\"reason\":\"retire obsolete Worker\""));
         let token = request
             .lines()
@@ -962,7 +945,7 @@ mod tests {
 
         #[derive(Default)]
         struct RecordingDispatcher {
-            seen: Mutex<Option<(WorkerMutationSourceClaims, String, String, String, String)>>,
+            seen: Mutex<Option<(WorkerMutationSourceClaims, String, String, String)>>,
         }
         impl EmbeddedWorkerMutationDispatcher for RecordingDispatcher {
             fn execute_worker_remove(
@@ -970,14 +953,12 @@ mod tests {
                 proof: InProcessWorkerMutationProof,
                 target_runtime_id: &str,
                 target_worker_id: &str,
-                expected_worker_revision: &str,
                 reason: &str,
             ) -> Result<WorkspaceResponse, RuntimeWorkerMutationForwardError> {
                 *self.seen.lock().unwrap() = Some((
                     proof.into_claims(),
                     target_runtime_id.to_string(),
                     target_worker_id.to_string(),
-                    expected_worker_revision.to_string(),
                     reason.to_string(),
                 ));
                 Ok(WorkspaceResponse {
@@ -996,15 +977,10 @@ mod tests {
             dispatcher.clone(),
         );
         let response = forwarder
-            .execute_worker_remove(
-                "runtime-target",
-                "worker-target",
-                "revision-7",
-                "retire obsolete Worker",
-            )
+            .execute_worker_remove("runtime-target", "worker-target", "retire obsolete Worker")
             .unwrap();
         assert_eq!(response.status, 202);
-        let (claims, target_runtime_id, target_worker_id, expected_revision, reason) =
+        let (claims, target_runtime_id, target_worker_id, reason) =
             dispatcher.seen.lock().unwrap().take().unwrap();
         assert_eq!(claims.iss, "runtime-embedded");
         assert_eq!(claims.worker_id, "worker-source");
@@ -1012,7 +988,6 @@ mod tests {
         assert_eq!(claims.target_worker_id, "worker-target");
         assert_eq!(target_runtime_id, "runtime-target");
         assert_eq!(target_worker_id, "worker-target");
-        assert_eq!(expected_revision, "revision-7");
         assert_eq!(reason, "retire obsolete Worker");
     }
 

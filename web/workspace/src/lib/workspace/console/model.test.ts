@@ -2,11 +2,14 @@ import type { Event } from "$lib/generated/protocol";
 import {
   type ConsoleEventInput,
   type ConsoleLine,
+  consoleWorkerViews,
   createConsoleProjector,
   isConsoleProjectionEvent,
   projectConsole,
   projectConsoleLines,
   projectOverviewLines,
+  resolveConsoleViewScrollTop,
+  resolveConsoleWorkerView,
   segmentsToText,
   selectConsoleTimelineLines,
   workerConsoleHref,
@@ -1443,6 +1446,96 @@ Deno.test("Internal Worker output stays separate and revision-fenced", () => {
     },
   }]);
   assertEquals(projection.internalWorkers[0].console.lines.length, 1);
+
+  const views = consoleWorkerViews(projection);
+  assertEquals(views.map((view) => [view.sessionId, view.label]), [
+    [null, "main"],
+    ["child-session", "research"],
+  ]);
+  assertEquals(
+    resolveConsoleWorkerView(projection, "child-session").console.lines[0].body,
+    "child output",
+  );
+  assertEquals(resolveConsoleWorkerView(projection, "missing").sessionId, null);
+});
+
+Deno.test("console Worker views expose only direct Internal Workers", () => {
+  const projector = createConsoleProjector();
+  projector.append([{
+    eventId: "nested",
+    event: {
+      event: "internal_worker",
+      data: {
+        worker: {
+          session_id: "child-session",
+          name: "research",
+          parent_session_id: "parent-session",
+          kind: "sub_worker",
+        },
+        revision: 1,
+        event: {
+          event: "internal_worker",
+          data: {
+            worker: {
+              session_id: "grandchild-session",
+              name: "nested",
+              parent_session_id: "child-session",
+              kind: "sub_worker",
+            },
+            revision: 1,
+            event: { event: "status", data: { status: "running" } },
+          },
+        },
+      },
+    },
+  }]);
+
+  projector.append([{
+    eventId: "peer",
+    event: {
+      event: "internal_worker",
+      data: {
+        worker: {
+          session_id: "peer-other",
+          name: "research",
+          parent_session_id: "parent-session",
+          kind: "sub_worker",
+        },
+        revision: 1,
+        event: { event: "status", data: { status: "idle" } },
+      },
+    },
+  }]);
+
+  const projection = projector.snapshot();
+  const views = consoleWorkerViews(projection);
+  assertEquals(views.map((view) => view.sessionId), [
+    null,
+    "child-session",
+    "peer-other",
+  ]);
+  assertEquals(views[1].label, "research · ession");
+  assertEquals(views[2].label, "research · -other");
+  assertEquals(
+    resolveConsoleWorkerView(projection, "grandchild-session").sessionId,
+    null,
+  );
+});
+
+Deno.test("console Worker view scroll restores manual offsets and auto-follow", () => {
+  assertEquals(resolveConsoleViewScrollTop(undefined, 1000, 200), 1000);
+  assertEquals(
+    resolveConsoleViewScrollTop({ top: 100, autoFollow: true }, 1000, 200),
+    1000,
+  );
+  assertEquals(
+    resolveConsoleViewScrollTop({ top: 300, autoFollow: false }, 1000, 200),
+    300,
+  );
+  assertEquals(
+    resolveConsoleViewScrollTop({ top: 900, autoFollow: false }, 1000, 200),
+    800,
+  );
 });
 
 Deno.test("parent snapshot authoritatively replaces Internal Worker projections", () => {

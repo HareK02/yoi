@@ -48,7 +48,6 @@ pub trait WorkerControlService: Send + Sync {
         &self,
         runtime_id: &str,
         worker_id: &str,
-        expected_worker_revision: &str,
         reason: &str,
     ) -> Result<WorkspaceResponse, WorkspaceClientError>;
     async fn execute_runtime(
@@ -170,11 +169,10 @@ impl WorkerControlService for WorkspaceWorkerControlService {
         &self,
         runtime_id: &str,
         worker_id: &str,
-        expected_worker_revision: &str,
         reason: &str,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         self.client
-            .execute_worker_remove(runtime_id, worker_id, expected_worker_revision, reason)
+            .execute_worker_remove(runtime_id, worker_id, reason)
     }
 
     async fn execute_runtime(
@@ -535,7 +533,6 @@ struct WorkerStopInput {
 #[serde(deny_unknown_fields)]
 struct WorkerRemoveInput {
     subject: WorkerSubjectInput,
-    expected_worker_revision: String,
     reason: String,
 }
 
@@ -597,7 +594,7 @@ impl WorkerOperation {
                 "Restore a stopped Backend/Runtime Worker session in the current Workspace."
             }
             Self::Remove => {
-                "Remove an eligible stopped, unassigned, non-internal Worker. Supply the current Worker revision and a bounded reason; Backend validation and retention are authoritative."
+                "Remove an eligible stopped, unassigned, non-internal Worker. Supply a bounded reason; Backend validation and retention are authoritative."
             }
         }
     }
@@ -747,8 +744,6 @@ impl Tool for WorkspaceWorkerTool {
             WorkerOperation::Remove => {
                 let input = parse::<WorkerRemoveInput>(input_json, "WorkerRemove")?;
                 let (runtime_id, worker_id) = runtime_subject_ids(&input.subject, self.operation)?;
-                let expected_worker_revision =
-                    non_empty(input.expected_worker_revision, "expected_worker_revision")?;
                 let reason = non_empty(input.reason, "reason")?;
                 if reason.len() > 512 {
                     return Err(ToolError::ExecutionFailed(
@@ -756,12 +751,7 @@ impl Tool for WorkspaceWorkerTool {
                     ));
                 }
                 self.control
-                    .remove_runtime_worker(
-                        &runtime_id,
-                        &worker_id,
-                        &expected_worker_revision,
-                        &reason,
-                    )
+                    .remove_runtime_worker(&runtime_id, &worker_id, &reason)
                     .map_err(control_tool_error)?
             }
         };
@@ -957,7 +947,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct RecordingWorkspaceClient {
         requests: Mutex<Vec<WorkspaceRequest>>,
-        removals: Mutex<Vec<(String, String, String, String)>>,
+        removals: Mutex<Vec<(String, String, String)>>,
     }
 
     impl WorkspaceClient for RecordingWorkspaceClient {
@@ -988,13 +978,11 @@ mod tests {
             &self,
             target_runtime_id: &str,
             target_worker_id: &str,
-            expected_worker_revision: &str,
             reason: &str,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
             self.removals.lock().unwrap().push((
                 target_runtime_id.to_string(),
                 target_worker_id.to_string(),
-                expected_worker_revision.to_string(),
                 reason.to_string(),
             ));
             Ok(WorkspaceResponse {
@@ -1205,7 +1193,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_remove_forwards_only_target_revision_and_bounded_reason() {
+    async fn worker_remove_forwards_only_target_and_bounded_reason() {
         let client = Arc::new(RecordingWorkspaceClient::default());
         let tool = WorkspaceWorkerTool {
             operation: WorkerOperation::Remove,
@@ -1218,7 +1206,6 @@ mod tests {
                     "runtime_id": "runtime-1",
                     "worker_id": "worker-7",
                 },
-                "expected_worker_revision": "2026-08-11T20:00:00Z",
                 "reason": "  retire completed Worker  "
             })
             .to_string(),
@@ -1231,7 +1218,6 @@ mod tests {
             [(
                 "runtime-1".to_string(),
                 "worker-7".to_string(),
-                "2026-08-11T20:00:00Z".to_string(),
                 "retire completed Worker".to_string(),
             )]
         );
@@ -1239,15 +1225,18 @@ mod tests {
         let schema = serde_json::to_value(schemars::schema_for!(WorkerRemoveInput))
             .unwrap()
             .to_string();
-        for field in [
-            "runtime_id",
-            "worker_id",
-            "expected_worker_revision",
-            "reason",
-        ] {
+        for field in ["runtime_id", "worker_id", "reason"] {
             assert!(schema.contains(field));
         }
-        for forbidden in ["proof", "actor", "workspace_id", "policy", "plan", "stage"] {
+        for forbidden in [
+            "expected_worker_revision",
+            "proof",
+            "actor",
+            "workspace_id",
+            "policy",
+            "plan",
+            "stage",
+        ] {
             assert!(!schema.contains(forbidden), "schema leaked {forbidden}");
         }
     }
@@ -1268,7 +1257,6 @@ mod tests {
                             "runtime_id": "runtime-1",
                             "worker_id": "worker-7",
                         },
-                        "expected_worker_revision": "revision-1",
                         "reason": reason,
                     })
                     .to_string(),

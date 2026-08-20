@@ -29,7 +29,7 @@
 <style>
   .spinner {
     display: inline-flex;
-    color: var(--accent);
+    color: var(--spinner-color, var(--accent));
     line-height: 1;
   }
 </style>

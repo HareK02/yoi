@@ -233,6 +233,12 @@ pub struct InternalWorkerView {
     pub app: Box<App>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerViewTab {
+    pub label: String,
+    pub selected: bool,
+}
+
 pub struct App {
     pub worker_name: String,
     pub connected: bool,
@@ -281,8 +287,11 @@ pub struct App {
     /// replayable conversation rows during segment rotation.
     run_error_messages: Vec<String>,
     /// Presentation-only Internal Worker projections keyed by session identity.
-    /// They are rendered in separate sub-panes and never mixed into `blocks`.
+    /// They are rendered in separate selectable views and never mixed into `blocks`.
     pub internal_workers: Vec<InternalWorkerView>,
+    /// Selected Internal Worker transcript/task view. `None` is the parent (`main`)
+    /// view; the stable session identity survives projection reordering.
+    selected_internal_worker_session_id: Option<String>,
     /// Terminal child-session fences, reset only by an authoritative snapshot.
     removed_internal_workers: HashMap<String, u64>,
     pub scroll: Scroll,
@@ -363,6 +372,7 @@ impl App {
             blocks: Vec::new(),
             run_error_messages: Vec::new(),
             internal_workers: Vec::new(),
+            selected_internal_worker_session_id: None,
             removed_internal_workers: HashMap::new(),
             scroll: Scroll::default(),
             mode: Mode::Normal,
@@ -448,16 +458,98 @@ impl App {
     pub fn toggle_task_pane(&mut self) {
         self.task_pane_open = !self.task_pane_open;
         if !self.task_pane_open {
-            self.task_pane_scroll = 0;
+            self.selected_worker_view_mut().task_pane_scroll = 0;
+        }
+    }
+
+    pub fn worker_view_tabs(&self) -> Vec<WorkerViewTab> {
+        let selected = self.selected_internal_worker_session_id.as_deref();
+        let mut tabs = Vec::with_capacity(self.internal_workers.len().saturating_add(1));
+        tabs.push(WorkerViewTab {
+            label: "main".to_owned(),
+            selected: selected.is_none(),
+        });
+        tabs.extend(self.internal_workers.iter().map(|view| {
+            WorkerViewTab {
+                label: view
+                    .worker
+                    .name
+                    .lines()
+                    .next()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or("subworker")
+                    .to_owned(),
+                selected: selected == Some(view.worker.session_id.as_str()),
+            }
+        }));
+        tabs
+    }
+
+    pub fn selected_internal_worker_index(&self) -> Option<usize> {
+        let selected = self.selected_internal_worker_session_id.as_deref()?;
+        self.internal_workers
+            .iter()
+            .position(|view| view.worker.session_id == selected)
+    }
+
+    pub fn selected_worker_view(&self) -> &App {
+        self.selected_internal_worker_index()
+            .map(|index| self.internal_workers[index].app.as_ref())
+            .unwrap_or(self)
+    }
+
+    pub fn selected_worker_view_mut(&mut self) -> &mut App {
+        if let Some(index) = self.selected_internal_worker_index() {
+            self.internal_workers[index].app.as_mut()
+        } else {
+            self
+        }
+    }
+
+    /// Cycle the presentation-only transcript/task view. Input and control
+    /// methods continue to target the parent Worker regardless of selection.
+    pub fn cycle_worker_view(&mut self) -> bool {
+        if self.internal_workers.is_empty() {
+            self.selected_internal_worker_session_id = None;
+            return false;
+        }
+
+        self.selected_internal_worker_session_id = self
+            .selected_internal_worker_index()
+            .and_then(|index| self.internal_workers.get(index.saturating_add(1)))
+            .map(|view| view.worker.session_id.clone())
+            .or_else(|| {
+                if self.selected_internal_worker_session_id.is_none() {
+                    self.internal_workers
+                        .first()
+                        .map(|view| view.worker.session_id.clone())
+                } else {
+                    None
+                }
+            });
+        true
+    }
+
+    pub fn cycle_mode(&mut self) {
+        let mode = self.mode.cycle();
+        self.set_mode_recursively(mode);
+    }
+
+    fn set_mode_recursively(&mut self, mode: Mode) {
+        self.mode = mode;
+        for view in &mut self.internal_workers {
+            view.app.set_mode_recursively(mode);
         }
     }
 
     pub fn scroll_task_pane_up(&mut self, n: usize) {
-        self.task_pane_scroll = self.task_pane_scroll.saturating_sub(n);
+        let view = self.selected_worker_view_mut();
+        view.task_pane_scroll = view.task_pane_scroll.saturating_sub(n);
     }
 
     pub fn scroll_task_pane_down(&mut self, n: usize) {
-        self.task_pane_scroll = self.task_pane_scroll.saturating_add(n);
+        let view = self.selected_worker_view_mut();
+        view.task_pane_scroll = view.task_pane_scroll.saturating_add(n);
     }
 
     pub fn set_worker_status(&mut self, status: WorkerStatus) {
@@ -1747,6 +1839,9 @@ impl App {
     }
 
     pub fn request_rewind_picker(&mut self) -> Option<Method> {
+        // Rewind is a parent Worker control surface. Bring the parent transcript
+        // back into view before presenting diagnostics or the picker.
+        self.selected_internal_worker_session_id = None;
         if self.rewind_submit_pending() {
             self.push_command_diagnostic(
                 "rewind is already applying; wait for the Worker response",
@@ -2007,15 +2102,66 @@ impl App {
     /// produced. Followed by `Event::Entry` updates for anything
     /// committed after the snapshot.
     fn replace_internal_worker_snapshots(&mut self, snapshots: Vec<InternalWorkerSnapshot>) {
+        let mode = self.mode;
+        let mut previous = std::mem::take(&mut self.internal_workers);
         self.internal_workers = snapshots
             .into_iter()
-            .map(Self::internal_worker_view_from_snapshot)
+            .map(|snapshot| {
+                if let Some(index) = previous
+                    .iter()
+                    .position(|view| view.worker.session_id == snapshot.worker.session_id)
+                {
+                    let view = previous.remove(index);
+                    Self::update_internal_worker_view_from_snapshot(view, snapshot, mode)
+                } else {
+                    Self::internal_worker_view_from_snapshot(snapshot, mode)
+                }
+            })
             .collect();
+        if self.selected_internal_worker_index().is_none() {
+            self.selected_internal_worker_session_id = None;
+        }
         self.removed_internal_workers.clear();
     }
 
-    fn internal_worker_view_from_snapshot(snapshot: InternalWorkerSnapshot) -> InternalWorkerView {
+    fn update_internal_worker_view_from_snapshot(
+        mut previous: InternalWorkerView,
+        snapshot: InternalWorkerSnapshot,
+        mode: Mode,
+    ) -> InternalWorkerView {
+        let mut refreshed = Self::internal_worker_view_from_snapshot(snapshot, mode);
+        Self::transfer_worker_view_state(&mut previous.app, &mut refreshed.app);
+        refreshed
+    }
+
+    fn transfer_worker_view_state(previous: &mut App, refreshed: &mut App) {
+        refreshed.scroll = std::mem::take(&mut previous.scroll);
+        refreshed.text_selection = std::mem::take(&mut previous.text_selection);
+        refreshed.task_pane_scroll = previous.task_pane_scroll;
+        refreshed.selected_internal_worker_session_id =
+            previous.selected_internal_worker_session_id.take();
+
+        let mut previous_children = std::mem::take(&mut previous.internal_workers);
+        for child in &mut refreshed.internal_workers {
+            if let Some(index) = previous_children
+                .iter()
+                .position(|old| old.worker.session_id == child.worker.session_id)
+            {
+                let mut old = previous_children.remove(index);
+                Self::transfer_worker_view_state(&mut old.app, &mut child.app);
+            }
+        }
+        if refreshed.selected_internal_worker_index().is_none() {
+            refreshed.selected_internal_worker_session_id = None;
+        }
+    }
+
+    fn internal_worker_view_from_snapshot(
+        snapshot: InternalWorkerSnapshot,
+        mode: Mode,
+    ) -> InternalWorkerView {
         let mut app = App::new(snapshot.worker.name.clone());
+        app.mode = mode;
         app.restore_entries(&snapshot.entries, None);
         app.apply_in_flight_snapshot(snapshot.in_flight);
         app.set_worker_status(snapshot.status);
@@ -2052,10 +2198,12 @@ impl App {
         let target = if let Some(index) = index {
             &mut self.internal_workers[index]
         } else {
+            let mut app = App::new(worker.name.clone());
+            app.mode = self.mode;
             self.internal_workers.push(InternalWorkerView {
                 worker: worker.clone(),
                 revision: 0,
-                app: Box::new(App::new(worker.name.clone())),
+                app: Box::new(app),
             });
             self.internal_workers.last_mut().unwrap()
         };
@@ -2068,13 +2216,17 @@ impl App {
     }
 
     fn remove_internal_worker(&mut self, worker: InternalWorkerRef, revision: u64) {
+        let session_id = worker.session_id;
         let Some(index) = self
             .internal_workers
             .iter()
-            .position(|candidate| candidate.worker.session_id == worker.session_id)
+            .position(|candidate| candidate.worker.session_id == session_id)
         else {
+            if self.selected_internal_worker_session_id.as_deref() == Some(session_id.as_str()) {
+                self.selected_internal_worker_session_id = None;
+            }
             self.removed_internal_workers
-                .entry(worker.session_id)
+                .entry(session_id)
                 .and_modify(|current| *current = (*current).max(revision))
                 .or_insert(revision);
             return;
@@ -2083,8 +2235,10 @@ impl App {
             return;
         }
         self.internal_workers.remove(index);
-        self.removed_internal_workers
-            .insert(worker.session_id, revision);
+        if self.selected_internal_worker_session_id.as_deref() == Some(session_id.as_str()) {
+            self.selected_internal_worker_session_id = None;
+        }
+        self.removed_internal_workers.insert(session_id, revision);
     }
 
     fn restore_snapshot(
@@ -3583,6 +3737,188 @@ mod completion_flow_tests {
         );
     }
 
+    fn test_internal_worker_snapshot(
+        session_id: &str,
+        name: &str,
+        revision: u64,
+    ) -> InternalWorkerSnapshot {
+        InternalWorkerSnapshot {
+            worker: InternalWorkerRef {
+                session_id: session_id.into(),
+                name: name.into(),
+                parent_session_id: Some("parent".into()),
+                kind: protocol::InternalWorkerKind::SubWorker,
+            },
+            revision,
+            status: WorkerStatus::Idle,
+            entries: Vec::new(),
+            in_flight: protocol::InFlightSnapshot::default(),
+            error: None,
+            internal_workers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn worker_view_cycle_uses_stable_session_identity_and_wraps_to_main() {
+        let mut app = App::new("parent".into());
+        for (session_id, name) in [("child-a", "alpha"), ("child-b", "beta")] {
+            app.internal_workers.push(InternalWorkerView {
+                worker: InternalWorkerRef {
+                    session_id: session_id.into(),
+                    name: name.into(),
+                    parent_session_id: Some("parent".into()),
+                    kind: protocol::InternalWorkerKind::SubWorker,
+                },
+                revision: 1,
+                app: Box::new(App::new(name.into())),
+            });
+        }
+
+        assert_eq!(app.selected_worker_view().worker_name, "parent");
+        assert!(app.cycle_worker_view());
+        assert_eq!(app.selected_worker_view().worker_name, "alpha");
+
+        app.internal_workers.swap(0, 1);
+        assert_eq!(app.selected_worker_view().worker_name, "alpha");
+        assert!(app.cycle_worker_view());
+        assert_eq!(app.selected_worker_view().worker_name, "parent");
+        assert!(app.cycle_worker_view());
+        assert_eq!(app.selected_worker_view().worker_name, "beta");
+    }
+
+    #[test]
+    fn worker_view_cycle_preserves_each_views_text_selection() {
+        use crate::text_selection::{HistoryViewport, SelectionRow};
+
+        fn select_first_row(app: &mut App, text: &str) {
+            app.text_selection.set_history_snapshot(
+                HistoryViewport {
+                    x: 0,
+                    y: 0,
+                    width: 20,
+                    height: 1,
+                    top_offset: 0,
+                    total_lines: 1,
+                },
+                vec![SelectionRow::new(text.into(), true)],
+            );
+            assert!(app.text_selection.begin_drag(0, 0));
+        }
+
+        let mut app = App::new("parent".into());
+        app.replace_internal_worker_snapshots(vec![test_internal_worker_snapshot(
+            "child", "child", 1,
+        )]);
+        select_first_row(&mut app, "parent selection");
+        select_first_row(app.internal_workers[0].app.as_mut(), "child selection");
+
+        app.cycle_worker_view();
+        assert!(app.selected_worker_view().text_selection.has_selection());
+        app.cycle_worker_view();
+
+        assert!(app.text_selection.has_selection());
+        assert!(app.internal_workers[0].app.text_selection.has_selection());
+    }
+
+    #[test]
+    fn snapshot_removal_falls_selected_worker_view_back_to_main() {
+        let mut app = App::new("parent".into());
+        app.internal_workers.push(InternalWorkerView {
+            worker: InternalWorkerRef {
+                session_id: "old".into(),
+                name: "old".into(),
+                parent_session_id: Some("parent".into()),
+                kind: protocol::InternalWorkerKind::SubWorker,
+            },
+            revision: 1,
+            app: Box::new(App::new("old".into())),
+        });
+        app.cycle_worker_view();
+        assert_eq!(app.selected_worker_view().worker_name, "old");
+
+        app.replace_internal_worker_snapshots(Vec::new());
+
+        assert_eq!(app.selected_worker_view().worker_name, "parent");
+        assert_eq!(
+            app.worker_view_tabs(),
+            vec![WorkerViewTab {
+                label: "main".into(),
+                selected: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn same_session_snapshot_preserves_subworker_view_local_state() {
+        use crate::text_selection::{HistoryViewport, SelectionRow};
+
+        let mut app = App::new("parent".into());
+        app.replace_internal_worker_snapshots(vec![test_internal_worker_snapshot(
+            "child", "child", 1,
+        )]);
+        let child = app.internal_workers[0].app.as_mut();
+        child.scroll.follow_tail = false;
+        child.scroll.top_offset = 7;
+        child.task_pane_scroll = 4;
+        child.text_selection.set_history_snapshot(
+            HistoryViewport {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 1,
+                top_offset: 0,
+                total_lines: 1,
+            },
+            vec![SelectionRow::new("selected".into(), true)],
+        );
+        assert!(child.text_selection.begin_drag(0, 0));
+
+        app.replace_internal_worker_snapshots(vec![test_internal_worker_snapshot(
+            "child",
+            "renamed-child",
+            2,
+        )]);
+
+        let view = &app.internal_workers[0];
+        assert_eq!(view.revision, 2);
+        assert_eq!(view.app.worker_name, "renamed-child");
+        assert!(!view.app.scroll.follow_tail);
+        assert_eq!(view.app.scroll.top_offset, 7);
+        assert_eq!(view.app.task_pane_scroll, 4);
+        assert!(view.app.text_selection.has_selection());
+    }
+
+    #[test]
+    fn task_pane_scroll_is_local_to_selected_worker_view() {
+        let mut app = App::new("parent".into());
+        app.replace_internal_worker_snapshots(vec![
+            test_internal_worker_snapshot("child-a", "alpha", 1),
+            test_internal_worker_snapshot("child-b", "beta", 1),
+        ]);
+        app.task_pane_scroll = 3;
+
+        app.cycle_worker_view();
+        app.scroll_task_pane_down(5);
+        assert_eq!(app.selected_worker_view().task_pane_scroll, 5);
+
+        app.cycle_worker_view();
+        app.scroll_task_pane_down(7);
+        assert_eq!(app.selected_worker_view().task_pane_scroll, 7);
+
+        app.cycle_worker_view();
+        assert_eq!(app.selected_worker_view().worker_name, "parent");
+        assert_eq!(app.task_pane_scroll, 3);
+        assert_eq!(app.internal_workers[0].app.task_pane_scroll, 5);
+        assert_eq!(app.internal_workers[1].app.task_pane_scroll, 7);
+
+        app.cycle_worker_view();
+        app.toggle_task_pane();
+        app.toggle_task_pane();
+        assert_eq!(app.internal_workers[0].app.task_pane_scroll, 0);
+        assert_eq!(app.internal_workers[1].app.task_pane_scroll, 7);
+        assert_eq!(app.task_pane_scroll, 3);
+    }
+
     #[test]
     fn terminal_internal_worker_removal_drops_descendants_and_fences_late_events() {
         let mut app = App::new("parent".into());
@@ -3611,6 +3947,8 @@ mod completion_flow_tests {
         });
         assert_eq!(app.internal_workers.len(), 1);
         assert_eq!(app.internal_workers[0].app.internal_workers.len(), 1);
+        app.cycle_worker_view();
+        assert_eq!(app.selected_worker_view().worker_name, "child");
 
         app.handle_worker_event(Event::InternalWorkerRemoved {
             worker: worker.clone(),
@@ -3625,6 +3963,7 @@ mod completion_flow_tests {
         });
 
         assert!(app.internal_workers.is_empty());
+        assert_eq!(app.selected_worker_view().worker_name, "parent");
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
             entries: Vec::new(),

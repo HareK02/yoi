@@ -91,18 +91,57 @@ export type InternalWorkerProjection = {
   console: ConsoleProjection;
 };
 
-export type FlattenedInternalWorkerProjection = InternalWorkerProjection & {
-  depth: number;
+export type ConsoleViewScroll = {
+  top: number;
+  autoFollow: boolean;
 };
 
-export function flattenInternalWorkers(
-  workers: InternalWorkerProjection[],
-  depth = 0,
-): FlattenedInternalWorkerProjection[] {
-  return workers.flatMap((worker) => [
-    { ...worker, depth },
-    ...flattenInternalWorkers(worker.console.internalWorkers, depth + 1),
-  ]);
+export function resolveConsoleViewScrollTop(
+  state: ConsoleViewScroll | undefined,
+  scrollHeight: number,
+  clientHeight: number,
+): number {
+  if (!state || state.autoFollow) return scrollHeight;
+  return Math.min(state.top, Math.max(0, scrollHeight - clientHeight));
+}
+
+export type ConsoleWorkerView = {
+  sessionId: string | null;
+  label: string;
+  console: ConsoleProjection;
+};
+
+export function consoleWorkerViews(
+  projection: ConsoleProjection,
+): ConsoleWorkerView[] {
+  const labels = projection.internalWorkers.map((worker) =>
+    worker.worker.name || "subworker"
+  );
+  const labelCounts = new Map<string, number>();
+  for (const label of labels) {
+    labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1);
+  }
+  return [
+    { sessionId: null, label: "main", console: projection },
+    ...projection.internalWorkers.map((worker, index) => {
+      const label = labels[index] ?? "subworker";
+      return {
+        sessionId: worker.worker.session_id,
+        label: labelCounts.get(label) === 1
+          ? label
+          : `${label} · ${worker.worker.session_id.slice(-6)}`,
+        console: worker.console,
+      };
+    }),
+  ];
+}
+
+export function resolveConsoleWorkerView(
+  projection: ConsoleProjection,
+  selectedSessionId: string | null,
+): ConsoleWorkerView {
+  const views = consoleWorkerViews(projection);
+  return views.find((view) => view.sessionId === selectedSessionId) ?? views[0];
 }
 
 export type ConsoleProjection = {

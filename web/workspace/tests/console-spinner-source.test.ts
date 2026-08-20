@@ -28,6 +28,62 @@ Deno.test("Console spinner wraps a reusable timed sequence loop", async () => {
   assert(spinner.includes("SequenceLoop"), "Spinner should wrap SequenceLoop");
 });
 
+Deno.test("sidebar running status reuses the green symbol spinner", async () => {
+  const sidebar = await Deno.readTextFile(
+    new URL(
+      "../src/lib/workspace/sidebar/WorkersNavSection.svelte",
+      import.meta.url,
+    ),
+  );
+  const sidebarCss = await Deno.readTextFile(
+    new URL(
+      "../src/lib/workspace/sidebar/sidebar.css",
+      import.meta.url,
+    ),
+  );
+
+  assert(
+    sidebar.includes(
+      "import Spinner from '$lib/workspace/console/Spinner.svelte'",
+    ),
+    "Workers sidebar should import the reusable symbol Spinner",
+  );
+  assert(
+    sidebar.includes('<Spinner label="Running" />'),
+    "running Workers should render the reusable symbol Spinner",
+  );
+  assert(
+    sidebarCss.includes("--spinner-color: var(--success)"),
+    "sidebar spinner should use the green success token",
+  );
+  assert(
+    sidebar.indexOf("worker.state === 'running'") <
+      sidebar.indexOf("worker.has_running_internal_workers"),
+    "parent running state should keep the green Spinner priority",
+  );
+  assert(
+    sidebar.indexOf("worker.has_running_internal_workers") <
+      sidebar.indexOf("worker.state === 'idle'"),
+    "SubWorker activity should replace the idle dot with the purple Spinner",
+  );
+  assert(
+    sidebar.includes("worker.has_running_internal_workers"),
+    "idle parents should render SubWorker activity from the Workspace projection",
+  );
+  assert(
+    sidebar.includes('<Spinner label="SubWorker running" />'),
+    "running SubWorkers should use the reusable symbol Spinner",
+  );
+  assert(
+    sidebarCss.includes("--spinner-color: var(--tui-magenta)"),
+    "SubWorker spinner should use the purple TUI token",
+  );
+  assert(
+    !sidebarCss.includes("@keyframes worker-status-spin"),
+    "legacy rotating ring spinner should be removed",
+  );
+});
+
 Deno.test("running status is Composer-side above mini Tasks", async () => {
   const page = await Deno.readTextFile(
     new URL(
@@ -42,10 +98,12 @@ Deno.test("running status is Composer-side above mini Tasks", async () => {
     ),
   );
   const status = page.indexOf("<WorkerRunStatus");
-  const tasks = page.indexOf('<ConsoleTasks {tasks} mode="mini"');
+  const miniMode = page.indexOf('mode="mini"');
+  const tasks = page.lastIndexOf("<ConsoleTasks", miniMode);
   const composer = page.indexOf('<form class="console-composer card"');
 
   assert(status >= 0, "WorkerRunStatus should be rendered");
+  assert(miniMode >= 0 && tasks >= 0, "mini Tasks should be rendered");
   assert(status < tasks, "WorkerRunStatus should be above mini Tasks");
   assert(tasks < composer, "mini Tasks should remain above Composer");
   assert(

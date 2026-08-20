@@ -11,6 +11,7 @@ import type { Worker } from './types';
 export type SidebarWorker = Worker & {
   repository_id: string | null;
   working_directory_id: string | null;
+  has_running_internal_workers: boolean;
 };
 
 export type WorkspaceWorkersState = {
@@ -96,6 +97,7 @@ function projectWorker(worker: SubscriptionWorker): SidebarWorker {
     },
     repository_id: worker.repository_id ?? null,
     working_directory_id: worker.working_directory_id ?? null,
+    has_running_internal_workers: worker.has_running_internal_workers,
     working_directory: null,
     diagnostics: [],
   };

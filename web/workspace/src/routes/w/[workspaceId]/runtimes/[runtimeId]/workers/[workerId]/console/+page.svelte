@@ -19,15 +19,18 @@
     import { fitTextarea } from "$lib/workspace/console/textarea-fit";
     import { resolveWorkerControlShortcut } from "$lib/workspace/console/worker-control-shortcuts";
     import {
+        consoleWorkerViews,
         createConsoleProjector,
-        flattenInternalWorkers,
         isConsoleProjectionEvent,
         projectConsoleLines,
+        resolveConsoleViewScrollTop,
+        resolveConsoleWorkerView,
         selectConsoleTimelineLines,
         type ConsoleEventInput,
         type ConsoleLine,
         type ConsoleProjection,
         type ConsoleViewMode,
+        type ConsoleViewScroll,
     } from "$lib/workspace/console/model";
     import type { Event as ProtocolEvent, Method as ProtocolMethod, RewindTarget, Segment } from "$lib/generated/protocol";
     import { workspaceApiPath } from "$lib/workspace/api/http";
@@ -122,6 +125,8 @@
     let streamDiagnostics = $state<Diagnostic[]>([]);
     let workerDetailsOpen = $state(false);
     let taskPaneOpen = $state(false);
+    let selectedWorkerViewSessionId = $state<string | null>(null);
+    let workerViewSelectionGeneration = 0;
     let timelineOpen = $state(false);
     let consoleViewMode = $state<ConsoleViewMode>("overview");
     let consoleBodyElement: HTMLElement | null = null;
@@ -129,6 +134,7 @@
     let timelineRailDragCleanup: (() => void) | null = null;
     let autoFollowConsole = $state(true);
     let consoleScroll = $state<ScrollMetrics>({ top: 0, height: 1, client: 1 });
+    const consoleViewScroll = new Map<string, ConsoleViewScroll>();
     const eventObservedAtById = new Map<string, number>();
     let nextEventObservedAtVersion = 0;
     let eventObservedAtVersion = $state(0);
@@ -156,13 +162,18 @@
 
     const consoleTarget = $derived({ workspaceId, runtimeId, workerId });
 
+    const workerViews = $derived(consoleWorkerViews(consoleProjection));
+    const selectedWorkerView = $derived(
+        resolveConsoleWorkerView(
+            consoleProjection,
+            selectedWorkerViewSessionId,
+        ),
+    );
+    const selectedConsoleProjection = $derived(selectedWorkerView.console);
     const lines = $derived(
-        projectConsoleLines(consoleProjection.lines, consoleViewMode),
+        projectConsoleLines(selectedConsoleProjection.lines, consoleViewMode),
     );
-    const tasks = $derived(consoleProjection.tasks);
-    const internalWorkers = $derived(
-        flattenInternalWorkers(consoleProjection.internalWorkers),
-    );
+    const tasks = $derived(selectedConsoleProjection.tasks);
     const timelineLayout = $derived(
         buildTimelineLayout(lines, eventObservedAtVersion, consoleScroll),
     );
@@ -1085,6 +1096,47 @@
             : value.replaceAll('"', '\\"');
     }
 
+    function consoleWorkerViewKey(sessionId: string | null): string {
+        return sessionId === null ? "main" : `internal:${sessionId}`;
+    }
+
+    function consoleWorkerViewSelectionIsResolved(): boolean {
+        return selectedWorkerViewSessionId === selectedWorkerView.sessionId;
+    }
+
+    function rememberConsoleWorkerViewScroll() {
+        if (!consoleBodyElement || !consoleWorkerViewSelectionIsResolved()) return;
+        consoleViewScroll.set(consoleWorkerViewKey(selectedWorkerView.sessionId), {
+            top: consoleBodyElement.scrollTop,
+            autoFollow: autoFollowConsole,
+        });
+    }
+
+    async function selectConsoleWorkerView(
+        sessionId: string | null,
+        rememberCurrent = true,
+    ) {
+        if (sessionId === selectedWorkerViewSessionId) return;
+        const generation = ++workerViewSelectionGeneration;
+        if (rememberCurrent) rememberConsoleWorkerViewScroll();
+        const target = workerViews.find((view) => view.sessionId === sessionId) ??
+            workerViews[0];
+        const targetScroll = consoleViewScroll.get(
+            consoleWorkerViewKey(target.sessionId),
+        );
+        autoFollowConsole = targetScroll?.autoFollow ?? true;
+        selectedWorkerViewSessionId = target.sessionId;
+        await tick();
+        if (generation !== workerViewSelectionGeneration) return;
+        if (!consoleBodyElement) return;
+        consoleBodyElement.scrollTop = resolveConsoleViewScrollTop(
+            targetScroll,
+            consoleBodyElement.scrollHeight,
+            consoleBodyElement.clientHeight,
+        );
+        updateConsoleScrollMetrics();
+    }
+
     function updateConsoleScrollMetrics() {
         if (!consoleBodyElement) {
             return;
@@ -1104,21 +1156,30 @@
     }
 
     function handleConsoleScroll() {
-        if (!consoleBodyElement) {
+        if (!consoleWorkerViewSelectionIsResolved() || !consoleBodyElement) {
             return;
         }
         autoFollowConsole = isNearConsoleBottom(consoleBodyElement);
         updateConsoleScrollMetrics();
+        rememberConsoleWorkerViewScroll();
     }
 
     async function scrollConsoleToBottom() {
+        if (!consoleWorkerViewSelectionIsResolved()) return;
+        const sessionId = selectedWorkerView.sessionId;
         await tick();
-        if (!consoleBodyElement) {
+        if (
+            !consoleBodyElement ||
+            !autoFollowConsole ||
+            !consoleWorkerViewSelectionIsResolved() ||
+            selectedWorkerView.sessionId !== sessionId
+        ) {
             return;
         }
         consoleBodyElement.scrollTop = consoleBodyElement.scrollHeight;
         updateConsoleScrollMetrics();
         autoFollowConsole = true;
+        rememberConsoleWorkerViewScroll();
     }
 
     const scrollFollowKey = $derived(
@@ -1132,10 +1193,32 @@
 
     $effect(() => {
         scrollFollowKey;
+        if (!consoleWorkerViewSelectionIsResolved()) return;
         if (autoFollowConsole) {
             void scrollConsoleToBottom();
         } else {
-            tick().then(updateConsoleScrollMetrics);
+            const sessionId = selectedWorkerView.sessionId;
+            tick().then(() => {
+                if (
+                    consoleWorkerViewSelectionIsResolved() &&
+                    selectedWorkerView.sessionId === sessionId
+                ) {
+                    updateConsoleScrollMetrics();
+                }
+            });
+        }
+    });
+
+    $effect(() => {
+        const activeViewKeys = new Set(
+            workerViews.map((view) => consoleWorkerViewKey(view.sessionId)),
+        );
+        for (const key of consoleViewScroll.keys()) {
+            if (!activeViewKeys.has(key)) consoleViewScroll.delete(key);
+        }
+        const resolvedSessionId = selectedWorkerView.sessionId;
+        if (resolvedSessionId !== selectedWorkerViewSessionId) {
+            void selectConsoleWorkerView(resolvedSessionId, false);
         }
     });
 
@@ -1147,6 +1230,10 @@
         const target = consoleTarget;
         const targetWorker = data.worker;
         const targetWorkerError = data.workerError;
+        workerViewSelectionGeneration += 1;
+        selectedWorkerViewSessionId = null;
+        consoleViewScroll.clear();
+        autoFollowConsole = true;
         resetObservedEvents();
         taskPaneOpen = false;
         worker = targetWorker;
@@ -1282,7 +1369,10 @@
             bind:this={consoleBodyElement}
             onscroll={handleConsoleScroll}
         >
-            <article class="card console-card worker-console-card">
+            <article
+                class="card console-card worker-console-card"
+                aria-label={`${selectedWorkerView.label} transcript`}
+            >
                 {#if workerError}
                     <p class="error">{workerError}</p>
                 {/if}
@@ -1297,28 +1387,6 @@
                     </ol>
                 {/if}
             </article>
-
-            {#each internalWorkers as internal (internal.worker.session_id)}
-                <section
-                    class="card internal-worker-pane"
-                    style={`--internal-worker-depth: ${internal.depth}`}
-                    aria-label={`SubWorker ${internal.worker.name}`}
-                >
-                    <header class="internal-worker-header">
-                        <strong>{internal.worker.name}</strong>
-                        <span>{internal.console.status ?? "unknown"}</span>
-                    </header>
-                    {#if internal.console.lines.length === 0}
-                        <p>No output yet.</p>
-                    {:else}
-                        <ol class="console-log">
-                            {#each projectConsoleLines(internal.console.lines, consoleViewMode) as item (item.id)}
-                                <ConsoleLineItem {item} />
-                            {/each}
-                        </ol>
-                    {/if}
-                </section>
-            {/each}
         </div>
 
             <ConsoleTimeline
@@ -1428,7 +1496,18 @@
         />
     {/if}
 
-    <ConsoleTasks {tasks} mode="mini" />
+    <ConsoleTasks
+        {tasks}
+        mode="mini"
+        workerViews={workerViews.map(({ sessionId, label }) => ({
+            sessionId,
+            label,
+        }))}
+        selectedWorkerViewSessionId={selectedWorkerView.sessionId}
+        onSelectWorkerView={(sessionId) => {
+            void selectConsoleWorkerView(sessionId);
+        }}
+    />
 
     <form class="console-composer card" onsubmit={sendMessage}>
         <div class="composer-input-shell">
@@ -1867,23 +1946,6 @@
 
     .composer-actions .composer-notice {
         margin-right: auto;
-    }
-
-    .internal-worker-pane {
-        margin: 0.75rem 0 0 calc((var(--internal-worker-depth) + 1) * 1rem);
-        border-left: 3px solid var(--color-border-strong, currentColor);
-    }
-
-    .internal-worker-header {
-        display: flex;
-        justify-content: space-between;
-        gap: 1rem;
-        margin-bottom: 0.5rem;
-        font-family: var(--font-mono);
-    }
-
-    .internal-worker-header span {
-        color: var(--color-text-muted);
     }
 
     @media (max-width: 960px) {
