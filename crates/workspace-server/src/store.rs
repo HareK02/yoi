@@ -1061,6 +1061,14 @@ impl SqliteWorkspaceStore {
         } else {
             Vec::new()
         };
+        apply_migrations_through(&candidate, 38)?;
+        let assignment_worker_tombstone_repairs =
+            legacy_assignment_worker_tombstone_repairs(&candidate)?.len();
+        if assignment_worker_tombstone_repairs > 0 {
+            repairs.push(format!(
+                "materialize {assignment_worker_tombstone_repairs} legacy Ticket assignment Worker tombstone(s)"
+            ));
+        }
         apply_migrations_through(&candidate, i64::MAX)?;
         ticket::migrate_sqlite_ticket_schema(&candidate)?;
         merge_request::migrate(&candidate).map_err(|error| Error::Store(error.to_string()))?;
@@ -5537,8 +5545,11 @@ fn workspace_resource_reference_diagnostics(conn: &Connection) -> Result<Vec<Str
     }
 
     // Assignment and operation rows are historical soft references. Schema v39 records an
-    // explicit tombstone before a live Ticket or Worker parent is deleted/moved; older schemas
-    // have no tombstone authority, so every missing live parent remains migration-blocking drift.
+    // explicit tombstone before a live Ticket or Worker parent is deleted/moved. A pre-v39
+    // assignment with a valid Worker UUID and no contradictory Worker authority in another
+    // Workspace is repairable legacy evidence; the migration materializes its tombstone.
+    // Missing Ticket parents remain migration-blocking because no equivalent legacy repair is
+    // currently defined.
     if table_exists(conn, "ticket_worker_assignments")? && table_exists(conn, "typed_tickets")? {
         let tombstone_filter = if table_exists(conn, "ticket_assignment_ticket_tombstones")? {
             "AND NOT EXISTS (SELECT 1 FROM ticket_assignment_ticket_tombstones AS tombstone \
@@ -5566,28 +5577,7 @@ fn workspace_resource_reference_diagnostics(conn: &Connection) -> Result<Vec<Str
         && column_exists(conn, "ticket_worker_assignments", "worker_id")?
         && column_exists(conn, "worker_registry", "worker_id")?
     {
-        let tombstone_filter = if table_exists(conn, "ticket_assignment_worker_tombstones")? {
-            "AND NOT EXISTS (SELECT 1 FROM ticket_assignment_worker_tombstones AS tombstone \
-             WHERE tombstone.workspace_id = assignment.workspace_id \
-               AND tombstone.runtime_id = assignment.runtime_id \
-               AND tombstone.worker_id = assignment.worker_id)"
-        } else {
-            ""
-        };
-        collect_reference_diagnostics(
-            conn,
-            &format!(
-                "SELECT assignment.workspace_id || '/' || assignment.assignment_id || ' -> ' || assignment.runtime_id || '/' || assignment.worker_id \
-                 FROM ticket_worker_assignments AS assignment \
-                 WHERE NOT EXISTS (SELECT 1 FROM worker_registry AS worker \
-                     WHERE worker.workspace_id = assignment.workspace_id \
-                       AND worker.runtime_id = assignment.runtime_id \
-                       AND worker.worker_id = assignment.worker_id) \
-                 {tombstone_filter} LIMIT 100"
-            ),
-            "ticket_worker_assignments.worker_id",
-            &mut diagnostics,
-        )?;
+        collect_assignment_worker_reference_diagnostics(conn, &mut diagnostics)?;
     }
     if table_exists(conn, "ticket_assignment_operations")? && table_exists(conn, "typed_tickets")? {
         let tombstone_filter = if table_exists(conn, "ticket_assignment_ticket_tombstones")? {
@@ -5612,6 +5602,114 @@ fn workspace_resource_reference_diagnostics(conn: &Connection) -> Result<Vec<Str
         )?;
     }
     Ok(diagnostics)
+}
+
+fn collect_assignment_worker_reference_diagnostics(
+    conn: &Connection,
+    diagnostics: &mut Vec<String>,
+) -> Result<()> {
+    let has_assignment_tombstones = table_exists(conn, "ticket_assignment_worker_tombstones")?;
+    let legacy_tombstone_repairs = legacy_assignment_worker_tombstone_repairs(conn)?;
+    let tombstone_filter = if has_assignment_tombstones {
+        "AND NOT EXISTS (SELECT 1 FROM ticket_assignment_worker_tombstones AS tombstone \
+         WHERE tombstone.workspace_id = assignment.workspace_id \
+           AND tombstone.runtime_id = assignment.runtime_id \
+           AND tombstone.worker_id = assignment.worker_id)"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT assignment.workspace_id, assignment.assignment_id, \
+                assignment.runtime_id, assignment.worker_id \
+         FROM ticket_worker_assignments AS assignment \
+         WHERE NOT EXISTS (SELECT 1 FROM worker_registry AS worker \
+             WHERE worker.workspace_id = assignment.workspace_id \
+               AND worker.runtime_id = assignment.runtime_id \
+               AND worker.worker_id = assignment.worker_id) \
+         {tombstone_filter}"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut worker_diagnostic_count = 0;
+    for row in rows {
+        let (workspace_id, assignment_id, runtime_id, worker_id) = row?;
+        if legacy_tombstone_repairs.contains(&(
+            workspace_id.clone(),
+            runtime_id.clone(),
+            worker_id.clone(),
+        )) {
+            continue;
+        }
+        diagnostics.push(format!(
+            "ticket_worker_assignments.worker_id: \
+             {workspace_id}/{assignment_id} -> {runtime_id}/{worker_id}"
+        ));
+        worker_diagnostic_count += 1;
+        if worker_diagnostic_count == 100 {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn legacy_assignment_worker_tombstone_repairs(
+    conn: &Connection,
+) -> Result<std::collections::BTreeSet<(String, String, String)>> {
+    if current_schema_version(conn)? >= 39
+        || table_exists(conn, "ticket_assignment_worker_tombstones")?
+        || !table_exists(conn, "ticket_worker_assignments")?
+        || !table_exists(conn, "worker_registry")?
+        || !column_exists(conn, "ticket_worker_assignments", "worker_id")?
+        || !column_exists(conn, "worker_registry", "worker_id")?
+    {
+        return Ok(std::collections::BTreeSet::new());
+    }
+
+    let mut repairs = std::collections::BTreeSet::new();
+    let mut statement = conn.prepare(
+        "SELECT DISTINCT assignment.workspace_id, assignment.runtime_id, assignment.worker_id \
+         FROM ticket_worker_assignments AS assignment \
+         WHERE NOT EXISTS (SELECT 1 FROM worker_registry AS worker \
+             WHERE worker.workspace_id = assignment.workspace_id \
+               AND worker.runtime_id = assignment.runtime_id \
+               AND worker.worker_id = assignment.worker_id)",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (workspace_id, runtime_id, worker_id) = row?;
+        if WorkerId::parse(&worker_id).is_none() {
+            continue;
+        }
+        let exists_only_outside_workspace: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM worker_registry \
+                 WHERE worker_id = ?1 AND workspace_id != ?2) \
+               AND NOT EXISTS(SELECT 1 FROM worker_registry \
+                 WHERE worker_id = ?1 AND workspace_id = ?2)",
+            params![worker_id, workspace_id],
+            |row| row.get(0),
+        )?;
+        if !exists_only_outside_workspace {
+            // Before v39, supported cleanup and Runtime-placement changes could remove or move a
+            // Worker without recording an assignment-specific tombstone. A valid,
+            // non-cross-Workspace Worker identity is sufficient legacy evidence; v39
+            // materializes the missing tombstone in the migration transaction.
+            repairs.insert((workspace_id, runtime_id, worker_id));
+        }
+    }
+    Ok(repairs)
 }
 
 fn collect_reference_diagnostics(
@@ -6540,6 +6638,21 @@ CREATE TABLE ticket_worker_assignments_v39 (
     FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
 );
 INSERT INTO ticket_worker_assignments_v39 SELECT * FROM ticket_worker_assignments;
+INSERT OR IGNORE INTO ticket_assignment_worker_tombstones (
+    workspace_id, runtime_id, worker_id, deleted_at
+)
+SELECT DISTINCT
+    assignment.workspace_id,
+    assignment.runtime_id,
+    assignment.worker_id,
+    CURRENT_TIMESTAMP
+FROM ticket_worker_assignments_v39 AS assignment
+WHERE NOT EXISTS (
+    SELECT 1 FROM worker_registry AS worker
+    WHERE worker.workspace_id = assignment.workspace_id
+      AND worker.runtime_id = assignment.runtime_id
+      AND worker.worker_id = assignment.worker_id
+);
 
 CREATE TABLE ticket_worker_assignment_events_v39 (
     workspace_id TEXT NOT NULL,
@@ -8947,7 +9060,6 @@ INSERT INTO ticket_worker_assignment_events (
             "{error}"
         );
         assert!(error.contains("assignment-cross-worker"), "{error}");
-        assert!(error.contains("assignment-runtime-mismatch"), "{error}");
         assert!(error.contains("assignment-missing-parents"), "{error}");
         assert!(
             error.contains("ticket_worker_assignment_events.assignment_id"),
@@ -9125,6 +9237,123 @@ INSERT INTO ticket_worker_assignment_events (
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
             .unwrap();
         assert_eq!(integrity, "ok");
+    }
+
+    #[test]
+    fn workspace_resource_fk_migration_preserves_assignments_for_legacy_absent_workers() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        apply_migrations_through(&conn, 38).unwrap();
+        ticket::migrate_sqlite_ticket_schema(&conn).unwrap();
+        merge_request::migrate(&conn).unwrap();
+
+        conn.execute_batch(
+            r#"
+INSERT INTO workspaces (
+    workspace_id, display_name, state, created_at, updated_at
+) VALUES ('workspace-a', 'A', 'active', '2026-01-01', '2026-01-01');
+INSERT INTO typed_tickets (
+    workspace_id, ticket_id, slug, title, status, kind, priority, body,
+    workflow_state, workflow_state_explicit
+) VALUES (
+    'workspace-a', 'ticket-a', 'ticket-a', 'A', 'open', 'task', 'normal', '',
+    'planning', 1
+);
+INSERT INTO worker_registry (
+    workspace_id, runtime_id, worker_id, display_name, retention_state, created_at, updated_at
+) VALUES
+(
+    'workspace-a', 'runtime-a', '00000000-0000-7000-8000-000000000001',
+    'Worker A', 'normal', '2026-01-01', '2026-01-01'
+),
+(
+    'workspace-a', 'runtime-old', '00000000-0000-7000-8000-000000000002',
+    'Worker B', 'normal', '2026-01-01', '2026-01-01'
+);
+INSERT INTO ticket_worker_assignments (
+    workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at
+) VALUES
+(
+    'workspace-a', 'ticket-a', 'assignment-a', 'runtime-a',
+    '00000000-0000-7000-8000-000000000001', 'tester', '2026-01-01'
+),
+(
+    'workspace-a', 'ticket-a', 'assignment-b', 'runtime-old',
+    '00000000-0000-7000-8000-000000000002', 'tester', '2026-01-01'
+);
+DELETE FROM worker_registry
+WHERE workspace_id = 'workspace-a'
+  AND runtime_id = 'runtime-a'
+  AND worker_id = '00000000-0000-7000-8000-000000000001';
+UPDATE worker_registry
+SET runtime_id = 'runtime-new'
+WHERE workspace_id = 'workspace-a'
+  AND runtime_id = 'runtime-old'
+  AND worker_id = '00000000-0000-7000-8000-000000000002';
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            legacy_assignment_worker_tombstone_repairs(&conn)
+                .unwrap()
+                .len(),
+            2
+        );
+        drop(conn);
+
+        let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
+        assert!(
+            plan.repairs.iter().any(
+                |repair| repair == "materialize 2 legacy Ticket assignment Worker tombstone(s)"
+            ),
+            "{:?}",
+            plan.repairs
+        );
+
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 38);
+        assert!(!table_exists(&conn, "ticket_assignment_worker_tombstones").unwrap());
+        apply_migrations_through(&conn, 39).unwrap();
+
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM ticket_worker_assignments \
+                 WHERE workspace_id = 'workspace-a' AND assignment_id = 'assignment-a'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM ticket_assignment_worker_tombstones \
+                 WHERE workspace_id = 'workspace-a' \
+                   AND runtime_id = 'runtime-a' \
+                   AND worker_id = '00000000-0000-7000-8000-000000000001'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM ticket_assignment_worker_tombstones \
+                 WHERE workspace_id = 'workspace-a' \
+                   AND runtime_id = 'runtime-old' \
+                   AND worker_id = '00000000-0000-7000-8000-000000000002'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        validate_workspace_resource_references(&conn).unwrap();
     }
 
     #[test]
