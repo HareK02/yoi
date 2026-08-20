@@ -554,6 +554,8 @@ pub struct SubscriptionWorker {
     /// Producer-owned monotonic revision for this Worker subject.
     pub subject_revision: u64,
     pub state: SubscriptionWorkerState,
+    #[serde(default)]
+    pub has_running_internal_workers: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -796,6 +798,7 @@ mod tests {
             runtime_id: None,
             subject_revision: 0,
             state: SubscriptionWorkerState::Idle,
+            has_running_internal_workers: false,
             workspace_id: Some("workspace-1".to_string()),
             display_name: Some(format!("Worker {value}")),
             profile: Some("builtin:coder".to_string()),

@@ -267,12 +267,17 @@
     background: var(--success);
   }
   .worker-status-spinner {
-    width: 0.625rem;
-    height: 0.625rem;
-    border: 0.125rem solid color-mix(in oklch, var(--accent) 25%, transparent);
-    border-top-color: var(--accent);
-    border-radius: 50%;
-    animation: worker-status-spin 0.8s linear infinite;
+    --spinner-color: var(--success);
+
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 0.75rem;
+    font-size: 0.7rem;
+    line-height: 1;
+  }
+  .worker-status-spinner.is-subworker {
+    --spinner-color: var(--tui-magenta);
   }
   .worker-nav-label {
     grid-column: 2;
@@ -338,16 +343,6 @@
   }
   .worker-overflow-toggle[aria-expanded="true"] .worker-overflow-chevron {
     transform: rotate(180deg);
-  }
-  @keyframes worker-status-spin {
-    to {
-      transform: rotate(360deg);
-    }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .worker-status-spinner {
-      animation: none;
-    }
   }
 
   @media (max-width: 760px) {

@@ -335,6 +335,7 @@ impl Runtime {
         for (worker_id, worker) in &mut state.workers {
             if worker.status.is_active() {
                 worker.status = WorkerStatus::Stopped;
+                worker.internal_workers.clear();
                 stopped.push(*worker_id);
             }
         }
@@ -574,6 +575,7 @@ impl Runtime {
                 run_generation: 1,
                 working_directory: None,
                 execution_handle: None,
+                internal_workers: BTreeMap::new(),
             };
             state.workers.insert(worker_id, record);
             state.persist_runtime_snapshot()?;
@@ -1471,7 +1473,8 @@ impl Runtime {
         let mut state = self.lock()?;
         state.ensure_worker_ref(worker_ref)?;
         let status_changed = state.project_protocol_event_to_status(worker_ref, &payload);
-        if status_changed {
+        let activity_changed = state.project_internal_worker_activity(worker_ref, &payload);
+        if status_changed || activity_changed {
             state.publish_worker_upsert(worker_ref.worker_id)?;
         }
         let event = state.push_worker_observation_event(worker_ref.clone(), payload);
@@ -1528,6 +1531,7 @@ impl Runtime {
         let worker = state.worker_mut(worker_ref)?;
         worker.status = status;
         worker.execution_handle = None;
+        worker.internal_workers.clear();
         let status = worker.status;
         state.publish_worker_upsert(worker_ref.worker_id)?;
         state.persist_runtime_snapshot()?;
@@ -1940,6 +1944,7 @@ impl RuntimeState {
                     run_generation: worker.run_generation,
                     working_directory: worker.working_directory,
                     execution_handle: None,
+                    internal_workers: BTreeMap::new(),
                 },
             );
         }
@@ -2260,6 +2265,10 @@ impl RuntimeState {
                 .copied()
                 .unwrap_or(0),
             state: subscription_worker_state(worker.status),
+            has_running_internal_workers: worker
+                .internal_workers
+                .values()
+                .any(|worker| worker.status == protocol::WorkerStatus::Running),
             workspace_id: worker.workspace_id.clone(),
             display_name: worker.request.display_name.clone(),
             profile,
@@ -2402,6 +2411,7 @@ impl RuntimeState {
         let worker = self.worker_mut(worker_ref)?;
         worker.execution_handle = None;
         worker.status = WorkerStatus::Stopped;
+        worker.internal_workers.clear();
         self.publish_worker_upsert(worker_ref.worker_id)?;
         self.persist_runtime_snapshot()?;
         Ok(())
@@ -2455,7 +2465,134 @@ impl RuntimeState {
         event
     }
 
-    #[cfg(feature = "ws-server")]
+    fn internal_worker_snapshot_statuses(
+        statuses: &mut BTreeMap<String, InternalWorkerActivity>,
+        snapshot: &protocol::InternalWorkerSnapshot,
+    ) {
+        statuses.insert(
+            snapshot.worker.session_id.clone(),
+            InternalWorkerActivity {
+                status: snapshot.status,
+                parent_session_id: snapshot.worker.parent_session_id.clone(),
+            },
+        );
+        for child in &snapshot.internal_workers {
+            Self::internal_worker_snapshot_statuses(statuses, child);
+        }
+    }
+
+    fn remove_internal_worker_subtree(
+        statuses: &mut BTreeMap<String, InternalWorkerActivity>,
+        root_session_id: &str,
+    ) {
+        let mut removed = vec![root_session_id.to_string()];
+        while let Some(parent_session_id) = removed.pop() {
+            let children = statuses
+                .iter()
+                .filter_map(|(session_id, worker)| {
+                    (worker.parent_session_id.as_deref() == Some(parent_session_id.as_str()))
+                        .then(|| session_id.clone())
+                })
+                .collect::<Vec<_>>();
+            statuses.remove(&parent_session_id);
+            removed.extend(children);
+        }
+    }
+
+    fn project_internal_worker_event(
+        statuses: &mut BTreeMap<String, InternalWorkerActivity>,
+        worker: &protocol::InternalWorkerRef,
+        event: &protocol::Event,
+    ) {
+        match event {
+            protocol::Event::Snapshot {
+                status,
+                internal_workers,
+                ..
+            } => {
+                Self::remove_internal_worker_subtree(statuses, &worker.session_id);
+                statuses.insert(
+                    worker.session_id.clone(),
+                    InternalWorkerActivity {
+                        status: *status,
+                        parent_session_id: worker.parent_session_id.clone(),
+                    },
+                );
+                for child in internal_workers {
+                    Self::internal_worker_snapshot_statuses(statuses, child);
+                }
+            }
+            protocol::Event::InternalWorker {
+                worker: nested_worker,
+                event,
+                ..
+            } => Self::project_internal_worker_event(statuses, nested_worker, event),
+            protocol::Event::Status { status } => {
+                statuses.insert(
+                    worker.session_id.clone(),
+                    InternalWorkerActivity {
+                        status: *status,
+                        parent_session_id: worker.parent_session_id.clone(),
+                    },
+                );
+            }
+            protocol::Event::RunEnd { result } => {
+                let status = match result {
+                    protocol::RunResult::Paused => protocol::WorkerStatus::Paused,
+                    protocol::RunResult::Finished
+                    | protocol::RunResult::LimitReached
+                    | protocol::RunResult::RolledBack => protocol::WorkerStatus::Idle,
+                };
+                statuses.insert(
+                    worker.session_id.clone(),
+                    InternalWorkerActivity {
+                        status,
+                        parent_session_id: worker.parent_session_id.clone(),
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn update_internal_worker_activity(
+        statuses: &mut BTreeMap<String, InternalWorkerActivity>,
+        event: &protocol::Event,
+    ) -> bool {
+        let was_running = statuses
+            .values()
+            .any(|worker| worker.status == protocol::WorkerStatus::Running);
+        match event {
+            protocol::Event::Snapshot {
+                internal_workers, ..
+            } => {
+                statuses.clear();
+                for child in internal_workers {
+                    Self::internal_worker_snapshot_statuses(statuses, child);
+                }
+            }
+            protocol::Event::InternalWorker { worker, event, .. } => {
+                Self::project_internal_worker_event(statuses, worker, event);
+            }
+            _ => {}
+        }
+        let is_running = statuses
+            .values()
+            .any(|worker| worker.status == protocol::WorkerStatus::Running);
+        was_running != is_running
+    }
+
+    fn project_internal_worker_activity(
+        &mut self,
+        worker_ref: &WorkerRef,
+        event: &protocol::Event,
+    ) -> bool {
+        let Some(worker) = self.workers.get_mut(&worker_ref.worker_id) else {
+            return false;
+        };
+        Self::update_internal_worker_activity(&mut worker.internal_workers, event)
+    }
+
     fn project_protocol_event_to_status(
         &mut self,
         worker_ref: &WorkerRef,
@@ -2498,6 +2635,12 @@ impl RuntimeState {
     }
 }
 
+#[derive(Debug, Clone)]
+struct InternalWorkerActivity {
+    status: protocol::WorkerStatus,
+    parent_session_id: Option<String>,
+}
+
 #[derive(Debug)]
 struct WorkerRecord {
     worker_ref: WorkerRef,
@@ -2508,6 +2651,7 @@ struct WorkerRecord {
     run_generation: u64,
     working_directory: Option<CatalogWorkingDirectoryStatus>,
     execution_handle: Option<WorkerExecutionHandle>,
+    internal_workers: BTreeMap<String, InternalWorkerActivity>,
 }
 
 impl WorkerRecord {
@@ -2729,6 +2873,126 @@ mod tests {
     #[cfg(feature = "fs-store")]
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+
+    fn internal_worker_ref(
+        session_id: &str,
+        parent_session_id: Option<&str>,
+    ) -> protocol::InternalWorkerRef {
+        protocol::InternalWorkerRef {
+            session_id: session_id.to_string(),
+            parent_session_id: parent_session_id.map(str::to_string),
+            name: session_id.to_string(),
+            kind: protocol::InternalWorkerKind::SubWorker,
+        }
+    }
+
+    fn internal_worker_status_event(
+        worker: protocol::InternalWorkerRef,
+        status: protocol::WorkerStatus,
+    ) -> protocol::Event {
+        protocol::Event::InternalWorker {
+            worker,
+            revision: 1,
+            event: Box::new(protocol::Event::Status { status }),
+        }
+    }
+
+    #[test]
+    fn internal_worker_activity_tracks_running_children_independently() {
+        let mut activity = BTreeMap::new();
+        assert!(RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &internal_worker_status_event(
+                internal_worker_ref("child-a", None),
+                protocol::WorkerStatus::Running,
+            ),
+        ));
+        assert!(!RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &internal_worker_status_event(
+                internal_worker_ref("child-b", None),
+                protocol::WorkerStatus::Running,
+            ),
+        ));
+        assert!(!RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &internal_worker_status_event(
+                internal_worker_ref("child-a", None),
+                protocol::WorkerStatus::Idle,
+            ),
+        ));
+        assert!(RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &internal_worker_status_event(
+                internal_worker_ref("child-b", None),
+                protocol::WorkerStatus::Idle,
+            ),
+        ));
+    }
+
+    #[test]
+    fn nested_internal_worker_activity_reaches_the_parent_projection() {
+        let mut activity = BTreeMap::new();
+        let direct_child = internal_worker_ref("child", None);
+        let nested_running = protocol::Event::InternalWorker {
+            worker: direct_child.clone(),
+            revision: 1,
+            event: Box::new(internal_worker_status_event(
+                internal_worker_ref("grandchild", Some("child")),
+                protocol::WorkerStatus::Running,
+            )),
+        };
+        assert!(RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &nested_running,
+        ));
+
+        let nested_idle = protocol::Event::InternalWorker {
+            worker: direct_child,
+            revision: 2,
+            event: Box::new(internal_worker_status_event(
+                internal_worker_ref("grandchild", Some("child")),
+                protocol::WorkerStatus::Idle,
+            )),
+        };
+        assert!(RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &nested_idle,
+        ));
+    }
+
+    #[test]
+    fn parent_snapshot_replaces_stale_internal_worker_activity() {
+        let mut activity = BTreeMap::new();
+        RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &internal_worker_status_event(
+                internal_worker_ref("child-a", None),
+                protocol::WorkerStatus::Running,
+            ),
+        );
+        let snapshot = protocol::Event::Snapshot {
+            entries: Vec::new(),
+            greeting: protocol::Greeting {
+                worker_name: "parent".to_string(),
+                cwd: "/tmp".to_string(),
+                provider: "test".to_string(),
+                model: "test".to_string(),
+                scope_summary: String::new(),
+                tools: Vec::new(),
+                context_window: 0,
+                context_tokens: 0,
+            },
+            status: protocol::WorkerStatus::Idle,
+            in_flight: protocol::InFlightSnapshot::default(),
+            internal_workers: Vec::new(),
+        };
+        assert!(RuntimeState::update_internal_worker_activity(
+            &mut activity,
+            &snapshot,
+        ));
+        assert!(activity.is_empty());
+    }
 
     #[test]
     fn runtime_identity_binding_is_immutable_and_host_owned() {
@@ -3083,16 +3347,75 @@ mod tests {
             payload => panic!("unexpected subscription payload: {payload:?}"),
         }
 
-        runtime.stop_runtime().unwrap();
+        runtime
+            .observe_worker_event(
+                &created.worker_ref,
+                internal_worker_status_event(
+                    internal_worker_ref("child-live", None),
+                    protocol::WorkerStatus::Running,
+                ),
+            )
+            .unwrap();
         let update = receive_subscription_update(&mut subscription).unwrap();
         assert_eq!(update.subject_revision, 2);
         match update.payload {
             SubscriptionEventPayload::WorkerUpserted { worker } => {
-                assert_eq!(worker.worker_id.as_str(), created.worker_id.to_string());
-                assert_eq!(worker.state, SubscriptionWorkerState::Stopped);
+                assert_eq!(worker.state, SubscriptionWorkerState::Idle);
+                assert!(worker.has_running_internal_workers);
             }
             payload => panic!("unexpected subscription payload: {payload:?}"),
         }
+
+        runtime
+            .observe_worker_event(
+                &created.worker_ref,
+                internal_worker_status_event(
+                    internal_worker_ref("child-live", None),
+                    protocol::WorkerStatus::Idle,
+                ),
+            )
+            .unwrap();
+        let update = receive_subscription_update(&mut subscription).unwrap();
+        assert_eq!(update.subject_revision, 3);
+        match update.payload {
+            SubscriptionEventPayload::WorkerUpserted { worker } => {
+                assert_eq!(worker.state, SubscriptionWorkerState::Idle);
+                assert!(!worker.has_running_internal_workers);
+            }
+            payload => panic!("unexpected subscription payload: {payload:?}"),
+        }
+
+        runtime
+            .observe_worker_event(
+                &created.worker_ref,
+                internal_worker_status_event(
+                    internal_worker_ref("child-live", None),
+                    protocol::WorkerStatus::Running,
+                ),
+            )
+            .unwrap();
+        let update = receive_subscription_update(&mut subscription).unwrap();
+        assert_eq!(update.subject_revision, 4);
+        match update.payload {
+            SubscriptionEventPayload::WorkerUpserted { worker } => {
+                assert_eq!(worker.state, SubscriptionWorkerState::Idle);
+                assert!(worker.has_running_internal_workers);
+            }
+            payload => panic!("unexpected subscription payload: {payload:?}"),
+        }
+
+        runtime.stop_worker(&created.worker_ref, None).unwrap();
+        let update = receive_subscription_update(&mut subscription).unwrap();
+        assert_eq!(update.subject_revision, 5);
+        match update.payload {
+            SubscriptionEventPayload::WorkerUpserted { worker } => {
+                assert_eq!(worker.worker_id.as_str(), created.worker_id.to_string());
+                assert_eq!(worker.state, SubscriptionWorkerState::Stopped);
+                assert!(!worker.has_running_internal_workers);
+            }
+            payload => panic!("unexpected subscription payload: {payload:?}"),
+        }
+        runtime.stop_runtime().unwrap();
     }
 
     #[test]

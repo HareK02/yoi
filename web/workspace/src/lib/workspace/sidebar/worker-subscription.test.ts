@@ -20,6 +20,7 @@ function worker(runtimeId: string, workerId: string, revision: number): Subscrip
     runtime_id: runtimeId,
     subject_revision: revision,
     state: 'idle',
+    has_running_internal_workers: false,
     workspace_id: 'workspace-test',
     display_name: null,
     profile: null,

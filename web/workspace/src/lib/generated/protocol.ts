@@ -128,7 +128,7 @@ runtime_id?: string | null,
 /**
  * Producer-owned monotonic revision for this Worker subject.
  */
-subject_revision: number, state: SubscriptionWorkerState, workspace_id?: string | null, display_name?: string | null, profile?: string | null, repository_id?: string | null, working_directory_id?: SubscriptionWorkdirId | null, };
+subject_revision: number, state: SubscriptionWorkerState, has_running_internal_workers: boolean, workspace_id?: string | null, display_name?: string | null, profile?: string | null, repository_id?: string | null, working_directory_id?: SubscriptionWorkdirId | null, };
 
 export type SubscriptionWorkdir = { working_directory_id: SubscriptionWorkdirId, repository_id: string, state: string, primary_worker_id?: SubscriptionWorkerId | null, };
 
