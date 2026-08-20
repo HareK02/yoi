@@ -12889,38 +12889,10 @@ mod tests {
             .is_err()
         );
 
-        let ticket = browser_ticket_backend(&api)
-            .unwrap()
-            .create(create_input)
-            .unwrap();
-        let flow_ticket_launch = WorkerSpawnRequest {
-            requested_worker_name: Some("cross-workspace-ticket".to_string()),
-            intent: WorkerSpawnIntent::TicketRole {
-                ticket_id: ticket.id,
-                role: TicketWorkerRole::Coder,
-            },
-            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                expected_segments: 2,
-            },
-            profile: ProfileSelector::Builtin("builtin:coder".to_string()),
-            ticket_assignment: None,
-            initial_submit: vec![
-                Segment::Flow {
-                    selector: "builtin:coder-review".to_string(),
-                },
-                Segment::text("Implement the Ticket"),
-            ],
-            working_directory_request: None,
-            resolved_working_directory_request: None,
-            resolved_working_directory: None,
-            resolved_config_bundle: None,
-            resolved_worker_observation_enabled: false,
-            resolved_worker_observation_grants: Vec::new(),
-            resolved_control_operation: None,
-            resolved_workspace_api: None,
-        };
         assert!(
-            api.validate_worker_spawn_repository_scope(&flow_ticket_launch)
+            browser_ticket_backend(&api)
+                .unwrap()
+                .create(create_input)
                 .is_err()
         );
 
@@ -14392,27 +14364,7 @@ mod tests {
 
         let mut missing = ticket::NewTicket::new("Missing target");
         missing.repository_id = Some("unknown".to_owned());
-        let missing = backend.create(missing).unwrap();
-        assert!(matches!(
-            backend.mark_ready(
-                TicketIdOrSlug::Id(missing.id.clone()),
-                ticket::TicketMarkReady {
-                    operation_key: "missing-repository".to_owned(),
-                    reason: None,
-                    author: None,
-                    intake_summary: None,
-                },
-            ),
-            Err(ticket::TicketError::UnknownTargetRepository(_))
-        ));
-        assert_eq!(
-            backend
-                .show(TicketIdOrSlug::Id(missing.id))
-                .unwrap()
-                .meta
-                .workflow_state,
-            TicketWorkflowState::Planning
-        );
+        assert!(backend.create(missing).is_err());
         assert!(matches!(
             backend.set_workflow_state(
                 TicketIdOrSlug::Id(ticket_ref.id),
@@ -14604,6 +14556,21 @@ mod tests {
             .create(ticket::NewTicket::new("Assigned Ticket"))
             .unwrap();
         let ticket_id = created.id;
+        api.store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                worker: RuntimeWorkerRef::new("embedded", "42"),
+                display_name: "Worker 42".to_string(),
+                profile: Some("builtin:coder".to_string()),
+                retention_state: "normal".to_string(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: TEST_CREATED_AT.to_string(),
+                updated_at: TEST_CREATED_AT.to_string(),
+            })
+            .unwrap();
         let assignment = TicketWorkerAssignmentRecord {
             workspace_id: TEST_WORKSPACE_ID.to_string(),
             ticket_id: ticket_id.clone(),
@@ -14698,6 +14665,24 @@ mod tests {
             .unwrap()
             .worker
             .unwrap();
+        api.store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                worker: RuntimeWorkerRef::new(
+                    EMBEDDED_WORKER_RUNTIME_ID,
+                    source_worker.worker.worker_id.clone(),
+                ),
+                display_name: "Source Worker".to_string(),
+                profile: Some("builtin:coder".to_string()),
+                retention_state: "normal".to_string(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: TEST_CREATED_AT.to_string(),
+                updated_at: TEST_CREATED_AT.to_string(),
+            })
+            .unwrap();
         let recipient_worker = api
             .runtime
             .spawn_worker(
@@ -14707,6 +14692,24 @@ mod tests {
             )
             .unwrap()
             .worker
+            .unwrap();
+        api.store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                worker: RuntimeWorkerRef::new(
+                    EMBEDDED_WORKER_RUNTIME_ID,
+                    recipient_worker.worker.worker_id.clone(),
+                ),
+                display_name: "Recipient Worker".to_string(),
+                profile: Some("builtin:coder".to_string()),
+                retention_state: "normal".to_string(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: TEST_CREATED_AT.to_string(),
+                updated_at: TEST_CREATED_AT.to_string(),
+            })
             .unwrap();
         let backend = browser_ticket_backend(&api).unwrap();
         let ticket_ref = backend
@@ -18946,6 +18949,26 @@ mod tests {
                 updated_at: TEST_CREATED_AT.to_string(),
             })
             .await
+            .unwrap();
+        rusqlite::Connection::open(&config.database_path)
+            .unwrap()
+            .execute_batch(
+                r#"
+INSERT INTO typed_tickets (
+    workspace_id, ticket_id, slug, title, status, kind, priority, body,
+    workflow_state, workflow_state_explicit
+) VALUES
+    ('0192f0e8-4d84-7d6e-a000-000000000001', '00000000001J2', 'ticket-j2', 'Ticket J2', 'open', 'task', 'normal', '', 'planning', 1),
+    ('0192f0e8-4d84-7d6e-a000-000000000001', '00000000001J3', 'ticket-j3', 'Ticket J3', 'open', 'task', 'normal', '', 'planning', 1);
+INSERT INTO workspace_resource_human_keys (
+    workspace_id, resource_kind, resource_id, sequence, human_key, allocated_at
+) VALUES
+    ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', '00000000001J2', 1, 'T-1', '2026-01-01T00:00:00Z'),
+    ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', '00000000001J3', 2, 'T-2', '2026-01-01T00:00:00Z');
+INSERT INTO workspace_resource_human_key_counters (workspace_id, resource_kind, next_sequence)
+VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
+"#,
+            )
             .unwrap();
         let api = WorkspaceApi::new_with_execution_backend(
             config,

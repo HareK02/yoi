@@ -848,16 +848,14 @@ fn collect_foreign_key_diagnostics(
             )
         })
         .collect::<BTreeSet<_>>();
+    // The Ticket component owns its required foreign keys, while an integrated host may
+    // strengthen Workspace/domain boundaries with additional references to host-owned
+    // tables. Reject missing component constraints, but do not treat those host extensions
+    // as Ticket schema drift.
     for missing in expected.difference(&actual) {
         push_diagnostic(
             diagnostics,
             format!("table {table:?} is missing foreign key {missing:?}"),
-        );
-    }
-    for unexpected in actual.difference(&expected) {
-        push_diagnostic(
-            diagnostics,
-            format!("table {table:?} has unexpected foreign key {unexpected:?}"),
         );
     }
 }
