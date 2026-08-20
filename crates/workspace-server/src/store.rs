@@ -275,6 +275,9 @@ pub struct RepositoryRecord {
 pub struct WorkspaceBootstrapRecord {
     pub operation_key: String,
     pub request_fingerprint: String,
+    /// When true, the transaction must prove that no Workspace exists before
+    /// it inserts this ownerless local-bootstrap Workspace.
+    pub require_empty_catalog: bool,
     pub workspace: WorkspaceRecord,
     pub repository: RepositoryRecord,
 }
@@ -1442,6 +1445,20 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     config_revision,
                     replayed: true,
                 });
+            }
+
+            if record.require_empty_catalog {
+                let workspace_exists = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM workspaces LIMIT 1)",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if workspace_exists {
+                    return Err(Error::WorkspaceConfigConflict(
+                        "ownerless local bootstrap is available only while the Workspace catalog is empty"
+                            .to_string(),
+                    ));
+                }
             }
 
             if let Some(existing) = tx

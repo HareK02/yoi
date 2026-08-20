@@ -842,25 +842,19 @@ async fn create_server_workspace(
     headers: HeaderMap,
     Json(request): Json<WorkspaceCreateRequest>,
 ) -> Response {
-    let owner_account_id = match resolve_server_actor(&api, &headers).await {
-        Ok(Some(actor)) => Some(actor.account_id),
-        Ok(None) if api.template.allow_local_workspace_bootstrap => {
-            match api.store.list_workspaces() {
-                Ok(workspaces) if workspaces.is_empty() => None,
-                Ok(_) => {
-                    return forbidden_server_response(
-                        "Workspace creation requires an authenticated owner",
-                    );
-                }
-                Err(error) => return server_error_response(error),
-            }
-        }
+    let (owner_account_id, local_bootstrap) = match resolve_server_actor(&api, &headers).await {
+        Ok(Some(actor)) => (Some(actor.account_id), false),
+        Ok(None) if api.template.allow_local_workspace_bootstrap => (None, true),
         Ok(None) => {
             return forbidden_server_response("Workspace creation requires an authenticated owner");
         }
         Err(error) => return server_error_response(error),
     };
-    let created = match api.catalog.create(request, owner_account_id) {
+    let created = match if local_bootstrap {
+        api.catalog.create_first_ownerless(request)
+    } else {
+        api.catalog.create(request, owner_account_id)
+    } {
         Ok(created) => created,
         Err(error) => return server_error_response(error),
     };
@@ -935,7 +929,10 @@ fn is_server_global_forward(path: &str) -> bool {
 fn scoped_workspace_id(path: &str) -> Option<&str> {
     let mut segments = path.trim_start_matches('/').split('/');
     match (segments.next(), segments.next(), segments.next()) {
-        (Some("api"), Some("w"), Some(workspace_id)) if !workspace_id.is_empty() => {
+        (Some("api"), Some("w"), Some(workspace_id))
+        | (Some("internal"), Some("w"), Some(workspace_id))
+            if !workspace_id.is_empty() =>
+        {
             Some(workspace_id)
         }
         (Some("w"), Some(workspace_id), _) if !workspace_id.is_empty() => Some(workspace_id),
@@ -1963,8 +1960,8 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             post(scoped_test_remote_runtime_connection),
         )
         .route(
-            "/internal/runtime/resources/fetch",
-            post(post_internal_runtime_resource_fetch),
+            "/internal/w/{workspace_id}/runtime/resources/fetch",
+            post(scoped_post_internal_runtime_resource_fetch),
         )
         .route("/api/companion/status", get(get_companion_status))
         .route(
@@ -9792,13 +9789,20 @@ fn browser_worker_response_from_summary(
     })
 }
 
-async fn post_internal_runtime_resource_fetch(
+async fn scoped_post_internal_runtime_resource_fetch(
     State(api): State<WorkspaceApi>,
+    AxumPath(workspace_id): AxumPath<String>,
     Json(request): Json<BackendResourceFetchRequest>,
 ) -> std::result::Result<
     Json<worker_runtime::resource::BackendResourceFetchResponse>,
     (StatusCode, Json<BackendResourceError>),
 > {
+    if workspace_id != api.workspace_id() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(BackendResourceError::MissingResource),
+        ));
+    }
     api.resource_broker
         .fetch_profile_source_archive(request)
         .map(Json)
@@ -14466,6 +14470,37 @@ mod tests {
         assert_eq!(b["workspace_id"], workspace_b.workspace.workspace_id);
         assert_eq!(b["display_name"], "Workspace B");
 
+        let handle = missing_resource_handle();
+        let resource_response = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/internal/w/{}/runtime/resources/fetch",
+                    workspace_b.workspace.workspace_id
+                ))
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&BackendResourceFetchRequest {
+                        audit_correlation_id: handle.audit_correlation_id.clone(),
+                        runtime_id: "runtime-test".to_string(),
+                        worker_id: None,
+                        handle,
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resource_response.status(), StatusCode::NOT_FOUND);
+        let resource_error: BackendResourceError = serde_json::from_slice(
+            &to_bytes(resource_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resource_error, BackendResourceError::MissingResource);
+
         let missing = app
             .oneshot(
                 Request::builder()
@@ -14519,6 +14554,7 @@ mod tests {
         assert_eq!(workspace["display_name"], "Created Workspace");
 
         let replayed = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -14529,10 +14565,29 @@ mod tests {
             )
             .await
             .unwrap();
-        // Local bootstrap authority is consumed after the first Workspace; even
-        // an exact HTTP retry must authenticate rather than creating another
-        // ownerless Workspace accidentally.
-        assert_eq!(replayed.status(), StatusCode::FORBIDDEN);
+        assert_eq!(replayed.status(), StatusCode::OK);
+
+        let second_payload = json!({
+            "operation_key": "bootstrap-2",
+            "display_name": "Second Ownerless Workspace",
+            "repository": {
+                "uri": repository,
+                "display_name": "Repository",
+                "default_ref": "HEAD"
+            }
+        });
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/workspaces")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(second_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT);
     }
 
     #[test]
@@ -14544,6 +14599,10 @@ mod tests {
         assert_eq!(
             scoped_workspace_id("/w/workspace-b/workers"),
             Some("workspace-b")
+        );
+        assert_eq!(
+            scoped_workspace_id("/internal/w/workspace-c/runtime/resources/fetch"),
+            Some("workspace-c")
         );
         assert_eq!(scoped_workspace_id("/api/workspaces"), None);
         assert_eq!(scoped_workspace_id("/api/workspace"), None);
@@ -17146,20 +17205,20 @@ mod tests {
         let handle = missing_resource_handle();
         let response = app
             .oneshot(
-                Request::post("/internal/runtime/resources/fetch")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::to_vec(
-                            &worker_runtime::resource::BackendResourceFetchRequest {
-                                audit_correlation_id: handle.audit_correlation_id.clone(),
-                                runtime_id: "runtime-test".to_string(),
-                                worker_id: None,
-                                handle,
-                            },
-                        )
-                        .unwrap(),
-                    ))
+                Request::post(format!(
+                    "/internal/w/{TEST_WORKSPACE_ID}/runtime/resources/fetch"
+                ))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&worker_runtime::resource::BackendResourceFetchRequest {
+                        audit_correlation_id: handle.audit_correlation_id.clone(),
+                        runtime_id: "runtime-test".to_string(),
+                        worker_id: None,
+                        handle,
+                    })
                     .unwrap(),
+                ))
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -17182,7 +17241,7 @@ mod tests {
         let archive = test_profile_archive();
         let runtime_id = "runtime-test";
         let handle = broker.issue_profile_source_archive_handle(
-            "workspace-test",
+            TEST_WORKSPACE_ID,
             crate::resource_broker::BackendResourceTarget::Runtime(runtime_id),
             archive,
         );
@@ -17191,7 +17250,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let client = worker_runtime::resource::HttpBackendResourceClient::new(
-            format!("http://{addr}/internal/runtime/resources/fetch"),
+            format!("http://{addr}/internal/w/{TEST_WORKSPACE_ID}/runtime/resources/fetch"),
             None,
         );
 

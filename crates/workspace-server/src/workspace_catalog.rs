@@ -76,7 +76,14 @@ impl WorkspaceCatalogService {
         request: WorkspaceCreateRequest,
         owner_account_id: Option<String>,
     ) -> Result<WorkspaceCreateResponse> {
-        self.create_with_workspace_id(request, owner_account_id, None)
+        self.create_internal(request, owner_account_id, None, false)
+    }
+
+    pub fn create_first_ownerless(
+        &self,
+        request: WorkspaceCreateRequest,
+    ) -> Result<WorkspaceCreateResponse> {
+        self.create_internal(request, None, None, true)
     }
 
     pub fn create_with_workspace_id(
@@ -84,6 +91,16 @@ impl WorkspaceCatalogService {
         request: WorkspaceCreateRequest,
         owner_account_id: Option<String>,
         requested_workspace_id: Option<String>,
+    ) -> Result<WorkspaceCreateResponse> {
+        self.create_internal(request, owner_account_id, requested_workspace_id, false)
+    }
+
+    fn create_internal(
+        &self,
+        request: WorkspaceCreateRequest,
+        owner_account_id: Option<String>,
+        requested_workspace_id: Option<String>,
+        require_empty_catalog: bool,
     ) -> Result<WorkspaceCreateResponse> {
         let operation_key = normalize_required(
             "operation_key",
@@ -134,6 +151,7 @@ impl WorkspaceCatalogService {
             .create_workspace_bootstrap(&WorkspaceBootstrapRecord {
                 operation_key,
                 request_fingerprint: fingerprint.clone(),
+                require_empty_catalog,
                 workspace: WorkspaceRecord {
                     workspace_id: workspace_id.clone(),
                     owner_account_id,
@@ -286,6 +304,61 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn concurrent_ownerless_bootstrap_commits_exactly_one_workspace() {
+        let store = Arc::new(SqliteWorkspaceStore::in_memory().unwrap());
+        let service = WorkspaceCatalogService::new(store.clone());
+        let repository_a = git_repository();
+        let repository_b = git_repository();
+        let requests = [
+            WorkspaceCreateRequest {
+                operation_key: "bootstrap-a".to_string(),
+                display_name: "Workspace A".to_string(),
+                repository: InitialRepositoryIntent {
+                    uri: repository_a.path().display().to_string(),
+                    display_name: None,
+                    default_ref: None,
+                },
+            },
+            WorkspaceCreateRequest {
+                operation_key: "bootstrap-b".to_string(),
+                display_name: "Workspace B".to_string(),
+                repository: InitialRepositoryIntent {
+                    uri: repository_b.path().display().to_string(),
+                    display_name: None,
+                    default_ref: None,
+                },
+            },
+        ];
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let results = std::thread::scope(|scope| {
+            requests
+                .into_iter()
+                .map(|request| {
+                    let service = service.clone();
+                    let barrier = barrier.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        service.create_first_ownerless(request)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        assert_eq!(store.list_workspaces().unwrap().len(), 1);
+        let error = results
+            .into_iter()
+            .find_map(Result::err)
+            .unwrap()
+            .to_string();
+        assert!(error.contains("catalog is empty"), "{error}");
     }
 
     #[tokio::test]
