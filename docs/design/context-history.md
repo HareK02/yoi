@@ -24,7 +24,7 @@ Do not insert turn-crossing information directly into context without first appe
 Forbidden examples:
 
 - Delivering a `Notify` or `WorkerEvent` only as a temporary context note.
-- Adding a `<system-reminder>` that explains behavior but is not persisted.
+- Adding a system reminder that explains behavior but is not persisted.
 - Rewriting old messages to include new facts.
 - Letting UI/controller-only state become model-visible without a committed record.
 

@@ -2,8 +2,8 @@
 //!
 //! Items in worker history with `role:system` are never produced by the
 //! LLM — they are always inserted by the Worker itself (notifications,
-//! file ref resolutions, child-worker lifecycle events,
-//! future `<system-reminder>` tags, …). [`SystemItem`] carries the
+//! file ref resolutions, child-worker lifecycle events, reminders, …).
+//! [`SystemItem`] carries the
 //! typed shape of each such injection so clients can dispatch on
 //! `kind` instead of parsing text prefixes like `[Notification] …` or
 //! `[File: …]`.
@@ -22,10 +22,7 @@ use llm_engine::llm_client::types::Item;
 use protocol::WorkerEvent;
 use serde::{Deserialize, Serialize};
 
-const SYSTEM_REMINDER_OPEN: &str = "<system-reminder>";
-const SYSTEM_REMINDER_CLOSE: &str = "</system-reminder>";
-
-/// Source policy that produced a durable `<system-reminder>` input.
+/// Source policy that produced a durable system reminder input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SystemReminderSource {
@@ -52,55 +49,28 @@ pub struct SystemReminder {
 }
 
 impl SystemReminder {
-    /// Build a task-inactivity reminder from an unwrapped body.
+    /// Build a task-inactivity reminder from its plain system-message body.
     pub fn task_inactivity(body: impl Into<String>) -> Self {
         Self::new(SystemReminderSource::TaskInactivity, body)
     }
 
-    /// Build a reminder from an unwrapped body. If a caller passes a body that
-    /// is already exactly wrapped in `<system-reminder>` tags, normalize it back
-    /// to the inner body so rendering still wraps exactly once.
+    /// Build a reminder whose body is committed verbatim as a system message.
     pub fn new(source: SystemReminderSource, body: impl Into<String>) -> Self {
-        let body = normalize_unwrapped_system_reminder_body(body.into());
-        Self { source, body }
-    }
-
-    pub fn source(&self) -> SystemReminderSource {
-        self.source
-    }
-
-    pub fn body(&self) -> &str {
-        &self.body
-    }
-
-    pub fn rendered_body(&self) -> String {
-        render_system_reminder(&self.body)
+        Self {
+            source,
+            body: body.into(),
+        }
     }
 
     pub fn into_system_item(self) -> SystemItem {
         match self.source {
             SystemReminderSource::TaskInactivity => SystemItem::TaskReminder {
                 source: self.source,
-                body: self.rendered_body(),
+                body: self.body,
                 prompt_provenance: None,
             },
         }
     }
-}
-
-fn normalize_unwrapped_system_reminder_body(body: String) -> String {
-    let trimmed = body.trim();
-    if let Some(inner) = trimmed
-        .strip_prefix(SYSTEM_REMINDER_OPEN)
-        .and_then(|rest| rest.strip_suffix(SYSTEM_REMINDER_CLOSE))
-    {
-        return inner.trim_matches('\n').to_string();
-    }
-    body
-}
-
-fn render_system_reminder(body: &str) -> String {
-    format!("{SYSTEM_REMINDER_OPEN}\n{body}\n{SYSTEM_REMINDER_CLOSE}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -178,7 +148,7 @@ pub enum SystemItem {
 
     /// Task-management inactivity reminder inserted before an LLM request.
     /// `source` is the policy that produced this durable reminder; `body` is
-    /// the exact LLM-context text wrapped in a `<system-reminder>` block.
+    /// the exact plain system-message text committed to LLM context.
     TaskReminder {
         #[serde(default = "default_task_reminder_source")]
         source: SystemReminderSource,
@@ -324,21 +294,9 @@ mod tests {
     }
 
     #[test]
-    fn system_reminder_renders_body_once() {
-        let reminder = SystemReminder::task_inactivity("remember tasks");
-        assert_eq!(
-            reminder.rendered_body(),
-            "<system-reminder>\nremember tasks\n</system-reminder>"
-        );
-
-        let already_wrapped = SystemReminder::task_inactivity(
-            "<system-reminder>\nremember tasks\n</system-reminder>",
-        );
-        assert_eq!(already_wrapped.body(), "remember tasks");
-        assert_eq!(
-            already_wrapped.rendered_body(),
-            "<system-reminder>\nremember tasks\n</system-reminder>"
-        );
+    fn system_reminder_preserves_plain_body() {
+        let item = SystemReminder::task_inactivity("remember tasks").into_system_item();
+        assert_eq!(item.history_text(), "remember tasks");
     }
 
     #[test]
@@ -347,10 +305,7 @@ mod tests {
         match item {
             SystemItem::TaskReminder { source, body, .. } => {
                 assert_eq!(source, SystemReminderSource::TaskInactivity);
-                assert_eq!(
-                    body,
-                    "<system-reminder>\nremember tasks\n</system-reminder>"
-                );
+                assert_eq!(body, "remember tasks");
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -358,10 +313,8 @@ mod tests {
 
     #[test]
     fn task_reminder_deserialization_defaults_legacy_source() {
-        let parsed: SystemItem = serde_json::from_str(
-            r#"{"kind":"task_reminder","body":"<system-reminder>\nbody\n</system-reminder>"}"#,
-        )
-        .unwrap();
+        let parsed: SystemItem =
+            serde_json::from_str(r#"{"kind":"task_reminder","body":"legacy body"}"#).unwrap();
         match parsed {
             SystemItem::TaskReminder { source, .. } => {
                 assert_eq!(source, SystemReminderSource::TaskInactivity);

@@ -358,7 +358,7 @@ pub enum Event {
     /// `Method::Run` (kind=`UserSend`), `Method::Notify` (kind=`Notify`),
     /// `Method::WorkerEvent` re-injection (kind=`WorkerEvent`), and any other
     /// IDLE-breaking trigger. Mid-run interrupts (e.g. hook output,
-    /// `<system-reminder>` injection that doesn't break IDLE) do not
+    /// typed system reminder insertion that doesn't break IDLE) do not
     /// emit `InvokeStart` — they appear as `SystemItem` only.
     ///
     /// Carries `kind` only; the payload (user text / notify message /
@@ -833,7 +833,7 @@ pub enum InvokeKind {
     Notify,
     /// `Method::WorkerEvent` — typed lifecycle report from a child Worker.
     WorkerEvent,
-    /// `<system-reminder>` etc. that crosses an IDLE boundary (mid-run
+    /// A typed system reminder that crosses an IDLE boundary (mid-run
     /// reminders that don't break IDLE are SystemItem-only and do not
     /// open a new Invoke).
     SystemReminder,

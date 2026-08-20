@@ -176,9 +176,7 @@ impl SystemItemAppendHandle {
 
     /// Queue a task-inactivity reminder for durable model-visible append.
     ///
-    /// The body should be the unwrapped reminder text; the host-side
-    /// `SystemReminder` renderer wraps it exactly once in `<system-reminder>`
-    /// tags before commit.
+    /// The body is committed verbatim as the typed item's system-message text.
     pub fn append_task_reminder(&self, body: impl Into<String>) {
         let item = SystemReminder::task_inactivity(body).into_system_item();
         self.pending
@@ -452,8 +450,7 @@ mod tests {
         assert_eq!(queued.len(), 1);
         match &queued[0] {
             SystemItem::TaskReminder { body, .. } => {
-                assert_eq!(body.matches("<system-reminder>").count(), 1);
-                assert!(body.contains("remember tasks"));
+                assert_eq!(body, "remember tasks");
             }
             other => panic!("unexpected system item: {other:?}"),
         }

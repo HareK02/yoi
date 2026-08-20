@@ -2980,6 +2980,12 @@ fn idle_orchestrator_gets_bounded_attention_for_new_queued_work() {
         .expect("idle orchestrator should receive queued-work attention");
 
     assert_eq!(request.worker_name, "test-orchestrator");
+    assert!(
+        request
+            .notice
+            .message
+            .starts_with("Workspace Dashboard observed")
+    );
     assert!(request.notice.message.contains("00001QUEUE"));
     assert!(request.notice.message.contains("new_queued"));
     assert!(request.notice.message.contains("queued -> inprogress"));

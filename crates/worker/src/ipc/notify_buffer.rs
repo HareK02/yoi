@@ -12,8 +12,8 @@
 //!
 //! This is the **single lane** for "system messages produced by Worker
 //! state that should land in the next LLM request": Notify,
-//! agent-visible WorkerEvent variants, and any future `<system-reminder>`
-//! injection all ride this queue.
+//! agent-visible WorkerEvent variants, and any future typed system reminder
+//! insertion all ride this queue.
 //! Per `tickets/notify-history-persist.md` and `AGENTS.md` (LLM
 //! context の加工原則), there is **no** "transient, history-skipping"
 //! lane — everything injected into a request is also committed to
