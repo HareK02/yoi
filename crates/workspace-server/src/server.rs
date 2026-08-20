@@ -340,6 +340,21 @@ pub struct WorkspaceApi {
 }
 
 #[derive(Clone)]
+struct ServerAuthApi {
+    config: ServerConfig,
+    store: Arc<dyn ControlPlaneStore>,
+}
+
+impl From<&WorkspaceApi> for ServerAuthApi {
+    fn from(api: &WorkspaceApi) -> Self {
+        Self {
+            config: api.config.clone(),
+            store: api.store.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
 struct WorkspaceWorkerRemoveExecutor {
     workspace_id: String,
     store: Arc<dyn ControlPlaneStore>,
@@ -931,7 +946,7 @@ fn is_server_global_forward(path: &str) -> bool {
 }
 
 fn is_server_static_forward(path: &str) -> bool {
-    path == "/" || path.starts_with("/_app/") || path.starts_with("/assets/")
+    !path.starts_with("/api/") && !path.starts_with("/internal/")
 }
 
 async fn serve_server_static_shell(api: &WorkspaceServerApi, path: &str) -> Response {
@@ -959,15 +974,20 @@ pub async fn build_workspace_server_router(
     template: ServerConfig,
     store: Arc<dyn ControlPlaneStore>,
 ) -> Result<Router> {
+    let auth = build_server_auth_router(ServerAuthApi {
+        config: template.clone(),
+        store: store.clone(),
+    });
     let api = WorkspaceServerApi::new(template, store);
     api.preload().await?;
-    Ok(Router::new()
+    let catalog = Router::new()
         .route(
             "/api/workspaces",
             get(list_server_workspaces).post(create_server_workspace),
         )
         .fallback(dispatch_workspace_request)
-        .with_state(api))
+        .with_state(api);
+    Ok(auth.merge(catalog))
 }
 
 impl WorkspaceApi {
@@ -1552,7 +1572,7 @@ fn resolve_backend_path(workspace_root: &Path, path: &Path) -> PathBuf {
     }
 }
 
-pub fn build_router(api: WorkspaceApi) -> Router {
+fn build_server_auth_router(api: ServerAuthApi) -> Router {
     Router::new()
         .route("/api/auth/config", get(get_auth_config))
         .route("/api/auth/bootstrap-user", post(post_auth_bootstrap_user))
@@ -1573,10 +1593,22 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             post(post_passkey_login_complete),
         )
         .route("/api/auth/logout", post(post_auth_logout))
-        .route("/api/auth/device-login/start", post(post_device_login_start))
-        .route("/api/auth/device-login/approve", post(post_device_login_approve))
+        .route(
+            "/api/auth/device-login/start",
+            post(post_device_login_start),
+        )
+        .route(
+            "/api/auth/device-login/approve",
+            post(post_device_login_approve),
+        )
         .route("/api/auth/device-login/poll", post(post_device_login_poll))
         .route("/api/auth/whoami", get(get_auth_whoami))
+        .with_state(api)
+}
+
+pub fn build_router(api: WorkspaceApi) -> Router {
+    let auth = build_server_auth_router(ServerAuthApi::from(&api));
+    let workspace = Router::new()
         .route("/api/workspace", get(get_workspace))
         .route("/api/w/{workspace_id}/workspace", get(scoped_get_workspace))
         .route(
@@ -2100,7 +2132,8 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             get(scoped_list_host_workers),
         )
         .fallback(get(static_or_spa_fallback))
-        .with_state(api)
+        .with_state(api);
+    auth.merge(workspace)
         .layer(middleware::from_fn(log_failed_api_response))
 }
 
@@ -4536,7 +4569,7 @@ async fn scoped_repair_merge_request_selector(
     let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     require_workspace_access(&workspace_id, &api)?;
     reject_non_browser_reopen_auth(&headers)?;
-    let _actor = require_actor(&api, &headers).await?;
+    let _actor = require_actor(&ServerAuthApi::from(&api), &headers).await?;
     if !input.explicit_confirmation {
         return Err(Error::BrowserReopenConfirmationRequired.into());
     }
@@ -8317,12 +8350,12 @@ struct LogoutResponse {
     status: String,
 }
 
-async fn get_auth_config(State(api): State<WorkspaceApi>) -> ApiResult<Json<AuthPublicConfig>> {
+async fn get_auth_config(State(api): State<ServerAuthApi>) -> ApiResult<Json<AuthPublicConfig>> {
     Ok(Json(auth_public_config(&api.config)))
 }
 
 async fn post_auth_bootstrap_user(
-    State(api): State<WorkspaceApi>,
+    State(api): State<ServerAuthApi>,
     Json(request): Json<AuthBootstrapUserRequest>,
 ) -> ApiResult<Json<AuthUserResponse>> {
     let user = ensure_user_account(&api, &request.handle, request.display_name.as_deref())?;
@@ -8330,7 +8363,7 @@ async fn post_auth_bootstrap_user(
 }
 
 async fn post_passkey_registration_options(
-    State(api): State<WorkspaceApi>,
+    State(api): State<ServerAuthApi>,
     headers: HeaderMap,
     Json(request): Json<PasskeyRegistrationOptionsRequest>,
 ) -> ApiResult<Json<PasskeyRegistrationOptionsResponse>> {
@@ -8379,7 +8412,7 @@ async fn post_passkey_registration_options(
 }
 
 async fn post_passkey_registration_complete(
-    State(api): State<WorkspaceApi>,
+    State(api): State<ServerAuthApi>,
     Json(request): Json<PasskeyRegistrationCompleteRequest>,
 ) -> ApiResult<Response> {
     let challenge = api
@@ -8448,7 +8481,7 @@ async fn post_passkey_registration_complete(
 }
 
 async fn post_passkey_login_options(
-    State(api): State<WorkspaceApi>,
+    State(api): State<ServerAuthApi>,
     headers: HeaderMap,
     Json(request): Json<PasskeyLoginOptionsRequest>,
 ) -> ApiResult<Json<PasskeyLoginOptionsResponse>> {
@@ -8499,7 +8532,7 @@ async fn post_passkey_login_options(
 }
 
 async fn post_passkey_login_complete(
-    State(api): State<WorkspaceApi>,
+    State(api): State<ServerAuthApi>,
     Json(request): Json<PasskeyLoginCompleteRequest>,
 ) -> ApiResult<Response> {
     let challenge = api
@@ -8582,7 +8615,7 @@ async fn post_passkey_login_complete(
     issue_browser_session_response(&api, user)
 }
 
-fn issue_browser_session_response(api: &WorkspaceApi, user: UserRecord) -> ApiResult<Response> {
+fn issue_browser_session_response(api: &ServerAuthApi, user: UserRecord) -> ApiResult<Response> {
     let session_token = mint_secret("yoi_sess");
     api.store.create_browser_session(&BrowserSessionRecord {
         session_id: new_id("session"),
@@ -8615,7 +8648,7 @@ fn issue_browser_session_response(api: &WorkspaceApi, user: UserRecord) -> ApiRe
 }
 
 async fn post_device_login_start(
-    State(api): State<WorkspaceApi>,
+    State(api): State<ServerAuthApi>,
     Json(request): Json<DeviceLoginStartRequest>,
 ) -> ApiResult<Json<DeviceLoginStartResponse>> {
     let auth = auth_public_config(&api.config);
@@ -8650,7 +8683,7 @@ async fn post_device_login_start(
 }
 
 async fn post_device_login_approve(
-    State(api): State<WorkspaceApi>,
+    State(api): State<ServerAuthApi>,
     headers: HeaderMap,
     Json(request): Json<DeviceLoginApproveRequest>,
 ) -> ApiResult<Json<DeviceLoginApproveResponse>> {
@@ -8710,7 +8743,7 @@ async fn post_device_login_approve(
 }
 
 async fn post_device_login_poll(
-    State(api): State<WorkspaceApi>,
+    State(api): State<ServerAuthApi>,
     Json(request): Json<DeviceLoginPollRequest>,
 ) -> ApiResult<Json<DeviceLoginPollResponse>> {
     let Some(flow) = api
@@ -8751,7 +8784,7 @@ async fn post_device_login_poll(
 }
 
 async fn get_auth_whoami(
-    State(api): State<WorkspaceApi>,
+    State(api): State<ServerAuthApi>,
     headers: HeaderMap,
 ) -> ApiResult<Json<WhoamiResponse>> {
     Ok(Json(WhoamiResponse {
@@ -8760,7 +8793,7 @@ async fn get_auth_whoami(
 }
 
 async fn post_auth_logout(
-    State(api): State<WorkspaceApi>,
+    State(api): State<ServerAuthApi>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let auth = auth_public_config(&api.config);
@@ -8849,7 +8882,7 @@ fn webauthn_for_auth(auth: &AuthPublicConfig) -> ApiResult<Webauthn> {
         .map_err(|error| auth_error("webauthn_builder_failed", &error.to_string()).into())
 }
 
-fn passkeys_for_user(api: &WorkspaceApi, user_id: &str) -> ApiResult<Vec<Passkey>> {
+fn passkeys_for_user(api: &ServerAuthApi, user_id: &str) -> ApiResult<Vec<Passkey>> {
     api.store
         .list_passkey_credentials_for_user(user_id)?
         .into_iter()
@@ -8891,7 +8924,7 @@ fn auth_public_config(config: &ServerConfig) -> AuthPublicConfig {
 }
 
 fn ensure_user_account(
-    api: &WorkspaceApi,
+    api: &ServerAuthApi,
     handle: &str,
     display_name: Option<&str>,
 ) -> ApiResult<AuthenticatedUser> {
@@ -8935,12 +8968,15 @@ fn user_response(user: UserRecord) -> AuthenticatedUser {
     }
 }
 
-async fn resolve_actor(api: &WorkspaceApi, headers: &HeaderMap) -> ApiResult<Option<RequestActor>> {
+async fn resolve_actor(
+    api: &ServerAuthApi,
+    headers: &HeaderMap,
+) -> ApiResult<Option<RequestActor>> {
     let cookie_name = auth_public_config(&api.config).cookie_name;
     Ok(resolve_request_actor(api.store.as_ref(), headers, &cookie_name).await?)
 }
 
-async fn require_actor(api: &WorkspaceApi, headers: &HeaderMap) -> ApiResult<RequestActor> {
+async fn require_actor(api: &ServerAuthApi, headers: &HeaderMap) -> ApiResult<RequestActor> {
     resolve_actor(api, headers).await?.ok_or_else(|| {
         auth_error(
             "auth_required",
@@ -14471,6 +14507,8 @@ mod tests {
 
         for (uri, expected) in [
             ("/", "<main>Workspace chooser</main>"),
+            ("/account", "<main>Workspace chooser</main>"),
+            ("/login/device", "<main>Workspace chooser</main>"),
             (
                 "/_app/immutable/entry/start.js",
                 "console.log('workspace app');",
@@ -14495,6 +14533,7 @@ mod tests {
         }
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/workspaces")
@@ -14506,6 +14545,21 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), json!([]));
+
+        let auth = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(auth.status(), StatusCode::OK);
+        let body = to_bytes(auth.into_body(), usize::MAX).await.unwrap();
+        let auth: Value = serde_json::from_slice(&body).unwrap();
+        assert!(auth["rp_id"].is_string());
+        assert!(auth["cookie_name"].is_string());
     }
 
     #[tokio::test]
