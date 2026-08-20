@@ -334,6 +334,137 @@ Deno.test("projectConsole groups tool call lifecycle into one Call block", () =>
   );
 });
 
+Deno.test("projectConsole streams distinct Bash stdout and stderr through terminal status", () => {
+  const projection = projectConsole([
+    {
+      eventId: "command-tool",
+      event: {
+        event: "tool_call_done",
+        data: {
+          id: "bash-stream",
+          name: "Bash",
+          arguments: JSON.stringify({ command: "long-command" }),
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "command-started",
+      event: {
+        event: "command",
+        data: {
+          event: {
+            kind: "started",
+            command_id: "command-1",
+            tool_call_id: "bash-stream",
+            observed_at_ms: 1000,
+          },
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "command-stdout",
+      event: {
+        event: "command",
+        data: {
+          event: {
+            kind: "output",
+            command_id: "command-1",
+            stream: "stdout",
+            start_offset: 0,
+            end_offset: 6,
+            content: "ready\n",
+            observed_at_ms: 1100,
+          },
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "command-stderr",
+      event: {
+        event: "command",
+        data: {
+          event: {
+            kind: "output",
+            command_id: "command-1",
+            stream: "stderr",
+            start_offset: 0,
+            end_offset: 5,
+            content: "warn\n",
+            observed_at_ms: 1200,
+          },
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "command-terminal",
+      event: {
+        event: "command",
+        data: {
+          event: {
+            kind: "terminal",
+            command_id: "command-1",
+            status: "failed",
+            exit_code: 7,
+            stdout_end_offset: 6,
+            stderr_end_offset: 5,
+            observed_at_ms: 1300,
+          },
+        },
+      } satisfies Event,
+    },
+  ]);
+
+  const [line] = projection.lines.filter((line) => line.kind === "tool");
+  assert(line.body.includes("Bash — failed (exit 7)"), line.body);
+  assert(line.body.includes("elapsed 300ms"), line.body);
+  assert(line.body.includes("stdout:\nready\n"), line.body);
+  assert(line.body.includes("stderr:\nwarn\n"), line.body);
+  assertEquals(line.streaming, false);
+  assertEquals(line.error, true);
+});
+
+Deno.test("snapshot restores bounded in-flight Bash command output", () => {
+  const snapshot = snapshotEvent("/repo");
+  if (snapshot.event !== "snapshot") throw new Error("snapshot fixture expected");
+  snapshot.data.status = "running";
+  snapshot.data.in_flight = {
+    blocks: [{
+      kind: "tool_call",
+      id: "bash-snapshot",
+      name: "Bash",
+      args: JSON.stringify({ command: "slow" }),
+      state: "done",
+    }],
+    commands: [{
+      command_id: "command-2",
+      tool_call_id: "bash-snapshot",
+      status: "running",
+      started_at_ms: 1000,
+      observed_at_ms: 1250,
+      last_output_at_ms: 1200,
+      stdout: {
+        start_offset: 1024,
+        end_offset: 1031,
+        content: "tail\n",
+        truncated: true,
+      },
+      stderr: { start_offset: 0, end_offset: 0, content: "", truncated: false },
+      exit_code: null,
+    }],
+  };
+
+  const projection = projectConsole([{ eventId: "snapshot-command", event: snapshot }]);
+  const [line] = projection.lines.filter((line) => line.kind === "tool");
+  assert(line.body.includes("Bash — running…"), line.body);
+  assert(
+    line.body.includes("elapsed 250ms · last output at +200ms"),
+    line.body,
+  );
+  assert(line.body.includes("[stdout tail; earlier output omitted]"), line.body);
+  assert(line.body.includes("stdout:\ntail\n"), line.body);
+  assertEquals(line.streaming, true);
+});
+
 Deno.test("projectConsole caps default tool request and result previews", () => {
   const projection = projectConsole([
     {

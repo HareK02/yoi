@@ -28,8 +28,14 @@ use crate::worker::{
     WorkerRunResult,
 };
 use protocol::{
-    AlertLevel, AlertSource, ErrorCode, Event, Method, RewindTargetId, RunResult, Segment,
-    TurnResult, WorkerStatus,
+    AlertLevel, AlertSource, CommandEvent as ProtocolCommandEvent,
+    CommandSnapshot as ProtocolCommandSnapshot, CommandStatus as ProtocolCommandStatus,
+    CommandStream as ProtocolCommandStream, CommandStreamSlice as ProtocolCommandStreamSlice,
+    ErrorCode, Event, Method, RewindTargetId, RunResult, Segment, TurnResult, WorkerStatus,
+};
+use workdir::{
+    CommandEvent as WorkdirCommandEvent, CommandSnapshot as WorkdirCommandSnapshot,
+    CommandStatus as WorkdirCommandStatus, CommandStream as WorkdirCommandStream, WorkdirSession,
 };
 
 // ---------------------------------------------------------------------------
@@ -424,6 +430,9 @@ impl WorkerController {
             Some(method_tx.downgrade()),
         )
         .await?;
+        if let Some(session) = fs_for_view.as_ref() {
+            wire_workdir_command_events(session, &in_flight);
+        }
 
         // Intake role Workers self-terminate only after a successful
         // TicketIntakeReady turn has fully settled back to Idle. The request
@@ -495,6 +504,118 @@ impl WorkerController {
         ));
 
         Ok((handle, shutdown_rx))
+    }
+}
+
+pub(crate) fn wire_workdir_command_events(
+    session: &Arc<dyn WorkdirSession>,
+    in_flight: &InFlightEvents,
+) {
+    in_flight.replace_command_snapshot(
+        session
+            .command_snapshot()
+            .into_iter()
+            .map(protocol_command_snapshot)
+            .collect(),
+    );
+    let Some(mut events) = session.subscribe_command_events() else {
+        return;
+    };
+    let in_flight = in_flight.clone();
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(event) => in_flight.publish_command_event(protocol_command_event(event)),
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // Never retain stale command output after a provider-local
+                    // observer lag. The next chunk reconstructs a bounded tail
+                    // with its absolute offset and marks the gap truncated.
+                    in_flight.replace_command_snapshot(Vec::new());
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+fn protocol_command_snapshot(snapshot: WorkdirCommandSnapshot) -> ProtocolCommandSnapshot {
+    ProtocolCommandSnapshot {
+        command_id: snapshot.command_id,
+        tool_call_id: snapshot.tool_call_id,
+        status: protocol_command_status(snapshot.status),
+        started_at_ms: snapshot.started_at_ms,
+        observed_at_ms: snapshot.observed_at_ms,
+        last_output_at_ms: snapshot.last_output_at_ms,
+        stdout: ProtocolCommandStreamSlice {
+            start_offset: snapshot.stdout.start_offset,
+            end_offset: snapshot.stdout.end_offset,
+            content: snapshot.stdout.content,
+            truncated: snapshot.stdout.truncated,
+        },
+        stderr: ProtocolCommandStreamSlice {
+            start_offset: snapshot.stderr.start_offset,
+            end_offset: snapshot.stderr.end_offset,
+            content: snapshot.stderr.content,
+            truncated: snapshot.stderr.truncated,
+        },
+        exit_code: snapshot.exit_code,
+    }
+}
+
+fn protocol_command_event(event: WorkdirCommandEvent) -> ProtocolCommandEvent {
+    match event {
+        WorkdirCommandEvent::Started {
+            command_id,
+            tool_call_id,
+            observed_at_ms,
+        } => ProtocolCommandEvent::Started {
+            command_id,
+            tool_call_id,
+            observed_at_ms,
+        },
+        WorkdirCommandEvent::Output {
+            command_id,
+            stream,
+            start_offset,
+            end_offset,
+            content,
+            observed_at_ms,
+        } => ProtocolCommandEvent::Output {
+            command_id,
+            stream: match stream {
+                WorkdirCommandStream::Stdout => ProtocolCommandStream::Stdout,
+                WorkdirCommandStream::Stderr => ProtocolCommandStream::Stderr,
+            },
+            start_offset,
+            end_offset,
+            content,
+            observed_at_ms,
+        },
+        WorkdirCommandEvent::Terminal {
+            command_id,
+            status,
+            exit_code,
+            stdout_end_offset,
+            stderr_end_offset,
+            observed_at_ms,
+        } => ProtocolCommandEvent::Terminal {
+            command_id,
+            status: protocol_command_status(status),
+            exit_code,
+            stdout_end_offset,
+            stderr_end_offset,
+            observed_at_ms,
+        },
+    }
+}
+
+fn protocol_command_status(status: WorkdirCommandStatus) -> ProtocolCommandStatus {
+    match status {
+        WorkdirCommandStatus::Running => ProtocolCommandStatus::Running,
+        WorkdirCommandStatus::Completed => ProtocolCommandStatus::Completed,
+        WorkdirCommandStatus::Failed => ProtocolCommandStatus::Failed,
+        WorkdirCommandStatus::TimedOut => ProtocolCommandStatus::TimedOut,
+        WorkdirCommandStatus::Cancelled => ProtocolCommandStatus::Cancelled,
     }
 }
 

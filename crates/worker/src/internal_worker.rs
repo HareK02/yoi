@@ -17,7 +17,7 @@ use session_store::{LogEntry, SegmentId, SessionId, Store, StoreError, TraceEntr
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::controller::wire_event_bridges_on_engine;
+use crate::controller::{wire_event_bridges_on_engine, wire_workdir_command_events};
 use crate::feature::FeatureRegistryBuilder;
 use crate::in_flight::{InFlightEvents, snapshot_from_guard};
 use crate::ipc::alerter::Alerter;
@@ -576,6 +576,9 @@ pub(crate) async fn prepare_internal_worker_session(
     spawn_internal_log_event_bridge(sink.clone(), event_tx.clone());
     let alerter = Alerter::new(event_tx.clone());
     let in_flight = InFlightEvents::new(event_tx.clone());
+    if let Some(session) = worker.workdir_session() {
+        wire_workdir_command_events(session, &in_flight);
+    }
     let actor_in_flight = in_flight.clone();
     worker.attach_alerter(alerter.clone());
     worker.attach_event_tx(event_tx.clone());

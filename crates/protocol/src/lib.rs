@@ -556,6 +556,12 @@ pub enum Event {
     Status {
         status: WorkerStatus,
     },
+    /// Bounded, provider-owned command telemetry for the live Console. This is
+    /// intentionally not a history entry and is reconstructed from
+    /// `Snapshot.in_flight.commands` after reconnect.
+    Command {
+        event: CommandEvent,
+    },
     /// Reply to `Method::ListCompletions`. Delivered only to the
     /// requesting socket (not broadcast). `entries` is empty when no
     /// candidates match or when the requested kind has no resolver
@@ -723,8 +729,79 @@ pub struct RewindSummary {
     pub tool_side_effect_warning: bool,
 }
 
-/// Unfinished model output included in `Event::Snapshot` for clients that
-/// attach while an LLM response is still streaming.
+/// Live provider-owned command status. These values are operational Console
+/// state only and are never appended to Worker history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum CommandStatus {
+    Running,
+    Completed,
+    Failed,
+    TimedOut,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum CommandStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct CommandStreamSlice {
+    pub start_offset: u64,
+    pub end_offset: u64,
+    pub content: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct CommandSnapshot {
+    pub command_id: String,
+    pub tool_call_id: Option<String>,
+    pub status: CommandStatus,
+    pub started_at_ms: u64,
+    pub observed_at_ms: u64,
+    pub last_output_at_ms: Option<u64>,
+    pub stdout: CommandStreamSlice,
+    pub stderr: CommandStreamSlice,
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommandEvent {
+    Started {
+        command_id: String,
+        tool_call_id: Option<String>,
+        observed_at_ms: u64,
+    },
+    Output {
+        command_id: String,
+        stream: CommandStream,
+        start_offset: u64,
+        end_offset: u64,
+        content: String,
+        observed_at_ms: u64,
+    },
+    Terminal {
+        command_id: String,
+        status: CommandStatus,
+        exit_code: Option<i32>,
+        stdout_end_offset: u64,
+        stderr_end_offset: u64,
+        observed_at_ms: u64,
+    },
+}
+
+/// Unfinished model output and active command state included in
+/// `Event::Snapshot` for clients that attach while work is still streaming.
 ///
 /// These blocks are presentation state only: they are reconstructed from the
 /// active Worker controller and must not be treated as committed assistant
@@ -735,11 +812,13 @@ pub struct RewindSummary {
 pub struct InFlightSnapshot {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<InFlightBlock>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<CommandSnapshot>,
 }
 
 impl InFlightSnapshot {
     pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
+        self.blocks.is_empty() && self.commands.is_empty()
     }
 }
 
@@ -1384,6 +1463,22 @@ mod tests {
                         state: InFlightToolCallState::StreamingArgs,
                     },
                 ],
+                commands: vec![CommandSnapshot {
+                    command_id: "command-1".into(),
+                    tool_call_id: Some("call_1".into()),
+                    status: CommandStatus::Running,
+                    started_at_ms: 100,
+                    observed_at_ms: 120,
+                    last_output_at_ms: Some(120),
+                    stdout: CommandStreamSlice {
+                        start_offset: 4,
+                        end_offset: 8,
+                        content: "tail".into(),
+                        truncated: true,
+                    },
+                    stderr: CommandStreamSlice::default(),
+                    exit_code: None,
+                }],
             },
             internal_workers: Vec::new(),
         };
@@ -1450,6 +1545,41 @@ mod tests {
             Event::Status {
                 status: WorkerStatus::Running
             }
+        ));
+    }
+
+    #[test]
+    fn event_command_output_roundtrip_preserves_stream_and_offsets() {
+        let event = Event::Command {
+            event: CommandEvent::Output {
+                command_id: "command-1".into(),
+                stream: CommandStream::Stderr,
+                start_offset: 8,
+                end_offset: 12,
+                content: "warn".into(),
+                observed_at_ms: 42,
+            },
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "command");
+        assert_eq!(parsed["data"]["event"]["kind"], "output");
+        assert_eq!(parsed["data"]["event"]["stream"], "stderr");
+        assert_eq!(parsed["data"]["event"]["start_offset"], 8);
+        assert_eq!(parsed["data"]["event"]["end_offset"], 12);
+        assert_eq!(parsed["data"]["event"]["observed_at_ms"], 42);
+        assert!(matches!(
+            serde_json::from_str::<Event>(&json).unwrap(),
+            Event::Command {
+                event: CommandEvent::Output {
+                    command_id,
+                    stream: CommandStream::Stderr,
+                    start_offset: 8,
+                    end_offset: 12,
+                    content,
+                    observed_at_ms: 42,
+                }
+            } if command_id == "command-1" && content == "warn"
         ));
     }
 
