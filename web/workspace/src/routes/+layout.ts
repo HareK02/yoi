@@ -1,25 +1,5 @@
-import { redirect } from "@sveltejs/kit";
-import { loadJson, workspaceRoute } from "$lib/workspace/api/http";
-import type { WorkspaceResponse } from "$lib/workspace/sidebar/types";
-import type { LayoutLoad } from "./$types";
+import type { LayoutLoad } from './$types';
 
-export const ssr = false;
-export const prerender = false;
-
-export const load: LayoutLoad = async ({ fetch, params, url }) => {
-  if (params.workspaceId) {
-    return {};
-  }
-
-  const publicRoutes = new Set(["/account", "/login/device"]);
-  if (publicRoutes.has(url.pathname)) {
-    return {};
-  }
-
-  const workspace = await loadJson<WorkspaceResponse>(fetch, "/api/workspace");
-  if (workspace.data) {
-    const scopedPath = workspaceRoute(workspace.data.workspace_id);
-    throw redirect(307, `${scopedPath}${url.search}`);
-  }
-  return {};
-};
+// Workspace selection is explicit at `/`; the root layout must never infer a
+// singleton Workspace or redirect based on an unscoped compatibility endpoint.
+export const load: LayoutLoad = () => ({});

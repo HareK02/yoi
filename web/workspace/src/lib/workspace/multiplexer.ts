@@ -42,6 +42,13 @@ export function workspaceMultiplexer(workspaceId: string): WorkspaceMultiplexer 
   return multiplexer;
 }
 
+export function disposeWorkspaceMultiplexer(workspaceId: string): void {
+  const multiplexer = multiplexers.get(workspaceId);
+  if (!multiplexer) return;
+  multiplexers.delete(workspaceId);
+  multiplexer.dispose();
+}
+
 export class WorkspaceMultiplexer {
   readonly #workspaceId: string;
   readonly #subscriptions = new Map<string, ActiveSubscription>();
@@ -217,6 +224,22 @@ export class WorkspaceMultiplexer {
       this.#socket?.close();
       this.#socket = null;
     }
+  }
+
+  dispose(): void {
+    this.#closed = true;
+    if (this.#reconnectTimer) {
+      clearTimeout(this.#reconnectTimer);
+      this.#reconnectTimer = null;
+    }
+    for (const subscription of this.#subscriptions.values()) {
+      subscription.listener.onStatus?.('closed', 'Workspace selection changed');
+    }
+    this.#subscriptions.clear();
+    this.#requests.clear();
+    this.#runtimeSubscriptions.clear();
+    this.#socket?.close();
+    this.#socket = null;
   }
 
   #send(frame: SubscriptionFrame): void {

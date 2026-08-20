@@ -38,25 +38,31 @@ Deno.test("workspace route helpers scope browser routes and API by immutable wor
   );
 });
 
-Deno.test("root layout bootstraps only the scoped workspace entry", async () => {
+Deno.test("root layout leaves Workspace selection explicit", async () => {
   const layout = await Deno.readTextFile(
     new URL("./../../../routes/+layout.ts", import.meta.url),
   );
   assert(
-    layout.includes('loadJson<WorkspaceResponse>(fetch, "/api/workspace")'),
-    "unscoped layout may use only the workspace-id bootstrap endpoint",
+    !layout.includes("/api/workspace") &&
+      !layout.includes("redirect(") &&
+      layout.includes("Workspace selection is explicit"),
+    "root layout must not infer or redirect to a singleton Workspace",
   );
+});
+
+Deno.test("Workspace route changes dispose old multiplexed subscription state", async () => {
+  const [layout, multiplexer] = await Promise.all([
+    Deno.readTextFile(
+      new URL("./../../../routes/w/[workspaceId]/+layout.svelte", import.meta.url),
+    ),
+    Deno.readTextFile(new URL("./../multiplexer.ts", import.meta.url)),
+  ]);
   assert(
-    layout.includes("throw redirect(307") &&
-      layout.includes("workspaceRoute(workspace.data.workspace_id)") &&
-      !layout.includes("scopedCompatibilityRoute") &&
-      !layout.includes("workspaceRoute(workspaceId, pathname)"),
-    "root layout should redirect only to the scoped workspace entry",
-  );
-  assert(
-    !layout.includes("`/api${path}`") &&
-      !layout.includes('"/api/repositories"'),
-    "layout must not fall back to unscoped workspace-scoped API calls",
+    layout.includes("disposeWorkspaceMultiplexer(workspaceId)") &&
+      multiplexer.includes("multiplexers.delete(workspaceId)") &&
+      multiplexer.includes("this.#subscriptions.clear()") &&
+      multiplexer.includes("this.#socket?.close()"),
+    "changing Workspace must dispose old subscriptions and transport state",
   );
 });
 
