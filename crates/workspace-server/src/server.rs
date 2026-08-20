@@ -897,6 +897,9 @@ async fn dispatch_workspace_request(
             Ok(workspaces) => workspaces,
             Err(error) => return server_error_response(error),
         };
+        if workspaces.is_empty() && is_server_static_forward(path) {
+            return serve_server_static_shell(&api, path).await;
+        }
         if workspaces.len() == 1 || is_server_global_forward(path) {
             match workspaces.first() {
                 Some(workspace) => match api.router_for_workspace(&workspace.workspace_id).await {
@@ -925,6 +928,17 @@ fn is_server_global_forward(path: &str) -> bool {
         || path == "/"
         || path.starts_with("/_app/")
         || path.starts_with("/assets/")
+}
+
+fn is_server_static_forward(path: &str) -> bool {
+    path == "/" || path.starts_with("/_app/") || path.starts_with("/assets/")
+}
+
+async fn serve_server_static_shell(api: &WorkspaceServerApi, path: &str) -> Response {
+    let Some(static_root) = api.template.static_assets_dir.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    static_file_or_spa_response(static_root, path).await
 }
 
 fn scoped_workspace_id(path: &str) -> Option<&str> {
@@ -12503,16 +12517,7 @@ async fn static_or_spa_fallback(State(api): State<WorkspaceApi>, uri: Uri) -> Re
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    match read_static_or_index(static_root, scoped_workspace_static_path(uri.path())).await {
-        Ok(StaticAsset {
-            bytes,
-            content_type,
-        }) => (StatusCode::OK, [(CONTENT_TYPE, content_type)], bytes).into_response(),
-        Err(error) => {
-            tracing::debug!(%error, path = %uri.path(), "failed to serve static asset");
-            StatusCode::NOT_FOUND.into_response()
-        }
-    }
+    static_file_or_spa_response(static_root, scoped_workspace_static_path(uri.path())).await
 }
 
 fn unscoped_workspace_ui_redirect(
@@ -12550,6 +12555,19 @@ fn workspace_id_from_ui_path(path: &str) -> Option<&str> {
 struct StaticAsset {
     bytes: Vec<u8>,
     content_type: &'static str,
+}
+
+async fn static_file_or_spa_response(static_root: &Path, request_path: &str) -> Response {
+    match read_static_or_index(static_root, request_path).await {
+        Ok(StaticAsset {
+            bytes,
+            content_type,
+        }) => (StatusCode::OK, [(CONTENT_TYPE, content_type)], bytes).into_response(),
+        Err(error) => {
+            tracing::debug!(%error, path = request_path, "failed to serve static asset");
+            StatusCode::NOT_FOUND.into_response()
+        }
+    }
 }
 
 fn scoped_workspace_static_path(path: &str) -> &str {
@@ -14427,6 +14445,67 @@ mod tests {
             default_selector: Some("HEAD".to_string()),
         }];
         config
+    }
+
+    #[tokio::test]
+    async fn server_router_serves_workspace_chooser_before_first_workspace_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let static_dir = dir.path().join("static");
+        std::fs::create_dir_all(static_dir.join("_app/immutable/entry")).unwrap();
+        std::fs::write(
+            static_dir.join("index.html"),
+            "<main>Workspace chooser</main>",
+        )
+        .unwrap();
+        std::fs::write(
+            static_dir.join("_app/immutable/entry/start.js"),
+            "console.log('workspace app');",
+        )
+        .unwrap();
+        let mut template = test_server_config(dir.path());
+        template.static_assets_dir = Some(static_dir);
+        let store = Arc::new(SqliteWorkspaceStore::open(&template.database_path).unwrap());
+        let app = build_workspace_server_router(template, store)
+            .await
+            .unwrap();
+
+        for (uri, expected) in [
+            ("/", "<main>Workspace chooser</main>"),
+            (
+                "/_app/immutable/entry/start.js",
+                "console.log('workspace app');",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                String::from_utf8(
+                    to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap()
+                        .to_vec(),
+                )
+                .unwrap(),
+                expected
+            );
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/workspaces")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), json!([]));
     }
 
     #[tokio::test]
