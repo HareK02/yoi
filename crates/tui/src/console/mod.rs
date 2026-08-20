@@ -96,12 +96,12 @@ fn copy_to_terminal_clipboard<W: io::Write>(out: &mut W, text: &str) -> io::Resu
 }
 
 fn copy_selection_to_writer<W: io::Write>(app: &mut App, out: &mut W) -> bool {
-    let Some(text) = app.text_selection.copy_text() else {
+    let Some(text) = app.selected_worker_view_mut().text_selection.copy_text() else {
         return false;
     };
 
     let result = copy_to_terminal_clipboard(out, &text);
-    app.text_selection.clear();
+    app.selected_worker_view_mut().text_selection.clear();
     match result {
         Ok(()) => {
             app.flash_actionbar_notice(
@@ -890,25 +890,27 @@ const WHEEL_LINES: usize = 3;
 const PANE_SCROLL_LINES: usize = 5;
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    let rewind_picker_open = app.rewind_picker.is_some();
+    let view = app.selected_worker_view_mut();
     match mouse.kind {
         MouseEventKind::ScrollUp => {
-            app.text_selection.clear();
-            app.scroll.scroll_up(WHEEL_LINES);
+            view.text_selection.clear();
+            view.scroll.scroll_up(WHEEL_LINES);
         }
         MouseEventKind::ScrollDown => {
-            app.text_selection.clear();
-            app.scroll.scroll_down(WHEEL_LINES);
+            view.text_selection.clear();
+            view.scroll.scroll_down(WHEEL_LINES);
         }
-        MouseEventKind::Down(MouseButton::Left) if app.rewind_picker.is_none() => {
-            if !app.text_selection.begin_drag(mouse.column, mouse.row) {
-                app.text_selection.clear();
+        MouseEventKind::Down(MouseButton::Left) if !rewind_picker_open => {
+            if !view.text_selection.begin_drag(mouse.column, mouse.row) {
+                view.text_selection.clear();
             }
         }
-        MouseEventKind::Drag(MouseButton::Left) if app.rewind_picker.is_none() => {
-            app.text_selection.update_drag(mouse.column, mouse.row);
+        MouseEventKind::Drag(MouseButton::Left) if !rewind_picker_open => {
+            view.text_selection.update_drag(mouse.column, mouse.row);
         }
-        MouseEventKind::Up(MouseButton::Left) if app.rewind_picker.is_none() => {
-            app.text_selection.finish_drag(mouse.column, mouse.row);
+        MouseEventKind::Up(MouseButton::Left) if !rewind_picker_open => {
+            view.text_selection.finish_drag(mouse.column, mouse.row);
         }
         _ => {}
     }
@@ -942,31 +944,31 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
     // Modifier-key bindings.
     if let Some(method) = match key.code {
         KeyCode::Up if shift => {
-            app.scroll.scroll_up(1);
+            app.selected_worker_view_mut().scroll.scroll_up(1);
             Some(None)
         }
         KeyCode::Down if shift => {
-            app.scroll.scroll_down(1);
+            app.selected_worker_view_mut().scroll.scroll_down(1);
             Some(None)
         }
         KeyCode::Home if ctrl => {
-            app.scroll.to_top();
+            app.selected_worker_view_mut().scroll.to_top();
             Some(None)
         }
         KeyCode::End if ctrl => {
-            app.scroll.to_bottom();
+            app.selected_worker_view_mut().scroll.to_bottom();
             Some(None)
         }
         KeyCode::Char('[') if ctrl => {
-            app.scroll.jump_prev_turn();
+            app.selected_worker_view_mut().scroll.jump_prev_turn();
             Some(None)
         }
         KeyCode::Char(']') if ctrl => {
-            app.scroll.jump_next_turn();
+            app.selected_worker_view_mut().scroll.jump_next_turn();
             Some(None)
         }
         KeyCode::Char('o') if ctrl => {
-            app.mode = app.mode.cycle();
+            app.cycle_mode();
             Some(None)
         }
         KeyCode::Char('t') if ctrl => {
@@ -1047,7 +1049,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             if app.task_pane_open {
                 app.scroll_task_pane_up(PANE_SCROLL_LINES);
             } else {
-                app.scroll.page_up();
+                app.selected_worker_view_mut().scroll.page_up();
             }
             return None;
         }
@@ -1055,7 +1057,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             if app.task_pane_open {
                 app.scroll_task_pane_down(PANE_SCROLL_LINES);
             } else {
-                app.scroll.page_down();
+                app.selected_worker_view_mut().scroll.page_down();
             }
             return None;
         }
@@ -1130,12 +1132,17 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
         }
     }
 
+    if key.code == KeyCode::Tab && key.modifiers.is_empty() && app.completion.is_none() {
+        app.cycle_worker_view();
+        return None;
+    }
+
     if key.modifiers.is_empty() {
         match key.code {
-            KeyCode::Esc if app.text_selection.clear() => return None,
-            KeyCode::Char('y') if app.text_selection.has_selection() => {
+            KeyCode::Esc if app.selected_worker_view_mut().text_selection.clear() => return None,
+            KeyCode::Char('y') if app.selected_worker_view().text_selection.has_selection() => {
                 if !copy_selection_to_terminal(app) {
-                    app.text_selection.clear();
+                    app.selected_worker_view_mut().text_selection.clear();
                     app.flash_actionbar_notice(
                         "Selection contains no copyable text.",
                         ActionbarNoticeLevel::Warn,
@@ -2170,6 +2177,18 @@ mod tests {
     #[test]
     fn command_completion_tab_applies_unambiguous_candidate() {
         let mut app = App::new("agent".to_string());
+        app.handle_worker_event(Event::InternalWorker {
+            worker: protocol::InternalWorkerRef {
+                session_id: "child-session".into(),
+                name: "subworker-hoge".into(),
+                parent_session_id: Some("parent-session".into()),
+                kind: protocol::InternalWorkerKind::SubWorker,
+            },
+            revision: 1,
+            event: Box::new(Event::Status {
+                status: WorkerStatus::Running,
+            }),
+        });
         enter_command_mode(&mut app);
         type_keys(&mut app, "no");
 
@@ -2177,6 +2196,7 @@ mod tests {
 
         assert!(app.is_command_mode());
         assert_eq!(app.command_text(), "noop ");
+        assert_eq!(app.selected_worker_view().worker_name, "agent");
         assert_eq!(input_text(&app), "");
     }
 
@@ -2267,6 +2287,89 @@ mod tests {
         assert!(has_alert(&app, "Invalid arguments. Usage: open <path>"));
         assert!(!has_alert(&app, "open executed"));
         assert_eq!(input_text(&app), "");
+    }
+
+    #[test]
+    fn tab_cycles_main_and_subworker_view_without_changing_composer() {
+        let mut app = App::new("agent".to_string());
+        type_keys(&mut app, "hello");
+        app.handle_worker_event(Event::InternalWorker {
+            worker: protocol::InternalWorkerRef {
+                session_id: "child-session".into(),
+                name: "subworker-hoge".into(),
+                parent_session_id: Some("parent-session".into()),
+                kind: protocol::InternalWorkerKind::SubWorker,
+            },
+            revision: 1,
+            event: Box::new(Event::Status {
+                status: WorkerStatus::Running,
+            }),
+        });
+
+        assert!(handle_key(&mut app, key(KeyCode::Tab)).is_none());
+        assert_eq!(app.selected_worker_view().worker_name, "subworker-hoge");
+        assert_eq!(input_text(&app), "hello");
+
+        assert!(handle_key(&mut app, key(KeyCode::Tab)).is_none());
+        assert_eq!(app.selected_worker_view().worker_name, "agent");
+        assert_eq!(input_text(&app), "hello");
+    }
+
+    #[test]
+    fn subworker_view_does_not_redirect_parent_worker_controls() {
+        let mut app = App::new("agent".to_string());
+        app.set_worker_status(WorkerStatus::Idle);
+        app.handle_worker_event(Event::InternalWorker {
+            worker: protocol::InternalWorkerRef {
+                session_id: "child-session".into(),
+                name: "subworker-hoge".into(),
+                parent_session_id: Some("parent-session".into()),
+                kind: protocol::InternalWorkerKind::SubWorker,
+            },
+            revision: 1,
+            event: Box::new(Event::Status {
+                status: WorkerStatus::Running,
+            }),
+        });
+        handle_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.selected_worker_view().worker_name, "subworker-hoge");
+
+        let method = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        );
+
+        assert!(matches!(method, Some(Method::Shutdown)));
+        assert_eq!(app.worker_status, WorkerStatus::Idle);
+    }
+
+    #[test]
+    fn active_composer_completion_takes_tab_priority_over_worker_view_cycle() {
+        let mut app = App::new("agent".to_string());
+        app.insert_char('@');
+        app.insert_char('s');
+        let _ = app.refresh_completion();
+        app.completion.as_mut().unwrap().entries = vec![protocol::CompletionEntry {
+            value: "src/main.rs".into(),
+            is_dir: false,
+        }];
+        app.handle_worker_event(Event::InternalWorker {
+            worker: protocol::InternalWorkerRef {
+                session_id: "child-session".into(),
+                name: "subworker-hoge".into(),
+                parent_session_id: Some("parent-session".into()),
+                kind: protocol::InternalWorkerKind::SubWorker,
+            },
+            revision: 1,
+            event: Box::new(Event::Status {
+                status: WorkerStatus::Running,
+            }),
+        });
+
+        let _ = handle_key(&mut app, key(KeyCode::Tab));
+
+        assert_eq!(app.selected_worker_view().worker_name, "agent");
+        assert_eq!(input_text(&app), "@src/main.rs");
     }
 
     #[test]

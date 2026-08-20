@@ -27,7 +27,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use protocol::{AlertLevel, CompletionEntry, Greeting, Segment, WorkerEvent};
 
-use crate::app::{ActionbarNoticeLevel, App, CompletionState, alert_source_label, fmt_tokens};
+use crate::app::{
+    ActionbarNoticeLevel, App, CompletionState, WorkerViewTab, alert_source_label, fmt_tokens,
+};
 use crate::block::{Block, CompactEvent, ThinkingBlock, ThinkingState};
 use crate::command::CommandCandidate;
 use crate::task::{TaskCounts, TaskEntry, TaskStatus, TaskStore};
@@ -52,7 +54,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         app.input
             .apply_cursor_viewport(&mut input_render, input_height);
     }
-    let mini_view_h = task_mini_view_height(&app.task_store);
+    let tabs = app.worker_view_tabs();
+    let show_tabs = tabs.len() > 1;
+    let mini_view_h = task_mini_view_height(&app.selected_worker_view().task_store, show_tabs);
     // One blank row separates the history tail from the mini-view so
     // the latest message doesn't visually crash into the task summary.
     // Folds away with the mini-view when there are no tasks.
@@ -69,11 +73,26 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .split(area);
 
-    draw_history(frame, app, chunks[0]);
+    let selected_index = app.selected_internal_worker_index();
+    if let Some(index) = selected_index {
+        let task_pane_open = app.task_pane_open;
+        let view = app.internal_workers[index].app.as_mut();
+        view.task_pane_open = task_pane_open;
+        draw_history(frame, view, chunks[0]);
+    } else {
+        draw_history(frame, app, chunks[0]);
+    }
     if mini_view_h > 0 {
-        draw_task_mini_view(frame, &app.task_store, chunks[2]);
+        draw_task_mini_view(
+            frame,
+            &app.selected_worker_view().task_store,
+            &tabs,
+            chunks[2],
+        );
     }
     draw_separator(frame, chunks[3]);
+    // Status/composer/control surfaces remain parent-owned. View selection changes
+    // only transcript/task presentation and never implies SubWorker control.
     draw_status(frame, app, chunks[4]);
     draw_input(frame, app, &input_render, chunks[5]);
     draw_actionbar(frame, app, chunks[6]);
@@ -89,19 +108,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 /// the summary.
 const MINI_VIEW_MAX_ACTIVE: usize = 3;
 
-/// Height the mini-view section occupies. Returns 0 when there are no
-/// tasks at all, so the section collapses cleanly into surrounding
-/// layout — there's no point reserving rows for an empty store.
-fn task_mini_view_height(store: &TaskStore) -> u16 {
-    if store.is_empty() {
+/// Height the mini-view section occupies. Returns 0 only when there are
+/// neither tasks nor Worker-view tabs, so SubWorker selection remains
+/// available even when the selected task store is empty.
+fn task_mini_view_height(store: &TaskStore, show_tabs: bool) -> u16 {
+    if store.is_empty() && !show_tabs {
         return 0;
     }
     let active_shown = store.counts().active().min(MINI_VIEW_MAX_ACTIVE);
-    // active rows + 1 summary line
+    // active rows + 1 summary/tab line
     (active_shown as u16).saturating_add(1)
 }
 
-fn draw_task_mini_view(frame: &mut Frame, store: &TaskStore, area: Rect) {
+fn draw_task_mini_view(frame: &mut Frame, store: &TaskStore, tabs: &[WorkerViewTab], area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -123,7 +142,7 @@ fn draw_task_mini_view(frame: &mut Frame, store: &TaskStore, area: Rect) {
         lines.push(mini_view_active_line(entry, inner.width));
         shown += 1;
     }
-    lines.push(mini_view_summary_line(store.counts(), inner.width));
+    lines.push(mini_view_summary_line(store.counts(), tabs, inner.width));
 
     Paragraph::new(lines)
         .block(outer_block)
@@ -146,8 +165,8 @@ fn mini_view_active_line(entry: &TaskEntry, width: u16) -> Line<'static> {
     ])
 }
 
-fn mini_view_summary_line(counts: TaskCounts, width: u16) -> Line<'static> {
-    let text = format!(
+fn mini_view_summary_line(counts: TaskCounts, tabs: &[WorkerViewTab], width: u16) -> Line<'static> {
+    let summary = format!(
         "{} task(s) — pending: {}, inprogress: {}, completed: {}, deleted: {}",
         counts.total(),
         counts.pending,
@@ -155,8 +174,79 @@ fn mini_view_summary_line(counts: TaskCounts, width: u16) -> Line<'static> {
         counts.completed,
         counts.deleted,
     );
-    let shown = truncate_with_ellipsis(&text, width as usize);
-    Line::from(Span::styled(shown, Style::default().fg(Color::DarkGray)))
+    if tabs.len() <= 1 {
+        let shown = truncate_with_ellipsis(&summary, width as usize);
+        return Line::from(Span::styled(shown, Style::default().fg(Color::DarkGray)));
+    }
+
+    let tabs_width = worker_view_tabs_width(tabs);
+    let width = width as usize;
+    if tabs_width >= width {
+        let selected = tabs.iter().find(|tab| tab.selected).unwrap_or(&tabs[0]);
+        if width <= 4 {
+            return Line::from(Span::styled(
+                truncate_with_ellipsis(&selected.label, width),
+                worker_view_selected_tab_style(),
+            ));
+        }
+        let shown = truncate_with_ellipsis(&selected.label, width.saturating_sub(4));
+        let selected_width = UnicodeWidthStr::width(shown.as_str());
+        return Line::from(vec![
+            Span::raw(" ".repeat(width.saturating_sub(selected_width.saturating_add(4)))),
+            Span::styled("[ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(shown, worker_view_selected_tab_style()),
+            Span::styled(" ]", Style::default().fg(Color::DarkGray)),
+        ]);
+    }
+
+    let summary_budget = width.saturating_sub(tabs_width + 1);
+    let shown = truncate_with_ellipsis(&summary, summary_budget);
+    let shown_width = UnicodeWidthStr::width(shown.as_str());
+    let padding = width.saturating_sub(shown_width + tabs_width);
+    let mut spans = vec![
+        Span::styled(shown, Style::default().fg(Color::DarkGray)),
+        Span::raw(" ".repeat(padding)),
+    ];
+    spans.extend(worker_view_tab_spans(tabs));
+    Line::from(spans)
+}
+
+fn worker_view_tabs_text(tabs: &[WorkerViewTab]) -> String {
+    format!(
+        "[ {} ]",
+        tabs.iter()
+            .map(|tab| tab.label.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    )
+}
+
+fn worker_view_tabs_width(tabs: &[WorkerViewTab]) -> usize {
+    UnicodeWidthStr::width(worker_view_tabs_text(tabs).as_str())
+}
+
+fn worker_view_selected_tab_style() -> Style {
+    Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn worker_view_tab_spans(tabs: &[WorkerViewTab]) -> Vec<Span<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let selected = worker_view_selected_tab_style();
+    let mut spans = Vec::with_capacity(tabs.len().saturating_mul(2).saturating_add(1));
+    spans.push(Span::styled("[ ", dim));
+    for (index, tab) in tabs.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" | ", dim));
+        }
+        spans.push(Span::styled(
+            tab.label.clone(),
+            if tab.selected { selected } else { dim },
+        ));
+    }
+    spans.push(Span::styled(" ]", dim));
+    spans
 }
 
 /// Two-character status marker + the style to render it with. Mirrors
@@ -385,28 +475,6 @@ pub fn compute_history(app: &App, width: u16) -> HistoryLayout {
         );
         previous_selectable = current_selectable;
         i += 1;
-    }
-
-    for internal in &app.internal_workers {
-        logical.push((Line::from(""), false));
-        logical.push((
-            Line::from(vec![
-                Span::styled("SubWorker ", Style::default().bold()),
-                Span::raw(internal.worker.name.clone()),
-                Span::styled(
-                    format!("  {:?}", internal.app.worker_status),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]),
-            false,
-        ));
-        let child_width = width.saturating_sub(2).max(1);
-        let child_history = compute_history(&internal.app, child_width);
-        logical.extend(child_history.rows.into_iter().map(|row| {
-            let mut spans = vec![Span::raw("  ")];
-            spans.extend(row.line.spans);
-            (Line::from(spans), row.selectable)
-        }));
     }
 
     // Step 2: pre-wrap every logical line to char-based terminal rows so
@@ -1984,6 +2052,93 @@ mod tests {
     use crate::block::{ToolCallBlock, ToolCallState};
     use protocol::WorkerStatus;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn task_summary_right_aligns_worker_tabs_and_highlights_selection() {
+        let tabs = vec![
+            WorkerViewTab {
+                label: "main".into(),
+                selected: false,
+            },
+            WorkerViewTab {
+                label: "subworker-hoge".into(),
+                selected: true,
+            },
+            WorkerViewTab {
+                label: "subworker-fuga".into(),
+                selected: false,
+            },
+        ];
+
+        let line = mini_view_summary_line(TaskCounts::default(), &tabs, 96);
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(UnicodeWidthStr::width(text.as_str()), 96);
+        assert!(text.ends_with("[ main | subworker-hoge | subworker-fuga ]"));
+        let selected = line
+            .spans
+            .iter()
+            .find(|span| span.content == "subworker-hoge")
+            .expect("selected tab span");
+        assert_eq!(selected.style.fg, Some(Color::Cyan));
+        assert!(selected.style.add_modifier.contains(Modifier::BOLD));
+
+        let narrow = mini_view_summary_line(TaskCounts::default(), &tabs, 20);
+        let narrow_text = narrow
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(UnicodeWidthStr::width(narrow_text.as_str()), 20);
+        assert!(narrow_text.ends_with("[ subworker-hoge ]"));
+    }
+
+    #[test]
+    fn selected_worker_view_history_is_not_appended_to_main_history() {
+        let mut app = App::new("main".into());
+        app.handle_worker_event(protocol::Event::TextDelta {
+            text: "main transcript".into(),
+        });
+        app.handle_worker_event(protocol::Event::InternalWorker {
+            worker: protocol::InternalWorkerRef {
+                session_id: "child-session".into(),
+                name: "subworker-hoge".into(),
+                parent_session_id: Some("parent-session".into()),
+                kind: protocol::InternalWorkerKind::SubWorker,
+            },
+            revision: 1,
+            event: Box::new(protocol::Event::TextDelta {
+                text: "child transcript".into(),
+            }),
+        });
+
+        let main = compute_history(&app, 80)
+            .rows
+            .into_iter()
+            .map(|row| row.line.to_string())
+            .collect::<String>();
+        assert!(main.contains("main transcript"));
+        assert!(!main.contains("child transcript"));
+
+        app.cycle_worker_view();
+        let child = compute_history(app.selected_worker_view(), 80)
+            .rows
+            .into_iter()
+            .map(|row| row.line.to_string())
+            .collect::<String>();
+        assert!(!child.contains("main transcript"));
+        assert!(child.contains("child transcript"));
+    }
+
+    #[test]
+    fn worker_tabs_keep_mini_view_visible_without_tasks() {
+        assert_eq!(task_mini_view_height(&TaskStore::new(), false), 0);
+        assert_eq!(task_mini_view_height(&TaskStore::new(), true), 1);
+    }
 
     #[test]
     fn queue_status_text_includes_count_and_preview() {
