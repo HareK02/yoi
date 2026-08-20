@@ -21,7 +21,7 @@ Start exactly one instance of the new Server binary against the database. Startu
 
 - rebuilds Ticket, Objective, assignment, Artifact, and human-key tables with Workspace-scoped composite identity;
 - adds composite foreign keys for repository, Ticket, Objective, Worker, relation-target, and current-assignment references;
-- validates new historical assignment/event references with SQLite triggers while allowing those audit rows to survive later Ticket or Worker retention deletion; reservation operation ids remain intentionally unconstrained until their resources exist;
+- validates new historical assignment/event references with SQLite triggers while allowing those audit rows to survive later Ticket or Worker retention deletion; startup treats a parent missing from every Workspace as retained history but still rejects an id that resolves only in another Workspace; reservation operation ids remain intentionally unconstrained until their resources exist;
 - checks the rebuilt schema with `PRAGMA foreign_key_check` before recording the schema version; and
 - restores `PRAGMA foreign_keys = ON` whether the transaction commits or rolls back.
 

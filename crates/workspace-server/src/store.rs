@@ -5236,13 +5236,18 @@ fn workspace_resource_reference_diagnostics(conn: &Connection) -> Result<Vec<Str
                  WHERE ticket.workspace_id = link.workspace_id \
                    AND ticket.ticket_id = link.ticket_id) LIMIT 100",
         ),
+        // Historical assignment/operation rows intentionally survive Ticket or Worker
+        // retention deletion. A parent missing from every Workspace is therefore a retained
+        // soft reference; a matching id that exists only in another Workspace is corruption.
         (
             "ticket_worker_assignments.ticket_id",
             "SELECT assignment.workspace_id || '/' || assignment.assignment_id || ' -> ' || assignment.ticket_id \
              FROM ticket_worker_assignments AS assignment \
              WHERE NOT EXISTS (SELECT 1 FROM typed_tickets AS ticket \
                  WHERE ticket.workspace_id = assignment.workspace_id \
-                   AND ticket.ticket_id = assignment.ticket_id) LIMIT 100",
+                   AND ticket.ticket_id = assignment.ticket_id) \
+               AND EXISTS (SELECT 1 FROM typed_tickets AS foreign_ticket \
+                 WHERE foreign_ticket.ticket_id = assignment.ticket_id) LIMIT 100",
         ),
         (
             "ticket_worker_assignments.worker_id",
@@ -5250,8 +5255,9 @@ fn workspace_resource_reference_diagnostics(conn: &Connection) -> Result<Vec<Str
              FROM ticket_worker_assignments AS assignment \
              WHERE NOT EXISTS (SELECT 1 FROM worker_registry AS worker \
                  WHERE worker.workspace_id = assignment.workspace_id \
-                   AND worker.runtime_id = assignment.runtime_id \
-                   AND worker.worker_id = assignment.worker_id) LIMIT 100",
+                   AND worker.worker_id = assignment.worker_id) \
+               AND EXISTS (SELECT 1 FROM worker_registry AS foreign_worker \
+                 WHERE foreign_worker.worker_id = assignment.worker_id) LIMIT 100",
         ),
         (
             "ticket_current_worker_assignments.assignment_id",
@@ -5285,7 +5291,9 @@ fn workspace_resource_reference_diagnostics(conn: &Connection) -> Result<Vec<Str
              FROM ticket_assignment_operations AS operation \
              WHERE NOT EXISTS (SELECT 1 FROM typed_tickets AS ticket \
                  WHERE ticket.workspace_id = operation.workspace_id \
-                   AND ticket.ticket_id = operation.ticket_id) LIMIT 100",
+                   AND ticket.ticket_id = operation.ticket_id) \
+               AND EXISTS (SELECT 1 FROM typed_tickets AS foreign_ticket \
+                 WHERE foreign_ticket.ticket_id = operation.ticket_id) LIMIT 100",
         ),
         (
             "artifacts.ticket_id",
@@ -8300,6 +8308,58 @@ INSERT INTO worker_registry (
     }
 
     #[test]
+    fn startup_accepts_retained_assignment_history_after_parent_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+INSERT INTO workspaces (workspace_id, display_name, state, created_at, updated_at)
+VALUES ('workspace-a', 'A', 'active', '2026-01-01', '2026-01-01');
+INSERT INTO typed_tickets (
+    workspace_id, ticket_id, slug, title, status, kind, priority, body,
+    workflow_state, workflow_state_explicit
+) VALUES ('workspace-a', 'ticket-a', 'ticket-a', 'A', 'open', 'task', 'normal', '', 'planning', 1);
+INSERT INTO worker_registry (
+    workspace_id, runtime_id, worker_id, display_name, retention_state, created_at, updated_at
+) VALUES (
+    'workspace-a', 'runtime-a', '00000000-0000-7000-8000-000000000001',
+    'Worker A', 'normal', '2026-01-01', '2026-01-01'
+);
+INSERT INTO ticket_worker_assignments (
+    workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at
+) VALUES (
+    'workspace-a', 'ticket-a', 'assignment-a', 'runtime-a',
+    '00000000-0000-7000-8000-000000000001', 'tester', '2026-01-01'
+);
+DELETE FROM worker_registry
+WHERE workspace_id = 'workspace-a' AND worker_id = '00000000-0000-7000-8000-000000000001';
+DELETE FROM typed_tickets
+WHERE workspace_id = 'workspace-a' AND ticket_id = 'ticket-a';
+"#,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+
+        let reopened = SqliteWorkspaceStore::open(&path).unwrap();
+        reopened
+            .with_conn(|conn| {
+                let retained: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM ticket_worker_assignments WHERE workspace_id = 'workspace-a'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(retained, 1);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn migration_plan_lists_workspace_reference_violations_without_mutating_source() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("server.db");
@@ -8444,6 +8504,12 @@ INSERT INTO ticket_worker_assignments (
 INSERT INTO ticket_worker_assignments (
     workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at
 ) VALUES (
+    'workspace-b', 'ticket-a', 'assignment-cross-ticket', 'runtime-b',
+    '00000000-0000-7000-8000-000000000002', 'tester', '2026-01-01'
+);
+INSERT INTO ticket_worker_assignments (
+    workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at
+) VALUES (
     'workspace-b', 'ticket-b', 'assignment-event-source', 'runtime-b',
     '00000000-0000-7000-8000-000000000002', 'tester', '2026-01-01'
 );
@@ -8467,6 +8533,11 @@ INSERT INTO ticket_worker_assignment_events (
             error.contains("objective_ticket_links.objective_id"),
             "{error}"
         );
+        assert!(
+            error.contains("ticket_worker_assignments.ticket_id"),
+            "{error}"
+        );
+        assert!(error.contains("assignment-cross-ticket"), "{error}");
         assert!(
             error.contains("ticket_worker_assignments.worker_id"),
             "{error}"
@@ -8595,6 +8666,7 @@ INSERT INTO ticket_worker_assignment_events (
             [],
         )
         .unwrap();
+        validate_workspace_resource_references(&conn).unwrap();
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM ticket_worker_assignments WHERE workspace_id = 'workspace-b'",
