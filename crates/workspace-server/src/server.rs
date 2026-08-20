@@ -7960,11 +7960,6 @@ struct PasskeyLoginCompleteRequest {
     credential: PublicKeyCredential,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct PasskeyLoginCompleteResponse {
-    user: AuthenticatedUser,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DeviceLoginStartRequest {

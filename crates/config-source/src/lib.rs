@@ -24,7 +24,6 @@ pub const MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_PATH_BYTES: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, ts_rs::TS)]
-#[serde(transparent)]
 pub struct VirtualPath(String);
 
 impl VirtualPath {
@@ -1789,6 +1788,19 @@ mod tests {
             assert!(VirtualPath::parse(invalid).is_err(), "{invalid:?}");
         }
         assert_eq!(path("profiles/main.dcdl").as_str(), "profiles/main.dcdl");
+    }
+
+    #[test]
+    fn virtual_path_serde_shape_is_a_string() {
+        let path = path("profiles/main.dcdl");
+        assert_eq!(
+            serde_json::to_value(&path).unwrap(),
+            serde_json::json!(path.as_str())
+        );
+        assert_eq!(
+            serde_json::from_value::<VirtualPath>(serde_json::json!(path.as_str())).unwrap(),
+            path
+        );
     }
 
     #[test]
