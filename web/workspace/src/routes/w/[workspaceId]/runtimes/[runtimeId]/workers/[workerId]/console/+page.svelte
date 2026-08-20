@@ -15,15 +15,19 @@
         type ComposerCompletionEntry,
         type ComposerCompletionToken,
     } from "$lib/workspace/console/composer-completion";
+    import WorkerRunStatus from "$lib/workspace/console/WorkerRunStatus.svelte";
     import { fitTextarea } from "$lib/workspace/console/textarea-fit";
+    import { resolveWorkerControlShortcut } from "$lib/workspace/console/worker-control-shortcuts";
     import {
         createConsoleProjector,
         flattenInternalWorkers,
         isConsoleProjectionEvent,
+        projectConsoleLines,
         selectConsoleTimelineLines,
         type ConsoleEventInput,
         type ConsoleLine,
         type ConsoleProjection,
+        type ConsoleViewMode,
     } from "$lib/workspace/console/model";
     import type { Event as ProtocolEvent, Method as ProtocolMethod, RewindTarget, Segment } from "$lib/generated/protocol";
     import { workspaceApiPath } from "$lib/workspace/api/http";
@@ -119,6 +123,7 @@
     let workerDetailsOpen = $state(false);
     let taskPaneOpen = $state(false);
     let timelineOpen = $state(false);
+    let consoleViewMode = $state<ConsoleViewMode>("overview");
     let consoleBodyElement: HTMLElement | null = null;
     let composerTextareaElement: HTMLTextAreaElement | null = null;
     let timelineRailDragCleanup: (() => void) | null = null;
@@ -151,7 +156,9 @@
 
     const consoleTarget = $derived({ workspaceId, runtimeId, workerId });
 
-    const lines = $derived(consoleProjection.lines);
+    const lines = $derived(
+        projectConsoleLines(consoleProjection.lines, consoleViewMode),
+    );
     const tasks = $derived(consoleProjection.tasks);
     const internalWorkers = $derived(
         flattenInternalWorkers(consoleProjection.internalWorkers),
@@ -171,6 +178,7 @@
     );
     const workerState = $derived(liveWorkerState ?? worker?.state ?? "loading");
     const workerRunning = $derived(workerState === "running");
+    const workerPaused = $derived(workerState === "paused");
     const inputReady = $derived(workerState === "idle");
     const composerEditable = $derived(protocolState === "open" && !sending);
     const canSubmitDraft = $derived(inputReady && composerEditable);
@@ -404,6 +412,52 @@
             controlNotice = null;
             sendError = error instanceof Error ? error.message : String(error);
         }
+    }
+
+    function sendWorkerControl(command: "pause" | "cancel" | "resume") {
+        const label = command[0].toUpperCase() + command.slice(1);
+        sendControl({ method: command }, label);
+    }
+
+    function isEditableTarget(target: EventTarget | null): boolean {
+        return (
+            target instanceof HTMLInputElement ||
+            target instanceof HTMLTextAreaElement ||
+            target instanceof HTMLSelectElement ||
+            (target instanceof HTMLElement && target.isContentEditable)
+        );
+    }
+
+    function targetHasSelection(target: EventTarget | null): boolean {
+        if (
+            target instanceof HTMLInputElement ||
+            target instanceof HTMLTextAreaElement
+        ) {
+            return (
+                target.selectionStart !== null &&
+                target.selectionEnd !== null &&
+                target.selectionStart !== target.selectionEnd
+            );
+        }
+        return Boolean(window.getSelection()?.toString());
+    }
+
+    function handleWorkerControlShortcut(event: KeyboardEvent) {
+        const composerFocused = event.target === composerTextareaElement;
+        const command = resolveWorkerControlShortcut(event, {
+            protocolOpen: protocolState === "open",
+            running: workerRunning,
+            paused: workerPaused,
+            composerFocused,
+            draftBlank: draft.trim().length === 0,
+            editableTarget: isEditableTarget(event.target) && !composerFocused,
+            hasSelection: targetHasSelection(event.target),
+        });
+        if (!command) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+        sendWorkerControl(command);
     }
 
     function requestRewindTargets() {
@@ -1107,6 +1161,8 @@
     $effect(() => connectProtocolTransport(worker, reloadToken, consoleTarget));
 </script>
 
+<svelte:window onkeydown={handleWorkerControlShortcut} />
+
 <svelte:head>
     <title>Worker Console · Yoi Workspace</title>
     <meta
@@ -1119,35 +1175,27 @@
     <section class="console-header card" aria-label="Worker controls">
         <div class="console-header-actions">
             <div
-                class="console-status-pill"
-                class:warn={protocolState !== "open"}
+                class="console-view-modes"
+                role="group"
+                aria-label="Console display mode"
             >
-                {workerState} · protocol {protocolState}
+                <button
+                    type="button"
+                    class:active={consoleViewMode === "overview"}
+                    aria-pressed={consoleViewMode === "overview"}
+                    onclick={() => (consoleViewMode = "overview")}
+                >
+                    Overview
+                </button>
+                <button
+                    type="button"
+                    class:active={consoleViewMode === "normal"}
+                    aria-pressed={consoleViewMode === "normal"}
+                    onclick={() => (consoleViewMode = "normal")}
+                >
+                    Normal
+                </button>
             </div>
-            <button
-                type="button"
-                class="secondary-button"
-                disabled={protocolState !== "open"}
-                onclick={() => sendControl({ method: "cancel" }, "Cancel")}
-            >
-                Cancel
-            </button>
-            <button
-                type="button"
-                class="secondary-button"
-                disabled={protocolState !== "open"}
-                onclick={() => sendControl({ method: "pause" }, "Pause")}
-            >
-                Pause
-            </button>
-            <button
-                type="button"
-                class="secondary-button"
-                disabled={protocolState !== "open"}
-                onclick={() => sendControl({ method: "resume" }, "Resume")}
-            >
-                Resume
-            </button>
             <button
                 type="button"
                 class="secondary-button"
@@ -1264,7 +1312,7 @@
                         <p>No output yet.</p>
                     {:else}
                         <ol class="console-log">
-                            {#each internal.console.lines as item (item.id)}
+                            {#each projectConsoleLines(internal.console.lines, consoleViewMode) as item (item.id)}
                                 <ConsoleLineItem {item} />
                             {/each}
                         </ol>
@@ -1369,6 +1417,15 @@
                 </details>
             {/if}
         </aside>
+    {/if}
+
+    {#if workerRunning}
+        <WorkerRunStatus
+            startedAtMs={consoleProjection.runActivity.startedAtMs}
+            requests={consoleProjection.runActivity.requests}
+            uploadTokens={consoleProjection.runActivity.uploadTokens}
+            outputTokens={consoleProjection.runActivity.outputTokens}
+        />
     {/if}
 
     <ConsoleTasks {tasks} mode="mini" />
@@ -1481,25 +1538,40 @@
         display: flex;
         align-items: center;
         justify-content: flex-end;
+        flex-wrap: wrap;
         gap: var(--space-2);
     }
 
-    .console-status-pill {
-        min-width: 14rem;
-        padding: 0.75rem 0.9rem;
+    .console-view-modes {
+        display: inline-flex;
+        overflow: hidden;
         border: 1px solid var(--line);
-        border-radius: 16px;
+        border-radius: 0.55rem;
         background: var(--bg-raised);
-        color: var(--text-muted);
-        font-weight: 800;
-        text-transform: uppercase;
-        letter-spacing: 0.04em;
-        font-size: 0.76rem;
-        text-align: right;
     }
 
-    .console-status-pill.warn {
-        color: var(--warning);
+    .console-view-modes button {
+        border: 0;
+        background: transparent;
+        color: var(--text-muted);
+        padding: 0.42rem 0.65rem;
+        font: inherit;
+        font-size: 0.7rem;
+        font-weight: 700;
+        cursor: pointer;
+    }
+
+    .console-view-modes button + button {
+        border-left: 1px solid var(--line);
+    }
+
+    .console-view-modes button:hover {
+        color: var(--text-strong);
+    }
+
+    .console-view-modes button.active {
+        background: var(--accent);
+        color: var(--bg);
     }
 
     .console-notice {
@@ -1821,11 +1893,6 @@
 
         .console-header {
             flex-direction: column;
-        }
-
-        .console-status-pill {
-            width: 100%;
-            text-align: left;
         }
     }
 </style>

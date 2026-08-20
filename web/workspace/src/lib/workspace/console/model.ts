@@ -9,6 +9,13 @@ import type {
 } from "$lib/generated/protocol";
 import { workspaceRoute } from "$lib/workspace/api/http";
 import {
+  applyRunActivityEvent,
+  emptyRunActivityStats,
+  formatRunElapsedCompact,
+  formatRunTokens,
+  type RunActivityStats,
+} from "./run-status.ts";
+import {
   applyTaskSnapshotText,
   applyTaskToolCall,
   type ConsoleTask,
@@ -19,6 +26,9 @@ export type ConsoleLineKind =
   | "assistant"
   | "thinking"
   | "tool"
+  | "activity"
+  | "task_reminder"
+  | "run_stats"
   | "status"
   | "error"
   | "usage"
@@ -51,6 +61,8 @@ export type ConsoleDiffLine = {
   content: string;
 };
 
+export type ConsoleViewMode = "overview" | "normal";
+
 export type ConsoleLine = {
   id: string;
   kind: ConsoleLineKind;
@@ -63,6 +75,10 @@ export type ConsoleLine = {
   streaming?: boolean;
   error?: boolean;
   toolCall?: ToolCallView;
+  /** Number of calls represented by a lower-level aggregate line. */
+  toolCallCount?: number;
+  /** Typed `SystemItem.kind` used by presentation-only projections. */
+  systemItemKind?: string;
 };
 
 export type InternalWorkerProjection = {
@@ -91,6 +107,7 @@ export type ConsoleProjection = {
   taskNextId: number;
   status: string | null;
   usage: string | null;
+  runActivity: RunActivityStats;
   cwd: string | null;
   lastEventId: string | null;
   internalWorkers: InternalWorkerProjection[];
@@ -176,6 +193,7 @@ export function emptyConsoleProjection(): ConsoleProjection {
     taskNextId: 1,
     status: null,
     usage: null,
+    runActivity: emptyRunActivityStats(),
     cwd: null,
     lastEventId: null,
     internalWorkers: [],
@@ -222,6 +240,199 @@ function projectVisibleConsole(
       console: projectVisibleConsole(worker.console),
     })),
   };
+}
+
+function isOverviewThinkingLine(line: ConsoleLine): boolean {
+  return line.kind === "thinking" ||
+    (line.kind === "in_flight" && line.title === "in-flight thinking");
+}
+
+function representedToolCallCount(line: ConsoleLine): number {
+  return Math.max(1, line.toolCallCount ?? 1);
+}
+
+function overviewToolActivityLine(group: ConsoleLine[]): ConsoleLine {
+  const first = group[0]!;
+  const last = group[group.length - 1]!;
+  let readCount = 0;
+  let searchCount = 0;
+  let commandCount = 0;
+  let editCount = 0;
+  let writeCount = 0;
+  let additions = 0;
+  let deletions = 0;
+  let failedCount = 0;
+  let activeCount = 0;
+  let readActive = false;
+  let searchActive = false;
+  let commandActive = false;
+  let editActive = false;
+  let writeActive = false;
+  const otherCounts = new Map<string, number>();
+
+  for (const line of group) {
+    const count = representedToolCallCount(line);
+    const name = line.toolCall?.name ?? "Tool";
+    const state = line.toolCall?.state;
+    if (state === "error" || line.error || line.toolCall?.isError) {
+      failedCount += count;
+    }
+    const callActive = state === "pending" || state === "streaming_args" ||
+      state === "running";
+    if (callActive) activeCount += count;
+
+    switch (name) {
+      case "Read":
+        readCount += count;
+        readActive ||= callActive;
+        break;
+      case "Glob":
+      case "Grep":
+      case "WebSearch":
+      case "SearchSessionEntries":
+        searchCount += count;
+        searchActive ||= callActive;
+        break;
+      case "Bash":
+        commandCount += count;
+        commandActive ||= callActive;
+        break;
+      case "Edit":
+        editCount += count;
+        editActive ||= callActive;
+        if (state === "done") {
+          additions += line.diff?.filter((diff) =>
+            diff.kind === "add"
+          ).length ?? 0;
+          deletions += line.diff?.filter((diff) =>
+            diff.kind === "remove"
+          ).length ?? 0;
+        }
+        break;
+      case "Write":
+        writeCount += count;
+        writeActive ||= callActive;
+        break;
+      default:
+        otherCounts.set(name, (otherCounts.get(name) ?? 0) + count);
+        break;
+    }
+  }
+
+  const active = activeCount > 0;
+  const primary: string[] = [];
+  if (readCount > 0) {
+    primary.push(
+      readActive
+        ? `reading ${readCount} file${readCount === 1 ? "" : "s"}`
+        : `${readCount} file${readCount === 1 ? "" : "s"} read`,
+    );
+  }
+  if (searchCount > 0) {
+    primary.push(
+      searchActive
+        ? `searching ${searchCount} time${searchCount === 1 ? "" : "s"}`
+        : `searched ${searchCount} time${searchCount === 1 ? "" : "s"}`,
+    );
+  }
+  if (commandCount > 0) {
+    primary.push(
+      commandActive
+        ? `running ${commandCount} command${commandCount === 1 ? "" : "s"}`
+        : `ran ${commandCount} command${commandCount === 1 ? "" : "s"}`,
+    );
+  }
+  for (
+    const [name, count] of [...otherCounts].sort(([left], [right]) =>
+      left.localeCompare(right)
+    )
+  ) {
+    primary.push(count === 1 ? name : `${count} ${name}`);
+  }
+
+  const changes: string[] = [];
+  if (editCount > 0) {
+    if (editActive) {
+      changes.push(`editing ${editCount} file${editCount === 1 ? "" : "s"}`);
+    } else if (additions > 0 || deletions > 0) {
+      changes.push(`edited +${additions}/-${deletions}`);
+    } else {
+      changes.push(`edited ${editCount} file${editCount === 1 ? "" : "s"}`);
+    }
+  }
+  if (writeCount > 0) {
+    changes.push(
+      writeActive
+        ? `writing ${writeCount} file${writeCount === 1 ? "" : "s"}`
+        : `wrote ${writeCount} file${writeCount === 1 ? "" : "s"}`,
+    );
+  }
+  if (failedCount > 0) changes.push(`${failedCount} failed`);
+
+  return {
+    id: `activity-${first.id}-${last.id}`,
+    kind: "activity",
+    title: "Activity",
+    body: [primary.join("・"), ...changes].filter(Boolean).join("\n"),
+    source: "event",
+    streaming: active,
+    error: failedCount > 0,
+  };
+}
+
+/**
+ * Builds the overview-only Console presentation. Protocol projection retains
+ * full tool and thinking state for reconciliation, but the visible history
+ * hides thinking and folds each uninterrupted tool run into one activity.
+ */
+export function projectOverviewLines(lines: ConsoleLine[]): ConsoleLine[] {
+  const overview: ConsoleLine[] = [];
+  let toolGroup: ConsoleLine[] = [];
+
+  const flushTools = () => {
+    if (toolGroup.length === 0) return;
+    overview.push(overviewToolActivityLine(toolGroup));
+    toolGroup = [];
+  };
+
+  for (const line of lines) {
+    if (line.systemItemKind === "task_reminder") continue;
+    if (isOverviewThinkingLine(line)) continue;
+    if (line.kind === "tool" && line.toolCall) {
+      toolGroup.push(line);
+      continue;
+    }
+    flushTools();
+    overview.push(line);
+  }
+  flushTools();
+  return overview;
+}
+
+export function projectNormalLines(lines: ConsoleLine[]): ConsoleLine[] {
+  return lines.map((line) => {
+    if (line.systemItemKind !== "task_reminder") return line;
+    const first = line.body
+      .split("\n")
+      .map((part) => part.trim())
+      .find(Boolean);
+    return {
+      ...line,
+      kind: "task_reminder",
+      title: "Task reminder",
+      body: first ? `task reminder: ${first}` : "task reminder",
+      detail: undefined,
+    };
+  });
+}
+
+export function projectConsoleLines(
+  lines: ConsoleLine[],
+  mode: ConsoleViewMode,
+): ConsoleLine[] {
+  return mode === "overview"
+    ? projectOverviewLines(lines)
+    : projectNormalLines(lines);
 }
 
 function appendSnapshotInFlightLines(
@@ -275,19 +486,24 @@ function projectInternalWorkerSnapshot(
 
 export function applyProtocolEvent(
   projection: ConsoleProjection,
-  envelope: { eventId: string; event: ProtocolEvent },
+  envelope: ConsoleEventInput,
 ): ConsoleProjection {
+  const event = envelope.event;
   const next: ConsoleProjection = {
     lines: [...projection.lines],
     tasks: [...projection.tasks],
     taskNextId: projection.taskNextId,
     status: projection.status,
     usage: projection.usage,
+    runActivity: applyRunActivityEvent(
+      projection.runActivity,
+      event,
+      envelope.observedAtMs ?? 0,
+    ),
     cwd: projection.cwd,
     lastEventId: envelope.eventId,
     internalWorkers: [...projection.internalWorkers],
   };
-  const event = envelope.event;
 
   switch (event.event) {
     case "user_message":
@@ -427,6 +643,7 @@ export function applyProtocolEvent(
           eventId:
             `${envelope.eventId}:internal:${event.data.worker.session_id}:${event.data.revision}`,
           event: event.data.event,
+          observedAtMs: envelope.observedAtMs,
         }),
       };
       if (existingIndex >= 0) next.internalWorkers[existingIndex] = updated;
@@ -455,7 +672,15 @@ export function applyProtocolEvent(
     case "llm_call_end":
     case "llm_retry":
     case "llm_continuation":
+      break;
     case "run_end":
+      next.lines.push(
+        runStatsLine(
+          envelope.eventId,
+          next.runActivity,
+          envelope.observedAtMs ?? next.runActivity.startedAtMs ?? 0,
+        ),
+      );
       break;
     case "alert":
       appendAlertLine(next, envelope.eventId, event.data);
@@ -512,6 +737,22 @@ export function segmentsToText(segments: Segment[]): string {
     .join("\n");
 }
 
+function runStatsLine(
+  eventId: string,
+  stats: RunActivityStats,
+  endedAtMs: number,
+): ConsoleLine {
+  const elapsedMs = endedAtMs - (stats.startedAtMs ?? endedAtMs);
+  return line(
+    eventId,
+    "run_stats",
+    "Run stats",
+    `${formatRunElapsedCompact(elapsedMs)} ・${stats.requests} reqs ↑${
+      formatRunTokens(stats.uploadTokens)
+    }/↓${formatRunTokens(stats.outputTokens)}`,
+  );
+}
+
 function line(
   eventId: string,
   kind: ConsoleLineKind,
@@ -542,7 +783,10 @@ function systemItemLine(eventId: string, item: unknown): ConsoleLine {
   const title = `System · ${itemKind.replaceAll("_", " ")}`;
   const body = stringField(item, "body") ?? stringField(item, "message") ??
     stringField(item, "content") ?? jsonPreview(item);
-  return line(eventId, "system", title, body);
+  return {
+    ...line(eventId, "system", title, body),
+    systemItemKind: itemKind,
+  };
 }
 
 function upsertStatusLine(
@@ -867,6 +1111,12 @@ function readAggregateLine(group: ConsoleLine[]): ConsoleLine {
     source: "event",
     streaming: inProgress,
     error: hasError,
+    toolCall: {
+      ...calls[0]!,
+      state: hasError ? "error" : inProgress ? "running" : "done",
+      isError: hasError,
+    },
+    toolCallCount: count,
   };
 }
 
@@ -1291,6 +1541,7 @@ function snapshotProjectionFromEntries(
     taskNextId: 1,
     status: null,
     usage: null,
+    runActivity: emptyRunActivityStats(),
     cwd,
     lastEventId: eventId,
     internalWorkers: [],

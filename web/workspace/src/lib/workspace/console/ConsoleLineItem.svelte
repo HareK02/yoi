@@ -19,7 +19,8 @@
   }
 
   function shouldRenderHeading(line: ConsoleLine): boolean {
-    return line.kind !== 'assistant' && line.kind !== 'user' && line.kind !== 'tool';
+    return line.kind !== 'assistant' && line.kind !== 'user' && line.kind !== 'tool' &&
+      line.kind !== 'activity' && line.kind !== 'task_reminder' && line.kind !== 'run_stats';
   }
 
   function toolSummary(line: ConsoleLine): { label: string; suffix: string; rest: string } {
@@ -49,24 +50,29 @@
   {#if shouldRenderHeading(item)}
     <div class="message-heading">
       <span>{item.title}</span>
-      {#if item.streaming}<small>streaming</small>{/if}
     </div>
   {:else if item.kind === 'tool'}
     <div class="tool-summary">
       <span class="tool-label">{toolSummary(item).label}</span>
       <span class="tool-separator"> — </span>
       <span class={`tool-suffix ${item.toolCall?.state ?? ''}`}>{toolSummary(item).suffix}</span>
-      {#if item.streaming}<small>streaming</small>{/if}
-    </div>
-  {:else if item.streaming}
-    <div class="message-heading streaming-heading">
-      <small>streaming</small>
     </div>
   {/if}
   {#if item.kind === 'tool'}
     {#if bodyTextAfterToolSummary(item)}
       <p class="console-plain-text">{bodyTextAfterToolSummary(item)}</p>
     {/if}
+  {:else if item.kind === 'user'}
+    <div class="user-message">
+      <span class="user-prompt" aria-hidden="true">&gt;</span>
+      <div><RichMarkdown text={item.body || '—'} /></div>
+    </div>
+  {:else if item.kind === 'activity'}
+    <p class="activity-summary">{item.body || '—'}</p>
+  {:else if item.kind === 'task_reminder'}
+    <p class="task-reminder-summary">{item.body || 'task reminder'}</p>
+  {:else if item.kind === 'run_stats'}
+    <p class="run-stats">{item.body}</p>
   {:else if shouldRenderMarkdown(item)}
     <RichMarkdown text={item.body || '—'} />
   {:else}
@@ -100,6 +106,48 @@
 
   .console-line.user {
     color: var(--tui-green);
+  }
+
+  .user-message {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 0.55rem;
+    align-items: start;
+  }
+
+  .user-prompt {
+    color: var(--tui-green);
+    font-weight: 700;
+    line-height: 1.55;
+  }
+
+  .activity-summary,
+  .task-reminder-summary {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 0.78rem;
+    line-height: 1.55;
+    white-space: pre-line;
+  }
+
+  .task-reminder-summary {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .console-line.error .activity-summary {
+    color: var(--tui-error);
+  }
+
+  .run-stats {
+    margin: 0;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    white-space: nowrap;
   }
 
   .console-line.assistant {
@@ -154,14 +202,6 @@
     font-weight: 750;
   }
 
-  .tool-summary small {
-    margin-left: var(--space-2);
-    color: var(--text-muted);
-    font-size: 0.74rem;
-    font-weight: 700;
-    text-transform: uppercase;
-  }
-
   .tool-label {
     flex: 0 0 auto;
     color: var(--tui-cyan);
@@ -206,18 +246,6 @@
     color: var(--text-muted);
     font-size: 0.78rem;
     font-weight: 750;
-  }
-
-  .message-heading.streaming-heading {
-    justify-content: flex-start;
-  }
-
-  .message-heading small {
-    margin: 0;
-    color: var(--text-muted);
-    font-size: 0.74rem;
-    font-weight: 700;
-    text-transform: uppercase;
   }
 
   .console-diff {

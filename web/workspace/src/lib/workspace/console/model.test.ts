@@ -1,9 +1,12 @@
 import type { Event } from "$lib/generated/protocol";
 import {
+  type ConsoleEventInput,
   type ConsoleLine,
   createConsoleProjector,
   isConsoleProjectionEvent,
   projectConsole,
+  projectConsoleLines,
+  projectOverviewLines,
   segmentsToText,
   selectConsoleTimelineLines,
   workerConsoleHref,
@@ -758,6 +761,9 @@ Deno.test("projectConsole aggregates Read calls without showing file content", (
       !toolLines[0].body.includes("another content"),
     "Read aggregate should not display file contents",
   );
+  const overview = projectOverviewLines(projection.lines);
+  assertEquals(overview.length, 1);
+  assertEquals(overview[0].body, "2 files read");
 });
 
 Deno.test("projectConsole renders Edit calls with structured diff lines", () => {
@@ -856,11 +862,13 @@ Deno.test("projectConsole hides lifecycle events and renders system items", () =
     },
   ]);
 
-  assertEquals(projection.lines.length, 1);
-  assertEquals(projection.lines[0].kind, "system");
-  assertEquals(projection.lines[0].title, "System · notification");
+  assertEquals(projection.lines.length, 2);
+  assertEquals(projection.lines[0].kind, "run_stats");
+  assertEquals(projection.lines[0].body, "0s ・0 reqs ↑0/↓0");
+  assertEquals(projection.lines[1].kind, "system");
+  assertEquals(projection.lines[1].title, "System · notification");
   assertEquals(
-    projection.lines[0].body,
+    projection.lines[1].body,
     "Reread Ticket 00001KZ6TSGG5 before acting.",
   );
   assertEquals(projection.status, "running");
@@ -1399,4 +1407,183 @@ Deno.test("snapshot restores TaskStore state from system history", () => {
     description: "From compaction",
   }]);
   assertEquals(projection.taskNextId, 4);
+});
+
+Deno.test("overview hides typed task reminders after restoring TaskStore state", () => {
+  const body =
+    `[Session TaskStore snapshot]\n\n\`\`\`json\n{\n  "tasks": [{"taskid": 8, "status": "inprogress", "subject": "Visible in Tasks", "description": "Hidden in overview"}]\n}\n\`\`\``;
+  const projection = projectConsole([{
+    eventId: "task-reminder",
+    event: {
+      event: "system_item",
+      data: {
+        item: { kind: "task_reminder", body },
+      },
+    },
+  }]);
+
+  assertEquals(projection.tasks[0]?.taskid, 8);
+  assertEquals(projection.lines[0]?.systemItemKind, "task_reminder");
+  assertEquals(projectConsoleLines(projection.lines, "overview"), []);
+  const normal = projectConsoleLines(projection.lines, "normal");
+  assertEquals(normal.length, 1);
+  assertEquals(normal[0].kind, "task_reminder");
+  assertEquals(
+    normal[0].body,
+    "task reminder: [Session TaskStore snapshot]",
+  );
+});
+
+Deno.test("overview hides thinking and aggregates uninterrupted tool activity", () => {
+  const toolLine = (
+    id: string,
+    name: string,
+    diff?: ConsoleLine["diff"],
+  ): ConsoleLine => ({
+    id,
+    kind: "tool",
+    title: `Call · ${name}`,
+    body: name,
+    source: "event",
+    diff,
+    toolCall: {
+      id,
+      name,
+      argsStream: "",
+      state: "done",
+    },
+  });
+
+  const overview = projectOverviewLines([
+    consoleLine("user", "user"),
+    consoleLine("assistant-before", "assistant"),
+    consoleLine("thought-before-tools", "thinking"),
+    toolLine("read-a", "Read"),
+    consoleLine("thought-between-tools", "thinking"),
+    toolLine("read-b", "Read"),
+    toolLine("bash-a", "Bash"),
+    consoleLine("assistant-after-tools", "assistant"),
+    toolLine("edit-a", "Edit", [
+      { kind: "remove", oldNumber: 1, content: "old" },
+      { kind: "add", newNumber: 1, content: "new" },
+      { kind: "add", newNumber: 2, content: "next" },
+    ]),
+  ]);
+
+  assertEquals(overview.map((line) => line.kind), [
+    "user",
+    "assistant",
+    "activity",
+    "assistant",
+    "activity",
+  ]);
+  assertEquals(overview[2].body, "2 files read・ran 1 command");
+  assertEquals(overview[4].body, "edited +2/-1");
+});
+
+Deno.test("overview hides in-flight thinking and keeps tool failures visible", () => {
+  const overview = projectOverviewLines([
+    {
+      ...consoleLine("thinking-in-flight", "in_flight"),
+      title: "in-flight thinking",
+    },
+    {
+      ...consoleLine("failed-read", "tool"),
+      error: true,
+      toolCall: {
+        id: "failed-read",
+        name: "Read",
+        argsStream: "",
+        state: "error",
+        isError: true,
+      },
+    },
+  ]);
+
+  assertEquals(overview.length, 1);
+  assertEquals(overview[0].kind, "activity");
+  assertEquals(overview[0].body, "1 file read\n1 failed");
+  assertEquals(overview[0].error, true);
+});
+
+Deno.test("RunEnd appends TUI-compatible request and token stats", () => {
+  const events: ConsoleEventInput[] = [
+    {
+      eventId: "invoke",
+      observedAtMs: 1_000,
+      event: { event: "invoke_start", data: { kind: "user_send" } },
+    },
+    ...Array.from({ length: 5 }, (_, index) => ({
+      eventId: `turn-${index}`,
+      observedAtMs: 1_010 + index,
+      event: { event: "turn_start", data: { turn: index + 1 } } as Event,
+    })),
+    {
+      eventId: "usage",
+      observedAtMs: 1_020,
+      event: {
+        event: "usage",
+        data: {
+          input_tokens: 60_000,
+          cache_read_input_tokens: 3_500,
+          output_tokens: 1_200,
+        },
+      },
+    },
+    {
+      eventId: "run-end",
+      observedAtMs: 621_000,
+      event: { event: "run_end", data: { result: "finished" } },
+    },
+  ];
+
+  const projection = projectConsole(events);
+  const stats = projection.lines.filter((line) => line.kind === "run_stats");
+  assertEquals(stats.length, 1);
+  assertEquals(stats[0].body, "10m20s ・5 reqs ↑56.5k/↓1.2k");
+  assertEquals(
+    projectConsoleLines(projection.lines, "overview").at(-1)?.kind,
+    "run_stats",
+  );
+  assertEquals(
+    projectConsoleLines(projection.lines, "normal").at(-1)?.kind,
+    "run_stats",
+  );
+});
+
+Deno.test("new invoke resets stats before the next RunEnd", () => {
+  const projector = createConsoleProjector();
+  projector.append([
+    {
+      eventId: "first-invoke",
+      event: { event: "invoke_start", data: { kind: "user_send" } },
+    },
+    {
+      eventId: "first-turn",
+      event: { event: "turn_start", data: { turn: 1 } },
+    },
+    {
+      eventId: "first-usage",
+      event: {
+        event: "usage",
+        data: { input_tokens: 1_000, output_tokens: 100 },
+      },
+    },
+    {
+      eventId: "first-end",
+      event: { event: "run_end", data: { result: "finished" } },
+    },
+  ]);
+  const projection = projector.append([
+    {
+      eventId: "second-invoke",
+      event: { event: "invoke_start", data: { kind: "notify" } },
+    },
+    {
+      eventId: "second-end",
+      event: { event: "run_end", data: { result: "finished" } },
+    },
+  ]);
+
+  assertEquals(projection.lines.at(-1)?.body, "0s ・0 reqs ↑0/↓0");
 });
