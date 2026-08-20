@@ -14,6 +14,8 @@ pub struct BackendRuntimeTarget {
     /// Workspace Backend API root URL, for example `http://127.0.0.1:8787`.
     /// This is intentionally the Backend endpoint, not a Runtime endpoint.
     pub base_url: String,
+    /// Workspace identity used for every Worker lifecycle and protocol operation.
+    pub workspace_id: String,
     /// Backend-owned Runtime identity used as path authority.
     pub runtime_id: String,
     /// Backend-owned Worker identity used as path authority.
@@ -23,11 +25,13 @@ pub struct BackendRuntimeTarget {
 impl BackendRuntimeTarget {
     pub fn new(
         base_url: impl Into<String>,
+        workspace_id: impl Into<String>,
         runtime_id: impl Into<String>,
         worker_id: impl Into<String>,
     ) -> Self {
         Self {
             base_url: base_url.into(),
+            workspace_id: workspace_id.into(),
             runtime_id: runtime_id.into(),
             worker_id: worker_id.into(),
         }
@@ -56,6 +60,36 @@ impl BackendRuntimeListTarget {
             workspace_id,
             runtime_id,
         }
+    }
+
+    pub fn select_workspace(&mut self, workspace_id: impl Into<String>) {
+        self.workspace_id = Some(workspace_id.into());
+    }
+
+    pub fn clear_workspace(&mut self) {
+        self.workspace_id = None;
+    }
+
+    pub fn workspace_id(&self) -> Option<&str> {
+        self.workspace_id.as_deref()
+    }
+
+    pub fn runtime_target(
+        &self,
+        runtime_id: impl Into<String>,
+        worker_id: impl Into<String>,
+    ) -> Result<BackendRuntimeTarget, BackendRuntimeClientError> {
+        let workspace_id = self.workspace_id.clone().ok_or_else(|| {
+            BackendRuntimeClientError::InvalidTarget(
+                "workspace_id is required before selecting a Backend worker".to_string(),
+            )
+        })?;
+        Ok(BackendRuntimeTarget::new(
+            self.base_url.clone(),
+            workspace_id,
+            runtime_id,
+            worker_id,
+        ))
     }
 }
 
@@ -186,7 +220,13 @@ pub async fn list_backend_workers(
     validate_list_target(target)?;
     let http = reqwest::Client::new();
     if let Some(runtime_id) = target.runtime_id.as_deref() {
-        let path = backend_runtime_workers_path(target.workspace_id.as_deref(), runtime_id);
+        let path = backend_runtime_workers_path(
+            target
+                .workspace_id
+                .as_deref()
+                .expect("validated Backend Workspace scope"),
+            runtime_id,
+        );
         let url = join_base_and_path(&target.base_url, &path);
         return Ok(http
             .get(url)
@@ -197,7 +237,12 @@ pub async fn list_backend_workers(
             .await?);
     }
 
-    let runtime_path = backend_runtimes_path(target.workspace_id.as_deref());
+    let runtime_path = backend_runtimes_path(
+        target
+            .workspace_id
+            .as_deref()
+            .expect("validated Backend Workspace scope"),
+    );
     let runtime_url = join_base_and_path(&target.base_url, &runtime_path);
     let runtimes = http
         .get(runtime_url)
@@ -210,8 +255,13 @@ pub async fn list_backend_workers(
     let mut items = Vec::new();
     let mut diagnostics = runtimes.diagnostics;
     for runtime in runtimes.items {
-        let path =
-            backend_runtime_workers_path(target.workspace_id.as_deref(), &runtime.runtime_id);
+        let path = backend_runtime_workers_path(
+            target
+                .workspace_id
+                .as_deref()
+                .expect("validated Backend Workspace scope"),
+            &runtime.runtime_id,
+        );
         let url = join_base_and_path(&target.base_url, &path);
         match http
             .get(url)
@@ -256,7 +306,13 @@ pub async fn list_backend_stopped_workers(
         ));
     };
     let http = reqwest::Client::new();
-    let path = backend_runtime_workers_path(target.workspace_id.as_deref(), runtime_id);
+    let path = backend_runtime_workers_path(
+        target
+            .workspace_id
+            .as_deref()
+            .expect("validated Backend Workspace scope"),
+        runtime_id,
+    );
     let url = join_base_and_path(&target.base_url, &format!("{path}?status=stopped"));
     Ok(http
         .get(url)
@@ -272,7 +328,11 @@ pub async fn restore_backend_worker(
 ) -> Result<BackendWorkerRestoreResponse, BackendRuntimeClientError> {
     validate_target(target)?;
     let http = reqwest::Client::new();
-    let path = backend_runtime_worker_restore_path(None, &target.runtime_id, &target.worker_id);
+    let path = backend_runtime_worker_restore_path(
+        &target.workspace_id,
+        &target.runtime_id,
+        &target.worker_id,
+    );
     let url = join_base_and_path(&target.base_url, &path);
     Ok(http
         .post(url)
@@ -440,6 +500,11 @@ fn validate_target(target: &BackendRuntimeTarget) -> Result<(), BackendRuntimeCl
             "Backend API base URL must start with http:// or https://".to_string(),
         ));
     }
+    if target.workspace_id.is_empty() {
+        return Err(BackendRuntimeClientError::InvalidTarget(
+            "workspace_id is required".to_string(),
+        ));
+    }
     if target.runtime_id.is_empty() {
         return Err(BackendRuntimeClientError::InvalidTarget(
             "runtime_id is required".to_string(),
@@ -466,10 +531,18 @@ fn validate_list_target(
             "Backend API base URL must start with http:// or https://".to_string(),
         ));
     }
-    if target.workspace_id.as_deref().is_some_and(str::is_empty) {
-        return Err(BackendRuntimeClientError::InvalidTarget(
-            "workspace_id must not be empty when provided".to_string(),
-        ));
+    match target.workspace_id.as_deref() {
+        Some("") => {
+            return Err(BackendRuntimeClientError::InvalidTarget(
+                "workspace_id must not be empty".to_string(),
+            ));
+        }
+        None => {
+            return Err(BackendRuntimeClientError::InvalidTarget(
+                "workspace selection is required before listing Backend workers".to_string(),
+            ));
+        }
+        Some(_) => {}
     }
     if target.runtime_id.as_deref().is_some_and(str::is_empty) {
         return Err(BackendRuntimeClientError::InvalidTarget(
@@ -479,47 +552,35 @@ fn validate_list_target(
     Ok(())
 }
 
-fn backend_runtimes_path(workspace_id: Option<&str>) -> String {
-    match workspace_id {
-        Some(workspace_id) => format!("/api/w/{}/runtimes", path_segment_encode(workspace_id)),
-        None => "/api/runtimes".to_string(),
-    }
+fn backend_runtimes_path(workspace_id: &str) -> String {
+    format!("/api/w/{}/runtimes", path_segment_encode(workspace_id))
 }
 
-fn backend_runtime_workers_path(workspace_id: Option<&str>, runtime_id: &str) -> String {
-    match workspace_id {
-        Some(workspace_id) => format!(
-            "/api/w/{}/runtimes/{}/workers",
-            path_segment_encode(workspace_id),
-            path_segment_encode(runtime_id)
-        ),
-        None => format!("/api/runtimes/{}/workers", path_segment_encode(runtime_id)),
-    }
+fn backend_runtime_workers_path(workspace_id: &str, runtime_id: &str) -> String {
+    format!(
+        "/api/w/{}/runtimes/{}/workers",
+        path_segment_encode(workspace_id),
+        path_segment_encode(runtime_id)
+    )
 }
 
 fn backend_runtime_worker_restore_path(
-    workspace_id: Option<&str>,
+    workspace_id: &str,
     runtime_id: &str,
     worker_id: &str,
 ) -> String {
-    match workspace_id {
-        Some(workspace_id) => format!(
-            "/api/w/{}/runtimes/{}/workers/{}/restore",
-            path_segment_encode(workspace_id),
-            path_segment_encode(runtime_id),
-            path_segment_encode(worker_id)
-        ),
-        None => format!(
-            "/api/runtimes/{}/workers/{}/restore",
-            path_segment_encode(runtime_id),
-            path_segment_encode(worker_id)
-        ),
-    }
+    format!(
+        "/api/w/{}/runtimes/{}/workers/{}/restore",
+        path_segment_encode(workspace_id),
+        path_segment_encode(runtime_id),
+        path_segment_encode(worker_id)
+    )
 }
 
 fn protocol_ws_url(target: &BackendRuntimeTarget) -> String {
     let path = format!(
-        "/api/runtimes/{}/workers/{}/protocol/ws",
+        "/api/w/{}/runtimes/{}/workers/{}/protocol/ws",
+        path_segment_encode(&target.workspace_id),
         path_segment_encode(&target.runtime_id),
         path_segment_encode(&target.worker_id)
     );
@@ -573,11 +634,15 @@ mod tests {
 
     #[test]
     fn protocol_url_uses_backend_runtime_worker_identity() {
-        let target =
-            BackendRuntimeTarget::new("http://127.0.0.1:8787/", "runtime/one", "worker one");
+        let target = BackendRuntimeTarget::new(
+            "http://127.0.0.1:8787/",
+            "workspace alpha",
+            "runtime/one",
+            "worker one",
+        );
         assert_eq!(
             protocol_ws_url(&target),
-            "ws://127.0.0.1:8787/api/runtimes/runtime%2Fone/workers/worker%20one/protocol/ws"
+            "ws://127.0.0.1:8787/api/w/workspace%20alpha/runtimes/runtime%2Fone/workers/worker%20one/protocol/ws"
         );
     }
 
@@ -622,8 +687,8 @@ mod tests {
     }
 
     #[test]
-    fn workers_path_can_be_workspace_scoped_for_status_queries() {
-        let path = backend_runtime_workers_path(Some("team main"), "runtime/one");
+    fn workers_path_requires_workspace_scope_for_status_queries() {
+        let path = backend_runtime_workers_path("team main", "runtime/one");
         assert_eq!(
             format!("{path}?status=stopped"),
             "/api/w/team%20main/runtimes/runtime%2Fone/workers?status=stopped"
@@ -631,10 +696,10 @@ mod tests {
     }
 
     #[test]
-    fn restore_worker_path_uses_backend_runtime_worker_identity() {
+    fn restore_worker_path_requires_workspace_scope() {
         assert_eq!(
-            backend_runtime_worker_restore_path(None, "runtime/one", "worker one"),
-            "/api/runtimes/runtime%2Fone/workers/worker%20one/restore"
+            backend_runtime_worker_restore_path("team main", "runtime/one", "worker one"),
+            "/api/w/team%20main/runtimes/runtime%2Fone/workers/worker%20one/restore"
         );
     }
 }

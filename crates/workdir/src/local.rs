@@ -14,21 +14,22 @@ use std::io::Write as _;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use manifest::{Permission, Scope, ScopeConfig, ScopeRule, SharedScope};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, broadcast, watch};
 use tokio::task::JoinHandle;
 
 use crate::{
-    CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest, CommandStatus, EditRequest,
-    EditResult, GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest, ListResult,
-    ReadRequest, ReadResult, StatRequest, StatResult, Workdir, WorkdirDelegationPermission,
+    CommandEvent, CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest,
+    CommandSnapshot, CommandStatus, CommandStream, CommandStreamSlice, EditRequest, EditResult,
+    GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest, ListResult, ReadRequest,
+    ReadResult, StatRequest, StatResult, Workdir, WorkdirDelegationPermission,
     WorkdirDelegationRequest, WorkdirError, WorkdirPath, WorkdirSession,
     WorkdirSessionCapabilities, WorkdirSessionCapability, WorkdirSessionHandle, WriteRequest,
     WriteResult,
@@ -36,13 +37,170 @@ use crate::{
 #[cfg(test)]
 use crate::{EntryKind, WriteOutcome};
 
+const COMMAND_EVENT_CHANNEL_CAPACITY: usize = 256;
+const COMMAND_EVENT_CHUNK_BYTES: usize = 8 * 1024;
+const COMMAND_SNAPSHOT_STREAM_BYTES: usize = 32 * 1024;
+
+fn command_observed_at_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
 #[derive(Debug)]
 enum LocalCommand {
     Running {
         task: JoinHandle<Result<CommandOutput, WorkdirError>>,
         completion: Arc<Notify>,
+        cancel: watch::Sender<bool>,
     },
     Completed(CommandOutput),
+}
+
+#[derive(Debug, Clone)]
+struct CommandTelemetry {
+    inner: Arc<CommandTelemetryInner>,
+}
+
+#[derive(Debug)]
+struct CommandTelemetryInner {
+    snapshots: StdMutex<HashMap<String, CommandSnapshot>>,
+    events: broadcast::Sender<CommandEvent>,
+}
+
+impl CommandTelemetry {
+    fn new() -> Self {
+        let (events, _) = broadcast::channel(COMMAND_EVENT_CHANNEL_CAPACITY);
+        Self {
+            inner: Arc::new(CommandTelemetryInner {
+                snapshots: StdMutex::new(HashMap::new()),
+                events,
+            }),
+        }
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<CommandEvent> {
+        self.inner.events.subscribe()
+    }
+
+    fn snapshot(&self) -> Vec<CommandSnapshot> {
+        let mut snapshots = self
+            .inner
+            .snapshots
+            .lock()
+            .expect("command telemetry mutex poisoned")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        snapshots.sort_by(|left, right| left.command_id.cmp(&right.command_id));
+        snapshots
+    }
+
+    fn started(&self, command_id: &str, tool_call_id: Option<String>) {
+        let observed_at_ms = command_observed_at_ms();
+        self.inner
+            .snapshots
+            .lock()
+            .expect("command telemetry mutex poisoned")
+            .insert(
+                command_id.to_string(),
+                CommandSnapshot {
+                    command_id: command_id.to_string(),
+                    tool_call_id: tool_call_id.clone(),
+                    status: CommandStatus::Running,
+                    started_at_ms: observed_at_ms,
+                    observed_at_ms,
+                    last_output_at_ms: None,
+                    stdout: CommandStreamSlice::default(),
+                    stderr: CommandStreamSlice::default(),
+                    exit_code: None,
+                },
+            );
+        let _ = self.inner.events.send(CommandEvent::Started {
+            command_id: command_id.to_string(),
+            tool_call_id,
+            observed_at_ms,
+        });
+    }
+
+    fn output(&self, command_id: &str, stream: CommandStream, start_offset: u64, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let end_offset = start_offset.saturating_add(bytes.len() as u64);
+        let content = String::from_utf8_lossy(bytes).into_owned();
+        let observed_at_ms = command_observed_at_ms();
+        if let Some(snapshot) = self
+            .inner
+            .snapshots
+            .lock()
+            .expect("command telemetry mutex poisoned")
+            .get_mut(command_id)
+        {
+            snapshot.observed_at_ms = observed_at_ms;
+            snapshot.last_output_at_ms = Some(observed_at_ms);
+            let target = match stream {
+                CommandStream::Stdout => &mut snapshot.stdout,
+                CommandStream::Stderr => &mut snapshot.stderr,
+            };
+            target.end_offset = end_offset;
+            target.content.push_str(&content);
+            if target.content.len() > COMMAND_SNAPSHOT_STREAM_BYTES {
+                let mut cut = target.content.len() - COMMAND_SNAPSHOT_STREAM_BYTES;
+                while cut < target.content.len() && !target.content.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                target.content.drain(..cut);
+                target.start_offset = end_offset.saturating_sub(target.content.len() as u64);
+                target.truncated = true;
+            }
+        }
+        let _ = self.inner.events.send(CommandEvent::Output {
+            command_id: command_id.to_string(),
+            stream,
+            start_offset,
+            end_offset,
+            content,
+            observed_at_ms,
+        });
+    }
+
+    fn terminal(&self, command_id: &str, status: CommandStatus, exit_code: Option<i32>) {
+        let observed_at_ms = command_observed_at_ms();
+        let (stdout_end_offset, stderr_end_offset) = if let Some(snapshot) = self
+            .inner
+            .snapshots
+            .lock()
+            .expect("command telemetry mutex poisoned")
+            .get_mut(command_id)
+        {
+            snapshot.status = status;
+            snapshot.exit_code = exit_code;
+            snapshot.observed_at_ms = observed_at_ms;
+            (snapshot.stdout.end_offset, snapshot.stderr.end_offset)
+        } else {
+            (0, 0)
+        };
+        let _ = self.inner.events.send(CommandEvent::Terminal {
+            command_id: command_id.to_string(),
+            status,
+            exit_code,
+            stdout_end_offset,
+            stderr_end_offset,
+            observed_at_ms,
+        });
+    }
+
+    fn remove(&self, command_id: &str) {
+        self.inner
+            .snapshots
+            .lock()
+            .expect("command telemetry mutex poisoned")
+            .remove(command_id);
+    }
 }
 
 #[derive(Debug)]
@@ -69,6 +227,7 @@ struct LocalWorkdirSessionInner {
     close_lock: Mutex<()>,
     next_command_id: AtomicU64,
     commands: Mutex<HashMap<String, LocalCommand>>,
+    command_telemetry: CommandTelemetry,
 }
 
 impl Drop for LocalWorkdirSessionInner {
@@ -171,6 +330,7 @@ impl LocalWorkdirSession {
                 close_lock: Mutex::new(()),
                 next_command_id: AtomicU64::new(1),
                 commands: Mutex::new(HashMap::new()),
+                command_telemetry: CommandTelemetry::new(),
             }),
         }
     }
@@ -502,23 +662,35 @@ impl WorkdirSession for LocalWorkdirSession {
 
     async fn start_command(&self, request: CommandRequest) -> Result<CommandHandle, WorkdirError> {
         self.ensure_capability(WorkdirSessionCapability::Command)?;
+        self.ensure_open()?;
         let id = self.inner.next_command_id.fetch_add(1, Ordering::Relaxed);
         let handle = CommandHandle(format!("command-{id}"));
         let cwd = self.inner.cwd.clone();
         let completion = Arc::new(Notify::new());
         let task_completion = Arc::clone(&completion);
+        let command_id = handle.0.clone();
+        let telemetry = self.inner.command_telemetry.clone();
+        let (cancel, cancel_rx) = watch::channel(false);
         let task = tokio::spawn(async move {
-            let output = run_command(cwd, request).await;
+            let output = run_command(cwd, request, command_id, telemetry, cancel_rx).await;
             task_completion.notify_one();
             output
         });
         let mut commands = self.inner.commands.lock().await;
         if let Err(error) = self.ensure_open() {
+            let _ = cancel.send(true);
             task.abort();
             completion.notify_one();
             return Err(error);
         }
-        commands.insert(handle.0.clone(), LocalCommand::Running { task, completion });
+        commands.insert(
+            handle.0.clone(),
+            LocalCommand::Running {
+                task,
+                completion,
+                cancel,
+            },
+        );
         Ok(handle)
     }
 
@@ -530,7 +702,13 @@ impl WorkdirSession for LocalWorkdirSession {
             .ok_or_else(|| WorkdirError::UnknownCommand(handle.0.clone()))?;
         Ok(match command {
             LocalCommand::Running { task, .. } if !task.is_finished() => CommandStatus::Running,
-            LocalCommand::Running { .. } => CommandStatus::Completed,
+            LocalCommand::Running { .. } => self
+                .inner
+                .command_telemetry
+                .snapshot()
+                .into_iter()
+                .find(|snapshot| snapshot.command_id == handle.0)
+                .map_or(CommandStatus::Completed, |snapshot| snapshot.status),
             LocalCommand::Completed(output) => output.status,
         })
     }
@@ -584,24 +762,49 @@ impl WorkdirSession for LocalWorkdirSession {
             if !self.inner.closed.load(Ordering::Acquire) {
                 commands.insert(request.handle.0, LocalCommand::Completed(output));
             }
+        } else {
+            self.inner.command_telemetry.remove(&request.handle.0);
         }
         Ok(page)
     }
 
     async fn cancel_command(&self, handle: CommandHandle) -> Result<(), WorkdirError> {
         self.ensure_capability(WorkdirSessionCapability::Command)?;
-        let command = self
-            .inner
-            .commands
-            .lock()
-            .await
-            .remove(&handle.0)
-            .ok_or_else(|| WorkdirError::UnknownCommand(handle.0))?;
-        if let LocalCommand::Running { task, completion } = command {
-            task.abort();
-            completion.notify_one();
+        let cancel = {
+            let commands = self.inner.commands.lock().await;
+            let command = commands
+                .get(&handle.0)
+                .ok_or_else(|| WorkdirError::UnknownCommand(handle.0.clone()))?;
+            match command {
+                LocalCommand::Running { task, cancel, .. } if !task.is_finished() => {
+                    Some(cancel.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(cancel) = cancel {
+            let _ = cancel.send(true);
         }
         Ok(())
+    }
+
+    fn subscribe_command_events(&self) -> Option<broadcast::Receiver<CommandEvent>> {
+        self.inner
+            .capabilities
+            .supports(WorkdirSessionCapability::Command)
+            .then(|| self.inner.command_telemetry.subscribe())
+    }
+
+    fn command_snapshot(&self) -> Vec<CommandSnapshot> {
+        if self
+            .inner
+            .capabilities
+            .supports(WorkdirSessionCapability::Command)
+        {
+            self.inner.command_telemetry.snapshot()
+        } else {
+            Vec::new()
+        }
     }
 
     async fn close(&self) -> Result<(), WorkdirError> {
@@ -609,11 +812,25 @@ impl WorkdirSession for LocalWorkdirSession {
         if self.inner.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        let mut commands = self.inner.commands.lock().await;
-        for (_, command) in commands.drain() {
-            if let LocalCommand::Running { task, completion } = command {
-                task.abort();
-                completion.notify_one();
+        let commands = {
+            let mut commands = self.inner.commands.lock().await;
+            commands
+                .drain()
+                .map(|(_, command)| command)
+                .collect::<Vec<_>>()
+        };
+        for command in commands {
+            match command {
+                LocalCommand::Running {
+                    task,
+                    completion,
+                    cancel,
+                } => {
+                    let _ = cancel.send(true);
+                    let _ = task.await;
+                    completion.notify_one();
+                }
+                LocalCommand::Completed(_) => {}
             }
         }
         Ok(())
@@ -680,7 +897,13 @@ fn sanitize_error(error: WorkdirError, logical: &WorkdirPath) -> WorkdirError {
     }
 }
 
-async fn run_command(cwd: PathBuf, request: CommandRequest) -> Result<CommandOutput, WorkdirError> {
+async fn run_command(
+    cwd: PathBuf,
+    request: CommandRequest,
+    command_id: String,
+    telemetry: CommandTelemetry,
+    mut cancel: watch::Receiver<bool>,
+) -> Result<CommandOutput, WorkdirError> {
     let stdout = tempfile::NamedTempFile::new().map_err(|error| WorkdirError::io(&cwd, error))?;
     let stderr = tempfile::NamedTempFile::new().map_err(|error| WorkdirError::io(&cwd, error))?;
     let stdout_path = stdout.into_temp_path();
@@ -690,7 +913,8 @@ async fn run_command(cwd: PathBuf, request: CommandRequest) -> Result<CommandOut
     let stderr_file = std::fs::File::create(&stderr_path)
         .map_err(|error| WorkdirError::io(&stderr_path, error))?;
 
-    let mut child = Command::new("bash")
+    telemetry.started(&command_id, request.tool_call_id.clone());
+    let mut child = match Command::new("bash")
         .arg("-c")
         .arg(&request.command)
         .current_dir(&cwd)
@@ -699,43 +923,186 @@ async fn run_command(cwd: PathBuf, request: CommandRequest) -> Result<CommandOut
         .stderr(Stdio::from(stderr_file))
         .kill_on_drop(true)
         .spawn()
-        .map_err(|error| WorkdirError::io(&cwd, error))?;
-
-    let timed_out = match tokio::time::timeout(
-        Duration::from_secs(request.timeout_secs.max(1)),
-        child.wait(),
-    )
-    .await
     {
-        Ok(result) => {
-            let status = result.map_err(|error| WorkdirError::io(&cwd, error))?;
-            let (content, truncated) =
-                read_command_output_files(&stdout_path, &stderr_path, request.output_limit.max(1))?;
-            return Ok(CommandOutput {
-                status: CommandStatus::Completed,
-                exit_code: status.code(),
-                timed_out: false,
-                content,
-                next_cursor: None,
-                truncated,
-            });
-        }
-        Err(_) => {
-            let _ = child.kill().await;
-            true
+        Ok(child) => child,
+        Err(error) => {
+            telemetry.terminal(&command_id, CommandStatus::Failed, None);
+            return Err(WorkdirError::io(&cwd, error));
         }
     };
+
+    let mut stdout_reader =
+        std::fs::File::open(&stdout_path).map_err(|error| WorkdirError::io(&stdout_path, error))?;
+    let mut stderr_reader =
+        std::fs::File::open(&stderr_path).map_err(|error| WorkdirError::io(&stderr_path, error))?;
+    let mut stdout_decoder = CommandOutputDecoder::default();
+    let mut stderr_decoder = CommandOutputDecoder::default();
+    let mut timeout = Box::pin(tokio::time::sleep(Duration::from_secs(
+        request.timeout_secs.max(1),
+    )));
+    let mut interval = tokio::time::interval(Duration::from_millis(50));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+
+    let (status, exit_code) = loop {
+        tokio::select! {
+            exit = child.wait() => {
+                let exit = exit.map_err(|error| WorkdirError::io(&cwd, error))?;
+                break (
+                    if exit.success() { CommandStatus::Completed } else { CommandStatus::Failed },
+                    exit.code(),
+                );
+            }
+            _ = &mut timeout => {
+                let _ = child.start_kill();
+                let exit_code = child.wait().await.ok().and_then(|status| status.code());
+                break (CommandStatus::TimedOut, exit_code);
+            }
+            changed = cancel.changed() => {
+                if changed.is_err() || *cancel.borrow() {
+                    let _ = child.start_kill();
+                    let exit_code = child.wait().await.ok().and_then(|status| status.code());
+                    break (CommandStatus::Cancelled, exit_code);
+                }
+            }
+            _ = interval.tick() => {
+                publish_available_output(
+                    &mut stdout_reader,
+                    &mut stdout_decoder,
+                    &telemetry,
+                    &command_id,
+                    CommandStream::Stdout,
+                    &stdout_path,
+                    false,
+                )?;
+                publish_available_output(
+                    &mut stderr_reader,
+                    &mut stderr_decoder,
+                    &telemetry,
+                    &command_id,
+                    CommandStream::Stderr,
+                    &stderr_path,
+                    false,
+                )?;
+            }
+        }
+    };
+
+    publish_available_output(
+        &mut stdout_reader,
+        &mut stdout_decoder,
+        &telemetry,
+        &command_id,
+        CommandStream::Stdout,
+        &stdout_path,
+        true,
+    )?;
+    publish_available_output(
+        &mut stderr_reader,
+        &mut stderr_decoder,
+        &telemetry,
+        &command_id,
+        CommandStream::Stderr,
+        &stderr_path,
+        true,
+    )?;
+    telemetry.terminal(&command_id, status, exit_code);
 
     let (content, truncated) =
         read_command_output_files(&stdout_path, &stderr_path, request.output_limit.max(1))?;
     Ok(CommandOutput {
-        status: CommandStatus::Failed,
-        exit_code: None,
-        timed_out,
+        status,
+        exit_code,
+        timed_out: status == CommandStatus::TimedOut,
         content,
         next_cursor: None,
         truncated,
     })
+}
+
+#[derive(Debug, Default)]
+struct CommandOutputDecoder {
+    read_offset: u64,
+    emitted_offset: u64,
+    pending: Vec<u8>,
+}
+
+fn publish_available_output(
+    file: &mut std::fs::File,
+    decoder: &mut CommandOutputDecoder,
+    telemetry: &CommandTelemetry,
+    command_id: &str,
+    stream: CommandStream,
+    path: &Path,
+    flush: bool,
+) -> Result<(), WorkdirError> {
+    file.seek(SeekFrom::Start(decoder.read_offset))
+        .map_err(|error| WorkdirError::io(path, error))?;
+    loop {
+        let mut buffer = vec![0; COMMAND_EVENT_CHUNK_BYTES];
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| WorkdirError::io(path, error))?;
+        if read == 0 {
+            publish_decoded_output(decoder, telemetry, command_id, stream, flush);
+            return Ok(());
+        }
+        decoder.pending.extend_from_slice(&buffer[..read]);
+        decoder.read_offset = decoder.read_offset.saturating_add(read as u64);
+        publish_decoded_output(decoder, telemetry, command_id, stream, false);
+        if read < COMMAND_EVENT_CHUNK_BYTES {
+            if flush {
+                publish_decoded_output(decoder, telemetry, command_id, stream, true);
+            }
+            return Ok(());
+        }
+    }
+}
+
+fn publish_decoded_output(
+    decoder: &mut CommandOutputDecoder,
+    telemetry: &CommandTelemetry,
+    command_id: &str,
+    stream: CommandStream,
+    flush: bool,
+) {
+    let prefix_len = if flush {
+        decoder.pending.len()
+    } else {
+        stable_utf8_prefix_len(&decoder.pending)
+    };
+    if prefix_len == 0 {
+        return;
+    }
+    telemetry.output(
+        command_id,
+        stream,
+        decoder.emitted_offset,
+        &decoder.pending[..prefix_len],
+    );
+    decoder.emitted_offset = decoder.emitted_offset.saturating_add(prefix_len as u64);
+    decoder.pending.drain(..prefix_len);
+}
+
+/// Return the byte prefix that can be decoded now without replacing a valid
+/// UTF-8 scalar whose remaining bytes may arrive in a later file read. Definite
+/// invalid sequences remain in the prefix and are rendered lossily, preserving
+/// the existing arbitrary-byte output behavior.
+fn stable_utf8_prefix_len(bytes: &[u8]) -> usize {
+    let mut inspected = 0;
+    while inspected < bytes.len() {
+        match std::str::from_utf8(&bytes[inspected..]) {
+            Ok(_) => return bytes.len(),
+            Err(error) => {
+                inspected += error.valid_up_to();
+                match error.error_len() {
+                    Some(invalid_len) => inspected += invalid_len,
+                    None => return inspected,
+                }
+            }
+        }
+    }
+    inspected
 }
 
 fn read_command_output_files(
@@ -1024,6 +1391,7 @@ mod tests {
                 command: "sleep 30".to_owned(),
                 timeout_secs: 60,
                 output_limit: 1024,
+                tool_call_id: None,
             },
         )
         .await
@@ -1549,6 +1917,7 @@ mod tests {
                 command: "pwd && printf provider-command".into(),
                 timeout_secs: 5,
                 output_limit: 4096,
+                tool_call_id: None,
             },
         )
         .await
@@ -1583,6 +1952,7 @@ mod tests {
                 command: "printf 'aéz'".into(),
                 timeout_secs: 5,
                 output_limit: 1024,
+                tool_call_id: None,
             },
         )
         .await
@@ -1620,6 +1990,213 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn command_output_decoder_preserves_utf8_split_across_file_reads() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("command.out");
+        let mut first_write = vec![b'a'; COMMAND_EVENT_CHUNK_BYTES - 1];
+        first_write.push(0xe2);
+        std::fs::write(&path, first_write).unwrap();
+
+        let telemetry = CommandTelemetry::new();
+        let mut events = telemetry.subscribe();
+        telemetry.started("command-utf8", None);
+        let mut decoder = CommandOutputDecoder::default();
+        let mut reader = std::fs::File::open(&path).unwrap();
+        publish_available_output(
+            &mut reader,
+            &mut decoder,
+            &telemetry,
+            "command-utf8",
+            CommandStream::Stdout,
+            &path,
+            false,
+        )
+        .unwrap();
+        assert_eq!(decoder.pending, vec![0xe2]);
+
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writer.write_all(&[0x82, 0xac]).unwrap();
+        writer.flush().unwrap();
+        publish_available_output(
+            &mut reader,
+            &mut decoder,
+            &telemetry,
+            "command-utf8",
+            CommandStream::Stdout,
+            &path,
+            false,
+        )
+        .unwrap();
+
+        let output = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                CommandEvent::Output {
+                    stream: CommandStream::Stdout,
+                    content,
+                    ..
+                } => Some(content),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(output.len(), COMMAND_EVENT_CHUNK_BYTES - 1 + "€".len());
+        assert!(output.ends_with('€'));
+        assert!(!output.contains('\u{fffd}'));
+        assert!(decoder.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_streams_bounded_command_lifecycle_and_distinct_output() {
+        let dir = TempDir::new().unwrap();
+        let workdir = make_fs(&dir);
+        let mut events = WorkdirSession::subscribe_command_events(&workdir)
+            .expect("local command observation must be available");
+        let handle = WorkdirSession::start_command(
+            &workdir,
+            CommandRequest {
+                command: "printf ready; printf warning >&2; sleep 0.2; printf done".into(),
+                timeout_secs: 5,
+                output_limit: 1024,
+                tool_call_id: Some("tool-7".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut stdout = String::new();
+        let mut stdout_chunks = 0;
+        let mut stderr = String::new();
+        let mut terminal = None;
+        while terminal.is_none() {
+            let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .expect("command telemetry should not stall")
+                .unwrap();
+            match event {
+                CommandEvent::Started {
+                    command_id,
+                    tool_call_id,
+                    ..
+                } => {
+                    assert_eq!(command_id, handle.0);
+                    assert_eq!(tool_call_id.as_deref(), Some("tool-7"));
+                }
+                CommandEvent::Output {
+                    command_id,
+                    stream,
+                    content,
+                    ..
+                } => {
+                    assert_eq!(command_id, handle.0);
+                    match stream {
+                        CommandStream::Stdout => {
+                            stdout_chunks += 1;
+                            stdout.push_str(&content);
+                        }
+                        CommandStream::Stderr => stderr.push_str(&content),
+                    }
+                }
+                CommandEvent::Terminal {
+                    command_id,
+                    status,
+                    exit_code,
+                    stdout_end_offset,
+                    stderr_end_offset,
+                    observed_at_ms,
+                } => {
+                    assert_eq!(command_id, handle.0);
+                    terminal = Some((
+                        status,
+                        exit_code,
+                        stdout_end_offset,
+                        stderr_end_offset,
+                        observed_at_ms,
+                    ));
+                }
+            }
+        }
+        let (status, exit_code, stdout_end_offset, stderr_end_offset, observed_at_ms) =
+            terminal.unwrap();
+        assert_eq!(status, CommandStatus::Completed);
+        assert_eq!(exit_code, Some(0));
+        assert_eq!(stdout_end_offset, "readydone".len() as u64);
+        assert_eq!(stderr_end_offset, "warning".len() as u64);
+        assert!(observed_at_ms > 0);
+        assert!(
+            stdout_chunks >= 2,
+            "long-running output should stream incrementally"
+        );
+        assert_eq!(stdout, "readydone");
+        assert_eq!(stderr, "warning");
+        let snapshot = WorkdirSession::command_snapshot(&workdir);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].status, CommandStatus::Completed);
+        assert_eq!(snapshot[0].stdout.content, "readydone");
+        assert_eq!(snapshot[0].stderr.content, "warning");
+
+        let output = WorkdirSession::command_output(
+            &workdir,
+            CommandOutputRequest {
+                handle,
+                cursor: 0,
+                limit: 1024,
+                wait: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.status, CommandStatus::Completed);
+        assert!(WorkdirSession::command_snapshot(&workdir).is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_distinguishes_timed_out_terminal_state() {
+        let dir = TempDir::new().unwrap();
+        let workdir = make_fs(&dir);
+        let mut events = WorkdirSession::subscribe_command_events(&workdir).unwrap();
+        let handle = WorkdirSession::start_command(
+            &workdir,
+            CommandRequest {
+                command: "sleep 30".into(),
+                timeout_secs: 1,
+                output_limit: 1024,
+                tool_call_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let output = WorkdirSession::command_output(
+            &workdir,
+            CommandOutputRequest {
+                handle: handle.clone(),
+                cursor: 0,
+                limit: 1024,
+                wait: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.status, CommandStatus::TimedOut);
+        assert!(output.timed_out);
+
+        let mut terminal = None;
+        while let Ok(event) = events.try_recv() {
+            if let CommandEvent::Terminal {
+                command_id,
+                status,
+                exit_code,
+                ..
+            } = event
+            {
+                terminal = Some((command_id, status, exit_code));
+            }
+        }
+        assert_eq!(terminal, Some((handle.0, CommandStatus::TimedOut, None)));
+    }
+
     #[tokio::test]
     async fn provider_cancels_active_command() {
         let dir = TempDir::new().unwrap();
@@ -1630,6 +2207,7 @@ mod tests {
                 command: "sleep 30".into(),
                 timeout_secs: 60,
                 output_limit: 1024,
+                tool_call_id: None,
             },
         )
         .await
@@ -1658,12 +2236,12 @@ mod tests {
         WorkdirSession::cancel_command(&workdir, handle.clone())
             .await
             .unwrap();
-        let waiter_error = tokio::time::timeout(Duration::from_secs(1), waiter)
+        let output = tokio::time::timeout(Duration::from_secs(1), waiter)
             .await
             .expect("cancel should wake command output waiters")
             .unwrap()
-            .unwrap_err();
-        assert!(matches!(waiter_error, WorkdirError::UnknownCommand(_)));
+            .unwrap();
+        assert_eq!(output.status, CommandStatus::Cancelled);
         assert!(matches!(
             WorkdirSession::command_status(&workdir, handle).await,
             Err(WorkdirError::UnknownCommand(_))

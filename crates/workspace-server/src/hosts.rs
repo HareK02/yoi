@@ -2447,6 +2447,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
 #[derive(Clone)]
 pub struct RemoteRuntimeConfig {
     pub runtime_id: String,
+    /// Explicit Workspace assignment granted by Server authority.
+    pub workspace_id: Option<String>,
     pub display_name: String,
     pub base_url: String,
     pub bearer_token: Option<String>,
@@ -2489,6 +2491,7 @@ impl RemoteRuntimeConfig {
     ) -> Self {
         Self {
             runtime_id: runtime_id.into(),
+            workspace_id: None,
             display_name: display_name.into(),
             base_url: base_url.into(),
             bearer_token,
@@ -2499,6 +2502,11 @@ impl RemoteRuntimeConfig {
             cached_status: "configured".to_string(),
             timeout: Duration::from_secs(10),
         }
+    }
+
+    pub fn with_workspace_id(mut self, workspace_id: impl Into<String>) -> Self {
+        self.workspace_id = Some(workspace_id.into());
+        self
     }
 
     pub fn with_cached_capabilities(mut self, capabilities: RuntimeCapabilitySummary) -> Self {

@@ -50,6 +50,7 @@ impl Tool for WriteTool {
             Err(error) => return Err(ToolsError::from(error).into()),
         };
 
+        let old_line_count = self.tracker.observed_workdir_line_count(&path).unwrap_or(0);
         let outcome = self
             .session
             .write(WriteRequest {
@@ -60,6 +61,8 @@ impl Tool for WriteTool {
             .await
             .map_err(ToolsError::from)?;
 
+        self.tracker
+            .record_change(params.content.lines().count(), old_line_count);
         self.tracker
             .record_workdir_content(&path, params.content.as_bytes());
 

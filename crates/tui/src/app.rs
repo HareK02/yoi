@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -283,6 +283,8 @@ pub struct App {
     /// Presentation-only Internal Worker projections keyed by session identity.
     /// They are rendered in separate sub-panes and never mixed into `blocks`.
     pub internal_workers: Vec<InternalWorkerView>,
+    /// Terminal child-session fences, reset only by an authoritative snapshot.
+    removed_internal_workers: HashMap<String, u64>,
     pub scroll: Scroll,
     pub mode: Mode,
     pub cache: FileCache,
@@ -361,6 +363,7 @@ impl App {
             blocks: Vec::new(),
             run_error_messages: Vec::new(),
             internal_workers: Vec::new(),
+            removed_internal_workers: HashMap::new(),
             scroll: Scroll::default(),
             mode: Mode::Normal,
             cache: FileCache::new(),
@@ -1318,10 +1321,16 @@ impl App {
                 revision,
                 event,
             } => self.apply_internal_worker_event(worker, revision, *event),
+            Event::InternalWorkerRemoved { worker, revision } => {
+                self.remove_internal_worker(worker, revision)
+            }
             Event::Status { status } => {
                 self.rewind_refresh_fence = false;
                 self.set_worker_status(status);
             }
+            // Command telemetry is an operational Web Console surface. The
+            // TUI continues to render the final Bash ToolResult from history.
+            Event::Command { .. } => {}
             Event::Completions { kind, entries } => {
                 // Apply only if the popup is still on the same
                 // (kind, prefix) the request was issued for; an
@@ -2002,6 +2011,7 @@ impl App {
             .into_iter()
             .map(Self::internal_worker_view_from_snapshot)
             .collect();
+        self.removed_internal_workers.clear();
     }
 
     fn internal_worker_view_from_snapshot(snapshot: InternalWorkerSnapshot) -> InternalWorkerView {
@@ -2029,6 +2039,12 @@ impl App {
         revision: u64,
         event: Event,
     ) {
+        if self
+            .removed_internal_workers
+            .contains_key(&worker.session_id)
+        {
+            return;
+        }
         let index = self
             .internal_workers
             .iter()
@@ -2049,6 +2065,26 @@ impl App {
         target.worker = worker;
         target.revision = revision;
         let _ = target.app.handle_worker_event(event);
+    }
+
+    fn remove_internal_worker(&mut self, worker: InternalWorkerRef, revision: u64) {
+        let Some(index) = self
+            .internal_workers
+            .iter()
+            .position(|candidate| candidate.worker.session_id == worker.session_id)
+        else {
+            self.removed_internal_workers
+                .entry(worker.session_id)
+                .and_modify(|current| *current = (*current).max(revision))
+                .or_insert(revision);
+            return;
+        };
+        if revision <= self.internal_workers[index].revision {
+            return;
+        }
+        self.internal_workers.remove(index);
+        self.removed_internal_workers
+            .insert(worker.session_id, revision);
     }
 
     fn restore_snapshot(
@@ -3474,6 +3510,7 @@ mod completion_flow_tests {
                         finished: false,
                     },
                 ],
+                commands: Vec::new(),
             },
             internal_workers: Vec::new(),
         });
@@ -3544,6 +3581,84 @@ mod completion_flow_tests {
                 |block| matches!(block, Block::AssistantText { text } if text == "child output")
             )
         );
+    }
+
+    #[test]
+    fn terminal_internal_worker_removal_drops_descendants_and_fences_late_events() {
+        let mut app = App::new("parent".into());
+        let worker = InternalWorkerRef {
+            session_id: "child-session".into(),
+            name: "child".into(),
+            parent_session_id: Some("parent-session".into()),
+            kind: protocol::InternalWorkerKind::SubWorker,
+        };
+        let nested = InternalWorkerRef {
+            session_id: "grandchild-session".into(),
+            name: "grandchild".into(),
+            parent_session_id: Some("child-session".into()),
+            kind: protocol::InternalWorkerKind::SubWorker,
+        };
+        app.handle_worker_event(Event::InternalWorker {
+            worker: worker.clone(),
+            revision: 2,
+            event: Box::new(Event::InternalWorker {
+                worker: nested,
+                revision: 1,
+                event: Box::new(Event::TextDone {
+                    text: "nested".into(),
+                }),
+            }),
+        });
+        assert_eq!(app.internal_workers.len(), 1);
+        assert_eq!(app.internal_workers[0].app.internal_workers.len(), 1);
+
+        app.handle_worker_event(Event::InternalWorkerRemoved {
+            worker: worker.clone(),
+            revision: 3,
+        });
+        app.handle_worker_event(Event::InternalWorker {
+            worker,
+            revision: 4,
+            event: Box::new(Event::TextDone {
+                text: "late".into(),
+            }),
+        });
+
+        assert!(app.internal_workers.is_empty());
+        app.handle_worker_event(Event::Snapshot {
+            greeting: test_greeting(),
+            entries: Vec::new(),
+            status: WorkerStatus::Idle,
+            in_flight: Default::default(),
+            internal_workers: Vec::new(),
+        });
+        assert!(app.internal_workers.is_empty());
+        assert!(app.removed_internal_workers.is_empty());
+    }
+
+    #[test]
+    fn stale_internal_worker_removal_keeps_newer_projection() {
+        let mut app = App::new("parent".into());
+        let worker = InternalWorkerRef {
+            session_id: "child-session".into(),
+            name: "child".into(),
+            parent_session_id: Some("parent-session".into()),
+            kind: protocol::InternalWorkerKind::SubWorker,
+        };
+        app.handle_worker_event(Event::InternalWorker {
+            worker: worker.clone(),
+            revision: 4,
+            event: Box::new(Event::TextDone {
+                text: "current".into(),
+            }),
+        });
+        app.handle_worker_event(Event::InternalWorkerRemoved {
+            worker,
+            revision: 3,
+        });
+
+        assert_eq!(app.internal_workers.len(), 1);
+        assert_eq!(app.internal_workers[0].revision, 4);
     }
 
     #[test]

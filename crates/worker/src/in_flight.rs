@@ -1,8 +1,13 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use protocol::{Event, InFlightBlock, InFlightSnapshot, InFlightToolCallState};
+use protocol::{
+    CommandEvent, CommandSnapshot, CommandStatus, CommandStream, CommandStreamSlice, Event,
+    InFlightBlock, InFlightSnapshot, InFlightToolCallState,
+};
 use session_store::{LoggedContentPart, LoggedItem};
 use tokio::sync::broadcast;
+
+const COMMAND_SNAPSHOT_STREAM_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InFlightBlockId(u64);
@@ -17,6 +22,7 @@ pub struct InFlightEvents {
 pub(crate) struct InFlightInner {
     next_block_id: u64,
     blocks: Vec<TrackedBlock>,
+    commands: Vec<CommandSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +52,7 @@ impl InFlightEvents {
             inner: Arc::new(Mutex::new(InFlightInner {
                 next_block_id: 1,
                 blocks: Vec::new(),
+                commands: Vec::new(),
             })),
             event_tx,
         }
@@ -201,6 +208,15 @@ impl InFlightEvents {
         f()
     }
 
+    pub(crate) fn publish_command_event(&self, event: CommandEvent) {
+        self.lock().apply_command_event(&event);
+        let _ = self.event_tx.send(Event::Command { event });
+    }
+
+    pub(crate) fn replace_command_snapshot(&self, commands: Vec<CommandSnapshot>) {
+        self.lock().commands = commands;
+    }
+
     pub(crate) fn clear(&self) {
         let mut inner = self.lock();
         inner.clear();
@@ -222,6 +238,92 @@ impl InFlightInner {
         self.blocks
             .iter_mut()
             .find(|block| block.block_id() == block_id)
+    }
+
+    fn apply_command_event(&mut self, event: &CommandEvent) {
+        match event {
+            CommandEvent::Started {
+                command_id,
+                tool_call_id,
+                observed_at_ms,
+            } => {
+                self.commands
+                    .retain(|command| command.command_id != *command_id);
+                self.commands.push(CommandSnapshot {
+                    command_id: command_id.clone(),
+                    tool_call_id: tool_call_id.clone(),
+                    status: CommandStatus::Running,
+                    started_at_ms: *observed_at_ms,
+                    observed_at_ms: *observed_at_ms,
+                    last_output_at_ms: None,
+                    stdout: CommandStreamSlice::default(),
+                    stderr: CommandStreamSlice::default(),
+                    exit_code: None,
+                });
+            }
+            CommandEvent::Output {
+                command_id,
+                stream,
+                start_offset,
+                end_offset,
+                content,
+                observed_at_ms,
+            } => {
+                let command = match self
+                    .commands
+                    .iter_mut()
+                    .find(|command| command.command_id == *command_id)
+                {
+                    Some(command) => command,
+                    None => {
+                        self.commands.push(CommandSnapshot {
+                            command_id: command_id.clone(),
+                            tool_call_id: None,
+                            status: CommandStatus::Running,
+                            started_at_ms: *observed_at_ms,
+                            observed_at_ms: *observed_at_ms,
+                            last_output_at_ms: Some(*observed_at_ms),
+                            stdout: CommandStreamSlice::default(),
+                            stderr: CommandStreamSlice::default(),
+                            exit_code: None,
+                        });
+                        self.commands.last_mut().expect("command was inserted")
+                    }
+                };
+                command.observed_at_ms = *observed_at_ms;
+                command.last_output_at_ms = Some(*observed_at_ms);
+                let target = match stream {
+                    CommandStream::Stdout => &mut command.stdout,
+                    CommandStream::Stderr => &mut command.stderr,
+                };
+                if target.end_offset != *start_offset {
+                    target.content.clear();
+                    target.start_offset = *start_offset;
+                    target.truncated = *start_offset > 0;
+                }
+                target.content.push_str(content);
+                target.end_offset = *end_offset;
+                if target.content.len() > COMMAND_SNAPSHOT_STREAM_BYTES {
+                    let mut cut = target.content.len() - COMMAND_SNAPSHOT_STREAM_BYTES;
+                    while cut < target.content.len() && !target.content.is_char_boundary(cut) {
+                        cut += 1;
+                    }
+                    target.content.drain(..cut);
+                    target.start_offset = target
+                        .end_offset
+                        .saturating_sub(target.content.len() as u64);
+                    target.truncated = true;
+                }
+            }
+            CommandEvent::Terminal { command_id, .. } => {
+                // Terminal state is delivered as a live protocol event. It is
+                // no longer in-flight snapshot state, and removing it here
+                // also prevents queued output from an aborted turn from
+                // surviving the subsequent terminal event after `clear()`.
+                self.commands
+                    .retain(|command| command.command_id != *command_id);
+            }
+        }
     }
 
     fn clear_for_committed_item(&mut self, item: &LoggedItem) {
@@ -273,14 +375,16 @@ impl InFlightInner {
                 .iter()
                 .filter_map(TrackedBlock::to_snapshot_block)
                 .collect(),
+            commands: self.commands.clone(),
         }
     }
 
     fn clear(&mut self) -> bool {
-        if self.blocks.is_empty() {
+        if self.blocks.is_empty() && self.commands.is_empty() {
             false
         } else {
             self.blocks.clear();
+            self.commands.clear();
             true
         }
     }
@@ -581,6 +685,57 @@ mod tests {
                 finished: false,
             }]
         );
+    }
+
+    #[test]
+    fn command_events_are_bounded_and_recoverable_from_snapshot() {
+        let (event_tx, _) = broadcast::channel(16);
+        let mut rx = event_tx.subscribe();
+        let in_flight = InFlightEvents::new(event_tx);
+        in_flight.publish_command_event(CommandEvent::Started {
+            command_id: "command-1".into(),
+            tool_call_id: Some("tool-1".into()),
+            observed_at_ms: 100,
+        });
+        in_flight.publish_command_event(CommandEvent::Output {
+            command_id: "command-1".into(),
+            stream: CommandStream::Stdout,
+            start_offset: 0,
+            end_offset: 5,
+            content: "ready".into(),
+            observed_at_ms: 110,
+        });
+
+        let guard = in_flight.snapshot_guard();
+        let snapshot = snapshot_from_guard(&guard);
+        assert_eq!(snapshot.commands.len(), 1);
+        assert_eq!(snapshot.commands[0].tool_call_id.as_deref(), Some("tool-1"));
+        assert_eq!(snapshot.commands[0].stdout.content, "ready");
+        assert_eq!(snapshot.commands[0].status, CommandStatus::Running);
+        drop(guard);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Event::Command {
+                event: CommandEvent::Started { .. }
+            }
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Event::Command {
+                event: CommandEvent::Output { .. }
+            }
+        ));
+
+        in_flight.publish_command_event(CommandEvent::Terminal {
+            command_id: "command-1".into(),
+            status: CommandStatus::TimedOut,
+            exit_code: None,
+            stdout_end_offset: 5,
+            stderr_end_offset: 0,
+            observed_at_ms: 200,
+        });
+        let guard = in_flight.snapshot_guard();
+        assert!(snapshot_from_guard(&guard).commands.is_empty());
     }
 
     #[test]

@@ -337,6 +337,137 @@ Deno.test("projectConsole groups tool call lifecycle into one Call block", () =>
   );
 });
 
+Deno.test("projectConsole streams distinct Bash stdout and stderr through terminal status", () => {
+  const projection = projectConsole([
+    {
+      eventId: "command-tool",
+      event: {
+        event: "tool_call_done",
+        data: {
+          id: "bash-stream",
+          name: "Bash",
+          arguments: JSON.stringify({ command: "long-command" }),
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "command-started",
+      event: {
+        event: "command",
+        data: {
+          event: {
+            kind: "started",
+            command_id: "command-1",
+            tool_call_id: "bash-stream",
+            observed_at_ms: 1000,
+          },
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "command-stdout",
+      event: {
+        event: "command",
+        data: {
+          event: {
+            kind: "output",
+            command_id: "command-1",
+            stream: "stdout",
+            start_offset: 0,
+            end_offset: 6,
+            content: "ready\n",
+            observed_at_ms: 1100,
+          },
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "command-stderr",
+      event: {
+        event: "command",
+        data: {
+          event: {
+            kind: "output",
+            command_id: "command-1",
+            stream: "stderr",
+            start_offset: 0,
+            end_offset: 5,
+            content: "warn\n",
+            observed_at_ms: 1200,
+          },
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "command-terminal",
+      event: {
+        event: "command",
+        data: {
+          event: {
+            kind: "terminal",
+            command_id: "command-1",
+            status: "failed",
+            exit_code: 7,
+            stdout_end_offset: 6,
+            stderr_end_offset: 5,
+            observed_at_ms: 1300,
+          },
+        },
+      } satisfies Event,
+    },
+  ]);
+
+  const [line] = projection.lines.filter((line) => line.kind === "tool");
+  assert(line.body.includes("Bash — failed (exit 7)"), line.body);
+  assert(line.body.includes("elapsed 300ms"), line.body);
+  assert(line.body.includes("stdout:\nready\n"), line.body);
+  assert(line.body.includes("stderr:\nwarn\n"), line.body);
+  assertEquals(line.streaming, false);
+  assertEquals(line.error, true);
+});
+
+Deno.test("snapshot restores bounded in-flight Bash command output", () => {
+  const snapshot = snapshotEvent("/repo");
+  if (snapshot.event !== "snapshot") throw new Error("snapshot fixture expected");
+  snapshot.data.status = "running";
+  snapshot.data.in_flight = {
+    blocks: [{
+      kind: "tool_call",
+      id: "bash-snapshot",
+      name: "Bash",
+      args: JSON.stringify({ command: "slow" }),
+      state: "done",
+    }],
+    commands: [{
+      command_id: "command-2",
+      tool_call_id: "bash-snapshot",
+      status: "running",
+      started_at_ms: 1000,
+      observed_at_ms: 1250,
+      last_output_at_ms: 1200,
+      stdout: {
+        start_offset: 1024,
+        end_offset: 1031,
+        content: "tail\n",
+        truncated: true,
+      },
+      stderr: { start_offset: 0, end_offset: 0, content: "", truncated: false },
+      exit_code: null,
+    }],
+  };
+
+  const projection = projectConsole([{ eventId: "snapshot-command", event: snapshot }]);
+  const [line] = projection.lines.filter((line) => line.kind === "tool");
+  assert(line.body.includes("Bash — running…"), line.body);
+  assert(
+    line.body.includes("elapsed 250ms · last output at +200ms"),
+    line.body,
+  );
+  assert(line.body.includes("[stdout tail; earlier output omitted]"), line.body);
+  assert(line.body.includes("stdout:\ntail\n"), line.body);
+  assertEquals(line.streaming, true);
+});
+
 Deno.test("projectConsole caps default tool request and result previews", () => {
   const projection = projectConsole([
     {
@@ -1295,7 +1426,10 @@ Deno.test("Internal Worker output stays separate and revision-fenced", () => {
   }]);
   assertEquals(projection.lines, []);
   assertEquals(projection.internalWorkers.length, 1);
-  assertEquals(projection.internalWorkers[0].console.lines[0].body, "child output");
+  assertEquals(
+    projection.internalWorkers[0].console.lines[0].body,
+    "child output",
+  );
 
   projection = projector.append([{
     eventId: "2",
@@ -1372,13 +1506,110 @@ Deno.test("parent snapshot authoritatively replaces Internal Worker projections"
     },
   }]);
   const projection = projector.append([{ eventId: "snapshot", event }]);
-  assertEquals(projection.internalWorkers.map((worker) => worker.worker.session_id), [
-    "replacement",
-  ]);
+  assertEquals(
+    projection.internalWorkers.map((worker) => worker.worker.session_id),
+    [
+      "replacement",
+    ],
+  );
   const childLines = projection.internalWorkers[0].console.lines;
   assertEquals(childLines.length, 1);
   assertEquals(new Set(childLines.map((line) => line.id)).size, 1);
   assertEquals(childLines[0].kind, "tool");
+});
+
+Deno.test("terminal Internal Worker removal drops descendants and fences late events", () => {
+  const worker = {
+    session_id: "child-session",
+    name: "child",
+    parent_session_id: "parent-session",
+    kind: "sub_worker" as const,
+  };
+  const nestedWorker = {
+    session_id: "grandchild-session",
+    name: "grandchild",
+    parent_session_id: "child-session",
+    kind: "sub_worker" as const,
+  };
+  const projector = createConsoleProjector();
+  let projection = projector.append([{
+    eventId: "child",
+    event: {
+      event: "internal_worker",
+      data: {
+        worker,
+        revision: 2,
+        event: {
+          event: "internal_worker",
+          data: {
+            worker: nestedWorker,
+            revision: 1,
+            event: { event: "text_done", data: { text: "nested" } },
+          },
+        },
+      },
+    },
+  }]);
+  assertEquals(projection.internalWorkers.length, 1);
+  assertEquals(
+    projection.internalWorkers[0].console.internalWorkers.length,
+    1,
+  );
+
+  projection = projector.append([{
+    eventId: "removed",
+    event: {
+      event: "internal_worker_removed",
+      data: { worker, revision: 3 },
+    },
+  }, {
+    eventId: "late",
+    event: {
+      event: "internal_worker",
+      data: {
+        worker,
+        revision: 4,
+        event: { event: "text_done", data: { text: "must stay removed" } },
+      },
+    },
+  }]);
+  assertEquals(projection.internalWorkers, []);
+
+  const snapshot = snapshotEvent("/repo");
+  projection = projector.append([{ eventId: "snapshot", event: snapshot }]);
+  assertEquals(projection.internalWorkers, []);
+  assertEquals(projection.removedInternalWorkers, {});
+});
+
+Deno.test("stale Internal Worker removal cannot discard a newer projection", () => {
+  const worker = {
+    session_id: "child-session",
+    name: "child",
+    parent_session_id: "parent-session",
+    kind: "sub_worker" as const,
+  };
+  const projector = createConsoleProjector();
+  projector.append([{
+    eventId: "current",
+    event: {
+      event: "internal_worker",
+      data: {
+        worker,
+        revision: 4,
+        event: { event: "text_done", data: { text: "current" } },
+      },
+    },
+  }]);
+
+  const projection = projector.append([{
+    eventId: "stale-removal",
+    event: {
+      event: "internal_worker_removed",
+      data: { worker, revision: 3 },
+    },
+  }]);
+  assertEquals(projection.internalWorkers.length, 1);
+  assertEquals(projection.internalWorkers[0].revision, 4);
 });
 
 Deno.test("snapshot restores TaskStore state from system history", () => {

@@ -7,17 +7,20 @@
 //! Parent registry drop closes all session handles and synchronously returns delegated Write deny
 //! rules to the parent scope.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::time::Instant;
+
+use serde::{Deserialize, Serialize};
 
 use manifest::{Permission, ScopeRule, SharedScope};
 use protocol::{Event, InternalWorkerKind, InternalWorkerRef, InternalWorkerSnapshot};
 use session_store::{
-    WorkerMetadataStore, WorkerReclaimedChild, WorkerSpawnedChild, WorkerStoreError,
+    LoggedItem, WorkerMetadataStore, WorkerReclaimedChild, WorkerSpawnedChild, WorkerStoreError,
 };
 use tokio::sync::broadcast;
 use tracing::warn;
@@ -27,6 +30,39 @@ use crate::internal_worker::{InternalWorkerSessionHandle, InternalWorkerVisibili
 use crate::runtime::dir::{RuntimeDir, SpawnedWorkerRecord};
 use crate::runtime::worker_allocation;
 
+const STOP_SUMMARY_TOOL_LIMIT: usize = 16;
+const STOP_SUMMARY_TOOL_NAME_LIMIT: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SubWorkerFinalOutcome {
+    Done,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SubWorkerToolCount {
+    pub name: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SubWorkerChangeStat {
+    pub added: u64,
+    pub deleted: u64,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SubWorkerStopSummary {
+    pub session_id: String,
+    pub display_name: String,
+    pub outcome: SubWorkerFinalOutcome,
+    pub elapsed_ms: u64,
+    pub tool_counts: Vec<SubWorkerToolCount>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_stat: Option<SubWorkerChangeStat>,
+}
+
 #[derive(Clone)]
 pub(crate) struct InternalSpawnedWorkerRecord {
     pub worker_name: String,
@@ -35,8 +71,13 @@ pub(crate) struct InternalSpawnedWorkerRecord {
     #[cfg(test)]
     pub installed_tools: Arc<[String]>,
     pub session: InternalWorkerSessionHandle,
+    change_tracker: Option<tools::Tracker>,
+    started_at: Instant,
+    stop_lock: Arc<tokio::sync::Mutex<()>>,
     scope_reclaimed: Arc<AtomicBool>,
     protocol_revision: Arc<AtomicU64>,
+    protocol_emit_lock: Arc<Mutex<()>>,
+    protocol_terminal: Arc<AtomicBool>,
     forwarding_started: Arc<AtomicBool>,
 }
 
@@ -47,6 +88,7 @@ impl InternalSpawnedWorkerRecord {
         workdir_delegation: WorkdirDelegation,
         #[cfg(test)] installed_tools: Vec<String>,
         session: InternalWorkerSessionHandle,
+        change_tracker: Option<tools::Tracker>,
     ) -> Self {
         Self {
             worker_name,
@@ -55,9 +97,61 @@ impl InternalSpawnedWorkerRecord {
             #[cfg(test)]
             installed_tools: installed_tools.into(),
             session,
+            change_tracker,
+            started_at: Instant::now(),
+            stop_lock: Arc::new(tokio::sync::Mutex::new(())),
             scope_reclaimed: Arc::new(AtomicBool::new(false)),
             protocol_revision: Arc::new(AtomicU64::new(0)),
+            protocol_emit_lock: Arc::new(Mutex::new(())),
+            protocol_terminal: Arc::new(AtomicBool::new(false)),
             forwarding_started: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn stop_summary(&self) -> SubWorkerStopSummary {
+        let mut counts = BTreeMap::<String, u64>::new();
+        for entry in self.session.entries() {
+            if let session_store::LogEntry::AssistantItem {
+                item: LoggedItem::ToolCall { name, .. },
+                ..
+            } = entry
+            {
+                let count = counts.entry(bounded_tool_name(&name)).or_default();
+                *count = count.saturating_add(1);
+            }
+        }
+        let mut tool_counts = counts
+            .into_iter()
+            .map(|(name, count)| SubWorkerToolCount { name, count })
+            .collect::<Vec<_>>();
+        tool_counts.sort_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        tool_counts.truncate(STOP_SUMMARY_TOOL_LIMIT);
+
+        let change_stat = self.change_tracker.as_ref().and_then(|tracker| {
+            let stat = tracker.change_stat();
+            (stat.added > 0 || stat.deleted > 0).then(|| SubWorkerChangeStat {
+                added: stat.added,
+                deleted: stat.deleted,
+                source: "tracked_write_edit_tools".to_string(),
+            })
+        });
+
+        SubWorkerStopSummary {
+            session_id: self.session.session_id_string(),
+            display_name: self.worker_name.clone(),
+            outcome: SubWorkerFinalOutcome::Done,
+            elapsed_ms: self
+                .started_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+            tool_counts,
+            change_stat,
         }
     }
 
@@ -277,12 +371,20 @@ impl SpawnedWorkerRegistry {
         };
         let worker = record.protocol_ref(Some(parent_session_id));
         let protocol_revision = record.protocol_revision.clone();
+        let protocol_emit_lock = record.protocol_emit_lock.clone();
+        let protocol_terminal = record.protocol_terminal.clone();
         let mut child_rx = record.session.subscribe_events();
         tokio::spawn(async move {
             loop {
                 match child_rx.recv().await {
                     Ok(event) => {
                         let shutdown = matches!(event, Event::Shutdown);
+                        let _emit_guard = protocol_emit_lock
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        if protocol_terminal.load(Ordering::Acquire) {
+                            break;
+                        }
                         let revision = protocol_revision.fetch_add(1, Ordering::AcqRel) + 1;
                         let _ = parent_tx.send(Event::InternalWorker {
                             worker: worker.clone(),
@@ -294,6 +396,12 @@ impl SpawnedWorkerRegistry {
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        let _emit_guard = protocol_emit_lock
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        if protocol_terminal.load(Ordering::Acquire) {
+                            break;
+                        }
                         let revision = protocol_revision.fetch_add(1, Ordering::AcqRel) + 1;
                         let _ = parent_tx.send(Event::InternalWorker {
                             worker: worker.clone(),
@@ -385,13 +493,34 @@ impl SpawnedWorkerRegistry {
         result
     }
 
+    /// Stop one direct Internal SubWorker and discard its registry/scope state.
+    ///
+    /// The child actor must acknowledge its stop before the registry is removed.
+    /// After scope reclamation and removal, `InternalWorkerRemoved` is published
+    /// exactly once as the parent-stream terminal fence. Callers only receive
+    /// `Done` after all authoritative cleanup succeeds.
     pub(crate) async fn remove_internal(
         &self,
         worker_name: &str,
-    ) -> io::Result<Option<InternalSpawnedWorkerRecord>> {
-        if let Some(record) = self.get_internal(worker_name) {
-            self.reclaim_record_scope(&record)?;
+    ) -> io::Result<Option<SubWorkerStopSummary>> {
+        let Some(record) = self.get_internal(worker_name) else {
+            return Ok(None);
+        };
+        let _stop_guard = record.stop_lock.lock().await;
+        let still_registered = self.get_internal(worker_name).is_some_and(|current| {
+            current.session.session_id_string() == record.session.session_id_string()
+        });
+        if !still_registered {
+            return Ok(None);
         }
+
+        record
+            .session
+            .stop()
+            .await
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let summary = record.stop_summary();
+        self.reclaim_record_scope(&record)?;
         let removed =
             {
                 let mut records = self.internal_records.lock().map_err(|_| {
@@ -402,14 +531,41 @@ impl SpawnedWorkerRegistry {
                 })?;
                 let removed = records
                     .iter()
-                    .position(|record| record.worker_name == worker_name)
+                    .position(|candidate| {
+                        candidate.worker_name == worker_name
+                            && candidate.session.session_id_string()
+                                == record.session.session_id_string()
+                    })
                     .map(|index| records.remove(index));
                 if removed.is_some() {
                     names.remove(worker_name);
                 }
                 removed
             };
-        Ok(removed)
+        if removed.is_some() {
+            self.publish_internal_removal(&record);
+        }
+        Ok(removed.map(|_| summary))
+    }
+
+    fn publish_internal_removal(&self, record: &InternalSpawnedWorkerRecord) {
+        if record.session.visibility() != InternalWorkerVisibility::ParentClient {
+            return;
+        }
+        let Some((parent_tx, parent_session_id)) = self.parent_protocol.lock().unwrap().clone()
+        else {
+            return;
+        };
+        let _emit_guard = record
+            .protocol_emit_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        record.protocol_terminal.store(true, Ordering::Release);
+        let revision = record.protocol_revision.fetch_add(1, Ordering::AcqRel) + 1;
+        let _ = parent_tx.send(Event::InternalWorkerRemoved {
+            worker: record.protocol_ref(Some(parent_session_id)),
+            revision,
+        });
     }
 }
 
@@ -508,6 +664,17 @@ fn record_from_worker_state(child: &WorkerSpawnedChild) -> io::Result<SpawnedWor
     })
 }
 
+fn bounded_tool_name(name: &str) -> String {
+    let mut bounded = name
+        .chars()
+        .take(STOP_SUMMARY_TOOL_NAME_LIMIT)
+        .collect::<String>();
+    if name.chars().count() > STOP_SUMMARY_TOOL_NAME_LIMIT {
+        bounded.push('…');
+    }
+    bounded
+}
+
 fn store_error_to_io(error: WorkerStoreError) -> io::Error {
     io::Error::other(error)
 }
@@ -520,7 +687,7 @@ mod tests {
     use session_store::LogEntry;
 
     use super::*;
-    use crate::internal_worker::test_internal_worker_session;
+    use crate::internal_worker::{InternalWorkerSessionStatus, test_internal_worker_session};
 
     fn registry() -> Arc<SpawnedWorkerRegistry> {
         let scope = Scope::from_config(&ScopeConfig {
@@ -577,6 +744,7 @@ mod tests {
                 delegation,
                 Vec::new(),
                 session,
+                None,
             ),
             sender,
         )
@@ -668,5 +836,125 @@ mod tests {
                 .is_err()
         );
         assert!(registry.internal_worker_snapshots().is_empty());
+    }
+
+    fn install_record(registry: &SpawnedWorkerRegistry, record: InternalSpawnedWorkerRecord) {
+        registry
+            .internal_names
+            .lock()
+            .unwrap()
+            .insert(record.worker_name.clone());
+        registry.internal_records.lock().unwrap().push(record);
+    }
+
+    #[tokio::test]
+    async fn stop_removes_internal_worker_and_returns_bounded_summary() {
+        let registry = registry();
+        let (parent_tx, mut parent_rx) = broadcast::channel(32);
+        registry.attach_parent_protocol(parent_tx, "parent-session".into());
+        let tracker = tools::Tracker::new();
+        tracker.record_change(12, 4);
+        let (mut record, _events) = record("child", InternalWorkerVisibility::ParentClient).await;
+        record.change_tracker = Some(tracker);
+        for (index, name) in ["Read", "Read", "Grep"].into_iter().enumerate() {
+            record.session.publish_test_entry(LogEntry::AssistantItem {
+                ts: index as u64,
+                item: LoggedItem::ToolCall {
+                    call_id: format!("call-{index}"),
+                    name: name.to_string(),
+                    arguments: "{}".to_string(),
+                },
+            });
+        }
+        registry.start_protocol_forwarding(record.clone());
+        install_record(&registry, record);
+
+        let summary = registry.remove_internal("child").await.unwrap().unwrap();
+
+        assert_eq!(summary.display_name, "child");
+        assert_eq!(summary.outcome, SubWorkerFinalOutcome::Done);
+        assert_eq!(
+            summary.tool_counts,
+            vec![
+                SubWorkerToolCount {
+                    name: "Read".to_string(),
+                    count: 2,
+                },
+                SubWorkerToolCount {
+                    name: "Grep".to_string(),
+                    count: 1,
+                },
+            ]
+        );
+        assert_eq!(
+            summary.change_stat,
+            Some(SubWorkerChangeStat {
+                added: 12,
+                deleted: 4,
+                source: "tracked_write_edit_tools".to_string(),
+            })
+        );
+        assert!(registry.get_internal("child").is_none());
+        let terminal_revision = loop {
+            if let Event::InternalWorkerRemoved { worker, revision } =
+                parent_rx.recv().await.unwrap()
+            {
+                assert_eq!(worker.session_id, summary.session_id);
+                assert!(revision > 0);
+                break revision;
+            }
+        };
+        assert!(registry.remove_internal("child").await.unwrap().is_none());
+        while let Ok(Ok(event)) =
+            tokio::time::timeout(Duration::from_millis(20), parent_rx.recv()).await
+        {
+            assert!(!matches!(event, Event::InternalWorkerRemoved { .. }));
+            if let Event::InternalWorker { revision, .. } = event {
+                assert!(revision > terminal_revision);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn running_worker_is_stopped_before_removal() {
+        let registry = registry();
+        let (record, _events) = record("running", InternalWorkerVisibility::ParentClient).await;
+        record
+            .session
+            .force_status(InternalWorkerSessionStatus::Running);
+        install_record(&registry, record);
+
+        let summary = registry.remove_internal("running").await.unwrap().unwrap();
+
+        assert_eq!(summary.outcome, SubWorkerFinalOutcome::Done);
+        assert!(registry.get_internal("running").is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_failure_keeps_registry_and_emits_no_removal() {
+        let registry = registry();
+        let (parent_tx, mut parent_rx) = broadcast::channel(8);
+        registry.attach_parent_protocol(parent_tx, "parent-session".into());
+        let (record, _events) = record("child", InternalWorkerVisibility::ParentClient).await;
+        record.session.force_stop_failure();
+        install_record(&registry, record);
+
+        let error = registry.remove_internal("child").await.unwrap_err();
+
+        assert!(error.to_string().contains("unavailable"));
+        assert!(registry.get_internal("child").is_some());
+        assert!(matches!(
+            parent_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_only_summary_omits_unavailable_change_stat() {
+        let tracker = tools::Tracker::new();
+        let (mut record, _events) = record("reader", InternalWorkerVisibility::ParentClient).await;
+        record.change_tracker = Some(tracker);
+
+        assert_eq!(record.stop_summary().change_stat, None);
     }
 }

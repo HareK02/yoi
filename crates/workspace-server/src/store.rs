@@ -215,6 +215,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "add Workspace resource human keys",
         apply: add_workspace_resource_human_keys,
     },
+    Migration {
+        version: 39,
+        name: "enforce Workspace resource foreign keys",
+        apply: enforce_workspace_resource_foreign_keys,
+    },
+    Migration {
+        version: 40,
+        name: "create atomic Workspace catalog operations",
+        apply: create_workspace_catalog_operations,
+    },
 ];
 
 struct Migration {
@@ -262,8 +272,28 @@ pub struct RepositoryRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceBootstrapRecord {
+    pub operation_key: String,
+    pub request_fingerprint: String,
+    /// When true, the transaction must prove that no Workspace exists before
+    /// it inserts this ownerless local-bootstrap Workspace.
+    pub require_empty_catalog: bool,
+    pub workspace: WorkspaceRecord,
+    pub repository: RepositoryRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceBootstrapResult {
+    pub workspace: WorkspaceRecord,
+    pub repository: RepositoryRecord,
+    pub config_revision: u64,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TrustedRuntimeRecord {
     pub runtime_id: String,
+    pub workspace_id: Option<String>,
     pub display_name: String,
     pub base_url: String,
     pub public_key: String,
@@ -579,6 +609,10 @@ pub trait ControlPlaneStore: Send + Sync {
     ) -> Result<Option<String>>;
     async fn upsert_workspace(&self, record: &WorkspaceRecord) -> Result<()>;
     async fn get_workspace(&self, workspace_id: &str) -> Result<Option<WorkspaceRecord>>;
+    fn create_workspace_bootstrap(
+        &self,
+        record: &WorkspaceBootstrapRecord,
+    ) -> Result<WorkspaceBootstrapResult>;
     async fn get_trusted_runtime(&self, runtime_id: &str) -> Result<Option<TrustedRuntimeRecord>>;
     async fn consume_worker_mutation_source_jti(
         &self,
@@ -1030,7 +1064,7 @@ impl SqliteWorkspaceStore {
         apply_migrations_through(&candidate, i64::MAX)?;
         ticket::migrate_sqlite_ticket_schema(&candidate)?;
         merge_request::migrate(&candidate).map_err(|error| Error::Store(error.to_string()))?;
-        validate_workspace_repository_references(&candidate)?;
+        validate_workspace_resource_references(&candidate)?;
         let foreign_key_failures: i64 =
             candidate.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
                 row.get(0)
@@ -1062,10 +1096,15 @@ impl SqliteWorkspaceStore {
 
     pub fn from_connection(conn: Connection) -> Result<Self> {
         configure_sqlite(&conn)?;
-        apply_migrations(&conn)?;
-        ticket::migrate_sqlite_ticket_schema(&conn)?;
-        merge_request::migrate(&conn).map_err(|error| Error::Store(error.to_string()))?;
-        validate_workspace_repository_references(&conn)?;
+        apply_migrations(&conn)
+            .map_err(|error| Error::Store(format!("workspace schema migration failed: {error}")))?;
+        ticket::migrate_sqlite_ticket_schema(&conn)
+            .map_err(|error| Error::Store(format!("Ticket schema verification failed: {error}")))?;
+        merge_request::migrate(&conn).map_err(|error| {
+            Error::Store(format!("Merge Request schema verification failed: {error}"))
+        })?;
+        validate_workspace_resource_references(&conn)?;
+        verify_workspace_resource_constraints(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -1207,8 +1246,8 @@ impl SqliteWorkspaceStore {
         self.with_conn(|conn| {
             conn.execute(
                 r#"INSERT INTO trusted_runtime_records (
-                    runtime_id, display_name, base_url, public_key, created_at, updated_at, revoked_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    runtime_id, workspace_id, display_name, base_url, public_key, created_at, updated_at, revoked_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                 ON CONFLICT(runtime_id) DO UPDATE SET
                     display_name = excluded.display_name,
                     base_url = excluded.base_url,
@@ -1217,6 +1256,7 @@ impl SqliteWorkspaceStore {
                     revoked_at = excluded.revoked_at"#,
                 params![
                     record.runtime_id,
+                    record.workspace_id,
                     record.display_name,
                     record.base_url,
                     record.public_key,
@@ -1235,10 +1275,10 @@ impl SqliteWorkspaceStore {
     ) -> Result<Vec<TrustedRuntimeRecord>> {
         self.with_conn(|conn| {
             let sql = if include_revoked {
-                r#"SELECT runtime_id, display_name, base_url, public_key, created_at, updated_at, revoked_at
+                r#"SELECT runtime_id, workspace_id, display_name, base_url, public_key, created_at, updated_at, revoked_at
                    FROM trusted_runtime_records ORDER BY runtime_id ASC"#
             } else {
-                r#"SELECT runtime_id, display_name, base_url, public_key, created_at, updated_at, revoked_at
+                r#"SELECT runtime_id, workspace_id, display_name, base_url, public_key, created_at, updated_at, revoked_at
                    FROM trusted_runtime_records WHERE revoked_at IS NULL ORDER BY runtime_id ASC"#
             };
             let mut stmt = conn.prepare(sql)?;
@@ -1361,10 +1401,181 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn create_workspace_bootstrap(
+        &self,
+        record: &WorkspaceBootstrapRecord,
+    ) -> Result<WorkspaceBootstrapResult> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some((fingerprint, workspace_id)) = tx
+                .query_row(
+                    "SELECT request_fingerprint, workspace_id FROM workspace_create_operations WHERE operation_key = ?1",
+                    params![record.operation_key],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+            {
+                if fingerprint != record.request_fingerprint {
+                    return Err(Error::WorkspaceConfigConflict(
+                        "Workspace create operation key was already used with different input"
+                            .to_string(),
+                    ));
+                }
+                let workspace = tx.query_row(
+                    r#"SELECT workspace_id, owner_account_id, display_name, state, created_at, updated_at
+                       FROM workspaces WHERE workspace_id = ?1"#,
+                    params![workspace_id],
+                    read_workspace_record,
+                )?;
+                let repository = tx.query_row(
+                    r#"SELECT workspace_id, repository_id, name, kind, provider, uri, default_ref,
+                              auth_ref_kind, auth_ref_key, created_at, updated_at
+                       FROM repositories WHERE workspace_id = ?1 AND repository_id = ?2"#,
+                    params![workspace.workspace_id, record.repository.repository_id],
+                    read_repository_record,
+                )?;
+                let config_revision = crate::config_source::load_state(&tx, &workspace.workspace_id)?
+                    .ok_or_else(|| Error::Store("Workspace config is missing".to_string()))?
+                    .snapshot
+                    .revision;
+                tx.commit()?;
+                return Ok(WorkspaceBootstrapResult {
+                    workspace,
+                    repository,
+                    config_revision,
+                    replayed: true,
+                });
+            }
+
+            if record.require_empty_catalog {
+                let workspace_exists = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM workspaces LIMIT 1)",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if workspace_exists {
+                    return Err(Error::WorkspaceConfigConflict(
+                        "ownerless local bootstrap is available only while the Workspace catalog is empty"
+                            .to_string(),
+                    ));
+                }
+            }
+
+            if let Some(existing) = tx
+                .query_row(
+                    r#"SELECT workspace_id, owner_account_id, display_name, state, created_at, updated_at
+                       FROM workspaces WHERE workspace_id = ?1"#,
+                    params![record.workspace.workspace_id],
+                    read_workspace_record,
+                )
+                .optional()?
+            {
+                if existing.owner_account_id != record.workspace.owner_account_id
+                    || existing.display_name != record.workspace.display_name
+                    || existing.state != record.workspace.state
+                {
+                    return Err(Error::WorkspaceConfigConflict(
+                        "Workspace identity already exists with different metadata".to_string(),
+                    ));
+                }
+                let existing_repository = tx
+                    .query_row(
+                        r#"SELECT workspace_id, repository_id, name, kind, provider, uri, default_ref,
+                                  auth_ref_kind, auth_ref_key, created_at, updated_at
+                           FROM repositories WHERE workspace_id = ?1 AND repository_id = ?2"#,
+                        params![record.repository.workspace_id, record.repository.repository_id],
+                        read_repository_record,
+                    )
+                    .optional()?;
+                if existing_repository.as_ref() != Some(&record.repository) {
+                    return Err(Error::WorkspaceConfigConflict(
+                        "Workspace initial repository already exists with different metadata"
+                            .to_string(),
+                    ));
+                }
+            } else {
+                tx.execute(
+                    r#"INSERT INTO workspaces (
+                        workspace_id, owner_account_id, display_name, state, created_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+                    params![
+                        record.workspace.workspace_id,
+                        record.workspace.owner_account_id,
+                        record.workspace.display_name,
+                        record.workspace.state,
+                        record.workspace.created_at,
+                        record.workspace.updated_at,
+                    ],
+                )?;
+                tx.execute(
+                    r#"INSERT INTO repositories (
+                        workspace_id, repository_id, name, kind, provider, uri, default_ref,
+                        auth_ref_kind, auth_ref_key, created_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
+                    params![
+                        record.repository.workspace_id,
+                        record.repository.repository_id,
+                        record.repository.name,
+                        record.repository.kind,
+                        record.repository.provider,
+                        record.repository.uri,
+                        record.repository.default_ref,
+                        record.repository.auth_ref_kind,
+                        record.repository.auth_ref_key,
+                        record.repository.created_at,
+                        record.repository.updated_at,
+                    ],
+                )?;
+            }
+            if crate::config_source::load_state(&tx, &record.workspace.workspace_id)?.is_none() {
+                let state = crate::config_source::initial_state()?;
+                crate::config_source::insert_materialized_state(
+                    &tx,
+                    &record.workspace.workspace_id,
+                    &state,
+                    &record.workspace.created_at,
+                )?;
+            }
+            for resource_kind in ["ticket", "objective", "worker"] {
+                tx.execute(
+                    r#"INSERT OR IGNORE INTO workspace_resource_human_key_counters (
+                        workspace_id, resource_kind, next_sequence
+                    ) VALUES (?1, ?2, 1)"#,
+                    params![record.workspace.workspace_id, resource_kind],
+                )?;
+            }
+            let config_revision = crate::config_source::load_state(
+                &tx,
+                &record.workspace.workspace_id,
+            )?
+            .ok_or_else(|| Error::Store("Workspace config is missing".to_string()))?
+            .snapshot
+            .revision;
+            tx.execute(
+                r#"INSERT INTO workspace_create_operations (
+                    operation_key, request_fingerprint, workspace_id, created_at
+                ) VALUES (?1, ?2, ?3, ?4)"#,
+                params![
+                    record.operation_key,
+                    record.request_fingerprint,
+                    record.workspace.workspace_id,
+                    record.workspace.created_at,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(WorkspaceBootstrapResult {
+                workspace: record.workspace.clone(),
+                repository: record.repository.clone(),
+                config_revision,
+                replayed: false,
+            })
+        })
+    }
+
     async fn get_trusted_runtime(&self, runtime_id: &str) -> Result<Option<TrustedRuntimeRecord>> {
         self.with_conn(|conn| {
             conn.query_row(
-                r#"SELECT runtime_id, display_name, base_url, public_key, created_at, updated_at, revoked_at
+                r#"SELECT runtime_id, workspace_id, display_name, base_url, public_key, created_at, updated_at, revoked_at
                    FROM trusted_runtime_records WHERE runtime_id = ?1"#,
                 params![runtime_id],
                 read_trusted_runtime_record,
@@ -1789,7 +2000,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 r#"INSERT INTO objectives (
                     workspace_id, objective_id, title, state, body_md, created_at, updated_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                ON CONFLICT(objective_id) DO UPDATE SET
+                ON CONFLICT(workspace_id, objective_id) DO UPDATE SET
                     workspace_id = excluded.workspace_id,
                     title = excluded.title,
                     state = excluded.state,
@@ -1888,7 +2099,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     r#"INSERT INTO objective_ticket_links (
                         workspace_id, objective_id, ticket_id, kind, created_at
                     ) VALUES (?1, ?2, ?3, ?4, ?5)
-                    ON CONFLICT(objective_id, ticket_id, kind) DO UPDATE SET
+                    ON CONFLICT(workspace_id, objective_id, ticket_id, kind) DO UPDATE SET
                         workspace_id = excluded.workspace_id,
                         created_at = excluded.created_at"#,
                     params![
@@ -1977,7 +2188,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 r#"INSERT INTO objective_resources (
                     workspace_id, objective_id, resource_path, body, media_type, created_at, updated_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                ON CONFLICT(objective_id, resource_path) DO UPDATE SET
+                ON CONFLICT(workspace_id, objective_id, resource_path) DO UPDATE SET
                     workspace_id = excluded.workspace_id,
                     body = excluded.body,
                     media_type = excluded.media_type,
@@ -3938,12 +4149,13 @@ fn account_select_sql(where_clause: &str) -> String {
 fn read_trusted_runtime_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrustedRuntimeRecord> {
     Ok(TrustedRuntimeRecord {
         runtime_id: row.get(0)?,
-        display_name: row.get(1)?,
-        base_url: row.get(2)?,
-        public_key: row.get(3)?,
-        created_at: row.get(4)?,
-        updated_at: row.get(5)?,
-        revoked_at: row.get(6)?,
+        workspace_id: row.get(1)?,
+        display_name: row.get(2)?,
+        base_url: row.get(3)?,
+        public_key: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+        revoked_at: row.get(7)?,
     })
 }
 
@@ -4960,7 +5172,7 @@ DROP TABLE IF EXISTS flow_instances;
 }
 
 fn scope_repository_identity_by_workspace(conn: &Connection) -> Result<()> {
-    validate_workspace_repository_references(conn)?;
+    validate_workspace_resource_references(conn)?;
     conn.execute_batch(
         r#"
 CREATE TABLE repositories_v27 (
@@ -5119,14 +5331,71 @@ CREATE UNIQUE INDEX ux_worker_workdir_attachment_reservation_id
     Ok(())
 }
 
-fn validate_workspace_repository_references(conn: &Connection) -> Result<()> {
+fn create_workspace_catalog_operations(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        ALTER TABLE trusted_runtime_records
+            ADD COLUMN workspace_id TEXT REFERENCES workspaces(workspace_id) ON DELETE RESTRICT;
+        CREATE INDEX idx_trusted_runtime_records_workspace
+            ON trusted_runtime_records(workspace_id, revoked_at, runtime_id);
+
+        CREATE TABLE workspace_create_operations (
+            operation_key TEXT PRIMARY KEY,
+            request_fingerprint TEXT NOT NULL,
+            workspace_id TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+fn verify_workspace_resource_constraints(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? < 39 {
+        return Ok(());
+    }
+    for trigger in [
+        "ticket_assignment_ticket_parent_tombstone",
+        "ticket_assignment_worker_parent_tombstone_delete",
+        "ticket_assignment_worker_parent_tombstone_move",
+        "ticket_worker_assignments_validate_insert",
+        "ticket_worker_assignments_validate_update",
+        "ticket_worker_assignment_events_validate_insert",
+        "ticket_assignment_operations_validate_insert",
+    ] {
+        let exists = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'trigger' AND name = ?1)",
+            [trigger],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exists {
+            return Err(Error::Store(format!(
+                "Workspace resource constraint trigger `{trigger}` is missing"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_workspace_resource_references(conn: &Connection) -> Result<()> {
+    let diagnostics = workspace_resource_reference_diagnostics(conn)?;
+    if diagnostics.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Store(format!(
+        "Workspace resource foreign-key preflight failed:\n- {}",
+        diagnostics.join("\n- ")
+    )))
+}
+
+fn workspace_resource_reference_diagnostics(conn: &Connection) -> Result<Vec<String>> {
+    let mut diagnostics = Vec::new();
     for (table, repository_nullable) in [
         ("workdir_registry", false),
         ("artifacts", true),
-        // `typed_tickets` is owned and migrated by the Ticket component. The control-plane
-        // migration may reject an already-invalid integrated reference, but must not rebuild
-        // that component table or claim its schema authority.
         ("typed_tickets", true),
+        ("merge_requests", false),
     ] {
         if !table_exists(conn, table)? || !column_exists(conn, table, "repository_id")? {
             continue;
@@ -5136,24 +5405,225 @@ fn validate_workspace_repository_references(conn: &Connection) -> Result<()> {
         } else {
             ""
         };
-        let sql = format!(
-            "SELECT child.workspace_id, child.repository_id FROM {table} AS child \
-             WHERE {null_filter} NOT EXISTS (\
-                 SELECT 1 FROM repositories AS repository \
-                 WHERE repository.workspace_id = child.workspace_id \
-                   AND repository.repository_id = child.repository_id\
-             ) LIMIT 1"
-        );
-        let invalid = conn
-            .query_row(&sql, [], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .optional()?;
-        if let Some((workspace_id, repository_id)) = invalid {
-            return Err(Error::Store(format!(
-                "invalid Workspace-owned repository reference: {table} contains repository `{repository_id}` outside Workspace `{workspace_id}`"
-            )));
+        collect_reference_diagnostics(
+            conn,
+            &format!(
+                "SELECT child.workspace_id || '/' || child.repository_id FROM {table} AS child \
+                 WHERE {null_filter} NOT EXISTS (\
+                     SELECT 1 FROM repositories AS parent \
+                     WHERE parent.workspace_id = child.workspace_id \
+                       AND parent.repository_id = child.repository_id\
+                 ) LIMIT 100"
+            ),
+            &format!("{table}.repository_id"),
+            &mut diagnostics,
+        )?;
+    }
+
+    for (label, sql) in [
+        (
+            "typed_ticket_relations.target",
+            "SELECT relation.workspace_id || '/' || relation.ticket_id || ' -> ' || relation.target \
+             FROM typed_ticket_relations AS relation \
+             WHERE NOT EXISTS (SELECT 1 FROM typed_tickets AS target \
+                 WHERE target.workspace_id = relation.workspace_id \
+                   AND target.ticket_id = relation.target) LIMIT 100",
+        ),
+        (
+            "objective_events.objective_id",
+            "SELECT child.workspace_id || '/' || child.event_id || ' -> ' || child.objective_id \
+             FROM objective_events AS child \
+             WHERE NOT EXISTS (SELECT 1 FROM objectives AS parent \
+                 WHERE parent.workspace_id = child.workspace_id \
+                   AND parent.objective_id = child.objective_id) LIMIT 100",
+        ),
+        (
+            "objective_resources.objective_id",
+            "SELECT child.workspace_id || '/' || child.resource_path || ' -> ' || child.objective_id \
+             FROM objective_resources AS child \
+             WHERE NOT EXISTS (SELECT 1 FROM objectives AS parent \
+                 WHERE parent.workspace_id = child.workspace_id \
+                   AND parent.objective_id = child.objective_id) LIMIT 100",
+        ),
+        (
+            "objective_ticket_links.objective_id",
+            "SELECT link.workspace_id || '/' || link.objective_id || ' -> ' || link.ticket_id \
+             FROM objective_ticket_links AS link \
+             WHERE NOT EXISTS (SELECT 1 FROM objectives AS objective \
+                 WHERE objective.workspace_id = link.workspace_id \
+                   AND objective.objective_id = link.objective_id) LIMIT 100",
+        ),
+        (
+            "objective_ticket_links.ticket_id",
+            "SELECT link.workspace_id || '/' || link.objective_id || ' -> ' || link.ticket_id \
+             FROM objective_ticket_links AS link \
+             WHERE NOT EXISTS (SELECT 1 FROM typed_tickets AS ticket \
+                 WHERE ticket.workspace_id = link.workspace_id \
+                   AND ticket.ticket_id = link.ticket_id) LIMIT 100",
+        ),
+        (
+            "ticket_current_worker_assignments.assignment_id",
+            "SELECT current.workspace_id || '/' || current.assignment_id \
+             FROM ticket_current_worker_assignments AS current \
+             WHERE NOT EXISTS (SELECT 1 FROM ticket_worker_assignments AS assignment \
+                 WHERE assignment.workspace_id = current.workspace_id \
+                   AND assignment.ticket_id = current.ticket_id \
+                   AND assignment.assignment_id = current.assignment_id \
+                   AND assignment.runtime_id = current.runtime_id \
+                   AND assignment.worker_id = current.worker_id) LIMIT 100",
+        ),
+        (
+            "ticket_worker_assignment_events.assignment_id",
+            "SELECT event.workspace_id || '/' || event.event_id \
+             FROM ticket_worker_assignment_events AS event \
+             WHERE (event.assignment_id IS NOT NULL AND NOT EXISTS (\
+                       SELECT 1 FROM ticket_worker_assignments AS assignment \
+                       WHERE assignment.workspace_id = event.workspace_id \
+                         AND assignment.ticket_id = event.ticket_id \
+                         AND assignment.assignment_id = event.assignment_id)) \
+                OR (event.previous_assignment_id IS NOT NULL AND NOT EXISTS (\
+                       SELECT 1 FROM ticket_worker_assignments AS assignment \
+                       WHERE assignment.workspace_id = event.workspace_id \
+                         AND assignment.ticket_id = event.ticket_id \
+                         AND assignment.assignment_id = event.previous_assignment_id)) LIMIT 100",
+        ),
+        (
+            "artifacts.ticket_id",
+            "SELECT artifact.workspace_id || '/' || artifact.artifact_id || ' -> ' || artifact.ticket_id \
+             FROM artifacts AS artifact WHERE artifact.ticket_id IS NOT NULL \
+               AND NOT EXISTS (SELECT 1 FROM typed_tickets AS ticket \
+                 WHERE ticket.workspace_id = artifact.workspace_id \
+                   AND ticket.ticket_id = artifact.ticket_id) LIMIT 100",
+        ),
+        (
+            "artifacts.worker_ref",
+            "SELECT artifact.workspace_id || '/' || artifact.artifact_id \
+             FROM artifacts AS artifact \
+             WHERE (artifact.worker_ref_kind IS NULL) != (artifact.worker_ref_key IS NULL) LIMIT 100",
+        ),
+        (
+            "artifacts.objective_id",
+            "SELECT artifact.workspace_id || '/' || artifact.artifact_id || ' -> ' || artifact.objective_id \
+             FROM artifacts AS artifact WHERE artifact.objective_id IS NOT NULL \
+               AND NOT EXISTS (SELECT 1 FROM objectives AS objective \
+                 WHERE objective.workspace_id = artifact.workspace_id \
+                   AND objective.objective_id = artifact.objective_id) LIMIT 100",
+        ),
+    ] {
+        let Some(table) = label.split('.').next() else {
+            continue;
+        };
+        if !table_exists(conn, table)? {
+            continue;
         }
+        if sql.contains("typed_tickets") && !table_exists(conn, "typed_tickets")? {
+            continue;
+        }
+        if sql.contains("worker.worker_id") && !column_exists(conn, "worker_registry", "worker_id")?
+        {
+            continue;
+        }
+        if sql.contains("assignment.worker_id")
+            && !column_exists(conn, "ticket_worker_assignments", "worker_id")?
+        {
+            continue;
+        }
+        if sql.contains("current.worker_id")
+            && !column_exists(conn, "ticket_current_worker_assignments", "worker_id")?
+        {
+            continue;
+        }
+        collect_reference_diagnostics(conn, sql, label, &mut diagnostics)?;
+    }
+
+    // Assignment and operation rows are historical soft references. Schema v39 records an
+    // explicit tombstone before a live Ticket or Worker parent is deleted/moved; older schemas
+    // have no tombstone authority, so every missing live parent remains migration-blocking drift.
+    if table_exists(conn, "ticket_worker_assignments")? && table_exists(conn, "typed_tickets")? {
+        let tombstone_filter = if table_exists(conn, "ticket_assignment_ticket_tombstones")? {
+            "AND NOT EXISTS (SELECT 1 FROM ticket_assignment_ticket_tombstones AS tombstone \
+             WHERE tombstone.workspace_id = assignment.workspace_id \
+               AND tombstone.ticket_id = assignment.ticket_id)"
+        } else {
+            ""
+        };
+        collect_reference_diagnostics(
+            conn,
+            &format!(
+                "SELECT assignment.workspace_id || '/' || assignment.assignment_id || ' -> ' || assignment.ticket_id \
+                 FROM ticket_worker_assignments AS assignment \
+                 WHERE NOT EXISTS (SELECT 1 FROM typed_tickets AS ticket \
+                     WHERE ticket.workspace_id = assignment.workspace_id \
+                       AND ticket.ticket_id = assignment.ticket_id) \
+                 {tombstone_filter} LIMIT 100"
+            ),
+            "ticket_worker_assignments.ticket_id",
+            &mut diagnostics,
+        )?;
+    }
+    if table_exists(conn, "ticket_worker_assignments")?
+        && table_exists(conn, "worker_registry")?
+        && column_exists(conn, "ticket_worker_assignments", "worker_id")?
+        && column_exists(conn, "worker_registry", "worker_id")?
+    {
+        let tombstone_filter = if table_exists(conn, "ticket_assignment_worker_tombstones")? {
+            "AND NOT EXISTS (SELECT 1 FROM ticket_assignment_worker_tombstones AS tombstone \
+             WHERE tombstone.workspace_id = assignment.workspace_id \
+               AND tombstone.runtime_id = assignment.runtime_id \
+               AND tombstone.worker_id = assignment.worker_id)"
+        } else {
+            ""
+        };
+        collect_reference_diagnostics(
+            conn,
+            &format!(
+                "SELECT assignment.workspace_id || '/' || assignment.assignment_id || ' -> ' || assignment.runtime_id || '/' || assignment.worker_id \
+                 FROM ticket_worker_assignments AS assignment \
+                 WHERE NOT EXISTS (SELECT 1 FROM worker_registry AS worker \
+                     WHERE worker.workspace_id = assignment.workspace_id \
+                       AND worker.runtime_id = assignment.runtime_id \
+                       AND worker.worker_id = assignment.worker_id) \
+                 {tombstone_filter} LIMIT 100"
+            ),
+            "ticket_worker_assignments.worker_id",
+            &mut diagnostics,
+        )?;
+    }
+    if table_exists(conn, "ticket_assignment_operations")? && table_exists(conn, "typed_tickets")? {
+        let tombstone_filter = if table_exists(conn, "ticket_assignment_ticket_tombstones")? {
+            "AND NOT EXISTS (SELECT 1 FROM ticket_assignment_ticket_tombstones AS tombstone \
+             WHERE tombstone.workspace_id = operation.workspace_id \
+               AND tombstone.ticket_id = operation.ticket_id)"
+        } else {
+            ""
+        };
+        collect_reference_diagnostics(
+            conn,
+            &format!(
+                "SELECT operation.workspace_id || '/' || operation.operation_id || ' -> ' || operation.ticket_id \
+                 FROM ticket_assignment_operations AS operation \
+                 WHERE NOT EXISTS (SELECT 1 FROM typed_tickets AS ticket \
+                     WHERE ticket.workspace_id = operation.workspace_id \
+                       AND ticket.ticket_id = operation.ticket_id) \
+                 {tombstone_filter} LIMIT 100"
+            ),
+            "ticket_assignment_operations.ticket_id",
+            &mut diagnostics,
+        )?;
+    }
+    Ok(diagnostics)
+}
+
+fn collect_reference_diagnostics(
+    conn: &Connection,
+    sql: &str,
+    label: &str,
+    diagnostics: &mut Vec<String>,
+) -> Result<()> {
+    let mut statement = conn.prepare(sql)?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        diagnostics.push(format!("{label}: {}", row?));
     }
     Ok(())
 }
@@ -5934,11 +6404,523 @@ pub(crate) fn materialize_main_config_entrypoint(conn: &Connection) -> Result<()
     Ok(())
 }
 
+fn enforce_workspace_resource_foreign_keys(conn: &Connection) -> Result<()> {
+    let schema = r#"
+CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_registry_workspace_runtime_worker
+    ON worker_registry(workspace_id, runtime_id, worker_id);
+
+CREATE TABLE objectives_v39 (
+    workspace_id TEXT NOT NULL,
+    objective_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    state TEXT NOT NULL,
+    body_md TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, objective_id),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+);
+INSERT INTO objectives_v39 SELECT * FROM objectives;
+
+CREATE TABLE objective_events_v39 (
+    workspace_id TEXT NOT NULL,
+    objective_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    body_md TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, event_id),
+    FOREIGN KEY (workspace_id, objective_id)
+        REFERENCES objectives(workspace_id, objective_id) ON DELETE CASCADE
+);
+INSERT INTO objective_events_v39
+SELECT workspace_id, objective_id, event_id, kind, body_md, created_at FROM objective_events;
+
+CREATE TABLE objective_resources_v39 (
+    workspace_id TEXT NOT NULL,
+    objective_id TEXT NOT NULL,
+    resource_path TEXT NOT NULL,
+    body TEXT NOT NULL,
+    media_type TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, objective_id, resource_path),
+    FOREIGN KEY (workspace_id, objective_id)
+        REFERENCES objectives(workspace_id, objective_id) ON DELETE CASCADE
+);
+INSERT INTO objective_resources_v39
+SELECT workspace_id, objective_id, resource_path, body, media_type, created_at, updated_at
+FROM objective_resources;
+
+CREATE TABLE typed_tickets_v39 (
+    workspace_id TEXT NOT NULL,
+    ticket_id TEXT NOT NULL,
+    slug TEXT NOT NULL,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    priority TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT,
+    updated_at TEXT,
+    assignee TEXT,
+    readiness TEXT,
+    workflow_state TEXT NOT NULL,
+    workflow_state_explicit INTEGER NOT NULL,
+    queued_by TEXT,
+    queued_at TEXT,
+    resolution TEXT,
+    repository_id TEXT,
+    ref_selector TEXT,
+    PRIMARY KEY (workspace_id, ticket_id),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, repository_id)
+        REFERENCES repositories(workspace_id, repository_id) ON DELETE RESTRICT
+);
+INSERT INTO typed_tickets_v39 SELECT * FROM typed_tickets;
+
+CREATE TABLE typed_ticket_relations_v39 (
+    workspace_id TEXT NOT NULL,
+    ticket_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    target TEXT NOT NULL,
+    note TEXT,
+    author TEXT NOT NULL,
+    at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, ticket_id, kind, target),
+    FOREIGN KEY (workspace_id, ticket_id)
+        REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, target)
+        REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
+);
+INSERT INTO typed_ticket_relations_v39 SELECT * FROM typed_ticket_relations;
+
+CREATE TABLE objective_ticket_links_v39 (
+    workspace_id TEXT NOT NULL,
+    objective_id TEXT NOT NULL,
+    ticket_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, objective_id, ticket_id, kind),
+    FOREIGN KEY (workspace_id, objective_id)
+        REFERENCES objectives(workspace_id, objective_id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, ticket_id)
+        REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
+);
+INSERT INTO objective_ticket_links_v39 SELECT * FROM objective_ticket_links;
+
+CREATE TABLE ticket_assignment_ticket_tombstones (
+    workspace_id TEXT NOT NULL,
+    ticket_id TEXT NOT NULL,
+    deleted_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, ticket_id),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+);
+
+CREATE TABLE ticket_assignment_worker_tombstones (
+    workspace_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    deleted_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, runtime_id, worker_id),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+);
+
+CREATE TABLE ticket_worker_assignments_v39 (
+    workspace_id TEXT NOT NULL,
+    ticket_id TEXT NOT NULL,
+    assignment_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    assigned_by TEXT NOT NULL,
+    assigned_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, assignment_id),
+    UNIQUE (workspace_id, ticket_id, assignment_id),
+    UNIQUE (workspace_id, ticket_id, assignment_id, runtime_id, worker_id),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+);
+INSERT INTO ticket_worker_assignments_v39 SELECT * FROM ticket_worker_assignments;
+
+CREATE TABLE ticket_worker_assignment_events_v39 (
+    workspace_id TEXT NOT NULL,
+    ticket_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('assigned', 'reassigned', 'unassigned')),
+    assignment_id TEXT,
+    previous_assignment_id TEXT,
+    actor TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, event_id),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+);
+INSERT INTO ticket_worker_assignment_events_v39 SELECT * FROM ticket_worker_assignment_events;
+
+CREATE TABLE ticket_current_worker_assignments_v39 (
+    workspace_id TEXT NOT NULL,
+    ticket_id TEXT NOT NULL,
+    assignment_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, ticket_id),
+    UNIQUE (workspace_id, runtime_id, worker_id),
+    FOREIGN KEY (workspace_id, ticket_id, assignment_id, runtime_id, worker_id)
+        REFERENCES ticket_worker_assignments(
+            workspace_id, ticket_id, assignment_id, runtime_id, worker_id
+        ) ON DELETE CASCADE
+);
+INSERT INTO ticket_current_worker_assignments_v39 SELECT * FROM ticket_current_worker_assignments;
+
+CREATE TABLE ticket_assignment_operations_v39 (
+    workspace_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('assign', 'reassign', 'unassign')),
+    ticket_id TEXT NOT NULL,
+    runtime_id TEXT,
+    worker_id TEXT,
+    assignment_id TEXT,
+    expected_assignment_id TEXT,
+    created_at TEXT NOT NULL,
+    request_fingerprint TEXT,
+    PRIMARY KEY (workspace_id, operation_id),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+);
+INSERT INTO ticket_assignment_operations_v39 SELECT * FROM ticket_assignment_operations;
+
+CREATE TABLE artifacts_v39 (
+    workspace_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    uri TEXT NOT NULL,
+    media_type TEXT,
+    sha256 TEXT,
+    size_bytes INTEGER,
+    summary TEXT,
+    created_at TEXT NOT NULL,
+    created_by_kind TEXT NOT NULL,
+    created_by_key TEXT NOT NULL,
+    created_by_display TEXT NOT NULL,
+    created_by_source_kind TEXT,
+    created_by_source_key TEXT,
+    ticket_id TEXT,
+    objective_id TEXT,
+    event_id TEXT,
+    worker_ref_kind TEXT,
+    worker_ref_key TEXT,
+    worker_display TEXT,
+    repository_id TEXT,
+    source_kind TEXT,
+    source_revision TEXT,
+    PRIMARY KEY (workspace_id, artifact_id),
+    CHECK ((worker_ref_kind IS NULL) = (worker_ref_key IS NULL)),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, ticket_id)
+        REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, objective_id)
+        REFERENCES objectives(workspace_id, objective_id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, repository_id)
+        REFERENCES repositories(workspace_id, repository_id) ON DELETE RESTRICT
+);
+INSERT INTO artifacts_v39 SELECT * FROM artifacts;
+
+CREATE TABLE workspace_resource_human_key_counters_v39 (
+    workspace_id TEXT NOT NULL,
+    resource_kind TEXT NOT NULL CHECK (resource_kind IN ('ticket', 'objective', 'worker')),
+    next_sequence INTEGER NOT NULL CHECK (next_sequence > 0),
+    PRIMARY KEY (workspace_id, resource_kind),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+);
+INSERT INTO workspace_resource_human_key_counters_v39 SELECT * FROM workspace_resource_human_key_counters;
+
+CREATE TABLE workspace_resource_human_keys_v39 (
+    workspace_id TEXT NOT NULL,
+    resource_kind TEXT NOT NULL CHECK (resource_kind IN ('ticket', 'objective', 'worker')),
+    resource_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL CHECK (sequence > 0),
+    human_key TEXT NOT NULL,
+    allocated_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, resource_kind, resource_id),
+    UNIQUE (workspace_id, resource_kind, sequence),
+    UNIQUE (workspace_id, human_key),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+);
+INSERT INTO workspace_resource_human_keys_v39 SELECT * FROM workspace_resource_human_keys;
+
+DROP TABLE ticket_current_worker_assignments;
+DROP TABLE ticket_worker_assignment_events;
+DROP TABLE ticket_assignment_operations;
+DROP TABLE objective_ticket_links;
+DROP TABLE objective_events;
+DROP TABLE objective_resources;
+DROP TABLE typed_ticket_relations;
+
+ALTER TABLE ticket_worker_assignments RENAME TO ticket_worker_assignments_v38;
+ALTER TABLE typed_tickets RENAME TO typed_tickets_v38;
+ALTER TABLE objectives RENAME TO objectives_v38;
+
+ALTER TABLE objectives_v39 RENAME TO objectives;
+ALTER TABLE typed_tickets_v39 RENAME TO typed_tickets;
+ALTER TABLE ticket_worker_assignments_v39 RENAME TO ticket_worker_assignments;
+ALTER TABLE objective_events_v39 RENAME TO objective_events;
+ALTER TABLE objective_resources_v39 RENAME TO objective_resources;
+ALTER TABLE typed_ticket_relations_v39 RENAME TO typed_ticket_relations;
+ALTER TABLE objective_ticket_links_v39 RENAME TO objective_ticket_links;
+ALTER TABLE ticket_worker_assignment_events_v39 RENAME TO ticket_worker_assignment_events;
+ALTER TABLE ticket_current_worker_assignments_v39 RENAME TO ticket_current_worker_assignments;
+ALTER TABLE ticket_assignment_operations_v39 RENAME TO ticket_assignment_operations;
+
+DROP TABLE ticket_worker_assignments_v38;
+DROP TABLE typed_tickets_v38;
+DROP TABLE objectives_v38;
+
+DROP TABLE artifacts;
+ALTER TABLE artifacts_v39 RENAME TO artifacts;
+DROP TABLE workspace_resource_human_keys;
+DROP TABLE workspace_resource_human_key_counters;
+ALTER TABLE workspace_resource_human_key_counters_v39 RENAME TO workspace_resource_human_key_counters;
+ALTER TABLE workspace_resource_human_keys_v39 RENAME TO workspace_resource_human_keys;
+
+CREATE INDEX IF NOT EXISTS idx_objectives_workspace_updated
+    ON objectives(workspace_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_objective_events_workspace_created
+    ON objective_events(workspace_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_objective_resources_workspace_objective
+    ON objective_resources(workspace_id, objective_id);
+CREATE INDEX IF NOT EXISTS idx_objective_ticket_links_workspace_objective
+    ON objective_ticket_links(workspace_id, objective_id);
+CREATE INDEX IF NOT EXISTS idx_objective_ticket_links_workspace_ticket
+    ON objective_ticket_links(workspace_id, ticket_id);
+CREATE INDEX IF NOT EXISTS idx_typed_tickets_workspace_state_updated
+    ON typed_tickets(workspace_id, workflow_state, updated_at DESC, ticket_id);
+CREATE INDEX IF NOT EXISTS idx_typed_tickets_workspace_updated
+    ON typed_tickets(workspace_id, updated_at DESC, ticket_id);
+CREATE INDEX IF NOT EXISTS idx_typed_ticket_relations_workspace_target
+    ON typed_ticket_relations(workspace_id, target, at DESC);
+CREATE INDEX IF NOT EXISTS idx_ticket_worker_assignments_ticket
+    ON ticket_worker_assignments(workspace_id, ticket_id, assigned_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ticket_worker_assignments_worker
+    ON ticket_worker_assignments(workspace_id, runtime_id, worker_id, assigned_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ticket_worker_assignment_events_ticket
+    ON ticket_worker_assignment_events(workspace_id, ticket_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ticket_assignment_operations_ticket
+    ON ticket_assignment_operations(workspace_id, ticket_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_artifacts_workspace_created
+    ON artifacts(workspace_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_workspace_resource_human_keys_reverse
+    ON workspace_resource_human_keys(workspace_id, resource_kind, human_key);
+"#;
+    for statement in schema
+        .split(';')
+        .map(str::trim)
+        .filter(|sql| !sql.is_empty())
+    {
+        conn.execute_batch(statement).map_err(|error| {
+            Error::Store(format!(
+                "Workspace resource FK migration statement failed: {statement}: {error}"
+            ))
+        })?;
+    }
+    // Assignment rows and events are historical evidence and intentionally survive Ticket or
+    // Worker retention deletion, so parent FKs would impose the wrong delete semantics. Parent
+    // delete/move triggers record an exact tombstone before authority disappears; insertion
+    // triggers require every new assignment to resolve both authorities in the same Workspace,
+    // and event references resolve a committed assignment for the same Ticket. Operation
+    // assignment/Worker ids remain unconstrained because reservations are persisted before
+    // assignment/Worker creation and expected ids may intentionally be stale.
+    conn.execute_batch(
+        r#"
+CREATE TRIGGER ticket_assignment_ticket_parent_tombstone
+BEFORE DELETE ON typed_tickets
+WHEN EXISTS (
+        SELECT 1 FROM ticket_worker_assignments AS assignment
+        WHERE assignment.workspace_id = OLD.workspace_id
+          AND assignment.ticket_id = OLD.ticket_id
+    )
+    OR EXISTS (
+        SELECT 1 FROM ticket_assignment_operations AS operation
+        WHERE operation.workspace_id = OLD.workspace_id
+          AND operation.ticket_id = OLD.ticket_id
+    )
+BEGIN
+    INSERT OR IGNORE INTO ticket_assignment_ticket_tombstones (
+        workspace_id, ticket_id, deleted_at
+    ) VALUES (OLD.workspace_id, OLD.ticket_id, CURRENT_TIMESTAMP);
+END;
+
+CREATE TRIGGER ticket_assignment_worker_parent_tombstone_delete
+BEFORE DELETE ON worker_registry
+WHEN EXISTS (
+    SELECT 1 FROM ticket_worker_assignments AS assignment
+    WHERE assignment.workspace_id = OLD.workspace_id
+      AND assignment.runtime_id = OLD.runtime_id
+      AND assignment.worker_id = OLD.worker_id
+)
+BEGIN
+    INSERT OR IGNORE INTO ticket_assignment_worker_tombstones (
+        workspace_id, runtime_id, worker_id, deleted_at
+    ) VALUES (OLD.workspace_id, OLD.runtime_id, OLD.worker_id, CURRENT_TIMESTAMP);
+END;
+
+CREATE TRIGGER ticket_assignment_worker_parent_tombstone_move
+BEFORE UPDATE OF runtime_id ON worker_registry
+WHEN OLD.runtime_id != NEW.runtime_id
+ AND EXISTS (
+    SELECT 1 FROM ticket_worker_assignments AS assignment
+    WHERE assignment.workspace_id = OLD.workspace_id
+      AND assignment.runtime_id = OLD.runtime_id
+      AND assignment.worker_id = OLD.worker_id
+)
+BEGIN
+    INSERT OR IGNORE INTO ticket_assignment_worker_tombstones (
+        workspace_id, runtime_id, worker_id, deleted_at
+    ) VALUES (OLD.workspace_id, OLD.runtime_id, OLD.worker_id, CURRENT_TIMESTAMP);
+END;
+
+CREATE TRIGGER ticket_worker_assignments_validate_insert
+BEFORE INSERT ON ticket_worker_assignments
+WHEN NOT EXISTS (
+        SELECT 1 FROM typed_tickets AS ticket
+        WHERE ticket.workspace_id = NEW.workspace_id AND ticket.ticket_id = NEW.ticket_id
+    )
+    OR NOT EXISTS (
+        SELECT 1 FROM worker_registry AS worker
+        WHERE worker.workspace_id = NEW.workspace_id
+          AND worker.runtime_id = NEW.runtime_id
+          AND worker.worker_id = NEW.worker_id
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'ticket_worker_assignments must reference a Ticket and Worker in the same Workspace');
+END;
+
+CREATE TRIGGER ticket_worker_assignments_validate_update
+BEFORE UPDATE OF workspace_id, ticket_id, runtime_id, worker_id ON ticket_worker_assignments
+WHEN NOT EXISTS (
+        SELECT 1 FROM typed_tickets AS ticket
+        WHERE ticket.workspace_id = NEW.workspace_id AND ticket.ticket_id = NEW.ticket_id
+    )
+    OR NOT EXISTS (
+        SELECT 1 FROM worker_registry AS worker
+        WHERE worker.workspace_id = NEW.workspace_id
+          AND worker.runtime_id = NEW.runtime_id
+          AND worker.worker_id = NEW.worker_id
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'ticket_worker_assignments must reference a Ticket and Worker in the same Workspace');
+END;
+
+CREATE TRIGGER ticket_worker_assignment_events_validate_insert
+BEFORE INSERT ON ticket_worker_assignment_events
+WHEN (NEW.assignment_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM ticket_worker_assignments AS assignment
+        WHERE assignment.workspace_id = NEW.workspace_id
+          AND assignment.ticket_id = NEW.ticket_id
+          AND assignment.assignment_id = NEW.assignment_id
+    ))
+    OR (NEW.previous_assignment_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM ticket_worker_assignments AS assignment
+        WHERE assignment.workspace_id = NEW.workspace_id
+          AND assignment.ticket_id = NEW.ticket_id
+          AND assignment.assignment_id = NEW.previous_assignment_id
+    ))
+BEGIN
+    SELECT RAISE(ABORT, 'ticket_worker_assignment_events must reference assignments in the same Workspace');
+END;
+
+CREATE TRIGGER ticket_assignment_operations_validate_insert
+BEFORE INSERT ON ticket_assignment_operations
+WHEN NOT EXISTS (
+    SELECT 1 FROM typed_tickets AS ticket
+    WHERE ticket.workspace_id = NEW.workspace_id AND ticket.ticket_id = NEW.ticket_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'ticket_assignment_operations must reference a Ticket in the same Workspace');
+END;
+"#,
+    )?;
+    Ok(())
+}
+
 pub(crate) fn apply_migrations_through(conn: &Connection, through_version: i64) -> Result<()> {
     let current = current_schema_version(conn)?;
     for migration in MIGRATIONS.iter().filter(|migration| {
         i64::from(migration.version) > current && i64::from(migration.version) <= through_version
     }) {
+        if migration.version == 39 {
+            ticket::migrate_sqlite_ticket_schema(conn).map_err(|error| {
+                Error::Store(format!(
+                    "migration 39 Ticket schema preparation failed: {error}"
+                ))
+            })?;
+            if !table_exists(conn, "typed_tickets")? {
+                return Err(Error::Store(
+                    "migration 39 Ticket schema preparation created no typed_tickets".to_string(),
+                ));
+            }
+            merge_request::migrate(conn).map_err(|error| {
+                Error::Store(format!(
+                    "migration 39 Merge Request schema preparation failed: {error}"
+                ))
+            })?;
+            validate_workspace_resource_references(conn)
+                .map_err(|error| Error::Store(format!("migration 39 preflight failed: {error}")))?;
+            conn.execute_batch("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;")?;
+            let result = (|| -> Result<()> {
+                let tx = conn.unchecked_transaction()?;
+                (migration.apply)(&tx)?;
+                if !table_exists(&tx, "typed_tickets")? {
+                    return Err(Error::Store(
+                        "migration 39 did not materialize `typed_tickets`".to_string(),
+                    ));
+                }
+                let dangling_foreign_key: Option<(String, String)> = tx
+                    .query_row(
+                        "SELECT name, sql FROM sqlite_schema \
+                         WHERE type = 'table' AND (sql LIKE '%_v38%' OR sql LIKE '%_v39%') LIMIT 1",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((child, sql)) = dangling_foreign_key {
+                    return Err(Error::Store(format!(
+                        "migration 39 left a temporary reference in `{child}`: {sql}"
+                    )));
+                }
+                let foreign_key_failures: i64 = tx
+                    .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                        row.get(0)
+                    })
+                    .map_err(|error| {
+                        Error::Store(format!(
+                            "migration 39 could not evaluate foreign keys: {error}"
+                        ))
+                    })?;
+                if foreign_key_failures != 0 {
+                    return Err(Error::Store(format!(
+                        "migration 39 found {foreign_key_failures} foreign key violation(s)"
+                    )));
+                }
+                tx.execute(
+                    "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+                    params![migration.version, migration.name],
+                )
+                .map_err(|error| {
+                    Error::Store(format!("migration 39 version insert failed: {error}"))
+                })?;
+                tx.commit().map_err(|error| {
+                    Error::Store(format!("migration 39 commit failed: {error}"))
+                })?;
+                Ok(())
+            })();
+            conn.execute_batch("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;")
+                .map_err(|error| {
+                    Error::Store(format!(
+                        "migration 39 could not restore FK enforcement: {error}"
+                    ))
+                })?;
+            result?;
+            continue;
+        }
+
         let tx = conn.unchecked_transaction()?;
         if migration.version == 37 {
             crate::retention::repair_worker_diagnostics_archive_table(&tx)?;
@@ -5954,7 +6936,14 @@ pub(crate) fn apply_migrations_through(conn: &Connection, through_version: i64) 
 }
 
 fn apply_migrations(conn: &Connection) -> Result<()> {
-    apply_migrations_through(conn, i64::MAX)
+    let latest = i64::from(MIGRATIONS.last().expect("at least one migration").version);
+    let current = current_schema_version(conn)?;
+    if current > latest {
+        return Err(Error::Store(format!(
+            "database schema version {current} is newer than this server supports ({latest}); refusing to serve with an older binary"
+        )));
+    }
+    apply_migrations_through(conn, latest)
 }
 
 fn align_legacy_bootstrap_schema(conn: &Connection) -> Result<()> {
@@ -6443,7 +7432,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         configure_sqlite(&conn).unwrap();
         apply_migrations(&conn).unwrap();
-        assert!(!table_exists(&conn, "ticket_schema_migrations").unwrap());
+        assert!(table_exists(&conn, "ticket_schema_migrations").unwrap());
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
         store
@@ -6482,7 +7471,7 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
         assert_eq!(plan.current_schema_version, 36);
-        assert_eq!(plan.target_schema_version, 38);
+        assert_eq!(plan.target_schema_version, 40);
         assert!(plan.migration_required);
         assert_eq!(plan.worker_count, 1);
         assert_eq!(plan.mappings[0].legacy_worker_id, 7);
@@ -6496,7 +7485,7 @@ mod tests {
         store
             .with_conn(|conn| {
                 assert!(table_exists(conn, "worker_diagnostics_archives")?);
-                assert_eq!(current_schema_version(conn)?, 38);
+                assert_eq!(current_schema_version(conn)?, 40);
                 Ok(())
             })
             .unwrap();
@@ -6575,7 +7564,7 @@ mod tests {
                 ),
             ]
         );
-        assert_eq!(current_schema_version(&conn).unwrap(), 38);
+        assert_eq!(current_schema_version(&conn).unwrap(), 40);
         let foreign_key_error: Option<String> = conn
             .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
             .optional()
@@ -6647,11 +7636,16 @@ CREATE TABLE ticket_worker_links (ticket_id TEXT, worker_ref_key TEXT);
             .unwrap();
             tx.commit().unwrap();
         }
+        ticket::migrate_sqlite_ticket_schema(&conn).unwrap();
         conn.execute_batch(
             r#"
 INSERT INTO workspaces (
     workspace_id, display_name, state, created_at, updated_at
 ) VALUES ('workspace-a', 'Workspace A', 'active', '1', '1');
+INSERT INTO typed_tickets (
+    workspace_id, ticket_id, slug, title, status, kind, priority, body,
+    workflow_state, workflow_state_explicit
+) VALUES ('workspace-a', 'ticket-a', 'ticket-a', 'Ticket A', 'open', 'task', 'normal', '', 'planning', 1);
 INSERT INTO worker_registry (
     workspace_id, runtime_id, runtime_worker_id, display_name,
     retention_state, created_at, updated_at
@@ -6699,7 +7693,7 @@ INSERT INTO worker_orphan_diagnostics (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 38);
+        assert_eq!(current_schema_version(&conn).unwrap(), 40);
         assert!(!table_exists(&conn, "worker_control_delegation_operations").unwrap());
         let controller_worker_id: String = conn
             .query_row(
@@ -6817,7 +7811,7 @@ INSERT INTO worker_orphan_diagnostics (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 38);
+        assert_eq!(current_schema_version(&conn).unwrap(), 40);
         assert!(table_exists(&conn, "worker_workdir_attachment_reservations").unwrap());
     }
 
@@ -6850,7 +7844,7 @@ CREATE TABLE flow_events (event_id TEXT PRIMARY KEY);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 38);
+        assert_eq!(current_schema_version(&conn).unwrap(), 40);
         assert!(table_exists(&conn, "flow_sources").unwrap());
         assert!(table_exists(&conn, "flow_source_revisions").unwrap());
         assert!(!table_exists(&conn, "flow_instances").unwrap());
@@ -6917,7 +7911,7 @@ INSERT INTO worker_workdir_attachment_reservations (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 38);
+        assert_eq!(current_schema_version(&conn).unwrap(), 40);
         let repositories_sql: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'repositories'",
@@ -7038,8 +8032,7 @@ INSERT INTO workdir_registry (
     }
 
     #[tokio::test]
-    async fn startup_rejects_cross_workspace_ticket_repository_reference_without_claiming_ticket_schema()
-     {
+    async fn workspace_schema_rejects_cross_workspace_ticket_repository_reference_at_write_time() {
         let dir = tempfile::tempdir().unwrap();
         let database_path = dir.path().join("workspace.sqlite");
         let store = SqliteWorkspaceStore::open(&database_path).unwrap();
@@ -7080,15 +8073,14 @@ INSERT INTO workdir_registry (
         .unwrap();
         let mut input = ticket::NewTicket::new("Foreign repository");
         input.repository_id = Some("main".to_string());
-        ticket::TicketBackend::create(&backend, input).unwrap();
+        let error = ticket::TicketBackend::create(&backend, input).unwrap_err();
+        assert!(
+            error.to_string().contains("FOREIGN KEY constraint failed"),
+            "{error}"
+        );
         drop(backend);
 
-        let error = match SqliteWorkspaceStore::open(&database_path) {
-            Ok(_) => panic!("cross-Workspace Ticket repository reference must fail closed"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("typed_tickets"));
-        assert!(error.to_string().contains("workspace-b"));
+        SqliteWorkspaceStore::open(&database_path).unwrap();
     }
 
     #[tokio::test]
@@ -7097,7 +8089,7 @@ INSERT INTO workdir_registry (
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 38);
+        assert_eq!(store.schema_version().await.unwrap(), 40);
         assert!(
             !store
                 .with_conn(|conn| table_exists(conn, "worker_workspace_credentials"))
@@ -7114,7 +8106,7 @@ INSERT INTO workdir_registry (
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 38);
+        assert_eq!(reopened.schema_version().await.unwrap(), 40);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -7339,6 +8331,29 @@ INSERT INTO workdir_registry (
                 updated_at: "2026-07-32T00:00:00Z".to_string(),
             })
             .await
+            .unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+INSERT INTO typed_tickets (
+    workspace_id, ticket_id, slug, title, status, kind, priority, body,
+    workflow_state, workflow_state_explicit
+) VALUES
+    ('workspace-a', 'ticket-1', 'ticket-1', 'Ticket 1', 'open', 'task', 'normal', '', 'planning', 1),
+    ('workspace-a', 'ticket-2', 'ticket-2', 'Ticket 2', 'open', 'task', 'normal', '', 'planning', 1),
+    ('workspace-a', 'ticket-3', 'ticket-3', 'Ticket 3', 'open', 'task', 'normal', '', 'planning', 1);
+INSERT INTO worker_registry (
+    workspace_id, runtime_id, worker_id, display_name, retention_state, created_at, updated_at
+) VALUES
+    ('workspace-a', 'runtime-1', 'worker-1', 'Worker 1', 'normal', '1', '1'),
+    ('workspace-a', 'runtime-1', 'worker-other', 'Other Worker', 'normal', '1', '1'),
+    ('workspace-a', 'runtime-2', 'worker-2', 'Worker 2', 'normal', '1', '1'),
+    ('workspace-a', 'runtime-3', 'worker-3', 'Worker 3', 'normal', '1', '1');
+"#,
+                )?;
+                Ok(())
+            })
             .unwrap();
 
         let first = TicketWorkerAssignmentRecord {
@@ -7585,6 +8600,534 @@ INSERT INTO workdir_registry (
     }
 
     #[test]
+    fn server_refuses_a_database_from_a_newer_schema_generation() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_sqlite(&conn).unwrap();
+        apply_migrations(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (41, 'future')",
+            [],
+        )
+        .unwrap();
+
+        let error = apply_migrations(&conn).unwrap_err().to_string();
+        assert!(error.contains("schema version 41 is newer"), "{error}");
+        assert!(error.contains("refusing to serve"), "{error}");
+    }
+
+    #[test]
+    fn startup_rejects_missing_workspace_resource_constraint_trigger() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER ticket_worker_assignments_validate_insert")?;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+
+        let error = match SqliteWorkspaceStore::open(&path) {
+            Ok(_) => panic!("missing assignment constraint trigger must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("ticket_worker_assignments_validate_insert"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn startup_accepts_retained_assignment_history_after_parent_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+INSERT INTO workspaces (workspace_id, display_name, state, created_at, updated_at)
+VALUES ('workspace-a', 'A', 'active', '2026-01-01', '2026-01-01');
+INSERT INTO typed_tickets (
+    workspace_id, ticket_id, slug, title, status, kind, priority, body,
+    workflow_state, workflow_state_explicit
+) VALUES ('workspace-a', 'ticket-a', 'ticket-a', 'A', 'open', 'task', 'normal', '', 'planning', 1);
+INSERT INTO worker_registry (
+    workspace_id, runtime_id, worker_id, display_name, retention_state, created_at, updated_at
+) VALUES (
+    'workspace-a', 'runtime-a', '00000000-0000-7000-8000-000000000001',
+    'Worker A', 'normal', '2026-01-01', '2026-01-01'
+);
+INSERT INTO ticket_worker_assignments (
+    workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at
+) VALUES (
+    'workspace-a', 'ticket-a', 'assignment-a', 'runtime-a',
+    '00000000-0000-7000-8000-000000000001', 'tester', '2026-01-01'
+);
+DELETE FROM worker_registry
+WHERE workspace_id = 'workspace-a' AND worker_id = '00000000-0000-7000-8000-000000000001';
+DELETE FROM typed_tickets
+WHERE workspace_id = 'workspace-a' AND ticket_id = 'ticket-a';
+INSERT INTO workspaces (workspace_id, display_name, state, created_at, updated_at)
+VALUES ('workspace-b', 'B', 'active', '2026-01-01', '2026-01-01');
+INSERT INTO typed_tickets (
+    workspace_id, ticket_id, slug, title, status, kind, priority, body,
+    workflow_state, workflow_state_explicit
+) VALUES ('workspace-b', 'ticket-a', 'ticket-a-b', 'B', 'open', 'task', 'normal', '', 'planning', 1);
+INSERT INTO worker_registry (
+    workspace_id, runtime_id, worker_id, display_name, retention_state, created_at, updated_at
+) VALUES (
+    'workspace-b', 'runtime-b', '00000000-0000-7000-8000-000000000001',
+    'Worker B', 'normal', '2026-01-01', '2026-01-01'
+);
+"#,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+
+        let reopened = SqliteWorkspaceStore::open(&path).unwrap();
+        reopened
+            .with_conn(|conn| {
+                let retained: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM ticket_worker_assignments WHERE workspace_id = 'workspace-a'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(retained, 1);
+                let ticket_tombstones: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM ticket_assignment_ticket_tombstones WHERE workspace_id = 'workspace-a' AND ticket_id = 'ticket-a'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let worker_tombstones: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM ticket_assignment_worker_tombstones WHERE workspace_id = 'workspace-a' AND runtime_id = 'runtime-a' AND worker_id = '00000000-0000-7000-8000-000000000001'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(ticket_tombstones, 1);
+                assert_eq!(worker_tombstones, 1);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn migration_plan_lists_workspace_reference_violations_without_mutating_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        apply_migrations_through(&conn, 38).unwrap();
+        ticket::migrate_sqlite_ticket_schema(&conn).unwrap();
+        merge_request::migrate(&conn).unwrap();
+        conn.execute_batch(
+            r#"
+INSERT INTO workspaces (workspace_id, display_name, state, created_at, updated_at) VALUES
+    ('workspace-a', 'A', 'active', '2026-01-01', '2026-01-01'),
+    ('workspace-b', 'B', 'active', '2026-01-01', '2026-01-01');
+INSERT INTO typed_tickets (
+    workspace_id, ticket_id, slug, title, status, kind, priority, body,
+    workflow_state, workflow_state_explicit
+) VALUES
+    ('workspace-a', 'ticket-a', 'ticket-a', 'A', 'open', 'task', 'normal', '', 'planning', 1),
+    ('workspace-b', 'ticket-b', 'ticket-b', 'B', 'open', 'task', 'normal', '', 'planning', 1);
+INSERT INTO typed_ticket_relations (workspace_id, ticket_id, kind, target, note, author, at)
+VALUES ('workspace-b', 'ticket-b', 'related', 'ticket-a', NULL, 'tester', '2026-01-01');
+"#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = SqliteWorkspaceStore::migration_plan(&path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("typed_ticket_relations.target"), "{error}");
+        assert!(
+            error.contains("workspace-b/ticket-b -> ticket-a"),
+            "{error}"
+        );
+
+        let source = Connection::open(&path).unwrap();
+        assert_eq!(current_schema_version(&source).unwrap(), 38);
+        assert_eq!(
+            source
+                .query_row("SELECT COUNT(*) FROM typed_ticket_relations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn workspace_resource_fk_migration_rolls_back_constraint_failures() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_sqlite(&conn).unwrap();
+        apply_migrations_through(&conn, 38).unwrap();
+        ticket::migrate_sqlite_ticket_schema(&conn).unwrap();
+        merge_request::migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO workspaces (workspace_id, display_name, state, created_at, updated_at) \
+             VALUES ('workspace-a', 'A', 'active', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO typed_tickets (workspace_id, ticket_id, slug, title, status, kind, priority, body, \
+             workflow_state, workflow_state_explicit, repository_id, ref_selector) \
+             VALUES ('workspace-a', 'ticket-a', 'ticket-a', 'A', 'open', 'task', 'normal', '', \
+             'planning', 1, NULL, 'develop')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute_batch("CREATE TABLE typed_tickets_v39 (sentinel TEXT)")
+            .unwrap();
+
+        let error = apply_migrations_through(&conn, 39).unwrap_err().to_string();
+        assert!(error.contains("CREATE TABLE typed_tickets_v39"), "{error}");
+        assert_eq!(current_schema_version(&conn).unwrap(), 38);
+        assert_eq!(
+            conn.query_row(
+                "SELECT ref_selector FROM typed_tickets WHERE workspace_id = 'workspace-a' AND ticket_id = 'ticket-a'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "develop"
+        );
+        assert!(table_exists(&conn, "typed_tickets_v39").unwrap());
+        assert!(!table_exists(&conn, "objectives_v39").unwrap());
+        let foreign_keys_enabled: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys_enabled, 1);
+    }
+
+    #[test]
+    fn schema_v40_adds_workspace_create_operations_and_fail_closed_runtime_assignment() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_sqlite(&conn).unwrap();
+        apply_migrations_through(&conn, 39).unwrap();
+        let now = "2026-01-01T00:00:00Z";
+        conn.execute(
+            r#"INSERT INTO workspaces (
+                workspace_id, display_name, state, created_at, updated_at
+            ) VALUES ('workspace-a', 'Workspace A', 'active', ?1, ?1)"#,
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            r#"INSERT INTO trusted_runtime_records (
+                runtime_id, display_name, base_url, public_key, created_at, updated_at
+            ) VALUES ('runtime-a', 'Runtime A', 'http://runtime-a.test', 'key', ?1, ?1)"#,
+            params![now],
+        )
+        .unwrap();
+
+        apply_migrations(&mut conn).unwrap();
+
+        assert_eq!(current_schema_version(&conn).unwrap(), 40);
+        let workspace_id: Option<String> = conn
+            .query_row(
+                "SELECT workspace_id FROM trusted_runtime_records WHERE runtime_id = 'runtime-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(workspace_id, None);
+        assert!(table_exists(&conn, "workspace_create_operations").unwrap());
+    }
+
+    #[test]
+    fn workspace_resource_fk_migration_preflights_and_enforces_composite_identity() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_sqlite(&conn).unwrap();
+        apply_migrations_through(&conn, 38).unwrap();
+        ticket::migrate_sqlite_ticket_schema(&conn).unwrap();
+        merge_request::migrate(&conn).unwrap();
+
+        conn.execute_batch(
+            r#"
+INSERT INTO workspaces (
+    workspace_id, display_name, state, created_at, updated_at
+) VALUES
+    ('workspace-a', 'A', 'active', '2026-01-01', '2026-01-01'),
+    ('workspace-b', 'B', 'active', '2026-01-01', '2026-01-01');
+INSERT INTO repositories (
+    workspace_id, repository_id, name, kind, provider, uri, default_ref, created_at, updated_at
+) VALUES ('workspace-a', 'repo-a', 'Repo A', 'git', 'git', '/repo-a', 'develop', '2026-01-01', '2026-01-01');
+INSERT INTO typed_tickets (
+    workspace_id, ticket_id, slug, title, status, kind, priority, body,
+    created_at, updated_at, workflow_state, workflow_state_explicit,
+    repository_id, ref_selector
+) VALUES
+    ('workspace-a', 'ticket-a', 'ticket-a', 'A', 'open', 'task', 'normal', '',
+     '2026-01-01', '2026-01-01', 'planning', 1, 'repo-a', 'develop'),
+    ('workspace-b', 'ticket-b', 'ticket-b', 'B', 'open', 'task', 'normal', '',
+     '2026-01-01', '2026-01-01', 'planning', 1, NULL, NULL),
+    ('workspace-b', 'ticket-b2', 'ticket-b2', 'B2', 'open', 'task', 'normal', '',
+     '2026-01-01', '2026-01-01', 'planning', 1, NULL, NULL);
+INSERT INTO objectives (
+    workspace_id, objective_id, title, state, body_md, created_at, updated_at
+) VALUES ('workspace-a', 'objective-a', 'A', 'active', '', '2026-01-01', '2026-01-01');
+INSERT INTO typed_ticket_relations (
+    workspace_id, ticket_id, kind, target, note, author, at
+) VALUES ('workspace-b', 'ticket-b', 'related', 'ticket-a', NULL, 'tester', '2026-01-01');
+INSERT INTO objective_ticket_links (
+    workspace_id, objective_id, ticket_id, kind, created_at
+) VALUES ('workspace-b', 'objective-a', 'ticket-b', 'tracks', '2026-01-01');
+INSERT INTO worker_registry (
+    workspace_id, runtime_id, worker_id, display_name, retention_state, created_at, updated_at
+) VALUES
+    ('workspace-a', 'runtime-a', '00000000-0000-7000-8000-000000000001', 'Worker A', 'normal', '2026-01-01', '2026-01-01'),
+    ('workspace-b', 'runtime-b', '00000000-0000-7000-8000-000000000002', 'Worker B', 'normal', '2026-01-01', '2026-01-01');
+INSERT INTO ticket_worker_assignments (
+    workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at
+) VALUES (
+    'workspace-b', 'ticket-b', 'assignment-cross-worker', 'runtime-a',
+    '00000000-0000-7000-8000-000000000001', 'tester', '2026-01-01'
+);
+INSERT INTO ticket_worker_assignments (
+    workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at
+) VALUES (
+    'workspace-b', 'ticket-b', 'assignment-runtime-mismatch', 'runtime-wrong',
+    '00000000-0000-7000-8000-000000000002', 'tester', '2026-01-01'
+);
+INSERT INTO ticket_worker_assignments (
+    workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at
+) VALUES (
+    'workspace-b', 'ticket-missing', 'assignment-missing-parents', 'runtime-missing',
+    '00000000-0000-7000-8000-000000000003', 'tester', '2026-01-01'
+);
+INSERT INTO ticket_worker_assignments (
+    workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at
+) VALUES (
+    'workspace-b', 'ticket-a', 'assignment-cross-ticket', 'runtime-b',
+    '00000000-0000-7000-8000-000000000002', 'tester', '2026-01-01'
+);
+INSERT INTO ticket_worker_assignments (
+    workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at
+) VALUES (
+    'workspace-b', 'ticket-b', 'assignment-event-source', 'runtime-b',
+    '00000000-0000-7000-8000-000000000002', 'tester', '2026-01-01'
+);
+INSERT INTO ticket_worker_assignment_events (
+    workspace_id, ticket_id, event_id, action, assignment_id, actor, created_at
+) VALUES (
+    'workspace-b', 'ticket-b2', 'event-cross-ticket', 'assigned',
+    'assignment-event-source', 'tester', '2026-01-01'
+);
+"#,
+        )
+        .unwrap();
+
+        let error = apply_migrations_through(&conn, 39).unwrap_err().to_string();
+        assert!(error.contains("typed_ticket_relations.target"), "{error}");
+        assert!(
+            error.contains("workspace-b/ticket-b -> ticket-a"),
+            "{error}"
+        );
+        assert!(
+            error.contains("objective_ticket_links.objective_id"),
+            "{error}"
+        );
+        assert!(
+            error.contains("ticket_worker_assignments.ticket_id"),
+            "{error}"
+        );
+        assert!(error.contains("assignment-cross-ticket"), "{error}");
+        assert!(
+            error.contains("ticket_worker_assignments.worker_id"),
+            "{error}"
+        );
+        assert!(error.contains("assignment-cross-worker"), "{error}");
+        assert!(error.contains("assignment-runtime-mismatch"), "{error}");
+        assert!(error.contains("assignment-missing-parents"), "{error}");
+        assert!(
+            error.contains("ticket_worker_assignment_events.assignment_id"),
+            "{error}"
+        );
+        assert!(error.contains("event-cross-ticket"), "{error}");
+        assert_eq!(current_schema_version(&conn).unwrap(), 38);
+
+        conn.execute("DELETE FROM typed_ticket_relations", [])
+            .unwrap();
+        conn.execute("DELETE FROM objective_ticket_links", [])
+            .unwrap();
+        conn.execute("DELETE FROM ticket_worker_assignment_events", [])
+            .unwrap();
+        conn.execute("DELETE FROM ticket_worker_assignments", [])
+            .unwrap();
+        apply_migrations_through(&conn, 39).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 39);
+
+        let bad_target = conn.execute(
+            "UPDATE typed_tickets SET repository_id = 'repo-a', ref_selector = 'develop' \
+             WHERE workspace_id = 'workspace-b' AND ticket_id = 'ticket-b'",
+            [],
+        );
+        assert!(bad_target.is_err());
+        let cross_relation = conn.execute(
+            "INSERT INTO typed_ticket_relations \
+             (workspace_id, ticket_id, kind, target, note, author, at) \
+             VALUES ('workspace-b', 'ticket-b', 'related', 'ticket-a', NULL, 'tester', '2026-01-01')",
+            [],
+        );
+        assert!(cross_relation.is_err());
+        let cross_objective_link = conn.execute(
+            "INSERT INTO objective_ticket_links \
+             (workspace_id, objective_id, ticket_id, kind, created_at) \
+             VALUES ('workspace-b', 'objective-a', 'ticket-b', 'tracks', '2026-01-01')",
+            [],
+        );
+        assert!(cross_objective_link.is_err());
+        let cross_ticket_assignment = conn.execute(
+            "INSERT INTO ticket_worker_assignments \
+             (workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at) \
+             VALUES ('workspace-b', 'ticket-a', 'assignment-cross-ticket', 'runtime-b', \
+             '00000000-0000-7000-8000-000000000002', 'tester', '2026-01-01')",
+            [],
+        );
+        assert!(cross_ticket_assignment.is_err());
+        let cross_worker_assignment = conn.execute(
+            "INSERT INTO ticket_worker_assignments \
+             (workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at) \
+             VALUES ('workspace-b', 'ticket-b', 'assignment-cross-worker', 'runtime-a', \
+             '00000000-0000-7000-8000-000000000001', 'tester', '2026-01-01')",
+            [],
+        );
+        assert!(cross_worker_assignment.is_err());
+        let runtime_mismatch_assignment = conn.execute(
+            "INSERT INTO ticket_worker_assignments \
+             (workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at) \
+             VALUES ('workspace-b', 'ticket-b', 'assignment-runtime-mismatch', 'runtime-wrong', \
+             '00000000-0000-7000-8000-000000000002', 'tester', '2026-01-01')",
+            [],
+        );
+        assert!(runtime_mismatch_assignment.is_err());
+        conn.execute(
+            "INSERT INTO ticket_worker_assignments \
+             (workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at) \
+             VALUES ('workspace-b', 'ticket-b', 'assignment-b', 'runtime-b', \
+             '00000000-0000-7000-8000-000000000002', 'tester', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        let mismatched_current_assignment = conn.execute(
+            "INSERT INTO ticket_current_worker_assignments \
+             (workspace_id, ticket_id, assignment_id, runtime_id, worker_id, updated_at) \
+             VALUES ('workspace-b', 'ticket-b', 'assignment-b', 'runtime-a', \
+             '00000000-0000-7000-8000-000000000001', '2026-01-01')",
+            [],
+        );
+        assert!(mismatched_current_assignment.is_err());
+        let cross_assignment_event = conn.execute(
+            "INSERT INTO ticket_worker_assignment_events \
+             (workspace_id, ticket_id, event_id, action, assignment_id, actor, created_at) \
+             VALUES ('workspace-b', 'ticket-b2', 'event-cross-assignment', 'assigned', \
+             'assignment-b', 'tester', '2026-01-01')",
+            [],
+        );
+        assert!(cross_assignment_event.is_err());
+        let cross_operation_ticket = conn.execute(
+            "INSERT INTO ticket_assignment_operations \
+             (workspace_id, operation_id, action, ticket_id, created_at) \
+             VALUES ('workspace-b', 'operation-cross-ticket', 'assign', 'ticket-a', '2026-01-01')",
+            [],
+        );
+        assert!(cross_operation_ticket.is_err());
+        assert!(
+            conn.execute(
+                "DELETE FROM repositories WHERE workspace_id = 'workspace-a' AND repository_id = 'repo-a'",
+                [],
+            )
+            .is_err()
+        );
+        conn.execute(
+            "INSERT INTO typed_ticket_relations \
+             (workspace_id, ticket_id, kind, target, note, author, at) \
+             VALUES ('workspace-b', 'ticket-b', 'related', 'ticket-b2', NULL, 'tester', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM typed_tickets WHERE workspace_id = 'workspace-b' AND ticket_id = 'ticket-b2'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM typed_ticket_relations WHERE workspace_id = 'workspace-b'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        conn.execute(
+            "DELETE FROM worker_registry WHERE workspace_id = 'workspace-b' AND worker_id = '00000000-0000-7000-8000-000000000002'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM typed_tickets WHERE workspace_id = 'workspace-b' AND ticket_id = 'ticket-b'",
+            [],
+        )
+        .unwrap();
+        validate_workspace_resource_references(&conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM ticket_worker_assignments WHERE workspace_id = 'workspace-b'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "historical assignments survive Worker and Ticket retention deletion"
+        );
+        conn.execute(
+            "DELETE FROM workspaces WHERE workspace_id = 'workspace-b'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM typed_tickets WHERE workspace_id = 'workspace-b'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM ticket_worker_assignments WHERE workspace_id = 'workspace-b'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+
+        let foreign_key_failures: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_failures, 0);
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    }
+
+    #[test]
     fn fresh_schema_matches_workspace_db_v0_boundaries() {
         let conn = Connection::open_in_memory().unwrap();
         configure_sqlite(&conn).unwrap();
@@ -7790,7 +9333,7 @@ INSERT INTO workdir_registry (
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 38);
+        assert_eq!(store.schema_version().await.unwrap(), 40);
 
         store
             .with_conn(|conn| {
@@ -7979,7 +9522,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 38);
+        assert_eq!(store.schema_version().await.unwrap(), 40);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -8045,7 +9588,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 38);
+        assert_eq!(store.schema_version().await.unwrap(), 40);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -8436,7 +9979,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 38);
+        assert_eq!(store.schema_version().await.unwrap(), 40);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),
@@ -8622,6 +10165,7 @@ CREATE TABLE ticket_assignment_operations (
         store
             .upsert_trusted_runtime(&TrustedRuntimeRecord {
                 runtime_id: "runtime-a".to_string(),
+                workspace_id: None,
                 display_name: "Runtime A".to_string(),
                 base_url: "https://runtime.invalid".to_string(),
                 public_key: "public-key".to_string(),

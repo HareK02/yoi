@@ -119,12 +119,22 @@ fn normalize_path_lexically(path: &Path) -> PathBuf {
     normalized
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChangeStat {
+    pub added: u64,
+    pub deleted: u64,
+}
+
 #[derive(Debug, Default)]
 struct Inner {
     /// Hash of each file's last observed contents, keyed by canonical path.
     hashes: HashMap<PathBuf, ContentHash>,
+    /// Line count paired with observations that included the file content.
+    line_counts: HashMap<PathBuf, usize>,
     /// LRU list of touched files. Front = most recently touched.
     recency: VecDeque<PathBuf>,
+    /// Successful Write/Edit mutations attributed to this session's tools.
+    change_stat: ChangeStat,
 }
 
 /// Canonical-path keyed tracker of file observations and their recency.
@@ -187,8 +197,27 @@ impl Tracker {
         }
     }
 
-    pub fn record_workdir_content(&self, path: &workdir::WorkdirPath, bytes: &[u8]) {
-        self.record_workdir_hash(path, hash_bytes(bytes));
+    pub fn record_workdir_content(&self, path: &workdir::WorkdirPath, content: &[u8]) {
+        let key = PathBuf::from(path.as_str());
+        let hash = hash_bytes(content);
+        let line_count = String::from_utf8_lossy(content).lines().count();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.line_counts.insert(key.clone(), line_count);
+        inner.hashes.insert(key.clone(), hash);
+        inner.recency.retain(|candidate| candidate != &key);
+        inner.recency.push_front(key);
+        if inner.recency.len() > RECENCY_CAPACITY {
+            inner.recency.pop_back();
+        }
+    }
+
+    pub fn observed_workdir_line_count(&self, path: &workdir::WorkdirPath) -> Option<usize> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .line_counts
+            .get(Path::new(path.as_str()))
+            .copied()
     }
 
     pub fn record_workdir_hash(&self, path: &workdir::WorkdirPath, hash: workdir::ContentHash) {
@@ -200,6 +229,50 @@ impl Tracker {
         if inner.recency.len() > RECENCY_CAPACITY {
             inner.recency.pop_back();
         }
+    }
+
+    /// Record a successful, session-attributable source mutation.
+    ///
+    /// Callers supply line counts derived from the exact replacement accepted
+    /// by a Write/Edit tool. Bash and external process mutations are excluded
+    /// because this tracker cannot attribute them to one tool operation
+    /// authoritatively.
+    pub fn record_change(&self, added: usize, deleted: usize) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.change_stat.added = inner.change_stat.added.saturating_add(added as u64);
+        inner.change_stat.deleted = inner.change_stat.deleted.saturating_add(deleted as u64);
+    }
+
+    pub fn record_workdir_edit(
+        &self,
+        path: &workdir::WorkdirPath,
+        hash: workdir::ContentHash,
+        replacements: usize,
+        added_lines_per_replacement: usize,
+        deleted_lines_per_replacement: usize,
+    ) {
+        let added = added_lines_per_replacement.saturating_mul(replacements);
+        let deleted = deleted_lines_per_replacement.saturating_mul(replacements);
+        let key = PathBuf::from(path.as_str());
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.change_stat.added = inner.change_stat.added.saturating_add(added as u64);
+        inner.change_stat.deleted = inner.change_stat.deleted.saturating_add(deleted as u64);
+        if let Some(line_count) = inner.line_counts.get_mut(&key) {
+            *line_count = line_count.saturating_sub(deleted).saturating_add(added);
+        }
+        inner.hashes.insert(key.clone(), hash);
+        inner.recency.retain(|candidate| candidate != &key);
+        inner.recency.push_front(key);
+        if inner.recency.len() > RECENCY_CAPACITY {
+            inner.recency.pop_back();
+        }
+    }
+
+    pub fn change_stat(&self) -> ChangeStat {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .change_stat
     }
 
     pub fn expected_workdir_hash(
@@ -456,6 +529,21 @@ mod tests {
             let name = format!("f{i:02}.txt");
             assert!(recent.iter().all(|p| !p.ends_with(&name)));
         }
+    }
+
+    #[test]
+    fn change_stat_saturates_and_accumulates_tracked_mutations() {
+        let tracker = Tracker::new();
+        tracker.record_change(7, 3);
+        tracker.record_change(5, 2);
+
+        assert_eq!(
+            tracker.change_stat(),
+            ChangeStat {
+                added: 12,
+                deleted: 5,
+            }
+        );
     }
 
     #[tokio::test]

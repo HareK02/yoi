@@ -27,7 +27,7 @@ pub use error::ToolsError;
 pub use glob::glob_tool;
 pub use grep::grep_tool;
 pub use read::read_tool;
-pub use tracker::Tracker;
+pub use tracker::{ChangeStat, Tracker};
 pub use view_image::view_image_tool;
 pub use web::{web_fetch_tool, web_search_tool};
 pub use write::write_tool;

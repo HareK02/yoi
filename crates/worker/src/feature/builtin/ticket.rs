@@ -1781,6 +1781,7 @@ provider = "github"
             assert!(request.contains("\"title\":\"HTTP ticket\""));
             let response_body = serde_json::to_string(&TicketRef {
                 id: "01TEST".to_string(),
+                human_key: None,
                 slug: "http-ticket".to_string(),
                 status: ticket::TicketStatus::Open,
             })
