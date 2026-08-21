@@ -540,6 +540,7 @@ dependencies = [
  "tokio-tungstenite 0.29.0",
  "uuid",
  "workdir",
+ "workspace-api",
 ]
 
 [[package]]
@@ -6136,6 +6137,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "workspace-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "workdir",
+]
+
+[[package]]
 name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6265,6 +6275,7 @@ dependencies = [
  "workdir",
  "worker",
  "worker-runtime",
+ "workspace-api",
 ]
 
 [[package]]

@@ -46,7 +46,7 @@ pub(crate) async fn run(
                 }
                 Err(error) => response.diagnostics.push(client::BackendDiagnostic {
                     code: "backend_stopped_workers_list_failed".to_string(),
-                    severity: Some("error".to_string()),
+                    severity: client::BackendDiagnosticSeverity::Error,
                     message: error.to_string(),
                 }),
             }
@@ -396,6 +396,7 @@ mod tests {
             workspace: BackendWorkerWorkspaceSummary {
                 visibility: "workspace".to_string(),
                 identity: "ws".to_string(),
+                workspace_id: Some("ws".to_string()),
             },
             state: "running".to_string(),
             last_seen_at: None,

@@ -1,13 +1,21 @@
 use futures::{SinkExt, StreamExt};
 use protocol::stream::{decode_event, encode_method};
 use protocol::{ErrorCode, Event, Method};
-use serde::Deserialize;
 use std::collections::VecDeque;
 use std::fmt;
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 pub use workdir::workspace::WorkingDirectorySummary as BackendWorkingDirectorySummary;
+pub use workspace_api::{
+    Diagnostic as BackendDiagnostic, DiagnosticSeverity as BackendDiagnosticSeverity,
+    ListResponse as BackendRuntimeListResponse, RuntimeSummary as BackendRuntimeSummary,
+    WorkerCapabilitySummary as BackendWorkerCapabilitySummary,
+    WorkerImplementationSummary as BackendWorkerImplementationSummary,
+    WorkerRestoreResponse as BackendWorkerRestoreResponse,
+    WorkerRestoreResult as BackendWorkerRestoreResult, WorkerSummary as BackendWorkerSummary,
+    WorkerWorkspaceSummary as BackendWorkerWorkspaceSummary,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendRuntimeTarget {
@@ -91,94 +99,6 @@ impl BackendRuntimeListTarget {
             worker_id,
         ))
     }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct BackendRuntimeListResponse<T> {
-    pub workspace_id: String,
-    pub limit: usize,
-    pub items: Vec<T>,
-    pub source: String,
-    #[serde(default)]
-    pub diagnostics: Vec<BackendDiagnostic>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct BackendRuntimeSummary {
-    pub runtime_id: String,
-    pub label: String,
-    pub kind: String,
-    pub status: String,
-    #[serde(default)]
-    pub host_ids: Vec<String>,
-    #[serde(default)]
-    pub diagnostics: Vec<BackendDiagnostic>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct BackendWorkerWorkspaceSummary {
-    pub visibility: String,
-    pub identity: String,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct BackendWorkerImplementationSummary {
-    pub kind: String,
-    pub display_hint: String,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct BackendWorkerCapabilitySummary {
-    pub can_stop: bool,
-    pub can_spawn_followup: bool,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct BackendWorkerSummary {
-    pub runtime_id: String,
-    pub worker_id: String,
-    pub resource_key: String,
-    pub host_id: String,
-    #[serde(default)]
-    pub display_name: String,
-    pub label: String,
-    #[serde(default)]
-    pub profile: Option<String>,
-    #[serde(default)]
-    pub singleton_key: Option<String>,
-    #[serde(default)]
-    pub tags: Vec<String>,
-    pub workspace: BackendWorkerWorkspaceSummary,
-    pub state: String,
-    #[serde(default)]
-    pub last_seen_at: Option<String>,
-    #[serde(default)]
-    pub pinned: bool,
-    #[serde(default)]
-    pub retention_state: String,
-    pub implementation: BackendWorkerImplementationSummary,
-    pub capabilities: BackendWorkerCapabilitySummary,
-    #[serde(default)]
-    pub working_directory: Option<BackendWorkingDirectorySummary>,
-    #[serde(default)]
-    pub diagnostics: Vec<BackendDiagnostic>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct BackendWorkerRestoreResult {
-    pub state: String,
-    #[serde(default)]
-    pub worker: Option<BackendWorkerSummary>,
-    #[serde(default)]
-    pub diagnostics: Vec<BackendDiagnostic>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct BackendWorkerRestoreResponse {
-    pub workspace_id: String,
-    pub runtime_id: String,
-    pub worker_id: String,
-    pub result: BackendWorkerRestoreResult,
 }
 
 #[derive(Debug)]
@@ -277,7 +197,7 @@ pub async fn list_backend_workers(
             }
             Err(error) => diagnostics.push(BackendDiagnostic {
                 code: "runtime_worker_list_failed".to_string(),
-                severity: Some("error".to_string()),
+                severity: BackendDiagnosticSeverity::Error,
                 message: format!(
                     "failed to list workers for runtime {}: {error}",
                     runtime.runtime_id
@@ -617,14 +537,6 @@ fn percent_encode(input: &str, keep: impl Fn(u8) -> bool) -> String {
         }
     }
     encoded
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct BackendDiagnostic {
-    pub code: String,
-    #[serde(default)]
-    pub severity: Option<String>,
-    pub message: String,
 }
 
 #[cfg(test)]

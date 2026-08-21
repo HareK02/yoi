@@ -246,8 +246,6 @@ pub struct WorkerCapabilitySummary {
 pub struct WorkerSummary {
     #[serde(flatten)]
     pub worker: RuntimeWorkerRef,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resource_key: Option<String>,
     pub host_id: String,
     /// Human-readable display name. This is not identity and may be duplicated.
     pub display_name: String,
@@ -269,6 +267,119 @@ pub struct WorkerSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<WorkingDirectorySummary>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+impl From<RuntimeDiagnostic> for workspace_api::Diagnostic {
+    fn from(diagnostic: RuntimeDiagnostic) -> Self {
+        let severity = match diagnostic.severity {
+            DiagnosticSeverity::Info => workspace_api::DiagnosticSeverity::Info,
+            DiagnosticSeverity::Warning => workspace_api::DiagnosticSeverity::Warning,
+            DiagnosticSeverity::Error => workspace_api::DiagnosticSeverity::Error,
+        };
+        Self {
+            code: diagnostic.code,
+            severity,
+            message: diagnostic.message,
+        }
+    }
+}
+
+impl From<RuntimeSourceSummary> for workspace_api::RuntimeSourceSummary {
+    fn from(source: RuntimeSourceSummary) -> Self {
+        let kind = match source.kind {
+            RuntimeSourceKind::EmbeddedWorkerRuntime => {
+                workspace_api::RuntimeSourceKind::EmbeddedWorkerRuntime
+            }
+            RuntimeSourceKind::RemoteHttp => workspace_api::RuntimeSourceKind::RemoteHttp,
+        };
+        let status = match source.status {
+            RuntimeSourceStatus::Active => workspace_api::RuntimeSourceStatus::Active,
+            RuntimeSourceStatus::Reserved => workspace_api::RuntimeSourceStatus::Reserved,
+        };
+        let identity_authority = match source.identity_authority {
+            RuntimeIdentityAuthority::RuntimeRegistryProjection => {
+                workspace_api::RuntimeIdentityAuthority::RuntimeRegistryProjection
+            }
+        };
+        Self {
+            kind,
+            status,
+            identity_authority,
+            note: source.note,
+        }
+    }
+}
+
+impl From<RuntimeCapabilitySummary> for workspace_api::RuntimeCapabilitySummary {
+    fn from(capabilities: RuntimeCapabilitySummary) -> Self {
+        Self {
+            can_list_hosts: capabilities.can_list_hosts,
+            can_list_workers: capabilities.can_list_workers,
+            can_get_worker: capabilities.can_get_worker,
+            can_spawn_worker: capabilities.can_spawn_worker,
+            can_stop_worker: capabilities.can_stop_worker,
+            has_workspace_fs: capabilities.has_workspace_fs,
+            has_shell: capabilities.has_shell,
+            has_git: capabilities.has_git,
+            supports_worktrees: capabilities.supports_worktrees,
+            supports_backend_internal_tools: capabilities.supports_backend_internal_tools,
+            workspace_scope: capabilities.workspace_scope,
+            max_workers: capabilities.max_workers,
+            os: capabilities.os,
+            arch: capabilities.arch,
+        }
+    }
+}
+
+impl From<RuntimeSummary> for workspace_api::RuntimeSummary {
+    fn from(runtime: RuntimeSummary) -> Self {
+        Self {
+            runtime_id: runtime.runtime_id,
+            label: runtime.label,
+            kind: runtime.kind,
+            status: runtime.status,
+            source: runtime.source.into(),
+            host_ids: runtime.host_ids,
+            capabilities: runtime.capabilities.into(),
+            diagnostics: runtime.diagnostics.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+pub(crate) fn workspace_worker_summary(
+    summary: WorkerSummary,
+    resource_key: String,
+) -> workspace_api::WorkerSummary {
+    workspace_api::WorkerSummary {
+        runtime_id: summary.worker.runtime_id,
+        worker_id: summary.worker.worker_id,
+        resource_key,
+        host_id: summary.host_id,
+        display_name: summary.display_name,
+        label: summary.label,
+        profile: summary.profile,
+        singleton_key: summary.singleton_key,
+        tags: summary.tags,
+        workspace: workspace_api::WorkerWorkspaceSummary {
+            visibility: summary.workspace.visibility,
+            identity: summary.workspace.identity,
+            workspace_id: summary.workspace.workspace_id,
+        },
+        state: summary.state,
+        last_seen_at: summary.last_seen_at,
+        pinned: summary.pinned,
+        retention_state: summary.retention_state,
+        implementation: workspace_api::WorkerImplementationSummary {
+            kind: summary.implementation.kind,
+            display_hint: summary.implementation.display_hint,
+        },
+        capabilities: workspace_api::WorkerCapabilitySummary {
+            can_stop: summary.capabilities.can_stop,
+            can_spawn_followup: summary.capabilities.can_spawn_followup,
+        },
+        working_directory: summary.working_directory,
+        diagnostics: summary.diagnostics.into_iter().map(Into::into).collect(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -507,6 +618,16 @@ pub enum WorkerOperationState {
     Accepted,
     Unsupported,
     Rejected,
+}
+
+impl From<WorkerOperationState> for workspace_api::WorkerOperationState {
+    fn from(state: WorkerOperationState) -> Self {
+        match state {
+            WorkerOperationState::Accepted => Self::Accepted,
+            WorkerOperationState::Unsupported => Self::Unsupported,
+            WorkerOperationState::Rejected => Self::Rejected,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1680,7 +1801,6 @@ impl EmbeddedWorkerRuntime {
         );
         WorkerSummary {
             worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
-            resource_key: None,
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
             label: display.display_name,
@@ -1720,7 +1840,6 @@ impl EmbeddedWorkerRuntime {
         );
         WorkerSummary {
             worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
-            resource_key: None,
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
             label: display.display_name,
@@ -2806,7 +2925,6 @@ impl RemoteWorkerRuntime {
         );
         WorkerSummary {
             worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
-            resource_key: None,
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
             label: display.display_name,
@@ -2850,7 +2968,6 @@ impl RemoteWorkerRuntime {
         );
         WorkerSummary {
             worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
-            resource_key: None,
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
             label: display.display_name,
@@ -4222,7 +4339,6 @@ pub fn placeholder_worker(host_id: impl Into<String>) -> WorkerSummary {
     let host_id = host_id.into();
     WorkerSummary {
         worker: RuntimeWorkerRef::new("placeholder", "worker-placeholder"),
-        resource_key: None,
         host_id,
         display_name: "Worker runtime actions are not implemented".to_string(),
         label: "Worker runtime actions are not implemented".to_string(),
@@ -4616,7 +4732,6 @@ mod tests {
                 host_id: host_id.to_string(),
                 workers: vec![WorkerSummary {
                     worker: RuntimeWorkerRef::new(runtime_id, worker_id),
-                    resource_key: None,
                     host_id: host_id.to_string(),
                     display_name: label.to_string(),
                     label: label.to_string(),
