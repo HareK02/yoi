@@ -1589,7 +1589,7 @@ fn ticket_evidence_event(sequence: usize, event: &TicketEvent) -> TicketEvidence
     }
 }
 
-fn merge_request_summary(
+pub(crate) fn merge_request_summary(
     request: MergeRequest,
     current_subject_ref: Option<String>,
 ) -> TicketMergeRequestSummary {

@@ -5,6 +5,7 @@
     workspaceApiJsonWithBody,
     workspaceApiPath,
   } from "$lib/workspace/api/http";
+  import { mergeRequestPagePath } from "$lib/workspace/api/merge-requests";
   import {
     relationLabel,
     TICKET_STATES,
@@ -18,54 +19,6 @@
     TicketDetail,
   } from "$lib/workspace/sidebar/types";
 
-  type MergeRequestThreadEvent =
-    | {
-      kind: "review_requested";
-      event_id: string;
-      sequence: number;
-      subject_ref: string;
-      requested_by: { runtime_id: string; worker_id: string };
-      reviewer: { runtime_id: string; worker_id: string };
-    }
-    | {
-      kind: "review";
-      event_id: string;
-      sequence: number;
-      request_event_id: string;
-      subject_ref: string;
-      decision: "approve" | "request_changes";
-      body: string;
-      reviewer: { runtime_id: string; worker_id: string };
-    }
-    | { kind: "review_revoked"; sequence: number; review_event_id: string; reason: string }
-    | { kind: "review_cancelled"; sequence: number; request_event_id: string; reason: string }
-    | {
-      kind: "comment";
-      sequence: number;
-      body: string;
-      author: { runtime_id: string; worker_id: string };
-    }
-    | {
-      kind: "merge";
-      sequence: number;
-      approval_event_id: string;
-      approved_source_ref: string;
-      target_ref_after: string;
-      strategy: "fast_forward" | "merge";
-      resolution: "none" | "clean" | "conflicts_resolved";
-      merged_by: { runtime_id: string; worker_id: string };
-    };
-
-  type RefProjection = { status: "known" | "unknown" | "requires_repair"; ref?: string };
-  type MergeRequestDetail = {
-    state: "open" | "closed" | "merged";
-    selector_from: string | null;
-    selector_to: string;
-    source: RefProjection;
-    target: RefProjection;
-    thread: MergeRequestThreadEvent[];
-  };
-
   const MUTABLE_TICKET_STATES = TICKET_STATES.filter((state) =>
     state !== "done" && state !== "ready" && state !== "queued"
   );
@@ -77,7 +30,6 @@
       ticket: ApiResult<TicketDetail>;
       repositories: ApiResult<RepositoryListResponse>;
       orchestrator: ApiResult<WorkspaceOrchestratorStatus>;
-      mergeRequest: ApiResult<MergeRequestDetail | null>;
     };
   }>();
 
@@ -88,24 +40,7 @@
   const orchestratorOnline = initialData.orchestrator.data?.online ?? false;
 
   let ticket = $state<TicketDetail>(loadedTicket);
-  let mergeRequest = $state<MergeRequestDetail | null>(initialData.mergeRequest.data ?? null);
-  const currentReviewRequest = $derived(
-    mergeRequest?.thread.findLast((event) => event.kind === "review_requested") ?? null,
-  );
-  const currentReview = $derived.by(() => {
-    if (mergeRequest?.source.status !== "known") return null;
-    const review = mergeRequest.thread.findLast(
-      (event) => event.kind === "review" && event.subject_ref === mergeRequest.source.ref,
-    );
-    if (!review || review.kind !== "review") return null;
-    const revoked = mergeRequest.thread.some(
-      (event) => event.kind === "review_revoked" && event.review_event_id === review.event_id,
-    );
-    return revoked ? null : review;
-  });
-  const mergeEvent = $derived(
-    mergeRequest?.thread.findLast((event) => event.kind === "merge") ?? null,
-  );
+  const mergeRequest = $derived(ticket.merge_request);
   let editing = $state(false);
   let editTitle = $state(loadedTicket.title);
   let editBody = $state(loadedTicket.body);
@@ -458,41 +393,19 @@
 
       <section class="ticket-control-card">
         <header><h2>Merge Request</h2></header>
-        {#if data.mergeRequest.error}
-          <p class="workspace-callout is-error">{data.mergeRequest.error}</p>
-        {:else if mergeRequest}
-          <p><strong>{mergeRequest.state}</strong></p>
-          <p>From <code>{mergeRequest.selector_from ?? "requires repair"}</code> · {mergeRequest.source.status}{mergeRequest.source.ref ? ` @ ${mergeRequest.source.ref}` : ""}</p>
-          <p>To <code>{mergeRequest.selector_to}</code> · {mergeRequest.target.status}{mergeRequest.target.ref ? ` @ ${mergeRequest.target.ref}` : ""}</p>
-          {#if currentReviewRequest?.kind === "review_requested"}
-            <p>Review requested for <code>{currentReviewRequest.subject_ref}</code></p>
+        {#if mergeRequest}
+          <p><strong>{mergeRequest.state}</strong> · review {mergeRequest.review_status}</p>
+          <p>
+            From <code>{mergeRequest.selector_from ?? "requires repair"}</code>
+            to <code>{mergeRequest.selector_to}</code>
+          </p>
+          {#if mergeRequest.current_subject_ref}
+            <p>Current source <code>{mergeRequest.current_subject_ref}</code></p>
           {/if}
-          {#if currentReview?.kind === "review"}
-            <p><strong>{currentReview.decision}</strong> by <code>{currentReview.reviewer.runtime_id}/{currentReview.reviewer.worker_id}</code></p>
-            {#if currentReview.body}<RichMarkdown text={currentReview.body} />{/if}
-          {/if}
-          {#if mergeEvent?.kind === "merge"}
-            <p>Final merge · {mergeEvent.strategy} / {mergeEvent.resolution}</p>
-            <p>Target ref <code>{mergeEvent.target_ref_after}</code></p>
-            <p>Completed by <code>{mergeEvent.merged_by.runtime_id}/{mergeEvent.merged_by.worker_id}</code></p>
-          {/if}
-          <h4>Thread</h4>
-          {#each mergeRequest.thread as event (event.sequence)}
-            <p>
-              <code>#{event.sequence}</code> · {event.kind}
-              {#if event.kind === "review_requested"}
-                · <code>{event.subject_ref}</code> · {event.requested_by.runtime_id}/{event.requested_by.worker_id}
-              {:else if event.kind === "review"}
-                · <code>{event.subject_ref}</code> · {event.reviewer.runtime_id}/{event.reviewer.worker_id}
-              {:else if event.kind === "comment"}
-                · {event.author.runtime_id}/{event.author.worker_id} · {event.body}
-              {:else if event.kind === "review_cancelled" || event.kind === "review_revoked"}
-                · {event.reason}
-              {:else if event.kind === "merge"}
-                · approval <code>{event.approval_event_id}</code>
-              {/if}
-            </p>
-          {/each}
+          <a
+            class="workspace-secondary-button"
+            href={mergeRequestPagePath(data.workspaceId, mergeRequest.merge_request_id)}
+          >Open Merge Request</a>
         {:else}
           <p class="workspace-empty-copy">The assigned Coder has not opened a Merge Request.</p>
         {/if}

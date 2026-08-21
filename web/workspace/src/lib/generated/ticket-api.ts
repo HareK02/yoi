@@ -90,6 +90,17 @@ export type TicketMergeRequestSummary = {
   review_excerpt: string | null;
 };
 
+export type MergeRequestListItem = {
+  summary: TicketMergeRequestSummary;
+  ticket_ids: Array<string>;
+  thread_event_count: number;
+};
+
+export type MergeRequestListResponse = {
+  items: Array<MergeRequestListItem>;
+  next_cursor: string | null;
+};
+
 export type TicketEvidenceSummary = {
   has_merge_request: boolean;
   has_current_subject_ref: boolean;

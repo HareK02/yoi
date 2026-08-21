@@ -27,6 +27,14 @@ pub enum MergeRequestState {
     Closed,
 }
 impl MergeRequestState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Merged => "merged",
+            Self::Closed => "closed",
+        }
+    }
+
     fn parse(v: &str) -> Result<Self, MergeRequestError> {
         match v {
             "draft" | "open" => Ok(Self::Open),
@@ -214,6 +222,23 @@ impl MergeRequest {
     pub fn effective_review(&self, subject: &str) -> Option<&ReviewEvent> {
         self.thread.iter().rev().find_map(|e|match e{MergeRequestThreadEvent::Review(v)if v.subject_ref==subject&&!self.thread.iter().any(|x|matches!(x,MergeRequestThreadEvent::ReviewRevoked(r)if r.review_event_id==v.event_id))=>Some(v),_=>None})
     }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MergeRequestListQuery {
+    pub state: Option<MergeRequestState>,
+    pub repository_id: Option<String>,
+    pub ticket_id: Option<String>,
+    pub selector_from: Option<String>,
+    pub selector_to: Option<String>,
+    pub cursor: Option<String>,
+    pub limit: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct MergeRequestListPage {
+    pub items: Vec<MergeRequest>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -935,6 +960,80 @@ impl MergeRequestStore {
             None => Err(MergeRequestError::NotFound),
         }
     }
+    pub fn get_by_id(
+        &self,
+        workspace_id: &str,
+        merge_request_id: &str,
+    ) -> Result<MergeRequest, MergeRequestError> {
+        let c = self.lock()?;
+        load_mr(&c, workspace_id, merge_request_id)?.ok_or(MergeRequestError::NotFound)
+    }
+    pub fn list(
+        &self,
+        workspace_id: &str,
+        query: &MergeRequestListQuery,
+    ) -> Result<MergeRequestListPage, MergeRequestError> {
+        let c = self.lock()?;
+        let limit = query.limit.clamp(1, 100);
+        let cursor_position = match query.cursor.as_deref() {
+            Some(cursor) => Some(
+                c.query_row(
+                    "SELECT updated_at,merge_request_id FROM merge_requests WHERE workspace_id=?1 AND merge_request_id=?2",
+                    params![workspace_id, cursor],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| MergeRequestError::Validation("invalid merge request cursor".into()))?,
+            ),
+            None => None,
+        };
+        let cursor_updated_at = cursor_position
+            .as_ref()
+            .map(|(updated_at, _)| updated_at.as_str());
+        let cursor_id = cursor_position.as_ref().map(|(_, id)| id.as_str());
+        let state = query.state.map(MergeRequestState::as_str);
+        let mut statement = c.prepare(
+            "SELECT mr.merge_request_id
+             FROM merge_requests mr
+             WHERE mr.workspace_id=?1
+               AND (?2 IS NULL OR mr.state=?2)
+               AND (?3 IS NULL OR mr.repository_id=?3)
+               AND (?4 IS NULL OR mr.selector_from=?4)
+               AND (?5 IS NULL OR mr.selector_to=?5)
+               AND (?6 IS NULL OR EXISTS (
+                    SELECT 1 FROM merge_request_ticket_relations relation
+                    WHERE relation.workspace_id=mr.workspace_id
+                      AND relation.merge_request_id=mr.merge_request_id
+                      AND relation.ticket_id=?6
+               ))
+               AND (?7 IS NULL OR mr.updated_at<?7 OR (mr.updated_at=?7 AND mr.merge_request_id>?8))
+             ORDER BY mr.updated_at DESC,mr.merge_request_id ASC
+             LIMIT ?9",
+        )?;
+        let rows = statement.query_map(
+            params![
+                workspace_id,
+                state,
+                query.repository_id.as_deref(),
+                query.selector_from.as_deref(),
+                query.selector_to.as_deref(),
+                query.ticket_id.as_deref(),
+                cursor_updated_at,
+                cursor_id,
+                (limit + 1) as i64,
+            ],
+            |row| row.get::<_, String>(0),
+        )?;
+        let mut ids = rows.collect::<Result<Vec<_>, _>>()?;
+        let has_more = ids.len() > limit;
+        ids.truncate(limit);
+        let next_cursor = has_more.then(|| ids.last().cloned()).flatten();
+        let items = ids
+            .iter()
+            .map(|id| load_mr(&c, workspace_id, id)?.ok_or(MergeRequestError::NotFound))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(MergeRequestListPage { items, next_cursor })
+    }
     pub fn thread_page(
         &self,
         ws: &str,
@@ -945,6 +1044,25 @@ impl MergeRequestStore {
         let mr = self.get(ws, ticket)?;
         let c = self.lock()?;
         load_thread(&c, ws, &mr.merge_request_id, after, limit.clamp(1, 200))
+    }
+    pub fn thread_page_by_id(
+        &self,
+        workspace_id: &str,
+        merge_request_id: &str,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<MergeRequestThreadEvent>, MergeRequestError> {
+        let c = self.lock()?;
+        if load_mr(&c, workspace_id, merge_request_id)?.is_none() {
+            return Err(MergeRequestError::NotFound);
+        }
+        load_thread(
+            &c,
+            workspace_id,
+            merge_request_id,
+            after,
+            limit.clamp(1, 200),
+        )
     }
     fn assigned(&self, a: &MergeRequestAuth, t: &str, r: &str) -> Result<(), MergeRequestError> {
         self.repo(a, r)?;

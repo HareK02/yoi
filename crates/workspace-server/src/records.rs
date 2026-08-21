@@ -285,6 +285,21 @@ pub struct TicketMergeRequestSummary {
     pub review_excerpt: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct MergeRequestListItem {
+    pub summary: TicketMergeRequestSummary,
+    pub ticket_ids: Vec<String>,
+    pub thread_event_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct MergeRequestListResponse {
+    pub items: Vec<MergeRequestListItem>,
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketEvidenceSummary {
@@ -474,6 +489,8 @@ pub fn ticket_api_typescript() -> String {
         TicketEvidenceEvent::decl(&config),
         TicketAssignmentSummary::decl(&config),
         TicketMergeRequestSummary::decl(&config),
+        MergeRequestListItem::decl(&config),
+        MergeRequestListResponse::decl(&config),
         TicketEvidenceSummary::decl(&config),
         TicketQueryRequest::decl(&config),
         TicketQueryItem::decl(&config),

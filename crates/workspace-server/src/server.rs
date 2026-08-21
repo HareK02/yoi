@@ -65,7 +65,7 @@ use crate::auth::{
 };
 use crate::authority::{
     MemoryAuthority, ObjectiveAuthority, ObjectiveCreateInput, ObjectiveEditInput,
-    SqliteWorkspaceAuthority, TicketAuthority, TicketMergeRevisionSource,
+    SqliteWorkspaceAuthority, TicketAuthority, TicketMergeRevisionSource, merge_request_summary,
 };
 use crate::companion::{
     CompanionCancelRequest, CompanionConsole, CompanionMessageRequest, CompanionMessageResponse,
@@ -97,8 +97,9 @@ use crate::observation::{
 };
 use crate::profile_settings::UpdateWorkspaceMetadataRequest;
 use crate::records::{
-    ObjectiveDetail, ObjectiveQueryRequest, ObjectiveQueryResponse, ObjectiveShowRequest,
-    ProjectRecordList, TicketDetail, TicketQueryRequest, TicketQueryResponse, TicketShowRequest,
+    MergeRequestListItem, MergeRequestListResponse, ObjectiveDetail, ObjectiveQueryRequest,
+    ObjectiveQueryResponse, ObjectiveShowRequest, ProjectRecordList, TicketDetail,
+    TicketQueryRequest, TicketQueryResponse, TicketShowRequest,
 };
 use crate::repositories::{
     ConfiguredRepository, RepositoryListProjection, RepositoryLogRead, RepositoryLookupError,
@@ -1730,8 +1731,16 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             post(scoped_queue_ticket_record),
         )
         .route(
+            "/api/w/{workspace_id}/merge-requests",
+            get(scoped_list_merge_requests),
+        )
+        .route(
+            "/api/w/{workspace_id}/merge-requests/{merge_request_id}",
+            get(scoped_show_merge_request),
+        )
+        .route(
             "/api/w/{workspace_id}/tickets/{id}/merge-request",
-            get(scoped_show_merge_request).post(scoped_open_merge_request),
+            post(scoped_open_merge_request),
         )
         .route(
             "/api/w/{workspace_id}/tickets/{id}/merge-request/readiness",
@@ -4401,39 +4410,172 @@ fn resolve_workspace_ticket_reference(
         .ok_or_else(|| Error::Ticket(ticket::TicketError::NotFound(reference.to_string())).into())
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct MergeRequestListHttpQuery {
+    state: Option<String>,
+    repository_id: Option<String>,
+    ticket_ref: Option<String>,
+    selector_from: Option<String>,
+    selector_to: Option<String>,
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct MergeRequestRefResponse {
+    status: String,
+    #[serde(rename = "ref")]
+    revision_ref: Option<String>,
+    observed_at: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct MergeRequestLinkedTicketResponse {
+    ticket_id: String,
+    key: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct MergeRequestDetailResponse {
+    #[serde(flatten)]
+    merge_request: merge_request::MergeRequest,
+    source: MergeRequestRefResponse,
+    target: MergeRequestRefResponse,
+    linked_tickets: Vec<MergeRequestLinkedTicketResponse>,
+}
+
+async fn scoped_list_merge_requests(
+    State(api): State<WorkspaceApi>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Query(query): Query<MergeRequestListHttpQuery>,
+) -> ApiResult<Json<MergeRequestListResponse>> {
+    let workspace_id = parse_workspace_id(&workspace_id)?;
+    require_workspace_access(&workspace_id, &api)?;
+    let ticket_id = query
+        .ticket_ref
+        .as_deref()
+        .map(|reference| resolve_workspace_ticket_reference(&api, &workspace_id, reference))
+        .transpose()?;
+    let state = query
+        .state
+        .as_deref()
+        .map(|state| match state {
+            "open" => Ok(merge_request::MergeRequestState::Open),
+            "merged" => Ok(merge_request::MergeRequestState::Merged),
+            "closed" => Ok(merge_request::MergeRequestState::Closed),
+            _ => Err(settings_bad_request(
+                "invalid_merge_request_state",
+                "state must be one of open, merged, or closed",
+            )),
+        })
+        .transpose()?;
+    let store = merge_request_store(&api, &workspace_id)?;
+    let page = store.list(
+        &workspace_id,
+        &merge_request::MergeRequestListQuery {
+            state,
+            repository_id: query.repository_id,
+            ticket_id,
+            selector_from: query.selector_from,
+            selector_to: query.selector_to,
+            cursor: query.cursor,
+            limit: query.limit.unwrap_or(50),
+        },
+    )?;
+    let reader = api.repository_reader();
+    let items = page
+        .items
+        .into_iter()
+        .map(|merge_request| {
+            let current_subject_ref = merge_request.selector_from.as_deref().and_then(|selector| {
+                reader
+                    .observe_merge_target(&merge_request.repository_id, Some(selector))
+                    .ok()
+                    .map(|observation| observation.commit)
+            });
+            let ticket_ids = merge_request.ticket_ids.clone();
+            let thread_event_count = merge_request.thread.len();
+            MergeRequestListItem {
+                summary: merge_request_summary(merge_request, current_subject_ref),
+                ticket_ids,
+                thread_event_count,
+            }
+        })
+        .collect();
+    Ok(Json(MergeRequestListResponse {
+        items,
+        next_cursor: page.next_cursor,
+    }))
+}
+
 async fn scoped_show_merge_request(
     State(api): State<WorkspaceApi>,
-    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
-) -> ApiResult<Json<serde_json::Value>> {
+    AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
+    Query(query): Query<MergeRequestThreadQuery>,
+) -> ApiResult<Json<MergeRequestDetailResponse>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
-    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
+    require_workspace_access(&workspace_id, &api)?;
     let store = merge_request_store(&api, &workspace_id)?;
-    let mut mr = store.get(&workspace_id, &ticket_id)?;
-    mr.thread = store.thread_page(&workspace_id, &ticket_id, None, 100)?;
+    let mut mr = store.get_by_id(&workspace_id, &merge_request_id)?;
+    mr.thread = store.thread_page_by_id(
+        &workspace_id,
+        &merge_request_id,
+        query.after,
+        query.limit.unwrap_or(100),
+    )?;
     let reader = api.repository_reader();
     let observed_at = Utc::now().to_rfc3339();
     let source = match mr.selector_from.as_deref() {
         Some(selector) => match reader.observe_merge_target(&mr.repository_id, Some(selector)) {
-            Ok(value) => {
-                serde_json::json!({"status":"known","ref":value.commit,"observed_at":observed_at})
-            }
-            Err(_) => serde_json::json!({"status":"unknown","observed_at":observed_at}),
+            Ok(value) => MergeRequestRefResponse {
+                status: "known".into(),
+                revision_ref: Some(value.commit),
+                observed_at: observed_at.clone(),
+            },
+            Err(_) => MergeRequestRefResponse {
+                status: "unknown".into(),
+                revision_ref: None,
+                observed_at: observed_at.clone(),
+            },
         },
-        None => serde_json::json!({"status":"requires_repair","observed_at":observed_at}),
+        None => MergeRequestRefResponse {
+            status: "requires_repair".into(),
+            revision_ref: None,
+            observed_at: observed_at.clone(),
+        },
     };
     let target = match reader.observe_merge_target(&mr.repository_id, Some(&mr.selector_to)) {
-        Ok(value) => {
-            serde_json::json!({"status":"known","ref":value.commit,"observed_at":observed_at})
-        }
-        Err(_) => serde_json::json!({"status":"unknown","observed_at":observed_at}),
+        Ok(value) => MergeRequestRefResponse {
+            status: "known".into(),
+            revision_ref: Some(value.commit),
+            observed_at,
+        },
+        Err(_) => MergeRequestRefResponse {
+            status: "unknown".into(),
+            revision_ref: None,
+            observed_at,
+        },
     };
-    let mut response =
-        serde_json::to_value(mr).map_err(|error| Error::InvalidInput(error.to_string()))?;
-    if let Some(object) = response.as_object_mut() {
-        object.insert("source".into(), source);
-        object.insert("target".into(), target);
-    }
-    Ok(Json(response))
+    let linked_tickets = mr
+        .ticket_ids
+        .iter()
+        .map(|ticket_id| {
+            Ok(MergeRequestLinkedTicketResponse {
+                ticket_id: ticket_id.clone(),
+                key: api.store.resource_human_key(
+                    &workspace_id,
+                    WorkspaceResourceKind::Ticket,
+                    ticket_id,
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Json(MergeRequestDetailResponse {
+        merge_request: mr,
+        source,
+        target,
+        linked_tickets,
+    }))
 }
 
 async fn scoped_merge_request_readiness(
@@ -17847,6 +17989,67 @@ mod tests {
                     diagnostic["code"] == "remote_runtime_worker_creation_unavailable"
                 })
         );
+    }
+
+    #[tokio::test]
+    async fn merge_request_reads_use_first_class_workspace_resources() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = build_router(test_api(dir.path()).await);
+
+        let collection = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/w/{TEST_WORKSPACE_ID}/merge-requests"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(collection.status(), StatusCode::OK);
+        let body = to_bytes(collection.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["items"], json!([]));
+        assert!(body["next_cursor"].is_null());
+
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/w/{TEST_WORKSPACE_ID}/merge-requests/missing"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let nested = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/w/{TEST_WORKSPACE_ID}/tickets/T-1/merge-request"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(nested.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        let invalid_filter = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/w/{TEST_WORKSPACE_ID}/merge-requests?state=unknown"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_filter.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

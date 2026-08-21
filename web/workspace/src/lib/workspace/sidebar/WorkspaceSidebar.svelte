@@ -2,6 +2,7 @@
   import './sidebar.css';
   import ObjectivesNavSection from './ObjectivesNavSection.svelte';
   import MemoryNavSection from './MemoryNavSection.svelte';
+  import MergeRequestsNavSection from './MergeRequestsNavSection.svelte';
   import TicketsNavSection from './TicketsNavSection.svelte';
   import WorkersNavSection from './WorkersNavSection.svelte';
   import WorkspaceSwitcher from './WorkspaceSwitcher.svelte';
@@ -41,6 +42,7 @@
     <TicketsNavSection {currentPath} {workspaceId} />
     <ObjectivesNavSection {currentPath} {workspaceId} />
     <MemoryNavSection {currentPath} {workspaceId} />
+    <MergeRequestsNavSection {currentPath} {workspaceId} />
     <WorkersNavSection {currentPath} {workspaceId} />
   </nav>
 </div>

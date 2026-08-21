@@ -437,6 +437,75 @@ fn selector_repair_rejects_unapproved_resolved_subject() {
 }
 
 #[test]
+fn first_class_list_and_detail_are_workspace_scoped_and_cursor_bounded() {
+    let (dir, store) = fixture();
+    open(&store);
+    Connection::open(dir.path().join("db"))
+        .unwrap()
+        .execute(
+            "UPDATE merge_requests SET state='closed' WHERE workspace_id='W' AND merge_request_id='MR'",
+            [],
+        )
+        .unwrap();
+    store
+        .open_merge_request(OpenMergeRequest {
+            merge_request_id: "MR-2".into(),
+            ticket_id: "T".into(),
+            repository_id: "R".into(),
+            selector_from: "work/t-2".into(),
+            selector_to: "develop".into(),
+            summary: "second".into(),
+            auth: auth(),
+            now: at(8),
+        })
+        .unwrap();
+
+    let first = store
+        .list(
+            "W",
+            &MergeRequestListQuery {
+                ticket_id: Some("T".into()),
+                limit: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(first.items[0].merge_request_id, "MR-2");
+    assert_eq!(first.next_cursor.as_deref(), Some("MR-2"));
+
+    let second = store
+        .list(
+            "W",
+            &MergeRequestListQuery {
+                ticket_id: Some("T".into()),
+                cursor: first.next_cursor,
+                limit: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(second.items[0].merge_request_id, "MR");
+    assert!(second.next_cursor.is_none());
+
+    let closed = store
+        .list(
+            "W",
+            &MergeRequestListQuery {
+                state: Some(MergeRequestState::Closed),
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(closed.items.len(), 1);
+    assert_eq!(store.get_by_id("W", "MR").unwrap().merge_request_id, "MR");
+    assert!(matches!(
+        store.get_by_id("other", "MR"),
+        Err(MergeRequestError::NotFound)
+    ));
+}
+
+#[test]
 fn transactional_completion_rejects_assignment_changed_in_control_plane_db() {
     let (dir, store) = fixture();
     open(&store);
