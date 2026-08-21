@@ -1835,7 +1835,6 @@
         flex: 0 0 auto;
         display: grid;
         gap: var(--space-3);
-        margin-inline: calc(-1 * var(--space-6));
         background: var(--bg);
     }
 

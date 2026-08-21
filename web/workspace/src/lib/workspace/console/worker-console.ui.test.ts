@@ -452,6 +452,7 @@ Deno.test("Worker Console removes redundant chrome and uses shared alerts", asyn
       !page.includes(
         "padding: var(--space-3) var(--space-6) var(--space-4)",
       ) &&
+      !page.includes("margin-inline: calc(-1 * var(--space-6))") &&
       page.includes('import { pushWorkspaceAlert }') &&
       page.includes('title: "Worker control"') &&
       page.includes('title: "Rewind targets"') &&
