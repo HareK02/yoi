@@ -449,6 +449,18 @@ pub struct WebFetchConfig {
     pub allow_private_addresses: Option<bool>,
 }
 
+/// Immutable Workspace Memory settings bound into a Worker launch snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceMemorySettingsSnapshot {
+    /// Workspace that owns the settings revision.
+    pub workspace_id: String,
+    /// Monotonic Workspace Memory settings revision.
+    pub settings_revision: u64,
+    /// Normalized language used for Memory extraction and consolidation output.
+    pub language: String,
+}
+
 /// Memory subsystem configuration. Presence in the manifest enables
 /// memory; `workspace_root` pins the memory workspace explicitly. When it
 /// is absent, memory resolution searches upward from the Worker's pwd for a
@@ -477,11 +489,14 @@ pub struct MemoryConfig {
     /// system-prompt section. `None` ⇒ enabled.
     #[serde(default)]
     pub inject_summary: Option<bool>,
-    /// Language used by memory extraction / consolidation sub_worker for durable
-    /// memory text. Free-form so workspaces can use names like
-    /// `English`, `Japanese`, or locale tags. `None` ⇒
-    /// [`defaults::MEMORY_LANGUAGE`].
-    #[serde(default)]
+    /// Workspace that owns the bound Memory settings revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    /// Monotonic revision of the bound Workspace Memory settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_revision: Option<u64>,
+    /// Language from the bound Workspace Memory settings revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
     /// Optional model for the extract worker. When `None`,
     /// the main engine model is cloned via `clone_boxed()`. Lightweight
@@ -518,6 +533,24 @@ pub struct MemoryConfig {
     /// `None` for both thresholds ⇒ consolidation disabled.
     #[serde(default)]
     pub consolidation_threshold_bytes: Option<u64>,
+}
+
+impl MemoryConfig {
+    /// Replace any profile-authored language fields with a trusted Workspace snapshot.
+    pub fn bind_workspace_settings(&mut self, snapshot: &WorkspaceMemorySettingsSnapshot) {
+        self.workspace_id = Some(snapshot.workspace_id.clone());
+        self.settings_revision = Some(snapshot.settings_revision);
+        self.language = Some(snapshot.language.clone());
+    }
+
+    /// Return the complete bound Workspace settings snapshot, if every field is present.
+    pub fn workspace_settings(&self) -> Option<WorkspaceMemorySettingsSnapshot> {
+        Some(WorkspaceMemorySettingsSnapshot {
+            workspace_id: self.workspace_id.clone()?,
+            settings_revision: self.settings_revision?,
+            language: self.language.clone()?,
+        })
+    }
 }
 
 /// Worker metadata.

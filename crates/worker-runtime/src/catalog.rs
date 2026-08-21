@@ -174,6 +174,9 @@ pub struct CreateWorkerRequest {
     pub worker_observation_grants: Vec<RuntimeWorkerRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_api: Option<WorkspaceApiRef>,
+    /// Backend-authored immutable Workspace Memory settings snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_settings: Option<manifest::WorkspaceMemorySettingsSnapshot>,
 }
 
 /// Worker lifecycle status for the in-memory embedded runtime.

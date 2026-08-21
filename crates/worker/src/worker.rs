@@ -2163,6 +2163,33 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         let Some(template) = self.system_prompt_template.take() else {
             return Ok(());
         };
+        let is_memory_consolidation = self.manifest.profile.as_ref().is_some_and(|snapshot| {
+            matches!(
+                &snapshot.source,
+                manifest::ProfileSource::Registry {
+                    source: manifest::ProfileRegistrySource::Builtin,
+                    name,
+                    ..
+                } if name == "memory-consolidation"
+            )
+        });
+        if is_memory_consolidation {
+            let memory_config = self.manifest.memory.as_ref().ok_or_else(|| {
+                WorkerError::InvalidState(
+                    "Memory consolidation Worker has no Memory configuration".to_string(),
+                )
+            })?;
+            let language = memory_language(memory_config)?;
+            let rendered = self
+                .prompts
+                .load_full()
+                .memory_consolidation_system(&language)?;
+            self.engine
+                .as_mut()
+                .expect("worker present")
+                .set_system_prompt(rendered);
+            return Ok(());
+        }
         let alerter = self.alerter.clone();
         let tool_names: Vec<String> = {
             let worker = self.engine.as_mut().expect("worker present");
@@ -3750,6 +3777,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 memory::audit::AuditTrigger::TokenThreshold,
                 Some(model_audit_from_manifest(model)),
             )
+            .with_memory_settings(&memory_cfg)
             .emit(
                 self.workspace_client(),
                 self.event_tx.as_ref(),
@@ -3780,6 +3808,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                     memory::audit::AuditTrigger::TokenThreshold,
                     Some(model_audit_from_manifest(model)),
                 )
+                .with_memory_settings(&memory_cfg)
                 .emit(
                     self.workspace_client(),
                     self.event_tx.as_ref(),
@@ -3845,7 +3874,8 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             memory::audit::AuditWorker::MemoryExtract,
             memory::audit::AuditTrigger::TokenThreshold,
             Some(model_audit_from_manifest(model)),
-        );
+        )
+        .with_memory_settings(memory_cfg);
         let event_tx = self.event_tx.as_ref();
 
         let pointer_snapshot = self
@@ -3997,11 +4027,11 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 return Err(err);
             }
         };
-        let memory_language = memory_language(memory_cfg);
+        let memory_language = memory_language(memory_cfg)?;
         let extract_system_prompt = match self
             .prompts
             .load_full()
-            .memory_extract_system(memory_language)
+            .memory_extract_system(&memory_language)
         {
             Ok(prompt) => prompt,
             Err(err) => {
@@ -4191,6 +4221,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 memory::audit::AuditTrigger::StagingBacklog,
                 Some(model_audit_from_manifest(model)),
             )
+            .with_memory_settings(&memory_cfg)
             .emit(
                 self.workspace_client(),
                 self.event_tx.as_ref(),
@@ -4232,6 +4263,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                     memory::audit::AuditTrigger::StagingBacklog,
                     Some(model_audit_from_manifest(model)),
                 )
+                .with_memory_settings(&memory_cfg)
                 .emit(
                     self.workspace_client(),
                     self.event_tx.as_ref(),
@@ -4312,6 +4344,7 @@ struct WorkerAuditBase {
     worker: memory::audit::AuditWorker,
     trigger: memory::audit::AuditTrigger,
     model: Option<memory::audit::ModelAudit>,
+    memory_settings: Option<memory::audit::MemorySettingsAudit>,
 }
 
 impl WorkerAuditBase {
@@ -4325,7 +4358,20 @@ impl WorkerAuditBase {
             worker,
             trigger,
             model,
+            memory_settings: None,
         }
+    }
+
+    fn with_memory_settings(mut self, memory_config: &manifest::MemoryConfig) -> Self {
+        self.memory_settings =
+            memory_config
+                .workspace_settings()
+                .map(|snapshot| memory::audit::MemorySettingsAudit {
+                    workspace_id: snapshot.workspace_id,
+                    settings_revision: snapshot.settings_revision,
+                    language: snapshot.language,
+                });
+        self
     }
 
     async fn emit(
@@ -4345,6 +4391,7 @@ impl WorkerAuditBase {
             status,
             trigger: self.trigger,
             reason: reason.clone(),
+            memory_settings: self.memory_settings.clone(),
             model: self.model.clone(),
             usage,
             extract,
@@ -4391,12 +4438,14 @@ fn is_idle_consolidation_skip_reason(reason: &str) -> bool {
         || reason.starts_with("threshold_not_reached")
 }
 
-fn memory_language(cfg: &manifest::MemoryConfig) -> &str {
-    cfg.language
-        .as_deref()
-        .map(str::trim)
-        .filter(|language| !language.is_empty())
-        .unwrap_or(manifest::defaults::MEMORY_LANGUAGE)
+fn memory_language(cfg: &manifest::MemoryConfig) -> Result<String, WorkerError> {
+    cfg.workspace_settings()
+        .map(|snapshot| snapshot.language)
+        .ok_or_else(|| {
+            WorkerError::InvalidState(
+                "Memory operation requires a bound Workspace Memory settings snapshot".to_string(),
+            )
+        })
 }
 
 fn worker_language(cfg: &manifest::EngineManifest) -> &str {
@@ -4453,6 +4502,7 @@ where
         workspace_context: WorkerWorkspaceContext,
         filesystem_authority: WorkerFilesystemAuthority,
     ) -> Result<Self, WorkerError> {
+        validate_workspace_memory_snapshot(&manifest.worker.name, &manifest, &workspace_context)?;
         let common = prepare_worker_common_with_context(
             &manifest,
             &loader,
@@ -4654,6 +4704,7 @@ where
         workspace_context: WorkerWorkspaceContext,
         filesystem_authority: WorkerFilesystemAuthority,
     ) -> Result<Self, WorkerError> {
+        validate_workspace_memory_snapshot(&manifest.worker.name, &manifest, &workspace_context)?;
         let common = prepare_worker_common_with_context(
             &manifest,
             &loader,
@@ -5156,8 +5207,48 @@ fn worker_metadata_for_manifest(
     metadata
 }
 
+fn validate_workspace_memory_snapshot(
+    worker_name: &str,
+    manifest: &WorkerManifest,
+    workspace_context: &WorkerWorkspaceContext,
+) -> Result<(), WorkerError> {
+    let Some(workspace_id) = workspace_context.workspace_id() else {
+        return Ok(());
+    };
+    let snapshot = manifest
+        .memory
+        .as_ref()
+        .and_then(manifest::MemoryConfig::workspace_settings)
+        .ok_or_else(|| {
+            WorkerError::InvalidState(format!(
+                "Workspace Worker {worker_name} has no complete persisted Memory settings snapshot"
+            ))
+        })?;
+    if snapshot.workspace_id != workspace_id.as_str() {
+        return Err(WorkerError::InvalidState(format!(
+            "Workspace Worker {worker_name} Memory settings belong to {} instead of {}",
+            snapshot.workspace_id,
+            workspace_id.as_str()
+        )));
+    }
+    if snapshot.settings_revision == 0
+        || !matches!(snapshot.language.as_str(), "English" | "Japanese")
+    {
+        return Err(WorkerError::InvalidState(format!(
+            "Workspace Worker {worker_name} has corrupt Memory settings snapshot metadata"
+        )));
+    }
+    Ok(())
+}
+
 fn should_persist_resolved_manifest_snapshot(manifest: &WorkerManifest) -> bool {
-    manifest.profile.is_some() || manifest.plugins.has_resolved_plan()
+    manifest.profile.is_some()
+        || manifest.plugins.has_resolved_plan()
+        || manifest
+            .memory
+            .as_ref()
+            .and_then(manifest::MemoryConfig::workspace_settings)
+            .is_some()
 }
 
 fn restore_manifest_from_worker_metadata_snapshot(
@@ -6180,6 +6271,92 @@ permission = "write"
     }
 
     #[test]
+    fn workspace_memory_settings_snapshot_is_persisted_and_scope_checked() {
+        let mut manifest = WorkerManifest::from_toml(
+            r#"
+[worker]
+name = "memory-snapshot"
+
+[model]
+scheme = "anthropic"
+model_id = "claude-sonnet-4-20250514"
+
+[engine]
+instruction = "default"
+
+[[scope.allow]]
+target = "/workspace"
+permission = "read"
+
+[[delegation_scope.allow]]
+target = "/workspace"
+permission = "read"
+"#,
+        )
+        .unwrap();
+        manifest.memory = Some(manifest::MemoryConfig::default());
+        manifest.memory.as_mut().unwrap().bind_workspace_settings(
+            &manifest::WorkspaceMemorySettingsSnapshot {
+                workspace_id: "workspace-a".to_string(),
+                settings_revision: 7,
+                language: "Japanese".to_string(),
+            },
+        );
+
+        let metadata = worker_metadata_for_manifest(&manifest, None, None, None);
+        let restored: WorkerManifest = serde_json::from_value(
+            metadata
+                .resolved_manifest_snapshot
+                .expect("Memory settings require a resolved manifest snapshot"),
+        )
+        .unwrap();
+        assert_eq!(
+            restored.memory.unwrap().workspace_settings(),
+            Some(manifest::WorkspaceMemorySettingsSnapshot {
+                workspace_id: "workspace-a".to_string(),
+                settings_revision: 7,
+                language: "Japanese".to_string(),
+            })
+        );
+        assert!(
+            validate_workspace_memory_snapshot(
+                "memory-snapshot",
+                &manifest,
+                &WorkerWorkspaceContext::unavailable(
+                    Some(WorkspaceId::new("workspace-a").unwrap()),
+                    "test",
+                )
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_workspace_memory_snapshot(
+                "memory-snapshot",
+                &manifest,
+                &WorkerWorkspaceContext::unavailable(
+                    Some(WorkspaceId::new("workspace-b").unwrap()),
+                    "test",
+                )
+            )
+            .is_err()
+        );
+
+        let mut missing = manifest.clone();
+        missing.memory.as_mut().unwrap().settings_revision = None;
+        assert!(
+            validate_workspace_memory_snapshot(
+                "memory-snapshot",
+                &missing,
+                &WorkerWorkspaceContext::unavailable(
+                    Some(WorkspaceId::new("workspace-a").unwrap()),
+                    "test",
+                )
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn plugin_resolved_manifest_snapshot_is_persisted_without_profile() {
         let mut manifest = WorkerManifest::from_toml(
             r#"
@@ -7064,6 +7241,52 @@ mod build_summary_prompt_tests {
         }
     }
 
+    #[tokio::test]
+    async fn memory_consolidation_prompt_uses_bound_workspace_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let mut manifest = minimal_manifest();
+        manifest.profile = Some(manifest::ProfileManifestSnapshot {
+            source: manifest::ProfileSource::Registry {
+                source: manifest::ProfileRegistrySource::Builtin,
+                name: "memory-consolidation".to_string(),
+                path: None,
+                provenance: None,
+            },
+            profile: None,
+        });
+        let mut memory = manifest::MemoryConfig::default();
+        memory.bind_workspace_settings(&manifest::WorkspaceMemorySettingsSnapshot {
+            workspace_id: "workspace-test".to_string(),
+            settings_revision: 3,
+            language: "Japanese".to_string(),
+        });
+        manifest.memory = Some(memory);
+        let mut worker = Worker::new(
+            manifest,
+            Engine::new(NoopClient),
+            store,
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone()),
+            Scope::writable(&cwd).unwrap(),
+        )
+        .await
+        .unwrap();
+        worker.set_system_prompt_template(
+            SystemPromptTemplate::parse(
+                "default",
+                crate::prompt::source::PromptCatalogSource::builtins_only(),
+            )
+            .unwrap(),
+        );
+        worker.ensure_system_prompt_materialized().await.unwrap();
+        let prompt = worker.engine().get_system_prompt().unwrap();
+        assert!(prompt.contains("`language`: `Japanese`"));
+        assert!(!prompt.contains("`language`: `English`"));
+    }
+
     async fn render_system_prompt_with_summary(
         summary_doc: Option<&str>,
         memory_config: Option<manifest::MemoryConfig>,
@@ -7358,6 +7581,9 @@ mod build_summary_prompt_tests {
         let mut manifest = minimal_manifest();
         manifest.memory = Some(manifest::MemoryConfig {
             extract_threshold: Some(1),
+            workspace_id: Some("workspace-test".to_string()),
+            settings_revision: Some(1),
+            language: Some("English".to_string()),
             ..Default::default()
         });
         let memory_config = manifest.memory.clone().unwrap();
@@ -7454,6 +7680,14 @@ mod build_summary_prompt_tests {
         assert_eq!(audits.len(), 2);
         assert_eq!(audits[0].run_id, audits[1].run_id);
         assert_eq!(audits[0].worker, memory::audit::AuditWorker::MemoryExtract);
+        assert!(audits.iter().all(|audit| {
+            audit.memory_settings
+                == Some(memory::audit::MemorySettingsAudit {
+                    workspace_id: "workspace-test".to_string(),
+                    settings_revision: 1,
+                    language: "English".to_string(),
+                })
+        }));
         assert_eq!(
             audits.iter().map(|audit| audit.status).collect::<Vec<_>>(),
             vec![
