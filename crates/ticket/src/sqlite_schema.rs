@@ -76,6 +76,22 @@ const OWNED_TABLES: &[&str] = &[
     "typed_ticket_relations",
     "typed_ticket_orchestration_plans",
     "typed_ticket_artifacts",
+    "workspace_resource_keys",
+];
+
+const RESOURCE_KEY_COLUMNS: &[ExpectedColumn] = &[
+    column("workspace_id", "TEXT", true, 1),
+    column("resource_kind", "TEXT", true, 2),
+    column("resource_id", "TEXT", true, 3),
+    column("sequence", "INTEGER", true, 0),
+    column("resource_key", "TEXT", true, 0),
+    column("allocated_at", "TEXT", true, 0),
+];
+
+const RESOURCE_KEY_COUNTER_COLUMNS: &[ExpectedColumn] = &[
+    column("workspace_id", "TEXT", true, 1),
+    column("resource_kind", "TEXT", true, 2),
+    column("next_sequence", "INTEGER", true, 0),
 ];
 
 const MIGRATION_COLUMNS: &[ExpectedColumn] = &[
@@ -460,6 +476,49 @@ pub fn verify_sqlite_ticket_schema(connection: &Connection) -> Result<()> {
         collect_table_diagnostics(connection, table, columns, foreign_keys, &mut diagnostics);
     }
 
+    collect_column_diagnostics(
+        connection,
+        "workspace_resource_keys",
+        RESOURCE_KEY_COLUMNS,
+        &mut diagnostics,
+    );
+    collect_column_diagnostics(
+        connection,
+        "workspace_resource_key_counters",
+        RESOURCE_KEY_COUNTER_COLUMNS,
+        &mut diagnostics,
+    );
+    collect_index_diagnostics(
+        connection,
+        "workspace_resource_keys",
+        None,
+        true,
+        &["workspace_id", "resource_kind", "sequence"],
+        &mut diagnostics,
+    );
+    collect_index_diagnostics(
+        connection,
+        "workspace_resource_keys",
+        None,
+        true,
+        &["workspace_id", "resource_key"],
+        &mut diagnostics,
+    );
+    collect_index_diagnostics(
+        connection,
+        "workspace_resource_keys",
+        Some("idx_workspace_resource_keys_reverse"),
+        false,
+        &["workspace_id", "resource_kind", "resource_key"],
+        &mut diagnostics,
+    );
+    for legacy_table in [
+        "workspace_resource_human_keys",
+        "workspace_resource_human_key_counters",
+    ] {
+        collect_absent_table_diagnostic(connection, legacy_table, &mut diagnostics);
+    }
+
     for table in OWNED_TABLES {
         collect_foreign_key_check_diagnostics(connection, table, &mut diagnostics);
     }
@@ -824,6 +883,106 @@ fn verify_table(
     } else {
         Err(TicketError::Sqlite(diagnostics.join("; ")))
     }
+}
+
+fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|value| value.is_some())
+        .map_err(sqlite_err)
+}
+
+fn collect_absent_table_diagnostic(
+    connection: &Connection,
+    table: &str,
+    diagnostics: &mut Vec<String>,
+) {
+    match table_exists(connection, table) {
+        Ok(false) => {}
+        Ok(true) => diagnostics.push(format!("legacy table `{table}` is still present")),
+        Err(error) => {
+            diagnostics.push(format!("failed to inspect legacy table `{table}`: {error}"))
+        }
+    }
+}
+
+fn collect_index_diagnostics(
+    connection: &Connection,
+    table: &str,
+    expected_name: Option<&str>,
+    expected_unique: bool,
+    expected_columns: &[&str],
+    diagnostics: &mut Vec<String>,
+) {
+    let sql = format!("PRAGMA index_list({table})");
+    let mut statement = match connection.prepare(&sql) {
+        Ok(statement) => statement,
+        Err(error) => {
+            diagnostics.push(format!("failed to inspect indexes for `{table}`: {error}"));
+            return;
+        }
+    };
+    let rows = match statement.query_map([], |row| {
+        Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)? != 0))
+    }) {
+        Ok(rows) => rows,
+        Err(error) => {
+            diagnostics.push(format!("failed to read indexes for `{table}`: {error}"));
+            return;
+        }
+    };
+    let indexes = match rows.collect::<std::result::Result<Vec<_>, _>>() {
+        Ok(indexes) => indexes,
+        Err(error) => {
+            diagnostics.push(format!("failed to decode indexes for `{table}`: {error}"));
+            return;
+        }
+    };
+    for (name, unique) in indexes {
+        if expected_name.is_some_and(|expected| expected != name) || unique != expected_unique {
+            continue;
+        }
+        let sql = format!("PRAGMA index_info({name})");
+        let mut statement = match connection.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) => {
+                diagnostics.push(format!("failed to inspect index `{name}`: {error}"));
+                return;
+            }
+        };
+        let rows = match statement.query_map([], |row| row.get::<_, String>(2)) {
+            Ok(rows) => rows,
+            Err(error) => {
+                diagnostics.push(format!("failed to read index `{name}`: {error}"));
+                return;
+            }
+        };
+        match rows.collect::<std::result::Result<Vec<_>, _>>() {
+            Ok(columns) if columns == expected_columns => return,
+            Ok(_) => {}
+            Err(error) => {
+                diagnostics.push(format!("failed to decode index `{name}`: {error}"));
+                return;
+            }
+        }
+    }
+    let identity = expected_name
+        .map(|name| format!("named `{name}`"))
+        .unwrap_or_else(|| "unnamed".to_string());
+    diagnostics.push(format!(
+        "table `{table}` is missing {identity} {} index on ({})",
+        if expected_unique {
+            "unique"
+        } else {
+            "non-unique"
+        },
+        expected_columns.join(", ")
+    ));
 }
 
 fn collect_table_diagnostics(
@@ -1268,6 +1427,38 @@ mod tests {
                 .contains("unsupported Ticket schema migration version 99")
         );
         assert_eq!(load_applied_migrations(&connection).unwrap().len(), 7);
+    }
+
+    #[test]
+    fn verifier_rejects_resource_key_schema_drift() {
+        for (drift, expected) in [
+            (
+                "DROP TABLE workspace_resource_key_counters",
+                "workspace_resource_key_counters",
+            ),
+            (
+                "ALTER TABLE workspace_resource_keys RENAME COLUMN resource_key TO human_key",
+                "missing column \"resource_key\"",
+            ),
+            (
+                "DROP INDEX idx_workspace_resource_keys_reverse",
+                "idx_workspace_resource_keys_reverse",
+            ),
+            (
+                "CREATE TABLE workspace_resource_human_keys (value TEXT)",
+                "legacy table `workspace_resource_human_keys` is still present",
+            ),
+        ] {
+            let connection = Connection::open_in_memory().unwrap();
+            migrate_sqlite_ticket_schema(&connection).unwrap();
+            connection.execute_batch(drift).unwrap();
+
+            let error = verify_sqlite_ticket_schema(&connection).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?} after {drift:?}, got {error}"
+            );
+        }
     }
 
     #[test]
