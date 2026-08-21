@@ -197,8 +197,8 @@
     min-width: 0;
     margin: 0;
     font-family: var(--font-mono);
-    font-size: 12px;
-    line-height: 12px;
+    font-size: 14px;
+    line-height: 1.2;
     overflow-x: auto;
     white-space: pre;
   }
