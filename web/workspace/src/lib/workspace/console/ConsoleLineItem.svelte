@@ -141,6 +141,10 @@
     white-space: pre-line;
   }
 
+  .activity-summary {
+    font-size: 14px;
+  }
+
   .task-reminder-summary {
     white-space: nowrap;
     overflow: hidden;

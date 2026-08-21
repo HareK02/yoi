@@ -357,6 +357,18 @@ Deno.test("Worker Console uses protocol observation events without transcript fe
   );
 });
 
+Deno.test("Worker Console overview activity summaries use 14px text", async () => {
+  const consoleLine = await Deno.readTextFile(
+    new URL("./ConsoleLineItem.svelte", import.meta.url),
+  );
+
+  assert(
+    consoleLine.includes(".activity-summary {") &&
+      consoleLine.includes("font-size: 14px;"),
+    "Overview activity summaries such as ran command counts should render at 14px",
+  );
+});
+
 Deno.test("Worker Console renders markdown only for message rows", async () => {
   const consoleLine = await Deno.readTextFile(
     new URL("./ConsoleLineItem.svelte", import.meta.url),
