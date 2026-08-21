@@ -1166,7 +1166,7 @@ impl SqliteWorkspaceStore {
         &self,
         workspace_id: &str,
     ) -> Result<WorkspaceMemorySettingsRecord> {
-        self.with_conn(|conn| {
+        let record = self.with_conn(|conn| {
             conn.query_row(
                 "SELECT workspace_id, settings_revision, language, created_at, updated_at \
                  FROM workspace_memory_settings WHERE workspace_id = ?1",
@@ -1186,7 +1186,9 @@ impl SqliteWorkspaceStore {
             )
             .optional()?
             .ok_or_else(|| Error::Store("Workspace Memory settings are missing".to_string()))
-        })
+        })?;
+        validate_workspace_memory_settings_record(&record, workspace_id)?;
+        Ok(record)
     }
 
     pub(crate) fn update_workspace_memory_settings(
@@ -1218,6 +1220,7 @@ impl SqliteWorkspaceStore {
                 )
                 .optional()?
                 .ok_or_else(|| Error::Store("Workspace Memory settings are missing".to_string()))?;
+            validate_workspace_memory_settings_record(&current, workspace_id)?;
             let current_revision = current.settings_revision;
             if current_revision != expected_revision {
                 return Err(Error::WorkspaceConfigConflict(format!(
@@ -1271,6 +1274,7 @@ impl SqliteWorkspaceStore {
                 "Worker create allocation key and fingerprint must be non-empty".to_string(),
             ));
         }
+        validate_workspace_memory_settings_record(current_memory_settings, workspace_id)?;
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let existing = tx
@@ -1315,16 +1319,18 @@ impl SqliteWorkspaceStore {
                         "Worker create allocation {allocation_key} has a non-UUIDv7 worker id"
                     ))
                 })?;
+                let snapshot = manifest::WorkspaceMemorySettingsSnapshot {
+                    workspace_id: workspace_id.to_string(),
+                    settings_revision: revision.try_into().map_err(|_| {
+                        rusqlite::Error::IntegralValueOutOfRange(4, revision)
+                    })?,
+                    language,
+                };
+                validate_workspace_memory_settings_snapshot(&snapshot, workspace_id)?;
                 return Ok(WorkerCreateReservation {
                     worker_id,
                     create_fingerprint,
-                    memory_settings: manifest::WorkspaceMemorySettingsSnapshot {
-                        workspace_id: workspace_id.to_string(),
-                        settings_revision: revision.try_into().map_err(|_| {
-                            rusqlite::Error::IntegralValueOutOfRange(4, revision)
-                        })?,
-                        language,
-                    },
+                    memory_settings: snapshot,
                 });
             }
 
@@ -1353,6 +1359,7 @@ impl SqliteWorkspaceStore {
                 settings_revision: authoritative_revision,
                 language: authoritative_language,
             };
+            validate_workspace_memory_settings_snapshot(&snapshot, workspace_id)?;
             let create_fingerprint =
                 bound_worker_create_fingerprint(request_fingerprint, &snapshot);
             let worker_id = WorkerId::now_v7();
@@ -5929,6 +5936,35 @@ fn collect_reference_diagnostics(
     Ok(())
 }
 
+fn validate_workspace_memory_settings_snapshot(
+    snapshot: &manifest::WorkspaceMemorySettingsSnapshot,
+    expected_workspace_id: &str,
+) -> Result<()> {
+    if snapshot.workspace_id != expected_workspace_id
+        || snapshot.settings_revision == 0
+        || !manifest::is_normalized_workspace_memory_language(&snapshot.language)
+    {
+        return Err(Error::Store(
+            "Workspace Memory settings are corrupt or belong to another Workspace".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_workspace_memory_settings_record(
+    record: &WorkspaceMemorySettingsRecord,
+    expected_workspace_id: &str,
+) -> Result<()> {
+    validate_workspace_memory_settings_snapshot(
+        &manifest::WorkspaceMemorySettingsSnapshot {
+            workspace_id: record.workspace_id.clone(),
+            settings_revision: record.settings_revision,
+            language: record.language.clone(),
+        },
+        expected_workspace_id,
+    )
+}
+
 fn normalize_workspace_memory_language(language: &str) -> Result<String> {
     let language = language.trim();
     if !manifest::is_normalized_workspace_memory_language(language) {
@@ -8782,6 +8818,47 @@ INSERT INTO workdir_registry (
             })
             .unwrap();
         assert_eq!(state, "created");
+
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE workspace_memory_settings SET language = ' English ' \
+                     WHERE workspace_id = 'workspace-a'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.get_workspace_memory_settings("workspace-a").is_err());
+        assert!(
+            store
+                .update_workspace_memory_settings("workspace-a", 2, "Spanish")
+                .is_err()
+        );
+        let mut corrupt = updated_memory_settings.clone();
+        corrupt.language = " English ".to_string();
+        assert!(
+            store
+                .reserve_worker_create(
+                    "workspace-a",
+                    "arcadia",
+                    "operation-corrupt",
+                    "sha256:corrupt",
+                    &corrupt,
+                )
+                .is_err()
+        );
+
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "DELETE FROM workspace_memory_settings WHERE workspace_id = 'workspace-a'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.get_workspace_memory_settings("workspace-a").is_err());
     }
 
     #[tokio::test]

@@ -3013,14 +3013,7 @@ async fn scoped_get_workspace_memory_settings(
     State(api): State<WorkspaceApi>,
     AxumPath(workspace_id): AxumPath<String>,
 ) -> ApiResult<Json<workspace_api::WorkspaceMemorySettings>> {
-    if api
-        .config_store
-        .get_workspace(&workspace_id)
-        .await?
-        .is_none()
-    {
-        return Err(ApiError::from(Error::WorkspaceIdMismatch));
-    }
+    validate_workspace_scope(&api, &workspace_id)?;
     let settings = api
         .config_store
         .get_workspace_memory_settings(&workspace_id)
@@ -3037,14 +3030,7 @@ async fn scoped_update_workspace_memory_settings(
     AxumPath(workspace_id): AxumPath<String>,
     Json(request): Json<workspace_api::UpdateWorkspaceMemorySettingsRequest>,
 ) -> ApiResult<Json<workspace_api::WorkspaceMemorySettings>> {
-    if api
-        .config_store
-        .get_workspace(&workspace_id)
-        .await?
-        .is_none()
-    {
-        return Err(ApiError::from(Error::WorkspaceIdMismatch));
-    }
+    validate_workspace_scope(&api, &workspace_id)?;
     let settings = api
         .config_store
         .update_workspace_memory_settings(
@@ -16589,6 +16575,32 @@ mod tests {
 
     async fn test_api(workspace_root: impl Into<PathBuf>) -> WorkspaceApi {
         test_api_with_recording_backend(workspace_root).await.0
+    }
+
+    #[tokio::test]
+    async fn memory_settings_handlers_reject_foreign_workspace_path_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        assert!(
+            scoped_get_workspace_memory_settings(
+                State(api.clone()),
+                AxumPath("workspace-foreign".to_string()),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            scoped_update_workspace_memory_settings(
+                State(api),
+                AxumPath("workspace-foreign".to_string()),
+                Json(workspace_api::UpdateWorkspaceMemorySettingsRequest {
+                    expected_revision: 1,
+                    language: "English".to_string(),
+                }),
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
