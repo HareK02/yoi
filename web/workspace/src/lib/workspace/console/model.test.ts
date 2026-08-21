@@ -422,9 +422,11 @@ Deno.test("projectConsole streams distinct Bash stdout and stderr through termin
 
   const [line] = projection.lines.filter((line) => line.kind === "tool");
   assert(line.body.includes("Bash — failed (exit 7)"), line.body);
-  assert(line.body.includes("elapsed 300ms"), line.body);
-  assert(line.body.includes("stdout:\nready\n"), line.body);
+  assert(!line.body.includes("elapsed"), line.body);
+  assert(!line.body.includes("stdout:"), line.body);
+  assert(line.body.includes("ready\n"), line.body);
   assert(line.body.includes("stderr:\nwarn\n"), line.body);
+  assert(line.detail?.includes("command: elapsed 300ms"), line.detail ?? "");
   assertEquals(line.streaming, false);
   assertEquals(line.error, true);
 });
@@ -462,12 +464,13 @@ Deno.test("snapshot restores bounded in-flight Bash command output", () => {
   const projection = projectConsole([{ eventId: "snapshot-command", event: snapshot }]);
   const [line] = projection.lines.filter((line) => line.kind === "tool");
   assert(line.body.includes("Bash — running…"), line.body);
+  assert(!line.body.includes("elapsed"), line.body);
+  assert(!line.body.includes("stdout:"), line.body);
+  assert(line.body.includes("[… earlier stdout omitted]\ntail\n"), line.body);
   assert(
-    line.body.includes("elapsed 250ms · last output at +200ms"),
-    line.body,
+    line.detail?.includes("command: elapsed 250ms · last output at +200ms"),
+    line.detail ?? "",
   );
-  assert(line.body.includes("[stdout tail; earlier output omitted]"), line.body);
-  assert(line.body.includes("stdout:\ntail\n"), line.body);
   assertEquals(line.streaming, true);
 });
 

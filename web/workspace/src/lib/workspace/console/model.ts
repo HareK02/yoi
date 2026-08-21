@@ -1505,7 +1505,6 @@ function renderBashTool(toolCall: ToolCallView): string {
   return compactLines([
     `Bash — ${commandStateSuffix(toolCall)}`,
     command ? `$ ${command}` : argsText(toolCall),
-    commandTiming(toolCall.command),
     ["done", "error"].includes(toolCall.state)
       ? cappedDisplaySection(resultText(toolCall), 10)
       : renderLiveCommandOutput(toolCall.command),
@@ -1549,11 +1548,17 @@ function durationLabel(milliseconds: number): string {
 
 function renderLiveCommandOutput(command?: CommandSnapshot): string | undefined {
   if (!command) return undefined;
+  const stdout = compactLines([
+    command.stdout.truncated ? "[… earlier stdout omitted]" : undefined,
+    command.stdout.content,
+  ]);
+  const stderr = compactLines([
+    command.stderr.truncated ? "[… earlier stderr omitted]" : undefined,
+    command.stderr.content,
+  ]);
   return compactLines([
-    command.stdout.truncated ? "[stdout tail; earlier output omitted]" : undefined,
-    command.stdout.content ? `stdout:\n${command.stdout.content}` : undefined,
-    command.stderr.truncated ? "[stderr tail; earlier output omitted]" : undefined,
-    command.stderr.content ? `stderr:\n${command.stderr.content}` : undefined,
+    stdout,
+    stderr ? `stderr:\n${stderr}` : undefined,
   ]);
 }
 
@@ -1569,6 +1574,7 @@ function toolCallDetail(toolCall: ToolCallView): string {
   return compactLines([
     `id: ${toolCall.id}`,
     `state: ${stateSuffix(toolCall.state)}`,
+    toolCall.command ? `command: ${commandTiming(toolCall.command)}` : undefined,
     toolCall.summary
       ? `summary: ${
         normalizeKnownToolResult(toolCall.name, toolCall.summary, toolCall.cwd)
