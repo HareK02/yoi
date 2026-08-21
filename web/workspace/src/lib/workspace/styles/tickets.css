@@ -260,6 +260,7 @@
     text-align: center;
   }
   .ticket-detail-page {
+    container: ticket-detail / inline-size;
     gap: var(--space-4);
     max-width: 88rem;
   }
@@ -296,9 +297,14 @@
   }
   .ticket-detail-main, .ticket-control-rail {
     display: grid;
+    min-width: 0;
     gap: var(--space-4);
   }
+  .ticket-detail-main {
+    overflow-wrap: anywhere;
+  }
   .ticket-detail-section, .ticket-control-card, .ticket-editor {
+    min-width: 0;
     border: 1px solid var(--line);
     border-radius: 0.8rem;
     background: var(--bg-raised);
@@ -434,6 +440,15 @@
   .ticket-event-author {
     margin: 0.2rem 0;
   }
+  @container ticket-detail (max-width: 48rem) {
+    .ticket-detail-grid {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .ticket-control-rail {
+      grid-row: 1;
+    }
+  }
+
   @media (max-width: 64rem) {
     .ticket-detail-grid {
       grid-template-columns: 1fr;

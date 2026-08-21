@@ -11,7 +11,8 @@ import type {
 } from "../../generated/ticket-api.ts";
 
 declare const Deno: {
-  test(name: string, fn: () => void): void;
+  test(name: string, fn: () => void | Promise<void>): void;
+  readTextFile(path: URL): Promise<string>;
 };
 
 function assertEquals<T>(actual: T, expected: T): void {
@@ -107,4 +108,21 @@ Deno.test("ticket worker launch uses the common Worker route and bounded Ticket 
     url.searchParams.get("initialInput"),
     "Work on Ticket 00001KYRRDVH9 as its reviewer.",
   );
+});
+
+Deno.test("ticket detail keeps the operation rail outside main content", async () => {
+  const css = await Deno.readTextFile(
+    new URL("../styles/tickets.css", import.meta.url),
+  );
+
+  assertEquals(css.includes("container: ticket-detail / inline-size;"), true);
+  assertEquals(
+    css.includes(".ticket-detail-main {\n    overflow-wrap: anywhere;"),
+    true,
+  );
+  assertEquals(
+    css.includes("@container ticket-detail (max-width: 48rem)"),
+    true,
+  );
+  assertEquals(css.includes("min-width: 0;"), true);
 });
