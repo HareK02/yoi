@@ -449,6 +449,17 @@ pub struct WebFetchConfig {
     pub allow_private_addresses: Option<bool>,
 }
 
+/// Maximum Unicode scalar values accepted in a normalized Workspace Memory language name.
+pub const MAX_WORKSPACE_MEMORY_LANGUAGE_CHARS: usize = 64;
+
+/// Return whether a Workspace Memory language is already normalized and safe to persist.
+pub fn is_normalized_workspace_memory_language(language: &str) -> bool {
+    !language.is_empty()
+        && language == language.trim()
+        && language.chars().count() <= MAX_WORKSPACE_MEMORY_LANGUAGE_CHARS
+        && !language.chars().any(char::is_control)
+}
+
 /// Immutable Workspace Memory settings bound into a Worker launch snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -536,7 +547,7 @@ pub struct MemoryConfig {
 }
 
 impl MemoryConfig {
-    /// Replace any profile-authored language fields with a trusted Workspace snapshot.
+    /// Replace any untrusted manifest values with a trusted Workspace snapshot.
     pub fn bind_workspace_settings(&mut self, snapshot: &WorkspaceMemorySettingsSnapshot) {
         self.workspace_id = Some(snapshot.workspace_id.clone());
         self.settings_revision = Some(snapshot.settings_revision);
@@ -1254,6 +1265,18 @@ model_id = "claude-sonnet-4-20250514"
             mem.workspace_root.unwrap(),
             std::path::PathBuf::from("/some/where")
         );
+    }
+
+    #[test]
+    fn workspace_memory_language_validation_is_bounded_free_form_utf8() {
+        assert!(is_normalized_workspace_memory_language("Français"));
+        assert!(is_normalized_workspace_memory_language("日本語"));
+        assert!(!is_normalized_workspace_memory_language(""));
+        assert!(!is_normalized_workspace_memory_language(" English "));
+        assert!(!is_normalized_workspace_memory_language("English\n"));
+        assert!(!is_normalized_workspace_memory_language(
+            &"x".repeat(MAX_WORKSPACE_MEMORY_LANGUAGE_CHARS + 1)
+        ));
     }
 
     #[test]

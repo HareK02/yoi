@@ -5232,7 +5232,7 @@ fn validate_workspace_memory_snapshot(
         )));
     }
     if snapshot.settings_revision == 0
-        || !matches!(snapshot.language.as_str(), "English" | "Japanese")
+        || !manifest::is_normalized_workspace_memory_language(&snapshot.language)
     {
         return Err(WorkerError::InvalidState(format!(
             "Workspace Worker {worker_name} has corrupt Memory settings snapshot metadata"

@@ -1198,21 +1198,35 @@ impl SqliteWorkspaceStore {
         let language = normalize_workspace_memory_language(language)?;
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let current_revision = tx
+            let current = tx
                 .query_row(
-                    "SELECT settings_revision FROM workspace_memory_settings WHERE workspace_id = ?1",
+                    "SELECT workspace_id, settings_revision, language, created_at, updated_at \
+                     FROM workspace_memory_settings WHERE workspace_id = ?1",
                     params![workspace_id],
-                    |row| row.get::<_, i64>(0),
+                    |row| {
+                        let revision = row.get::<_, i64>(1)?;
+                        Ok(WorkspaceMemorySettingsRecord {
+                            workspace_id: row.get(0)?,
+                            settings_revision: revision.try_into().map_err(|_| {
+                                rusqlite::Error::IntegralValueOutOfRange(1, revision)
+                            })?,
+                            language: row.get(2)?,
+                            created_at: row.get(3)?,
+                            updated_at: row.get(4)?,
+                        })
+                    },
                 )
                 .optional()?
                 .ok_or_else(|| Error::Store("Workspace Memory settings are missing".to_string()))?;
-            let current_revision: u64 = current_revision.try_into().map_err(|_| {
-                rusqlite::Error::IntegralValueOutOfRange(0, current_revision)
-            })?;
+            let current_revision = current.settings_revision;
             if current_revision != expected_revision {
                 return Err(Error::WorkspaceConfigConflict(format!(
                     "Workspace Memory settings revision changed: expected {expected_revision}, current {current_revision}"
                 )));
+            }
+            if current.language == language {
+                tx.commit()?;
+                return Ok(current);
             }
             let next_revision = current_revision.checked_add(1).ok_or_else(|| {
                 Error::InvalidInput("Workspace Memory settings revision overflow".to_string())
@@ -5916,13 +5930,14 @@ fn collect_reference_diagnostics(
 }
 
 fn normalize_workspace_memory_language(language: &str) -> Result<String> {
-    match language.trim().to_ascii_lowercase().as_str() {
-        "english" | "en" => Ok("English".to_string()),
-        "japanese" | "ja" => Ok("Japanese".to_string()),
-        _ => Err(Error::InvalidInput(
-            "Workspace Memory language must be one of: English, Japanese".to_string(),
-        )),
+    let language = language.trim();
+    if !manifest::is_normalized_workspace_memory_language(language) {
+        return Err(Error::InvalidInput(format!(
+            "Workspace Memory language must be a non-empty UTF-8 string of at most {} characters without control characters",
+            manifest::MAX_WORKSPACE_MEMORY_LANGUAGE_CHARS
+        )));
     }
+    Ok(language.to_string())
 }
 
 fn bound_worker_create_fingerprint(
@@ -8682,11 +8697,15 @@ INSERT INTO workdir_registry (
         );
         assert_eq!(reserved.memory_settings.settings_revision, 1);
         assert_eq!(reserved.memory_settings.language, "English");
+        let unchanged_memory_settings = store
+            .update_workspace_memory_settings("workspace-a", 1, " English ")
+            .unwrap();
+        assert_eq!(unchanged_memory_settings, memory_settings);
         let updated_memory_settings = store
-            .update_workspace_memory_settings("workspace-a", 1, "ja")
+            .update_workspace_memory_settings("workspace-a", 1, " Français ")
             .unwrap();
         assert_eq!(updated_memory_settings.settings_revision, 2);
-        assert_eq!(updated_memory_settings.language, "Japanese");
+        assert_eq!(updated_memory_settings.language, "Français");
         assert_eq!(
             store
                 .reserve_worker_create(

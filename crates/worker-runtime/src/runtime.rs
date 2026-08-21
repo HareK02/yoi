@@ -2810,9 +2810,9 @@ fn validate_create_workspace_scope(
             "Memory settings revision must be at least 1".to_string(),
         ));
     }
-    if !matches!(snapshot.language.as_str(), "English" | "Japanese") {
+    if !manifest::is_normalized_workspace_memory_language(&snapshot.language) {
         return Err(RuntimeError::InvalidRequest(
-            "Memory settings language must be a normalized supported value".to_string(),
+            "Memory settings language must be a normalized bounded UTF-8 value".to_string(),
         ));
     }
     Ok(())
@@ -3133,6 +3133,8 @@ mod tests {
     fn workspace_create_requires_matching_normalized_memory_settings_snapshot() {
         let mut request = scoped_task_request("memory-snapshot", "workspace-a");
         assert!(validate_create_workspace_scope(&request, Some("workspace-a")).is_ok());
+        request.memory_settings.as_mut().unwrap().language = "Français".to_string();
+        assert!(validate_create_workspace_scope(&request, Some("workspace-a")).is_ok());
 
         request.memory_settings = None;
         assert!(validate_create_workspace_scope(&request, Some("workspace-a")).is_err());
@@ -3147,7 +3149,7 @@ mod tests {
         request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
             workspace_id: "workspace-a".to_string(),
             settings_revision: 2,
-            language: "english".to_string(),
+            language: " english ".to_string(),
         });
         assert!(validate_create_workspace_scope(&request, Some("workspace-a")).is_err());
     }
