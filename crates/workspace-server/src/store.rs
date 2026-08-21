@@ -225,6 +225,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create atomic Workspace catalog operations",
         apply: create_workspace_catalog_operations,
     },
+    Migration {
+        version: 41,
+        name: "rename Workspace resource keys",
+        apply: verify_workspace_resource_key_schema,
+    },
 ];
 
 struct Migration {
@@ -595,7 +600,7 @@ impl WorkspaceResourceKind {
 #[async_trait]
 pub trait ControlPlaneStore: Send + Sync {
     async fn schema_version(&self) -> Result<i64>;
-    fn resource_human_key(
+    fn resource_key(
         &self,
         workspace_id: &str,
         kind: WorkspaceResourceKind,
@@ -1059,6 +1064,14 @@ impl SqliteWorkspaceStore {
         } else {
             Vec::new()
         };
+        apply_migrations_through(&candidate, 38)?;
+        let assignment_worker_tombstone_repairs =
+            legacy_assignment_worker_tombstone_repairs(&candidate)?.len();
+        if assignment_worker_tombstone_repairs > 0 {
+            repairs.push(format!(
+                "materialize {assignment_worker_tombstone_repairs} legacy Ticket assignment Worker tombstone(s)"
+            ));
+        }
         apply_migrations_through(&candidate, i64::MAX)?;
         ticket::migrate_sqlite_ticket_schema(&candidate)?;
         merge_request::migrate(&candidate).map_err(|error| Error::Store(error.to_string()))?;
@@ -1171,7 +1184,7 @@ impl SqliteWorkspaceStore {
 
             let worker_id = WorkerId::now_v7();
             let now = chrono::Utc::now().to_rfc3339();
-            allocate_resource_human_key(
+            allocate_resource_key(
                 &tx,
                 workspace_id,
                 WorkspaceResourceKind::Worker,
@@ -1304,7 +1317,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_conn(current_schema_version)
     }
 
-    fn resource_human_key(
+    fn resource_key(
         &self,
         workspace_id: &str,
         kind: WorkspaceResourceKind,
@@ -1312,7 +1325,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<Option<String>> {
         self.with_conn(|conn| {
             conn.query_row(
-                "SELECT human_key FROM workspace_resource_human_keys
+                "SELECT resource_key FROM workspace_resource_keys
                  WHERE workspace_id = ?1 AND resource_kind = ?2 AND resource_id = ?3",
                 params![workspace_id, kind.as_str(), resource_id],
                 |row| row.get(0),
@@ -1331,8 +1344,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_conn(|conn| {
             if let Some(resource_id) = conn
                 .query_row(
-                    "SELECT resource_id FROM workspace_resource_human_keys
-                     WHERE workspace_id = ?1 AND resource_kind = ?2 AND human_key = ?3",
+                    "SELECT resource_id FROM workspace_resource_keys
+                     WHERE workspace_id = ?1 AND resource_kind = ?2 AND resource_key = ?3",
                     params![workspace_id, kind.as_str(), reference],
                     |row| row.get(0),
                 )
@@ -1536,7 +1549,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             }
             for resource_kind in ["ticket", "objective", "worker"] {
                 tx.execute(
-                    r#"INSERT OR IGNORE INTO workspace_resource_human_key_counters (
+                    r#"INSERT OR IGNORE INTO workspace_resource_key_counters (
                         workspace_id, resource_kind, next_sequence
                     ) VALUES (?1, ?2, 1)"#,
                     params![record.workspace.workspace_id, resource_kind],
@@ -1979,7 +1992,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     fn upsert_objective(&self, record: &ObjectiveRecord) -> Result<()> {
         self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
-            allocate_resource_human_key(
+            allocate_resource_key(
                 &tx,
                 &record.workspace_id,
                 WorkspaceResourceKind::Objective,
@@ -2757,7 +2770,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
 
     fn upsert_worker_registry(&self, record: &WorkerRegistryRecord) -> Result<()> {
         self.with_conn(|conn| {
-            let removal_blocks_upsert: bool = conn.query_row(
+            let tx = conn.unchecked_transaction()?;
+            let removal_blocks_upsert: bool = tx.query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM worker_removal_operations
                     WHERE workspace_id = ?1 AND runtime_id = ?2
@@ -2774,7 +2788,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             if removal_blocks_upsert {
                 return Ok(());
             }
-            conn.execute(
+            tx.execute(
                 r#"INSERT INTO worker_registry (
                     workspace_id, runtime_id, worker_id, display_name, profile,
                     retention_state, transcript_ref, session_ref, summary_ref,
@@ -2816,6 +2830,14 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     record.updated_at,
                 ],
             )?;
+            allocate_resource_key(
+                &tx,
+                &record.workspace_id,
+                WorkspaceResourceKind::Worker,
+                &record.worker.worker_id,
+                &record.created_at,
+            )?;
+            tx.commit()?;
             Ok(())
         })
     }
@@ -5527,8 +5549,11 @@ fn workspace_resource_reference_diagnostics(conn: &Connection) -> Result<Vec<Str
     }
 
     // Assignment and operation rows are historical soft references. Schema v39 records an
-    // explicit tombstone before a live Ticket or Worker parent is deleted/moved; older schemas
-    // have no tombstone authority, so every missing live parent remains migration-blocking drift.
+    // explicit tombstone before a live Ticket or Worker parent is deleted/moved. A pre-v39
+    // assignment with a valid Worker UUID and no contradictory Worker authority in another
+    // Workspace is repairable legacy evidence; the migration materializes its tombstone.
+    // Missing Ticket parents remain migration-blocking because no equivalent legacy repair is
+    // currently defined.
     if table_exists(conn, "ticket_worker_assignments")? && table_exists(conn, "typed_tickets")? {
         let tombstone_filter = if table_exists(conn, "ticket_assignment_ticket_tombstones")? {
             "AND NOT EXISTS (SELECT 1 FROM ticket_assignment_ticket_tombstones AS tombstone \
@@ -5556,28 +5581,7 @@ fn workspace_resource_reference_diagnostics(conn: &Connection) -> Result<Vec<Str
         && column_exists(conn, "ticket_worker_assignments", "worker_id")?
         && column_exists(conn, "worker_registry", "worker_id")?
     {
-        let tombstone_filter = if table_exists(conn, "ticket_assignment_worker_tombstones")? {
-            "AND NOT EXISTS (SELECT 1 FROM ticket_assignment_worker_tombstones AS tombstone \
-             WHERE tombstone.workspace_id = assignment.workspace_id \
-               AND tombstone.runtime_id = assignment.runtime_id \
-               AND tombstone.worker_id = assignment.worker_id)"
-        } else {
-            ""
-        };
-        collect_reference_diagnostics(
-            conn,
-            &format!(
-                "SELECT assignment.workspace_id || '/' || assignment.assignment_id || ' -> ' || assignment.runtime_id || '/' || assignment.worker_id \
-                 FROM ticket_worker_assignments AS assignment \
-                 WHERE NOT EXISTS (SELECT 1 FROM worker_registry AS worker \
-                     WHERE worker.workspace_id = assignment.workspace_id \
-                       AND worker.runtime_id = assignment.runtime_id \
-                       AND worker.worker_id = assignment.worker_id) \
-                 {tombstone_filter} LIMIT 100"
-            ),
-            "ticket_worker_assignments.worker_id",
-            &mut diagnostics,
-        )?;
+        collect_assignment_worker_reference_diagnostics(conn, &mut diagnostics)?;
     }
     if table_exists(conn, "ticket_assignment_operations")? && table_exists(conn, "typed_tickets")? {
         let tombstone_filter = if table_exists(conn, "ticket_assignment_ticket_tombstones")? {
@@ -5602,6 +5606,114 @@ fn workspace_resource_reference_diagnostics(conn: &Connection) -> Result<Vec<Str
         )?;
     }
     Ok(diagnostics)
+}
+
+fn collect_assignment_worker_reference_diagnostics(
+    conn: &Connection,
+    diagnostics: &mut Vec<String>,
+) -> Result<()> {
+    let has_assignment_tombstones = table_exists(conn, "ticket_assignment_worker_tombstones")?;
+    let legacy_tombstone_repairs = legacy_assignment_worker_tombstone_repairs(conn)?;
+    let tombstone_filter = if has_assignment_tombstones {
+        "AND NOT EXISTS (SELECT 1 FROM ticket_assignment_worker_tombstones AS tombstone \
+         WHERE tombstone.workspace_id = assignment.workspace_id \
+           AND tombstone.runtime_id = assignment.runtime_id \
+           AND tombstone.worker_id = assignment.worker_id)"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT assignment.workspace_id, assignment.assignment_id, \
+                assignment.runtime_id, assignment.worker_id \
+         FROM ticket_worker_assignments AS assignment \
+         WHERE NOT EXISTS (SELECT 1 FROM worker_registry AS worker \
+             WHERE worker.workspace_id = assignment.workspace_id \
+               AND worker.runtime_id = assignment.runtime_id \
+               AND worker.worker_id = assignment.worker_id) \
+         {tombstone_filter}"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut worker_diagnostic_count = 0;
+    for row in rows {
+        let (workspace_id, assignment_id, runtime_id, worker_id) = row?;
+        if legacy_tombstone_repairs.contains(&(
+            workspace_id.clone(),
+            runtime_id.clone(),
+            worker_id.clone(),
+        )) {
+            continue;
+        }
+        diagnostics.push(format!(
+            "ticket_worker_assignments.worker_id: \
+             {workspace_id}/{assignment_id} -> {runtime_id}/{worker_id}"
+        ));
+        worker_diagnostic_count += 1;
+        if worker_diagnostic_count == 100 {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn legacy_assignment_worker_tombstone_repairs(
+    conn: &Connection,
+) -> Result<std::collections::BTreeSet<(String, String, String)>> {
+    if current_schema_version(conn)? >= 39
+        || table_exists(conn, "ticket_assignment_worker_tombstones")?
+        || !table_exists(conn, "ticket_worker_assignments")?
+        || !table_exists(conn, "worker_registry")?
+        || !column_exists(conn, "ticket_worker_assignments", "worker_id")?
+        || !column_exists(conn, "worker_registry", "worker_id")?
+    {
+        return Ok(std::collections::BTreeSet::new());
+    }
+
+    let mut repairs = std::collections::BTreeSet::new();
+    let mut statement = conn.prepare(
+        "SELECT DISTINCT assignment.workspace_id, assignment.runtime_id, assignment.worker_id \
+         FROM ticket_worker_assignments AS assignment \
+         WHERE NOT EXISTS (SELECT 1 FROM worker_registry AS worker \
+             WHERE worker.workspace_id = assignment.workspace_id \
+               AND worker.runtime_id = assignment.runtime_id \
+               AND worker.worker_id = assignment.worker_id)",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (workspace_id, runtime_id, worker_id) = row?;
+        if WorkerId::parse(&worker_id).is_none() {
+            continue;
+        }
+        let exists_only_outside_workspace: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM worker_registry \
+                 WHERE worker_id = ?1 AND workspace_id != ?2) \
+               AND NOT EXISTS(SELECT 1 FROM worker_registry \
+                 WHERE worker_id = ?1 AND workspace_id = ?2)",
+            params![worker_id, workspace_id],
+            |row| row.get(0),
+        )?;
+        if !exists_only_outside_workspace {
+            // Before v39, supported cleanup and Runtime-placement changes could remove or move a
+            // Worker without recording an assignment-specific tombstone. A valid,
+            // non-cross-Workspace Worker identity is sufficient legacy evidence; v39
+            // materializes the missing tombstone in the migration transaction.
+            repairs.insert((workspace_id, runtime_id, worker_id));
+        }
+    }
+    Ok(repairs)
 }
 
 fn collect_reference_diagnostics(
@@ -6132,7 +6244,7 @@ fn promote_workspace_worker_uuid_identity(
     Ok(mappings)
 }
 
-fn allocate_resource_human_key(
+fn allocate_resource_key(
     conn: &Connection,
     workspace_id: &str,
     kind: WorkspaceResourceKind,
@@ -6141,7 +6253,7 @@ fn allocate_resource_human_key(
 ) -> Result<String> {
     if let Some(existing) = conn
         .query_row(
-            "SELECT human_key FROM workspace_resource_human_keys
+            "SELECT resource_key FROM workspace_resource_keys
              WHERE workspace_id = ?1 AND resource_kind = ?2 AND resource_id = ?3",
             params![workspace_id, kind.as_str(), resource_id],
             |row| row.get(0),
@@ -6151,36 +6263,36 @@ fn allocate_resource_human_key(
         return Ok(existing);
     }
     conn.execute(
-        "INSERT OR IGNORE INTO workspace_resource_human_key_counters
+        "INSERT OR IGNORE INTO workspace_resource_key_counters
          (workspace_id, resource_kind, next_sequence) VALUES (?1, ?2, 1)",
         params![workspace_id, kind.as_str()],
     )?;
     let sequence: i64 = conn.query_row(
-        "SELECT next_sequence FROM workspace_resource_human_key_counters
+        "SELECT next_sequence FROM workspace_resource_key_counters
          WHERE workspace_id = ?1 AND resource_kind = ?2",
         params![workspace_id, kind.as_str()],
         |row| row.get(0),
     )?;
     conn.execute(
-        "UPDATE workspace_resource_human_key_counters SET next_sequence = ?3
+        "UPDATE workspace_resource_key_counters SET next_sequence = ?3
          WHERE workspace_id = ?1 AND resource_kind = ?2",
         params![workspace_id, kind.as_str(), sequence + 1],
     )?;
-    let human_key = format!("{}-{sequence}", kind.prefix());
+    let resource_key = format!("{}-{sequence}", kind.prefix());
     conn.execute(
-        "INSERT INTO workspace_resource_human_keys
-         (workspace_id, resource_kind, resource_id, sequence, human_key, allocated_at)
+        "INSERT INTO workspace_resource_keys
+         (workspace_id, resource_kind, resource_id, sequence, resource_key, allocated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             workspace_id,
             kind.as_str(),
             resource_id,
             sequence,
-            human_key,
+            resource_key,
             allocated_at
         ],
     )?;
-    Ok(human_key)
+    Ok(resource_key)
 }
 
 fn add_workspace_resource_human_keys(conn: &Connection) -> Result<()> {
@@ -6257,6 +6369,47 @@ fn add_workspace_resource_human_keys(conn: &Connection) -> Result<()> {
                 next_sequence = MAX(next_sequence, excluded.next_sequence);
             "#,
         )?;
+    }
+    Ok(())
+}
+
+fn verify_workspace_resource_key_schema(conn: &Connection) -> Result<()> {
+    ticket::migrate_sqlite_ticket_resource_key_schema_in_transaction(conn).map_err(|error| {
+        Error::Store(format!(
+            "migration 41 Ticket resource-key schema failed: {error}"
+        ))
+    })?;
+    for legacy_table in [
+        "workspace_resource_human_keys",
+        "workspace_resource_human_key_counters",
+    ] {
+        if table_exists(conn, legacy_table)? {
+            return Err(Error::Store(format!(
+                "migration 41 left legacy table `{legacy_table}`"
+            )));
+        }
+    }
+    if !table_exists(conn, "workspace_resource_keys")?
+        || !column_exists(conn, "workspace_resource_keys", "resource_key")?
+        || column_exists(conn, "workspace_resource_keys", "human_key")?
+        || !table_exists(conn, "workspace_resource_key_counters")?
+    {
+        return Err(Error::Store(
+            "migration 41 did not materialize the Workspace resource key schema".to_string(),
+        ));
+    }
+    let index_exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = 'idx_workspace_resource_keys_reverse'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !index_exists {
+        return Err(Error::Store(
+            "migration 41 did not create the Workspace resource key reverse index".to_string(),
+        ));
     }
     Ok(())
 }
@@ -6530,6 +6683,21 @@ CREATE TABLE ticket_worker_assignments_v39 (
     FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
 );
 INSERT INTO ticket_worker_assignments_v39 SELECT * FROM ticket_worker_assignments;
+INSERT OR IGNORE INTO ticket_assignment_worker_tombstones (
+    workspace_id, runtime_id, worker_id, deleted_at
+)
+SELECT DISTINCT
+    assignment.workspace_id,
+    assignment.runtime_id,
+    assignment.worker_id,
+    CURRENT_TIMESTAMP
+FROM ticket_worker_assignments_v39 AS assignment
+WHERE NOT EXISTS (
+    SELECT 1 FROM worker_registry AS worker
+    WHERE worker.workspace_id = assignment.workspace_id
+      AND worker.runtime_id = assignment.runtime_id
+      AND worker.worker_id = assignment.worker_id
+);
 
 CREATE TABLE ticket_worker_assignment_events_v39 (
     workspace_id TEXT NOT NULL,
@@ -6830,17 +6998,66 @@ END;
     Ok(())
 }
 
+fn rebuild_workspace_scoped_references_from_resource_keys(conn: &Connection) -> Result<()> {
+    if table_exists(conn, "workspace_resource_human_keys")? {
+        conn.execute_batch(
+            r#"
+INSERT OR IGNORE INTO workspace_resource_human_keys (
+    workspace_id, resource_kind, resource_id, sequence, human_key, allocated_at
+)
+SELECT workspace_id, resource_kind, resource_id, sequence, resource_key, allocated_at
+FROM workspace_resource_keys;
+INSERT INTO workspace_resource_human_key_counters (
+    workspace_id, resource_kind, next_sequence
+)
+SELECT workspace_id, resource_kind, next_sequence
+FROM workspace_resource_key_counters
+WHERE true
+ON CONFLICT(workspace_id, resource_kind) DO UPDATE SET
+    next_sequence = max(next_sequence, excluded.next_sequence);
+DROP INDEX IF EXISTS idx_workspace_resource_keys_reverse;
+DROP TABLE workspace_resource_keys;
+DROP TABLE workspace_resource_key_counters;
+"#,
+        )?;
+    } else {
+        conn.execute_batch(
+            r#"
+DROP INDEX IF EXISTS idx_workspace_resource_keys_reverse;
+ALTER TABLE workspace_resource_keys RENAME COLUMN resource_key TO human_key;
+ALTER TABLE workspace_resource_keys RENAME TO workspace_resource_human_keys;
+ALTER TABLE workspace_resource_key_counters RENAME TO workspace_resource_human_key_counters;
+"#,
+        )?;
+    }
+    enforce_workspace_resource_foreign_keys(conn)?;
+    conn.execute_batch(
+        r#"
+DROP INDEX IF EXISTS idx_workspace_resource_human_keys_reverse;
+ALTER TABLE workspace_resource_human_keys RENAME TO workspace_resource_keys;
+ALTER TABLE workspace_resource_keys RENAME COLUMN human_key TO resource_key;
+ALTER TABLE workspace_resource_human_key_counters RENAME TO workspace_resource_key_counters;
+CREATE INDEX idx_workspace_resource_keys_reverse
+    ON workspace_resource_keys(workspace_id, resource_kind, resource_key);
+"#,
+    )?;
+    Ok(())
+}
+
 pub(crate) fn apply_migrations_through(conn: &Connection, through_version: i64) -> Result<()> {
     let current = current_schema_version(conn)?;
     for migration in MIGRATIONS.iter().filter(|migration| {
         i64::from(migration.version) > current && i64::from(migration.version) <= through_version
     }) {
         if migration.version == 39 {
-            ticket::migrate_sqlite_ticket_schema(conn).map_err(|error| {
-                Error::Store(format!(
-                    "migration 39 Ticket schema preparation failed: {error}"
-                ))
-            })?;
+            let resource_key_schema_current = table_exists(conn, "workspace_resource_keys")?;
+            if !resource_key_schema_current {
+                ticket::migrate_sqlite_ticket_schema_through(conn, 5).map_err(|error| {
+                    Error::Store(format!(
+                        "migration 39 Ticket schema preparation failed: {error}"
+                    ))
+                })?;
+            }
             if !table_exists(conn, "typed_tickets")? {
                 return Err(Error::Store(
                     "migration 39 Ticket schema preparation created no typed_tickets".to_string(),
@@ -6856,7 +7073,11 @@ pub(crate) fn apply_migrations_through(conn: &Connection, through_version: i64) 
             conn.execute_batch("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;")?;
             let result = (|| -> Result<()> {
                 let tx = conn.unchecked_transaction()?;
-                (migration.apply)(&tx)?;
+                if resource_key_schema_current {
+                    rebuild_workspace_scoped_references_from_resource_keys(&tx)?;
+                } else {
+                    (migration.apply)(&tx)?;
+                }
                 if !table_exists(&tx, "typed_tickets")? {
                     return Err(Error::Store(
                         "migration 39 did not materialize `typed_tickets`".to_string(),
@@ -7461,7 +7682,7 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
         assert_eq!(plan.current_schema_version, 36);
-        assert_eq!(plan.target_schema_version, 40);
+        assert_eq!(plan.target_schema_version, 41);
         assert!(plan.migration_required);
         assert_eq!(plan.worker_count, 1);
         assert_eq!(plan.mappings[0].legacy_worker_id, 7);
@@ -7475,14 +7696,14 @@ mod tests {
         store
             .with_conn(|conn| {
                 assert!(table_exists(conn, "worker_diagnostics_archives")?);
-                assert_eq!(current_schema_version(conn)?, 40);
+                assert_eq!(current_schema_version(conn)?, 41);
                 Ok(())
             })
             .unwrap();
     }
 
     #[test]
-    fn v38_backfills_workspace_scoped_objective_and_worker_human_keys() {
+    fn v38_backfills_workspace_scoped_objective_and_worker_resource_keys() {
         let conn = Connection::open_in_memory().unwrap();
         configure_sqlite(&conn).unwrap();
         apply_migrations_through(&conn, 37).unwrap();
@@ -7518,11 +7739,11 @@ mod tests {
             ).unwrap();
         }
 
-        ticket::migrate_sqlite_ticket_schema(&conn).unwrap();
+        ticket::migrate_sqlite_ticket_schema_through(&conn, 5).unwrap();
         apply_migrations(&conn).unwrap();
         let mut statement = conn
             .prepare(
-                "SELECT resource_kind, resource_id, human_key FROM workspace_resource_human_keys
+                "SELECT resource_kind, resource_id, resource_key FROM workspace_resource_keys
              ORDER BY resource_kind, sequence",
             )
             .unwrap();
@@ -7554,7 +7775,7 @@ mod tests {
                 ),
             ]
         );
-        assert_eq!(current_schema_version(&conn).unwrap(), 40);
+        assert_eq!(current_schema_version(&conn).unwrap(), 41);
         let foreign_key_error: Option<String> = conn
             .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
             .optional()
@@ -7683,7 +7904,7 @@ INSERT INTO worker_orphan_diagnostics (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 40);
+        assert_eq!(current_schema_version(&conn).unwrap(), 41);
         assert!(!table_exists(&conn, "worker_control_delegation_operations").unwrap());
         let controller_worker_id: String = conn
             .query_row(
@@ -7801,7 +8022,7 @@ INSERT INTO worker_orphan_diagnostics (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 40);
+        assert_eq!(current_schema_version(&conn).unwrap(), 41);
         assert!(table_exists(&conn, "worker_workdir_attachment_reservations").unwrap());
     }
 
@@ -7834,7 +8055,7 @@ CREATE TABLE flow_events (event_id TEXT PRIMARY KEY);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 40);
+        assert_eq!(current_schema_version(&conn).unwrap(), 41);
         assert!(table_exists(&conn, "flow_sources").unwrap());
         assert!(table_exists(&conn, "flow_source_revisions").unwrap());
         assert!(!table_exists(&conn, "flow_instances").unwrap());
@@ -7901,7 +8122,7 @@ INSERT INTO worker_workdir_attachment_reservations (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 40);
+        assert_eq!(current_schema_version(&conn).unwrap(), 41);
         let repositories_sql: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'repositories'",
@@ -8079,7 +8300,7 @@ INSERT INTO workdir_registry (
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 40);
+        assert_eq!(store.schema_version().await.unwrap(), 41);
         assert!(
             !store
                 .with_conn(|conn| table_exists(conn, "worker_workspace_credentials"))
@@ -8096,7 +8317,7 @@ INSERT INTO workdir_registry (
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 40);
+        assert_eq!(reopened.schema_version().await.unwrap(), 41);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -8104,7 +8325,7 @@ INSERT INTO workdir_registry (
     }
 
     #[tokio::test]
-    async fn objective_creation_allocates_and_resolves_workspace_human_key() {
+    async fn objective_creation_allocates_and_resolves_workspace_resource_key() {
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteWorkspaceStore::open(dir.path().join("server.db")).unwrap();
         store
@@ -8131,7 +8352,7 @@ INSERT INTO workdir_registry (
             .unwrap();
         assert_eq!(
             store
-                .resource_human_key(
+                .resource_key(
                     "workspace-a",
                     WorkspaceResourceKind::Objective,
                     "objective-internal"
@@ -8185,7 +8406,7 @@ INSERT INTO workdir_registry (
         );
         assert_eq!(
             store
-                .resource_human_key(
+                .resource_key(
                     "workspace-a",
                     WorkspaceResourceKind::Worker,
                     &reserved.to_string()
@@ -8205,7 +8426,7 @@ INSERT INTO workdir_registry (
             .unwrap();
         assert_eq!(
             store
-                .resource_human_key(
+                .resource_key(
                     "workspace-a",
                     WorkspaceResourceKind::Worker,
                     &second.to_string()
@@ -8595,13 +8816,13 @@ INSERT INTO worker_registry (
         configure_sqlite(&conn).unwrap();
         apply_migrations(&conn).unwrap();
         conn.execute(
-            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (41, 'future')",
+            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (42, 'future')",
             [],
         )
         .unwrap();
 
         let error = apply_migrations(&conn).unwrap_err().to_string();
-        assert!(error.contains("schema version 41 is newer"), "{error}");
+        assert!(error.contains("schema version 42 is newer"), "{error}");
         assert!(error.contains("refusing to serve"), "{error}");
     }
 
@@ -8713,7 +8934,7 @@ INSERT INTO worker_registry (
         let conn = Connection::open(&path).unwrap();
         configure_sqlite(&conn).unwrap();
         apply_migrations_through(&conn, 38).unwrap();
-        ticket::migrate_sqlite_ticket_schema(&conn).unwrap();
+        ticket::migrate_sqlite_ticket_schema_through(&conn, 5).unwrap();
         merge_request::migrate(&conn).unwrap();
         conn.execute_batch(
             r#"
@@ -8759,7 +8980,7 @@ VALUES ('workspace-b', 'ticket-b', 'related', 'ticket-a', NULL, 'tester', '2026-
         let conn = Connection::open_in_memory().unwrap();
         configure_sqlite(&conn).unwrap();
         apply_migrations_through(&conn, 38).unwrap();
-        ticket::migrate_sqlite_ticket_schema(&conn).unwrap();
+        ticket::migrate_sqlite_ticket_schema_through(&conn, 5).unwrap();
         merge_request::migrate(&conn).unwrap();
         conn.execute(
             "INSERT INTO workspaces (workspace_id, display_name, state, created_at, updated_at) \
@@ -8822,7 +9043,7 @@ VALUES ('workspace-b', 'ticket-b', 'related', 'ticket-a', NULL, 'tester', '2026-
 
         apply_migrations(&mut conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 40);
+        assert_eq!(current_schema_version(&conn).unwrap(), 41);
         let workspace_id: Option<String> = conn
             .query_row(
                 "SELECT workspace_id FROM trusted_runtime_records WHERE runtime_id = 'runtime-a'",
@@ -8839,7 +9060,7 @@ VALUES ('workspace-b', 'ticket-b', 'related', 'ticket-a', NULL, 'tester', '2026-
         let conn = Connection::open_in_memory().unwrap();
         configure_sqlite(&conn).unwrap();
         apply_migrations_through(&conn, 38).unwrap();
-        ticket::migrate_sqlite_ticket_schema(&conn).unwrap();
+        ticket::migrate_sqlite_ticket_schema_through(&conn, 5).unwrap();
         merge_request::migrate(&conn).unwrap();
 
         conn.execute_batch(
@@ -8937,7 +9158,6 @@ INSERT INTO ticket_worker_assignment_events (
             "{error}"
         );
         assert!(error.contains("assignment-cross-worker"), "{error}");
-        assert!(error.contains("assignment-runtime-mismatch"), "{error}");
         assert!(error.contains("assignment-missing-parents"), "{error}");
         assert!(
             error.contains("ticket_worker_assignment_events.assignment_id"),
@@ -9115,6 +9335,123 @@ INSERT INTO ticket_worker_assignment_events (
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
             .unwrap();
         assert_eq!(integrity, "ok");
+    }
+
+    #[test]
+    fn workspace_resource_fk_migration_preserves_assignments_for_legacy_absent_workers() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        apply_migrations_through(&conn, 38).unwrap();
+        ticket::migrate_sqlite_ticket_schema_through(&conn, 5).unwrap();
+        merge_request::migrate(&conn).unwrap();
+
+        conn.execute_batch(
+            r#"
+INSERT INTO workspaces (
+    workspace_id, display_name, state, created_at, updated_at
+) VALUES ('workspace-a', 'A', 'active', '2026-01-01', '2026-01-01');
+INSERT INTO typed_tickets (
+    workspace_id, ticket_id, slug, title, status, kind, priority, body,
+    workflow_state, workflow_state_explicit
+) VALUES (
+    'workspace-a', 'ticket-a', 'ticket-a', 'A', 'open', 'task', 'normal', '',
+    'planning', 1
+);
+INSERT INTO worker_registry (
+    workspace_id, runtime_id, worker_id, display_name, retention_state, created_at, updated_at
+) VALUES
+(
+    'workspace-a', 'runtime-a', '00000000-0000-7000-8000-000000000001',
+    'Worker A', 'normal', '2026-01-01', '2026-01-01'
+),
+(
+    'workspace-a', 'runtime-old', '00000000-0000-7000-8000-000000000002',
+    'Worker B', 'normal', '2026-01-01', '2026-01-01'
+);
+INSERT INTO ticket_worker_assignments (
+    workspace_id, ticket_id, assignment_id, runtime_id, worker_id, assigned_by, assigned_at
+) VALUES
+(
+    'workspace-a', 'ticket-a', 'assignment-a', 'runtime-a',
+    '00000000-0000-7000-8000-000000000001', 'tester', '2026-01-01'
+),
+(
+    'workspace-a', 'ticket-a', 'assignment-b', 'runtime-old',
+    '00000000-0000-7000-8000-000000000002', 'tester', '2026-01-01'
+);
+DELETE FROM worker_registry
+WHERE workspace_id = 'workspace-a'
+  AND runtime_id = 'runtime-a'
+  AND worker_id = '00000000-0000-7000-8000-000000000001';
+UPDATE worker_registry
+SET runtime_id = 'runtime-new'
+WHERE workspace_id = 'workspace-a'
+  AND runtime_id = 'runtime-old'
+  AND worker_id = '00000000-0000-7000-8000-000000000002';
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            legacy_assignment_worker_tombstone_repairs(&conn)
+                .unwrap()
+                .len(),
+            2
+        );
+        drop(conn);
+
+        let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
+        assert!(
+            plan.repairs.iter().any(
+                |repair| repair == "materialize 2 legacy Ticket assignment Worker tombstone(s)"
+            ),
+            "{:?}",
+            plan.repairs
+        );
+
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 38);
+        assert!(!table_exists(&conn, "ticket_assignment_worker_tombstones").unwrap());
+        apply_migrations_through(&conn, 39).unwrap();
+
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM ticket_worker_assignments \
+                 WHERE workspace_id = 'workspace-a' AND assignment_id = 'assignment-a'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM ticket_assignment_worker_tombstones \
+                 WHERE workspace_id = 'workspace-a' \
+                   AND runtime_id = 'runtime-a' \
+                   AND worker_id = '00000000-0000-7000-8000-000000000001'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM ticket_assignment_worker_tombstones \
+                 WHERE workspace_id = 'workspace-a' \
+                   AND runtime_id = 'runtime-old' \
+                   AND worker_id = '00000000-0000-7000-8000-000000000002'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        validate_workspace_resource_references(&conn).unwrap();
     }
 
     #[test]
@@ -9323,7 +9660,7 @@ INSERT INTO ticket_worker_assignment_events (
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 40);
+        assert_eq!(store.schema_version().await.unwrap(), 41);
 
         store
             .with_conn(|conn| {
@@ -9512,7 +9849,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 40);
+        assert_eq!(store.schema_version().await.unwrap(), 41);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -9578,7 +9915,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 40);
+        assert_eq!(store.schema_version().await.unwrap(), 41);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -9698,6 +10035,17 @@ CREATE TABLE ticket_assignment_operations (
         runtime_sync_worker.retention_state = "normal".to_string();
         runtime_sync_worker.updated_at = "5".to_string();
         store.upsert_worker_registry(&runtime_sync_worker).unwrap();
+        assert_eq!(
+            store
+                .resource_key(
+                    "local-dev",
+                    WorkspaceResourceKind::Worker,
+                    &worker.worker.worker_id,
+                )
+                .unwrap()
+                .as_deref(),
+            Some("W-1")
+        );
         let mut expected_worker = worker.clone();
         expected_worker.updated_at = "5".to_string();
 
@@ -9969,7 +10317,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 40);
+        assert_eq!(store.schema_version().await.unwrap(), 41);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),

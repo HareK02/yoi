@@ -53,7 +53,7 @@ export type TicketLaneDefinition = (typeof LANE_DEFINITIONS)[number];
 export type TicketLaneId = TicketLaneDefinition["id"];
 export type TicketCardSummary = Pick<
   TicketSummary,
-  "id" | "human_key" | "title" | "state" | "priority" | "updated_at"
+  "id" | "resource_key" | "title" | "state" | "priority" | "updated_at"
 >;
 
 const STATE_SORT_ORDER = new Map<string, number>([

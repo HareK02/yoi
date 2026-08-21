@@ -4,7 +4,7 @@
   let { data }: { data: PageData } = $props();
 </script>
 
-<svelte:head><title>{data.worker?.human_key ?? 'Worker'} · Yoi</title></svelte:head>
+<svelte:head><title>{data.worker?.resource_key ?? 'Worker'} · Yoi</title></svelte:head>
 
 <section class="workspace-page-shell">
   {#if data.workerError}
@@ -12,7 +12,7 @@
   {:else if data.worker}
     <header class="workspace-page-header">
       <div>
-        <p class="eyebrow">{data.worker.human_key}</p>
+        <p class="eyebrow">{data.worker.resource_key}</p>
         <h1>{data.worker.display_name}</h1>
       </div>
       <a

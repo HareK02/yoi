@@ -19,6 +19,7 @@ function worker(overrides: Partial<Worker>): Worker {
   return {
     runtime_id: "arc",
     worker_id: "1",
+    resource_key: "W-1",
     host_id: "host",
     display_name: "Worker 1",
     label: "Worker 1",

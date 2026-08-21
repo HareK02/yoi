@@ -74,10 +74,12 @@ export function workspaceWorkersStore(workspaceId: string): Readable<WorkspaceWo
 
 function projectWorker(worker: SubscriptionWorker): SidebarWorker {
   if (!worker.runtime_id) throw new Error('Workspace Worker projection is missing runtime_id');
+  if (!worker.resource_key) throw new Error('Workspace Worker projection is missing resource_key');
   const displayName = worker.display_name ?? `Worker ${worker.worker_id}`;
   return {
     runtime_id: worker.runtime_id,
     worker_id: worker.worker_id,
+    resource_key: worker.resource_key,
     host_id: worker.runtime_id,
     display_name: displayName,
     label: displayName,

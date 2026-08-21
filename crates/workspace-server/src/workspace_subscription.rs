@@ -12,6 +12,7 @@ use worker_runtime::identity::RuntimeWorkerRef;
 
 use crate::runtime_subscription::{BrokerSubscriptionEvent, RuntimeSubscriptionBroker};
 use crate::server::{WorkspaceApi, connect_workspace_worker_protocol};
+use crate::store::WorkspaceResourceKind;
 
 const OUTBOUND_CAPACITY: usize = 256;
 
@@ -65,6 +66,7 @@ pub(crate) async fn serve_workspace_subscription(api: WorkspaceApi, socket: WebS
                         match selector {
                             EventSubscriptionSelector::WorkspaceWorkers => {
                                 let task = tokio::spawn(run_workspace_workers(
+                                    api.clone(),
                                     broker.clone(),
                                     request_id,
                                     subscription_id.clone(),
@@ -273,6 +275,7 @@ async fn run_worker_protocol(
 }
 
 async fn run_workspace_workers(
+    api: WorkspaceApi,
     broker: RuntimeSubscriptionBroker,
     request_id: protocol::subscription::SubscriptionRequestId,
     subscription_id: SubscriptionId,
@@ -307,7 +310,7 @@ async fn run_workspace_workers(
         };
         match event {
             BrokerSubscriptionEvent::Snapshot { snapshot, .. } => {
-                install_snapshot(&mut workers, &runtime_id, snapshot);
+                install_snapshot(&api, &mut workers, &runtime_id, snapshot);
                 pending.remove(&runtime_id);
             }
             BrokerSubscriptionEvent::Disconnected { .. }
@@ -371,7 +374,7 @@ async fn run_workspace_workers(
                         return;
                     }
                 }
-                install_snapshot(&mut workers, &runtime_id, snapshot);
+                install_snapshot(&api, &mut workers, &runtime_id, snapshot);
                 if let Some(current) = workers.get_mut(&runtime_id) {
                     for worker in current.values_mut() {
                         let worker_ref =
@@ -397,6 +400,14 @@ async fn run_workspace_workers(
             BrokerSubscriptionEvent::Event { payload, .. } => match payload {
                 SubscriptionEventPayload::WorkerUpserted { mut worker } => {
                     worker.runtime_id = Some(runtime_id.clone());
+                    let Ok(Some(resource_key)) = api.store.resource_key(
+                        &api.config.workspace_id,
+                        WorkspaceResourceKind::Worker,
+                        worker.worker_id.as_str(),
+                    ) else {
+                        continue;
+                    };
+                    worker.resource_key = Some(resource_key);
                     let worker_ref = RuntimeWorkerRef::new(&runtime_id, worker.worker_id.as_str());
                     let revision = next_revision(&mut revisions, &worker_ref);
                     worker.subject_revision = revision;
@@ -474,6 +485,7 @@ async fn run_workspace_workers(
 }
 
 fn install_snapshot(
+    api: &WorkspaceApi,
     workers: &mut HashMap<String, BTreeMap<String, SubscriptionWorker>>,
     runtime_id: &str,
     snapshot: SubscriptionSnapshot,
@@ -487,6 +499,14 @@ fn install_snapshot(
     let mut projected = BTreeMap::new();
     for mut worker in snapshot_workers {
         worker.runtime_id = Some(runtime_id.to_string());
+        let Ok(Some(resource_key)) = api.store.resource_key(
+            &api.config.workspace_id,
+            WorkspaceResourceKind::Worker,
+            worker.worker_id.as_str(),
+        ) else {
+            continue;
+        };
+        worker.resource_key = Some(resource_key);
         projected.insert(worker.worker_id.to_string(), worker);
     }
     workers.insert(runtime_id.to_string(), projected);

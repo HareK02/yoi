@@ -21,6 +21,7 @@ Start exactly one instance of the new Server binary against the database. Startu
 
 - rebuilds Ticket, Objective, assignment, Artifact, and human-key tables with Workspace-scoped composite identity;
 - adds composite foreign keys for repository, Ticket, Objective, Worker, relation-target, and current-assignment references;
+- materializes assignment-specific Worker tombstones for pre-v39 historical assignments whose valid Worker UUID no longer has a matching live registry row (including Workers deleted by the legacy cleanup path and Workers moved between Runtimes); a Worker ID that resolves only in another Workspace remains a preflight error;
 - validates new historical assignment/event references with SQLite triggers while allowing those audit rows to survive later Ticket or Worker retention deletion; parent delete/Runtime-move triggers record exact Workspace-scoped tombstones, and startup accepts a missing live parent only when that tombstone exists, so an unrelated same ID in another Workspace cannot change the result; reservation operation ids remain intentionally unconstrained until their resources exist;
 - checks the rebuilt schema with `PRAGMA foreign_key_check` before recording the schema version; and
 - restores `PRAGMA foreign_keys = ON` whether the transaction commits or rolls back.

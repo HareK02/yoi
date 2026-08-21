@@ -137,8 +137,7 @@ pub struct BackendWorkerCapabilitySummary {
 pub struct BackendWorkerSummary {
     pub runtime_id: String,
     pub worker_id: String,
-    #[serde(default)]
-    pub human_key: Option<String>,
+    pub resource_key: String,
     pub host_id: String,
     #[serde(default)]
     pub display_name: String,
@@ -651,6 +650,7 @@ mod tests {
         let payload = serde_json::json!({
             "runtime_id": "arcadia",
             "worker_id": "worker-opaque-64",
+            "resource_key": "W-64",
             "host_id": "host",
             "display_name": "Coder",
             "label": "Coder",

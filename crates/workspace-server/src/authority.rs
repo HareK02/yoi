@@ -228,10 +228,10 @@ impl SqliteWorkspaceAuthority {
         self
     }
 
-    fn human_key(&self, kind: WorkspaceResourceKind, resource_id: &str) -> Result<String> {
+    fn resource_key(&self, kind: WorkspaceResourceKind, resource_id: &str) -> Result<String> {
         self.store
-            .resource_human_key(&self.workspace_id, kind, resource_id)?
-            .ok_or_else(|| Error::Store(format!("missing human key for {resource_id}")))
+            .resource_key(&self.workspace_id, kind, resource_id)?
+            .ok_or_else(|| Error::Store(format!("missing resource key for {resource_id}")))
     }
 
     fn objective_record(&self, reference: &str) -> Result<ObjectiveRecord> {
@@ -262,7 +262,7 @@ impl SqliteWorkspaceAuthority {
             .filter(|ticket| linked_tickets.iter().any(|id| id == &ticket.id))
             .map(|ticket| ObjectiveLinkedTicketSummary {
                 id: ticket.id,
-                human_key: ticket.human_key,
+                resource_key: ticket.resource_key,
                 title: ticket.title,
                 state: ticket.state,
             })
@@ -304,7 +304,8 @@ impl SqliteWorkspaceAuthority {
                 .unwrap_or("none")
         );
         Ok(ObjectiveDetail {
-            human_key: self.human_key(WorkspaceResourceKind::Objective, &record.objective_id)?,
+            resource_key: self
+                .resource_key(WorkspaceResourceKind::Objective, &record.objective_id)?,
             id: record.objective_id,
             title: record.title,
             state: record.state,
@@ -746,8 +747,8 @@ impl SqliteWorkspaceAuthority {
             .into_iter()
             .map(|objective| {
                 Ok::<_, Error>(ObjectiveLinkSummary {
-                    human_key: self
-                        .human_key(WorkspaceResourceKind::Objective, &objective.objective_id)?,
+                    resource_key: self
+                        .resource_key(WorkspaceResourceKind::Objective, &objective.objective_id)?,
                     id: objective.objective_id,
                     title: objective.title,
                     state: objective.state,
@@ -765,7 +766,7 @@ impl SqliteWorkspaceAuthority {
             .store
             .get_current_ticket_worker_assignment(&self.workspace_id, id)?
             .map(|assignment| {
-                let worker_human_key = self.store.resource_human_key(
+                let worker_resource_key = self.store.resource_key(
                     &self.workspace_id,
                     WorkspaceResourceKind::Worker,
                     &assignment.worker.worker_id,
@@ -774,7 +775,7 @@ impl SqliteWorkspaceAuthority {
                     assignment_id: assignment.assignment_id,
                     runtime_id: assignment.worker.runtime_id,
                     worker_id: assignment.worker.worker_id,
-                    worker_human_key,
+                    worker_resource_key,
                 })
             })
             .transpose()?;
@@ -802,33 +803,33 @@ impl SqliteWorkspaceAuthority {
             .and_then(|event| event.attributes.get("event_id").cloned())
             .or_else(|| ticket.meta.updated_at.clone())
             .unwrap_or_else(|| format!("{}:0", ticket.meta.id));
-        let human_key = ticket
+        let resource_key = ticket
             .meta
-            .human_key
+            .resource_key
             .clone()
-            .or(self.store.resource_human_key(
+            .or(self.store.resource_key(
                 &self.workspace_id,
                 WorkspaceResourceKind::Ticket,
                 &ticket.meta.id,
             )?)
-            .ok_or_else(|| Error::Store(format!("missing human key for {}", ticket.meta.id)))?;
+            .ok_or_else(|| Error::Store(format!("missing resource key for {}", ticket.meta.id)))?;
         let mut relations: TicketRelationView = ticket.relations.into();
         for relation in &mut relations.outgoing {
-            relation.target_human_key = self.store.resource_human_key(
+            relation.target_resource_key = self.store.resource_key(
                 &self.workspace_id,
                 WorkspaceResourceKind::Ticket,
                 &relation.target,
             )?;
         }
         for relation in &mut relations.incoming {
-            relation.source_human_key = self.store.resource_human_key(
+            relation.source_resource_key = self.store.resource_key(
                 &self.workspace_id,
                 WorkspaceResourceKind::Ticket,
                 &relation.source_ticket,
             )?;
         }
         for blocker in &mut relations.blockers {
-            blocker.blocking_human_key = self.store.resource_human_key(
+            blocker.blocking_resource_key = self.store.resource_key(
                 &self.workspace_id,
                 WorkspaceResourceKind::Ticket,
                 &blocker.blocking_ticket,
@@ -836,7 +837,7 @@ impl SqliteWorkspaceAuthority {
         }
         Ok(TicketDetail {
             id: ticket.meta.id,
-            human_key,
+            resource_key,
             title: ticket.meta.title,
             state: ticket.meta.workflow_state.as_str().to_string(),
             readiness: ticket.meta.readiness,
@@ -892,11 +893,11 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
             .map(|item| {
                 let projection =
                     project_ticket_workspace_item(&item.summary, &item.relation_blockers, None);
-                let human_key = item.summary.human_key.clone().ok_or_else(|| {
-                    Error::Store(format!("missing human key for {}", item.summary.id))
+                let resource_key = item.summary.resource_key.clone().ok_or_else(|| {
+                    Error::Store(format!("missing resource key for {}", item.summary.id))
                 })?;
                 Ok::<_, Error>(TicketSummary {
-                    human_key,
+                    resource_key,
                     id: item.summary.id,
                     title: item.summary.title,
                     state: item.summary.workflow_state.as_str().to_string(),
@@ -1063,8 +1064,8 @@ impl ObjectiveAuthority for SqliteWorkspaceAuthority {
                 .map(|link| link.ticket_id)
                 .collect::<Vec<_>>();
             items.push(ObjectiveSummary {
-                human_key: self
-                    .human_key(WorkspaceResourceKind::Objective, &record.objective_id)?,
+                resource_key: self
+                    .resource_key(WorkspaceResourceKind::Objective, &record.objective_id)?,
                 id: record.objective_id,
                 title: record.title,
                 state: record.state,
@@ -1110,8 +1111,8 @@ impl ObjectiveAuthority for SqliteWorkspaceAuthority {
                 .collect::<Vec<_>>();
             let body_md = record.body_md.clone();
             let objective = ObjectiveSummary {
-                human_key: self
-                    .human_key(WorkspaceResourceKind::Objective, &record.objective_id)?,
+                resource_key: self
+                    .resource_key(WorkspaceResourceKind::Objective, &record.objective_id)?,
                 id: record.objective_id,
                 title: record.title,
                 state: record.state,
@@ -2137,7 +2138,7 @@ fn ticket_query_item(
     }
     TicketQueryItem {
         id: summary.id,
-        human_key: summary.human_key,
+        resource_key: summary.resource_key,
         title: summary.title,
         state: summary.state,
         readiness: detail.readiness.clone(),
@@ -2288,6 +2289,7 @@ fn objective_query_item(
     }
     ObjectiveQueryItem {
         id: objective.id,
+        resource_key: objective.resource_key,
         title: objective.title,
         state: objective.state,
         created_at: objective.created_at,
@@ -2480,7 +2482,7 @@ fn memory_resolution_from_record(record: MemoryStagingResolutionRecord) -> Memor
 fn ticket_summary_from_ticket(ticket: &ticket::Ticket) -> Result<TicketSummary> {
     let summary = ticket::TicketSummary {
         id: ticket.meta.id.clone(),
-        human_key: ticket.meta.human_key.clone(),
+        resource_key: ticket.meta.resource_key.clone(),
         slug: ticket.meta.slug.clone(),
         title: ticket.meta.title.clone(),
         status: ticket.meta.status.clone(),
@@ -2502,13 +2504,13 @@ fn ticket_summary_from_ticket(ticket: &ticket::Ticket) -> Result<TicketSummary> 
 
 fn ticket_summary_from_sqlite_item(item: SqliteTicketListItem) -> Result<TicketSummary> {
     let projection = project_ticket_workspace_item(&item.summary, &item.relation_blockers, None);
-    let human_key = item
+    let resource_key = item
         .summary
-        .human_key
+        .resource_key
         .clone()
-        .ok_or_else(|| Error::Store(format!("missing human key for {}", item.summary.id)))?;
+        .ok_or_else(|| Error::Store(format!("missing resource key for {}", item.summary.id)))?;
     Ok(TicketSummary {
-        human_key,
+        resource_key,
         id: item.summary.id,
         title: item.summary.title,
         state: item.summary.workflow_state.as_str().to_string(),
@@ -2865,13 +2867,13 @@ mod tests {
             .unwrap()
             .execute_batch(
                 r#"
-INSERT INTO workspace_resource_human_keys (
-    workspace_id, resource_kind, resource_id, sequence, human_key, allocated_at
+INSERT INTO workspace_resource_keys (
+    workspace_id, resource_kind, resource_id, sequence, resource_key, allocated_at
 ) VALUES
     ('workspace-test', 'ticket', '00000000001J2', 1, 'T-1', '2026-01-01T00:00:00Z'),
     ('workspace-test', 'ticket', '00000000001J5', 2, 'T-2', '2026-01-01T00:00:00Z'),
     ('workspace-test', 'ticket', '00000000001J6', 3, 'T-3', '2026-01-01T00:00:00Z');
-INSERT INTO workspace_resource_human_key_counters (workspace_id, resource_kind, next_sequence)
+INSERT INTO workspace_resource_key_counters (workspace_id, resource_kind, next_sequence)
 VALUES ('workspace-test', 'ticket', 4);
 "#,
             )
@@ -2965,7 +2967,7 @@ VALUES ('workspace-test', 'ticket', 4);
         assert_eq!(tickets.items[0].id, "00000000001J2");
         assert_eq!(tickets.items[0].state, "ready");
         assert_eq!(tickets.items[0].workspace_action_priority, "background");
-        let ticket_by_key = authority.ticket(&tickets.items[0].human_key).unwrap();
+        let ticket_by_key = authority.ticket(&tickets.items[0].resource_key).unwrap();
         assert_eq!(ticket_by_key.id, tickets.items[0].id);
 
         let ticket = authority.ticket("00000000001J2").unwrap();
@@ -3138,12 +3140,14 @@ VALUES ('workspace-test', 'ticket', 4);
         assert_eq!(objectives.items.len(), 1);
         assert_eq!(objectives.items[0].id, "00000000001J3");
         assert_eq!(objectives.items[0].linked_tickets, vec!["00000000001J2"]);
-        let objective_by_key = authority.objective(&objectives.items[0].human_key).unwrap();
+        let objective_by_key = authority
+            .objective(&objectives.items[0].resource_key)
+            .unwrap();
         assert_eq!(objective_by_key.id, objectives.items[0].id);
         assert_eq!(
             authority
                 .show_objective(
-                    &objectives.items[0].human_key,
+                    &objectives.items[0].resource_key,
                     ObjectiveShowRequest::default(),
                 )
                 .unwrap()
@@ -3241,12 +3245,12 @@ INSERT INTO typed_tickets (
 ) VALUES
     ('workspace-test', '00000000001J2', 'ticket-j2', 'Ticket J2', 'open', 'task', 'normal', '', 'planning', 1),
     ('workspace-test', '00000000001J3', 'ticket-j3', 'Ticket J3', 'open', 'task', 'normal', '', 'planning', 1);
-INSERT INTO workspace_resource_human_keys (
-    workspace_id, resource_kind, resource_id, sequence, human_key, allocated_at
+INSERT INTO workspace_resource_keys (
+    workspace_id, resource_kind, resource_id, sequence, resource_key, allocated_at
 ) VALUES
     ('workspace-test', 'ticket', '00000000001J2', 1, 'T-1', '2026-01-01T00:00:00Z'),
     ('workspace-test', 'ticket', '00000000001J3', 2, 'T-2', '2026-01-01T00:00:00Z');
-INSERT INTO workspace_resource_human_key_counters (workspace_id, resource_kind, next_sequence)
+INSERT INTO workspace_resource_key_counters (workspace_id, resource_kind, next_sequence)
 VALUES ('workspace-test', 'ticket', 3);
 "#,
             )

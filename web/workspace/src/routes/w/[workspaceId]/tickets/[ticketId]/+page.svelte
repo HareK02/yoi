@@ -255,27 +255,42 @@
         {#if ticket.relations.blockers.length > 0}
           <div class="ticket-blocker-list">
             {#each ticket.relations.blockers as blocker}
-              <a href={`/w/${encodeURIComponent(data.workspaceId)}/tickets/${encodeURIComponent(blocker.blocking_human_key ?? blocker.blocking_ticket)}`}>
-                <strong>Blocked by {blocker.blocking_human_key ?? blocker.blocking_ticket}</strong>
-                <span>{relationLabel(blocker.relation_kind)} · {blocker.blocking_state}</span>
-              </a>
+              {#if blocker.blocking_resource_key}
+                <a href={`/w/${encodeURIComponent(data.workspaceId)}/tickets/${encodeURIComponent(blocker.blocking_resource_key)}`}>
+                  <strong>Blocked by {blocker.blocking_resource_key}</strong>
+                  <span>{relationLabel(blocker.relation_kind)} · {blocker.blocking_state}</span>
+                </a>
+              {:else}
+                <div>
+                  <strong>Blocked by resource key unavailable</strong>
+                  <span>{relationLabel(blocker.relation_kind)} · {blocker.blocking_state}</span>
+                </div>
+              {/if}
             {/each}
           </div>
         {/if}
         <div class="ticket-relations-list">
           {#each ticket.relations.outgoing as relation}
-            <a href={`/w/${encodeURIComponent(data.workspaceId)}/tickets/${encodeURIComponent(relation.target_human_key ?? relation.target)}`}>
-              <span>{relationLabel(relation.kind)}</span>
-              <strong>{relation.target_human_key ?? relation.target}</strong>
-              {#if relation.note}<small>{relation.note}</small>{/if}
-            </a>
+            {#if relation.target_resource_key}
+              <a href={`/w/${encodeURIComponent(data.workspaceId)}/tickets/${encodeURIComponent(relation.target_resource_key)}`}>
+                <span>{relationLabel(relation.kind)}</span>
+                <strong>{relation.target_resource_key}</strong>
+                {#if relation.note}<small>{relation.note}</small>{/if}
+              </a>
+            {:else}
+              <span><strong>resource key unavailable</strong></span>
+            {/if}
           {/each}
           {#each ticket.relations.incoming as relation}
-            <a href={`/w/${encodeURIComponent(data.workspaceId)}/tickets/${encodeURIComponent(relation.source_human_key ?? relation.source_ticket)}`}>
-              <span>{relationLabel(relation.inverse_kind)}</span>
-              <strong>{relation.source_human_key ?? relation.source_ticket}</strong>
-              {#if relation.note}<small>{relation.note}</small>{/if}
-            </a>
+            {#if relation.source_resource_key}
+              <a href={`/w/${encodeURIComponent(data.workspaceId)}/tickets/${encodeURIComponent(relation.source_resource_key)}`}>
+                <span>{relationLabel(relation.inverse_kind)}</span>
+                <strong>{relation.source_resource_key}</strong>
+                {#if relation.note}<small>{relation.note}</small>{/if}
+              </a>
+            {:else}
+              <span><strong>resource key unavailable</strong></span>
+            {/if}
           {/each}
           {#if ticket.relations.outgoing.length === 0 && ticket.relations.incoming.length === 0}
             <p class="workspace-empty-copy">No Ticket relations.</p>

@@ -30,7 +30,7 @@
             <div class="objective-meta" aria-label="Objective metadata">
               <span>Updated {objective.updated_at ? formatDate(objective.updated_at) : 'unknown'}</span>
               <span>{objective.linked_tickets?.length ? `${objective.linked_tickets.length} linked ticket(s)` : 'No linked tickets'}</span>
-              <code>{objective.human_key}</code>
+              <code>{objective.resource_key}</code>
             </div>
           </a>
         {/each}

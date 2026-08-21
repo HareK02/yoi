@@ -136,6 +136,11 @@ export type SubscriptionWorker = { worker_id: SubscriptionWorkerId,
  */
 runtime_id?: string | null,
 /**
+ * Workspace-scoped canonical resource key. Runtime producers leave this unset;
+ * Workspace-facing projections must populate it before publishing the Worker.
+ */
+resource_key?: string | null,
+/**
  * Producer-owned monotonic revision for this Worker subject.
  */
 subject_revision: number, state: SubscriptionWorkerState, has_running_internal_workers: boolean, workspace_id?: string | null, display_name?: string | null, profile?: string | null, repository_id?: string | null, working_directory_id?: SubscriptionWorkdirId | null, };

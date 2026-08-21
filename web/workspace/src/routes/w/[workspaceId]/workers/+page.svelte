@@ -194,12 +194,12 @@
             {@const workerDisplayName = worker.display_name || worker.label}
             <tr>
               <td>
-                {#if canOpenWorkerConsole(worker)}
-                  <a class="worker-title-link" href={workerHref(data.workspaceId, worker)}><strong>{workerDisplayName}</strong></a>
+                {#if canOpenWorkerConsole(worker) && worker.resource_key}
+                  <a class="worker-title-link" href={workerHref(data.workspaceId, { ...worker, resource_key: worker.resource_key })}><strong>{workerDisplayName}</strong></a>
                 {:else}
                   <strong>{workerDisplayName}</strong>
                 {/if}
-                <small>worker <code>{worker.human_key ?? worker.worker_id}</code></small>
+                <small>worker <code>{worker.resource_key}</code></small>
               </td>
               <td><code>{worker.runtime_id}</code></td>
               <td>{workerProfile(worker)}</td>

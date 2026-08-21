@@ -2,7 +2,7 @@ import { redirect } from "@sveltejs/kit";
 import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
 import {
   canonicalResourceReference,
-  resourceHumanKey,
+  resourceKey,
 } from "$lib/workspace/resource-links";
 import type { WorkspaceOrchestratorStatus } from "$lib/workspace/tickets/ticket-panel";
 import type {
@@ -12,7 +12,7 @@ import type {
 import type { PageLoad } from "./$types";
 
 export const load = (async ({ fetch, params }) => {
-  const reference = resourceHumanKey(params.ticketId);
+  const reference = resourceKey(params.ticketId);
   const ticketPath = workspaceApiPath(
     params.workspaceId,
     `/tickets/${encodeURIComponent(reference)}`,
@@ -30,7 +30,7 @@ export const load = (async ({ fetch, params }) => {
   ]);
   if (ticket.data) {
     const canonical = canonicalResourceReference(
-      ticket.data.human_key,
+      ticket.data.resource_key,
       ticket.data.title,
     );
     if (params.ticketId !== canonical) {

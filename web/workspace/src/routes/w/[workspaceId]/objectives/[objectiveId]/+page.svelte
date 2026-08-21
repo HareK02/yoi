@@ -25,7 +25,7 @@
           </div>
           <div class="objective-meta" aria-label="Objective metadata">
             <span>Updated {objective.updated_at ? formatDate(objective.updated_at) : 'unknown'}</span>
-            <code>{objective.human_key}</code>
+            <code>{objective.resource_key}</code>
           </div>
         </a>
       {/each}
@@ -64,7 +64,7 @@
         <dd>
           {#if data.objective.linked_ticket_summaries.length}
             {#each data.objective.linked_ticket_summaries as ticket, index}
-              {#if index}, {/if}<a href={ticketHref(data.workspaceId, ticket)}>{ticket.human_key}</a>
+              {#if index}, {/if}<a href={ticketHref(data.workspaceId, ticket)}>{ticket.resource_key}</a>
             {/each}
           {:else}
             none

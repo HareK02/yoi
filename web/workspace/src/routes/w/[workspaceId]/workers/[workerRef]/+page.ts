@@ -2,13 +2,13 @@ import { redirect } from "@sveltejs/kit";
 import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
 import {
   canonicalResourceReference,
-  resourceHumanKey,
+  resourceKey,
 } from "$lib/workspace/resource-links";
 import type { Worker } from "$lib/workspace/sidebar/types";
 import type { PageLoad } from "./$types";
 
 export const load = (async ({ fetch, params }) => {
-  const reference = resourceHumanKey(params.workerRef);
+  const reference = resourceKey(params.workerRef);
   const result = await loadJson<Worker>(
     fetch,
     workspaceApiPath(
@@ -16,9 +16,9 @@ export const load = (async ({ fetch, params }) => {
       `/workers/${encodeURIComponent(reference)}`,
     ),
   );
-  if (result.data?.human_key) {
+  if (result.data?.resource_key) {
     const canonical = canonicalResourceReference(
-      result.data.human_key,
+      result.data.resource_key,
       result.data.display_name,
     );
     if (params.workerRef !== canonical) {
