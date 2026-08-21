@@ -119,7 +119,6 @@
     display: grid;
     gap: 0.1rem;
     min-width: 0;
-    margin-bottom: -0.75rem;
     padding-inline: 0.75rem;
     font-size: 0.8rem;
     line-height: 1.35;

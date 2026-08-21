@@ -435,6 +435,34 @@ Deno.test("Worker Console exposes a foldable timeline beside the scroll body", a
   );
 });
 
+Deno.test("Worker Console removes redundant chrome and uses shared alerts", async () => {
+  const page = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      import.meta.url,
+    ),
+  );
+  const tasks = await Deno.readTextFile(
+    new URL("./ConsoleTasks.svelte", import.meta.url),
+  );
+
+  assert(
+    page.includes('<form class="console-composer"') &&
+      !page.includes('class="console-composer card"') &&
+      !page.includes(
+        "padding: var(--space-3) var(--space-6) var(--space-4)",
+      ) &&
+      page.includes('import { pushWorkspaceAlert }') &&
+      page.includes('title: "Worker control"') &&
+      page.includes('title: "Rewind targets"') &&
+      page.includes('pushWorkspaceAlert("error"') &&
+      !page.includes("controlNotice") &&
+      !page.includes("console-notice") &&
+      !tasks.includes("margin-bottom: -0.75rem"),
+    "Console should remove redundant card/spacing chrome and route control notices through workspace alerts",
+  );
+});
+
 Deno.test("Worker Console composer fits to content without manual resize", async () => {
   const consolePage = await Deno.readTextFile(
     new URL(

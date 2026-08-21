@@ -33,6 +33,7 @@
         type ConsoleViewScroll,
     } from "$lib/workspace/console/model";
     import type { Event as ProtocolEvent, Method as ProtocolMethod, RewindTarget, Segment } from "$lib/generated/protocol";
+    import { pushWorkspaceAlert } from "$lib/workspace/alerts/store";
     import { workspaceApiPath } from "$lib/workspace/api/http";
     import { workspaceMultiplexer, type WorkspaceMultiplexerSubscription } from "$lib/workspace/multiplexer";
     import type {
@@ -111,7 +112,6 @@
     let sendError = $state<string | null>(null);
     let rewindTargets = $state<RewindTarget[]>([]);
     let rewindHeadEntries = $state(0);
-    let controlNotice = $state<string | null>(null);
     let composerNotice = $state<string | null>(null);
     let protocolState = $state<"connecting" | "open" | "closed" | "error">(
         "connecting",
@@ -161,6 +161,9 @@
     };
 
     const consoleTarget = $derived({ workspaceId, runtimeId, workerId });
+    const controlAlertId = $derived(
+        `worker-console-control:${runtimeId}:${workerId}`,
+    );
 
     const workerViews = $derived(consoleWorkerViews(consoleProjection));
     const selectedWorkerView = $derived(
@@ -418,10 +421,18 @@
     function sendControl(method: ProtocolMethod, label: string) {
         try {
             sendProtocolMethod(method);
-            controlNotice = `${label} sent through Worker protocol.`;
+            pushWorkspaceAlert(
+                "info",
+                `${label} sent through Worker protocol.`,
+                { id: controlAlertId, title: "Worker control" },
+            );
         } catch (error) {
-            controlNotice = null;
-            sendError = error instanceof Error ? error.message : String(error);
+            const message = error instanceof Error ? error.message : String(error);
+            sendError = message;
+            pushWorkspaceAlert("error", message, {
+                id: controlAlertId,
+                title: "Worker control failed",
+            });
         }
     }
 
@@ -674,10 +685,13 @@
         if (event.event === "rewind_targets") {
             rewindHeadEntries = event.data.head_entries;
             rewindTargets = event.data.targets;
-            controlNotice =
+            pushWorkspaceAlert(
+                "info",
                 event.data.targets.length === 0
                     ? "No rewind targets are available."
-                    : `Loaded ${event.data.targets.length} rewind target(s).`;
+                    : `Loaded ${event.data.targets.length} rewind target(s).`,
+                { id: controlAlertId, title: "Rewind targets" },
+            );
             return;
         }
         if (event.event === "error") {
@@ -1324,10 +1338,6 @@
         </div>
     </section>
 
-    {#if controlNotice}
-        <p class="console-notice">{controlNotice}</p>
-    {/if}
-
     {#if rewindTargets.length > 0}
         <section class="card rewind-targets" aria-label="Rewind targets">
             <h3>Rewind targets</h3>
@@ -1509,7 +1519,7 @@
         }}
     />
 
-    <form class="console-composer card" onsubmit={sendMessage}>
+    <form class="console-composer" onsubmit={sendMessage}>
         <div class="composer-input-shell">
             <textarea
                 id="worker-console-message"
@@ -1651,12 +1661,6 @@
     .console-view-modes button.active {
         background: var(--accent);
         color: var(--bg);
-    }
-
-    .console-notice {
-        margin: 0;
-        color: var(--text-muted);
-        font-size: 0.86rem;
     }
 
     .rewind-targets {
@@ -1832,7 +1836,6 @@
         display: grid;
         gap: var(--space-3);
         margin-inline: calc(-1 * var(--space-6));
-        padding: var(--space-3) var(--space-6) var(--space-4);
         background: var(--bg);
     }
 
