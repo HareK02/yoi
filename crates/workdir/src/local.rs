@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use manifest::{Permission, Scope, ScopeConfig, ScopeRule, SharedScope};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
-use tokio::sync::{Mutex, Notify, broadcast, watch};
+use tokio::sync::{Mutex, broadcast, watch};
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -54,7 +54,7 @@ fn command_observed_at_ms() -> u64 {
 enum LocalCommand {
     Running {
         task: JoinHandle<Result<CommandOutput, WorkdirError>>,
-        completion: Arc<Notify>,
+        completion: watch::Receiver<bool>,
         cancel: watch::Sender<bool>,
     },
     Completed(CommandOutput),
@@ -666,21 +666,19 @@ impl WorkdirSession for LocalWorkdirSession {
         let id = self.inner.next_command_id.fetch_add(1, Ordering::Relaxed);
         let handle = CommandHandle(format!("command-{id}"));
         let cwd = self.inner.cwd.clone();
-        let completion = Arc::new(Notify::new());
-        let task_completion = Arc::clone(&completion);
+        let (completion_tx, completion) = watch::channel(false);
         let command_id = handle.0.clone();
         let telemetry = self.inner.command_telemetry.clone();
         let (cancel, cancel_rx) = watch::channel(false);
         let task = tokio::spawn(async move {
             let output = run_command(cwd, request, command_id, telemetry, cancel_rx).await;
-            task_completion.notify_one();
+            let _ = completion_tx.send(true);
             output
         });
         let mut commands = self.inner.commands.lock().await;
         if let Err(error) = self.ensure_open() {
             let _ = cancel.send(true);
             task.abort();
-            completion.notify_one();
             return Err(error);
         }
         commands.insert(
@@ -725,12 +723,14 @@ impl WorkdirSession for LocalWorkdirSession {
                 return Err(WorkdirError::UnknownCommand(request.handle.0.clone()));
             };
             let completion = match command {
-                LocalCommand::Running {
-                    task, completion, ..
-                } if !task.is_finished() => Some(Arc::clone(completion)),
+                LocalCommand::Running { completion, .. }
+                    if !*completion.borrow() && completion.has_changed().is_ok() =>
+                {
+                    Some(completion.clone())
+                }
                 _ => None,
             };
-            if let Some(completion) = completion {
+            if let Some(mut completion) = completion {
                 if !request.wait {
                     return Ok(CommandOutput {
                         status: CommandStatus::Running,
@@ -742,8 +742,20 @@ impl WorkdirSession for LocalWorkdirSession {
                     });
                 }
                 drop(commands);
-                completion.notified().await;
+                let _ = completion.changed().await;
                 continue;
+            }
+            if !request.wait
+                && matches!(command, LocalCommand::Running { task, .. } if !task.is_finished())
+            {
+                return Ok(CommandOutput {
+                    status: CommandStatus::Running,
+                    exit_code: None,
+                    timed_out: false,
+                    content: String::new(),
+                    next_cursor: None,
+                    truncated: false,
+                });
             }
             break commands
                 .remove(&request.handle.0)
@@ -821,14 +833,9 @@ impl WorkdirSession for LocalWorkdirSession {
         };
         for command in commands {
             match command {
-                LocalCommand::Running {
-                    task,
-                    completion,
-                    cancel,
-                } => {
+                LocalCommand::Running { task, cancel, .. } => {
                     let _ = cancel.send(true);
                     let _ = task.await;
-                    completion.notify_one();
                 }
                 LocalCommand::Completed(_) => {}
             }
@@ -2046,6 +2053,121 @@ mod tests {
         assert!(output.ends_with('€'));
         assert!(!output.contains('\u{fffd}'));
         assert!(decoder.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn command_output_does_not_rewait_before_join_handle_finishes() {
+        let dir = TempDir::new().unwrap();
+        let workdir = make_fs(&dir);
+        let handle = CommandHandle("command-completion-race".into());
+        let (completion_tx, completion) = watch::channel(false);
+        let completion_observer = completion_tx.clone();
+        let (cancel, _cancel_rx) = watch::channel(false);
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+        let (completion_sent_tx, completion_sent_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            start_rx.await.unwrap();
+            completion_tx.send(true).unwrap();
+            completion_sent_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            Ok(CommandOutput {
+                status: CommandStatus::Completed,
+                exit_code: Some(0),
+                timed_out: false,
+                content: "done".into(),
+                next_cursor: None,
+                truncated: false,
+            })
+        });
+        workdir.inner.commands.lock().await.insert(
+            handle.0.clone(),
+            LocalCommand::Running {
+                task,
+                completion,
+                cancel,
+            },
+        );
+
+        let waiting_workdir = workdir.clone();
+        let waiting_handle = handle.clone();
+        let waiter = tokio::spawn(async move {
+            WorkdirSession::command_output(
+                &waiting_workdir,
+                CommandOutputRequest {
+                    handle: waiting_handle,
+                    cursor: 0,
+                    limit: 1024,
+                    wait: true,
+                },
+            )
+            .await
+        });
+        for _ in 0..100 {
+            if completion_observer.receiver_count() >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            completion_observer.receiver_count(),
+            2,
+            "waiter must subscribe before completion is published"
+        );
+
+        start_tx.send(()).unwrap();
+        completion_sent_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "command_output should await the task after observing completion state"
+        );
+        release_tx.send(()).unwrap();
+
+        let output = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("command output must not wait for a second completion notification")
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.status, CommandStatus::Completed);
+        assert_eq!(output.content, "done");
+    }
+
+    #[tokio::test]
+    async fn command_output_does_not_wait_forever_when_completion_sender_drops() {
+        let dir = TempDir::new().unwrap();
+        let workdir = make_fs(&dir);
+        let handle = CommandHandle("command-completion-drop".into());
+        let (completion_tx, completion) = watch::channel(false);
+        let (cancel, _cancel_rx) = watch::channel(false);
+        let task: JoinHandle<Result<CommandOutput, WorkdirError>> = tokio::spawn(async move {
+            drop(completion_tx);
+            panic!("simulated command task panic");
+        });
+        workdir.inner.commands.lock().await.insert(
+            handle.0.clone(),
+            LocalCommand::Running {
+                task,
+                completion,
+                cancel,
+            },
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            WorkdirSession::command_output(
+                &workdir,
+                CommandOutputRequest {
+                    handle,
+                    cursor: 0,
+                    limit: 1024,
+                    wait: true,
+                },
+            ),
+        )
+        .await
+        .expect("closed completion channel must wake the waiter");
+        assert!(matches!(result, Err(WorkdirError::Unavailable(_))));
     }
 
     #[tokio::test]
