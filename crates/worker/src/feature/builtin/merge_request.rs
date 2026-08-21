@@ -110,6 +110,16 @@ struct ReviewFindingInput {
     line: Option<u32>,
     body: String,
 }
+#[derive(Debug, Deserialize)]
+struct TicketMergeRequestProjection {
+    merge_request: Option<TicketMergeRequestReference>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TicketMergeRequestReference {
+    merge_request_id: String,
+}
+
 impl Kind {
     fn enabled(self, config: MergeRequestFeatureConfig) -> bool {
         match self {
@@ -145,24 +155,22 @@ impl Tool for MergeRequestTool {
         let ws = self.client.workspace_id().ok_or_else(|| {
             ToolError::ExecutionFailed("Merge Request tools require Workspace identity".into())
         })?;
+        if matches!(self.kind, Kind::Show) {
+            let value: ShowInput = parse(input)?;
+            nonempty(&value.ticket)?;
+            return self.show_current_merge_request(ws, &value.ticket);
+        }
         let (method, path, body) = match self.kind {
-            Kind::Show | Kind::Readiness => {
+            Kind::Readiness => {
                 let v: ShowInput = parse(input)?;
                 nonempty(&v.ticket)?;
                 (
                     WorkspaceRequestMethod::Get,
-                    format!(
-                        "/api/w/{ws}/tickets/{}/merge-request{}",
-                        v.ticket,
-                        if matches!(self.kind, Kind::Readiness) {
-                            "/readiness"
-                        } else {
-                            ""
-                        }
-                    ),
+                    format!("/api/w/{ws}/tickets/{}/merge-request/readiness", v.ticket),
                     None,
                 )
             }
+            Kind::Show => unreachable!("MergeRequestShow is handled above"),
             Kind::Open => {
                 let v: OpenInput = parse(input)?;
                 nonempty(&v.ticket)?;
@@ -225,6 +233,96 @@ impl Tool for MergeRequestTool {
         })
     }
 }
+
+impl MergeRequestTool {
+    fn show_current_merge_request(
+        &self,
+        workspace_id: &str,
+        ticket: &str,
+    ) -> Result<ToolOutput, ToolError> {
+        let ticket_path = encode_path_segment(ticket);
+        let show_response = self
+            .client
+            .execute(WorkspaceRequest::json(
+                WorkspaceRequestMethod::Post,
+                format!("/api/w/{workspace_id}/tickets/{ticket_path}/show"),
+                json!({"event_limit": 1}).to_string(),
+            ))
+            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+        if !show_response.is_success() {
+            return Err(api_error("Ticket Show API", &show_response));
+        }
+        let projection: TicketMergeRequestProjection = serde_json::from_str(&show_response.body)
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!(
+                    "Ticket Show API returned a malformed Merge Request projection: {error}"
+                ))
+            })?;
+        let merge_request = projection.merge_request.ok_or_else(|| {
+            ToolError::ExecutionFailed(format!("Ticket `{ticket}` has no current Merge Request"))
+        })?;
+        nonempty_id("merge_request_id", &merge_request.merge_request_id)?;
+
+        let merge_request_id = encode_path_segment(&merge_request.merge_request_id);
+        let response = self
+            .client
+            .execute(WorkspaceRequest::get(format!(
+                "/api/w/{workspace_id}/merge-requests/{merge_request_id}"
+            )))
+            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+        if !response.is_success() {
+            return Err(api_error("Merge Request API", &response));
+        }
+        Ok(ToolOutput {
+            summary: self.kind.name().into(),
+            content: Some(response.body),
+            attachments: vec![],
+        })
+    }
+}
+
+fn api_error(operation: &str, response: &crate::worker::WorkspaceResponse) -> ToolError {
+    ToolError::ExecutionFailed(format!(
+        "{operation} returned HTTP {}: {}",
+        response.status,
+        bounded_body(&response.body)
+    ))
+}
+
+fn bounded_body(body: &str) -> String {
+    const MAX_CHARS: usize = 4096;
+    let mut chars = body.chars();
+    let bounded: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{bounded}…")
+    } else {
+        bounded
+    }
+}
+
+fn encode_path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+fn nonempty_id(name: &str, value: &str) -> Result<(), ToolError> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        Err(ToolError::ExecutionFailed(format!(
+            "Ticket Show API returned an invalid {name}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 fn parse<T: serde::de::DeserializeOwned>(v: &str) -> Result<T, ToolError> {
     serde_json::from_str(v).map_err(|e| ToolError::InvalidArgument(e.to_string()))
 }
@@ -320,7 +418,103 @@ mod tests {
     use super::*;
     use crate::feature::FeatureRegistryBuilder;
     use crate::hook::HookRegistryBuilder;
-    use crate::worker::TestWorkspaceHttpClient;
+    use crate::worker::{TestWorkspaceHttpClient, WorkspaceClientError, WorkspaceResponse};
+    use std::{collections::VecDeque, sync::Mutex};
+
+    #[derive(Debug)]
+    struct RecordingWorkspaceClient {
+        responses: Mutex<VecDeque<WorkspaceResponse>>,
+        requests: Mutex<Vec<WorkspaceRequest>>,
+    }
+
+    impl RecordingWorkspaceClient {
+        fn new(responses: Vec<WorkspaceResponse>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl WorkspaceClient for RecordingWorkspaceClient {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("ws")
+        }
+
+        fn kind(&self) -> &str {
+            "recording"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn execute(
+            &self,
+            request: WorkspaceRequest,
+        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            self.requests.lock().expect("request lock").push(request);
+            self.responses
+                .lock()
+                .expect("response lock")
+                .pop_front()
+                .ok_or_else(|| WorkspaceClientError::Request("missing test response".into()))
+        }
+    }
+
+    fn response(body: serde_json::Value) -> WorkspaceResponse {
+        WorkspaceResponse {
+            status: 200,
+            body: body.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn show_resolves_ticket_projection_then_reads_canonical_resource() {
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![
+            response(json!({"merge_request":{"merge_request_id":"MR/1"}})),
+            response(json!({"merge_request_id":"MR/1","state":"open"})),
+        ]));
+        let tool = MergeRequestTool {
+            kind: Kind::Show,
+            client: client.clone(),
+        };
+
+        let output = tool
+            .execute(r#"{"ticket":"T/1"}"#, ToolExecutionContext::default())
+            .await
+            .expect("show should succeed");
+
+        assert_eq!(
+            output.content.as_deref(),
+            Some(r#"{"merge_request_id":"MR/1","state":"open"}"#)
+        );
+        let requests = client.requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, WorkspaceRequestMethod::Post);
+        assert_eq!(requests[0].path, "/api/w/ws/tickets/T%2F1/show");
+        assert_eq!(requests[1].method, WorkspaceRequestMethod::Get);
+        assert_eq!(requests[1].path, "/api/w/ws/merge-requests/MR%2F1");
+    }
+
+    #[tokio::test]
+    async fn show_fails_closed_when_ticket_has_no_current_merge_request() {
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![response(
+            json!({"merge_request":null}),
+        )]));
+        let tool = MergeRequestTool {
+            kind: Kind::Show,
+            client: client.clone(),
+        };
+
+        let error = tool
+            .execute(r#"{"ticket":"T1"}"#, ToolExecutionContext::default())
+            .await
+            .expect_err("missing Merge Request must fail");
+
+        assert!(error.to_string().contains("no current Merge Request"));
+        assert_eq!(client.requests.lock().expect("request lock").len(), 1);
+    }
 
     fn install(config: MergeRequestFeatureConfig) -> (Vec<String>, Vec<String>) {
         let client: Arc<dyn WorkspaceClient> =

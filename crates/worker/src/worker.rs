@@ -337,12 +337,16 @@ impl WorkspaceClient for ReviewerChildWorkspaceClient {
         &self,
         mut request: WorkspaceRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
-        let expected_path = format!(
-            "/api/w/{}/tickets/{}/merge-request/reviews",
-            self.workspace_id().unwrap_or_default(),
-            self.context.ticket_id
-        );
-        if request.method == WorkspaceRequestMethod::Post && request.path == expected_path {
+        let workspace_id = self.workspace_id().unwrap_or_default();
+        let ticket_id = &self.context.ticket_id;
+        let ticket_query_path = format!("/api/w/{workspace_id}/tickets/query");
+        let ticket_show_path = format!("/api/w/{workspace_id}/tickets/{ticket_id}/show");
+        let review_path =
+            format!("/api/w/{workspace_id}/tickets/{ticket_id}/merge-request/reviews");
+        let read_allowed = request.method == WorkspaceRequestMethod::Get
+            || (request.method == WorkspaceRequestMethod::Post
+                && (request.path == ticket_query_path || request.path == ticket_show_path));
+        if request.method == WorkspaceRequestMethod::Post && request.path == review_path {
             let body = request.body.take().ok_or_else(|| {
                 WorkspaceClientError::Request("review submission requires a JSON body".to_string())
             })?;
@@ -361,7 +365,7 @@ impl WorkspaceClient for ReviewerChildWorkspaceClient {
                 serde_json::to_string(&value)
                     .map_err(|error| WorkspaceClientError::Request(error.to_string()))?,
             );
-        } else if request.method != WorkspaceRequestMethod::Get {
+        } else if !read_allowed {
             return Err(WorkspaceClientError::Unavailable(
                 "Reviewer child Workspace authority is read-only except for its one attested Merge Request review submission".to_string(),
             ));
@@ -483,28 +487,114 @@ impl WorkspaceClient for MarkerWorkspaceClient {
 mod reviewer_client_tests {
     use super::*;
 
-    #[test]
-    fn reviewer_child_client_denies_non_review_workspace_mutations() {
-        let inner: Arc<dyn WorkspaceClient> = Arc::new(MarkerWorkspaceClient {
-            workspace_id: Some("ws".to_string()),
-            kind: "marker".to_string(),
-            available: true,
-            reason: "forwarded".to_string(),
-        });
-        let client = ReviewerChildWorkspaceClient::new(
+    #[derive(Debug, Default)]
+    struct RecordingWorkspaceClient {
+        requests: Mutex<Vec<WorkspaceRequest>>,
+    }
+
+    impl WorkspaceClient for RecordingWorkspaceClient {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("ws")
+        }
+
+        fn kind(&self) -> &str {
+            "recording"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn execute(
+            &self,
+            request: WorkspaceRequest,
+        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            self.requests.lock().expect("recording lock").push(request);
+            Ok(WorkspaceResponse {
+                status: 200,
+                body: "{}".into(),
+            })
+        }
+    }
+
+    fn reviewer_client(inner: Arc<dyn WorkspaceClient>) -> ReviewerChildWorkspaceClient {
+        ReviewerChildWorkspaceClient::new(
             inner,
             ReviewerContext {
                 ticket_id: "T1".into(),
             },
             "secret".into(),
-        );
-        let request = WorkspaceRequest::json(
-            WorkspaceRequestMethod::Post,
-            "/api/w/ws/tickets/T1/comments",
-            "{}".to_string(),
-        );
-        let error = client.execute(request).unwrap_err();
-        assert!(error.to_string().contains("read-only"));
+        )
+    }
+
+    #[test]
+    fn reviewer_child_client_allows_typed_ticket_reads() {
+        let inner = Arc::new(RecordingWorkspaceClient::default());
+        let client = reviewer_client(inner.clone());
+
+        for request in [
+            WorkspaceRequest::json(
+                WorkspaceRequestMethod::Post,
+                "/api/w/ws/tickets/query",
+                "{}".to_string(),
+            ),
+            WorkspaceRequest::json(
+                WorkspaceRequestMethod::Post,
+                "/api/w/ws/tickets/T1/show",
+                "{}".to_string(),
+            ),
+            WorkspaceRequest::get("/api/w/ws/merge-requests/MR1"),
+        ] {
+            client.execute(request).expect("read should be forwarded");
+        }
+
+        assert_eq!(inner.requests.lock().expect("recording lock").len(), 3);
+    }
+
+    #[test]
+    fn reviewer_child_client_rejects_other_ticket_and_mutation_posts() {
+        let inner: Arc<dyn WorkspaceClient> = Arc::new(RecordingWorkspaceClient::default());
+        let client = reviewer_client(inner);
+
+        for request in [
+            WorkspaceRequest::json(
+                WorkspaceRequestMethod::Post,
+                "/api/w/ws/tickets/T2/show",
+                "{}".to_string(),
+            ),
+            WorkspaceRequest::json(
+                WorkspaceRequestMethod::Post,
+                "/api/w/ws/tickets/T1/comments",
+                "{}".to_string(),
+            ),
+            WorkspaceRequest::json(
+                WorkspaceRequestMethod::Post,
+                "/api/w/ws/tickets/T1/merge-request",
+                "{}".to_string(),
+            ),
+        ] {
+            let error = client.execute(request).unwrap_err();
+            assert!(error.to_string().contains("read-only"));
+        }
+    }
+
+    #[test]
+    fn reviewer_child_client_injects_capability_only_for_attested_review() {
+        let inner = Arc::new(RecordingWorkspaceClient::default());
+        let client = reviewer_client(inner.clone());
+        client
+            .execute(WorkspaceRequest::json(
+                WorkspaceRequestMethod::Post,
+                "/api/w/ws/tickets/T1/merge-request/reviews",
+                r#"{"decision":"approve"}"#.to_string(),
+            ))
+            .expect("attested review should be forwarded");
+
+        let requests = inner.requests.lock().expect("recording lock");
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].body.as_deref().expect("review body"))
+                .expect("review JSON");
+        assert_eq!(body["capability_token"], "secret");
     }
 }
 
