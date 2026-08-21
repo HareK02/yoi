@@ -2824,7 +2824,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(worker_allocation)]
-    async fn restore_pending_workspace_worker_without_system_prompt_fails_closed() {
+    async fn restore_legacy_workspace_worker_without_manifest_snapshot_requires_replacement() {
         let root = tempfile::tempdir().unwrap();
         let runtime_store_dir = root.path().join("runtime");
         let worker_ref = WorkerRef::new(crate::identity::WorkerId::from_legacy_u64(1));
@@ -2833,32 +2833,6 @@ mod tests {
             .join(worker_ref.worker_id.to_string());
         let worker_name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&worker_ref);
         let session_id = session_store::new_session_id();
-        let manifest = manifest::WorkerManifest::from_toml(&format!(
-            r#"
-                [worker]
-                name = "{}"
-                pwd = "{}"
-
-                [model]
-                scheme = "anthropic"
-                model_id = "test-model"
-                auth = {{ kind = "none" }}
-
-                [engine]
-                max_tokens = 100
-
-                [feature.flow]
-                enabled = true
-
-                [[scope.allow]]
-                target = "{}"
-                permission = "write"
-            "#,
-            worker_name,
-            root.path().display(),
-            root.path().display(),
-        ))
-        .unwrap();
         WorkerAggregateStore::new(&worker_aggregate_dir, &worker_name)
             .unwrap()
             .set_active(
@@ -2866,7 +2840,7 @@ mod tests {
                 Some(session_store::WorkerActiveSegmentRef::pending_segment(
                     session_id,
                 )),
-                Some(serde_json::to_value(&manifest).unwrap()),
+                None,
             )
             .unwrap();
 
@@ -2899,10 +2873,10 @@ mod tests {
             })
             .await
         {
-            Ok(_) => panic!("pending Workspace Worker restore unexpectedly succeeded"),
+            Ok(_) => panic!("legacy Workspace Worker restore unexpectedly succeeded"),
             Err(error) => error,
         };
-        assert!(error.contains("requires operation-owned launch material"));
+        assert!(error.contains("replacement Worker is required"), "{error}");
     }
 
     #[tokio::test]

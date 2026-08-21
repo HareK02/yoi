@@ -4819,6 +4819,13 @@ where
                 .ok_or_else(|| WorkerError::WorkerMetadataMissing {
                     worker_name: worker_name.to_string(),
                 })?;
+        if workspace_context.workspace_id().is_some()
+            && metadata.resolved_manifest_snapshot.is_none()
+        {
+            return Err(WorkerError::WorkerMetadataManifestSnapshotMissing {
+                worker_name: worker_name.to_string(),
+            });
+        }
         let active = metadata
             .active
             .ok_or_else(|| WorkerError::WorkerMetadataInactive {
@@ -4868,6 +4875,13 @@ where
                 .ok_or_else(|| WorkerError::WorkerMetadataMissing {
                     worker_name: worker_name.to_string(),
                 })?;
+        if workspace_context.workspace_id().is_some()
+            && metadata.resolved_manifest_snapshot.is_none()
+        {
+            return Err(WorkerError::WorkerMetadataManifestSnapshotMissing {
+                worker_name: worker_name.to_string(),
+            });
+        }
         let active = metadata
             .active
             .ok_or_else(|| WorkerError::WorkerMetadataInactive {
@@ -5769,7 +5783,9 @@ pub enum WorkerError {
         session_id: SessionId,
     },
 
-    #[error("worker metadata for {worker_name} does not include a resolved manifest snapshot")]
+    #[error(
+        "worker metadata for {worker_name} does not include a trusted resolved manifest snapshot; a replacement Worker is required"
+    )]
     WorkerMetadataManifestSnapshotMissing { worker_name: String },
 
     #[error(
