@@ -5316,18 +5316,28 @@ fn ticket_notification_content(ticket_id: &str, current_state: &str) -> String {
 struct TicketNotificationDeliveryWarning {
     level: &'static str,
     event: &'static str,
+    workspace_id: String,
     ticket_id: String,
+    current_state: String,
     recipient_runtime_id: String,
     recipient_worker_id: String,
     error_category: &'static str,
 }
 
 impl TicketNotificationDeliveryWarning {
-    fn new(ticket_id: &str, recipient: &RuntimeWorkerRef, error_category: &'static str) -> Self {
+    fn new(
+        workspace_id: &str,
+        ticket_id: &str,
+        current_state: &str,
+        recipient: &RuntimeWorkerRef,
+        error_category: &'static str,
+    ) -> Self {
         Self {
             level: "warning",
             event: "ticket_notification_delivery_failed",
+            workspace_id: workspace_id.to_string(),
             ticket_id: ticket_id.to_string(),
+            current_state: current_state.to_string(),
             recipient_runtime_id: recipient.runtime_id.clone(),
             recipient_worker_id: recipient.worker_id.clone(),
             error_category,
@@ -5413,7 +5423,9 @@ fn notify_ticket_recipients(
         );
         if let Some(error_category) = ticket_notification_delivery_error_category(&result) {
             emit_ticket_notification_delivery_warning(TicketNotificationDeliveryWarning::new(
+                workspace_id,
                 ticket_id,
+                current_state,
                 &recipient,
                 error_category,
             ));
@@ -15796,7 +15808,8 @@ mod tests {
     #[tokio::test]
     async fn queued_ticket_mutation_stays_committed_when_notification_recipient_is_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let api = test_api(dir.path()).await;
+        init_clean_git_workspace(dir.path());
+        let (api, execution) = test_api_with_recording_backend(dir.path()).await;
         let source = api
             .runtime
             .spawn_worker(
@@ -15829,6 +15842,19 @@ mod tests {
             .unwrap()
             .worker
             .unwrap();
+        let orchestrator = scoped_start_workspace_orchestrator(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .worker
+        .expect("Workspace Orchestrator should be available")
+        .worker;
+        let _ = execution.take_inputs();
         let backend = browser_ticket_backend(&api).unwrap();
         let mut input = ticket::NewTicket::new("Queued notification");
         input.workflow_state = Some(TicketWorkflowState::Queued);
@@ -15908,12 +15934,28 @@ mod tests {
         let warning = &warnings[0];
         assert_eq!(warning.level, "warning");
         assert_eq!(warning.event, "ticket_notification_delivery_failed");
+        assert_eq!(warning.workspace_id, TEST_WORKSPACE_ID);
+        assert_eq!(warning.current_state, TicketWorkflowState::Queued.as_str());
         assert_eq!(warning.recipient_runtime_id, missing_recipient.runtime_id);
         assert_eq!(warning.recipient_worker_id, missing_recipient.worker_id);
         assert_eq!(warning.error_category, "unknown_worker");
         let serialized = serde_json::to_string(warning).unwrap();
         assert!(!serialized.contains("queued update"));
         assert!(!serialized.contains("Ticket notification:"));
+
+        let notifications = execution.take_inputs();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(
+            notifications[0].0.worker_id.to_string(),
+            orchestrator.worker_id
+        );
+        assert_eq!(
+            notifications[0].1,
+            ticket_notification_content(
+                ticket_ref.id.as_str(),
+                TicketWorkflowState::Queued.as_str()
+            )
+        );
     }
 
     #[tokio::test]
