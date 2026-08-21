@@ -126,6 +126,9 @@
     gap: var(--space-6);
     min-width: 0;
     min-height: 0;
+    width: 100%;
+    max-width: 720px;
+    margin-inline: auto;
     overflow-y: auto;
     padding: var(--space-6);
   }
