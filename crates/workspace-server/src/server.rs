@@ -9930,11 +9930,20 @@ async fn get_runtime_worker(
         .list_workdir_registry(&api.config.workspace_id, 500)?;
     let updated_at = record.updated_at.clone();
     let mut worker = merge_worker_registry_projection(Some(&worker), &record, links, &workdirs);
-    worker.human_key = api.store.resource_human_key(
-        &api.config.workspace_id,
-        WorkspaceResourceKind::Worker,
-        &worker_ref.worker_id,
-    )?;
+    worker.resource_key = Some(
+        api.store
+            .resource_key(
+                &api.config.workspace_id,
+                WorkspaceResourceKind::Worker,
+                &worker_ref.worker_id,
+            )?
+            .ok_or_else(|| {
+                Error::Store(format!(
+                    "Workspace Worker `{}` has no resource key",
+                    worker_ref.worker_id
+                ))
+            })?,
+    );
     Ok(Json(WorkerShowProjection { worker, updated_at }))
 }
 
@@ -9952,12 +9961,22 @@ async fn restore_runtime_worker(
         let workdirs = api
             .store
             .list_workdir_registry(&api.config.workspace_id, 500)?;
-        result.worker = Some(merge_worker_registry_projection(
-            Some(worker),
-            &record,
-            links,
-            &workdirs,
-        ));
+        let mut summary = merge_worker_registry_projection(Some(worker), &record, links, &workdirs);
+        summary.resource_key = Some(
+            api.store
+                .resource_key(
+                    &api.config.workspace_id,
+                    WorkspaceResourceKind::Worker,
+                    &record.worker.worker_id,
+                )?
+                .ok_or_else(|| {
+                    Error::Store(format!(
+                        "Workspace Worker `{}` has no resource key",
+                        record.worker.worker_id
+                    ))
+                })?,
+        );
+        result.worker = Some(summary);
     }
     Ok(Json(WorkerRestoreResponse {
         workspace_id: api.workspace_id().to_string(),
@@ -11041,11 +11060,20 @@ fn workers_response(api: WorkspaceApi) -> ApiResult<RuntimeListResponse<WorkerSu
             links,
             &workdir_records,
         );
-        summary.human_key = api.store.resource_human_key(
-            &api.config.workspace_id,
-            WorkspaceResourceKind::Worker,
-            &record.worker.worker_id,
-        )?;
+        summary.resource_key = Some(
+            api.store
+                .resource_key(
+                    &api.config.workspace_id,
+                    WorkspaceResourceKind::Worker,
+                    &record.worker.worker_id,
+                )?
+                .ok_or_else(|| {
+                    Error::Store(format!(
+                        "Workspace Worker `{}` has no resource key",
+                        record.worker.worker_id
+                    ))
+                })?,
+        );
         items.push(summary);
     }
     Ok(RuntimeListResponse {
@@ -11914,7 +11942,7 @@ fn record_worker_summary(
 fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> WorkerSummary {
     WorkerSummary {
         worker: record.worker.clone(),
-        human_key: None,
+        resource_key: None,
         host_id: "backend-registry".to_string(),
         display_name: record.display_name.clone(),
         label: record.display_name.clone(),
@@ -16065,10 +16093,11 @@ mod tests {
             .unwrap()
             .create(ticket::NewTicket::new("Browser Ticket API"))
             .unwrap();
-        let ticket_human_key = ticket_ref.human_key.clone().unwrap();
+        let ticket_resource_key = ticket_ref.resource_key.clone().unwrap();
         let ticket_id = ticket_ref.id;
         assert_eq!(
-            resolve_workspace_ticket_reference(&api, TEST_WORKSPACE_ID, &ticket_human_key).unwrap(),
+            resolve_workspace_ticket_reference(&api, TEST_WORKSPACE_ID, &ticket_resource_key)
+                .unwrap(),
             ticket_id
         );
         let path = || ScopedRecordPath {
@@ -18114,7 +18143,19 @@ mod tests {
 
         let store = SqliteWorkspaceStore::in_memory().unwrap();
         let mut config = test_server_config(dir.path());
-        write_ticket(
+        let sqlite_store = SqliteWorkspaceStore::open(&config.database_path).unwrap();
+        sqlite_store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                owner_account_id: None,
+                display_name: "Test Workspace".to_string(),
+                state: "active".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+        let ticket_id = write_ticket(
             &config.database_path,
             TEST_WORKSPACE_ID,
             "API Ticket",
@@ -18150,7 +18191,7 @@ mod tests {
                 &[ObjectiveTicketLinkRecord {
                     workspace_id: TEST_WORKSPACE_ID.to_string(),
                     objective_id: "00000000001J3".to_string(),
-                    ticket_id: "00000000001J2".to_string(),
+                    ticket_id: ticket_id.clone(),
                     kind: "linked".to_string(),
                     created_at: "2026-01-01T00:00:00Z".to_string(),
                 }],
@@ -18347,7 +18388,7 @@ mod tests {
             &format!("/api/w/{TEST_WORKSPACE_ID}/objectives/query"),
             Some(json!({
                 "query": "Objective body",
-                "linked_ticket_id": "00000000001J2",
+                "linked_ticket_id": ticket_id,
                 "limit": 1
             })),
             StatusCode::OK,
@@ -18363,7 +18404,7 @@ mod tests {
             StatusCode::OK,
         )
         .await;
-        assert_eq!(shown_objective["linked_tickets"][0], "00000000001J2");
+        assert_eq!(shown_objective["linked_tickets"][0], ticket_id);
         assert!(shown_objective["event_page"]["returned"].is_number());
 
         let memory_document =
@@ -19256,16 +19297,23 @@ mod tests {
         };
         let response: protocol::subscription::SubscriptionFrame =
             serde_json::from_str(text.as_str()).unwrap();
-        assert!(matches!(
-            response.payload,
+        let workers = match response.payload {
             protocol::subscription::SubscriptionFramePayload::Response(
                 protocol::subscription::SubscriptionResponse::Subscribed {
                     selector: protocol::subscription::EventSubscriptionSelector::WorkspaceWorkers,
-                    snapshot: protocol::subscription::SubscriptionSnapshot::Workers { .. },
+                    snapshot: protocol::subscription::SubscriptionSnapshot::Workers { workers },
                     ..
-                }
-            )
-        ));
+                },
+            ) => workers,
+            other => panic!("expected Workspace Worker snapshot, got {other:?}"),
+        };
+        assert_eq!(
+            workers
+                .iter()
+                .find(|worker| worker.worker_id.as_str() == worker_id)
+                .and_then(|worker| worker.resource_key.as_deref()),
+            Some("W-1")
+        );
 
         let subscribe_protocol = protocol::subscription::SubscriptionFrame::new(
             protocol::subscription::SubscriptionFramePayload::Request(
@@ -19602,12 +19650,12 @@ INSERT INTO typed_tickets (
 ) VALUES
     ('0192f0e8-4d84-7d6e-a000-000000000001', '00000000001J2', 'ticket-j2', 'Ticket J2', 'open', 'task', 'normal', '', 'planning', 1),
     ('0192f0e8-4d84-7d6e-a000-000000000001', '00000000001J3', 'ticket-j3', 'Ticket J3', 'open', 'task', 'normal', '', 'planning', 1);
-INSERT INTO workspace_resource_human_keys (
-    workspace_id, resource_kind, resource_id, sequence, human_key, allocated_at
+INSERT INTO workspace_resource_keys (
+    workspace_id, resource_kind, resource_id, sequence, resource_key, allocated_at
 ) VALUES
     ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', '00000000001J2', 1, 'T-1', '2026-01-01T00:00:00Z'),
     ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', '00000000001J3', 2, 'T-2', '2026-01-01T00:00:00Z');
-INSERT INTO workspace_resource_human_key_counters (workspace_id, resource_kind, next_sequence)
+INSERT INTO workspace_resource_key_counters (workspace_id, resource_kind, next_sequence)
 VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
 "#,
             )
@@ -19824,13 +19872,13 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
         workspace_id: &str,
         title: &str,
         state: ticket::TicketWorkflowState,
-    ) {
+    ) -> String {
         use ticket::TicketBackend as _;
 
         let backend = ticket::SqliteTicketBackend::open(database_path, workspace_id).unwrap();
         let mut input = ticket::NewTicket::new(title);
         input.workflow_state = Some(state);
-        backend.create(input).unwrap();
+        backend.create(input).unwrap().id
     }
 
     fn write_objective(root: &Path, id: &str, title: &str, state: &str) {

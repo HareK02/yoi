@@ -537,9 +537,9 @@ pub(super) fn panel_ticket_reference(row: &PanelRow) -> String {
         .as_ref()
         .map(|ticket| {
             ticket
-                .human_key
+                .resource_key
                 .clone()
-                .unwrap_or_else(|| ticket.id.clone())
+                .unwrap_or_else(|| "resource key unavailable".to_string())
         })
         .unwrap_or_else(|| match &row.key {
             PanelRowKey::Ticket(id) | PanelRowKey::InvalidTicket(id) => id.clone(),

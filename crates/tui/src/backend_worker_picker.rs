@@ -348,17 +348,6 @@ fn state_style(state: &str) -> Style {
     }
 }
 
-fn short_worker_id(worker: &BackendWorkerSummary) -> String {
-    if let Some(human_key) = worker.human_key.as_ref() {
-        return human_key.clone();
-    }
-    format!(
-        "{}:{}",
-        short_text(&worker.runtime_id),
-        short_text(&worker.worker_id)
-    )
-}
-
 fn short_text(text: &str) -> String {
     const MAX: usize = 24;
     let mut chars = text.chars();
@@ -368,6 +357,10 @@ fn short_text(text: &str) -> String {
     } else {
         shortened
     }
+}
+
+fn short_worker_id(worker: &BackendWorkerSummary) -> String {
+    worker.resource_key.clone()
 }
 
 fn working_directory_text(worker: &BackendWorkerSummary) -> String {
@@ -393,7 +386,7 @@ mod tests {
         BackendWorkerSummary {
             runtime_id: runtime_id.to_string(),
             worker_id: worker_id.to_string(),
-            human_key: None,
+            resource_key: "W-1".to_string(),
             host_id: "host".to_string(),
             label: "label".to_string(),
             display_name: "label".to_string(),
@@ -429,7 +422,7 @@ mod tests {
             .into_iter()
             .map(|span| span.content)
             .collect::<String>();
-        assert!(text.starts_with("▶ runtime-a:worker-b"));
+        assert!(text.starts_with("▶ W-1"));
         assert!(text.contains("[running]"));
         assert!(text.contains("profile:default"));
         assert!(text.contains("wd:—"));

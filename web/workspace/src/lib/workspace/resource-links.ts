@@ -1,7 +1,7 @@
-const HUMAN_KEY_PATTERN = /^(T|O|W)-(\d+)/;
+const RESOURCE_KEY_PATTERN = /^(T|O|W)-(\d+)/;
 
-export function resourceHumanKey(reference: string): string {
-  const match = HUMAN_KEY_PATTERN.exec(reference);
+export function resourceKey(reference: string): string {
+  const match = RESOURCE_KEY_PATTERN.exec(reference);
   return match ? `${match[1]}-${match[2]}` : reference;
 }
 
@@ -18,32 +18,30 @@ export function slugifyResourceTitle(title: string): string {
 }
 
 export function canonicalResourceReference(
-  humanKey: string,
+  resourceKey: string,
   title: string,
 ): string {
-  return `${humanKey}-${slugifyResourceTitle(title)}`;
+  return `${resourceKey}-${slugifyResourceTitle(title)}`;
 }
 
 export function ticketHref(
   workspaceId: string,
-  ticket: { human_key: string; title: string },
+  ticket: { resource_key: string; title: string },
 ): string {
-  return `/w/${encodeURIComponent(workspaceId)}/tickets/${encodeURIComponent(canonicalResourceReference(ticket.human_key, ticket.title))}`;
+  return `/w/${encodeURIComponent(workspaceId)}/tickets/${encodeURIComponent(canonicalResourceReference(ticket.resource_key, ticket.title))}`;
 }
 
 export function objectiveHref(
   workspaceId: string,
-  objective: { human_key: string; title: string },
+  objective: { resource_key: string; title: string },
 ): string {
-  return `/w/${encodeURIComponent(workspaceId)}/objectives/${encodeURIComponent(canonicalResourceReference(objective.human_key, objective.title))}`;
+  return `/w/${encodeURIComponent(workspaceId)}/objectives/${encodeURIComponent(canonicalResourceReference(objective.resource_key, objective.title))}`;
 }
 
 export function workerHref(
   workspaceId: string,
-  worker: { human_key?: string; display_name: string; worker_id: string },
+  worker: { resource_key: string; display_name: string },
 ): string {
-  const reference = worker.human_key
-    ? canonicalResourceReference(worker.human_key, worker.display_name)
-    : worker.worker_id;
+  const reference = canonicalResourceReference(worker.resource_key, worker.display_name);
   return `/w/${encodeURIComponent(workspaceId)}/workers/${encodeURIComponent(reference)}`;
 }

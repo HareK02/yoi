@@ -31,7 +31,7 @@ pub struct InvalidProjectRecord {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketSummary {
     pub id: String,
-    pub human_key: String,
+    pub resource_key: String,
     pub title: String,
     pub state: String,
     pub priority: String,
@@ -67,7 +67,7 @@ pub struct TicketListResponse {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketDetail {
     pub id: String,
-    pub human_key: String,
+    pub resource_key: String,
     pub title: String,
     pub state: String,
     pub readiness: Option<String>,
@@ -124,7 +124,7 @@ pub struct TicketRelation {
     pub kind: String,
     pub target: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_human_key: Option<String>,
+    pub target_resource_key: Option<String>,
     pub note: Option<String>,
     pub author: String,
     pub at: String,
@@ -135,7 +135,7 @@ pub struct TicketRelation {
 pub struct DerivedTicketRelation {
     pub source_ticket: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_human_key: Option<String>,
+    pub source_resource_key: Option<String>,
     pub inverse_kind: String,
     pub forward_kind: String,
     pub note: Option<String>,
@@ -148,7 +148,7 @@ pub struct DerivedTicketRelation {
 pub struct TicketRelationBlocker {
     pub blocking_ticket: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub blocking_human_key: Option<String>,
+    pub blocking_resource_key: Option<String>,
     pub reason_kind: String,
     pub relation_kind: String,
     pub note: Option<String>,
@@ -182,7 +182,7 @@ impl From<ticket::TicketRelationView> for TicketRelationView {
                     ticket_id: relation.ticket_id,
                     kind: relation.kind.as_str().to_string(),
                     target: relation.target,
-                    target_human_key: None,
+                    target_resource_key: None,
                     note: relation.note,
                     author: relation.author,
                     at: relation.at,
@@ -193,7 +193,7 @@ impl From<ticket::TicketRelationView> for TicketRelationView {
                 .into_iter()
                 .map(|relation| DerivedTicketRelation {
                     source_ticket: relation.source_ticket,
-                    source_human_key: None,
+                    source_resource_key: None,
                     inverse_kind: relation.inverse_kind,
                     forward_kind: relation.forward_kind.as_str().to_string(),
                     note: relation.note,
@@ -206,7 +206,7 @@ impl From<ticket::TicketRelationView> for TicketRelationView {
                 .into_iter()
                 .map(|blocker| TicketRelationBlocker {
                     blocking_ticket: blocker.blocking_ticket,
-                    blocking_human_key: None,
+                    blocking_resource_key: None,
                     reason_kind: blocker.reason_kind,
                     relation_kind: blocker.relation_kind.as_str().to_string(),
                     note: blocker.note,
@@ -242,7 +242,7 @@ pub struct QueryPage {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct ObjectiveLinkSummary {
     pub id: String,
-    pub human_key: String,
+    pub resource_key: String,
     pub title: String,
     pub state: String,
 }
@@ -265,7 +265,7 @@ pub struct TicketAssignmentSummary {
     pub runtime_id: String,
     pub worker_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worker_human_key: Option<String>,
+    pub worker_resource_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -327,7 +327,7 @@ pub struct TicketQueryRequest {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketQueryItem {
     pub id: String,
-    pub human_key: String,
+    pub resource_key: String,
     pub title: String,
     pub state: String,
     pub readiness: Option<String>,
@@ -379,6 +379,7 @@ pub struct ObjectiveQueryRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObjectiveQueryItem {
     pub id: String,
+    pub resource_key: String,
     pub title: String,
     pub state: String,
     pub created_at: Option<String>,
@@ -414,7 +415,7 @@ pub struct ObjectiveEventDetail {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObjectiveLinkedTicketSummary {
     pub id: String,
-    pub human_key: String,
+    pub resource_key: String,
     pub title: String,
     pub state: String,
 }
@@ -422,7 +423,7 @@ pub struct ObjectiveLinkedTicketSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObjectiveSummary {
     pub id: String,
-    pub human_key: String,
+    pub resource_key: String,
     pub title: String,
     pub state: String,
     pub created_at: Option<String>,
@@ -435,7 +436,7 @@ pub struct ObjectiveSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObjectiveDetail {
     pub id: String,
-    pub human_key: String,
+    pub resource_key: String,
     pub title: String,
     pub state: String,
     pub revision: String,

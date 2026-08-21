@@ -551,6 +551,10 @@ pub struct SubscriptionWorker {
     /// Runtime producers leave this unset because the connection identifies the Runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_id: Option<String>,
+    /// Workspace-scoped canonical resource key. Runtime producers leave this unset;
+    /// Workspace-facing projections must populate it before publishing the Worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_key: Option<String>,
     /// Producer-owned monotonic revision for this Worker subject.
     pub subject_revision: u64,
     pub state: SubscriptionWorkerState,
@@ -573,6 +577,9 @@ impl SubscriptionWorker {
         self.worker_id.validate()?;
         if let Some(runtime_id) = &self.runtime_id {
             validate_identifier("runtime_id", runtime_id, MAX_RESOURCE_ID_BYTES)?;
+        }
+        if let Some(resource_key) = &self.resource_key {
+            validate_identifier("resource_key", resource_key, MAX_RESOURCE_ID_BYTES)?;
         }
         if let Some(repository_id) = &self.repository_id {
             validate_identifier("repository_id", repository_id, MAX_RESOURCE_ID_BYTES)?;
@@ -796,6 +803,7 @@ mod tests {
         SubscriptionWorker {
             worker_id: worker_id(value),
             runtime_id: None,
+            resource_key: None,
             subject_revision: 0,
             state: SubscriptionWorkerState::Idle,
             has_running_internal_workers: false,

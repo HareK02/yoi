@@ -179,7 +179,7 @@
               class="ticket-card"
               href={ticketHref(data.workspaceId, ticket)}
             >
-              <span class="ticket-card-id">{ticket.human_key}</span>
+              <span class="ticket-card-id">{ticket.resource_key}</span>
               <strong>{ticket.title}</strong>
               <div class="ticket-card-meta">
                 <span>{ticket.state} · {ticket.priority}</span>
