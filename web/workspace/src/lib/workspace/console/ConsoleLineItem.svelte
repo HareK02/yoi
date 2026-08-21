@@ -1,4 +1,5 @@
 <script lang="ts">
+  import AnsiText from '$lib/workspace/console/AnsiText.svelte';
   import RichMarkdown from '$lib/workspace/console/RichMarkdown.svelte';
   import type { ConsoleLine } from '$lib/workspace/console/model';
 
@@ -16,6 +17,10 @@
     const name = line.toolCall?.name?.toLowerCase() ?? '';
     const state = line.toolCall?.state ?? (line.streaming ? 'streaming' : 'done');
     return [name ? `tool-${name}` : '', `tool-state-${state}`].filter(Boolean).join(' ');
+  }
+
+  function isBashTool(line: ConsoleLine): boolean {
+    return line.toolCall?.name?.toLowerCase() === 'bash';
   }
 
   function shouldRenderHeading(line: ConsoleLine): boolean {
@@ -60,7 +65,13 @@
   {/if}
   {#if item.kind === 'tool'}
     {#if bodyTextAfterToolSummary(item)}
-      <p class="console-plain-text">{bodyTextAfterToolSummary(item)}</p>
+      <p class="console-plain-text">
+        {#if isBashTool(item)}
+          <AnsiText text={bodyTextAfterToolSummary(item)} />
+        {:else}
+          {bodyTextAfterToolSummary(item)}
+        {/if}
+      </p>
     {/if}
   {:else if item.kind === 'user'}
     <div class="user-message">
@@ -191,6 +202,10 @@
 
   .console-line.tool .console-plain-text {
     color: var(--tui-gray);
+  }
+
+  .console-line.tool.tool-bash .console-plain-text {
+    color: var(--text);
   }
 
   .tool-summary {

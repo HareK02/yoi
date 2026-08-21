@@ -365,12 +365,17 @@ Deno.test("Worker Console renders markdown only for message rows", async () => {
   assert(
     consoleLine.includes("function shouldRenderMarkdown") &&
       consoleLine.includes("item.kind === 'tool'") &&
+      consoleLine.includes("{#if isBashTool(item)}") &&
       consoleLine.includes(
-        '<p class="console-plain-text">{bodyTextAfterToolSummary(item)}</p>',
+        "<AnsiText text={bodyTextAfterToolSummary(item)} />",
+      ) &&
+      consoleLine.includes(
+        ".console-line.tool.tool-bash .console-plain-text",
       ) &&
       consoleLine.includes("{:else if shouldRenderMarkdown(item)}") &&
-      consoleLine.includes("<RichMarkdown text={item.body || '—'} />"),
-    "Console should keep markdown rendering to user/assistant/system message bodies and render tool text literally",
+      consoleLine.includes("<RichMarkdown text={item.body || '—'} />") &&
+      !consoleLine.includes("{@html"),
+    "Console should keep markdown rendering to message bodies, safely project Bash ANSI, and render other tool text literally",
   );
 });
 
