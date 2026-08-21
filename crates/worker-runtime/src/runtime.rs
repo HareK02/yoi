@@ -2794,6 +2794,27 @@ fn validate_create_workspace_scope(
             )));
         }
     }
+    let snapshot = request.memory_settings.as_ref().ok_or_else(|| {
+        RuntimeError::InvalidRequest(
+            "Workspace-scoped Worker create requires a bound Memory settings snapshot".to_string(),
+        )
+    })?;
+    if snapshot.workspace_id != workspace_id {
+        return Err(RuntimeError::InvalidRequest(format!(
+            "Memory settings workspace_id {} does not match Runtime auth workspace_id {workspace_id}",
+            snapshot.workspace_id
+        )));
+    }
+    if snapshot.settings_revision == 0 {
+        return Err(RuntimeError::InvalidRequest(
+            "Memory settings revision must be at least 1".to_string(),
+        ));
+    }
+    if !manifest::is_normalized_workspace_memory_language(&snapshot.language) {
+        return Err(RuntimeError::InvalidRequest(
+            "Memory settings language must be a normalized bounded UTF-8 value".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -3086,6 +3107,11 @@ mod tests {
             worker_observation_enabled: false,
             worker_observation_grants: Vec::new(),
             workspace_api: None,
+            memory_settings: Some(manifest::WorkspaceMemorySettingsSnapshot {
+                workspace_id: "local".to_string(),
+                settings_revision: 1,
+                language: "English".to_string(),
+            }),
         }
     }
 
@@ -3095,7 +3121,37 @@ mod tests {
             workspace_id: workspace_id.to_string(),
             base_url: format!("https://workspace.example/{workspace_id}"),
         });
+        request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
+            workspace_id: workspace_id.to_string(),
+            settings_revision: 1,
+            language: "English".to_string(),
+        });
         request
+    }
+
+    #[test]
+    fn workspace_create_requires_matching_normalized_memory_settings_snapshot() {
+        let mut request = scoped_task_request("memory-snapshot", "workspace-a");
+        assert!(validate_create_workspace_scope(&request, Some("workspace-a")).is_ok());
+        request.memory_settings.as_mut().unwrap().language = "Français".to_string();
+        assert!(validate_create_workspace_scope(&request, Some("workspace-a")).is_ok());
+
+        request.memory_settings = None;
+        assert!(validate_create_workspace_scope(&request, Some("workspace-a")).is_err());
+
+        request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
+            workspace_id: "workspace-b".to_string(),
+            settings_revision: 1,
+            language: "English".to_string(),
+        });
+        assert!(validate_create_workspace_scope(&request, Some("workspace-a")).is_err());
+
+        request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
+            workspace_id: "workspace-a".to_string(),
+            settings_revision: 2,
+            language: " english ".to_string(),
+        });
+        assert!(validate_create_workspace_scope(&request, Some("workspace-a")).is_err());
     }
 
     fn scope(workspace_id: &str, server_id: &str) -> RuntimeWorkspaceScope {
@@ -4484,7 +4540,7 @@ mod tests {
         let worker = runtime
             .create_worker_scoped(
                 &RuntimeWorkspaceScope::new("workspace-a", "server"),
-                task_request("legacy"),
+                scoped_task_request("legacy", "workspace-a"),
             )
             .unwrap();
         drop(runtime);

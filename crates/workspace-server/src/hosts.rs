@@ -518,6 +518,9 @@ pub struct WorkerSpawnRequest {
     pub resolved_config_bundle: Option<ConfigBundle>,
     #[serde(skip, default)]
     pub resolved_workspace_api: Option<WorkspaceApiRef>,
+    /// Backend-authored immutable Workspace Memory settings snapshot.
+    #[serde(skip, default)]
+    pub resolved_memory_settings: Option<manifest::WorkspaceMemorySettingsSnapshot>,
     /// Backend-owned feature enablement; client input cannot set it.
     #[serde(skip, default)]
     pub resolved_worker_observation_enabled: bool,
@@ -2184,6 +2187,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             worker_observation_enabled: request.resolved_worker_observation_enabled,
             worker_observation_grants: request.resolved_worker_observation_grants.clone(),
             workspace_api: Some(workspace_api),
+            memory_settings: request.resolved_memory_settings.clone(),
         };
         let workspace_scope = RuntimeWorkspaceScope::new(workspace_id, "embedded-backend");
         match self
@@ -3331,6 +3335,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             worker_observation_enabled: request.resolved_worker_observation_enabled,
             worker_observation_grants: request.resolved_worker_observation_grants.clone(),
             workspace_api: Some(workspace_api),
+            memory_settings: request.resolved_memory_settings.clone(),
         };
         match self.post_json::<_, RuntimeHttpWorkerResponse>("/v1/workers", &create) {
             Ok(response) => WorkerSpawnResult {
@@ -4408,6 +4413,14 @@ mod tests {
         }
     }
 
+    fn test_memory_settings() -> manifest::WorkspaceMemorySettingsSnapshot {
+        manifest::WorkspaceMemorySettingsSnapshot {
+            workspace_id: "workspace-test".to_string(),
+            settings_revision: 1,
+            language: "English".to_string(),
+        }
+    }
+
     #[test]
     fn worker_summary_keeps_flat_wire_identity_while_using_structured_internal_identity() {
         let summary = placeholder_worker("placeholder");
@@ -5007,6 +5020,7 @@ mod tests {
             resolved_worker_observation_grants: Vec::new(),
             resolved_control_operation: None,
             resolved_workspace_api: Some(test_workspace_api()),
+            resolved_memory_settings: Some(test_memory_settings()),
         }
     }
 
@@ -5246,6 +5260,7 @@ mod tests {
                     resolved_worker_observation_grants: Vec::new(),
                     resolved_control_operation: None,
                     resolved_workspace_api: Some(test_workspace_api()),
+                    resolved_memory_settings: Some(test_memory_settings()),
                 },
             )
             .unwrap();
@@ -5345,6 +5360,7 @@ mod tests {
                     resolved_worker_observation_grants: Vec::new(),
                     resolved_control_operation: None,
                     resolved_workspace_api: Some(test_workspace_api()),
+                    resolved_memory_settings: Some(test_memory_settings()),
                 },
             )
             .unwrap();
@@ -5383,6 +5399,7 @@ mod tests {
                     resolved_worker_observation_grants: Vec::new(),
                     resolved_control_operation: None,
                     resolved_workspace_api: Some(test_workspace_api()),
+                    resolved_memory_settings: Some(test_memory_settings()),
                 },
             )
             .unwrap();

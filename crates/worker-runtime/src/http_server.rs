@@ -1882,6 +1882,11 @@ mod tests {
             workspace_id: workspace_id.to_string(),
             base_url: format!("https://workspace.example/{workspace_id}"),
         });
+        request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
+            workspace_id: workspace_id.to_string(),
+            settings_revision: 1,
+            language: "English".to_string(),
+        });
         request
     }
 
@@ -2193,6 +2198,11 @@ mod tests {
             worker_observation_enabled: false,
             worker_observation_grants: Vec::new(),
             workspace_api: None,
+            memory_settings: Some(manifest::WorkspaceMemorySettingsSnapshot {
+                workspace_id: "local".to_string(),
+                settings_revision: 1,
+                language: "English".to_string(),
+            }),
         }
     }
 
@@ -2828,6 +2838,11 @@ mod ws_tests {
             worker_observation_enabled: false,
             worker_observation_grants: Vec::new(),
             workspace_api: None,
+            memory_settings: Some(manifest::WorkspaceMemorySettingsSnapshot {
+                workspace_id: "local".to_string(),
+                settings_revision: 1,
+                language: "English".to_string(),
+            }),
         }
     }
 

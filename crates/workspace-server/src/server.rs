@@ -1182,8 +1182,11 @@ impl WorkspaceApi {
                 &now_registry_timestamp(),
             )?;
         }
-        let create_fingerprint = worker_spawn_create_fingerprint(&request)
+        let request_fingerprint = worker_spawn_create_fingerprint(&request)
             .map_err(|message| Error::Config(message.to_string()))?;
+        let current_memory_settings = self
+            .config_store
+            .get_workspace_memory_settings(&self.config.workspace_id)?;
         let allocation_key = request
             .resolved_control_operation
             .as_ref()
@@ -1195,22 +1198,25 @@ impl WorkspaceApi {
                     .map(|assignment| assignment.operation_id.clone())
             })
             .unwrap_or_else(|| format!("manual:{}", WorkerId::now_v7()));
-        let worker_id = self
+        let reservation = self
             .config_store
             .reserve_worker_create(
                 &self.config.workspace_id,
                 runtime_id,
                 &allocation_key,
-                &create_fingerprint,
+                &request_fingerprint,
+                &current_memory_settings,
             )
             .map_err(|error| Error::RuntimeOperationFailed {
                 runtime_id: runtime_id.to_string(),
                 code: "workspace_worker_allocation_conflict".to_string(),
                 message: error.to_string(),
             })?;
+        let worker_id = reservation.worker_id;
+        request.resolved_memory_settings = Some(reservation.memory_settings);
         let create_binding = WorkerCreateBinding {
             worker_id,
-            create_fingerprint,
+            create_fingerprint: reservation.create_fingerprint,
         };
         let result = match self
             .runtime
@@ -1600,6 +1606,11 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/settings/workspace",
             get(scoped_get_workspace_settings).put(scoped_update_workspace_settings),
+        )
+        .route(
+            "/api/w/{workspace_id}/settings/memory",
+            get(scoped_get_workspace_memory_settings)
+                .put(scoped_update_workspace_memory_settings),
         )
         .route(
             "/api/w/{workspace_id}/config/source-tree",
@@ -2996,6 +3007,43 @@ struct WorkspaceConfigTreeResponse {
     snapshot: ConfigTreeSnapshot,
     contract: config_source::ToolchainContract,
     projection_digest: String,
+}
+
+async fn scoped_get_workspace_memory_settings(
+    State(api): State<WorkspaceApi>,
+    AxumPath(workspace_id): AxumPath<String>,
+) -> ApiResult<Json<workspace_api::WorkspaceMemorySettings>> {
+    validate_workspace_scope(&api, &workspace_id)?;
+    let settings = api
+        .config_store
+        .get_workspace_memory_settings(&workspace_id)
+        .map_err(ApiError::from)?;
+    Ok(Json(workspace_api::WorkspaceMemorySettings {
+        workspace_id: settings.workspace_id,
+        settings_revision: settings.settings_revision,
+        language: settings.language,
+    }))
+}
+
+async fn scoped_update_workspace_memory_settings(
+    State(api): State<WorkspaceApi>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Json(request): Json<workspace_api::UpdateWorkspaceMemorySettingsRequest>,
+) -> ApiResult<Json<workspace_api::WorkspaceMemorySettings>> {
+    validate_workspace_scope(&api, &workspace_id)?;
+    let settings = api
+        .config_store
+        .update_workspace_memory_settings(
+            &workspace_id,
+            request.expected_revision,
+            &request.language,
+        )
+        .map_err(ApiError::from)?;
+    Ok(Json(workspace_api::WorkspaceMemorySettings {
+        workspace_id: settings.workspace_id,
+        settings_revision: settings.settings_revision,
+        language: settings.language,
+    }))
 }
 
 async fn scoped_get_workspace_config_tree(
@@ -6126,6 +6174,7 @@ fn start_memory_staging_consolidation(
             resolved_worker_observation_grants: Vec::new(),
             resolved_control_operation: None,
             resolved_workspace_api: None,
+            resolved_memory_settings: None,
         },
     )?;
     if result.state != WorkerOperationState::Accepted {
@@ -7192,6 +7241,7 @@ async fn scoped_start_workspace_orchestrator(
             resolved_worker_observation_grants: Vec::new(),
             resolved_control_operation: None,
             resolved_workspace_api: None,
+            resolved_memory_settings: None,
         },
     )?;
     if result.state != WorkerOperationState::Accepted || result.worker.is_none() {
@@ -9736,6 +9786,7 @@ async fn create_workspace_worker(
         resolved_worker_observation_grants: Vec::new(),
         resolved_control_operation,
         resolved_workspace_api: None,
+        resolved_memory_settings: None,
     };
     validate_ticket_assignment_spawn(&api, &runtime_id, &request)?;
     let assignment = request.ticket_assignment.clone();
@@ -13164,6 +13215,14 @@ mod tests {
         }
     }
 
+    fn test_worker_memory_settings() -> manifest::WorkspaceMemorySettingsSnapshot {
+        manifest::WorkspaceMemorySettingsSnapshot {
+            workspace_id: TEST_WORKSPACE_ID.to_string(),
+            settings_revision: 1,
+            language: "English".to_string(),
+        }
+    }
+
     #[test]
     fn ticket_api_errors_preserve_http_status() {
         let not_found = ApiError::from(Error::Ticket(ticket::TicketError::NotFound(
@@ -13432,6 +13491,7 @@ mod tests {
             resolved_worker_observation_grants: Vec::new(),
             resolved_control_operation: None,
             resolved_workspace_api: None,
+            resolved_memory_settings: None,
         };
         assert!(
             api.validate_worker_spawn_repository_scope(&workdir_flow_launch)
@@ -13604,6 +13664,7 @@ mod tests {
             resolved_worker_observation_grants: Vec::new(),
             resolved_control_operation: None,
             resolved_workspace_api: None,
+            resolved_memory_settings: None,
         };
 
         assert!(
@@ -15069,6 +15130,7 @@ mod tests {
                     resolved_workspace_api: Some(test_worker_workspace_api(
                         EMBEDDED_WORKER_RUNTIME_ID,
                     )),
+                    resolved_memory_settings: Some(test_worker_memory_settings()),
                     resolved_control_operation: None,
                 },
             )
@@ -15282,6 +15344,7 @@ mod tests {
                     resolved_workspace_api: Some(test_worker_workspace_api(
                         EMBEDDED_WORKER_RUNTIME_ID,
                     )),
+                    resolved_memory_settings: Some(test_worker_memory_settings()),
                     resolved_control_operation: None,
                 },
             )
@@ -15492,6 +15555,7 @@ mod tests {
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: Some(test_worker_workspace_api(EMBEDDED_WORKER_RUNTIME_ID)),
+            resolved_memory_settings: Some(test_worker_memory_settings()),
             resolved_control_operation: None,
         };
         let source_worker = api
@@ -15756,6 +15820,7 @@ mod tests {
                     resolved_workspace_api: Some(test_worker_workspace_api(
                         EMBEDDED_WORKER_RUNTIME_ID,
                     )),
+                    resolved_memory_settings: Some(test_worker_memory_settings()),
                     resolved_control_operation: None,
                 },
             )
@@ -15881,6 +15946,7 @@ mod tests {
             resolved_worker_observation_grants: Vec::new(),
             resolved_control_operation: None,
             resolved_workspace_api: None,
+            resolved_memory_settings: None,
         };
         let Json(first) = scoped_create_runtime_worker(
             State(api.clone()),
@@ -16045,22 +16111,28 @@ mod tests {
                 TEST_CREATED_AT,
             )
             .unwrap();
-        let reserved_worker_id = api
+        let current_memory_settings = api
+            .config_store
+            .get_workspace_memory_settings(TEST_WORKSPACE_ID)
+            .unwrap();
+        let reservation = api
             .config_store
             .reserve_worker_create(
                 TEST_WORKSPACE_ID,
                 EMBEDDED_WORKER_RUNTIME_ID,
                 "pending-spawn-operation",
                 &pending_fingerprint,
+                &current_memory_settings,
             )
             .unwrap();
+        pending_request.resolved_memory_settings = Some(reservation.memory_settings.clone());
         let spawned_before_backend_failure = api
             .runtime
             .spawn_worker(
                 EMBEDDED_WORKER_RUNTIME_ID,
                 WorkerCreateBinding {
-                    worker_id: reserved_worker_id,
-                    create_fingerprint: pending_fingerprint.clone(),
+                    worker_id: reservation.worker_id,
+                    create_fingerprint: reservation.create_fingerprint,
                 },
                 pending_request.clone(),
             )
@@ -16139,6 +16211,7 @@ mod tests {
             resolved_worker_observation_grants: Vec::new(),
             resolved_control_operation: None,
             resolved_workspace_api: None,
+            resolved_memory_settings: None,
         };
         let Json(created) = scoped_create_runtime_worker(
             State(api.clone()),
@@ -16505,6 +16578,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_settings_handlers_reject_foreign_workspace_path_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        assert!(
+            scoped_get_workspace_memory_settings(
+                State(api.clone()),
+                AxumPath("workspace-foreign".to_string()),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            scoped_update_workspace_memory_settings(
+                State(api),
+                AxumPath("workspace-foreign".to_string()),
+                Json(workspace_api::UpdateWorkspaceMemorySettingsRequest {
+                    expected_revision: 1,
+                    language: "English".to_string(),
+                }),
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn destructive_worker_remove_rejects_browser_and_legacy_source_headers() {
         let headers = HeaderMap::new();
         assert!(matches!(
@@ -16699,6 +16798,7 @@ mod tests {
                     resolved_worker_observation_enabled: false,
                     resolved_worker_observation_grants: Vec::new(),
                     resolved_workspace_api: None,
+                    resolved_memory_settings: None,
                     resolved_control_operation: None,
                 },
             )
@@ -16755,6 +16855,7 @@ mod tests {
                     resolved_worker_observation_enabled: false,
                     resolved_worker_observation_grants: Vec::new(),
                     resolved_workspace_api: None,
+                    resolved_memory_settings: None,
                     resolved_control_operation: None,
                 },
             )
@@ -17680,6 +17781,7 @@ mod tests {
             worker_observation_enabled: false,
             worker_observation_grants: Vec::new(),
             workspace_api: None,
+            memory_settings: None,
         }
     }
 
@@ -18974,6 +19076,7 @@ mod tests {
                     resolved_workspace_api: Some(test_worker_workspace_api(
                         "embedded-worker-runtime",
                     )),
+                    resolved_memory_settings: Some(test_worker_memory_settings()),
                     resolved_control_operation: None,
                 },
             )
@@ -19493,6 +19596,7 @@ mod tests {
             resolved_worker_observation_grants: Vec::new(),
             resolved_control_operation: None,
             resolved_workspace_api: None,
+            resolved_memory_settings: None,
         };
         let spawned = api
             .spawn_workspace_worker(EMBEDDED_WORKER_RUNTIME_ID, spawn_request)

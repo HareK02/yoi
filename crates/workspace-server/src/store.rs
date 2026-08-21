@@ -8,6 +8,7 @@ use rusqlite::{
     Connection, OpenFlags, OptionalExtension, TransactionBehavior, backup::Backup, params,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use worker_runtime::identity::{
@@ -230,6 +231,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "rename Workspace resource keys",
         apply: verify_workspace_resource_key_schema,
     },
+    Migration {
+        version: 42,
+        name: "create Workspace Memory settings authority",
+        apply: create_workspace_memory_settings_authority,
+    },
 ];
 
 struct Migration {
@@ -259,6 +265,22 @@ pub struct WorkspaceRecord {
     pub state: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceMemorySettingsRecord {
+    pub workspace_id: String,
+    pub settings_revision: u64,
+    pub language: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerCreateReservation {
+    pub worker_id: WorkerId,
+    pub create_fingerprint: String,
+    pub memory_settings: manifest::WorkspaceMemorySettingsSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1140,23 +1162,125 @@ impl SqliteWorkspaceStore {
         f(&mut conn)
     }
 
+    pub(crate) fn get_workspace_memory_settings(
+        &self,
+        workspace_id: &str,
+    ) -> Result<WorkspaceMemorySettingsRecord> {
+        let record = self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT workspace_id, settings_revision, language, created_at, updated_at \
+                 FROM workspace_memory_settings WHERE workspace_id = ?1",
+                params![workspace_id],
+                |row| {
+                    let revision = row.get::<_, i64>(1)?;
+                    Ok(WorkspaceMemorySettingsRecord {
+                        workspace_id: row.get(0)?,
+                        settings_revision: revision
+                            .try_into()
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, revision))?,
+                        language: row.get(2)?,
+                        created_at: row.get(3)?,
+                        updated_at: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| Error::Store("Workspace Memory settings are missing".to_string()))
+        })?;
+        validate_workspace_memory_settings_record(&record, workspace_id)?;
+        Ok(record)
+    }
+
+    pub(crate) fn update_workspace_memory_settings(
+        &self,
+        workspace_id: &str,
+        expected_revision: u64,
+        language: &str,
+    ) -> Result<WorkspaceMemorySettingsRecord> {
+        let language = normalize_workspace_memory_language(language)?;
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current = tx
+                .query_row(
+                    "SELECT workspace_id, settings_revision, language, created_at, updated_at \
+                     FROM workspace_memory_settings WHERE workspace_id = ?1",
+                    params![workspace_id],
+                    |row| {
+                        let revision = row.get::<_, i64>(1)?;
+                        Ok(WorkspaceMemorySettingsRecord {
+                            workspace_id: row.get(0)?,
+                            settings_revision: revision.try_into().map_err(|_| {
+                                rusqlite::Error::IntegralValueOutOfRange(1, revision)
+                            })?,
+                            language: row.get(2)?,
+                            created_at: row.get(3)?,
+                            updated_at: row.get(4)?,
+                        })
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| Error::Store("Workspace Memory settings are missing".to_string()))?;
+            validate_workspace_memory_settings_record(&current, workspace_id)?;
+            let current_revision = current.settings_revision;
+            if current_revision != expected_revision {
+                return Err(Error::WorkspaceConfigConflict(format!(
+                    "Workspace Memory settings revision changed: expected {expected_revision}, current {current_revision}"
+                )));
+            }
+            if current.language == language {
+                tx.commit()?;
+                return Ok(current);
+            }
+            let next_revision = current_revision.checked_add(1).ok_or_else(|| {
+                Error::InvalidInput("Workspace Memory settings revision overflow".to_string())
+            })?;
+            let now = chrono::Utc::now().to_rfc3339();
+            tx.execute(
+                "UPDATE workspace_memory_settings \
+                 SET settings_revision = ?2, language = ?3, updated_at = ?4 \
+                 WHERE workspace_id = ?1",
+                params![workspace_id, next_revision as i64, language, now],
+            )?;
+            let record = tx.query_row(
+                "SELECT workspace_id, settings_revision, language, created_at, updated_at \
+                 FROM workspace_memory_settings WHERE workspace_id = ?1",
+                params![workspace_id],
+                |row| {
+                    let revision = row.get::<_, i64>(1)?;
+                    Ok(WorkspaceMemorySettingsRecord {
+                        workspace_id: row.get(0)?,
+                        settings_revision: revision as u64,
+                        language: row.get(2)?,
+                        created_at: row.get(3)?,
+                        updated_at: row.get(4)?,
+                    })
+                },
+            )?;
+            tx.commit()?;
+            Ok(record)
+        })
+    }
+
     pub(crate) fn reserve_worker_create(
         &self,
         workspace_id: &str,
         runtime_id: &str,
         allocation_key: &str,
-        create_fingerprint: &str,
-    ) -> Result<WorkerId> {
-        if allocation_key.trim().is_empty() || create_fingerprint.trim().is_empty() {
+        request_fingerprint: &str,
+        current_memory_settings: &WorkspaceMemorySettingsRecord,
+    ) -> Result<WorkerCreateReservation> {
+        if allocation_key.trim().is_empty() || request_fingerprint.trim().is_empty() {
             return Err(Error::InvalidInput(
                 "Worker create allocation key and fingerprint must be non-empty".to_string(),
             ));
         }
+        validate_workspace_memory_settings_record(current_memory_settings, workspace_id)?;
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let existing = tx
                 .query_row(
-                    "SELECT worker_id, runtime_id, create_fingerprint \
+                    "SELECT worker_id, runtime_id, request_fingerprint, create_fingerprint, \
+                            memory_settings_revision, memory_language \
                      FROM worker_create_reservations \
                      WHERE workspace_id = ?1 AND allocation_key = ?2",
                     params![workspace_id, allocation_key],
@@ -1164,24 +1288,80 @@ impl SqliteWorkspaceStore {
                         Ok((
                             row.get::<_, String>(0)?,
                             row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<i64>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
                         ))
                     },
                 )
                 .optional()?;
-            if let Some((worker_id, reserved_runtime_id, reserved_fingerprint)) = existing {
-                if reserved_runtime_id != runtime_id || reserved_fingerprint != create_fingerprint {
+            if let Some((worker_id, reserved_runtime_id, stored_request_fingerprint, create_fingerprint, revision, language)) = existing {
+                if reserved_runtime_id != runtime_id
+                    || stored_request_fingerprint.as_deref() != Some(request_fingerprint)
+                {
                     return Err(Error::InvalidInput(format!(
-                        "Worker create allocation `{allocation_key}` was already used with different input"
+                        "Worker create allocation {allocation_key} was already used with different input"
                     )));
                 }
-                return worker_id.parse::<WorkerId>().map_err(|_| {
-                    Error::Store(format!(
-                        "Worker create allocation `{allocation_key}` has a non-UUIDv7 worker id"
+                let revision = revision.ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "Worker create allocation {allocation_key} has no persisted Memory settings snapshot"
                     ))
+                })?;
+                let language = language.ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "Worker create allocation {allocation_key} has no persisted Memory language"
+                    ))
+                })?;
+                let worker_id = worker_id.parse::<WorkerId>().map_err(|_| {
+                    Error::Store(format!(
+                        "Worker create allocation {allocation_key} has a non-UUIDv7 worker id"
+                    ))
+                })?;
+                let snapshot = manifest::WorkspaceMemorySettingsSnapshot {
+                    workspace_id: workspace_id.to_string(),
+                    settings_revision: revision.try_into().map_err(|_| {
+                        rusqlite::Error::IntegralValueOutOfRange(4, revision)
+                    })?,
+                    language,
+                };
+                validate_workspace_memory_settings_snapshot(&snapshot, workspace_id)?;
+                return Ok(WorkerCreateReservation {
+                    worker_id,
+                    create_fingerprint,
+                    memory_settings: snapshot,
                 });
             }
 
+            let (authoritative_revision, authoritative_language) = tx
+                .query_row(
+                    "SELECT settings_revision, language FROM workspace_memory_settings WHERE workspace_id = ?1",
+                    params![workspace_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| Error::Store("Workspace Memory settings are missing".to_string()))?;
+            let authoritative_revision: u64 = authoritative_revision.try_into().map_err(|_| {
+                rusqlite::Error::IntegralValueOutOfRange(0, authoritative_revision)
+            })?;
+            if authoritative_revision != current_memory_settings.settings_revision
+                || authoritative_language != current_memory_settings.language
+            {
+                return Err(Error::WorkspaceConfigConflict(
+                    "Workspace Memory settings changed while the Worker create reservation was being accepted"
+                        .to_string(),
+                ));
+            }
+
+            let snapshot = manifest::WorkspaceMemorySettingsSnapshot {
+                workspace_id: workspace_id.to_string(),
+                settings_revision: authoritative_revision,
+                language: authoritative_language,
+            };
+            validate_workspace_memory_settings_snapshot(&snapshot, workspace_id)?;
+            let create_fingerprint =
+                bound_worker_create_fingerprint(request_fingerprint, &snapshot);
             let worker_id = WorkerId::now_v7();
             let now = chrono::Utc::now().to_rfc3339();
             allocate_resource_key(
@@ -1194,19 +1374,27 @@ impl SqliteWorkspaceStore {
             tx.execute(
                 "INSERT INTO worker_create_reservations(\
                     workspace_id, allocation_key, worker_id, runtime_id, create_fingerprint,\
-                    state, created_at, updated_at\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?6)",
+                    state, created_at, updated_at, request_fingerprint,\
+                    memory_settings_revision, memory_language\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?6, ?7, ?8, ?9)",
                 params![
                     workspace_id,
                     allocation_key,
                     worker_id.to_string(),
                     runtime_id,
                     create_fingerprint,
-                    now
+                    now,
+                    request_fingerprint,
+                    snapshot.settings_revision as i64,
+                    snapshot.language,
                 ],
             )?;
             tx.commit()?;
-            Ok(worker_id)
+            Ok(WorkerCreateReservation {
+                worker_id,
+                create_fingerprint,
+                memory_settings: snapshot,
+            })
         })
     }
 
@@ -1375,8 +1563,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     }
 
     async fn upsert_workspace(&self, record: &WorkspaceRecord) -> Result<()> {
-        self.with_conn(|conn| {
-            conn.execute(
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
                 r#"INSERT INTO workspaces (
                     workspace_id, owner_account_id, display_name, state, created_at, updated_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -1394,6 +1583,13 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     record.updated_at,
                 ],
             )?;
+            tx.execute(
+                r#"INSERT OR IGNORE INTO workspace_memory_settings (
+                    workspace_id, settings_revision, language, created_at, updated_at
+                ) VALUES (?1, 1, 'English', ?2, ?3)"#,
+                params![record.workspace_id, record.created_at, record.updated_at],
+            )?;
+            tx.commit()?;
             Ok(())
         })?;
         self.materialize_workspace_config(&record.workspace_id, &record.created_at)
@@ -1514,6 +1710,16 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                         record.workspace.owner_account_id,
                         record.workspace.display_name,
                         record.workspace.state,
+                        record.workspace.created_at,
+                        record.workspace.updated_at,
+                    ],
+                )?;
+                tx.execute(
+                    r#"INSERT INTO workspace_memory_settings (
+                        workspace_id, settings_revision, language, created_at, updated_at
+                    ) VALUES (?1, 1, 'English', ?2, ?3)"#,
+                    params![
+                        record.workspace.workspace_id,
                         record.workspace.created_at,
                         record.workspace.updated_at,
                     ],
@@ -5730,6 +5936,67 @@ fn collect_reference_diagnostics(
     Ok(())
 }
 
+fn validate_workspace_memory_settings_snapshot(
+    snapshot: &manifest::WorkspaceMemorySettingsSnapshot,
+    expected_workspace_id: &str,
+) -> Result<()> {
+    if snapshot.workspace_id != expected_workspace_id
+        || snapshot.settings_revision == 0
+        || !manifest::is_normalized_workspace_memory_language(&snapshot.language)
+    {
+        return Err(Error::Store(
+            "Workspace Memory settings are corrupt or belong to another Workspace".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_workspace_memory_settings_record(
+    record: &WorkspaceMemorySettingsRecord,
+    expected_workspace_id: &str,
+) -> Result<()> {
+    validate_workspace_memory_settings_snapshot(
+        &manifest::WorkspaceMemorySettingsSnapshot {
+            workspace_id: record.workspace_id.clone(),
+            settings_revision: record.settings_revision,
+            language: record.language.clone(),
+        },
+        expected_workspace_id,
+    )
+}
+
+fn normalize_workspace_memory_language(language: &str) -> Result<String> {
+    let language = language.trim();
+    if !manifest::is_normalized_workspace_memory_language(language) {
+        return Err(Error::InvalidInput(format!(
+            "Workspace Memory language must be a non-empty UTF-8 string of at most {} characters without control characters",
+            manifest::MAX_WORKSPACE_MEMORY_LANGUAGE_CHARS
+        )));
+    }
+    Ok(language.to_string())
+}
+
+fn bound_worker_create_fingerprint(
+    request_fingerprint: &str,
+    snapshot: &manifest::WorkspaceMemorySettingsSnapshot,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"workspace-worker-create-v2\0");
+    digest.update(request_fingerprint.as_bytes());
+    digest.update(b"\0");
+    digest.update(snapshot.workspace_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(snapshot.settings_revision.to_be_bytes());
+    digest.update(b"\0");
+    digest.update(snapshot.language.as_bytes());
+    let encoded = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("sha256:{encoded}")
+}
+
 fn current_schema_version(conn: &Connection) -> Result<i64> {
     conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM __yoi_schema_migrations",
@@ -6370,6 +6637,42 @@ fn add_workspace_resource_human_keys(conn: &Connection) -> Result<()> {
             "#,
         )?;
     }
+    Ok(())
+}
+
+fn create_workspace_memory_settings_authority(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE workspace_memory_settings (
+            workspace_id TEXT PRIMARY KEY NOT NULL,
+            settings_revision INTEGER NOT NULL CHECK(settings_revision >= 1),
+            language TEXT NOT NULL CHECK(length(trim(language)) > 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+        );
+
+        INSERT INTO workspace_memory_settings (
+            workspace_id,
+            settings_revision,
+            language,
+            created_at,
+            updated_at
+        )
+        SELECT workspace_id, 1, 'English', created_at, updated_at
+        FROM workspaces;
+
+        ALTER TABLE worker_create_reservations
+            ADD COLUMN request_fingerprint TEXT;
+        ALTER TABLE worker_create_reservations
+            ADD COLUMN memory_settings_revision INTEGER;
+        ALTER TABLE worker_create_reservations
+            ADD COLUMN memory_language TEXT;
+
+        UPDATE worker_create_reservations
+        SET request_fingerprint = create_fingerprint;
+        "#,
+    )?;
     Ok(())
 }
 
@@ -7682,7 +7985,7 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
         assert_eq!(plan.current_schema_version, 36);
-        assert_eq!(plan.target_schema_version, 41);
+        assert_eq!(plan.target_schema_version, 42);
         assert!(plan.migration_required);
         assert_eq!(plan.worker_count, 1);
         assert_eq!(plan.mappings[0].legacy_worker_id, 7);
@@ -7696,7 +7999,7 @@ mod tests {
         store
             .with_conn(|conn| {
                 assert!(table_exists(conn, "worker_diagnostics_archives")?);
-                assert_eq!(current_schema_version(conn)?, 41);
+                assert_eq!(current_schema_version(conn)?, 42);
                 Ok(())
             })
             .unwrap();
@@ -7775,7 +8078,7 @@ mod tests {
                 ),
             ]
         );
-        assert_eq!(current_schema_version(&conn).unwrap(), 41);
+        assert_eq!(current_schema_version(&conn).unwrap(), 42);
         let foreign_key_error: Option<String> = conn
             .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
             .optional()
@@ -7904,7 +8207,7 @@ INSERT INTO worker_orphan_diagnostics (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 41);
+        assert_eq!(current_schema_version(&conn).unwrap(), 42);
         assert!(!table_exists(&conn, "worker_control_delegation_operations").unwrap());
         let controller_worker_id: String = conn
             .query_row(
@@ -8022,8 +8325,34 @@ INSERT INTO worker_orphan_diagnostics (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 41);
+        assert_eq!(current_schema_version(&conn).unwrap(), 42);
         assert!(table_exists(&conn, "worker_workdir_attachment_reservations").unwrap());
+    }
+
+    #[test]
+    fn schema_v42_initializes_existing_workspaces_with_explicit_english_memory_settings() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_sqlite(&conn).unwrap();
+        apply_migrations_through(&conn, 41).unwrap();
+        conn.execute(
+            "INSERT INTO workspaces (workspace_id, display_name, state, created_at, updated_at) \
+             VALUES ('workspace-existing', 'Existing', 'active', '1', '1')",
+            [],
+        )
+        .unwrap();
+
+        apply_migrations(&conn).unwrap();
+
+        assert_eq!(current_schema_version(&conn).unwrap(), 42);
+        let settings = conn
+            .query_row(
+                "SELECT settings_revision, language FROM workspace_memory_settings \
+                 WHERE workspace_id = 'workspace-existing'",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(settings, (1, "English".to_string()));
     }
 
     #[test]
@@ -8055,7 +8384,7 @@ CREATE TABLE flow_events (event_id TEXT PRIMARY KEY);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 41);
+        assert_eq!(current_schema_version(&conn).unwrap(), 42);
         assert!(table_exists(&conn, "flow_sources").unwrap());
         assert!(table_exists(&conn, "flow_source_revisions").unwrap());
         assert!(!table_exists(&conn, "flow_instances").unwrap());
@@ -8122,7 +8451,7 @@ INSERT INTO worker_workdir_attachment_reservations (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 41);
+        assert_eq!(current_schema_version(&conn).unwrap(), 42);
         let repositories_sql: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'repositories'",
@@ -8300,7 +8629,7 @@ INSERT INTO workdir_registry (
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 41);
+        assert_eq!(store.schema_version().await.unwrap(), 42);
         assert!(
             !store
                 .with_conn(|conn| table_exists(conn, "worker_workspace_credentials"))
@@ -8317,7 +8646,7 @@ INSERT INTO workdir_registry (
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 41);
+        assert_eq!(reopened.schema_version().await.unwrap(), 42);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -8386,22 +8715,54 @@ INSERT INTO workdir_registry (
             .await
             .unwrap();
 
+        let memory_settings = store.get_workspace_memory_settings("workspace-a").unwrap();
+        assert_eq!(memory_settings.settings_revision, 1);
+        assert_eq!(memory_settings.language, "English");
         let reserved = store
-            .reserve_worker_create("workspace-a", "arcadia", "operation-1", "sha256:one")
+            .reserve_worker_create(
+                "workspace-a",
+                "arcadia",
+                "operation-1",
+                "sha256:one",
+                &memory_settings,
+            )
             .unwrap();
         assert_eq!(
-            reserved.as_uuid().get_version(),
+            reserved.worker_id.as_uuid().get_version(),
             Some(uuid::Version::SortRand)
         );
+        assert_eq!(reserved.memory_settings.settings_revision, 1);
+        assert_eq!(reserved.memory_settings.language, "English");
+        let unchanged_memory_settings = store
+            .update_workspace_memory_settings("workspace-a", 1, " English ")
+            .unwrap();
+        assert_eq!(unchanged_memory_settings, memory_settings);
+        let updated_memory_settings = store
+            .update_workspace_memory_settings("workspace-a", 1, " Français ")
+            .unwrap();
+        assert_eq!(updated_memory_settings.settings_revision, 2);
+        assert_eq!(updated_memory_settings.language, "Français");
         assert_eq!(
             store
-                .reserve_worker_create("workspace-a", "arcadia", "operation-1", "sha256:one")
+                .reserve_worker_create(
+                    "workspace-a",
+                    "arcadia",
+                    "operation-1",
+                    "sha256:one",
+                    &updated_memory_settings,
+                )
                 .unwrap(),
             reserved
         );
         assert!(
             store
-                .reserve_worker_create("workspace-a", "arcadia", "operation-1", "sha256:different")
+                .reserve_worker_create(
+                    "workspace-a",
+                    "arcadia",
+                    "operation-1",
+                    "sha256:different",
+                    &updated_memory_settings,
+                )
                 .is_err()
         );
         assert_eq!(
@@ -8409,7 +8770,7 @@ INSERT INTO workdir_registry (
                 .resource_key(
                     "workspace-a",
                     WorkspaceResourceKind::Worker,
-                    &reserved.to_string()
+                    &reserved.worker_id.to_string()
                 )
                 .unwrap()
                 .as_deref(),
@@ -8419,37 +8780,85 @@ INSERT INTO workdir_registry (
             store
                 .resolve_resource_reference("workspace-a", WorkspaceResourceKind::Worker, "W-1")
                 .unwrap(),
-            Some(reserved.to_string())
+            Some(reserved.worker_id.to_string())
         );
         let second = store
-            .reserve_worker_create("workspace-a", "arcadia", "operation-2", "sha256:two")
+            .reserve_worker_create(
+                "workspace-a",
+                "arcadia",
+                "operation-2",
+                "sha256:two",
+                &updated_memory_settings,
+            )
             .unwrap();
+        assert_eq!(second.memory_settings.settings_revision, 2);
         assert_eq!(
             store
                 .resource_key(
                     "workspace-a",
                     WorkspaceResourceKind::Worker,
-                    &second.to_string()
+                    &second.worker_id.to_string()
                 )
                 .unwrap()
                 .as_deref(),
             Some("W-2")
         );
         store
-            .complete_worker_create_reservation("workspace-a", reserved)
+            .complete_worker_create_reservation("workspace-a", reserved.worker_id)
             .unwrap();
         let state: String = store
             .with_conn(|conn| {
                 conn.query_row(
                     "SELECT state FROM worker_create_reservations \
                      WHERE workspace_id = 'workspace-a' AND worker_id = ?1",
-                    [reserved.to_string()],
+                    [reserved.worker_id.to_string()],
                     |row| row.get(0),
                 )
                 .map_err(Error::from)
             })
             .unwrap();
         assert_eq!(state, "created");
+
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE workspace_memory_settings SET language = ' English ' \
+                     WHERE workspace_id = 'workspace-a'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.get_workspace_memory_settings("workspace-a").is_err());
+        assert!(
+            store
+                .update_workspace_memory_settings("workspace-a", 2, "Spanish")
+                .is_err()
+        );
+        let mut corrupt = updated_memory_settings.clone();
+        corrupt.language = " English ".to_string();
+        assert!(
+            store
+                .reserve_worker_create(
+                    "workspace-a",
+                    "arcadia",
+                    "operation-corrupt",
+                    "sha256:corrupt",
+                    &corrupt,
+                )
+                .is_err()
+        );
+
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "DELETE FROM workspace_memory_settings WHERE workspace_id = 'workspace-a'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.get_workspace_memory_settings("workspace-a").is_err());
     }
 
     #[tokio::test]
@@ -8816,13 +9225,13 @@ INSERT INTO worker_registry (
         configure_sqlite(&conn).unwrap();
         apply_migrations(&conn).unwrap();
         conn.execute(
-            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (42, 'future')",
+            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (43, 'future')",
             [],
         )
         .unwrap();
 
         let error = apply_migrations(&conn).unwrap_err().to_string();
-        assert!(error.contains("schema version 42 is newer"), "{error}");
+        assert!(error.contains("schema version 43 is newer"), "{error}");
         assert!(error.contains("refusing to serve"), "{error}");
     }
 
@@ -9043,7 +9452,7 @@ VALUES ('workspace-b', 'ticket-b', 'related', 'ticket-a', NULL, 'tester', '2026-
 
         apply_migrations(&mut conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 41);
+        assert_eq!(current_schema_version(&conn).unwrap(), 42);
         let workspace_id: Option<String> = conn
             .query_row(
                 "SELECT workspace_id FROM trusted_runtime_records WHERE runtime_id = 'runtime-a'",
@@ -9660,7 +10069,7 @@ WHERE workspace_id = 'workspace-a'
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 41);
+        assert_eq!(store.schema_version().await.unwrap(), 42);
 
         store
             .with_conn(|conn| {
@@ -9849,7 +10258,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 41);
+        assert_eq!(store.schema_version().await.unwrap(), 42);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -9915,7 +10324,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 41);
+        assert_eq!(store.schema_version().await.unwrap(), 42);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -10317,7 +10726,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 41);
+        assert_eq!(store.schema_version().await.unwrap(), 42);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),

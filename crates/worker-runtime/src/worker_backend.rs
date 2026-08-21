@@ -642,6 +642,60 @@ fn runtime_local_workdir_session(
     ))
 }
 
+fn bind_workspace_memory_settings(
+    manifest: &mut manifest::WorkerManifest,
+    request: &CreateWorkerRequest,
+) -> Result<(), String> {
+    let Some(snapshot) = request.memory_settings.as_ref() else {
+        if request.workspace_api.is_some() {
+            return Err(
+                "Workspace Worker request is missing its bound Memory settings snapshot"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    };
+    if let Some(workspace_api) = request.workspace_api.as_ref()
+        && snapshot.workspace_id != workspace_api.workspace_id
+    {
+        return Err(format!(
+            "Memory settings workspace {} does not match Workspace API scope {}",
+            snapshot.workspace_id, workspace_api.workspace_id
+        ));
+    }
+    manifest
+        .memory
+        .get_or_insert_with(manifest::MemoryConfig::default)
+        .bind_workspace_settings(snapshot);
+    Ok(())
+}
+
+fn validate_worker_memory_settings(
+    manifest: &manifest::WorkerManifest,
+    request: &CreateWorkerRequest,
+) -> Result<(), String> {
+    let Some(expected) = request.memory_settings.as_ref() else {
+        return Ok(());
+    };
+    let actual = manifest
+        .memory
+        .as_ref()
+        .and_then(manifest::MemoryConfig::workspace_settings)
+        .ok_or_else(|| {
+            "Workspace Worker restored without its bound Memory settings snapshot".to_string()
+        })?;
+    if &actual != expected {
+        return Err(format!(
+            "Workspace Worker Memory settings snapshot mismatch: expected {} revision {}, restored {} revision {}",
+            expected.workspace_id,
+            expected.settings_revision,
+            actual.workspace_id,
+            actual.settings_revision
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
     fn observe_workspace_prompt_projection(
@@ -696,7 +750,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         let archive = self
             .resolve_profile_source_archive(&request.request.profile_source)
             .await?;
-        let (manifest, mut loader) = {
+        let (mut manifest, mut loader) = {
             let manifest = archive
                 .resolve_profile(selector, &worker_root, &worker_name)
                 .map_err(|err| format!("failed to resolve profile source archive: {err}"))?;
@@ -714,6 +768,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 )?
             }
         };
+        bind_workspace_memory_settings(&mut manifest, &request.request)?;
         if let Some(bundle) = request.config_bundle.as_ref()
             && let Some(resolution) =
                 self.observe_bundle_prompt_projection(bundle, observation_workspace_id.as_deref())?
@@ -750,6 +805,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         )
         .await
         .map_err(|err| format!("failed to create Worker from profile: {err}"))?;
+        validate_worker_memory_settings(worker.manifest(), &request.request)?;
         if let Some(binding) = request.working_directory.as_ref() {
             worker.bind_workdir_session(Some(runtime_local_workdir_session(
                 &binding.working_directory.id,
@@ -856,7 +912,8 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             self.embedded_worker_mutation_dispatcher.as_ref(),
             Some(self.prompt_projection_cache.clone()),
         );
-        let (manifest, loader) = Self::restore_fallback_manifest(&worker_name)?;
+        let (mut manifest, loader) = Self::restore_fallback_manifest(&worker_name)?;
+        bind_workspace_memory_settings(&mut manifest, &request.request)?;
 
         let worker_aggregate_dir = self.worker_aggregate_dir(&request.worker_ref)?;
         let session_dir = worker_aggregate_dir.join("session");
@@ -924,6 +981,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             }
             Err(err) => return Err(format!("failed to restore Worker from metadata: {err}")),
         };
+        validate_worker_memory_settings(worker.manifest(), &request.request)?;
         let flow_transition_enabled = worker.manifest().feature.flow.enabled;
         if let Some(binding) = request.working_directory.as_ref() {
             worker.bind_workdir_session(Some(runtime_local_workdir_session(
@@ -2504,6 +2562,7 @@ mod tests {
             worker_observation_enabled: false,
             worker_observation_grants: Vec::new(),
             workspace_api: None,
+            memory_settings: None,
         }
     }
 
@@ -2765,7 +2824,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(worker_allocation)]
-    async fn restore_pending_workspace_worker_without_system_prompt_fails_closed() {
+    async fn restore_legacy_workspace_worker_without_manifest_snapshot_requires_replacement() {
         let root = tempfile::tempdir().unwrap();
         let runtime_store_dir = root.path().join("runtime");
         let worker_ref = WorkerRef::new(crate::identity::WorkerId::from_legacy_u64(1));
@@ -2774,32 +2833,6 @@ mod tests {
             .join(worker_ref.worker_id.to_string());
         let worker_name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&worker_ref);
         let session_id = session_store::new_session_id();
-        let manifest = manifest::WorkerManifest::from_toml(&format!(
-            r#"
-                [worker]
-                name = "{}"
-                pwd = "{}"
-
-                [model]
-                scheme = "anthropic"
-                model_id = "test-model"
-                auth = {{ kind = "none" }}
-
-                [engine]
-                max_tokens = 100
-
-                [feature.flow]
-                enabled = true
-
-                [[scope.allow]]
-                target = "{}"
-                permission = "write"
-            "#,
-            worker_name,
-            root.path().display(),
-            root.path().display(),
-        ))
-        .unwrap();
         WorkerAggregateStore::new(&worker_aggregate_dir, &worker_name)
             .unwrap()
             .set_active(
@@ -2807,7 +2840,7 @@ mod tests {
                 Some(session_store::WorkerActiveSegmentRef::pending_segment(
                     session_id,
                 )),
-                Some(serde_json::to_value(&manifest).unwrap()),
+                None,
             )
             .unwrap();
 
@@ -2815,6 +2848,11 @@ mod tests {
         request.workspace_api = Some(crate::catalog::WorkspaceApiRef {
             workspace_id: "workspace-restore".to_string(),
             base_url: "http://workspace.invalid".to_string(),
+        });
+        request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
+            workspace_id: "workspace-restore".to_string(),
+            settings_revision: 1,
+            language: "English".to_string(),
         });
         let identity = RuntimeIdentityMaterial::generate("runtime-restore").unwrap();
         let error = match ProfileRuntimeWorkerFactory::new(root.path())
@@ -2835,10 +2873,10 @@ mod tests {
             })
             .await
         {
-            Ok(_) => panic!("pending Workspace Worker restore unexpectedly succeeded"),
+            Ok(_) => panic!("legacy Workspace Worker restore unexpectedly succeeded"),
             Err(error) => error,
         };
-        assert!(error.contains("requires operation-owned launch material"));
+        assert!(error.contains("replacement Worker is required"), "{error}");
     }
 
     #[tokio::test]

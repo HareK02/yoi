@@ -86,6 +86,11 @@ fn create_request(name: &str) -> CreateWorkerRequest {
         worker_observation_enabled: false,
         worker_observation_grants: Vec::new(),
         workspace_api: None,
+        memory_settings: Some(manifest::WorkspaceMemorySettingsSnapshot {
+            workspace_id: "local".to_string(),
+            settings_revision: 1,
+            language: "English".to_string(),
+        }),
     }
 }
 

@@ -169,6 +169,23 @@ pub struct WorkerRestoreResponse {
     pub result: WorkerRestoreResult,
 }
 
+/// Workspace-owned Memory settings returned by the shared Server API.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceMemorySettings {
+    pub workspace_id: String,
+    pub settings_revision: u64,
+    pub language: String,
+}
+
+/// Compare-and-swap update for Workspace-owned Memory settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateWorkspaceMemorySettingsRequest {
+    pub expected_revision: u64,
+    pub language: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

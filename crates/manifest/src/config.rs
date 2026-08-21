@@ -748,6 +748,8 @@ impl MemoryConfig {
             query_result_limit: upper.query_result_limit.or(self.query_result_limit),
             query_excerpt_lines: upper.query_excerpt_lines.or(self.query_excerpt_lines),
             inject_summary: upper.inject_summary.or(self.inject_summary),
+            workspace_id: upper.workspace_id.or(self.workspace_id),
+            settings_revision: upper.settings_revision.or(self.settings_revision),
             language: upper.language.or(self.language),
             extract_model: upper.extract_model.or(self.extract_model),
             extract_threshold: upper.extract_threshold.or(self.extract_threshold),

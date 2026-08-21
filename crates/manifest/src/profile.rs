@@ -562,7 +562,7 @@ fn resolve_profile_value(
         mcp: profile.mcp,
         compaction,
         web: profile.web,
-        memory: profile.memory,
+        memory: profile.memory.map(Into::into),
         skills: profile.skills,
     };
     let config = WorkerManifestConfig::builtin_defaults().merge(config.resolve_paths(profile_dir));
@@ -580,6 +580,51 @@ fn resolve_profile_value(
         manifest_snapshot,
         raw_artifact,
     })
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileMemoryConfig {
+    #[serde(default)]
+    workspace_root: Option<PathBuf>,
+    #[serde(default)]
+    query_result_limit: Option<usize>,
+    #[serde(default)]
+    query_excerpt_lines: Option<usize>,
+    #[serde(default)]
+    inject_summary: Option<bool>,
+    #[serde(default)]
+    extract_model: Option<ModelManifest>,
+    #[serde(default)]
+    extract_threshold: Option<u64>,
+    #[serde(default)]
+    extract_worker_max_turns: Option<u32>,
+    #[serde(default)]
+    consolidation_model: Option<ModelManifest>,
+    #[serde(default)]
+    consolidation_threshold_files: Option<usize>,
+    #[serde(default)]
+    consolidation_threshold_bytes: Option<u64>,
+}
+
+impl From<ProfileMemoryConfig> for MemoryConfig {
+    fn from(profile: ProfileMemoryConfig) -> Self {
+        Self {
+            workspace_root: profile.workspace_root,
+            query_result_limit: profile.query_result_limit,
+            query_excerpt_lines: profile.query_excerpt_lines,
+            inject_summary: profile.inject_summary,
+            workspace_id: None,
+            settings_revision: None,
+            language: None,
+            extract_model: profile.extract_model,
+            extract_threshold: profile.extract_threshold,
+            extract_worker_max_turns: profile.extract_worker_max_turns,
+            consolidation_model: profile.consolidation_model,
+            consolidation_threshold_files: profile.consolidation_threshold_files,
+            consolidation_threshold_bytes: profile.consolidation_threshold_bytes,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -612,7 +657,7 @@ struct ProfileConfig {
     #[serde(default)]
     web: Option<WebConfig>,
     #[serde(default)]
-    memory: Option<MemoryConfig>,
+    memory: Option<ProfileMemoryConfig>,
     #[serde(default)]
     skills: Option<SkillsConfig>,
 }
@@ -1331,6 +1376,34 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(resolved.manifest.worker.name, "role-worker");
+        }
+    }
+
+    #[test]
+    fn profile_rejects_workspace_memory_snapshot_authority_fields() {
+        let tmp = TempDir::new().unwrap();
+        for (field, value) in [
+            ("workspace_id", serde_json::json!("workspace-a")),
+            ("settings_revision", serde_json::json!(2)),
+            ("language", serde_json::json!("Japanese")),
+        ] {
+            let artifact = serde_json::json!({ "memory": { (field): value } });
+            let error = resolve_profile_artifact_value(
+                artifact,
+                ProfileSource::Registry {
+                    source: ProfileRegistrySource::Builtin,
+                    name: "test".to_string(),
+                    path: None,
+                    provenance: None,
+                },
+                tmp.path(),
+                "test-worker",
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("unknown field"),
+                "unexpected error for {field}: {error}"
+            );
         }
     }
 

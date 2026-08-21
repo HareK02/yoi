@@ -178,12 +178,21 @@ impl OperationCounts {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySettingsAudit {
+    pub workspace_id: String,
+    pub settings_revision: u64,
+    pub language: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerLifecycleAudit {
     pub run_id: Uuid,
     pub worker: AuditWorker,
     pub status: WorkerLifecycleStatus,
     pub trigger: AuditTrigger,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_settings: Option<MemorySettingsAudit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelAudit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -405,6 +414,7 @@ mod tests {
                 status: WorkerLifecycleStatus::Started,
                 trigger: AuditTrigger::TokenThreshold,
                 reason: "tokens_threshold_reached".to_string(),
+                memory_settings: None,
                 model: None,
                 usage: None,
                 extract: None,
