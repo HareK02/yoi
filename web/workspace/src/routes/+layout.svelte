@@ -127,7 +127,7 @@
     min-width: 0;
     min-height: 0;
     width: 100%;
-    max-width: 720px;
+    max-width: 920px;
     margin-inline: auto;
     overflow-y: auto;
     padding: var(--space-6);
