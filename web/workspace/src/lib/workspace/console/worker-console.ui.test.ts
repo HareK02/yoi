@@ -857,9 +857,10 @@ Deno.test("Web Console renders the client-projected Worker task store", async ()
       tasksComponent.includes("[~]") &&
       tasksComponent.includes("[x]") &&
       tasksComponent.includes("[-]") &&
-      tasksComponent.includes("task(s) — pending:") &&
+      tasksComponent.includes('return count === 1 ? "task" : "tasks"') &&
+      !tasksComponent.includes(", deleted: {counts.deleted}") &&
       tasksComponent.includes("task.description"),
-    "Tasks UI should mirror the TUI status marks, summary, and descriptions",
+    "Tasks UI should mirror the TUI status marks, pluralize its summary, omit the deleted count, and show descriptions",
   );
   assert(
     tasksModel.includes('name === "TaskCreate"') &&

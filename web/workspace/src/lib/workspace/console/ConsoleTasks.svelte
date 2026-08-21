@@ -28,6 +28,10 @@
       .slice(0, 3),
   );
 
+  function taskNoun(count: number): "task" | "tasks" {
+    return count === 1 ? "task" : "tasks";
+  }
+
   function mark(status: ConsoleTask["status"]): string {
     switch (status) {
       case "pending":
@@ -54,7 +58,7 @@
     {/each}
     <div class="task-summary-row">
       <span class="task-summary">
-        {counts.total} task(s) — pending: {counts.pending}, inprogress: {counts.inprogress}, completed: {counts.completed}, deleted: {counts.deleted}
+        {counts.total} {taskNoun(counts.total)} — pending: {counts.pending}, inprogress: {counts.inprogress}, completed: {counts.completed}
       </span>
       {#if workerViews.length > 1}
         <span class="worker-view-tabs" role="group" aria-label="Worker transcript view">
