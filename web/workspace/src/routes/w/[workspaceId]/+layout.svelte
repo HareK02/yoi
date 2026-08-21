@@ -26,8 +26,6 @@
   <WorkspaceSidebar
     workspace={data.workspace ?? null}
     workspaceError={data.workspaceError ?? null}
-    repositories={data.repositories ?? null}
-    repositoriesError={data.repositoriesError ?? null}
     currentPath={page.url.pathname}
   />
 {/snippet}
