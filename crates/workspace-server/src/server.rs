@@ -14492,6 +14492,7 @@ mod tests {
         >,
         materializer: worker_runtime::working_directory::LocalGitWorktreeMaterializer,
         spawn_failure: std::sync::Mutex<Option<String>>,
+        input_failure: std::sync::Mutex<Option<String>>,
         inputs: std::sync::Mutex<Vec<(worker_runtime::identity::WorkerRef, String)>>,
         protocol_methods:
             std::sync::Mutex<Vec<(worker_runtime::identity::WorkerRef, protocol::Method)>>,
@@ -14513,6 +14514,7 @@ mod tests {
                     std::env::temp_dir().join(unique),
                 ),
                 spawn_failure: std::sync::Mutex::new(None),
+                input_failure: std::sync::Mutex::new(None),
                 inputs: std::sync::Mutex::new(Vec::new()),
                 protocol_methods: std::sync::Mutex::new(Vec::new()),
             }
@@ -14520,6 +14522,10 @@ mod tests {
     }
 
     impl DeterministicExecutionBackend {
+        fn reject_inputs(&self, message: impl Into<String>) {
+            *self.input_failure.lock().unwrap() = Some(message.into());
+        }
+
         fn take_inputs(&self) -> Vec<(worker_runtime::identity::WorkerRef, String)> {
             std::mem::take(&mut *self.inputs.lock().expect("inputs lock"))
         }
@@ -14665,6 +14671,12 @@ mod tests {
                 .lock()
                 .expect("inputs lock")
                 .push((handle.worker_ref().clone(), input.content.clone()));
+            if let Some(message) = self.input_failure.lock().unwrap().clone() {
+                return worker_runtime::execution::WorkerExecutionResult::errored(
+                    worker_runtime::execution::WorkerExecutionOperation::Input,
+                    message,
+                );
+            }
             let context = self
                 .contexts
                 .lock()
@@ -15956,6 +15968,62 @@ mod tests {
                 TicketWorkflowState::Queued.as_str()
             )
         );
+
+        execution.reject_inputs("sensitive fake Runtime transport detail");
+        TICKET_NOTIFICATION_DELIVERY_WARNING_CAPTURE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|warning| warning.ticket_id != ticket_ref.id);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-yoi-runtime-id",
+            axum::http::HeaderValue::from_static(EMBEDDED_WORKER_RUNTIME_ID),
+        );
+        headers.insert(
+            "x-yoi-worker-id",
+            axum::http::HeaderValue::from_str(&source.worker.worker_id).unwrap(),
+        );
+        let _ = execute_worker_ticket_test_operation(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            headers,
+            Json(TicketBackendOperation::AddEvent {
+                id: ticket_ref.id.clone().into(),
+                event: NewTicketEvent::new(TicketEventKind::Comment, "all delivery failure update"),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            api.authority.ticket(&ticket_ref.id).unwrap().state,
+            TicketWorkflowState::Queued.as_str()
+        );
+        let warnings = TICKET_NOTIFICATION_DELIVERY_WARNING_CAPTURE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|warning| warning.ticket_id == ticket_ref.id)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings.iter().any(|warning| {
+            warning.recipient_worker_id == missing_recipient.worker_id
+                && warning.error_category == "unknown_worker"
+        }));
+        assert!(warnings.iter().any(|warning| {
+            warning.recipient_worker_id == orchestrator.worker_id
+                && warning.error_category == "runtime_rejected"
+        }));
+        let serialized = serde_json::to_string(&warnings).unwrap();
+        assert!(!serialized.contains("all delivery failure update"));
+        assert!(!serialized.contains("Ticket notification:"));
+        assert!(!serialized.contains("sensitive fake Runtime transport detail"));
+        let attempts = execution.take_inputs();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].0.worker_id.to_string(), orchestrator.worker_id);
     }
 
     #[tokio::test]
