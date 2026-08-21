@@ -357,6 +357,26 @@ Deno.test("Worker Console uses protocol observation events without transcript fe
   );
 });
 
+Deno.test("Worker Console owns its narrower centered shell width", async () => {
+  const page = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      import.meta.url,
+    ),
+  );
+  const rootLayout = await Deno.readTextFile(
+    new URL("./../../../routes/+layout.svelte", import.meta.url),
+  );
+
+  assert(
+    page.includes(".console-shell {") &&
+      page.includes("max-width: 920px;") &&
+      page.includes("margin-inline: auto;") &&
+      rootLayout.includes("max-width: 1280px;"),
+    "Root content should allow 1280px while Worker Console remains centered at 920px",
+  );
+});
+
 Deno.test("Worker Console overview activity summaries use 14px text", async () => {
   const consoleLine = await Deno.readTextFile(
     new URL("./ConsoleLineItem.svelte", import.meta.url),

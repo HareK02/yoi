@@ -1596,6 +1596,12 @@
 </div>
 
 <style>
+    .console-shell {
+        width: 100%;
+        max-width: 920px;
+        margin-inline: auto;
+    }
+
     .worker-console-shell {
         display: flex;
         flex-direction: column;
