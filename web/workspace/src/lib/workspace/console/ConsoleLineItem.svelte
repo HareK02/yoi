@@ -195,7 +195,10 @@
     display: block;
     max-width: 100%;
     min-width: 0;
+    margin: 0;
     font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 12px;
     overflow-x: auto;
     white-space: pre;
   }
