@@ -8,11 +8,12 @@ use fs_operation::{
     EditRequest, EditResult, FsPath, GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest,
     ListResult, ReadRequest, ReadResult, StatRequest, StatResult, WriteRequest, WriteResult,
 };
+use tokio::sync::broadcast;
 
 use crate::{
-    CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest, CommandStatus, Workdir,
-    WorkdirError, WorkdirSession, WorkdirSessionCapabilities, WorkdirSessionCapability,
-    WorkdirSessionHandle,
+    CommandEvent, CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest,
+    CommandSnapshot, CommandStatus, Workdir, WorkdirError, WorkdirSession,
+    WorkdirSessionCapabilities, WorkdirSessionCapability, WorkdirSessionHandle,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -520,6 +521,22 @@ impl WorkdirSession for DelegatingWorkdirSession {
         self.source.cancel_command(handle).await
     }
 
+    fn subscribe_command_events(&self) -> Option<broadcast::Receiver<CommandEvent>> {
+        self.ensure_capability(WorkdirSessionCapability::Command, "command observation")
+            .ok()?;
+        self.source.subscribe_command_events()
+    }
+
+    fn command_snapshot(&self) -> Vec<CommandSnapshot> {
+        if self
+            .ensure_capability(WorkdirSessionCapability::Command, "command observation")
+            .is_err()
+        {
+            return Vec::new();
+        }
+        self.source.command_snapshot()
+    }
+
     async fn close(&self) -> Result<(), WorkdirError> {
         self.validity.active.store(false, Ordering::Release);
         if self.closes_source {
@@ -732,6 +749,53 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn delegation_capable_session_forwards_command_telemetry() {
+        let root = TempDir::new().unwrap();
+        let parent = session(root.path());
+        let mut events = parent
+            .subscribe_command_events()
+            .expect("delegation wrapper must preserve command observation");
+        let handle = parent
+            .start_command(CommandRequest {
+                command: "printf ready; sleep 0.2; printf done".into(),
+                timeout_secs: 5,
+                output_limit: 1024,
+                tool_call_id: Some("tool-delegated".into()),
+            })
+            .await
+            .unwrap();
+
+        let first_output = loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                .await
+                .expect("delegated command telemetry should not stall")
+                .unwrap();
+            if let CommandEvent::Output { content, .. } = event {
+                break content;
+            }
+        };
+        assert_eq!(first_output, "ready");
+        let snapshots = parent.command_snapshot();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].command_id, handle.0);
+        assert_eq!(snapshots[0].status, CommandStatus::Running);
+        assert_eq!(snapshots[0].stdout.content, "ready");
+
+        let output = parent
+            .command_output(CommandOutputRequest {
+                handle,
+                cursor: 0,
+                limit: 1024,
+                wait: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.status, CommandStatus::Completed);
+        assert_eq!(output.content, "readydone");
+        assert!(parent.command_snapshot().is_empty());
+    }
+
     #[test]
     fn non_recursive_rule_covers_target_and_direct_children_only() {
         let rule = WorkdirDelegationRule {
@@ -776,6 +840,8 @@ mod tests {
                 .capabilities
                 .supports(WorkdirSessionCapability::Command)
         );
+        assert!(child.scoped_session.subscribe_command_events().is_none());
+        assert!(child.scoped_session.command_snapshot().is_empty());
     }
 
     #[cfg(unix)]
