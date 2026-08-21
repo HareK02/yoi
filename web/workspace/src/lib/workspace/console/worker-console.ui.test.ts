@@ -375,8 +375,8 @@ Deno.test("Worker Console renders markdown only for message rows", async () => {
       consoleLine.includes(
         ".console-line.tool.tool-bash .console-plain-text",
       ) &&
-      consoleLine.includes("font-size: 14px;") &&
-      consoleLine.includes("line-height: 1.2;") &&
+      consoleLine.includes("font-size: 15px;") &&
+      consoleLine.includes("line-height: 1;") &&
       consoleLine.includes("{:else if shouldRenderMarkdown(item)}") &&
       consoleLine.includes("<RichMarkdown text={item.body || '—'} />") &&
       !consoleLine.includes("{@html"),
