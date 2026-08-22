@@ -1220,6 +1220,15 @@ impl SqliteWorkspaceStore {
                 "materialize {assignment_worker_tombstone_repairs} legacy Ticket assignment Worker tombstone(s)"
             ));
         }
+        apply_migrations_through(&candidate, 42)?;
+        if current_schema_version < 43 {
+            let stale_current = repairable_legacy_current_ticket_assignment_count(&candidate)?;
+            if stale_current > 0 {
+                repairs.push(format!(
+                    "clear {stale_current} tombstoned legacy current Ticket assignment pointer(s)"
+                ));
+            }
+        }
         apply_migrations_through(&candidate, i64::MAX)?;
         ticket::migrate_sqlite_ticket_schema(&candidate)?;
         merge_request::migrate(&candidate).map_err(|error| Error::Store(error.to_string()))?;
@@ -7517,10 +7526,20 @@ fn create_workspace_memory_settings_authority(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn generalize_ticket_role_assignments(conn: &Connection) -> Result<()> {
-    let invalid_current: i64 = conn.query_row(
+fn repairable_legacy_current_ticket_assignment_count(conn: &Connection) -> Result<i64> {
+    let (stale_current, unclassified_current): (i64, i64) = conn.query_row(
         r#"
-        SELECT COUNT(*)
+        SELECT
+            COALESCE(SUM(CASE
+                WHEN ticket.ticket_id IS NULL OR worker.worker_id IS NULL THEN 1
+                ELSE 0
+            END), 0),
+            COALESCE(SUM(CASE
+                WHEN (ticket.ticket_id IS NULL AND ticket_tombstone.ticket_id IS NULL)
+                  OR (worker.worker_id IS NULL AND worker_tombstone.worker_id IS NULL)
+                THEN 1
+                ELSE 0
+            END), 0)
         FROM ticket_current_worker_assignments AS current
         LEFT JOIN typed_tickets AS ticket
           ON ticket.workspace_id = current.workspace_id
@@ -7529,15 +7548,50 @@ fn generalize_ticket_role_assignments(conn: &Connection) -> Result<()> {
           ON worker.workspace_id = current.workspace_id
          AND worker.runtime_id = current.runtime_id
          AND worker.worker_id = current.worker_id
-        WHERE ticket.ticket_id IS NULL OR worker.worker_id IS NULL
+        LEFT JOIN ticket_assignment_ticket_tombstones AS ticket_tombstone
+          ON ticket_tombstone.workspace_id = current.workspace_id
+         AND ticket_tombstone.ticket_id = current.ticket_id
+        LEFT JOIN ticket_assignment_worker_tombstones AS worker_tombstone
+          ON worker_tombstone.workspace_id = current.workspace_id
+         AND worker_tombstone.runtime_id = current.runtime_id
+         AND worker_tombstone.worker_id = current.worker_id
         "#,
         [],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    if invalid_current != 0 {
+    if unclassified_current != 0 {
         return Err(Error::Store(format!(
-            "migration 43 cannot classify {invalid_current} legacy current Ticket assignment(s) as valid Coder Worker principals"
+            "migration 43 cannot repair {unclassified_current} legacy current Ticket assignment(s) whose missing Ticket or Worker has no matching tombstone"
         )));
+    }
+    Ok(stale_current)
+}
+
+fn generalize_ticket_role_assignments(conn: &Connection) -> Result<()> {
+    let stale_current = repairable_legacy_current_ticket_assignment_count(conn)?;
+    if stale_current > 0 {
+        let cleared = conn.execute(
+            r#"
+            DELETE FROM ticket_current_worker_assignments AS current
+            WHERE NOT EXISTS (
+                    SELECT 1 FROM typed_tickets AS ticket
+                    WHERE ticket.workspace_id = current.workspace_id
+                      AND ticket.ticket_id = current.ticket_id
+                )
+               OR NOT EXISTS (
+                    SELECT 1 FROM worker_registry AS worker
+                    WHERE worker.workspace_id = current.workspace_id
+                      AND worker.runtime_id = current.runtime_id
+                      AND worker.worker_id = current.worker_id
+                )
+            "#,
+            [],
+        )?;
+        if i64::try_from(cleared).ok() != Some(stale_current) {
+            return Err(Error::Store(format!(
+                "migration 43 classified {stale_current} stale current Ticket assignment(s) but cleared {cleared}"
+            )));
+        }
     }
 
     conn.execute_batch(
@@ -7574,6 +7628,7 @@ fn generalize_ticket_role_assignments(conn: &Connection) -> Result<()> {
             assigned_by TEXT NOT NULL,
             assigned_at TEXT NOT NULL,
             PRIMARY KEY (workspace_id, assignment_id),
+            UNIQUE (workspace_id, ticket_id, assignment_id),
             UNIQUE (workspace_id, ticket_id, role, assignment_id),
             UNIQUE (workspace_id, ticket_id, role, assignment_id, principal_kind, principal_id, runtime_id, worker_id),
             FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
@@ -8615,6 +8670,58 @@ pub(crate) fn apply_migrations_through(conn: &Connection, through_version: i64) 
                 .map_err(|error| {
                     Error::Store(format!(
                         "migration 39 could not restore FK enforcement: {error}"
+                    ))
+                })?;
+            result?;
+            continue;
+        }
+
+        if migration.version == 43 {
+            // Other in-database authorities may reference the assignment history table. Keep
+            // those foreign keys on the canonical table name while rebuilding its role-aware
+            // schema, then validate the complete database before restoring FK enforcement.
+            conn.execute_batch("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;")?;
+            let result = (|| -> Result<()> {
+                let tx = conn.unchecked_transaction()?;
+                (migration.apply)(&tx)?;
+                let dangling_reference: Option<(String, String)> = tx
+                    .query_row(
+                        "SELECT name, sql FROM sqlite_schema \
+                         WHERE sql LIKE '%ticket_worker_assignments_v43%' LIMIT 1",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((object, sql)) = dangling_reference {
+                    return Err(Error::Store(format!(
+                        "migration 43 left a temporary Ticket assignment reference in `{object}`: {sql}"
+                    )));
+                }
+                let foreign_key_failures: i64 = tx
+                    .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                        row.get(0)
+                    })
+                    .map_err(|error| {
+                        Error::Store(format!(
+                            "migration 43 could not evaluate foreign keys: {error}"
+                        ))
+                    })?;
+                if foreign_key_failures != 0 {
+                    return Err(Error::Store(format!(
+                        "migration 43 found {foreign_key_failures} foreign key violation(s)"
+                    )));
+                }
+                tx.execute(
+                    "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+                    params![migration.version, migration.name],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })();
+            conn.execute_batch("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;")
+                .map_err(|error| {
+                    Error::Store(format!(
+                        "migration 43 could not restore FK enforcement: {error}"
                     ))
                 })?;
             result?;
@@ -10491,6 +10598,166 @@ INSERT INTO worker_registry (
                 assigned_at: "2026-09-01T00:01:00Z".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn schema_v43_clears_tombstoned_legacy_current_assignment_pointers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("legacy-v42.db");
+        let conn = Connection::open(&db_path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        apply_migrations_through(&conn, 42).unwrap();
+        conn.execute_batch(
+            r#"
+            INSERT INTO workspaces (
+                workspace_id, display_name, state, created_at, updated_at
+            ) VALUES ('workspace-legacy', 'Legacy', 'active', '2026-09-01', '2026-09-01');
+            INSERT INTO typed_tickets (
+                workspace_id, ticket_id, slug, title, status, kind, priority, body,
+                workflow_state, workflow_state_explicit
+            ) VALUES
+                ('workspace-legacy', 'ticket-deleted-worker', 'deleted-worker',
+                 'Deleted Worker', 'open', 'task', 'normal', '', 'in_progress', 1),
+                ('workspace-legacy', 'ticket-deleted-ticket', 'deleted-ticket',
+                 'Deleted Ticket', 'open', 'task', 'normal', '', 'in_progress', 1);
+            INSERT INTO worker_registry (
+                workspace_id, runtime_id, worker_id, display_name, retention_state,
+                created_at, updated_at
+            ) VALUES
+                ('workspace-legacy', 'runtime-legacy',
+                 '00000000-0000-7000-8000-000000000001', 'Deleted Worker', 'normal',
+                 '2026-09-01', '2026-09-01'),
+                ('workspace-legacy', 'runtime-legacy',
+                 '00000000-0000-7000-8000-000000000002', 'Retained Worker', 'normal',
+                 '2026-09-01', '2026-09-01');
+            INSERT INTO ticket_worker_assignments (
+                workspace_id, ticket_id, assignment_id, runtime_id, worker_id,
+                assigned_by, assigned_at
+            ) VALUES
+                ('workspace-legacy', 'ticket-deleted-worker', 'assignment-deleted-worker',
+                 'runtime-legacy', '00000000-0000-7000-8000-000000000001',
+                 'legacy', '2026-09-01'),
+                ('workspace-legacy', 'ticket-deleted-ticket', 'assignment-deleted-ticket',
+                 'runtime-legacy', '00000000-0000-7000-8000-000000000002',
+                 'legacy', '2026-09-01');
+            INSERT INTO ticket_current_worker_assignments (
+                workspace_id, ticket_id, assignment_id, runtime_id, worker_id, updated_at
+            ) VALUES
+                ('workspace-legacy', 'ticket-deleted-worker', 'assignment-deleted-worker',
+                 'runtime-legacy', '00000000-0000-7000-8000-000000000001', '2026-09-01'),
+                ('workspace-legacy', 'ticket-deleted-ticket', 'assignment-deleted-ticket',
+                 'runtime-legacy', '00000000-0000-7000-8000-000000000002', '2026-09-01');
+            INSERT INTO ticket_worker_assignment_events (
+                workspace_id, ticket_id, event_id, action, assignment_id, actor, created_at
+            ) VALUES
+                ('workspace-legacy', 'ticket-deleted-worker', 'event-deleted-worker',
+                 'assigned', 'assignment-deleted-worker', 'legacy', '2026-09-01'),
+                ('workspace-legacy', 'ticket-deleted-ticket', 'event-deleted-ticket',
+                 'assigned', 'assignment-deleted-ticket', 'legacy', '2026-09-01');
+            CREATE TABLE legacy_assignment_consumer (
+                workspace_id TEXT NOT NULL,
+                ticket_id TEXT NOT NULL,
+                assignment_id TEXT NOT NULL,
+                FOREIGN KEY (workspace_id, ticket_id, assignment_id)
+                    REFERENCES ticket_worker_assignments (
+                        workspace_id, ticket_id, assignment_id
+                    )
+            );
+            INSERT INTO legacy_assignment_consumer
+            VALUES ('workspace-legacy', 'ticket-deleted-worker', 'assignment-deleted-worker');
+            DELETE FROM worker_registry
+            WHERE workspace_id = 'workspace-legacy'
+              AND worker_id = '00000000-0000-7000-8000-000000000001';
+            DELETE FROM typed_tickets
+            WHERE workspace_id = 'workspace-legacy'
+              AND ticket_id = 'ticket-deleted-ticket';
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM ticket_current_worker_assignments",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+        drop(conn);
+
+        let plan = SqliteWorkspaceStore::migration_plan(&db_path).unwrap();
+        assert!(plan.repairs.iter().any(|repair| {
+            repair == "clear 2 tombstoned legacy current Ticket assignment pointer(s)"
+        }));
+
+        let migrated = SqliteWorkspaceStore::open(&db_path).unwrap();
+        migrated
+            .with_conn(|conn| {
+                assert_eq!(current_schema_version(conn)?, 43);
+                assert_eq!(
+                    conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))?,
+                    1,
+                    "migration must restore foreign key enforcement"
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM ticket_current_worker_assignments",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    0
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM ticket_worker_assignments WHERE role = 'coder'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    2,
+                    "migration must retain assignment history"
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM ticket_worker_assignment_events WHERE role = 'coder'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    2,
+                    "migration must retain assignment events"
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM ticket_assignment_worker_tombstones",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    1
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM ticket_assignment_ticket_tombstones",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    1
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM legacy_assignment_consumer",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    1,
+                    "migration must preserve external assignment history references"
+                );
+                let foreign_key_failures: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                        row.get(0)
+                    })?;
+                assert_eq!(foreign_key_failures, 0);
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[tokio::test]
