@@ -16,6 +16,7 @@ pub mod spawn;
 pub mod target;
 pub mod ticket_role;
 mod worker_client;
+mod workspace_product;
 
 pub use backend_auth::{
     BackendAuthClientError, BackendAuthTarget, DeviceLoginPollResponse, DeviceLoginStartResponse,
@@ -36,9 +37,9 @@ pub use backend_workspace::{
 };
 pub use runtime_command::WorkerRuntimeCommand;
 pub use target::{
-    BackendTarget, Dashboard, LocalTarget, Target, TargetError, TargetKind, WorkerByName,
-    WorkerConnection, WorkerConnectionSelector, WorkerList, WorkerListRequest, WorkerResume,
-    WorkerSpawn,
+    BackendTarget, Dashboard, LocalTarget, ResolvedTarget, Target, TargetError, TargetKind,
+    WorkerByName, WorkerConnection, WorkerConnectionSelector, WorkerList, WorkerListRequest,
+    WorkerResume, WorkerSpawn,
 };
 
 pub use spawn::{
@@ -52,3 +53,5 @@ pub use ticket_role::{
     plan_ticket_role_launch_with_config,
 };
 pub use worker_client::WorkerClient;
+pub use workspace_api::{ObjectiveDetail, ObjectiveSummary};
+pub use workspace_product::BackendWorkspaceProductClient;

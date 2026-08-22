@@ -32,6 +32,108 @@ pub struct ListResponse<T> {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct QueryPage {
+    pub limit: usize,
+    pub returned: usize,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+    pub sort: String,
+    pub source_limit: Option<usize>,
+    pub source_truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectiveEventDetail {
+    pub event_ref: String,
+    pub kind: String,
+    pub body: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectiveLinkedTicketSummary {
+    pub id: String,
+    pub resource_key: String,
+    pub title: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectiveResourceSummary {
+    pub path: String,
+    pub media_type: Option<String>,
+    pub bytes: usize,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectiveSummary {
+    pub id: String,
+    pub resource_key: String,
+    pub title: String,
+    pub state: String,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub summary: String,
+    pub linked_tickets: Vec<String>,
+    pub record_source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectiveDetail {
+    pub id: String,
+    pub resource_key: String,
+    pub title: String,
+    pub state: String,
+    pub revision: String,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub linked_tickets: Vec<String>,
+    pub linked_ticket_summaries: Vec<ObjectiveLinkedTicketSummary>,
+    pub resources: Vec<ObjectiveResourceSummary>,
+    pub body: String,
+    pub body_truncated: bool,
+    pub events: Vec<ObjectiveEventDetail>,
+    pub event_page: QueryPage,
+    pub record_source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectiveCreateRequest {
+    pub title: String,
+    #[serde(default)]
+    pub body_md: String,
+    #[serde(default = "default_objective_state")]
+    pub state: String,
+    #[serde(default)]
+    pub linked_tickets: Vec<String>,
+}
+
+fn default_objective_state() -> String {
+    "active".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ObjectiveEditRequest {
+    pub title: Option<String>,
+    pub old_string: Option<String>,
+    pub new_string: Option<String>,
+    #[serde(default)]
+    pub replace_all: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectiveStateRequest {
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectiveLinkTicketRequest {
+    pub ticket_id: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeSourceKind {

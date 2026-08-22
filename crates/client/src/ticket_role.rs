@@ -743,6 +743,7 @@ mod tests {
             },
             status: WorkerStatus::Idle,
             in_flight: protocol::InFlightSnapshot::default(),
+            internal_workers: vec![],
         }
     }
 

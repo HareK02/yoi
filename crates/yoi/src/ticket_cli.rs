@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::{SecondsFormat, Utc};
+use client::{BackendWorkspaceProductClient, ResolvedTarget};
 use ticket::config::{
     TICKET_CONFIG_RELATIVE_PATH, TicketConfig, WORKSPACE_SETTINGS_RELATIVE_PATH,
     ticket_config_scaffold,
@@ -205,11 +206,32 @@ pub fn parse_ticket_args(args: &[String]) -> Result<TicketCli, TicketCliError> {
     Ok(TicketCli::Command(command))
 }
 
-pub fn run(cli: TicketCli) -> Result<TicketCliOutput, TicketCliError> {
-    let workspace = std::env::current_dir().map_err(|error| {
-        TicketCliError::new(format!("failed to resolve current directory: {error}"))
-    })?;
-    run_in_workspace(cli, &workspace)
+pub fn run(cli: TicketCli, target: ResolvedTarget) -> Result<TicketCliOutput, TicketCliError> {
+    match target {
+        ResolvedTarget::Local => {
+            let workspace = std::env::current_dir().map_err(|error| {
+                TicketCliError::new(format!("failed to resolve current directory: {error}"))
+            })?;
+            run_in_workspace(cli, &workspace)
+        }
+        ResolvedTarget::Backend {
+            base_url,
+            workspace_id,
+        } => match cli {
+            TicketCli::Help => Ok(TicketCliOutput {
+                status: TicketCliStatus::Success,
+                stdout: help_text().to_string(),
+            }),
+            TicketCli::Command(TicketCommand::Init | TicketCommand::ImportLocal) => Err(
+                TicketCliError::new("ticket init/import-local require an explicit local target"),
+            ),
+            TicketCli::Command(command) => {
+                let backend = BackendWorkspaceProductClient::new(base_url, workspace_id)
+                    .map_err(|error| TicketCliError::new(error.to_string()))?;
+                run_backend_command(command, &backend)
+            }
+        },
+    }
 }
 
 pub fn run_in_workspace(
@@ -234,20 +256,27 @@ fn run_command(
         TicketCommand::ImportLocal => import_local(workspace),
         command => {
             let backend = backend_for_workspace(workspace)?;
-            match command {
-                TicketCommand::Create(options) => create(backend.as_ref(), options),
-                TicketCommand::List(options) => list(backend.as_ref(), options),
-                TicketCommand::Show { query } => show(backend.as_ref(), query),
-                TicketCommand::Comment(options) => comment(backend.as_ref(), options),
-                TicketCommand::State(options) => state(backend.as_ref(), options),
-                TicketCommand::Close(options) => close(backend.as_ref(), options),
-                TicketCommand::Relation(options) => relation(backend.as_ref(), options),
-                TicketCommand::Doctor => doctor(backend.as_ref()),
-                TicketCommand::Init | TicketCommand::ImportLocal => {
-                    unreachable!("handled before backend setup")
-                }
-            }
+            run_backend_command(command, backend.as_ref())
         }
+    }
+}
+
+fn run_backend_command(
+    command: TicketCommand,
+    backend: &dyn TicketBackend,
+) -> Result<TicketCliOutput, TicketCliError> {
+    match command {
+        TicketCommand::Create(options) => create(backend, options),
+        TicketCommand::List(options) => list(backend, options),
+        TicketCommand::Show { query } => show(backend, query),
+        TicketCommand::Comment(options) => comment(backend, options),
+        TicketCommand::State(options) => state(backend, options),
+        TicketCommand::Close(options) => close(backend, options),
+        TicketCommand::Relation(options) => relation(backend, options),
+        TicketCommand::Doctor => doctor(backend),
+        TicketCommand::Init | TicketCommand::ImportLocal => Err(TicketCliError::new(
+            "ticket init/import-local require an explicit local target",
+        )),
     }
 }
 
@@ -1153,7 +1182,7 @@ fn default_author() -> String {
 }
 
 fn help_text() -> &'static str {
-    "yoi ticket\n\nUsage:\n  yoi ticket init\n  yoi ticket import-local\n  yoi ticket create --title <title>\n  yoi ticket list [--state active|all|planning|ready|queued|inprogress|done|closed[,..]] [--limit <n>]\n  yoi ticket show <id>\n  yoi ticket comment <id> [--role comment|plan|decision|implementation_report] (--file <path>|--message <text>)\n  yoi ticket state <id> <planning|ready|queued|inprogress|closed>\n  yoi ticket close <id> (--resolution <text>|--file <path>)\n  yoi ticket relation add --ticket <id> --kind <depends_on|blocks|related|supersedes|duplicate_of> --target <id> [--note <text>]\n  yoi ticket relation list [--ticket <id>] [--kind <kind>]\n  yoi ticket doctor\n\nOptions:\n  -h, --help    Print help\n\nBackend:\n  Tickets are stored in the workspace SQLite DB under the Yoi data directory.\n  `yoi ticket import-local` imports the legacy .yoi/tickets backend root configured in .yoi/workspace.toml.\n  `yoi ticket init` writes explicit fixed role profiles and optional [ticket].language into .yoi/workspace.toml, but does not create .yoi/tickets.\n"
+    "yoi ticket\n\nUsage:\n  yoi ticket init\n  yoi ticket import-local\n  yoi ticket create --title <title>\n  yoi ticket list [--state active|all|planning|ready|queued|inprogress|done|closed[,..]] [--limit <n>]\n  yoi ticket show <id>\n  yoi ticket comment <id> [--role comment|plan|decision|implementation_report] (--file <path>|--message <text>)\n  yoi ticket state <id> <planning|ready|queued|inprogress|closed>\n  yoi ticket close <id> (--resolution <text>|--file <path>)\n  yoi ticket relation add --ticket <id> --kind <depends_on|blocks|related|supersedes|duplicate_of> --target <id> [--note <text>]\n  yoi ticket relation list [--ticket <id>] [--kind <kind>]\n  yoi ticket doctor\n\nOptions:\n  -h, --help    Print help\n\nTargets:\n  Backend targets use the Workspace-scoped Ticket API selected by the shared client Target.\n  Explicit local targets use the workspace SQLite backend. `init` and `import-local` are local-only.\n  `yoi ticket import-local` imports the legacy .yoi/tickets backend root configured in .yoi/workspace.toml.\n  `yoi ticket init` writes explicit fixed role profiles and optional [ticket].language into .yoi/workspace.toml, but does not create .yoi/tickets.\n"
 }
 
 #[cfg(test)]

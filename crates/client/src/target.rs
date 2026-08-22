@@ -8,6 +8,24 @@ pub enum TargetKind {
     Backend,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedTarget {
+    Local,
+    Backend {
+        base_url: String,
+        workspace_id: String,
+    },
+}
+
+impl ResolvedTarget {
+    pub fn kind(&self) -> TargetKind {
+        match self {
+            Self::Local => TargetKind::Local,
+            Self::Backend { .. } => TargetKind::Backend,
+        }
+    }
+}
+
 impl fmt::Display for TargetKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -104,8 +122,14 @@ pub struct WorkerResume {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Dashboard {
-    pub runtime_command: WorkerRuntimeCommand,
+pub enum Dashboard {
+    Local {
+        runtime_command: WorkerRuntimeCommand,
+    },
+    Backend {
+        base_url: String,
+        workspace_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +180,13 @@ impl std::error::Error for TargetError {}
 pub trait Target: fmt::Debug + Send + Sync {
     fn kind(&self) -> TargetKind;
 
+    /// Resolve the target once for Workspace product-state operations.
+    ///
+    /// Backend targets must carry an explicit Workspace identity. Callers use
+    /// this value instead of rediscovering Backend/local authority from cwd or
+    /// process configuration after command dispatch.
+    fn resolve(&self) -> Result<ResolvedTarget, TargetError>;
+
     fn spawn_worker(&self) -> Result<WorkerSpawn, TargetError>;
 
     fn worker_by_name(&self) -> Result<WorkerByName, TargetError>;
@@ -177,6 +208,10 @@ impl Target for LocalTarget {
         TargetKind::Local
     }
 
+    fn resolve(&self) -> Result<ResolvedTarget, TargetError> {
+        Ok(ResolvedTarget::Local)
+    }
+
     fn spawn_worker(&self) -> Result<WorkerSpawn, TargetError> {
         Ok(WorkerSpawn {
             runtime_command: self.runtime_command()?,
@@ -196,7 +231,7 @@ impl Target for LocalTarget {
     }
 
     fn dashboard(&self) -> Result<Dashboard, TargetError> {
-        Ok(Dashboard {
+        Ok(Dashboard::Local {
             runtime_command: self.runtime_command()?,
         })
     }
@@ -231,6 +266,19 @@ impl Target for BackendTarget {
         TargetKind::Backend
     }
 
+    fn resolve(&self) -> Result<ResolvedTarget, TargetError> {
+        let workspace_id = self.workspace_id.clone().ok_or_else(|| {
+            TargetError::invalid(
+                self.kind(),
+                "workspace selection is required for Backend product-state operations",
+            )
+        })?;
+        Ok(ResolvedTarget::Backend {
+            base_url: self.base_url.clone(),
+            workspace_id,
+        })
+    }
+
     fn spawn_worker(&self) -> Result<WorkerSpawn, TargetError> {
         Err(TargetError::unsupported("Worker spawn", self.kind()))
     }
@@ -247,7 +295,16 @@ impl Target for BackendTarget {
     }
 
     fn dashboard(&self) -> Result<Dashboard, TargetError> {
-        Err(TargetError::unsupported("Dashboard", self.kind()))
+        match self.resolve()? {
+            ResolvedTarget::Backend {
+                base_url,
+                workspace_id,
+            } => Ok(Dashboard::Backend {
+                base_url,
+                workspace_id,
+            }),
+            ResolvedTarget::Local => unreachable!("BackendTarget cannot resolve as Local"),
+        }
     }
 
     fn list_workers(&self, request: WorkerListRequest) -> Result<WorkerList, TargetError> {
@@ -286,6 +343,63 @@ impl Target for BackendTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_target_resolves_workspace_scoped_product_state_authority() {
+        let target = BackendTarget::new("http://127.0.0.1:8787", Some("workspace-a"));
+
+        assert_eq!(
+            target.resolve().unwrap(),
+            ResolvedTarget::Backend {
+                base_url: "http://127.0.0.1:8787".to_string(),
+                workspace_id: "workspace-a".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn backend_target_rejects_product_state_resolution_without_workspace() {
+        let target = BackendTarget::new("http://127.0.0.1:8787", None::<String>);
+
+        assert!(
+            target
+                .resolve()
+                .unwrap_err()
+                .to_string()
+                .contains("workspace selection is required")
+        );
+    }
+
+    #[test]
+    fn local_target_resolves_local_product_state_authority() {
+        assert_eq!(LocalTarget::new().resolve().unwrap(), ResolvedTarget::Local);
+    }
+
+    #[test]
+    fn backend_target_builds_workspace_scoped_dashboard() {
+        let target = BackendTarget::new("http://127.0.0.1:8787", Some("workspace-a"));
+
+        assert_eq!(
+            target.dashboard().unwrap(),
+            Dashboard::Backend {
+                base_url: "http://127.0.0.1:8787".to_string(),
+                workspace_id: "workspace-a".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn backend_target_rejects_dashboard_without_workspace_selection() {
+        let target = BackendTarget::new("http://127.0.0.1:8787", None::<String>);
+
+        assert!(
+            target
+                .dashboard()
+                .unwrap_err()
+                .to_string()
+                .contains("workspace selection is required")
+        );
+    }
 
     #[test]
     fn backend_target_builds_worker_list() {

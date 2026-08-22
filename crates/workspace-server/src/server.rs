@@ -57,6 +57,9 @@ use workdir::workspace::{
 use worker::feature::builtin::{WorkerObservationSubject, WorkerObservationSubjectRef};
 use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest};
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
+use workspace_api::{
+    ObjectiveCreateRequest, ObjectiveEditRequest, ObjectiveLinkTicketRequest, ObjectiveStateRequest,
+};
 
 use crate::auth::{
     AuthPublicConfig, AuthenticatedUser, RequestActor, auth_error, is_expired, mint_secret, new_id,
@@ -2649,41 +2652,11 @@ struct ObjectiveListQuery {
 }
 
 #[derive(Debug, Deserialize)]
-struct ObjectiveCreateRequest {
-    title: String,
-    #[serde(default)]
-    body_md: String,
-    #[serde(default = "default_objective_state")]
-    state: String,
-    #[serde(default)]
-    linked_tickets: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ObjectiveEditRequest {
-    title: Option<String>,
-    old_string: Option<String>,
-    new_string: Option<String>,
-    #[serde(default)]
-    replace_all: bool,
-}
-
-#[derive(Debug, Deserialize)]
 struct TicketListQuery {
     limit: Option<usize>,
     cursor: Option<String>,
     /// Comma-separated workflow states. Repeated lane requests normally pass one state group.
     states: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ObjectiveStateRequest {
-    state: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ObjectiveLinkTicketRequest {
-    ticket_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2697,10 +2670,6 @@ struct ScopedObjectiveTicketPath {
     workspace_id: String,
     objective_id: String,
     ticket_id: String,
-}
-
-fn default_objective_state() -> String {
-    "active".to_string()
 }
 
 #[derive(Debug, Deserialize)]

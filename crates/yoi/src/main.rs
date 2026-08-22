@@ -34,10 +34,16 @@ enum Mode {
     MemoryLint(LintCliOptions),
     Mcp(mcp_cli::McpCliCommand),
     Plugin(plugin_cli::PluginCliCommand),
-    Objective(objective_cli::ObjectiveCli),
+    Objective {
+        cli: objective_cli::ObjectiveCli,
+        target: client::ResolvedTarget,
+    },
     Session(session_cli::SessionCli),
     WorkerCleanup(worker_cleanup_cli::WorkerCleanupCli),
-    Ticket(ticket_cli::TicketCli),
+    Ticket {
+        cli: ticket_cli::TicketCli,
+        target: client::ResolvedTarget,
+    },
     Login {
         backend_url: String,
         no_wait: bool,
@@ -119,19 +125,25 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Mode::Objective(cli) => match objective_cli::run(cli) {
-            Ok(output) => {
-                print!("{}", output.stdout);
-                match output.status {
-                    objective_cli::ObjectiveCliStatus::Success => ExitCode::SUCCESS,
-                    objective_cli::ObjectiveCliStatus::Failure => ExitCode::FAILURE,
+        Mode::Objective { cli, target } => {
+            match tokio::task::spawn_blocking(move || objective_cli::run(cli, target)).await {
+                Ok(Ok(output)) => {
+                    print!("{}", output.stdout);
+                    match output.status {
+                        objective_cli::ObjectiveCliStatus::Success => ExitCode::SUCCESS,
+                        objective_cli::ObjectiveCliStatus::Failure => ExitCode::FAILURE,
+                    }
+                }
+                Ok(Err(e)) => {
+                    eprintln!("yoi objective: {e}");
+                    ExitCode::FAILURE
+                }
+                Err(e) => {
+                    eprintln!("yoi objective: execution task failed: {e}");
+                    ExitCode::FAILURE
                 }
             }
-            Err(e) => {
-                eprintln!("yoi objective: {e}");
-                ExitCode::FAILURE
-            }
-        },
+        }
         Mode::Session(cli) => match session_cli::run(cli) {
             Ok(output) => {
                 print!("{}", output.stdout);
@@ -158,19 +170,25 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Mode::Ticket(cli) => match ticket_cli::run(cli) {
-            Ok(output) => {
-                print!("{}", output.stdout);
-                match output.status {
-                    ticket_cli::TicketCliStatus::Success => ExitCode::SUCCESS,
-                    ticket_cli::TicketCliStatus::Failure => ExitCode::FAILURE,
+        Mode::Ticket { cli, target } => {
+            match tokio::task::spawn_blocking(move || ticket_cli::run(cli, target)).await {
+                Ok(Ok(output)) => {
+                    print!("{}", output.stdout);
+                    match output.status {
+                        ticket_cli::TicketCliStatus::Success => ExitCode::SUCCESS,
+                        ticket_cli::TicketCliStatus::Failure => ExitCode::FAILURE,
+                    }
+                }
+                Ok(Err(e)) => {
+                    eprintln!("yoi ticket: {e}");
+                    ExitCode::FAILURE
+                }
+                Err(e) => {
+                    eprintln!("yoi ticket: execution task failed: {e}");
+                    ExitCode::FAILURE
                 }
             }
-            Err(e) => {
-                eprintln!("yoi ticket: {e}");
-                ExitCode::FAILURE
-            }
-        },
+        }
         Mode::WorkerRuntime(args) => worker::entrypoint::run_cli_from("yoi worker", args).await,
         Mode::Keys => tui::keys::launch().await,
         Mode::SetupModel => tui::setup_model::launch().await,
@@ -357,10 +375,18 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             return Ok(Mode::WorkerRuntime(args[1..].to_vec()));
         }
         "objective" => {
-            let _target = resolve_local_cli_connection(connection_resolver, CliCommand::Objective)?;
-            let objective_cli = objective_cli::parse_objective_args(&args[1..])
+            let workspace_root = current_dir()?;
+            let target = resolve_tui_target(
+                connection_resolver,
+                CliCommand::Objective,
+                &target_selection,
+                &workspace_root,
+            )?
+            .resolve()
+            .map_err(|error| ParseError(error.to_string()))?;
+            let cli = objective_cli::parse_objective_args(&args[1..])
                 .map_err(|e| ParseError(e.to_string()))?;
-            return Ok(Mode::Objective(objective_cli));
+            return Ok(Mode::Objective { cli, target });
         }
         "session" => {
             let _target = resolve_local_cli_connection(connection_resolver, CliCommand::Session)?;
@@ -369,10 +395,18 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             return Ok(Mode::Session(session_cli));
         }
         "ticket" => {
-            let _target = resolve_local_cli_connection(connection_resolver, CliCommand::Ticket)?;
-            let ticket_cli =
+            let workspace_root = current_dir()?;
+            let target = resolve_tui_target(
+                connection_resolver,
+                CliCommand::Ticket,
+                &target_selection,
+                &workspace_root,
+            )?
+            .resolve()
+            .map_err(|error| ParseError(error.to_string()))?;
+            let cli =
                 ticket_cli::parse_ticket_args(&args[1..]).map_err(|e| ParseError(e.to_string()))?;
-            return Ok(Mode::Ticket(ticket_cli));
+            return Ok(Mode::Ticket { cli, target });
         }
         "plugin" => {
             let _target = resolve_local_cli_connection(connection_resolver, CliCommand::Plugin)?;
@@ -1660,8 +1694,8 @@ Local commands:
   worker [WORKER_OPTIONS]      Run the local Worker runtime CLI
   worker delete <NAME>         Delete local Worker records
   worker prune                 Prune old local Worker records
-  ticket <COMMAND>             Manage Tickets through the local workspace authority
-  objective <COMMAND>          Manage Objectives through the local workspace authority
+  ticket <COMMAND>             Manage Tickets through the selected target
+  objective <COMMAND>          Manage Objectives through the selected target
   plugin <COMMAND>             Build/check/list/show plugins
   mcp <COMMAND>                Inspect configured MCP servers
   memory lint                  Lint local memory files
@@ -2105,8 +2139,64 @@ backend = "shared"
     #[test]
     fn parse_ticket_subcommand_uses_ticket_mode() {
         match parse_args_from(["ticket", "doctor"]).unwrap() {
-            Mode::Ticket(ticket_cli::TicketCli::Command(ticket_cli::TicketCommand::Doctor)) => {}
+            Mode::Ticket {
+                cli: ticket_cli::TicketCli::Command(ticket_cli::TicketCommand::Doctor),
+                target: client::ResolvedTarget::Local,
+            } => {}
             _ => panic!("expected Ticket doctor mode"),
+        }
+    }
+
+    #[test]
+    fn parse_backend_ticket_keeps_resolved_workspace_target() {
+        let resolver = FixedCliConnectionResolver {
+            backend_url: "http://fake-backend.example",
+        };
+        let args = vec![
+            "--backend".to_string(),
+            "http://ignored-by-fixed-resolver.example".to_string(),
+            "--workspace-id".to_string(),
+            "workspace-a".to_string(),
+            "ticket".to_string(),
+            "doctor".to_string(),
+        ];
+
+        match parse_args_slice_with_connection_resolver(&args, &resolver).unwrap() {
+            Mode::Ticket {
+                cli: ticket_cli::TicketCli::Command(ticket_cli::TicketCommand::Doctor),
+                target:
+                    client::ResolvedTarget::Backend {
+                        base_url,
+                        workspace_id,
+                    },
+            } => {
+                assert_eq!(base_url, "http://fake-backend.example");
+                assert_eq!(workspace_id, "workspace-a");
+            }
+            other => panic!("expected Backend Ticket mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_backend_objective_keeps_resolved_workspace_target() {
+        let resolver = FixedCliConnectionResolver {
+            backend_url: "http://fake-backend.example",
+        };
+        let args = vec![
+            "--backend".to_string(),
+            "http://ignored-by-fixed-resolver.example".to_string(),
+            "--workspace-id".to_string(),
+            "workspace-a".to_string(),
+            "objective".to_string(),
+            "doctor".to_string(),
+        ];
+
+        match parse_args_slice_with_connection_resolver(&args, &resolver).unwrap() {
+            Mode::Objective {
+                cli: objective_cli::ObjectiveCli::Command(objective_cli::ObjectiveCommand::Doctor),
+                target: client::ResolvedTarget::Backend { workspace_id, .. },
+            } => assert_eq!(workspace_id, "workspace-a"),
+            other => panic!("expected Backend Objective mode, got {other:?}"),
         }
     }
 
@@ -2124,7 +2214,10 @@ backend = "shared"
     #[test]
     fn parse_ticket_help_uses_ticket_mode() {
         match parse_args_from(["ticket", "--help"]).unwrap() {
-            Mode::Ticket(ticket_cli::TicketCli::Help) => {}
+            Mode::Ticket {
+                cli: ticket_cli::TicketCli::Help,
+                target: client::ResolvedTarget::Local,
+            } => {}
             _ => panic!("expected Ticket help mode"),
         }
     }

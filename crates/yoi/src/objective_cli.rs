@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use chrono::Utc;
+use client::{BackendWorkspaceProductClient, ResolvedTarget};
 use project_record::{allocate_record_id, unix_epoch_millis_now, validate_record_id};
 use serde::Deserialize;
 use ticket::config::TicketConfig;
@@ -167,11 +168,100 @@ pub fn parse_objective_args(args: &[String]) -> Result<ObjectiveCli, ObjectiveCl
     Ok(ObjectiveCli::Command(command))
 }
 
-pub fn run(cli: ObjectiveCli) -> Result<ObjectiveCliOutput, ObjectiveCliError> {
-    let workspace = std::env::current_dir().map_err(|error| {
-        ObjectiveCliError::new(format!("failed to resolve current directory: {error}"))
-    })?;
-    run_in_workspace(cli, &workspace)
+pub fn run(
+    cli: ObjectiveCli,
+    target: ResolvedTarget,
+) -> Result<ObjectiveCliOutput, ObjectiveCliError> {
+    match target {
+        ResolvedTarget::Local => {
+            let workspace = std::env::current_dir().map_err(|error| {
+                ObjectiveCliError::new(format!("failed to resolve current directory: {error}"))
+            })?;
+            run_in_workspace(cli, &workspace)
+        }
+        ResolvedTarget::Backend {
+            base_url,
+            workspace_id,
+        } => {
+            let backend = BackendWorkspaceProductClient::new(base_url, workspace_id)
+                .map_err(|error| ObjectiveCliError::new(error.to_string()))?;
+            run_with_backend(cli, &backend)
+        }
+    }
+}
+
+fn run_with_backend(
+    cli: ObjectiveCli,
+    backend: &BackendWorkspaceProductClient,
+) -> Result<ObjectiveCliOutput, ObjectiveCliError> {
+    match cli {
+        ObjectiveCli::Help => Ok(success(help_text().to_string())),
+        ObjectiveCli::Command(ObjectiveCommand::Create(options)) => {
+            let title = options.title.trim();
+            if title.is_empty() {
+                return Err(ObjectiveCliError::new("create --title must not be empty"));
+            }
+            let objective = backend
+                .create_objective(&workspace_api::ObjectiveCreateRequest {
+                    title: title.to_string(),
+                    body_md: objective_body_template(),
+                    state: "active".to_string(),
+                    linked_tickets: options.linked_tickets,
+                })
+                .map_err(|error| ObjectiveCliError::new(error.to_string()))?;
+            Ok(success(format!("created\t{}\n", objective.id)))
+        }
+        ObjectiveCli::Command(ObjectiveCommand::List(options)) => {
+            let response = backend
+                .list_objectives(BackendWorkspaceProductClient::default_product_list_limit())
+                .map_err(|error| ObjectiveCliError::new(error.to_string()))?;
+            let mut stdout = String::from("state\tid\ttitle\tupdated_at\tlinked_tickets\n");
+            for objective in response.items {
+                let state = ObjectiveState::parse(&objective.state);
+                if !list_state_matches(options.state, state) {
+                    continue;
+                }
+                stdout.push_str(&format!(
+                    "{}\t{}\t{}\t{}\t{}\n",
+                    objective.state,
+                    objective.id,
+                    objective.title,
+                    objective.updated_at.unwrap_or_default(),
+                    objective.linked_tickets.join(",")
+                ));
+            }
+            Ok(success(stdout))
+        }
+        ObjectiveCli::Command(ObjectiveCommand::Show { id }) => {
+            let objective = backend
+                .show_objective(&id)
+                .map_err(|error| ObjectiveCliError::new(error.to_string()))?;
+            let mut stdout = String::new();
+            stdout.push_str(&format!("# {}\n\n", objective.title));
+            stdout.push_str(&format!("State: {}\n", objective.state));
+            stdout.push_str(&format!("ID: {}\n", objective.id));
+            stdout.push_str(&format!(
+                "Updated: {}\n\n## item.md\n\n",
+                objective.updated_at.unwrap_or_default()
+            ));
+            stdout.push_str(&objective.body);
+            if !stdout.ends_with('\n') {
+                stdout.push('\n');
+            }
+            Ok(success(stdout))
+        }
+        ObjectiveCli::Command(ObjectiveCommand::Doctor) => {
+            let response = backend
+                .list_objectives(BackendWorkspaceProductClient::default_product_list_limit())
+                .map_err(|error| ObjectiveCliError::new(error.to_string()))?;
+            for objective in response.items {
+                backend
+                    .show_objective(&objective.id)
+                    .map_err(|error| ObjectiveCliError::new(error.to_string()))?;
+            }
+            Ok(success("doctor: ok\n".to_string()))
+        }
+    }
 }
 
 pub fn run_in_workspace(
@@ -453,15 +543,21 @@ fn list_state_matches(filter: ObjectiveListState, state: Option<ObjectiveState>)
     }
 }
 
+fn objective_body_template() -> String {
+    "## Goal\n\nTBD\n\n## Motivation / background\n\nTBD\n\n## Strategy / design direction\n\nTBD\n\n## Success criteria / exit conditions\n\n- TBD\n\n## Decision context\n\n- TBD\n"
+        .to_string()
+}
+
 fn render_objective_item(title: &str, linked_tickets: &[String]) -> String {
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     format!(
-        "---\ntitle: {}\nstate: {}\ncreated_at: {}\nupdated_at: {}\nlinked_tickets: {}\n---\n\n## Goal\n\nTBD\n\n## Motivation / background\n\nTBD\n\n## Strategy / design direction\n\nTBD\n\n## Success criteria / exit conditions\n\n- TBD\n\n## Decision context\n\n- TBD\n\n",
+        "---\ntitle: {}\nstate: {}\ncreated_at: {}\nupdated_at: {}\nlinked_tickets: {}\n---\n\n{}\n",
         yaml_string(title),
         yaml_string(ObjectiveState::Active.as_str()),
         yaml_string(&now),
         yaml_string(&now),
-        yaml_string_array(linked_tickets)
+        yaml_string_array(linked_tickets),
+        objective_body_template()
     )
 }
 
@@ -587,7 +683,7 @@ fn success(stdout: String) -> ObjectiveCliOutput {
 }
 
 fn help_text() -> &'static str {
-    "yoi objective\n\nUsage:\n  yoi objective create --title <TITLE> [--ticket <TICKET_ID> ...]\n  yoi objective list [--state active|paused|done|archived|all]\n  yoi objective show <OBJECTIVE_ID>\n  yoi objective doctor\n\nObjective records are lightweight project records stored as .yoi/objectives/<objective-id>/item.md. Linked Tickets must be canonical opaque Ticket IDs; Objective links are non-blocking context, not Ticket dependencies.\n"
+    "yoi objective\n\nUsage:\n  yoi objective create --title <TITLE> [--ticket <TICKET_ID> ...]\n  yoi objective list [--state active|paused|done|archived|all]\n  yoi objective show <OBJECTIVE_ID>\n  yoi objective doctor\n\nBackend targets use the Workspace-scoped Objective API selected by the shared client Target. Explicit local targets preserve the repository-file Objective backend. Linked Tickets must be canonical opaque Ticket IDs; Objective links are non-blocking context, not Ticket dependencies.\n"
 }
 
 #[cfg(test)]

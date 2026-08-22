@@ -1,4 +1,5 @@
 mod app;
+mod backend_dashboard;
 mod backend_worker_picker;
 mod backend_workspace_picker;
 mod block;
@@ -181,7 +182,13 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
             Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
         },
         LaunchMode::Panel { include_stopped } => match target.dashboard() {
-            Ok(dashboard) => dashboard::launch(dashboard.runtime_command, include_stopped).await,
+            Ok(client::Dashboard::Local { runtime_command }) => {
+                dashboard::launch(runtime_command, include_stopped).await
+            }
+            Ok(client::Dashboard::Backend {
+                base_url,
+                workspace_id,
+            }) => backend_dashboard::launch(base_url, workspace_id).await,
             Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
         },
     };

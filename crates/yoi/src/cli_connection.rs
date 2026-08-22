@@ -55,14 +55,14 @@ impl CliCommand {
             CliCommand::DefaultTui
             | CliCommand::Workers
             | CliCommand::Resume
-            | CliCommand::Panel => CliConnectionRequirement::ConnectionAware,
+            | CliCommand::Panel
+            | CliCommand::Ticket
+            | CliCommand::Objective => CliConnectionRequirement::ConnectionAware,
             CliCommand::Login => CliConnectionRequirement::BackendOnly,
             CliCommand::Keys
             | CliCommand::SetupModel
             | CliCommand::WorkerRuntime
             | CliCommand::WorkerCleanup
-            | CliCommand::Ticket
-            | CliCommand::Objective
             | CliCommand::Plugin
             | CliCommand::Mcp
             | CliCommand::MemoryLint
@@ -259,6 +259,8 @@ mod tests {
             CliCommand::Workers,
             CliCommand::Resume,
             CliCommand::Panel,
+            CliCommand::Ticket,
+            CliCommand::Objective,
         ] {
             assert_eq!(
                 command.connection_requirement(),
@@ -277,8 +279,6 @@ mod tests {
             CliCommand::SetupModel,
             CliCommand::WorkerRuntime,
             CliCommand::WorkerCleanup,
-            CliCommand::Ticket,
-            CliCommand::Objective,
             CliCommand::Plugin,
             CliCommand::Mcp,
             CliCommand::MemoryLint,

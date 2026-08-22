@@ -1,5 +1,9 @@
 use project_record::validate_record_id;
 use serde::{Deserialize, Serialize};
+pub use workspace_api::{
+    ObjectiveDetail, ObjectiveEventDetail, ObjectiveLinkedTicketSummary, ObjectiveResourceSummary,
+    ObjectiveSummary, QueryPage,
+};
 
 use crate::{Error, Result};
 
@@ -226,18 +230,6 @@ impl From<ticket::TicketRelationView> for TicketRelationView {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-pub struct QueryPage {
-    pub limit: usize,
-    pub returned: usize,
-    pub has_more: bool,
-    pub next_cursor: Option<String>,
-    pub sort: String,
-    pub source_limit: Option<usize>,
-    pub source_truncated: bool,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct ObjectiveLinkSummary {
@@ -416,63 +408,6 @@ pub struct ObjectiveQueryResponse {
 pub struct ObjectiveShowRequest {
     pub event_limit: Option<usize>,
     pub event_cursor: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-pub struct ObjectiveEventDetail {
-    pub event_ref: String,
-    pub kind: String,
-    pub body: Option<String>,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ObjectiveLinkedTicketSummary {
-    pub id: String,
-    pub resource_key: String,
-    pub title: String,
-    pub state: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ObjectiveSummary {
-    pub id: String,
-    pub resource_key: String,
-    pub title: String,
-    pub state: String,
-    pub created_at: Option<String>,
-    pub updated_at: Option<String>,
-    pub summary: String,
-    pub linked_tickets: Vec<String>,
-    pub record_source: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ObjectiveDetail {
-    pub id: String,
-    pub resource_key: String,
-    pub title: String,
-    pub state: String,
-    pub revision: String,
-    pub created_at: Option<String>,
-    pub updated_at: Option<String>,
-    pub linked_tickets: Vec<String>,
-    pub linked_ticket_summaries: Vec<ObjectiveLinkedTicketSummary>,
-    pub resources: Vec<ObjectiveResourceSummary>,
-    pub body: String,
-    pub body_truncated: bool,
-    pub events: Vec<ObjectiveEventDetail>,
-    pub event_page: QueryPage,
-    pub record_source: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ObjectiveResourceSummary {
-    pub path: String,
-    pub media_type: Option<String>,
-    pub bytes: usize,
-    pub updated_at: String,
 }
 
 #[cfg(feature = "typescript")]

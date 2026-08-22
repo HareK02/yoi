@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [features]
 default = ["typescript"]
-typescript = ["dep:ts-rs"]
+typescript = ["dep:ts-rs", "workspace-api/typescript"]
 
 [dependencies]
 async-trait.workspace = true

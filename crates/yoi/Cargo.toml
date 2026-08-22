@@ -15,6 +15,7 @@ client = { workspace = true }
 memory = { workspace = true }
 manifest = { workspace = true }
 worker = { workspace = true }
+workspace-api = { workspace = true }
 session-store = { workspace = true }
 session-analytics = { workspace = true }
 ticket = { workspace = true }
