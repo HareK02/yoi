@@ -3920,12 +3920,18 @@ async fn scoped_close_ticket(
     browser_ticket_detail(&api, &path.id)
 }
 
-fn reject_unguarded_ticket_start(operation: &TicketBackendOperation) -> Result<()> {
-    if matches!(
-        operation,
+fn generic_ticket_state_change(operation: &TicketBackendOperation) -> Option<&TicketStateChange> {
+    match operation {
         TicketBackendOperation::SetWorkflowState { change, .. }
-            if change.to == "inprogress" && change.from != "inprogress"
-    ) {
+        | TicketBackendOperation::SetStateField { change, .. } => Some(change),
+        _ => None,
+    }
+}
+
+fn reject_unguarded_ticket_start(operation: &TicketBackendOperation) -> Result<()> {
+    if generic_ticket_state_change(operation)
+        .is_some_and(|change| change.to == "inprogress" && change.from != "inprogress")
+    {
         return Err(Error::TicketAssignmentConflict(
             "inprogress is guarded by Queue acceptance or atomic ready-state Coder assignment"
                 .to_string(),
@@ -3936,8 +3942,7 @@ fn reject_unguarded_ticket_start(operation: &TicketBackendOperation) -> Result<(
 
 fn reject_unguarded_ticket_completion(operation: &TicketBackendOperation) -> Result<()> {
     reject_unguarded_ticket_start(operation)?;
-    if matches!(operation, TicketBackendOperation::SetWorkflowState { change, .. } if change.to == "done")
-    {
+    if generic_ticket_state_change(operation).is_some_and(|change| change.to == "done") {
         return Err(Error::TicketAssignmentConflict(
             "done is guarded by MergeRequestComplete with an approved immutable revision and operation_id".to_string(),
         ));
@@ -13329,37 +13334,60 @@ mod tests {
     #[test]
     fn generic_worker_state_change_cannot_enter_inprogress() {
         for from in ["planning", "ready", "queued"] {
-            let operation = TicketBackendOperation::SetWorkflowState {
-                id: TicketIdOrSlug::Query("T1".to_string()),
-                change: TicketStateChange::new(
+            let change = || {
+                TicketStateChange::new(
                     from,
                     "inprogress",
                     "worker-tool",
                     "bypass assignment-aware start",
-                ),
+                )
             };
-            let error = reject_unguarded_ticket_completion(&operation).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("atomic ready-state Coder assignment")
-            );
+            let operations = [
+                TicketBackendOperation::SetWorkflowState {
+                    id: TicketIdOrSlug::Query("T1".to_string()),
+                    change: change(),
+                },
+                TicketBackendOperation::SetStateField {
+                    id: TicketIdOrSlug::Query("T1".to_string()),
+                    field: "state".to_string(),
+                    change: change(),
+                },
+            ];
+            for operation in operations {
+                let error = reject_unguarded_ticket_completion(&operation).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("atomic ready-state Coder assignment")
+                );
+            }
         }
     }
 
     #[test]
     fn flow_or_generic_worker_state_change_is_not_ticket_completion_authority() {
-        let operation = TicketBackendOperation::SetWorkflowState {
-            id: TicketIdOrSlug::Query("T1".to_string()),
-            change: TicketStateChange::new(
+        let change = || {
+            TicketStateChange::new(
                 "inprogress",
                 "done",
                 "flow reached terminal state",
                 "terminal flow state",
-            ),
+            )
         };
-        let error = reject_unguarded_ticket_completion(&operation).unwrap_err();
-        assert!(error.to_string().contains("MergeRequestComplete"));
+        for operation in [
+            TicketBackendOperation::SetWorkflowState {
+                id: TicketIdOrSlug::Query("T1".to_string()),
+                change: change(),
+            },
+            TicketBackendOperation::SetStateField {
+                id: TicketIdOrSlug::Query("T1".to_string()),
+                field: "state".to_string(),
+                change: change(),
+            },
+        ] {
+            let error = reject_unguarded_ticket_completion(&operation).unwrap_err();
+            assert!(error.to_string().contains("MergeRequestComplete"));
+        }
     }
 
     #[test]
