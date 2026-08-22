@@ -5532,6 +5532,76 @@ fn ticket_notification_content(ticket_id: &str, current_state: &str) -> String {
     )
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct TicketNotificationDeliveryWarning {
+    level: &'static str,
+    event: &'static str,
+    workspace_id: String,
+    ticket_id: String,
+    current_state: String,
+    recipient_runtime_id: String,
+    recipient_worker_id: String,
+    error_category: &'static str,
+}
+
+impl TicketNotificationDeliveryWarning {
+    fn new(
+        workspace_id: &str,
+        ticket_id: &str,
+        current_state: &str,
+        recipient: &RuntimeWorkerRef,
+        error_category: &'static str,
+    ) -> Self {
+        Self {
+            level: "warning",
+            event: "ticket_notification_delivery_failed",
+            workspace_id: workspace_id.to_string(),
+            ticket_id: ticket_id.to_string(),
+            current_state: current_state.to_string(),
+            recipient_runtime_id: recipient.runtime_id.clone(),
+            recipient_worker_id: recipient.worker_id.clone(),
+            error_category,
+        }
+    }
+}
+
+#[cfg(test)]
+static TICKET_NOTIFICATION_DELIVERY_WARNING_CAPTURE: Mutex<Vec<TicketNotificationDeliveryWarning>> =
+    Mutex::new(Vec::new());
+
+fn ticket_notification_delivery_error_category(
+    result: &std::result::Result<WorkerInputResult, RuntimeRegistryError>,
+) -> Option<&'static str> {
+    match result {
+        Ok(result) => match result.state {
+            WorkerOperationState::Accepted => None,
+            WorkerOperationState::Rejected => Some("runtime_rejected"),
+            WorkerOperationState::Unsupported => Some("runtime_unsupported"),
+        },
+        Err(RuntimeRegistryError::InvalidIdentifier { .. }) => Some("invalid_identifier"),
+        Err(RuntimeRegistryError::UnknownRuntime(_)) => Some("unknown_runtime"),
+        Err(RuntimeRegistryError::UnknownHost(_)) => Some("unknown_host"),
+        Err(RuntimeRegistryError::UnknownWorker { .. }) => Some("unknown_worker"),
+        Err(RuntimeRegistryError::RuntimeOperationFailed { .. }) => {
+            Some("runtime_operation_failed")
+        }
+    }
+}
+
+fn emit_ticket_notification_delivery_warning(warning: TicketNotificationDeliveryWarning) {
+    let serialized = serde_json::to_string(&warning)
+        .expect("Ticket notification delivery warnings serialize from bounded string fields");
+    eprintln!(
+        "{} yoi-server {serialized}",
+        Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    );
+    #[cfg(test)]
+    TICKET_NOTIFICATION_DELIVERY_WARNING_CAPTURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(warning);
+}
+
 fn notify_ticket_recipients(
     api: &WorkspaceApi,
     workspace_id: &str,
@@ -5565,7 +5635,7 @@ fn notify_ticket_recipients(
         if source.as_ref().is_some_and(|source| source == &recipient) {
             continue;
         }
-        let _ = api.runtime.send_input(
+        let result = api.runtime.send_input(
             &recipient,
             WorkerInputRequest {
                 kind: WorkerInputKind::Notify,
@@ -5573,6 +5643,15 @@ fn notify_ticket_recipients(
                 segments: None,
             },
         );
+        if let Some(error_category) = ticket_notification_delivery_error_category(&result) {
+            emit_ticket_notification_delivery_warning(TicketNotificationDeliveryWarning::new(
+                workspace_id,
+                ticket_id,
+                current_state,
+                &recipient,
+                error_category,
+            ));
+        }
     }
 }
 
@@ -14721,6 +14800,7 @@ mod tests {
         >,
         materializer: worker_runtime::working_directory::LocalGitWorktreeMaterializer,
         spawn_failure: std::sync::Mutex<Option<String>>,
+        input_failure: std::sync::Mutex<Option<String>>,
         inputs: std::sync::Mutex<Vec<(worker_runtime::identity::WorkerRef, String)>>,
         protocol_methods:
             std::sync::Mutex<Vec<(worker_runtime::identity::WorkerRef, protocol::Method)>>,
@@ -14742,6 +14822,7 @@ mod tests {
                     std::env::temp_dir().join(unique),
                 ),
                 spawn_failure: std::sync::Mutex::new(None),
+                input_failure: std::sync::Mutex::new(None),
                 inputs: std::sync::Mutex::new(Vec::new()),
                 protocol_methods: std::sync::Mutex::new(Vec::new()),
             }
@@ -14749,6 +14830,10 @@ mod tests {
     }
 
     impl DeterministicExecutionBackend {
+        fn reject_inputs(&self, message: impl Into<String>) {
+            *self.input_failure.lock().unwrap() = Some(message.into());
+        }
+
         fn take_inputs(&self) -> Vec<(worker_runtime::identity::WorkerRef, String)> {
             std::mem::take(&mut *self.inputs.lock().expect("inputs lock"))
         }
@@ -14894,6 +14979,12 @@ mod tests {
                 .lock()
                 .expect("inputs lock")
                 .push((handle.worker_ref().clone(), input.content.clone()));
+            if let Some(message) = self.input_failure.lock().unwrap().clone() {
+                return worker_runtime::execution::WorkerExecutionResult::errored(
+                    worker_runtime::execution::WorkerExecutionOperation::Input,
+                    message,
+                );
+            }
             let context = self
                 .contexts
                 .lock()
@@ -15600,6 +15691,21 @@ mod tests {
             .unwrap();
         let source =
             RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, source_worker.worker.worker_id);
+        api.store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                worker: source.clone(),
+                display_name: "Notification Source".to_string(),
+                profile: Some("builtin:coder".to_string()),
+                retention_state: "normal".to_string(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: TEST_CREATED_AT.to_string(),
+                updated_at: TEST_CREATED_AT.to_string(),
+            })
+            .unwrap();
         let source_headers = || {
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -15629,7 +15735,7 @@ mod tests {
         let ticket = browser_ticket_backend(&api).unwrap().create(input).unwrap();
         assign_test_orchestrator(&api, &ticket.id);
         let ticket_id = TicketIdOrSlug::Id(ticket.id.clone());
-        let operations = [
+        let preparatory_operations = [
             TicketBackendOperation::MarkReady {
                 id: ticket_id.clone(),
                 request: ticket::TicketMarkReady {
@@ -15643,15 +15749,38 @@ mod tests {
                 id: ticket_id.clone(),
                 queued_by: "spoofed".to_owned(),
             },
-            TicketBackendOperation::SetWorkflowState {
-                id: ticket_id.clone(),
-                change: TicketStateChange::new(
-                    "queued",
-                    "inprogress",
-                    "implementation accepted",
-                    "test transition",
-                ),
+        ];
+        for operation in preparatory_operations {
+            execute_ticket_rest_operation(&api, TEST_WORKSPACE_ID, source_headers(), operation)
+                .await
+                .unwrap();
+        }
+        api.store
+            .set_current_ticket_coder_assignment(
+                &TicketCoderAssignmentRecord {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    ticket_id: ticket.id.clone(),
+                    assignment_id: "notification-source-assignment".to_string(),
+                    worker: source.clone(),
+                    assigned_by: "workspace-orchestrator".to_string(),
+                    assigned_at: TEST_CREATED_AT.to_string(),
+                },
+                None,
+                "notification-source-assignment-event",
+                "notification-source-assignment-operation",
+                false,
+            )
+            .unwrap();
+        accept_queued_ticket_after_worker_spawn(
+            &api,
+            &crate::hosts::WorkerTicketAssignmentRequest {
+                ticket_id: ticket.id.clone(),
+                operation_id: "notification-source-assignment-operation".to_string(),
             },
+        )
+        .unwrap();
+
+        let operations = [
             TicketBackendOperation::AddEvent {
                 id: ticket_id.clone(),
                 event: NewTicketEvent::new(TicketEventKind::Comment, "progress comment"),
@@ -15675,13 +15804,7 @@ mod tests {
         }
 
         let inputs = execution.take_inputs();
-        let expected_states = [
-            "queued",
-            "inprogress",
-            "inprogress",
-            "inprogress",
-            "inprogress",
-        ];
+        let expected_states = ["queued", "inprogress", "inprogress", "inprogress"];
         assert_eq!(inputs.len(), expected_states.len());
         for ((recipient, content), current_state) in inputs.iter().zip(expected_states) {
             assert_eq!(recipient.worker_id.to_string(), orchestrator.worker_id);
@@ -16102,12 +16225,17 @@ mod tests {
             Some("coder")
         );
 
+        let mut invalid_source_headers = HeaderMap::new();
+        invalid_source_headers.insert(
+            "x-yoi-worker-id",
+            axum::http::HeaderValue::from_str(&source_worker.worker.worker_id).unwrap(),
+        );
         let invalid_source = execute_worker_ticket_test_operation(
             State(api.clone()),
             AxumPath(ScopedWorkspacePath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
             }),
-            HeaderMap::new(),
+            invalid_source_headers,
             Json(TicketBackendOperation::AddEvent {
                 id: ticket_ref.id.clone().into(),
                 event: NewTicketEvent::new(TicketEventKind::Comment, "spoofed update"),
@@ -16307,6 +16435,217 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_ticket_mutation_stays_committed_when_notification_recipient_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let (api, execution) = test_api_with_recording_backend(dir.path()).await;
+        let source = api
+            .runtime
+            .spawn_worker(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                test_create_binding(),
+                WorkerSpawnRequest {
+                    requested_worker_name: Some("orchestrator-source".to_string()),
+                    intent: WorkerSpawnIntent::TicketRole {
+                        ticket_id: "source-ticket".to_string(),
+                        role: TicketWorkerRole::Coder,
+                    },
+                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                        expected_segments: 0,
+                    },
+                    profile: ProfileSelector::Builtin("builtin:coder".to_string()),
+                    ticket_assignment: None,
+                    initial_submit: Vec::new(),
+                    working_directory_request: None,
+                    resolved_working_directory_request: None,
+                    resolved_working_directory: None,
+                    resolved_config_bundle: None,
+                    resolved_worker_observation_enabled: false,
+                    resolved_worker_observation_grants: Vec::new(),
+                    resolved_workspace_api: Some(test_worker_workspace_api(
+                        EMBEDDED_WORKER_RUNTIME_ID,
+                    )),
+                    resolved_memory_settings: Some(test_worker_memory_settings()),
+                    resolved_control_operation: None,
+                },
+            )
+            .unwrap()
+            .worker
+            .unwrap();
+        let orchestrator = scoped_start_workspace_orchestrator(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .worker
+        .expect("Workspace Orchestrator should be available")
+        .worker;
+        let _ = execution.take_inputs();
+        let backend = browser_ticket_backend(&api).unwrap();
+        let mut input = ticket::NewTicket::new("Queued notification");
+        input.workflow_state = Some(TicketWorkflowState::Queued);
+        let ticket_ref = backend.create(input).unwrap();
+        assign_test_orchestrator(&api, ticket_ref.id.as_str());
+        let missing_recipient =
+            RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, "missing-notification-recipient");
+        api.store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                worker: missing_recipient.clone(),
+                display_name: "Missing notification recipient".to_string(),
+                profile: Some("builtin:coder".to_string()),
+                retention_state: "normal".to_string(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: TEST_CREATED_AT.to_string(),
+                updated_at: TEST_CREATED_AT.to_string(),
+            })
+            .unwrap();
+        api.store
+            .set_current_ticket_coder_assignment(
+                &TicketCoderAssignmentRecord {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    ticket_id: ticket_ref.id.clone(),
+                    assignment_id: "missing-recipient-assignment".to_string(),
+                    worker: missing_recipient.clone(),
+                    assigned_by: "test-user".to_string(),
+                    assigned_at: TEST_CREATED_AT.to_string(),
+                },
+                None,
+                "missing-recipient-assignment-event",
+                "missing-recipient-assignment-operation",
+                false,
+            )
+            .unwrap();
+        TICKET_NOTIFICATION_DELIVERY_WARNING_CAPTURE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|warning| warning.ticket_id != ticket_ref.id);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-yoi-runtime-id",
+            axum::http::HeaderValue::from_static(EMBEDDED_WORKER_RUNTIME_ID),
+        );
+        headers.insert(
+            "x-yoi-worker-id",
+            axum::http::HeaderValue::from_str(&source.worker.worker_id).unwrap(),
+        );
+        let _ = execute_worker_ticket_test_operation(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            headers,
+            Json(TicketBackendOperation::AddEvent {
+                id: ticket_ref.id.clone().into(),
+                event: NewTicketEvent::new(TicketEventKind::Comment, "queued update"),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            api.authority.ticket(&ticket_ref.id).unwrap().state,
+            TicketWorkflowState::Queued.as_str()
+        );
+        let warnings = TICKET_NOTIFICATION_DELIVERY_WARNING_CAPTURE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|warning| warning.ticket_id == ticket_ref.id)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1);
+        let warning = &warnings[0];
+        assert_eq!(warning.level, "warning");
+        assert_eq!(warning.event, "ticket_notification_delivery_failed");
+        assert_eq!(warning.workspace_id, TEST_WORKSPACE_ID);
+        assert_eq!(warning.current_state, TicketWorkflowState::Queued.as_str());
+        assert_eq!(warning.recipient_runtime_id, missing_recipient.runtime_id);
+        assert_eq!(warning.recipient_worker_id, missing_recipient.worker_id);
+        assert_eq!(warning.error_category, "unknown_worker");
+        let serialized = serde_json::to_string(warning).unwrap();
+        assert!(!serialized.contains("queued update"));
+        assert!(!serialized.contains("Ticket notification:"));
+
+        let notifications = execution.take_inputs();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(
+            notifications[0].0.worker_id.to_string(),
+            orchestrator.worker_id
+        );
+        assert_eq!(
+            notifications[0].1,
+            ticket_notification_content(
+                ticket_ref.id.as_str(),
+                TicketWorkflowState::Queued.as_str()
+            )
+        );
+
+        execution.reject_inputs("sensitive fake Runtime transport detail");
+        TICKET_NOTIFICATION_DELIVERY_WARNING_CAPTURE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|warning| warning.ticket_id != ticket_ref.id);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-yoi-runtime-id",
+            axum::http::HeaderValue::from_static(EMBEDDED_WORKER_RUNTIME_ID),
+        );
+        headers.insert(
+            "x-yoi-worker-id",
+            axum::http::HeaderValue::from_str(&source.worker.worker_id).unwrap(),
+        );
+        let _ = execute_worker_ticket_test_operation(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            headers,
+            Json(TicketBackendOperation::AddEvent {
+                id: ticket_ref.id.clone().into(),
+                event: NewTicketEvent::new(TicketEventKind::Comment, "all delivery failure update"),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            api.authority.ticket(&ticket_ref.id).unwrap().state,
+            TicketWorkflowState::Queued.as_str()
+        );
+        let warnings = TICKET_NOTIFICATION_DELIVERY_WARNING_CAPTURE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|warning| warning.ticket_id == ticket_ref.id)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings.iter().any(|warning| {
+            warning.recipient_worker_id == missing_recipient.worker_id
+                && warning.error_category == "unknown_worker"
+        }));
+        assert!(warnings.iter().any(|warning| {
+            warning.recipient_worker_id == orchestrator.worker_id
+                && warning.error_category == "runtime_rejected"
+        }));
+        let serialized = serde_json::to_string(&warnings).unwrap();
+        assert!(!serialized.contains("all delivery failure update"));
+        assert!(!serialized.contains("Ticket notification:"));
+        assert!(!serialized.contains("sensitive fake Runtime transport detail"));
+        let attempts = execution.take_inputs();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].0.worker_id.to_string(), orchestrator.worker_id);
     }
 
     #[tokio::test]
