@@ -110,6 +110,25 @@ Deno.test("ticket worker launch uses the common Worker route and bounded Ticket 
   );
 });
 
+Deno.test("ticket detail uses server-derived role assignment actions", async () => {
+  const source = await Deno.readTextFile(
+    new URL(
+      "../../../routes/w/[workspaceId]/tickets/[ticketId]/+page.svelte",
+      import.meta.url,
+    ),
+  );
+
+  assertEquals(source.includes("ticket.action_eligibility.can_queue"), true);
+  assertEquals(
+    source.includes("ticket.action_eligibility.can_assign_orchestrator"),
+    true,
+  );
+  assertEquals(source.includes("/assignments/${role}"), true);
+  assertEquals(source.includes('kind: "workspace_agent"'), true);
+  assertEquals(source.includes('kind: "worker"'), true);
+  assertEquals(source.includes("ticket.assignee"), false);
+});
+
 Deno.test("ticket detail keeps the operation rail outside main content", async () => {
   const css = await Deno.readTextFile(
     new URL("../styles/tickets.css", import.meta.url),

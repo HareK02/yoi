@@ -81,7 +81,6 @@ pub struct TicketDetail {
     pub item_revision: String,
     pub queued_by: Option<String>,
     pub queued_at: Option<String>,
-    pub assignee: Option<String>,
     pub repository_id: Option<String>,
     pub ref_selector: Option<String>,
     pub risk_flags: Vec<String>,
@@ -95,7 +94,10 @@ pub struct TicketDetail {
     pub relations: TicketRelationView,
     pub linked_objectives: Vec<ObjectiveLinkSummary>,
     pub implementation_reports: Vec<TicketEvidenceEvent>,
-    pub current_assignment: Option<TicketAssignmentSummary>,
+    pub assignments: Vec<TicketRoleAssignmentSummary>,
+    pub current_coder: Option<TicketAssignmentSummary>,
+    pub assignment_diagnostics: Vec<String>,
+    pub action_eligibility: TicketActionEligibility,
     pub merge_request: Option<TicketMergeRequestSummary>,
     pub evidence: TicketEvidenceSummary,
     pub resolution: Option<String>,
@@ -262,6 +264,43 @@ pub struct TicketAssignmentSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct TicketRoleAssignmentSummary {
+    pub assignment_id: String,
+    pub role: String,
+    pub principal: TicketAssignmentPrincipalSummary,
+    pub assigned_by: String,
+    pub assigned_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "typescript", ts(tag = "kind", rename_all = "snake_case"))]
+pub enum TicketAssignmentPrincipalSummary {
+    User {
+        account_id: String,
+    },
+    Worker {
+        runtime_id: String,
+        worker_id: String,
+    },
+    WorkspaceAgent {
+        agent_key: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct TicketActionEligibility {
+    pub can_assign_orchestrator: bool,
+    pub can_unassign_orchestrator: bool,
+    pub can_queue: bool,
+    pub can_start_manual_coder: bool,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketMergeRequestSummary {
     pub merge_request_id: String,
     pub repository_id: String,
@@ -424,6 +463,9 @@ pub fn ticket_api_typescript() -> String {
         ObjectiveLinkSummary::decl(&config),
         TicketEvidenceEvent::decl(&config),
         TicketAssignmentSummary::decl(&config),
+        TicketRoleAssignmentSummary::decl(&config),
+        TicketAssignmentPrincipalSummary::decl(&config),
+        TicketActionEligibility::decl(&config),
         TicketMergeRequestSummary::decl(&config),
         MergeRequestListItem::decl(&config),
         MergeRequestListResponse::decl(&config),

@@ -115,7 +115,8 @@ use crate::skills;
 use crate::store::{
     AccountRecord, ApiTokenRecord, AuthChallengeRecord, BrowserSessionRecord, ControlPlaneStore,
     DeviceLoginFlowRecord, FlowSourceRecord, PasskeyCredentialRecord, RepositoryRecord,
-    TicketWorkerAssignmentRecord, UserRecord, WorkdirRegistryRecord, WorkerControlGrantRecord,
+    TicketAssignmentPrincipal, TicketAssignmentRole, TicketCoderAssignmentRecord,
+    TicketRoleAssignmentRecord, UserRecord, WorkdirRegistryRecord, WorkerControlGrantRecord,
     WorkerRegistryRecord, WorkerWorkdirLinkRecord, WorkspaceRecord, WorkspaceResourceKind,
 };
 use crate::workspace_catalog::{WorkspaceCatalogService, WorkspaceCreateRequest};
@@ -1819,14 +1820,12 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             post(scoped_show_ticket),
         )
         .route(
-            "/api/w/{workspace_id}/tickets/{id}/assignment",
-            get(scoped_get_ticket_worker_assignment)
-                .put(scoped_set_ticket_worker_assignment)
-                .delete(scoped_clear_ticket_worker_assignment),
+            "/api/w/{workspace_id}/tickets/{id}/assignments",
+            get(scoped_list_ticket_assignments),
         )
         .route(
-            "/api/w/{workspace_id}/tickets/{id}/assignment/reassign",
-            post(scoped_reassign_ticket_worker_assignment),
+            "/api/w/{workspace_id}/tickets/{id}/assignments/{role}",
+            put(scoped_set_ticket_assignment).delete(scoped_clear_ticket_assignment),
         )
         .route(
             "/api/w/{workspace_id}/tickets/{id}/state",
@@ -3156,131 +3155,174 @@ async fn scoped_show_ticket(
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct TicketWorkerAssignmentResponse {
+struct TicketRoleAssignmentsResponse {
     workspace_id: String,
     ticket_id: String,
-    assignment: Option<TicketWorkerAssignmentRecord>,
-    worker: Option<WorkerSummary>,
+    assignments: Vec<TicketRoleAssignmentRecord>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct TicketWorkerAssignmentMutationResponse {
+struct TicketRoleAssignmentMutationResponse {
     workspace_id: String,
     ticket_id: String,
-    assignment: Option<TicketWorkerAssignmentRecord>,
-    previous_assignment_id: Option<String>,
+    assignment: Option<TicketRoleAssignmentRecord>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SetTicketWorkerAssignmentRequest {
+struct SetTicketRoleAssignmentRequest {
     operation_id: String,
-    #[serde(flatten)]
-    worker: RuntimeWorkerRef,
+    principal: TicketAssignmentPrincipal,
     expected_assignment_id: Option<String>,
-    assigned_by: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ClearTicketWorkerAssignmentQuery {
+struct ClearTicketRoleAssignmentQuery {
     operation_id: Option<String>,
-    expected_assignment_id: Option<String>,
-    actor: Option<String>,
+    assignment_id: Option<String>,
 }
 
-async fn scoped_get_ticket_worker_assignment(
+fn parse_ticket_assignment_role(role: &str) -> ApiResult<TicketAssignmentRole> {
+    match role {
+        "orchestrator" => Ok(TicketAssignmentRole::Orchestrator),
+        "coder" => Ok(TicketAssignmentRole::Coder),
+        "owner" => Ok(TicketAssignmentRole::Owner),
+        "contributor" => Ok(TicketAssignmentRole::Contributor),
+        _ => Err(Error::InvalidInput(format!("unknown Ticket assignment role `{role}`")).into()),
+    }
+}
+
+async fn scoped_list_ticket_assignments(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRecordPath>,
-) -> ApiResult<Json<TicketWorkerAssignmentResponse>> {
+) -> ApiResult<Json<TicketRoleAssignmentsResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let ticket = api.authority.ticket(&path.id)?;
-    let assignment = api
+    let assignments = api
         .store
-        .get_current_ticket_worker_assignment(&path.workspace_id, &ticket.id)?;
-    let worker = assignment
-        .as_ref()
-        .and_then(|assignment| api.runtime.worker(&assignment.worker).ok());
-    Ok(Json(TicketWorkerAssignmentResponse {
+        .list_current_ticket_role_assignments(&path.workspace_id, &ticket.id)?;
+    Ok(Json(TicketRoleAssignmentsResponse {
         workspace_id: path.workspace_id,
         ticket_id: ticket.id,
-        assignment,
-        worker,
+        assignments,
     }))
 }
 
-async fn scoped_set_ticket_worker_assignment(
+async fn scoped_set_ticket_assignment(
     State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedRecordPath>,
-    Json(request): Json<SetTicketWorkerAssignmentRequest>,
-) -> ApiResult<Json<TicketWorkerAssignmentMutationResponse>> {
-    set_ticket_worker_assignment(api, path, request, false).await
-}
-
-async fn scoped_reassign_ticket_worker_assignment(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedRecordPath>,
-    Json(request): Json<SetTicketWorkerAssignmentRequest>,
-) -> ApiResult<Json<TicketWorkerAssignmentMutationResponse>> {
-    set_ticket_worker_assignment(api, path, request, true).await
-}
-
-async fn set_ticket_worker_assignment(
-    api: WorkspaceApi,
-    path: ScopedRecordPath,
-    request: SetTicketWorkerAssignmentRequest,
-    allow_reassign: bool,
-) -> ApiResult<Json<TicketWorkerAssignmentMutationResponse>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    let ticket = api.authority.ticket(&path.id)?;
+    AxumPath((workspace_id, id, role)): AxumPath<(String, String, String)>,
+    Json(request): Json<SetTicketRoleAssignmentRequest>,
+) -> ApiResult<Json<TicketRoleAssignmentMutationResponse>> {
+    validate_workspace_scope(&api, &workspace_id)?;
+    let ticket = api.authority.ticket(&id)?;
+    let role = parse_ticket_assignment_role(&role)?;
     let operation_id = require_ticket_assignment_value("operation_id", request.operation_id)?;
-    let runtime_id = require_ticket_assignment_value("runtime_id", request.worker.runtime_id)?;
-    let worker_id = require_ticket_assignment_value("worker_id", request.worker.worker_id)?;
     let expected_assignment_id = request
         .expected_assignment_id
         .map(|value| require_ticket_assignment_value("expected_assignment_id", value))
         .transpose()?;
-    let assigned_by = request
-        .assigned_by
-        .map(|value| require_ticket_assignment_value("assigned_by", value))
-        .transpose()?
-        .unwrap_or_else(|| "workspace-api".to_string());
-    let requested_worker = RuntimeWorkerRef::new(runtime_id, worker_id);
-    let worker = api
-        .runtime
-        .worker(&requested_worker)
-        .map_err(|err| err.into_error())?;
+    if matches!(request.principal, TicketAssignmentPrincipal::User { .. }) {
+        return Err(Error::TicketAssignmentConflict(
+            "user-principal Ticket assignment requires an authenticated authoring boundary; weak Workspace Web access is not authority"
+                .to_string(),
+        )
+        .into());
+    }
     let assigned_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    let record = TicketWorkerAssignmentRecord {
-        workspace_id: path.workspace_id.clone(),
+    let record = TicketRoleAssignmentRecord {
+        workspace_id: workspace_id.clone(),
         ticket_id: ticket.id.clone(),
         assignment_id: new_id("tasg"),
-        worker: worker.worker.clone(),
-        assigned_by,
+        role,
+        principal: request.principal,
+        assigned_by: "workspace-web".to_string(),
         assigned_at,
     };
-    let update = api.store.set_current_ticket_worker_assignment(
-        &record,
-        expected_assignment_id.as_deref(),
-        &new_id("tasev"),
-        &operation_id,
-        allow_reassign,
-    )?;
-    Ok(Json(TicketWorkerAssignmentMutationResponse {
-        workspace_id: path.workspace_id,
+    let assignment = match role {
+        TicketAssignmentRole::Orchestrator => {
+            if !matches!(
+                ticket.state.as_str(),
+                state if state == TicketWorkflowState::Planning.as_str()
+                    || state == TicketWorkflowState::Ready.as_str()
+            ) {
+                return Err(Error::TicketAssignmentConflict(format!(
+                    "Orchestrator assignment requires planning or ready Ticket; current state is {}",
+                    ticket.state
+                ))
+                .into());
+            }
+            if api
+                .store
+                .get_current_ticket_role_assignment(
+                    &workspace_id,
+                    &ticket.id,
+                    TicketAssignmentRole::Coder,
+                )?
+                .is_some()
+            {
+                return Err(Error::TicketAssignmentConflict(
+                    "Orchestrator assignment conflicts with an active Coder assignment".to_string(),
+                )
+                .into());
+            }
+            api.store.set_current_ticket_role_assignment(
+                &record,
+                expected_assignment_id.as_deref(),
+                &new_id("tasev"),
+                &operation_id,
+                expected_assignment_id.is_some(),
+            )?
+        }
+        TicketAssignmentRole::Coder => {
+            if expected_assignment_id.is_some() {
+                return Err(Error::TicketAssignmentConflict(
+                    "manual Coder start does not support reassign; clear through a guarded lifecycle operation first"
+                        .to_string(),
+                )
+                .into());
+            }
+            if let TicketAssignmentPrincipal::Worker {
+                runtime_id,
+                worker_id,
+            } = &record.principal
+            {
+                api.runtime
+                    .worker(&RuntimeWorkerRef::new(
+                        runtime_id.clone(),
+                        worker_id.clone(),
+                    ))
+                    .map_err(|error| error.into_error())?;
+            }
+            api.store.start_ready_ticket_with_coder_assignment(
+                &record,
+                &new_id("tasev"),
+                &operation_id,
+            )?
+        }
+        TicketAssignmentRole::Owner | TicketAssignmentRole::Contributor => {
+            return Err(Error::TicketAssignmentConflict(
+                "Owner and Contributor mutation requires an authenticated authoring boundary"
+                    .to_string(),
+            )
+            .into());
+        }
+    };
+    Ok(Json(TicketRoleAssignmentMutationResponse {
+        workspace_id,
         ticket_id: ticket.id,
-        assignment: Some(update.current),
-        previous_assignment_id: update.previous.map(|assignment| assignment.assignment_id),
+        assignment: Some(assignment),
     }))
 }
 
-async fn scoped_clear_ticket_worker_assignment(
+async fn scoped_clear_ticket_assignment(
     State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedRecordPath>,
-    Query(query): Query<ClearTicketWorkerAssignmentQuery>,
-) -> ApiResult<Json<TicketWorkerAssignmentMutationResponse>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    let ticket = api.authority.ticket(&path.id)?;
+    AxumPath((workspace_id, id, role)): AxumPath<(String, String, String)>,
+    Query(query): Query<ClearTicketRoleAssignmentQuery>,
+) -> ApiResult<Json<TicketRoleAssignmentMutationResponse>> {
+    validate_workspace_scope(&api, &workspace_id)?;
+    let ticket = api.authority.ticket(&id)?;
+    let role = parse_ticket_assignment_role(&role)?;
     let operation_id = query
         .operation_id
         .map(|value| require_ticket_assignment_value("operation_id", value))
@@ -3288,32 +3330,49 @@ async fn scoped_clear_ticket_worker_assignment(
         .ok_or_else(|| {
             Error::TicketAssignmentConflict("unassign requires operation_id".to_string())
         })?;
-    let expected_assignment_id = query
-        .expected_assignment_id
-        .map(|value| require_ticket_assignment_value("expected_assignment_id", value))
-        .transpose()?;
-    let actor = query
-        .actor
-        .map(|value| require_ticket_assignment_value("actor", value))
+    let assignment_id = query
+        .assignment_id
+        .map(|value| require_ticket_assignment_value("assignment_id", value))
         .transpose()?
-        .unwrap_or_else(|| "workspace-api".to_string());
-    let previous = api.store.clear_current_ticket_worker_assignment(
-        &path.workspace_id,
+        .ok_or_else(|| {
+            Error::TicketAssignmentConflict("unassign requires assignment_id".to_string())
+        })?;
+    if matches!(
+        ticket.state.as_str(),
+        state if state == TicketWorkflowState::Queued.as_str()
+            || state == TicketWorkflowState::InProgress.as_str()
+    ) {
+        return Err(Error::TicketAssignmentConflict(format!(
+            "cannot unassign role `{}` while Ticket is {}; rescope through a guarded lifecycle operation",
+            role.as_str(),
+            ticket.state
+        ))
+        .into());
+    }
+    let cleared = api.store.clear_current_ticket_role_assignment(
+        &workspace_id,
         &ticket.id,
-        expected_assignment_id.as_deref(),
-        &operation_id,
+        role,
+        &assignment_id,
         &new_id("tasev"),
-        &actor,
+        &operation_id,
+        "workspace-web",
         &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        Some("role assignment removed from Ticket detail"),
     )?;
-    Ok(Json(TicketWorkerAssignmentMutationResponse {
-        workspace_id: path.workspace_id,
+    if !cleared {
+        return Err(Error::TicketAssignmentConflict(format!(
+            "assignment `{assignment_id}` is not current for role `{}`",
+            role.as_str()
+        ))
+        .into());
+    }
+    Ok(Json(TicketRoleAssignmentMutationResponse {
+        workspace_id,
         ticket_id: ticket.id,
         assignment: None,
-        previous_assignment_id: previous.map(|assignment| assignment.assignment_id),
     }))
 }
-
 fn validate_ticket_assignment_state(
     api: &WorkspaceApi,
     assignment: &WorkerTicketAssignmentRequest,
@@ -3327,6 +3386,28 @@ fn validate_ticket_assignment_state(
         return Err(Error::TicketAssignmentConflict(format!(
             "Ticket {} must be queued or inprogress before assigning an implementation Coder; current state is {}",
             ticket.id, ticket.state
+        )));
+    }
+    let Some(orchestrator_assignment) =
+        orchestrator_interested(api, &api.config.workspace_id, &ticket.id, &ticket.state)?
+    else {
+        return Err(Error::TicketAssignmentConflict(format!(
+            "Ticket {} cannot be assigned an orchestration Coder without an active Orchestrator role assignment",
+            ticket.id
+        )));
+    };
+    let queued = browser_ticket_backend(api)?.show(TicketIdOrSlug::Id(ticket.id.clone()))?;
+    let queued_assignment_id = queued
+        .events
+        .iter()
+        .rev()
+        .find_map(|event| event.attributes.get("orchestrator_assignment_id"));
+    if queued_assignment_id.map(String::as_str)
+        != Some(orchestrator_assignment.assignment_id.as_str())
+    {
+        return Err(Error::TicketAssignmentConflict(format!(
+            "Ticket {} Queue fence does not match active Orchestrator assignment {}",
+            ticket.id, orchestrator_assignment.assignment_id
         )));
     }
     Ok(())
@@ -3374,7 +3455,7 @@ fn validate_ticket_assignment_spawn(
 
     if let Some(current) = api
         .store
-        .get_current_ticket_worker_assignment(&api.config.workspace_id, &assignment.ticket_id)?
+        .get_current_ticket_coder_assignment(&api.config.workspace_id, &assignment.ticket_id)?
     {
         let replay_matches = api
             .store
@@ -3447,7 +3528,7 @@ fn assign_ticket_worker_from_lifecycle(
     assignment: &crate::hosts::WorkerTicketAssignmentRequest,
     runtime_id: &str,
     worker_id: &str,
-) -> Result<TicketWorkerAssignmentRecord> {
+) -> Result<TicketCoderAssignmentRecord> {
     let ticket = api.authority.ticket(&assignment.ticket_id)?;
     let worker = RuntimeWorkerRef::new(runtime_id, worker_id);
     if let Some(operation) = api
@@ -3458,7 +3539,7 @@ fn assign_ticket_worker_from_lifecycle(
         if operation.action == "assign"
             && operation.ticket_id == assignment.ticket_id
             && operation.worker.as_ref() == Some(&worker)
-            && let Some(current) = api.store.get_current_ticket_worker_assignment(
+            && let Some(current) = api.store.get_current_ticket_coder_assignment(
                 &api.config.workspace_id,
                 &assignment.ticket_id,
             )?
@@ -3473,7 +3554,7 @@ fn assign_ticket_worker_from_lifecycle(
         )));
     }
     let assigned_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    let record = TicketWorkerAssignmentRecord {
+    let record = TicketCoderAssignmentRecord {
         workspace_id: api.config.workspace_id.clone(),
         ticket_id: ticket.id,
         assignment_id: new_id("tasg"),
@@ -3483,7 +3564,7 @@ fn assign_ticket_worker_from_lifecycle(
     };
     Ok(api
         .store
-        .set_current_ticket_worker_assignment(
+        .set_current_ticket_coder_assignment(
             &record,
             None,
             &new_id("tasev"),
@@ -3873,11 +3954,52 @@ async fn execute_ticket_rest_operation(
         .as_ref()
         .map(|ticket| ticket.meta.workflow_state.as_str().to_string())
         .unwrap_or_else(|| ticket_operation_initial_state(&operation));
+    let mut event_attributes = BTreeMap::new();
+    if matches!(operation, TicketBackendOperation::QueueReady { .. }) {
+        let ticket = before.as_ref().ok_or_else(|| {
+            Error::TicketAssignmentConflict(
+                "Queue requires an existing Ticket with an active Orchestrator assignment"
+                    .to_string(),
+            )
+        })?;
+        let assignment = active_orchestrator_assignment(api, workspace_id, &ticket.meta.id)?
+            .ok_or_else(|| {
+                Error::TicketAssignmentConflict(
+                    "Queue requires role=orchestrator assignment to workspace-orchestrator"
+                        .to_string(),
+                )
+            })?;
+        let operation_id = new_id("tqueue");
+        let fingerprint = Sha256::digest(format!(
+            "ticket-queue:v1\0{workspace_id}\0{}\0{}\0{}",
+            ticket.meta.id,
+            ticket.meta.workflow_state.as_str(),
+            assignment.assignment_id
+        ))
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+        event_attributes.extend([
+            (
+                "orchestrator_assignment_id".to_string(),
+                assignment.assignment_id,
+            ),
+            (
+                "routing_principal".to_string(),
+                "workspace-orchestrator".to_string(),
+            ),
+            ("routing_operation_id".to_string(), operation_id),
+            ("routing_request_fingerprint".to_string(), fingerprint),
+        ]);
+    }
     if let Some(source) = source.as_ref() {
         bind_worker_ticket_operation_source(source, &mut operation);
         let source_context =
             worker_ticket_source_context(api, workspace_id, source, before.as_ref());
-        backend = backend.with_event_attributes(source_context.attributes(operation_kind));
+        event_attributes.extend(source_context.attributes(operation_kind));
+    }
+    if !event_attributes.is_empty() {
+        backend = backend.with_event_attributes(event_attributes);
     }
 
     let result = execute_ticket_backend_operation(&backend, operation).map_err(Error::from)?;
@@ -4223,7 +4345,7 @@ async fn scoped_queue_ticket_record(
         headers,
         TicketBackendOperation::QueueReady {
             id: TicketIdOrSlug::Query(id),
-            queued_by: String::new(),
+            queued_by: "workspace-web".to_string(),
         },
     )
     .await?;
@@ -4316,7 +4438,7 @@ impl merge_request::AssignmentSource for MergeRequestAssignmentSource {
         ticket_id: &str,
     ) -> std::result::Result<Option<merge_request::CurrentAssignment>, String> {
         self.store
-            .get_current_ticket_worker_assignment(workspace_id, ticket_id)
+            .get_current_ticket_coder_assignment(workspace_id, ticket_id)
             .map(|value| {
                 value.map(|assignment| merge_request::CurrentAssignment {
                     assignment_id: assignment.assignment_id,
@@ -4631,7 +4753,7 @@ async fn scoped_open_merge_request(
     let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
     let assignment = api
         .store
-        .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
+        .get_current_ticket_coder_assignment(&workspace_id, &ticket_id)?
         .ok_or_else(|| {
             Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
         })?;
@@ -4771,7 +4893,7 @@ async fn scoped_register_merge_request_review_capability(
     let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
     let assignment = api
         .store
-        .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
+        .get_current_ticket_coder_assignment(&workspace_id, &ticket_id)?
         .ok_or_else(|| {
             Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
         })?;
@@ -4857,7 +4979,7 @@ async fn scoped_revoke_merge_request_review(
     let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
     let assignment = api
         .store
-        .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
+        .get_current_ticket_coder_assignment(&workspace_id, &ticket_id)?
         .ok_or_else(|| {
             Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
         })?;
@@ -4925,7 +5047,7 @@ async fn scoped_complete_merge_request(
     }
     let assignment = api
         .store
-        .get_current_ticket_worker_assignment(&workspace_id, &ticket_id)?
+        .get_current_ticket_coder_assignment(&workspace_id, &ticket_id)?
         .ok_or_else(|| {
             Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
         })?;
@@ -5299,6 +5421,46 @@ fn worker_source_actor_role(is_current_assignment: bool, is_orchestrator: bool) 
     }
 }
 
+fn active_orchestrator_assignment(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    ticket_id: &str,
+) -> Result<Option<TicketRoleAssignmentRecord>> {
+    let assignment = api.store.get_current_ticket_role_assignment(
+        workspace_id,
+        ticket_id,
+        TicketAssignmentRole::Orchestrator,
+    )?;
+    match assignment {
+        Some(assignment)
+            if matches!(
+                assignment.principal,
+                TicketAssignmentPrincipal::WorkspaceAgent { ref agent_key }
+                    if agent_key == "workspace-orchestrator"
+            ) =>
+        {
+            Ok(Some(assignment))
+        }
+        Some(_) => Err(Error::TicketAssignmentConflict(
+            "Orchestrator role must reference the registered workspace-orchestrator principal"
+                .to_string(),
+        )),
+        None => Ok(None),
+    }
+}
+
+fn orchestrator_interested(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    ticket_id: &str,
+    state: &str,
+) -> Result<Option<TicketRoleAssignmentRecord>> {
+    if !matches!(state, "queued" | "inprogress") {
+        return Ok(None);
+    }
+    active_orchestrator_assignment(api, workspace_id, ticket_id)
+}
+
 fn worker_ticket_source_context(
     api: &WorkspaceApi,
     workspace_id: &str,
@@ -5307,7 +5469,7 @@ fn worker_ticket_source_context(
 ) -> WorkerTicketSourceContext {
     let assignment = ticket.and_then(|ticket| {
         api.store
-            .get_current_ticket_worker_assignment(workspace_id, &ticket.meta.id)
+            .get_current_ticket_coder_assignment(workspace_id, &ticket.meta.id)
             .ok()
             .flatten()
     });
@@ -5315,9 +5477,19 @@ fn worker_ticket_source_context(
     let is_current_assignment = assignment
         .as_ref()
         .is_some_and(|assignment| &assignment.worker == source);
-    let is_orchestrator = orchestrator
-        .as_ref()
-        .is_some_and(|worker| worker.worker == *source);
+    let is_orchestrator = active_orchestrator_assignment(
+        api,
+        workspace_id,
+        ticket
+            .map(|ticket| ticket.meta.id.as_str())
+            .unwrap_or_default(),
+    )
+    .ok()
+    .flatten()
+    .is_some()
+        && orchestrator
+            .as_ref()
+            .is_some_and(|worker| worker.worker == *source);
     let actor_role = worker_source_actor_role(is_current_assignment, is_orchestrator);
     WorkerTicketSourceContext {
         worker: source.clone(),
@@ -5338,21 +5510,23 @@ fn notify_ticket_recipients(
     api: &WorkspaceApi,
     workspace_id: &str,
     ticket_id: &str,
-    previous_state: &str,
+    _previous_state: &str,
     current_state: &str,
     source: Option<RuntimeWorkerRef>,
 ) {
     let mut recipients = Vec::new();
     if let Some(assignment) = api
         .store
-        .get_current_ticket_worker_assignment(workspace_id, ticket_id)
+        .get_current_ticket_coder_assignment(workspace_id, ticket_id)
         .ok()
         .flatten()
     {
         recipients.push(assignment.worker.clone());
     }
-    if (matches!(previous_state, "queued" | "inprogress")
-        || matches!(current_state, "queued" | "inprogress"))
+    if orchestrator_interested(api, workspace_id, ticket_id, current_state)
+        .ok()
+        .flatten()
+        .is_some()
         && let Some(orchestrator) = find_workspace_orchestrator(api)
     {
         recipients.push(orchestrator.worker.clone());
@@ -5855,6 +6029,24 @@ fn dispatch_orchestrator_queue_attention(api: &WorkspaceApi) {
     ])) else {
         return;
     };
+    queued.retain(|ticket| {
+        orchestrator_interested(api, &api.config.workspace_id, &ticket.id, "queued")
+            .ok()
+            .flatten()
+            .is_some()
+    });
+    let Ok(mut inprogress) = backend.list(ticket::TicketListQuery::states([
+        ticket::TicketListState::InProgress,
+    ])) else {
+        return;
+    };
+    inprogress.retain(|ticket| {
+        orchestrator_interested(api, &api.config.workspace_id, &ticket.id, "inprogress")
+            .ok()
+            .flatten()
+            .is_some()
+    });
+    queued.extend(inprogress);
     queued.sort_by(|left, right| left.id.cmp(&right.id));
     if queued.is_empty() {
         *api.orchestrator_attention_fingerprint
@@ -5862,15 +6054,6 @@ fn dispatch_orchestrator_queue_attention(api: &WorkspaceApi) {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         return;
     }
-    let Ok(inprogress) = backend.list(ticket::TicketListQuery::states([
-        ticket::TicketListState::InProgress,
-    ])) else {
-        return;
-    };
-    if !inprogress.is_empty() {
-        return;
-    }
-
     let fingerprint = queued
         .iter()
         .map(|ticket| ticket.id.as_str())
@@ -13668,6 +13851,7 @@ mod tests {
         let mut input = ticket::NewTicket::new("Assigned Ticket");
         input.workflow_state = Some(TicketWorkflowState::Queued);
         let ticket = backend.create(input).unwrap();
+        assign_test_orchestrator(&api, &ticket.id);
         let response = create_workspace_worker(
             State(api.clone()),
             HeaderMap::new(),
@@ -13697,7 +13881,7 @@ mod tests {
         );
         let current = api
             .store
-            .get_current_ticket_worker_assignment(&api.config.workspace_id, &ticket.id)
+            .get_current_ticket_coder_assignment(&api.config.workspace_id, &ticket.id)
             .unwrap()
             .unwrap();
         assert_eq!(current.worker, response.worker_ref);
@@ -13722,6 +13906,7 @@ mod tests {
         let mut input = ticket::NewTicket::new("Queued Ticket");
         input.workflow_state = Some(TicketWorkflowState::Queued);
         let ticket = backend.create(input).unwrap();
+        assign_test_orchestrator(&api, &ticket.id);
 
         let result = create_workspace_worker(
             State(api.clone()),
@@ -13751,7 +13936,7 @@ mod tests {
         );
         assert!(
             api.store
-                .get_current_ticket_worker_assignment(&api.config.workspace_id, &ticket.id)
+                .get_current_ticket_coder_assignment(&api.config.workspace_id, &ticket.id)
                 .unwrap()
                 .is_none()
         );
@@ -15354,6 +15539,7 @@ mod tests {
         input.repository_id = Some(TEST_REPOSITORY_ID.to_owned());
         input.ref_selector = Some("develop".to_owned());
         let ticket = browser_ticket_backend(&api).unwrap().create(input).unwrap();
+        assign_test_orchestrator(&api, &ticket.id);
         let ticket_id = TicketIdOrSlug::Id(ticket.id.clone());
         let operations = [
             TicketBackendOperation::MarkReady {
@@ -15442,7 +15628,7 @@ mod tests {
                 updated_at: TEST_CREATED_AT.to_string(),
             })
             .unwrap();
-        let assignment = TicketWorkerAssignmentRecord {
+        let assignment = TicketCoderAssignmentRecord {
             workspace_id: TEST_WORKSPACE_ID.to_string(),
             ticket_id: ticket_id.clone(),
             assignment_id: "assignment-api-1".to_string(),
@@ -15451,7 +15637,7 @@ mod tests {
             assigned_at: TEST_CREATED_AT.to_string(),
         };
         api.store
-            .set_current_ticket_worker_assignment(
+            .set_current_ticket_coder_assignment(
                 &assignment,
                 None,
                 "event-api-1",
@@ -15464,18 +15650,23 @@ mod tests {
             id: ticket_id.clone(),
         };
 
-        let Json(read) = scoped_get_ticket_worker_assignment(State(api.clone()), AxumPath(path()))
+        let Json(read) = scoped_list_ticket_assignments(State(api.clone()), AxumPath(path()))
             .await
             .unwrap();
-        assert_eq!(read.assignment, Some(assignment));
+        assert_eq!(read.assignments.len(), 1);
+        assert_eq!(read.assignments[0].assignment_id, assignment.assignment_id);
+        assert_eq!(read.assignments[0].role, TicketAssignmentRole::Coder);
 
-        let stale = scoped_clear_ticket_worker_assignment(
+        let stale = scoped_clear_ticket_assignment(
             State(api.clone()),
-            AxumPath(path()),
-            Query(ClearTicketWorkerAssignmentQuery {
+            AxumPath((
+                TEST_WORKSPACE_ID.to_string(),
+                ticket_id.clone(),
+                "coder".to_string(),
+            )),
+            Query(ClearTicketRoleAssignmentQuery {
                 operation_id: Some("clear-stale".to_string()),
-                expected_assignment_id: Some("stale-assignment".to_string()),
-                actor: Some("test-user".to_string()),
+                assignment_id: Some("stale-assignment".to_string()),
             }),
         )
         .await
@@ -15483,21 +15674,20 @@ mod tests {
         .into_response();
         assert_eq!(stale.status(), StatusCode::CONFLICT);
 
-        let Json(cleared) = scoped_clear_ticket_worker_assignment(
+        let Json(cleared) = scoped_clear_ticket_assignment(
             State(api.clone()),
-            AxumPath(path()),
-            Query(ClearTicketWorkerAssignmentQuery {
+            AxumPath((
+                TEST_WORKSPACE_ID.to_string(),
+                ticket_id.clone(),
+                "coder".to_string(),
+            )),
+            Query(ClearTicketRoleAssignmentQuery {
                 operation_id: Some("clear-current".to_string()),
-                expected_assignment_id: Some("assignment-api-1".to_string()),
-                actor: Some("test-user".to_string()),
+                assignment_id: Some("assignment-api-1".to_string()),
             }),
         )
         .await
         .unwrap();
-        assert_eq!(
-            cleared.previous_assignment_id.as_deref(),
-            Some("assignment-api-1")
-        );
         assert_eq!(cleared.assignment, None);
     }
 
@@ -15588,8 +15778,8 @@ mod tests {
             .create(ticket::NewTicket::new("Notify assigned Worker"))
             .unwrap();
         api.store
-            .set_current_ticket_worker_assignment(
-                &TicketWorkerAssignmentRecord {
+            .set_current_ticket_coder_assignment(
+                &TicketCoderAssignmentRecord {
                     workspace_id: TEST_WORKSPACE_ID.to_string(),
                     ticket_id: ticket_ref.id.clone(),
                     assignment_id: "notify-assignment".to_string(),
@@ -15691,8 +15881,8 @@ mod tests {
         );
 
         api.store
-            .set_current_ticket_worker_assignment(
-                &TicketWorkerAssignmentRecord {
+            .set_current_ticket_coder_assignment(
+                &TicketCoderAssignmentRecord {
                     workspace_id: TEST_WORKSPACE_ID.to_string(),
                     ticket_id: ticket_ref.id.clone(),
                     assignment_id: "source-assignment".to_string(),
@@ -15757,6 +15947,56 @@ mod tests {
         .unwrap_err()
         .into_response();
         assert_eq!(invalid_source.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn queue_requires_orchestrator_role_and_records_assignment_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let api = test_api(dir.path()).await;
+        let backend = browser_ticket_backend(&api).unwrap();
+        let mut input = ticket::NewTicket::new("Queue role gate");
+        input.workflow_state = Some(TicketWorkflowState::Ready);
+        input.repository_id = Some(TEST_REPOSITORY_ID.to_string());
+        input.ref_selector = Some("develop".to_string());
+        let ticket = backend.create(input).unwrap();
+        let path = (TEST_WORKSPACE_ID.to_string(), ticket.id.clone());
+
+        let missing = scoped_queue_ticket_record(
+            State(api.clone()),
+            AxumPath(path.clone()),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(missing.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            backend
+                .show(ticket.id.clone().into())
+                .unwrap()
+                .meta
+                .workflow_state,
+            TicketWorkflowState::Ready
+        );
+
+        assign_test_orchestrator(&api, &ticket.id);
+        scoped_queue_ticket_record(State(api.clone()), AxumPath(path), HeaderMap::new())
+            .await
+            .unwrap();
+        let queued = backend.show(ticket.id.into()).unwrap();
+        assert_eq!(queued.meta.workflow_state, TicketWorkflowState::Queued);
+        let event = queued.events.last().unwrap();
+        let expected_assignment_id = format!("orchestrator-{}", queued.meta.id);
+        assert_eq!(
+            event
+                .attributes
+                .get("orchestrator_assignment_id")
+                .map(String::as_str),
+            Some(expected_assignment_id.as_str())
+        );
+        assert!(event.attributes.contains_key("routing_operation_id"));
+        assert!(event.attributes.contains_key("routing_request_fingerprint"));
     }
 
     #[tokio::test]
@@ -15834,6 +16074,7 @@ mod tests {
         input.repository_id = Some(TEST_REPOSITORY_ID.to_owned());
         input.ref_selector = Some("HEAD".to_owned());
         let ticket_ref = backend.create(input).unwrap();
+        assign_test_orchestrator(&api, &ticket_ref.id);
         *api.orchestrator_attention_fingerprint.lock().unwrap() = Some(ticket_ref.id.clone());
 
         let Json(started) = scoped_start_workspace_orchestrator(
@@ -15890,6 +16131,7 @@ mod tests {
         let mut first_ticket_input = ticket::NewTicket::new("Spawn assignment");
         first_ticket_input.workflow_state = Some(TicketWorkflowState::InProgress);
         let first_ticket = backend.create(first_ticket_input).unwrap();
+        assign_test_orchestrator(&api, &first_ticket.id);
         let request = WorkerSpawnRequest {
             requested_worker_name: Some("assigned-spawn".to_string()),
             intent: WorkerSpawnIntent::TicketRole {
@@ -15928,7 +16170,7 @@ mod tests {
         .await
         .unwrap();
         let first_worker = first.worker.unwrap();
-        let Json(projected) = scoped_get_ticket_worker_assignment(
+        let Json(projected) = scoped_list_ticket_assignments(
             State(api.clone()),
             AxumPath(ScopedRecordPath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
@@ -15938,11 +16180,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            projected
-                .worker
-                .as_ref()
-                .map(|worker| worker.worker.worker_id.as_str()),
-            Some(first_worker.worker.worker_id.as_str())
+            projected.assignments[0]
+                .principal
+                .worker()
+                .map(|worker| worker.worker_id),
+            Some(first_worker.worker.worker_id.clone())
         );
         let Json(retried) = scoped_create_runtime_worker(
             State(api.clone()),
@@ -15960,7 +16202,7 @@ mod tests {
         );
         assert_eq!(
             api.store
-                .list_ticket_worker_assignment_events(TEST_WORKSPACE_ID, &first_ticket.id, 10,)
+                .list_ticket_coder_assignment_events(TEST_WORKSPACE_ID, &first_ticket.id, 10,)
                 .unwrap()
                 .len(),
             1
@@ -15968,7 +16210,7 @@ mod tests {
 
         let current = api
             .store
-            .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &first_ticket.id)
+            .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &first_ticket.id)
             .unwrap()
             .unwrap();
         api.store
@@ -15994,6 +16236,7 @@ mod tests {
         let mut second_ticket_input = ticket::NewTicket::new("Restore assignment");
         second_ticket_input.workflow_state = Some(TicketWorkflowState::InProgress);
         let second_ticket = backend.create(second_ticket_input).unwrap();
+        assign_test_orchestrator(&api, &second_ticket.id);
         let _ = scoped_restore_runtime_worker(
             State(api.clone()),
             AxumPath(ScopedRuntimeWorkerPath {
@@ -16033,7 +16276,7 @@ mod tests {
         );
         let restored_assignment = api
             .store
-            .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &second_ticket.id)
+            .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &second_ticket.id)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -16154,6 +16397,7 @@ mod tests {
             .create(ticket_input)
             .unwrap()
             .id;
+        assign_test_orchestrator(&api, &ticket_id);
         let assignment = crate::hosts::WorkerTicketAssignmentRequest {
             ticket_id: ticket_id.clone(),
             operation_id: "compensation-test-operation".to_string(),
@@ -16247,7 +16491,7 @@ mod tests {
         );
         assert!(
             api.store
-                .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket_id)
+                .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &ticket_id)
                 .unwrap()
                 .is_none()
         );
@@ -16346,7 +16590,8 @@ mod tests {
         assert_eq!(edited.body, "Updated from the Browser API.");
         assert_eq!(edited.repository_id.as_deref(), Some("main"));
         assert_eq!(edited.ref_selector.as_deref(), Some("develop"));
-        assert_eq!(edited.assignee, None);
+        assert!(edited.assignments.is_empty());
+        assert!(edited.assignment_diagnostics.is_empty());
         assert_eq!(edited.relations.outgoing.len(), 1);
         assert_eq!(edited.relations.outgoing[0].target, related_ticket_id);
         assert_eq!(edited.relations.outgoing[0].kind, "related");
@@ -16550,6 +16795,49 @@ mod tests {
 
     async fn test_api(workspace_root: impl Into<PathBuf>) -> WorkspaceApi {
         test_api_with_recording_backend(workspace_root).await.0
+    }
+
+    fn assign_test_orchestrator(api: &WorkspaceApi, ticket_id: &str) {
+        api.store
+            .set_current_ticket_role_assignment(
+                &TicketRoleAssignmentRecord {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    ticket_id: ticket_id.to_string(),
+                    assignment_id: format!("orchestrator-{ticket_id}"),
+                    role: TicketAssignmentRole::Orchestrator,
+                    principal: TicketAssignmentPrincipal::WorkspaceAgent {
+                        agent_key: "workspace-orchestrator".to_string(),
+                    },
+                    assigned_by: "test-user".to_string(),
+                    assigned_at: "2026-09-01T00:00:00Z".to_string(),
+                },
+                None,
+                &format!("orchestrator-event-{ticket_id}"),
+                &format!("orchestrator-op-{ticket_id}"),
+                false,
+            )
+            .unwrap();
+        if let Ok(ticket) = api.authority.ticket(ticket_id)
+            && matches!(ticket.state.as_str(), "queued" | "inprogress")
+        {
+            let assignment_id = format!("orchestrator-{ticket_id}");
+            let backend =
+                browser_ticket_backend(api)
+                    .unwrap()
+                    .with_event_attributes(BTreeMap::from([(
+                        "orchestrator_assignment_id".to_string(),
+                        assignment_id,
+                    )]));
+            backend
+                .add_event(
+                    TicketIdOrSlug::Id(ticket.id),
+                    ticket::NewTicketEvent::new(
+                        ticket::TicketEventKind::Comment,
+                        "test Queue assignment fence",
+                    ),
+                )
+                .unwrap();
+        }
     }
 
     #[tokio::test]

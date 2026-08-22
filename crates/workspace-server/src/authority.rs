@@ -17,16 +17,17 @@ use ticket::{
 use crate::records::{
     ObjectiveDetail, ObjectiveEventDetail, ObjectiveLinkSummary, ObjectiveLinkedTicketSummary,
     ObjectiveQueryItem, ObjectiveQueryRequest, ObjectiveQueryResponse, ObjectiveResourceSummary,
-    ObjectiveShowRequest, ObjectiveSummary, ProjectRecordList, QueryPage, TicketAssignmentSummary,
-    TicketDetail, TicketEventDetail, TicketEvidenceEvent, TicketEvidenceSummary,
-    TicketListPageRequest, TicketMergeRequestSummary, TicketQueryItem, TicketQueryRequest,
-    TicketQueryResponse, TicketRelationView, TicketShowRequest, TicketSummary, TicketSummaryPage,
+    ObjectiveShowRequest, ObjectiveSummary, ProjectRecordList, QueryPage, TicketActionEligibility,
+    TicketAssignmentPrincipalSummary, TicketAssignmentSummary, TicketDetail, TicketEventDetail,
+    TicketEvidenceEvent, TicketEvidenceSummary, TicketListPageRequest, TicketMergeRequestSummary,
+    TicketQueryItem, TicketQueryRequest, TicketQueryResponse, TicketRelationView,
+    TicketRoleAssignmentSummary, TicketShowRequest, TicketSummary, TicketSummaryPage,
     summarize_body, truncate_body, validate_project_id,
 };
 use crate::store::{
     ControlPlaneStore, MemoryDocumentRecord, MemoryStagingRecord, MemoryStagingResolutionRecord,
     ObjectiveEventRecord, ObjectiveRecord, ObjectiveTicketLinkRecord, SqliteWorkspaceStore,
-    WorkspaceResourceKind,
+    TicketAssignmentPrincipal, TicketAssignmentRole, WorkspaceResourceKind,
 };
 use crate::{Error, Result};
 
@@ -146,7 +147,7 @@ impl merge_request::AssignmentSource for AuthorityMergeRequestSource {
         ticket_id: &str,
     ) -> std::result::Result<Option<merge_request::CurrentAssignment>, String> {
         self.store
-            .get_current_ticket_worker_assignment(workspace_id, ticket_id)
+            .get_current_ticket_coder_assignment(workspace_id, ticket_id)
             .map(|assignment| {
                 assignment.map(|assignment| merge_request::CurrentAssignment {
                     assignment_id: assignment.assignment_id,
@@ -762,23 +763,107 @@ impl SqliteWorkspaceAuthority {
             .filter(|(_, event)| event.kind.as_str() == "implementation_report")
             .map(|(sequence, event)| ticket_evidence_event(sequence, event))
             .collect::<Vec<_>>();
-        let current_assignment = self
+        let role_assignments = self
             .store
-            .get_current_ticket_worker_assignment(&self.workspace_id, id)?
-            .map(|assignment| {
+            .list_current_ticket_role_assignments(&self.workspace_id, id)?;
+        let assignments = role_assignments
+            .iter()
+            .cloned()
+            .map(|assignment| TicketRoleAssignmentSummary {
+                assignment_id: assignment.assignment_id,
+                role: assignment.role.as_str().to_string(),
+                principal: match assignment.principal {
+                    TicketAssignmentPrincipal::User { account_id } => {
+                        TicketAssignmentPrincipalSummary::User { account_id }
+                    }
+                    TicketAssignmentPrincipal::Worker {
+                        runtime_id,
+                        worker_id,
+                    } => TicketAssignmentPrincipalSummary::Worker {
+                        runtime_id,
+                        worker_id,
+                    },
+                    TicketAssignmentPrincipal::WorkspaceAgent { agent_key } => {
+                        TicketAssignmentPrincipalSummary::WorkspaceAgent { agent_key }
+                    }
+                },
+                assigned_by: assignment.assigned_by,
+                assigned_at: assignment.assigned_at,
+            })
+            .collect::<Vec<_>>();
+        let current_coder = role_assignments
+            .iter()
+            .find(|assignment| assignment.role == TicketAssignmentRole::Coder)
+            .and_then(|assignment| {
+                assignment
+                    .principal
+                    .worker()
+                    .map(|worker| (assignment, worker))
+            })
+            .map(|(assignment, worker)| {
                 let worker_resource_key = self.store.resource_key(
                     &self.workspace_id,
                     WorkspaceResourceKind::Worker,
-                    &assignment.worker.worker_id,
+                    &worker.worker_id,
                 )?;
                 Ok::<_, Error>(TicketAssignmentSummary {
-                    assignment_id: assignment.assignment_id,
-                    runtime_id: assignment.worker.runtime_id,
-                    worker_id: assignment.worker.worker_id,
+                    assignment_id: assignment.assignment_id.clone(),
+                    runtime_id: worker.runtime_id,
+                    worker_id: worker.worker_id,
                     worker_resource_key,
                 })
             })
             .transpose()?;
+        let has_orchestrator = role_assignments
+            .iter()
+            .any(|assignment| assignment.role == TicketAssignmentRole::Orchestrator);
+        let has_coder = role_assignments
+            .iter()
+            .any(|assignment| assignment.role == TicketAssignmentRole::Coder);
+        let has_target = ticket.meta.repository_id.is_some() && ticket.meta.ref_selector.is_some();
+        let has_blockers = !ticket.relations.blockers.is_empty();
+        let mut assignment_diagnostics = Vec::new();
+        if let Some(legacy_assignee) = ticket
+            .meta
+            .assignee
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            assignment_diagnostics.push(format!(
+                "legacy Ticket assignee `{legacy_assignee}` is not assignment authority"
+            ));
+        }
+        let action_eligibility = TicketActionEligibility {
+            can_assign_orchestrator: matches!(
+                ticket.meta.workflow_state,
+                TicketWorkflowState::Planning | TicketWorkflowState::Ready
+            ) && !has_orchestrator
+                && !has_coder,
+            can_unassign_orchestrator: has_orchestrator
+                && matches!(
+                    ticket.meta.workflow_state,
+                    TicketWorkflowState::Planning | TicketWorkflowState::Ready
+                ),
+            can_queue: ticket.meta.workflow_state == TicketWorkflowState::Ready
+                && has_orchestrator
+                && !has_coder
+                && has_target
+                && !has_blockers,
+            can_start_manual_coder: ticket.meta.workflow_state == TicketWorkflowState::Ready
+                && !has_orchestrator
+                && !has_coder
+                && has_target
+                && !has_blockers,
+            blockers: [
+                (!has_target).then_some("Ticket target is required".to_string()),
+                has_blockers.then_some("unresolved blocking relations remain".to_string()),
+                (has_orchestrator && has_coder)
+                    .then_some("Orchestrator and manual Coder assignment conflict".to_string()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+        };
         let merge_request = match self.merge_request_store.get(&self.workspace_id, id) {
             Ok(request) => {
                 let current_subject_ref = request.selector_from.as_deref().and_then(|selector| {
@@ -847,7 +932,6 @@ impl SqliteWorkspaceAuthority {
             item_revision,
             queued_by: ticket.meta.queued_by,
             queued_at: ticket.meta.queued_at,
-            assignee: ticket.meta.assignee,
             repository_id: ticket.meta.repository_id,
             ref_selector: ticket.meta.ref_selector,
             risk_flags: ticket.meta.risk_flags,
@@ -873,7 +957,10 @@ impl SqliteWorkspaceAuthority {
             relations,
             linked_objectives,
             implementation_reports,
-            current_assignment,
+            assignments,
+            current_coder,
+            assignment_diagnostics,
+            action_eligibility,
             merge_request,
             evidence,
             resolution: ticket

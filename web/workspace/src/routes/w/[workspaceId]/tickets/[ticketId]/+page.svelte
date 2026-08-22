@@ -2,6 +2,7 @@
   import { untrack } from "svelte";
   import RichMarkdown from "$lib/workspace/console/RichMarkdown.svelte";
   import {
+    workspaceApiJson,
     workspaceApiJsonWithBody,
     workspaceApiPath,
   } from "$lib/workspace/api/http";
@@ -9,7 +10,6 @@
   import {
     relationLabel,
     TICKET_STATES,
-    ticketWorkerLaunchHref,
     type WorkspaceOrchestratorStatus,
   } from "$lib/workspace/tickets/ticket-panel";
   import type { ApiResult } from "$lib/workspace/api/http";
@@ -37,7 +37,6 @@
   const loadedTicket = initialData.ticket.data;
   if (!loadedTicket) throw new Error(initialData.ticket.error ?? "ticket load failed");
   const loadedRepositories = initialData.repositories.data;
-  const orchestratorOnline = initialData.orchestrator.data?.online ?? false;
 
   let ticket = $state<TicketDetail>(loadedTicket);
   const mergeRequest = $derived(ticket.merge_request);
@@ -54,6 +53,8 @@
   let busy = $state<string | null>(null);
   let errorMessage = $state<string | null>(null);
   let readyOperationKey = $state<string | null>(null);
+  let manualRuntimeId = $state("");
+  let manualWorkerId = $state("");
   const selectedRepository = $derived(
     (loadedRepositories?.items ?? []).find((repository: RepositorySummary) => repository.id === repositoryId) ?? null,
   );
@@ -72,7 +73,7 @@
       ),
   );
   const implementationStartEligible = $derived(
-    persistedTargetValid && ticket.state !== "planning" && ticket.state !== "closed",
+    ticket.action_eligibility.can_start_manual_coder,
   );
 
   const ticketPath = $derived(
@@ -114,6 +115,51 @@
     } finally {
       busy = null;
     }
+  }
+
+  async function mutateAssignment(
+    action: string,
+    role: "orchestrator" | "coder",
+    principal: Record<string, string>,
+  ): Promise<void> {
+    if (busy) return;
+    busy = action;
+    errorMessage = null;
+    try {
+      await workspaceApiJsonWithBody(
+        `${ticketPath}/assignments/${role}`,
+        {
+          method: "PUT",
+          body: JSON.stringify({
+            operation_id: crypto.randomUUID(),
+            principal,
+            expected_assignment_id: null,
+          }),
+        },
+      );
+      applyTicket(await workspaceApiJson<TicketDetail>(ticketPath));
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : String(error);
+    } finally {
+      busy = null;
+    }
+  }
+
+  async function assignOrchestrator(): Promise<void> {
+    await mutateAssignment("assign-orchestrator", "orchestrator", {
+      kind: "workspace_agent",
+      agent_key: "workspace-orchestrator",
+    });
+  }
+
+  async function startManualCoder(event: SubmitEvent): Promise<void> {
+    event.preventDefault();
+    if (!manualRuntimeId.trim() || !manualWorkerId.trim()) return;
+    await mutateAssignment("start-manual", "coder", {
+      kind: "worker",
+      runtime_id: manualRuntimeId.trim(),
+      worker_id: manualWorkerId.trim(),
+    });
   }
 
   async function saveEdit(event: SubmitEvent) {
@@ -326,24 +372,54 @@
 
     <aside class="ticket-control-rail">
       <section class="ticket-control-card ticket-worker-card">
-        <header><h2>Start a Worker</h2><span>Ticket role</span></header>
-        <p class="ticket-assignment-line">
-          Assigned to <strong>{ticket.assignee ?? "Unassigned"}</strong>
-        </p>
-        {#if orchestratorOnline && implementationStartEligible}
-          <p>The Orchestrator is online. Start a role-specific Worker with the validated Ticket target below.</p>
-          <div class="ticket-role-actions">
-            <a class="workspace-primary-button" href={ticketWorkerLaunchHref(data.workspaceId, ticket, "coder")}>Coder</a>
-          </div>
+        <header><h2>Role assignments</h2><span>Server-authoritative</span></header>
+        {#if ticket.assignments.length > 0}
+          <ul class="ticket-assignment-list">
+            {#each ticket.assignments as assignment}
+              <li>
+                <strong>{assignment.role}</strong>
+                <span>
+                  {#if assignment.principal.kind === "worker"}
+                    {assignment.principal.runtime_id}/{assignment.principal.worker_id}
+                  {:else if assignment.principal.kind === "user"}
+                    {assignment.principal.account_id}
+                  {:else}
+                    {assignment.principal.agent_key}
+                  {/if}
+                </span>
+              </li>
+            {/each}
+          </ul>
         {:else}
-          <p class="workspace-callout">
-            {orchestratorOnline
-              ? "Validate and persist the repository target before starting a Ticket Worker."
-              : "Start the Workspace Orchestrator from the Ticket panel before launching Ticket Workers."}
-          </p>
-          <div class="ticket-role-actions">
-            <button class="workspace-primary-button" type="button" disabled>Coder</button>
-          </div>
+          <p class="workspace-empty-copy">No active role assignment.</p>
+        {/if}
+        {#if ticket.action_eligibility.can_assign_orchestrator}
+          <button
+            class="workspace-primary-button"
+            type="button"
+            disabled={busy !== null}
+            onclick={assignOrchestrator}
+          >
+            {busy === "assign-orchestrator" ? "Assigning…" : "Assign Orchestrator"}
+          </button>
+        {/if}
+        {#if implementationStartEligible}
+          <form class="ticket-control-form" onsubmit={startManualCoder}>
+            <label>Runtime ID<input bind:value={manualRuntimeId} required /></label>
+            <label>Worker ID<input bind:value={manualWorkerId} required /></label>
+            <button
+              class="workspace-secondary-button"
+              type="submit"
+              disabled={busy !== null || !manualRuntimeId.trim() || !manualWorkerId.trim()}
+            >
+              {busy === "start-manual" ? "Starting…" : "Assign Coder and start"}
+            </button>
+          </form>
+        {/if}
+        {#if ticket.assignment_diagnostics.length > 0}
+          {#each ticket.assignment_diagnostics as diagnostic}
+            <p class="workspace-callout">{diagnostic}</p>
+          {/each}
         {/if}
       </section>
 
@@ -386,9 +462,12 @@
             <p class="workspace-empty-copy">Choose a healthy repository and an effective ref selector before marking ready.</p>
           {/if}
         {:else if ticket.state === "ready"}
-          <button class="workspace-primary-button ticket-queue-button" type="button" disabled={busy === "queue" || !orchestratorOnline || !persistedTargetValid} onclick={() => mutate("queue", "/queue", {})}>
-            {busy === "queue" ? "Queueing…" : orchestratorOnline ? "Queue ticket" : "Orchestrator offline"}
+          <button class="workspace-primary-button ticket-queue-button" type="button" disabled={busy === "queue" || !ticket.action_eligibility.can_queue} onclick={() => mutate("queue", "/queue", {})}>
+            {busy === "queue" ? "Queueing…" : "Queue ticket"}
           </button>
+          {#if !ticket.action_eligibility.can_queue}
+            <p class="workspace-empty-copy">Assign the Orchestrator role and resolve the listed blockers before Queue.</p>
+          {/if}
         {/if}
       </section>
 

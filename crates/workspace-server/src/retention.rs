@@ -1047,7 +1047,7 @@ fn parse_state(v: &str) -> rusqlite::Result<WorkerRemovalPlanState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{ControlPlaneStore, TicketWorkerAssignmentRecord, WorkerRegistryRecord};
+    use crate::store::{ControlPlaneStore, TicketCoderAssignmentRecord, WorkerRegistryRecord};
     use worker_runtime::identity::WorkerId;
     fn worker_id() -> WorkerId {
         WorkerId::from_legacy_u64(1)
@@ -1505,7 +1505,7 @@ mod tests {
         ).map_err(StoreError::from)).unwrap();
         assert_eq!(revision, "rev1");
 
-        let assignment = TicketWorkerAssignmentRecord {
+        let assignment = TicketCoderAssignmentRecord {
             workspace_id: "w".into(),
             ticket_id: "new-ticket".into(),
             assignment_id: "new-assignment".into(),
@@ -1518,7 +1518,7 @@ mod tests {
         };
         assert!(
             store
-                .set_current_ticket_worker_assignment(
+                .set_current_ticket_coder_assignment(
                     &assignment,
                     None,
                     "event",

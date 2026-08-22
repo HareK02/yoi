@@ -679,7 +679,9 @@ fn validate_generic_state_change(
     to: TicketWorkflowState,
 ) -> Result<()> {
     if current == TicketWorkflowState::Planning && to == TicketWorkflowState::Ready
+        || current == TicketWorkflowState::Planning && to == TicketWorkflowState::InProgress
         || current == TicketWorkflowState::Ready && to == TicketWorkflowState::Queued
+        || current == TicketWorkflowState::Ready && to == TicketWorkflowState::InProgress
     {
         return Err(TicketError::InvalidWorkflowTransition {
             from: current.as_str().to_owned(),
@@ -6996,6 +6998,24 @@ mod tests {
         assert_eq!(projection.visible_state, "ready→prog");
         assert!(!projection.queue_guard.can_queue_for_orchestrator);
         assert!(projection.visible_overlay.is_some());
+    }
+
+    #[test]
+    fn generic_state_change_rejects_manual_start_bypass() {
+        assert!(
+            validate_generic_state_change(
+                TicketWorkflowState::Ready,
+                TicketWorkflowState::InProgress
+            )
+            .is_err()
+        );
+        assert!(
+            validate_generic_state_change(
+                TicketWorkflowState::Planning,
+                TicketWorkflowState::InProgress
+            )
+            .is_err()
+        );
     }
 
     #[test]
