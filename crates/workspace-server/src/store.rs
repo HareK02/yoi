@@ -3618,11 +3618,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         for value in [
             record.workspace_id.as_str(),
             record.ticket_id.as_str(),
-            record.assignment_id.as_str(),
             record.role.as_str(),
             principal_json.as_str(),
             record.assigned_by.as_str(),
-            record.assigned_at.as_str(),
             expected_assignment_id.unwrap_or(""),
             if allow_reassign { "reassign" } else { "assign" },
         ] {
@@ -3857,10 +3855,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             "ticket-role-assignment:manual-start:v1",
             record.workspace_id.as_str(),
             record.ticket_id.as_str(),
-            record.assignment_id.as_str(),
             principal_json.as_str(),
             record.assigned_by.as_str(),
-            record.assigned_at.as_str(),
         ] {
             hasher.update(value.as_bytes());
             hasher.update([0]);
@@ -4069,7 +4065,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             assignment_id,
             principal_json.as_str(),
             actor,
-            occurred_at,
             reason.unwrap_or(""),
         ] {
             hasher.update(value.as_bytes());
@@ -4124,6 +4119,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     "operation `{operation_id}` was already used for different Ticket assignment input"
                 )));
             }
+            tx.commit()?;
+            return Ok(true);
         }
         let deleted = tx.execute(
             "DELETE FROM ticket_current_worker_assignments
@@ -10645,6 +10642,19 @@ INSERT INTO worker_registry (
             .start_ready_ticket_with_coder_assignment(&coder, "event-coder", "op-coder")
             .unwrap();
         assert_eq!(started, coder);
+        let replay_input = TicketRoleAssignmentRecord {
+            assignment_id: "coder-regenerated-result".to_string(),
+            assigned_at: "2026-09-01T00:01:59Z".to_string(),
+            ..coder.clone()
+        };
+        let replayed = store
+            .start_ready_ticket_with_coder_assignment(
+                &replay_input,
+                "event-coder-regenerated",
+                "op-coder",
+            )
+            .unwrap();
+        assert_eq!(replayed, coder);
         let ticket = ticket::TicketBackend::show(&backend, ticket.id.clone().into()).unwrap();
         assert_eq!(
             ticket.meta.workflow_state,

@@ -15646,6 +15646,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn role_assignment_endpoint_replays_same_operation_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let ticket = browser_ticket_backend(&api)
+            .unwrap()
+            .create(ticket::NewTicket::new("Idempotent assignment"))
+            .unwrap();
+        let request = || SetTicketRoleAssignmentRequest {
+            operation_id: "same-role-operation".to_string(),
+            principal: TicketAssignmentPrincipal::WorkspaceAgent {
+                agent_key: "workspace-orchestrator".to_string(),
+            },
+            expected_assignment_id: None,
+        };
+        let path = || {
+            AxumPath((
+                TEST_WORKSPACE_ID.to_string(),
+                ticket.id.clone(),
+                "orchestrator".to_string(),
+            ))
+        };
+
+        let Json(first) = scoped_set_ticket_assignment(State(api.clone()), path(), Json(request()))
+            .await
+            .unwrap();
+        let Json(replay) = scoped_set_ticket_assignment(State(api), path(), Json(request()))
+            .await
+            .unwrap();
+        assert_eq!(replay.assignment, first.assignment);
+    }
+
+    #[tokio::test]
     async fn ticket_assignment_endpoints_read_and_clear_current_assignment() {
         let dir = tempfile::tempdir().unwrap();
         let api = test_api(dir.path()).await;
@@ -15765,6 +15797,21 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(cleared.assignment, None);
+        let Json(replayed_clear) = scoped_clear_ticket_assignment(
+            State(api),
+            AxumPath((
+                TEST_WORKSPACE_ID.to_string(),
+                ticket_id,
+                "coder".to_string(),
+            )),
+            Query(ClearTicketRoleAssignmentQuery {
+                operation_id: Some("clear-current".to_string()),
+                assignment_id: Some("assignment-api-1".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replayed_clear.assignment, None);
     }
 
     #[tokio::test]
