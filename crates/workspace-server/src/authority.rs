@@ -857,8 +857,6 @@ impl SqliteWorkspaceAuthority {
             blockers: [
                 (!has_target).then_some("Ticket target is required".to_string()),
                 has_blockers.then_some("unresolved blocking relations remain".to_string()),
-                (has_orchestrator && has_coder)
-                    .then_some("Orchestrator and manual Coder assignment conflict".to_string()),
             ]
             .into_iter()
             .flatten()

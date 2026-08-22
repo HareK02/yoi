@@ -3920,7 +3920,22 @@ async fn scoped_close_ticket(
     browser_ticket_detail(&api, &path.id)
 }
 
+fn reject_unguarded_ticket_start(operation: &TicketBackendOperation) -> Result<()> {
+    if matches!(
+        operation,
+        TicketBackendOperation::SetWorkflowState { change, .. }
+            if change.to == "inprogress" && change.from != "inprogress"
+    ) {
+        return Err(Error::TicketAssignmentConflict(
+            "inprogress is guarded by Queue acceptance or atomic ready-state Coder assignment"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn reject_unguarded_ticket_completion(operation: &TicketBackendOperation) -> Result<()> {
+    reject_unguarded_ticket_start(operation)?;
     if matches!(operation, TicketBackendOperation::SetWorkflowState { change, .. } if change.to == "done")
     {
         return Err(Error::TicketAssignmentConflict(
@@ -13312,6 +13327,27 @@ mod tests {
     }
 
     #[test]
+    fn generic_worker_state_change_cannot_enter_inprogress() {
+        for from in ["planning", "ready", "queued"] {
+            let operation = TicketBackendOperation::SetWorkflowState {
+                id: TicketIdOrSlug::Query("T1".to_string()),
+                change: TicketStateChange::new(
+                    from,
+                    "inprogress",
+                    "worker-tool",
+                    "bypass assignment-aware start",
+                ),
+            };
+            let error = reject_unguarded_ticket_completion(&operation).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("atomic ready-state Coder assignment")
+            );
+        }
+    }
+
+    #[test]
     fn flow_or_generic_worker_state_change_is_not_ticket_completion_authority() {
         let operation = TicketBackendOperation::SetWorkflowState {
             id: TicketIdOrSlug::Query("T1".to_string()),
@@ -15650,6 +15686,7 @@ mod tests {
                 false,
             )
             .unwrap();
+        assign_test_orchestrator(&api, &ticket_id);
         let path = || ScopedRecordPath {
             workspace_id: TEST_WORKSPACE_ID.to_string(),
             id: ticket_id.clone(),
@@ -15658,9 +15695,23 @@ mod tests {
         let Json(read) = scoped_list_ticket_assignments(State(api.clone()), AxumPath(path()))
             .await
             .unwrap();
-        assert_eq!(read.assignments.len(), 1);
-        assert_eq!(read.assignments[0].assignment_id, assignment.assignment_id);
-        assert_eq!(read.assignments[0].role, TicketAssignmentRole::Coder);
+        assert_eq!(read.assignments.len(), 2);
+        let coder = read
+            .assignments
+            .iter()
+            .find(|assignment| assignment.role == TicketAssignmentRole::Coder)
+            .unwrap();
+        assert_eq!(coder.assignment_id, assignment.assignment_id);
+        let Json(detail) = browser_ticket_detail(&api, &ticket_id).unwrap();
+        assert!(
+            !detail
+                .action_eligibility
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("Orchestrator and manual Coder"))
+        );
+        assert!(!detail.action_eligibility.can_assign_orchestrator);
+        assert!(!detail.action_eligibility.can_start_manual_coder);
 
         let stale = scoped_clear_ticket_assignment(
             State(api.clone()),
