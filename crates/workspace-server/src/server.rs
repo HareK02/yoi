@@ -2713,7 +2713,7 @@ struct CurrentWorkerWorkdirAttachmentResponse {
     attached: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ScopedRecordPath {
     workspace_id: String,
     id: String,
@@ -3698,9 +3698,7 @@ struct BrowserAppendTicketEventRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BrowserQueueTicketRequest {
-    queued_by: Option<String>,
-}
+struct BrowserQueueTicketRequest {}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3829,6 +3827,15 @@ async fn scoped_transition_ticket_state(
         ).into());
     }
     let current = api.authority.ticket(&path.id)?;
+    if request.state == TicketWorkflowState::InProgress
+        && current.state != TicketWorkflowState::InProgress.as_str()
+    {
+        return Err(Error::TicketAssignmentConflict(
+            "generic Ticket state mutation cannot enter inprogress; use Queue acceptance or atomic ready-state Coder assignment"
+                .to_string(),
+        )
+        .into());
+    }
     let mut change = TicketStateChange::new(
         current.state,
         request.state.as_str(),
@@ -3881,22 +3888,20 @@ async fn scoped_mark_ticket_ready_from_browser(
 async fn scoped_queue_ticket(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRecordPath>,
-    Json(request): Json<BrowserQueueTicketRequest>,
+    Json(_request): Json<BrowserQueueTicketRequest>,
 ) -> ApiResult<Json<TicketDetail>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let queued_by = request.queued_by.as_deref().unwrap_or("web");
-    browser_ticket_backend(&api)?
-        .queue_ready(TicketIdOrSlug::Id(path.id.clone()), queued_by)
-        .map_err(Error::from)?;
-    let Json(ticket) = browser_ticket_detail(&api, &path.id)?;
-    notify_ticket_recipients(
+    let _ = execute_ticket_rest_operation(
         &api,
         &path.workspace_id,
-        &path.id,
-        TicketWorkflowState::Ready.as_str(),
-        ticket.state.as_str(),
-        None,
-    );
+        HeaderMap::new(),
+        TicketBackendOperation::QueueReady {
+            id: TicketIdOrSlug::Id(path.id.clone()),
+            queued_by: "workspace-web".to_string(),
+        },
+    )
+    .await?;
+    let Json(ticket) = browser_ticket_detail(&api, &path.id)?;
     Ok(Json(ticket))
 }
 
@@ -15950,6 +15955,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generic_browser_state_mutation_cannot_bypass_assignment_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let backend = browser_ticket_backend(&api).unwrap();
+        let ticket = backend
+            .create(ticket::NewTicket::new("Generic transition guard"))
+            .unwrap();
+        let path = ScopedRecordPath {
+            workspace_id: TEST_WORKSPACE_ID.to_string(),
+            id: ticket.id.clone(),
+        };
+
+        let planning = scoped_transition_ticket_state(
+            State(api.clone()),
+            AxumPath(path.clone()),
+            Json(BrowserTransitionTicketStateRequest {
+                state: TicketWorkflowState::InProgress,
+                reason: None,
+                body: None,
+                author: None,
+            }),
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(planning.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            backend
+                .show(ticket.id.clone().into())
+                .unwrap()
+                .meta
+                .workflow_state,
+            TicketWorkflowState::Planning
+        );
+
+        let mut ready_input = ticket::NewTicket::new("Ready transition guard");
+        ready_input.workflow_state = Some(TicketWorkflowState::Ready);
+        let ready = backend.create(ready_input).unwrap();
+        let ready_result = scoped_transition_ticket_state(
+            State(api.clone()),
+            AxumPath(ScopedRecordPath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                id: ready.id.clone(),
+            }),
+            Json(BrowserTransitionTicketStateRequest {
+                state: TicketWorkflowState::InProgress,
+                reason: None,
+                body: None,
+                author: None,
+            }),
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(ready_result.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            backend.show(ready.id.into()).unwrap().meta.workflow_state,
+            TicketWorkflowState::Ready
+        );
+    }
+
+    #[tokio::test]
     async fn queue_requires_orchestrator_role_and_records_assignment_fence() {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
@@ -15961,6 +16028,19 @@ mod tests {
         input.ref_selector = Some("develop".to_string());
         let ticket = backend.create(input).unwrap();
         let path = (TEST_WORKSPACE_ID.to_string(), ticket.id.clone());
+
+        let legacy_missing = scoped_queue_ticket(
+            State(api.clone()),
+            AxumPath(ScopedRecordPath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                id: ticket.id.clone(),
+            }),
+            Json(BrowserQueueTicketRequest {}),
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(legacy_missing.status(), StatusCode::CONFLICT);
 
         let missing = scoped_queue_ticket_record(
             State(api.clone()),
@@ -16623,18 +16703,17 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(ready.state, "ready");
+        assign_test_orchestrator(&api, &ticket_id);
 
         let Json(queued) = scoped_queue_ticket(
             State(api.clone()),
             AxumPath(path()),
-            Json(BrowserQueueTicketRequest {
-                queued_by: Some("browser-user".to_string()),
-            }),
+            Json(BrowserQueueTicketRequest {}),
         )
         .await
         .unwrap();
         assert_eq!(queued.state, "queued");
-        assert_eq!(queued.queued_by.as_deref(), Some("browser-user"));
+        assert_eq!(queued.queued_by.as_deref(), Some("workspace-web"));
         let Json(closed) = scoped_close_ticket(
             State(api),
             AxumPath(path()),

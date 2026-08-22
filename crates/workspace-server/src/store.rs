@@ -3648,6 +3648,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         };
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(worker) = record.principal.worker() {
+                ensure_worker_assignment_available(&tx, &record.workspace_id, &worker)?;
+            }
 
             let existing_operation: Option<(String, Option<String>)> = tx
                 .query_row(
@@ -3866,6 +3869,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
 
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(worker) = record.principal.worker() {
+                ensure_worker_assignment_available(&tx, &record.workspace_id, &worker)?;
+            }
             let existing_operation: Option<(String, Option<String>)> = tx
                 .query_row(
                     "SELECT request_fingerprint, assignment_id FROM ticket_assignment_operations
@@ -5372,6 +5378,32 @@ fn read_worker_control_grant_by_operation(
     )
     .optional()
     .map_err(Error::from)
+}
+
+fn ensure_worker_assignment_available(
+    conn: &Connection,
+    workspace_id: &str,
+    worker: &RuntimeWorkerRef,
+) -> Result<()> {
+    let removal_blocks_assignment: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM worker_removal_operations
+            WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
+              AND state IN ('executing', 'failed', 'succeeded')
+            UNION ALL
+            SELECT 1 FROM worker_tombstones
+            WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
+        )",
+        params![workspace_id, worker.runtime_id, worker.worker_id],
+        |row| row.get(0),
+    )?;
+    if removal_blocks_assignment {
+        return Err(Error::TicketAssignmentConflict(format!(
+            "Worker {}/{} is being retained or has been removed",
+            worker.runtime_id, worker.worker_id
+        )));
+    }
+    Ok(())
 }
 
 fn read_ticket_role_assignment_record(
@@ -10630,7 +10662,51 @@ INSERT INTO worker_registry (
                     TicketAssignmentRole::Coder,
                 )
                 .unwrap(),
-            Some(coder)
+            Some(coder.clone())
+        );
+        assert!(
+            store
+                .delete_worker_registry("workspace-role", &worker.worker)
+                .is_err(),
+            "active role assignment must prevent Worker removal"
+        );
+        assert!(
+            store
+                .clear_current_ticket_role_assignment(
+                    "workspace-role",
+                    &ticket.meta.id,
+                    TicketAssignmentRole::Coder,
+                    "coder-manual-1",
+                    "event-clear-coder",
+                    "op-clear-coder",
+                    "user",
+                    "2026-09-01T00:03:00Z",
+                    Some("test removal guard"),
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .delete_worker_registry("workspace-role", &worker.worker)
+                .unwrap()
+        );
+        let removed_worker_assignment = TicketRoleAssignmentRecord {
+            assignment_id: "contributor-removed-worker".to_string(),
+            role: TicketAssignmentRole::Contributor,
+            assigned_at: "2026-09-01T00:04:00Z".to_string(),
+            ..coder
+        };
+        assert!(
+            store
+                .set_current_ticket_role_assignment(
+                    &removed_worker_assignment,
+                    None,
+                    "event-removed-worker",
+                    "op-removed-worker",
+                    false,
+                )
+                .is_err(),
+            "removed/tombstoned Worker cannot become a new role principal"
         );
     }
 
