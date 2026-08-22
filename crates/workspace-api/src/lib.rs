@@ -7,6 +7,9 @@
 use serde::{Deserialize, Serialize};
 use workdir::workspace::WorkingDirectorySummary;
 
+pub const TICKET_RELATIONS_QUERY_PATH: &str = "/tickets/relations/search";
+pub const TICKET_ORCHESTRATION_PLANS_QUERY_PATH: &str = "/tickets/orchestration-plans/search";
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticSeverity {

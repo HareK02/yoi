@@ -11,6 +11,7 @@ use ticket::{
 use workspace_api::{
     ListResponse, ObjectiveCreateRequest, ObjectiveDetail, ObjectiveEditRequest,
     ObjectiveLinkTicketRequest, ObjectiveStateRequest, ObjectiveSummary,
+    TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_PATH,
 };
 
 use crate::BackendWorkspaceClientError;
@@ -173,7 +174,7 @@ impl BackendWorkspaceProductClient {
         }
         self.send_json(
             Method::POST,
-            "/ticket-relations/query",
+            TICKET_RELATIONS_QUERY_PATH,
             Some(&Query { ticket, kind }),
         )
     }
@@ -568,7 +569,7 @@ impl TicketBackend for BackendWorkspaceProductClient {
         }
         self.send_json(
             Method::POST,
-            "/ticket-orchestration-plans/query",
+            TICKET_ORCHESTRATION_PLANS_QUERY_PATH,
             Some(&Query { ticket, kind }),
         )
         .map_err(ticket_client_error)
@@ -745,7 +746,7 @@ mod tests {
 
         assert!(relations.is_empty());
         let request = request.recv().unwrap();
-        assert!(request.starts_with("POST /api/w/workspace-a/ticket-relations/query "));
+        assert!(request.starts_with("POST /api/w/workspace-a/tickets/relations/search "));
         assert!(request.contains("\"ticket\":{\"Query\":\"T-1\"}"));
         handle.join().unwrap();
     }
@@ -762,7 +763,7 @@ mod tests {
             request
                 .recv()
                 .unwrap()
-                .starts_with("POST /api/w/workspace-a/ticket-orchestration-plans/query ")
+                .starts_with("POST /api/w/workspace-a/tickets/orchestration-plans/search ")
         );
         handle.join().unwrap();
     }

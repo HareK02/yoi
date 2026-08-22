@@ -58,7 +58,8 @@ use worker::feature::builtin::{WorkerObservationSubject, WorkerObservationSubjec
 use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest};
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
 use workspace_api::{
-    ObjectiveCreateRequest, ObjectiveEditRequest, ObjectiveLinkTicketRequest, ObjectiveStateRequest,
+    ObjectiveCreateRequest, ObjectiveEditRequest, ObjectiveLinkTicketRequest,
+    ObjectiveStateRequest, TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_PATH,
 };
 
 use crate::auth::{
@@ -1603,6 +1604,10 @@ fn build_server_auth_router(api: ServerAuthApi) -> Router {
 
 pub fn build_router(api: WorkspaceApi) -> Router {
     let auth = build_server_auth_router(ServerAuthApi::from(&api));
+    let scoped_ticket_relations_query_path =
+        format!("/api/w/{{workspace_id}}{TICKET_RELATIONS_QUERY_PATH}");
+    let scoped_ticket_orchestration_plans_query_path =
+        format!("/api/w/{{workspace_id}}{TICKET_ORCHESTRATION_PLANS_QUERY_PATH}");
     let workspace = Router::new()
         .route("/api/workspace", get(get_workspace))
         .route("/api/w/{workspace_id}/workspace", get(scoped_get_workspace))
@@ -1697,11 +1702,11 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             get(scoped_ticket_doctor),
         )
         .route(
-            "/api/w/{workspace_id}/tickets/relations/search",
+            scoped_ticket_relations_query_path.as_str(),
             post(scoped_query_ticket_relations),
         )
         .route(
-            "/api/w/{workspace_id}/tickets/orchestration-plans/search",
+            scoped_ticket_orchestration_plans_query_path.as_str(),
             post(scoped_query_ticket_orchestration_plans),
         )
         .route(
@@ -18202,6 +18207,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+
+        for path in [
+            TICKET_RELATIONS_QUERY_PATH,
+            TICKET_ORCHESTRATION_PLANS_QUERY_PATH,
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/w/{TEST_WORKSPACE_ID}{path}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"ticket":null,"kind":null}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "path: {path}");
+        }
 
         let response = app
             .clone()
