@@ -79,7 +79,7 @@ impl Hook<PostToolCall> for TicketIntakeReadyShutdownHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm_engine::tool::ToolOutput;
+    use agen::tool::ToolOutput;
 
     fn tool_result(name: &str, is_error: bool) -> ToolResultSummary {
         ToolResultSummary {

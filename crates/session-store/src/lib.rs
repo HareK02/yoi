@@ -40,10 +40,10 @@ pub mod system_item;
 pub mod worker_metadata;
 pub mod worker_session_store;
 
+pub use agen::UsageRecord;
+pub use agen::llm_client::types::{ContentPart, Item, Role};
 pub use event_trace::{TraceEntry, TracePayload};
 pub use fs_store::FsStore;
-pub use llm_engine::UsageRecord;
-pub use llm_engine::llm_client::types::{ContentPart, Item, Role};
 pub use logged_item::{LoggedContentPart, LoggedItem, LoggedRole, from_logged, to_logged};
 pub use segment::{
     SegmentStartState, append_entry, append_system_item, classify_history_item,

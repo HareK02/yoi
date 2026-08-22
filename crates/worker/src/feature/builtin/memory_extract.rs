@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
+use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
-use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use memory::backend::{
     MemoryBackendOperation, MemoryBackendOperationResult, MemoryStageCandidateOperation,
 };
@@ -163,7 +163,7 @@ impl Tool for StageMemoryCandidateTool {
     async fn execute(
         &self,
         input_json: &str,
-        _context: llm_engine::tool::ToolExecutionContext,
+        _context: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: StageMemoryCandidateParams =
             serde_json::from_str(input_json).map_err(|error| {
@@ -249,7 +249,7 @@ impl Tool for FinishMemoryExtractionTool {
     async fn execute(
         &self,
         input_json: &str,
-        _context: llm_engine::tool::ToolExecutionContext,
+        _context: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: FinishMemoryExtractionParams =
             serde_json::from_str(input_json).map_err(|error| {
@@ -387,7 +387,7 @@ fn truncate_line(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use llm_engine::Item;
+    use agen::Item;
 
     use super::*;
 
@@ -451,7 +451,7 @@ mod tests {
         let error = tool
             .execute(
                 r#"{"kind":"decision","claim":"claim","why_useful":"useful","entry_refs":["E00000009"]}"#,
-                llm_engine::tool::ToolExecutionContext::direct(),
+                agen::tool::ToolExecutionContext::direct(),
             )
             .await
             .unwrap_err();

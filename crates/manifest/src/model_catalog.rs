@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::{AuthRef, ModelManifest, SchemeKind};
-use llm_engine::llm_client::capability::ModelCapability;
+use agen::llm_client::capability::ModelCapability;
 use serde::{Deserialize, Serialize};
 
 const BUILTIN_PROVIDERS: &str = include_str!("../../../resources/providers/builtin.toml");

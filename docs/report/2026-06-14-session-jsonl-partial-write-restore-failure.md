@@ -48,5 +48,5 @@ The corrupted `tool_result` was manually replaced with a synthetic repair record
 
 ## Related fixes made during investigation
 
-- Added safer SSE parse diagnostics in `llm-worker` so future provider-stream failures include HTTP status and selected safe response headers.
+- Added safer SSE parse diagnostics in `agen` so future provider-stream failures include HTTP status and selected safe response headers.
 - Enabled local trace via `.yoi/override.local.toml` and manually set `record_event_trace = true` in the `yoi-orchestrator` metadata snapshot for future restores.

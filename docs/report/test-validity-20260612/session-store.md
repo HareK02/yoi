@@ -55,7 +55,7 @@
   - trace file が segment log と分離されること
   - `read_entry_count`
   - `lookup_session_of`
-- `session_test.rs` は mock LLM + actual `llm_worker::Worker` を通して、単純応答・tool call・pause・restore・fork 系を実行している。単なる pure unit だけでなく、crate 境界上の使われ方もある程度守れている。
+- `session_test.rs` は mock LLM + actual `agen::Worker` を通して、単純応答・tool call・pause・restore・fork 系を実行している。単なる pure unit だけでなく、crate 境界上の使われ方もある程度守れている。
 - fork lineage について、fresh-session fork / in-session `fork_at` / live conflict `ensure_head_or_fork` / nested past fork まで触れているのは良いです。特に「source segment を mutate しない」方針をテストで固定できています。
 
 ## 不足・疑問のあるテスト

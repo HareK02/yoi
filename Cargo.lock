@@ -38,6 +38,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "agen"
+version = "0.2.1"
+dependencies = [
+ "agen-macros",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "clap",
+ "dotenv",
+ "eventsource-stream",
+ "futures",
+ "reqwest",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "trybuild",
+ "wiremock",
+ "zstd",
+]
+
+[[package]]
+name = "agen-macros"
+version = "0.2.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2262,42 +2298,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
-name = "llm-engine"
-version = "0.2.1"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "chrono",
- "clap",
- "dotenv",
- "eventsource-stream",
- "futures",
- "llm-engine-macros",
- "reqwest",
- "schemars",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "trybuild",
- "wiremock",
- "zstd",
-]
-
-[[package]]
-name = "llm-engine-macros"
-version = "0.2.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2384,8 +2384,8 @@ dependencies = [
 name = "manifest"
 version = "0.1.0"
 dependencies = [
+ "agen",
  "arc-swap",
- "llm-engine",
  "protocol",
  "secrets",
  "serde",
@@ -2512,11 +2512,11 @@ dependencies = [
 name = "memory"
 version = "0.1.0"
 dependencies = [
+ "agen",
  "async-trait",
  "chrono",
  "libc",
  "lint-common",
- "llm-engine",
  "manifest",
  "schemars",
  "serde",
@@ -3967,10 +3967,10 @@ dependencies = [
 name = "session-store"
 version = "0.1.0"
 dependencies = [
+ "agen",
  "async-trait",
  "base64 0.22.1",
  "futures",
- "llm-engine",
  "protocol",
  "serde",
  "serde_json",
@@ -4408,10 +4408,10 @@ dependencies = [
 name = "ticket"
 version = "0.1.0"
 dependencies = [
+ "agen",
  "async-trait",
  "chrono",
  "fs4",
- "llm-engine",
  "project-record",
  "rusqlite",
  "schemars",
@@ -4612,11 +4612,11 @@ checksum = "756daf9b1013ebe47a8776667b466417e2d4c5679d441c26230efd9ef78692db"
 name = "tools"
 version = "0.1.0"
 dependencies = [
+ "agen",
  "async-trait",
  "filetime",
  "fs-operation",
  "html5ever",
- "llm-engine",
  "manifest",
  "markup5ever_rcdom",
  "pdf-extract",
@@ -4794,11 +4794,11 @@ checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 name = "tui"
 version = "0.1.0"
 dependencies = [
+ "agen",
  "base64 0.22.1",
  "client",
  "crossterm 0.28.1",
  "fs4",
- "llm-engine",
  "manifest",
  "protocol",
  "pulldown-cmark",
@@ -6060,6 +6060,7 @@ dependencies = [
 name = "worker"
 version = "0.1.0"
 dependencies = [
+ "agen",
  "arc-swap",
  "async-trait",
  "chrono",
@@ -6074,7 +6075,6 @@ dependencies = [
  "futures-util",
  "include_dir",
  "libc",
- "llm-engine",
  "manifest",
  "mcp",
  "memory",
@@ -6108,13 +6108,13 @@ dependencies = [
 name = "worker-runtime"
 version = "0.1.0"
 dependencies = [
+ "agen",
  "async-trait",
  "axum",
  "base64 0.22.1",
  "decodal",
  "flow",
  "futures",
- "llm-engine",
  "manifest",
  "protocol",
  "reqwest",

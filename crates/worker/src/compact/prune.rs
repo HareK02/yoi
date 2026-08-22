@@ -11,11 +11,9 @@
 //! `UsageTracker` にも stash しておき、後続の `LlmUsage` と組で
 //! `prune.post_request` を吐けるようにする。
 
-use llm_engine::Item;
-use llm_engine::llm_client::client::LlmClient;
-use llm_engine::prune::{
-    PruneConfig, PruneDecision, PruneObserver, SavingsEstimator, TokenEstimator,
-};
+use agen::Item;
+use agen::llm_client::client::LlmClient;
+use agen::prune::{PruneConfig, PruneDecision, PruneObserver, SavingsEstimator, TokenEstimator};
 use session_metrics::Metric;
 use session_store::Store;
 

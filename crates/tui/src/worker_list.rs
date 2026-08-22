@@ -612,7 +612,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use llm_engine::llm_client::types::RequestConfig;
+    use agen::llm_client::types::RequestConfig;
     use protocol::stream::JsonLineWriter;
     use session_store::FsWorkerStore;
     use session_store::{LogEntry, Store, new_segment_id, new_session_id};

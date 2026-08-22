@@ -17,7 +17,7 @@ Owns:
 Does not own:
 
 - authoritative project records (`.yoi/tickets/`, git history)
-- normal Worker turn orchestration (`llm-engine`)
+- normal Worker turn orchestration (`agen`)
 - product CLI command shape (`yoi`)
 - curated workflow definitions (`workflow`)
 

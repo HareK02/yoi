@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use llm_engine::EngineError;
-use llm_engine::llm_client::client::LlmClient;
+use agen::EngineError;
+use agen::llm_client::client::LlmClient;
 use session_store::WorkerMetadataStore;
 use session_store::{LogEntry, SessionExtension, Store};
 use tokio::sync::{broadcast, mpsc, oneshot};

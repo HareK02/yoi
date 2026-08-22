@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 base64.workspace = true
-llm-engine = { workspace = true }
+agen = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 uuid = { workspace = true, features = ["v7", "serde"] }

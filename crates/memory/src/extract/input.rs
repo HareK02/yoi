@@ -5,7 +5,7 @@
 //! tool result は summary のみ）。conversation 全体を Markdown の単一
 //! セクションとして渡し、抽出指示は system prompt 側に寄せる。
 
-use llm_engine::Item;
+use agen::Item;
 
 /// 与えられた `items` を extract sub-Engine の最初の user 入力に整形する。
 pub fn build_extract_input(items: &[Item]) -> String {
@@ -26,9 +26,9 @@ fn render_items(items: &[Item]) -> String {
         match item {
             Item::Message { role, content, .. } => {
                 let role_label = match role {
-                    llm_engine::Role::User => "User",
-                    llm_engine::Role::Assistant => "Assistant",
-                    llm_engine::Role::System => "System",
+                    agen::Role::User => "User",
+                    agen::Role::Assistant => "Assistant",
+                    agen::Role::System => "System",
                 };
                 let text: String = content
                     .iter()

@@ -2335,7 +2335,7 @@ impl App {
         match entry {
             session_store::LogEntry::SegmentStart { history, .. } => {
                 for logged in history {
-                    let item: llm_engine::Item = logged.into();
+                    let item: agen::Item = logged.into();
                     let item_value = serde_json::to_value(&item).expect("Item is Serialize");
                     self.push_history_item(&item_value);
                 }
@@ -2351,7 +2351,7 @@ impl App {
             }
             session_store::LogEntry::AssistantItem { item, .. }
             | session_store::LogEntry::ToolResult { item, .. } => {
-                let it: llm_engine::Item = item.into();
+                let it: agen::Item = item.into();
                 let item_value = serde_json::to_value(&it).expect("Item is Serialize");
                 self.push_history_item(&item_value);
             }
@@ -3136,7 +3136,7 @@ mod completion_flow_tests {
                 is_dir: true,
             },
             CompletionEntry {
-                value: "crates/llm-engine".into(),
+                value: "crates/agen".into(),
                 is_dir: true,
             },
         ];
@@ -3271,7 +3271,7 @@ mod completion_flow_tests {
             ts: session_store::segment_log::now_millis(),
             session_id: uuid::Uuid::nil(),
             system_prompt: None,
-            config: llm_engine::llm_client::RequestConfig::default(),
+            config: agen::llm_client::RequestConfig::default(),
             history: vec![],
             forked_from: None,
             compacted_from: None,
@@ -3530,7 +3530,7 @@ mod completion_flow_tests {
             system_prompt: None,
             config: Default::default(),
             history: vec![session_store::LoggedItem::from(
-                &llm_engine::Item::system_message("[File: src/main.rs]\nfn main() {}"),
+                &agen::Item::system_message("[File: src/main.rs]\nfn main() {}"),
             )],
             forked_from: None,
             compacted_from: None,

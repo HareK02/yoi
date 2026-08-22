@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
-use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::Deserialize;
 
 use crate::error::ToolsError;
@@ -34,7 +34,7 @@ impl Tool for WriteTool {
     async fn execute(
         &self,
         input_json: &str,
-        ctx: llm_engine::tool::ToolExecutionContext,
+        ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: WriteParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid Write input: {e}")))?;
@@ -244,7 +244,7 @@ mod tests {
     #[tokio::test]
     async fn write_then_edit_same_file_same_batch_uses_call_order() {
         use crate::edit::edit_tool;
-        use llm_engine::tool::ToolExecutionContext;
+        use agen::tool::ToolExecutionContext;
 
         let (dir, fs, tracker) = setup();
         let file = dir.path().join("ordered.txt");
@@ -279,7 +279,7 @@ mod tests {
     #[tokio::test]
     async fn failed_same_file_mutation_releases_guard_for_followup() {
         use crate::edit::edit_tool;
-        use llm_engine::tool::ToolExecutionContext;
+        use agen::tool::ToolExecutionContext;
 
         let (dir, fs, tracker) = setup();
         let file = dir.path().join("release.txt");

@@ -14,9 +14,9 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
 use client::WorkerRuntimeCommand;
-use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use manifest::{Permission, ScopeRule};
 use protocol::stream::JsonLineReader;
 use protocol::{Event, Method, WorkerStatus};
@@ -843,7 +843,7 @@ where
     async fn execute(
         &self,
         _input_json: &str,
-        _ctx: llm_engine::tool::ToolExecutionContext,
+        _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let items = self
             .discovery
@@ -871,7 +871,7 @@ where
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_engine::tool::ToolExecutionContext,
+        _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let input: WorkerNameInput = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid RestoreWorker input: {e}")))?;
@@ -949,7 +949,7 @@ where
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_engine::tool::ToolExecutionContext,
+        _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let input: SendToPeerWorkerInput = serde_json::from_str(input_json).map_err(|e| {
             ToolError::InvalidArgument(format!("invalid SendToPeerWorker input: {e}"))

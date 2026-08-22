@@ -16,10 +16,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
-use llm_engine::Engine;
-use llm_engine::llm_client::client::LlmClient;
-use llm_engine::state::Mutable;
-use llm_engine::tool::ToolDefinition;
+use agen::Engine;
+use agen::llm_client::client::LlmClient;
+use agen::state::Mutable;
+use agen::tool::ToolDefinition;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -1732,10 +1732,10 @@ pub mod plugin;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agen::llm_client::{ClientError, Request, ResponseStream};
+    use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
     use async_trait::async_trait;
     use futures::stream;
-    use llm_engine::llm_client::{ClientError, Request, ResponseStream};
-    use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1760,7 +1760,7 @@ mod tests {
         async fn execute(
             &self,
             _input_json: &str,
-            _ctx: llm_engine::tool::ToolExecutionContext,
+            _ctx: agen::tool::ToolExecutionContext,
         ) -> Result<ToolOutput, ToolError> {
             Ok(ToolOutput::from("ok".to_string()))
         }

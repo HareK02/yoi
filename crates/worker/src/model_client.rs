@@ -9,12 +9,12 @@
 //!    default_capability > scheme 既定 の順でフォールバック（上位 3 段は
 //!    `catalog::resolve_model_manifest` が [`ModelConfig`] に詰め込む）
 //!
-//! llm-engine は低レベル基盤に留める方針なので、高レベル側で必要に
+//! agen は低レベル基盤に留める方針なので、高レベル側で必要に
 //! なる認証ストア解決と secret store 解決は worker 側で行う。
 
 use std::sync::Arc;
 
-use llm_engine::llm_client::{
+use agen::llm_client::{
     LlmClient,
     capability::ModelCapability,
     scheme::{
@@ -23,7 +23,7 @@ use llm_engine::llm_client::{
     },
     transport::{HttpTransport, ResolvedAuth, TransportPolicy},
 };
-use llm_engine::providers::codex::CodexAuthProvider;
+use agen::providers::codex::CodexAuthProvider;
 
 use manifest::{AuthRef, ModelManifest, SchemeKind, model_catalog as catalog};
 use secrets::{SecretStore, SecretValue};

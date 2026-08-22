@@ -1,13 +1,13 @@
 //! Cross-tool integration tests exercising `core_builtin_tools()` end-to-end.
 //!
 //! `ToolServerHandle::register_tool` / `flush_pending` are `pub(crate)` in
-//! llm-engine, so from here we exercise the factories directly — the same
+//! agen, so from here we exercise the factories directly — the same
 //! code path that `flush_pending()` runs at production time.
 
 use std::path::Path;
 use std::sync::Arc;
 
-use llm_engine::tool::{Tool, ToolDefinition, ToolMeta};
+use agen::tool::{Tool, ToolDefinition, ToolMeta};
 use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
 use serde_json::json;
 use tempfile::TempDir;
@@ -62,13 +62,13 @@ fn setup() -> (TempDir, TempDir, Registry) {
     (dir, spill, reg)
 }
 
-async fn call(tool: &Arc<dyn Tool>, input: serde_json::Value) -> llm_engine::tool::ToolOutput {
+async fn call(tool: &Arc<dyn Tool>, input: serde_json::Value) -> agen::tool::ToolOutput {
     tool.execute(&input.to_string(), Default::default())
         .await
         .expect("tool execution failed")
 }
 
-async fn call_err(tool: &Arc<dyn Tool>, input: serde_json::Value) -> llm_engine::tool::ToolError {
+async fn call_err(tool: &Arc<dyn Tool>, input: serde_json::Value) -> agen::tool::ToolError {
     tool.execute(&input.to_string(), Default::default())
         .await
         .expect_err("expected error")
@@ -114,14 +114,14 @@ async fn view_image_reads_scoped_bytes_into_durable_tool_detail() {
 
     let output = call(&tool, json!({ "path": "image.png" })).await;
     assert_eq!(output.attachments.len(), 1);
-    let llm_engine::tool::Attachment::Image(image) = &output.attachments[0];
+    let agen::tool::Attachment::Image(image) = &output.attachments[0];
     assert_eq!(image.mime_type(), "image/png");
     assert_eq!(image.data(), png);
     let serialized = serde_json::to_string(&output).unwrap();
     assert!(!serialized.contains("private-image-body"));
     assert!(serialized.contains("attachments"));
-    let restored: llm_engine::tool::ToolOutput = serde_json::from_str(&serialized).unwrap();
-    let llm_engine::tool::Attachment::Image(restored_image) = &restored.attachments[0];
+    let restored: agen::tool::ToolOutput = serde_json::from_str(&serialized).unwrap();
+    let agen::tool::Attachment::Image(restored_image) = &restored.attachments[0];
     assert_eq!(restored_image.data(), png);
 
     let escaped = call_err(&tool, json!({ "path": "../outside.png" })).await;

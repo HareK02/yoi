@@ -11,8 +11,8 @@
 - [client](client.md) — # テスト妥当性レビュー: client - 評価: 概ね良い
 - [daemon](daemon.md) — # テスト妥当性レビュー: daemon - 評価: 混在
 - [lint-common](lint-common.md) — # テスト妥当性レビュー: lint-common 
-- [llm-worker-macros](llm-worker-macros.md) — # テスト妥当性レビュー: llm-worker-macros - 評価: 混在
-- [llm-worker](llm-worker.md) — # テスト妥当性レビュー: llm-worker - 評価: 概ね良い
+- [agen-macros](agen-macros.md) — # テスト妥当性レビュー: agen-macros - 評価: 混在
+- [agen](agen.md) — # テスト妥当性レビュー: agen - 評価: 概ね良い
 - [manifest](manifest.md) — # テスト妥当性レビュー: manifest - 評価: 概ね良い
 - [memory](memory.md) — # テスト妥当性レビュー: memory 
 - [pod](pod.md) — # テスト妥当性レビュー: pod - 評価: 混在

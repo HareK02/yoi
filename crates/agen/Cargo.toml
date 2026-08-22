@@ -1,0 +1,55 @@
+[package]
+name = "agen"
+description = "Provider-neutral orchestration for tool-using LLM applications"
+version = "0.2.1"
+edition.workspace = true
+rust-version = "1.86"
+license.workspace = true
+readme = "README.md"
+repository = "https://gitea.hareworks.net/Hare/yoi"
+homepage = "https://gitea.hareworks.net/Hare/yoi"
+documentation = "https://docs.rs/agen"
+keywords = ["llm", "agent", "tools", "streaming", "orchestration"]
+categories = ["api-bindings", "asynchronous"]
+include = ["src/**", "tests/**", "examples/*.rs", "docs/**", "README.md", "LICENSE"]
+autoexamples = false
+
+[features]
+default = []
+codex = ["dep:chrono"]
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7"
+reqwest = { version = "0.13", default-features = false, features = ["stream", "json", "native-tls", "http2"] }
+eventsource-stream = "0.2"
+zstd = "0.13"
+base64 = "0.22.1"
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"], optional = true }
+agen-macros = { workspace = true }
+
+[dev-dependencies]
+clap = { version = "4.5", features = ["derive", "env"] }
+tempfile = { workspace = true }
+dotenv = "0.15"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+trybuild = "1.0.116"
+wiremock = "0.6.5"
+
+[[example]]
+name = "engine_cancel_demo"
+path = "examples/engine_cancel_demo.rs"
+
+[[example]]
+name = "engine_cli"
+path = "examples/engine_cli.rs"
+
+[package.metadata.docs.rs]
+all-features = true

@@ -38,7 +38,7 @@ pub fn core_builtin_tools(
     session: workdir::WorkdirSessionHandle,
     tracker: Tracker,
     bash_output_dir: std::path::PathBuf,
-) -> Vec<llm_engine::tool::ToolDefinition> {
+) -> Vec<agen::tool::ToolDefinition> {
     use workdir::WorkdirSessionCapability;
 
     let capabilities = session.capabilities();
@@ -66,7 +66,7 @@ pub fn core_builtin_tools(
 
 pub fn read_only_builtin_tools(
     session: workdir::WorkdirSessionHandle,
-) -> Vec<llm_engine::tool::ToolDefinition> {
+) -> Vec<agen::tool::ToolDefinition> {
     debug_assert_eq!(
         session.capabilities(),
         workdir::WorkdirSessionCapabilities::READ_ONLY,
@@ -77,7 +77,7 @@ pub fn read_only_builtin_tools(
 
 pub fn web_builtin_tools(
     web_config: Option<manifest::WebConfig>,
-) -> Vec<llm_engine::tool::ToolDefinition> {
+) -> Vec<agen::tool::ToolDefinition> {
     vec![
         web_search_tool(web::WebTools::new(web_config.clone())),
         web_fetch_tool(web::WebTools::new(web_config)),

@@ -16,8 +16,8 @@
 
 use std::sync::Mutex;
 
-use llm_engine::UsageRecord;
-use llm_engine::timeline::event::UsageEvent;
+use agen::UsageRecord;
+use agen::timeline::event::UsageEvent;
 
 /// One drained measurement: the underlying `UsageRecord` plus an optional
 /// `correlation_id` stamped by the prune projection (or any other future

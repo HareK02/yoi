@@ -8,10 +8,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use fs_operation::FsPath;
-use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use manifest::{
     CompactionConfigPartial, EngineManifestConfig, FileUploadLimitsPartial,
     PermissionConfigPartial, ProfileDiscovery, ProfileError, ProfileRegistry,
@@ -277,12 +277,12 @@ pub struct SubWorkerSpawnTool {
     prompt_loader: PromptCatalogSource,
     /// Compact selector list shared by tool description and diagnostics.
     available_profiles: AvailableProfiles,
-    internal_client_override: Option<Box<dyn llm_engine::llm_client::LlmClient>>,
+    internal_client_override: Option<Box<dyn agen::llm_client::LlmClient>>,
 }
 
 impl SubWorkerSpawnTool {
     #[cfg(test)]
-    fn with_internal_client(mut self, client: Box<dyn llm_engine::llm_client::LlmClient>) -> Self {
+    fn with_internal_client(mut self, client: Box<dyn agen::llm_client::LlmClient>) -> Self {
         self.internal_client_override = Some(client);
         self
     }
@@ -346,7 +346,7 @@ impl Tool for SubWorkerSpawnTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_engine::tool::ToolExecutionContext,
+        _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let input: SubWorkerSpawnInput = serde_json::from_str(input_json).map_err(|e| {
             ToolError::InvalidArgument(format!("invalid SubWorkerSpawn input: {e}"))
@@ -452,7 +452,7 @@ impl Tool for SubWorkerSpawnTool {
             };
         let store = EphemeralSessionStore::default();
         let filesystem_authority = WorkerFilesystemAuthority::None;
-        let mut child = Worker::<Box<dyn llm_engine::llm_client::LlmClient>, EphemeralSessionStore>::from_internal_manifest_with_context(
+        let mut child = Worker::<Box<dyn agen::llm_client::LlmClient>, EphemeralSessionStore>::from_internal_manifest_with_context(
             child_manifest,
             store.clone(),
             self.prompt_loader.clone(),
@@ -956,12 +956,12 @@ mod tests {
     use std::time::Duration;
 
     use crate::WorkspaceId;
+    use agen::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
+    use agen::llm_client::types::ContentPart;
+    use agen::llm_client::{ClientError, LlmClient, Request};
+    use agen::{Item, Role};
     use async_trait::async_trait;
     use futures::Stream;
-    use llm_engine::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
-    use llm_engine::llm_client::types::ContentPart;
-    use llm_engine::llm_client::{ClientError, LlmClient, Request};
-    use llm_engine::{Item, Role};
     use manifest::{AuthRef, ModelManifest, SchemeKind, WorkerManifest};
     use tempfile::TempDir;
 
@@ -1152,7 +1152,7 @@ extract_threshold = 4000
             serde_json::json!(runtime.path().join("outside-parent-scope"));
         tool.execute(
             &serde_json::to_string(&invalid_input).unwrap(),
-            llm_engine::tool::ToolExecutionContext::direct(),
+            agen::tool::ToolExecutionContext::direct(),
         )
         .await
         .expect_err("invalid delegation must fail before child preparation");
@@ -1162,7 +1162,7 @@ extract_threshold = 4000
         let output = tool
             .execute(
                 &serde_json::to_string(&input).unwrap(),
-                llm_engine::tool::ToolExecutionContext::direct(),
+                agen::tool::ToolExecutionContext::direct(),
             )
             .await
             .expect("spawn project reviewer as Internal Worker");
@@ -1208,7 +1208,7 @@ extract_threshold = 4000
         let duplicate_error = tool
             .execute(
                 &serde_json::to_string(&input).unwrap(),
-                llm_engine::tool::ToolExecutionContext::direct(),
+                agen::tool::ToolExecutionContext::direct(),
             )
             .await
             .expect_err("duplicate child name must be rejected before a first turn starts");
@@ -1226,7 +1226,7 @@ extract_threshold = 4000
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
 
-        let context = llm_engine::tool::ToolExecutionContext::direct();
+        let context = agen::tool::ToolExecutionContext::direct();
         let list = (crate::spawn::comm_tools::sub_worker_list_tool(registry.clone()))().1;
         let listed = list.execute("{}", context.clone()).await.unwrap();
         assert!(
@@ -1308,7 +1308,7 @@ extract_threshold = 4000
         teardown_input["name"] = serde_json::json!("reviewer-child-parent-drop");
         tool.execute(
             &serde_json::to_string(&teardown_input).unwrap(),
-            llm_engine::tool::ToolExecutionContext::direct(),
+            agen::tool::ToolExecutionContext::direct(),
         )
         .await
         .unwrap();

@@ -2,13 +2,13 @@ mod common;
 
 use std::sync::Arc;
 
+use agen::Engine;
+use agen::interceptor::{Interceptor, TurnEndAction};
+use agen::llm_client::event::{Event, ResponseStatus, StatusEvent};
+use agen::llm_client::types::{Item, RequestConfig};
+use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
 use common::MockLlmClient;
-use llm_engine::Engine;
-use llm_engine::interceptor::{Interceptor, TurnEndAction};
-use llm_engine::llm_client::event::{Event, ResponseStatus, StatusEvent};
-use llm_engine::llm_client::types::{Item, RequestConfig};
-use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use session_store::{FsStore, LogEntry, SegmentStartState, Store, collect_state};
 
 // =============================================================================
@@ -57,7 +57,7 @@ impl Tool for MockWeatherTool {
     async fn execute(
         &self,
         _input_json: &str,
-        _ctx: llm_engine::tool::ToolExecutionContext,
+        _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         Ok("Sunny, 25C".to_string().into())
     }
@@ -102,7 +102,7 @@ async fn run_and_persist(
     session_id: session_store::SessionId,
     segment_id: session_store::SegmentId,
     input: &str,
-) -> (Engine<MockLlmClient>, llm_engine::EngineResult) {
+) -> (Engine<MockLlmClient>, agen::EngineResult) {
     // Mirror Worker's run-entry contract: log the user input as segments
     // before the worker pushes its flattened user_message; save_delta
     // skips the resulting user_message item to avoid double-write.
@@ -191,7 +191,7 @@ async fn session_run_logs_entries() {
         matches!(
             e,
             LogEntry::RunCompleted {
-                result: llm_engine::EngineResult::Finished,
+                result: agen::EngineResult::Finished,
                 ..
             }
         )
@@ -291,7 +291,7 @@ async fn session_resume_after_pause() {
     .unwrap();
 
     let (_worker, result) = run_and_persist(worker, &store, sid, segid, "Weather?").await;
-    assert!(matches!(result, llm_engine::EngineResult::Paused));
+    assert!(matches!(result, agen::EngineResult::Paused));
 
     // Check RunCompleted is Paused
     let entries = store.read_all(sid, segid).unwrap();
@@ -299,7 +299,7 @@ async fn session_resume_after_pause() {
         matches!(
             e,
             LogEntry::RunCompleted {
-                result: llm_engine::EngineResult::Paused,
+                result: agen::EngineResult::Paused,
                 ..
             }
         )

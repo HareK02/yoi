@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use agen::Item;
+use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
-use llm_engine::Item;
-use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use session_store::collect_state;
@@ -495,7 +495,7 @@ impl Tool for ViewSessionOverviewTool {
     async fn execute(
         &self,
         input_json: &str,
-        _context: llm_engine::tool::ToolExecutionContext,
+        _context: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: ViewSessionOverviewParams = parse_input("ViewSessionOverview", input_json)?;
         let view = latest_view(&*self.provider, &params.subject).await?;
@@ -540,7 +540,7 @@ impl Tool for SearchSessionEntriesTool {
     async fn execute(
         &self,
         input_json: &str,
-        _context: llm_engine::tool::ToolExecutionContext,
+        _context: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: SearchSessionEntriesParams = parse_input("SearchSessionEntries", input_json)?;
         let view = latest_view(&*self.provider, &params.subject).await?;
@@ -598,7 +598,7 @@ impl Tool for ReadSessionEntryTool {
     async fn execute(
         &self,
         input_json: &str,
-        _context: llm_engine::tool::ToolExecutionContext,
+        _context: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: ReadSessionEntryParams = parse_input("ReadSessionEntry", input_json)?;
         let entry_ref = parse_entry_ref(&params.entry_ref)?;
@@ -714,7 +714,7 @@ fn json_output(summary: String, value: serde_json::Value) -> Result<ToolOutput, 
 mod tests {
     use std::sync::Mutex;
 
-    use llm_engine::Role;
+    use agen::Role;
 
     use crate::feature::{FeatureRegistryBuilder, HookRegistryBuilder};
 
@@ -797,7 +797,7 @@ mod tests {
         let hidden = read
             .execute(
                 r#"{"subject":{"kind":"runtime_worker","runtime_id":"runtime-1","worker_id":"unauthorized"},"entry_ref":"E00000000"}"#,
-                llm_engine::tool::ToolExecutionContext::direct(),
+                agen::tool::ToolExecutionContext::direct(),
             )
             .await
             .unwrap_err();
@@ -811,7 +811,7 @@ mod tests {
         let output = read
             .execute(
                 r#"{"subject":{"kind":"runtime_worker","runtime_id":"runtime-1","worker_id":"granted"},"entry_ref":"E00000000"}"#,
-                llm_engine::tool::ToolExecutionContext::direct(),
+                agen::tool::ToolExecutionContext::direct(),
             )
             .await
             .unwrap();
@@ -820,7 +820,7 @@ mod tests {
         let output = read
             .execute(
                 r#"{"subject":{"kind":"runtime_worker","runtime_id":"runtime-1","worker_id":"granted"},"entry_ref":"E00000001"}"#,
-                llm_engine::tool::ToolExecutionContext::direct(),
+                agen::tool::ToolExecutionContext::direct(),
             )
             .await
             .unwrap();

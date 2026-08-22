@@ -9,8 +9,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use llm_engine::timeline::event::UsageEvent;
-use llm_engine::{Engine, llm_client::LlmClient};
+use agen::timeline::event::UsageEvent;
+use agen::{Engine, llm_client::LlmClient};
 use manifest::{Scope, WorkerManifest};
 use protocol::{Event, InFlightSnapshot, WorkerStatus};
 use session_store::{LogEntry, SegmentId, SessionId, Store, StoreError, TraceEntry};
@@ -954,10 +954,10 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use agen::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
+    use agen::llm_client::{ClientError, Request};
     use async_trait::async_trait;
     use futures::Stream;
-    use llm_engine::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
-    use llm_engine::llm_client::{ClientError, Request};
 
     use super::*;
 

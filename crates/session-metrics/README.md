@@ -14,7 +14,7 @@ Owns:
 
 Does not own:
 
-- prompt context packing (`llm-engine`)
+- prompt context packing (`agen`)
 - generated memory contents (`memory`)
 - provider billing semantics (`provider`)
 - UI status rendering (`tui`)

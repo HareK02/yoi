@@ -376,7 +376,7 @@ pub enum Event {
     ///
     /// `turn` is the AgentTurn index from `Engine::turn_count`.
     ///
-    /// Currently retry is not yet implemented (`llm-engine-stream-continuation`)
+    /// Currently retry is not yet implemented (`agen-stream-continuation`)
     /// so AgentTurn and `LlmCall` fire 1:1, but the contract here is
     /// the AgentTurn boundary; consumers that want per-LLM-call signals
     /// must subscribe to `LlmCallStart` / `LlmCallEnd` instead.

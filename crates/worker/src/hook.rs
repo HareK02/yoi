@@ -9,7 +9,7 @@
 //! Hooks intentionally cannot mutate the Engine's context, history, tool
 //! call, or tool result. Internal mechanisms that need such access (e.g.
 //! compaction, notification injection, output truncation) implement
-//! `llm_engine::Interceptor` directly inside Worker, never via this trait.
+//! `agen::Interceptor` directly inside Worker, never via this trait.
 //!
 //! This separation lets Hooks be exposed safely to user-facing
 //! extension surfaces (scripting, plugins) in the future without
@@ -18,11 +18,11 @@
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
-use llm_engine::interceptor::{
+use agen::interceptor::{
     PostToolAction, PreRequestAction, PreToolAction, PromptAction, TurnEndAction,
 };
-use llm_engine::tool::{ToolOutput, ToolResult};
+use agen::tool::{ToolOutput, ToolResult};
+use async_trait::async_trait;
 use serde_json::Value;
 use session_store::{SystemItem, SystemReminder};
 
@@ -163,7 +163,7 @@ impl From<HookTurnEndAction> for TurnEndAction {
 /// event-specific context. The handle queues typed requests; the host drains the
 /// queue, commits each entry through `LogEntry::SystemItem`, and only then makes
 /// the matching system message visible to the model. It deliberately exposes no
-/// raw `llm_engine::Item`, history writer, event sender, `Worker`, `Engine`, or
+/// raw `agen::Item`, history writer, event sender, `Worker`, `Engine`, or
 /// notification buffer.
 pub struct SystemItemAppendHandle {
     pending: Arc<Mutex<Vec<SystemItem>>>,

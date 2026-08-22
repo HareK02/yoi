@@ -4,8 +4,8 @@ use crate::feature::{
     ToolDeclaration, ToolDefinition,
 };
 use crate::worker::{WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod};
+use agen::tool::{Tool, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
 use async_trait::async_trait;
-use llm_engine::tool::{Tool, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
 use manifest::MergeRequestFeatureConfig;
 use schemars::JsonSchema;
 use serde::Deserialize;

@@ -108,7 +108,7 @@ runtime state に segment 表示の不一致があった。
 - `019e5c2f` の 892-entry history が、旧 segment history の何番目から retained されたものか特定する。
 - 旧 segment の `LogEntry::LlmUsage { history_len, input_total_tokens, ... }` と retained cut の対応を確認する。
 - `split_for_retained` を当時の history / usage records に対して再実行し、見積もりと実 persisted size の差を出す。
-- `llm-worker` の prune threshold / protected area / min savings を確認し、pruning がこの乖離にどの程度寄与したかを確定する。
+- `agen` の prune threshold / protected area / min savings を確認し、pruning がこの乖離にどの程度寄与したかを確定する。
 - 空 turn が `run_completed finished` になった理由を追う。
 
 ## 注意

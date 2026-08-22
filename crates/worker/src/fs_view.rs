@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use llm_engine::Item;
+use agen::Item;
 use tools::ToolsError;
 use tracing::warn;
 #[cfg(test)]
@@ -282,7 +282,7 @@ fn format_range(offset: Option<usize>, limit: Option<usize>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm_engine::ContentPart;
+    use agen::ContentPart;
     use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
     use std::sync::Arc;
     use tempfile::TempDir;

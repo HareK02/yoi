@@ -4,9 +4,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
 use html5ever::tendril::TendrilSink;
-use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use manifest::{WebConfig, WebFetchConfig, WebSearchConfig, WebSearchProvider};
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, LOCATION};
@@ -149,7 +149,7 @@ impl Tool for WebSearchTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_engine::tool::ToolExecutionContext,
+        _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let input: WebSearchInput = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid WebSearch input: {e}")))?;
@@ -200,7 +200,7 @@ impl Tool for WebFetchTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_engine::tool::ToolExecutionContext,
+        _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let input: WebFetchInput = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid WebFetch input: {e}")))?;

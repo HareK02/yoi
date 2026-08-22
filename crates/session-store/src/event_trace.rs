@@ -7,7 +7,7 @@
 //!
 //! Disabled by default. Enable via `SessionConfig::record_event_trace`.
 
-use llm_engine::llm_client::event::Event;
+use agen::llm_client::event::Event;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

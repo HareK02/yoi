@@ -17,7 +17,7 @@ Does not own:
 
 - Worker runtime internals (`worker`)
 - socket client mechanics (`client`)
-- model turn orchestration (`llm-engine`)
+- model turn orchestration (`agen`)
 - TUI rendering/runtime implementation (`tui`)
 
 ## Design notes

@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
+use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
-use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::Deserialize;
 
 use crate::error::ToolsError;
@@ -40,7 +40,7 @@ impl Tool for ReadTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_engine::tool::ToolExecutionContext,
+        _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: ReadParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid Read input: {e}")))?;

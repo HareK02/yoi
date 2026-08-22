@@ -2,10 +2,10 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use llm_engine::tool::{
+use agen::tool::{
     Attachment, ImageAttachment, Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput,
 };
+use async_trait::async_trait;
 use serde::Deserialize;
 use workdir::{ReadRequest, WorkdirPath, WorkdirSessionHandle};
 
@@ -32,7 +32,7 @@ impl Tool for ViewImageTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_engine::tool::ToolExecutionContext,
+        _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let input: ViewImageParams = serde_json::from_str(input_json).map_err(|error| {
             ToolError::InvalidArgument(format!("invalid ViewImage input: {error}"))

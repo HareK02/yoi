@@ -2,13 +2,13 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use agen::Engine;
+use agen::llm_client::event::{ErrorEvent, Event as LlmEvent, ResponseStatus, StatusEvent};
+use agen::llm_client::types::Item;
+use agen::llm_client::{ClientError, LlmClient, Request};
+use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
-use llm_engine::Engine;
-use llm_engine::llm_client::event::{ErrorEvent, Event as LlmEvent, ResponseStatus, StatusEvent};
-use llm_engine::llm_client::types::Item;
-use llm_engine::llm_client::{ClientError, LlmClient, Request};
-use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use session_store::{CombinedStore, FsWorkerStore};
 use session_store::{FsStore, LogEntry};
 use workdir::{
@@ -766,7 +766,7 @@ async fn provider_stream_error_records_run_errored() {
         !entries.iter().any(|entry| matches!(
             entry,
             LogEntry::RunCompleted {
-                result: llm_engine::EngineResult::Finished,
+                result: agen::EngineResult::Finished,
                 ..
             }
         )),
@@ -1888,7 +1888,7 @@ impl Tool for HangingTool {
     async fn execute(
         &self,
         _input: &str,
-        _ctx: llm_engine::tool::ToolExecutionContext,
+        _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         std::future::pending::<()>().await;
         unreachable!()
@@ -2006,9 +2006,9 @@ async fn pause_then_resume_transitions_and_preserves_history_consistency() {
         .iter()
         .filter_map(|i| match i {
             Item::Message { role, .. } => match role {
-                llm_engine::Role::User => Some("user"),
-                llm_engine::Role::Assistant => Some("assistant"),
-                llm_engine::Role::System => Some("system"),
+                agen::Role::User => Some("user"),
+                agen::Role::Assistant => Some("assistant"),
+                agen::Role::System => Some("system"),
             },
             _ => None,
         })
@@ -2022,13 +2022,13 @@ async fn pause_then_resume_transitions_and_preserves_history_consistency() {
         .iter()
         .find_map(|i| match i {
             Item::Message {
-                role: llm_engine::Role::Assistant,
+                role: agen::Role::Assistant,
                 content,
                 ..
             } => Some(
                 content
                     .iter()
-                    .map(|p: &llm_engine::ContentPart| p.as_text().to_owned())
+                    .map(|p: &agen::ContentPart| p.as_text().to_owned())
                     .collect::<Vec<_>>()
                     .join(""),
             ),
@@ -2133,21 +2133,19 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
     let mut saw_new_user = false;
     for item in items {
         match item {
-            llm_engine::Item::ToolResult {
+            agen::Item::ToolResult {
                 call_id, summary, ..
             } if call_id == "call_orphan" => {
                 assert_eq!(summary, "[Interrupted by user]");
                 saw_synthetic_tool_result = true;
             }
-            llm_engine::Item::Message { role, content, .. }
-                if *role == llm_engine::Role::System =>
-            {
+            agen::Item::Message { role, content, .. } if *role == agen::Role::System => {
                 let text: String = content.iter().map(|p| p.as_text()).collect();
                 if text.contains("interrupted by the user") {
                     saw_interruption_note = true;
                 }
             }
-            llm_engine::Item::Message { role, content, .. } if *role == llm_engine::Role::User => {
+            agen::Item::Message { role, content, .. } if *role == agen::Role::User => {
                 let text: String = content.iter().map(|p| p.as_text()).collect();
                 if text.contains("new request") {
                     saw_new_user = true;
@@ -2172,13 +2170,12 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
     // Also confirm the closure chain is ordered: tool_result for the
     // orphan precedes the system note, which precedes the new user
     // message.
-    let idx = |pred: &dyn Fn(&llm_engine::Item) -> bool| items.iter().position(pred).unwrap();
-    let tool_result_idx = idx(
-        &|i| matches!(i, llm_engine::Item::ToolResult { call_id, .. } if call_id == "call_orphan"),
-    );
+    let idx = |pred: &dyn Fn(&agen::Item) -> bool| items.iter().position(pred).unwrap();
+    let tool_result_idx =
+        idx(&|i| matches!(i, agen::Item::ToolResult { call_id, .. } if call_id == "call_orphan"));
     let sys_idx = idx(&|i| match i {
-        llm_engine::Item::Message {
-            role: llm_engine::Role::System,
+        agen::Item::Message {
+            role: agen::Role::System,
             content,
             ..
         } => content
@@ -2189,8 +2186,8 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
         _ => false,
     });
     let user_idx = idx(&|i| match i {
-        llm_engine::Item::Message {
-            role: llm_engine::Role::User,
+        agen::Item::Message {
+            role: agen::Role::User,
             content,
             ..
         } => content
@@ -2274,7 +2271,7 @@ async fn paused_cancel_abandons_resume_and_next_input_is_fresh_run() {
         !entries_after_cancel.iter().any(|entry| matches!(
             entry,
             LogEntry::RunCompleted {
-                result: llm_engine::EngineResult::Finished,
+                result: agen::EngineResult::Finished,
                 interrupted: false,
                 ..
             }
@@ -2330,7 +2327,7 @@ async fn paused_cancel_abandons_resume_and_next_input_is_fresh_run() {
     assert!(
         items.iter().any(|item| matches!(
             item,
-            llm_engine::Item::ToolResult { call_id, summary, .. }
+            agen::Item::ToolResult { call_id, summary, .. }
                 if call_id == "call_cancelled" && summary == "[Interrupted by user]"
         )),
         "paused cancel should close orphan tool_use before future requests: {items:?}"
@@ -2338,8 +2335,8 @@ async fn paused_cancel_abandons_resume_and_next_input_is_fresh_run() {
     assert!(
         items.iter().any(|item| matches!(
             item,
-            llm_engine::Item::Message {
-                role: llm_engine::Role::System,
+            agen::Item::Message {
+                role: agen::Role::System,
                 ..
             } if item_text_contains(item, "interrupted by the user")
         )),
@@ -2348,8 +2345,8 @@ async fn paused_cancel_abandons_resume_and_next_input_is_fresh_run() {
     assert!(
         items.iter().any(|item| matches!(
             item,
-            llm_engine::Item::Message {
-                role: llm_engine::Role::User,
+            agen::Item::Message {
+                role: agen::Role::User,
                 ..
             } if item_text_contains(item, "fresh request")
         )),

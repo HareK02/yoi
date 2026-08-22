@@ -1,7 +1,7 @@
 //! Compact / prune 専用のトークン会計補助。
 //!
 //! 汎用部分（`prefix_bytes`, `tokens_at`, `total_tokens`, `total_tokens_at`）は
-//! [`llm_engine::token_counter`] にあり、`UsageRecord` の列と現在の history から
+//! [`agen::token_counter`] にあり、`UsageRecord` の列と現在の history から
 //! pure に推定する。本モジュールは compact / prune 固有のロジック
 //! （`split_for_retained`, `savings_for_prune`）と、Worker 上の公開 API に
 //! 限定する。
@@ -17,12 +17,12 @@
 //! - 推定の出どころは [`EstimateSource`] で呼び出し側に明示する。
 //!   課金判断には使えないが、compact / prune の閾値判定には十分な精度
 
-use llm_engine::llm_client::client::LlmClient;
-use llm_engine::token_counter::{item_bytes, prefix_bytes, tokens_at};
-use llm_engine::{Item, UsageRecord};
+use agen::llm_client::client::LlmClient;
+use agen::token_counter::{item_bytes, prefix_bytes, tokens_at};
+use agen::{Item, UsageRecord};
 use session_store::Store;
 
-pub use llm_engine::token_counter::{EstimateSource, TokenEstimate};
+pub use agen::token_counter::{EstimateSource, TokenEstimate};
 
 use crate::Worker;
 
@@ -188,7 +188,7 @@ pub(crate) fn token_estimates_for_prune_impl(
 
 /// Prune 射影（`ToolResult.content = None`）で節約されるトークン数の推定。
 ///
-/// `indices` は [`llm_engine::prune::prunable_indices`] が返す候補列を
+/// `indices` は [`agen::prune::prunable_indices`] が返す候補列を
 /// 想定する。各候補の content バイト差分を合算し、usage 履歴由来の
 /// tokens/byte レートでトークン数に換算する。範囲を「丸ごと drop」する
 /// のではなく、item 自体（summary 等）は残したままの値を返す点が
@@ -248,7 +248,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// 最後の measurement と、その後に追加された未測定分の byte/4 外挿。
     pub fn total_tokens(&self) -> TokenEstimate {
         let usage = self.usage_history();
-        llm_engine::token_counter::total_tokens(self.history(), &usage)
+        agen::token_counter::total_tokens(self.history(), &usage)
     }
 
     /// 任意の history index 時点でのプロンプト全長推定。
@@ -259,7 +259,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// pointer 以降に増えたプロンプト長を測るのに使う。
     pub fn total_tokens_at(&self, history_len: usize) -> TokenEstimate {
         let usage = self.usage_history();
-        llm_engine::token_counter::total_tokens_at(self.history(), &usage, history_len)
+        agen::token_counter::total_tokens_at(self.history(), &usage, history_len)
     }
 
     /// 末尾から `retained` トークン以上を残すための分割位置。

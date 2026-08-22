@@ -13,7 +13,7 @@
 
 #[cfg(test)]
 use crate::prompt::catalog::PromptCatalog;
-use llm_engine::Item;
+use agen::Item;
 
 /// Build synthetic `Item::ToolResult` items for every unanswered
 /// `Item::ToolCall` in `history`, preserving order.

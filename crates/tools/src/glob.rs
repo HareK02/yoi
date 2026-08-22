@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
+use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
-use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use workdir::{GlobRequest, WorkdirPath, WorkdirSessionHandle};
@@ -28,7 +28,7 @@ impl Tool for GlobTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_engine::tool::ToolExecutionContext,
+        _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: GlobParams = serde_json::from_str(input_json)
             .map_err(|error| ToolError::InvalidArgument(format!("invalid Glob input: {error}")))?;

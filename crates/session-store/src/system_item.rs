@@ -18,7 +18,7 @@
 //! preserved only on the log/wire side; the LLM still sees plain
 //! system-message text.
 
-use llm_engine::llm_client::types::Item;
+use agen::llm_client::types::Item;
 use protocol::WorkerEvent;
 use serde::{Deserialize, Serialize};
 

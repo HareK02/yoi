@@ -227,7 +227,7 @@ impl Default for SegmentLogSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm_engine::llm_client::RequestConfig;
+    use agen::llm_client::RequestConfig;
     use session_store::segment_log::now_millis;
 
     fn session_start() -> LogEntry {

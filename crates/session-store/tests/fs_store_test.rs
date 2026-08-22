@@ -1,5 +1,5 @@
-use llm_engine::EngineResult;
-use llm_engine::llm_client::types::{Item, RequestConfig};
+use agen::EngineResult;
+use agen::llm_client::types::{Item, RequestConfig};
 use session_store::{
     FsStore, LogEntry, Store, TraceEntry, collect_state, new_segment_id, new_session_id,
 };
@@ -177,9 +177,9 @@ fn trace_entries_in_separate_file() {
         turn: 0,
         llm_call: Some(0),
         payload: session_store::TracePayload::StreamEvent {
-            event: llm_engine::llm_client::event::Event::Ping(
-                llm_engine::llm_client::event::PingEvent { timestamp: None },
-            ),
+            event: agen::llm_client::event::Event::Ping(agen::llm_client::event::PingEvent {
+                timestamp: None,
+            }),
         },
     };
     store.append_trace(sid, segid, &trace).unwrap();

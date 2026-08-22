@@ -19,12 +19,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use agen::Engine;
+use agen::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent, UsageEvent};
+use agen::llm_client::{ClientError, LlmClient, Request};
+use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
 use futures::Stream;
-use llm_engine::Engine;
-use llm_engine::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent, UsageEvent};
-use llm_engine::llm_client::{ClientError, LlmClient, Request};
-use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use session_metrics::{DOMAIN, Metric, metrics_from_extensions};
 use session_store::{CombinedStore, FsWorkerStore};
 use session_store::{FsStore, LogEntry, SegmentId, SessionId, Store, StoreError, TraceEntry};
@@ -82,7 +82,7 @@ impl Tool for BigContentTool {
     async fn execute(
         &self,
         _input: &str,
-        _ctx: llm_engine::tool::ToolExecutionContext,
+        _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         Ok(ToolOutput {
             summary: self.summary.into(),

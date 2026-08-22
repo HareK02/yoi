@@ -7,8 +7,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
-use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 
 use crate::extract::payload::ExtractedPayload;
 
@@ -57,7 +57,7 @@ impl Tool for WriteExtractedTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_engine::tool::ToolExecutionContext,
+        _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let payload: ExtractedPayload = serde_json::from_str(input_json).map_err(|e| {
             ToolError::InvalidArgument(format!("invalid write_extracted input: {e}"))
@@ -107,7 +107,7 @@ pub fn write_extracted_tool(ctx: Arc<ExtractWorkerContext>) -> ToolDefinition {
 mod tests {
     use super::*;
 
-    use llm_engine::tool::Tool;
+    use agen::tool::Tool;
 
     #[tokio::test]
     async fn write_extracted_records_payload() {

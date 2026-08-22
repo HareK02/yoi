@@ -5,13 +5,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use agen::Item;
+use agen::llm_client::RequestConfig;
+use agen::llm_client::client::LlmClient;
+use agen::llm_client::types::Role;
+use agen::state::Mutable;
+use agen::{Engine, EngineError, EngineResult, ToolOutputLimits, UsageRecord};
 use arc_swap::ArcSwap;
-use llm_engine::Item;
-use llm_engine::llm_client::RequestConfig;
-use llm_engine::llm_client::client::LlmClient;
-use llm_engine::llm_client::types::Role;
-use llm_engine::state::Mutable;
-use llm_engine::{Engine, EngineError, EngineResult, ToolOutputLimits, UsageRecord};
 use session_store::{
     LogEntry, PromptRenderProvenance, SegmentId, SessionExtension, SessionId, Store, StoreError,
     SystemItem, segment_log, to_logged,
@@ -1191,7 +1191,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
             if matches!(
                 item,
                 Item::Message {
-                    role: llm_engine::Role::System,
+                    role: agen::Role::System,
                     ..
                 }
             ) {
@@ -1543,7 +1543,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             },
         })?;
         self.engine_mut()
-            .append_history(std::iter::once(llm_engine::Item::system_message(body)))?;
+            .append_history(std::iter::once(agen::Item::system_message(body)))?;
         Ok(activation)
     }
 
@@ -2673,9 +2673,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             },
         })?;
         self.engine_mut()
-            .append_history(std::iter::once(llm_engine::Item::system_message(
-                system_note,
-            )))?;
+            .append_history(std::iter::once(agen::Item::system_message(system_note)))?;
         Ok(())
     }
 
@@ -3173,7 +3171,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 if matches!(
                     item,
                     Item::Message {
-                        role: llm_engine::Role::System,
+                        role: agen::Role::System,
                         ..
                     }
                 ) {
@@ -3582,7 +3580,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             self.task_feature.snapshot_overview(),
             task_snapshot_text.clone(),
         ));
-        let result_estimate = llm_engine::token_counter::total_tokens(&new_history, &[]);
+        let result_estimate = agen::token_counter::total_tokens(&new_history, &[]);
         if result_context_max_tokens > 0 && result_estimate.tokens > result_context_max_tokens {
             return Err(WorkerError::CompactResultContextTooLarge {
                 tokens: result_estimate.tokens,
@@ -4296,7 +4294,7 @@ fn lifecycle_status_for_worker_error(err: &WorkerError) -> memory::audit::Worker
 }
 
 fn usage_audit_from_event(
-    event: &llm_engine::llm_client::event::UsageEvent,
+    event: &agen::llm_client::event::UsageEvent,
 ) -> memory::audit::UsageAudit {
     memory::audit::UsageAudit {
         input_tokens: event.input_tokens,
@@ -5024,7 +5022,7 @@ where
         let anchored_on_summary = matches!(
             state.history.first(),
             Some(Item::Message {
-                role: llm_engine::Role::System,
+                role: agen::Role::System,
                 ..
             })
         );
@@ -5520,9 +5518,9 @@ fn message_overview_entry(idx: usize, item: &Item, max_chars: usize) -> Option<S
         return None;
     };
     let role_label = match role {
-        llm_engine::Role::User => "User",
-        llm_engine::Role::Assistant => "Assistant",
-        llm_engine::Role::System => "System",
+        agen::Role::User => "User",
+        agen::Role::Assistant => "Assistant",
+        agen::Role::System => "System",
     };
     let text: String = content
         .iter()
@@ -6625,19 +6623,19 @@ mod build_summary_prompt_tests {
     impl LlmClient for CancelBeforeAiExtractClient {
         async fn stream(
             &self,
-            _request: llm_engine::llm_client::Request,
+            _request: agen::llm_client::Request,
         ) -> Result<
             std::pin::Pin<
                 Box<
                     dyn futures::Stream<
                             Item = Result<
-                                llm_engine::llm_client::event::Event,
-                                llm_engine::llm_client::ClientError,
+                                agen::llm_client::event::Event,
+                                agen::llm_client::ClientError,
                             >,
                         > + Send,
                 >,
             >,
-            llm_engine::llm_client::ClientError,
+            agen::llm_client::ClientError,
         > {
             let tx = self
                 .cancel_tx
@@ -6779,19 +6777,19 @@ mod build_summary_prompt_tests {
     impl LlmClient for NoopClient {
         async fn stream(
             &self,
-            _request: llm_engine::llm_client::Request,
+            _request: agen::llm_client::Request,
         ) -> Result<
             std::pin::Pin<
                 Box<
                     dyn futures::Stream<
                             Item = Result<
-                                llm_engine::llm_client::event::Event,
-                                llm_engine::llm_client::ClientError,
+                                agen::llm_client::event::Event,
+                                agen::llm_client::ClientError,
                             >,
                         > + Send,
                 >,
             >,
-            llm_engine::llm_client::ClientError,
+            agen::llm_client::ClientError,
         > {
             Ok(Box::pin(futures::stream::empty()))
         }

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use llm_engine::tool::{Tool, ToolDefinition};
+use agen::tool::{Tool, ToolDefinition};
 use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
 use serde_json::json;
 use tempfile::TempDir;
@@ -10,7 +10,7 @@ use tools::{Tracker, core_builtin_tools};
 use workdir::{LocalWorkdirSession, WorkdirSessionHandle};
 
 struct Registry {
-    entries: Vec<(llm_engine::tool::ToolMeta, Arc<dyn Tool>)>,
+    entries: Vec<(agen::tool::ToolMeta, Arc<dyn Tool>)>,
 }
 
 impl Registry {

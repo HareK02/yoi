@@ -6,10 +6,8 @@
 
 use std::sync::Arc;
 
+use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
 use async_trait::async_trait;
-use llm_engine::tool::{
-    Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput,
-};
 use memory::backend::{
     MemoryBackendHttpResponse, MemoryBackendOperation, MemoryBackendOperationResult,
     MemoryConsolidateStagingOperation, MemoryConsolidationOutput, MemoryDocumentReadOperation,
@@ -343,7 +341,7 @@ fn query_schema() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm_engine::tool::ToolDefinition;
+    use agen::tool::ToolDefinition;
 
     fn test_client() -> Arc<dyn WorkspaceClient> {
         Arc::new(crate::worker::TestWorkspaceHttpClient::new(

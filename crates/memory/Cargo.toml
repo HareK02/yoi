@@ -9,7 +9,7 @@ async-trait = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
 libc = { workspace = true }
 lint-common = { workspace = true }
-llm-engine = { workspace = true }
+agen = { workspace = true }
 manifest = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

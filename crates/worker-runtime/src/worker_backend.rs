@@ -2061,11 +2061,11 @@ mod tests {
     use crate::management::RuntimeOptions;
     use crate::observation::WorkerObservationCursor;
     use crate::working_directory::LocalGitWorktreeMaterializer;
+    use agen::Engine;
+    use agen::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
+    use agen::llm_client::{ClientError, LlmClient, Request};
     use async_trait::async_trait;
     use futures::{Stream, StreamExt};
-    use llm_engine::Engine;
-    use llm_engine::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
-    use llm_engine::llm_client::{ClientError, LlmClient, Request};
     use manifest::{Scope, WorkerManifest};
     use session_store::{LogEntry, WorkerMetadataStore};
 

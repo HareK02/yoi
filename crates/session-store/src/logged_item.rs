@@ -1,4 +1,4 @@
-//! Persistence-stable mirror of `llm_engine::Item`.
+//! Persistence-stable mirror of `agen::Item`.
 //!
 //! `LogEntry` does not embed `Item` directly because that couples the on-disk
 //! schema to the LLM worker's internal type — a field rename or addition there
@@ -12,11 +12,11 @@
 //! `Reasoning::encrypted_content` is preserved because OpenAI Responses ZDR
 //! requires it on stateless re-send.
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use llm_engine::{
+use agen::{
     llm_client::types::{ContentPart, Item, Role},
     tool::{Attachment, ImageAttachment},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 fn is_false(value: &bool) -> bool {
@@ -437,8 +437,8 @@ mod tests {
             "attached",
             None,
             false,
-            vec![llm_engine::tool::Attachment::Image(
-                llm_engine::tool::ImageAttachment::new(
+            vec![agen::tool::Attachment::Image(
+                agen::tool::ImageAttachment::new(
                     "image/png",
                     std::sync::Arc::<[u8]>::from(&b"secret-image-body"[..]),
                 ),

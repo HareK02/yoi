@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use llm_engine::tool::ToolError;
+use agen::tool::ToolError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ToolsError {

@@ -31,7 +31,7 @@ use crate::feature::{
     ToolDefinition,
 };
 use crate::worker::{WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod};
-use llm_engine::tool::{Tool, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
+use agen::tool::{Tool, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
 
 #[derive(Clone, Copy)]
 enum WorkspaceTicketReadKind {
@@ -1230,7 +1230,7 @@ mod tests {
     }
 
     fn pending_tool_description(
-        pending_tools: &[llm_engine::tool::ToolDefinition],
+        pending_tools: &[agen::tool::ToolDefinition],
         name: &str,
     ) -> String {
         pending_tools

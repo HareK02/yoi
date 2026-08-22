@@ -8,7 +8,7 @@ That rule shapes the crate split. The runtime can restart, attach, compact, or d
 
 - `yoi` owns the product CLI and top-level command shape. It is the façade that wires profile selection, memory linting, and normal TUI launch.
 - `worker` turns a `Engine` into a named runtime entity with scope, session persistence, protocol handling, tools, and Worker metadata integration.
-- `llm-engine` owns model-facing turns: history append, retries, continuation, pruning/compaction mechanics, tool loops, and provider-independent callbacks.
+- `agen` owns model-facing turns: history append, retries, continuation, pruning/compaction mechanics, tool loops, and provider-independent callbacks.
 - `session-store` owns replayable append-only conversation/session logs.
 - `pod-store` owns current Worker metadata keyed by Worker name.
 - `protocol` defines the socket message boundary between clients and Workers.

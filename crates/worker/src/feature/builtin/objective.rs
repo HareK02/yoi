@@ -7,10 +7,8 @@
 
 use std::sync::Arc;
 
+use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
 use async_trait::async_trait;
-use llm_engine::tool::{
-    Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -611,7 +609,7 @@ struct ObjectiveDetail {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm_engine::tool::ToolDefinition;
+    use agen::tool::ToolDefinition;
 
     fn tool_names(definitions: Vec<ToolDefinition>) -> Vec<String> {
         let mut names = definitions

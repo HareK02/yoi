@@ -95,7 +95,7 @@ The cleanup immediately before this audit removed 547 nonblank test LOC and 21 R
 
 `cargo test --workspace --no-fail-fast` currently fails during compilation before the workspace suite can run.
 
-The immediate failure is stale test code in `crates/llm-engine/tests/parallel_execution_test.rs`:
+The immediate failure is stale test code in `crates/agen/tests/parallel_execution_test.rs`:
 
 - tests pass `Vec<ToolOutput>` where production now requires `Vec<Segment>`;
 - tests still construct `ToolOutput` with two arguments although the current constructor accepts one;

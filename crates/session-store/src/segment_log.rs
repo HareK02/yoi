@@ -9,8 +9,8 @@
 //! ordered. Fork lineage references between segments use turn-number indices
 //! (`SegmentOrigin.at_turn_index`) rather than per-entry hashes.
 
-use llm_engine::llm_client::types::{Item, RequestConfig};
-use llm_engine::{EngineResult, UsageRecord};
+use agen::llm_client::types::{Item, RequestConfig};
+use agen::{EngineResult, UsageRecord};
 use protocol::{InvokeKind, Segment};
 use serde::{Deserialize, Serialize};
 
@@ -482,8 +482,8 @@ mod tests {
                 "attached",
                 None,
                 false,
-                vec![llm_engine::tool::Attachment::Image(
-                    llm_engine::tool::ImageAttachment::new("image/png", b"durable-image".to_vec()),
+                vec![agen::tool::Attachment::Image(
+                    agen::tool::ImageAttachment::new("image/png", b"durable-image".to_vec()),
                 )],
             )
             .into(),
@@ -497,7 +497,7 @@ mod tests {
             Item::ToolResult { attachments, .. }
                 if matches!(
                     attachments.as_slice(),
-                    [llm_engine::tool::Attachment::Image(image)]
+                    [agen::tool::Attachment::Image(image)]
                         if image.data() == b"durable-image"
                 )
         ));
@@ -837,10 +837,10 @@ mod tests {
         assert_eq!(state.history.len(), 1);
         match &state.history[0] {
             Item::Message { role, content, .. } => {
-                assert!(matches!(role, llm_engine::Role::User));
+                assert!(matches!(role, agen::Role::User));
                 assert_eq!(content.len(), 1);
                 match &content[0] {
-                    llm_engine::ContentPart::Text { text } => {
+                    agen::ContentPart::Text { text } => {
                         assert_eq!(text, "see line1\nline2@src/main.rs");
                     }
                     other => panic!("unexpected content: {other:?}"),

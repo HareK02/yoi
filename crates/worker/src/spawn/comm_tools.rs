@@ -12,8 +12,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
-use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use protocol::stream::{JsonLineReader, JsonLineWriter};
 use protocol::{Event, Method};
 use serde::{Deserialize, Serialize};
@@ -53,7 +53,7 @@ impl Tool for SubWorkerListTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_engine::tool::ToolExecutionContext,
+        _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let _input: SubWorkerListInput = serde_json::from_str(input_json).map_err(|error| {
             ToolError::InvalidArgument(format!("invalid SubWorkerList input: {error}"))
@@ -118,7 +118,7 @@ impl Tool for SubWorkerSendTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_engine::tool::ToolExecutionContext,
+        _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let input: SubWorkerSendInput = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid SubWorkerSend input: {e}")))?;
@@ -166,7 +166,7 @@ impl Tool for SubWorkerStopTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_engine::tool::ToolExecutionContext,
+        _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let input: NameInput = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid SubWorkerStop input: {e}")))?;

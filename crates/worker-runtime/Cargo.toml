@@ -48,7 +48,7 @@ workdir.workspace = true
 
 [dev-dependencies]
 futures.workspace = true
-llm-engine.workspace = true
+agen.workspace = true
 serial_test = "3.4.0"
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

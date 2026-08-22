@@ -2,13 +2,13 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use agen::llm_client::client::LlmClient;
+use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
 use flow::{
     ConditionVerdict, FlowTransitionAttempt, FlowTransitionResolution, FlowVerifierOutcome,
     TransitionConditionResult, TransitionId,
 };
-use llm_engine::llm_client::client::LlmClient;
-use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use manifest::{Scope, WorkerManifest};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -199,7 +199,7 @@ impl Tool for RequestFlowTransitionTool {
     async fn execute(
         &self,
         input_json: &str,
-        _context: llm_engine::tool::ToolExecutionContext,
+        _context: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: RequestFlowTransitionParams =
             serde_json::from_str(input_json).map_err(|error| {
@@ -350,7 +350,7 @@ impl Tool for FinishFlowVerificationTool {
     async fn execute(
         &self,
         input_json: &str,
-        _context: llm_engine::tool::ToolExecutionContext,
+        _context: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: FinishFlowVerificationParams =
             serde_json::from_str(input_json).map_err(|error| {
@@ -630,16 +630,16 @@ impl FeatureModule for ReadOnlyFlowWorkdirFeature {
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
-    use flow::{FlowAttemptStatus, FlowTransitionRejection, StateId, TransitionCheckSnapshot};
-    use futures::stream;
-    use llm_engine::llm_client::client::{LlmClient, ResponseStream};
-    use llm_engine::llm_client::error::ClientError;
-    use llm_engine::llm_client::event::{
+    use agen::llm_client::client::{LlmClient, ResponseStream};
+    use agen::llm_client::error::ClientError;
+    use agen::llm_client::event::{
         BlockDelta, BlockMetadata, BlockStart, BlockStop, BlockType, DeltaContent,
         Event as LlmEvent, StopReason,
     };
-    use llm_engine::llm_client::types::Request;
-    use llm_engine::tool::ToolExecutionContext;
+    use agen::llm_client::types::Request;
+    use agen::tool::ToolExecutionContext;
+    use flow::{FlowAttemptStatus, FlowTransitionRejection, StateId, TransitionCheckSnapshot};
+    use futures::stream;
     use manifest::WorkerManifest;
     use protocol::Segment;
     use session_store::{LogEntry, SegmentId, SessionId, Store};

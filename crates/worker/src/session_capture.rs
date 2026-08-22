@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use llm_engine::{Item, Role};
+use agen::{Item, Role};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_SEARCH_LIMIT: usize = 20;
@@ -661,11 +661,8 @@ mod tests {
                 "attached",
                 None,
                 false,
-                vec![llm_engine::tool::Attachment::Image(
-                    llm_engine::tool::ImageAttachment::new(
-                        "image/png",
-                        b"private-image-body".to_vec(),
-                    ),
+                vec![agen::tool::Attachment::Image(
+                    agen::tool::ImageAttachment::new("image/png", b"private-image-body".to_vec()),
                 )],
             )],
         );

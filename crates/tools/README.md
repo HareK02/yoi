@@ -16,7 +16,7 @@ Owns:
 Does not own:
 
 - manifest permission policy definition (`manifest`)
-- Engine tool-loop semantics (`llm-engine`)
+- Engine tool-loop semantics (`agen`)
 - Worker lifecycle decisions (`worker`)
 - UI presentation (`tui`)
 

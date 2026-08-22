@@ -11,7 +11,7 @@ default = []
 [dependencies]
 async-trait = { workspace = true }
 clap = { version = "4.6.0", features = ["derive"] }
-llm-engine = { workspace = true, features = ["codex"] }
+agen = { workspace = true, features = ["codex"] }
 session-store = { workspace = true }
 secrets = { workspace = true }
 manifest = { workspace = true }

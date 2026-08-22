@@ -27,7 +27,7 @@ ticket = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 worker = { path = "../worker" }
 pulldown-cmark = { version = "0.13.3", default-features = false }
-llm-engine.workspace = true
+agen.workspace = true
 
 [dev-dependencies]
 tempfile = { workspace = true }

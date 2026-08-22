@@ -18,11 +18,11 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
-use futures_util::{SinkExt, StreamExt};
-use llm_engine::tool::{
+use agen::tool::{
     Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOrigin, ToolOutput,
 };
+use async_trait::async_trait;
+use futures_util::{SinkExt, StreamExt};
 use manifest::plugin::{
     PLUGIN_COMPONENT_INSTANCE_WORLD, PLUGIN_COMPONENT_TOOL_WORLD, PLUGIN_RUNTIME_COMPONENT_KIND,
     PluginConfig, PluginDiscoveryLimits, PluginFsGrant, PluginFsOperation, PluginHostApi,

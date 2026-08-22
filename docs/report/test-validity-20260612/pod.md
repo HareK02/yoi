@@ -5,7 +5,7 @@
 ## 確認した範囲
 
 - `crates/pod/Cargo.toml`、`crates/pod/README.md`、`crates/pod/src/lib.rs`、`crates/pod/tests/*.rs` の integration suite、テスト一覧、および選択した失敗中の prompt-resource assertion を確認した。
-- `pod` crate の責務: `llm-worker` を中心とした Pod lifecycle/runtime authority、socket protocol serving、manifest/profile startup、スコープ付き built-in tools、session/pod-store persistence、spawned child Pod orchestration、prompt/resource assembly、compaction/extraction/consolidation、および runtime metadata integration。
+- `pod` crate の責務: `agen` を中心とした Pod lifecycle/runtime authority、socket protocol serving、manifest/profile startup、スコープ付き built-in tools、session/pod-store persistence、spawned child Pod orchestration、prompt/resource assembly、compaction/extraction/consolidation、および runtime metadata integration。
 - `cargo test -p pod -- --list` によるテスト一覧:
   - 310 件の lib/unit tests。
   - 9 件の integration test target、合計 106 件の integration tests。

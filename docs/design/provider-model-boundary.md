@@ -4,7 +4,7 @@ The Engine should be provider-independent. Provider-specific wire formats, auth 
 
 ## Engine responsibility
 
-`llm-engine` owns turn lifecycle:
+`agen` owns turn lifecycle:
 
 - committed history append
 - tool loops

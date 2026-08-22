@@ -2,7 +2,7 @@
 
 ## Role
 
-`worker` turns an `llm-engine` Engine into a named runtime entity with manifest configuration, scoped tools, session persistence, protocol handling, and Worker metadata integration.
+`worker` turns an `agen` Engine into a named runtime entity with manifest configuration, scoped tools, session persistence, protocol handling, and Worker metadata integration.
 
 ## Boundaries
 
@@ -16,7 +16,7 @@ Owns:
 
 Does not own:
 
-- provider-specific wire formats (`provider` / `llm-engine` clients)
+- provider-specific wire formats (`provider` / `agen` clients)
 - product CLI parsing (`yoi`)
 - TUI display authority (`tui`)
 - current-state storage schema outside Worker metadata (`session-store` worker metadata)

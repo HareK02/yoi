@@ -10,12 +10,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use agen::Engine;
+use agen::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
+use agen::llm_client::types::Item;
+use agen::llm_client::{ClientError, LlmClient, Request};
 use async_trait::async_trait;
 use futures::Stream;
-use llm_engine::Engine;
-use llm_engine::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
-use llm_engine::llm_client::types::Item;
-use llm_engine::llm_client::{ClientError, LlmClient, Request};
 use protocol::{Event, Method, RunResult};
 use session_store::{CombinedStore, FsWorkerStore, WorkerMetadataStore};
 use session_store::{FsStore, LogEntry, Store};
@@ -198,7 +198,7 @@ fn drain(rx: &mut broadcast::Receiver<Event>) -> Vec<Event> {
 /// `SegmentStart.history` carries, by reading the sink mirror directly.
 fn system_texts_in_sink_session_start(
     worker: &worker::Worker<
-        impl llm_engine::llm_client::client::LlmClient + Clone + 'static,
+        impl agen::llm_client::client::LlmClient + Clone + 'static,
         impl session_store::Store + Clone + 'static,
     >,
 ) -> Vec<String> {
@@ -211,7 +211,7 @@ fn system_texts_in_sink_session_start(
                     let item: Item = logged.into();
                     match item {
                         Item::Message {
-                            role: llm_engine::Role::System,
+                            role: agen::Role::System,
                             content,
                             ..
                         } => Some(

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
+use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
-use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -181,7 +181,7 @@ impl Tool for ShowOverviewTool {
     async fn execute(
         &self,
         input_json: &str,
-        _context: llm_engine::tool::ToolExecutionContext,
+        _context: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: ShowOverviewParams = parse_input("ShowOverview", input_json)?;
         let limit = bounded_limit(params.limit, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT);
@@ -223,7 +223,7 @@ impl Tool for SearchEntriesTool {
     async fn execute(
         &self,
         input_json: &str,
-        _context: llm_engine::tool::ToolExecutionContext,
+        _context: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: SearchEntriesParams = parse_input("SearchEntries", input_json)?;
         let kind = params.kind.as_deref().map(parse_kind).transpose()?;
@@ -286,7 +286,7 @@ impl Tool for ReadEntryTool {
     async fn execute(
         &self,
         input_json: &str,
-        _context: llm_engine::tool::ToolExecutionContext,
+        _context: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: ReadEntryParams = parse_input("ReadEntry", input_json)?;
         let entry_ref = parse_entry_ref(&params.entry_ref)?;
@@ -390,7 +390,7 @@ fn json_output(summary: String, value: serde_json::Value) -> Result<ToolOutput, 
 
 #[cfg(test)]
 mod tests {
-    use llm_engine::Item;
+    use agen::Item;
 
     use crate::feature::{FeatureRegistryBuilder, HookRegistryBuilder};
 
@@ -426,7 +426,7 @@ mod tests {
     async fn overview_uses_real_entry_refs_and_rejects_unknown_fields() {
         let tool = show_overview_definition(state())().1;
         let output = tool
-            .execute("{}", llm_engine::tool::ToolExecutionContext::direct())
+            .execute("{}", agen::tool::ToolExecutionContext::direct())
             .await
             .unwrap();
         let content = output.content.unwrap();
@@ -438,7 +438,7 @@ mod tests {
         let error = tool
             .execute(
                 r#"{"unexpected":true}"#,
-                llm_engine::tool::ToolExecutionContext::direct(),
+                agen::tool::ToolExecutionContext::direct(),
             )
             .await
             .unwrap_err();
@@ -451,7 +451,7 @@ mod tests {
         let output = search
             .execute(
                 r#"{"from":"E00000003","through":"E00000003"}"#,
-                llm_engine::tool::ToolExecutionContext::direct(),
+                agen::tool::ToolExecutionContext::direct(),
             )
             .await
             .unwrap();
@@ -463,7 +463,7 @@ mod tests {
         let output = read
             .execute(
                 r#"{"entry_ref":"E00000003"}"#,
-                llm_engine::tool::ToolExecutionContext::direct(),
+                agen::tool::ToolExecutionContext::direct(),
             )
             .await
             .unwrap();

@@ -11,15 +11,15 @@ use std::borrow::Cow;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use arc_swap::ArcSwap;
-use async_trait::async_trait;
-use llm_engine::Item;
-use llm_engine::UsageRecord;
-use llm_engine::interceptor::{
+use agen::Item;
+use agen::UsageRecord;
+use agen::interceptor::{
     Interceptor, PostToolAction, PreRequestAction, PreToolAction, PromptAction, ToolCallInfo,
     ToolResultInfo, TurnEndAction,
 };
-use llm_engine::tool::ToolOutput;
+use agen::tool::ToolOutput;
+use arc_swap::ArcSwap;
+use async_trait::async_trait;
 use tracing::info;
 
 use crate::compact::state::CompactState;
@@ -34,7 +34,7 @@ use crate::hook::{
 use crate::ipc::notify_buffer::{NotifyBuffer, build_system_item_with_provenance};
 use crate::prompt::catalog::PromptCatalog;
 use crate::worker::SystemItemCommitter;
-use llm_engine::token_counter::total_tokens;
+use agen::token_counter::total_tokens;
 
 /// Maximum number of bytes copied into `TurnEndInfo::final_text_preview`.
 const FINAL_TEXT_PREVIEW_LIMIT: usize = 512;
@@ -544,14 +544,14 @@ mod tests {
         .expect("task tool definition");
         let (meta, tool) = def();
         ToolCallInfo {
-            call: llm_engine::tool::ToolCall {
+            call: agen::tool::ToolCall {
                 id: "call-id".into(),
                 name: name.into(),
                 input,
             },
             meta,
             tool,
-            context: llm_engine::tool::ToolExecutionContext::new("call-id", "test-batch", 0),
+            context: agen::tool::ToolExecutionContext::new("call-id", "test-batch", 0),
         }
     }
 
@@ -637,7 +637,7 @@ mod tests {
         let history = usage_handle_with(ctx_items.len(), 50);
         let usage_tracker = Arc::new(UsageTracker::new());
         usage_tracker.note_request(ctx_items.len());
-        usage_tracker.record_usage(&llm_engine::event::UsageEvent {
+        usage_tracker.record_usage(&agen::event::UsageEvent {
             input_tokens: Some(150),
             output_tokens: Some(0),
             total_tokens: Some(150),
@@ -701,7 +701,7 @@ mod tests {
             cache_write_tokens: 0,
             output_tokens: 0,
         };
-        let prefix = llm_engine::token_counter::prefix_bytes(&ctx_items);
+        let prefix = agen::token_counter::prefix_bytes(&ctx_items);
         let delta_bytes = prefix[2].saturating_sub(prefix[1]);
         let old_projection =
             11_124 + (delta_bytes as u128 * 11_124_u128 / prefix[1] as u128) as u64;
@@ -808,7 +808,7 @@ mod tests {
         assert!(matches!(
             &items[0],
             Item::Message {
-                role: llm_engine::Role::System,
+                role: agen::Role::System,
                 ..
             }
         ));
@@ -950,7 +950,7 @@ mod tests {
         let info = task_tool_call_info("TaskList", serde_json::json!({}));
         let mut result_info = ToolResultInfo {
             call: info.call,
-            result: llm_engine::tool::ToolResult::from_output(
+            result: agen::tool::ToolResult::from_output(
                 "call-id",
                 ToolOutput {
                     summary: "ok".into(),
@@ -1039,7 +1039,7 @@ mod tests {
             let mut ctx = ctx_items.clone();
             let action = interceptor.pre_llm_request(&mut ctx).await;
             assert!(matches!(action, PreRequestAction::Continue));
-            usage_tracker.record_usage(&llm_engine::event::UsageEvent {
+            usage_tracker.record_usage(&agen::event::UsageEvent {
                 input_tokens: Some(10),
                 output_tokens: Some(0),
                 total_tokens: Some(10),
@@ -1055,7 +1055,7 @@ mod tests {
             other => panic!("expected reminder append, got {other:?}"),
         };
         assert_eq!(appended_len, 1);
-        usage_tracker.record_usage(&llm_engine::event::UsageEvent {
+        usage_tracker.record_usage(&agen::event::UsageEvent {
             input_tokens: Some(11),
             output_tokens: Some(0),
             total_tokens: Some(11),

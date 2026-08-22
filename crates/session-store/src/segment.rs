@@ -9,9 +9,9 @@ use crate::segment_log::{self, LogEntry, SegmentOrigin};
 use crate::store::{Store, StoreError};
 use crate::system_item::SystemItem;
 use crate::{SegmentId, SessionId};
-use llm_engine::EngineResult;
-use llm_engine::llm_client::RequestConfig;
-use llm_engine::llm_client::types::Item;
+use agen::EngineResult;
+use agen::llm_client::RequestConfig;
+use agen::llm_client::types::Item;
 use protocol::Segment;
 
 /// State snapshot for creating a SegmentStart entry.

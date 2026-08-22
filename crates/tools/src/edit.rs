@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
-use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::Deserialize;
 
 use crate::error::ToolsError;
@@ -39,7 +39,7 @@ impl Tool for EditTool {
     async fn execute(
         &self,
         input_json: &str,
-        ctx: llm_engine::tool::ToolExecutionContext,
+        ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: EditParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid Edit input: {e}")))?;
