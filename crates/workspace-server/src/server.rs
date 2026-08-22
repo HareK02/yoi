@@ -15041,6 +15041,13 @@ mod tests {
         config
     }
 
+    fn test_control_store(config: &ServerConfig) -> SqliteWorkspaceStore {
+        if let Some(parent) = config.database_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        SqliteWorkspaceStore::open(&config.database_path).unwrap()
+    }
+
     #[tokio::test]
     async fn server_router_serves_workspace_chooser_before_first_workspace_exists() {
         let dir = tempfile::tempdir().unwrap();
@@ -16225,26 +16232,69 @@ mod tests {
             Some("coder")
         );
 
-        let mut invalid_source_headers = HeaderMap::new();
-        invalid_source_headers.insert(
-            "x-yoi-worker-id",
-            axum::http::HeaderValue::from_str(&source_worker.worker.worker_id).unwrap(),
-        );
-        let invalid_source = execute_worker_ticket_test_operation(
+        let human_mutation = execute_worker_ticket_test_operation(
             State(api.clone()),
             AxumPath(ScopedWorkspacePath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
             }),
-            invalid_source_headers,
+            HeaderMap::new(),
             Json(TicketBackendOperation::AddEvent {
                 id: ticket_ref.id.clone().into(),
-                event: NewTicketEvent::new(TicketEventKind::Comment, "spoofed update"),
+                event: NewTicketEvent::new(TicketEventKind::Comment, "human update"),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            human_mutation.0,
+            TicketBackendOperationResult::Unit
+        ));
+        let human_event = backend.show(ticket_ref.id.clone().into()).unwrap();
+        let human_event = human_event.events.last().unwrap();
+        assert!(!human_event.attributes.contains_key("source_runtime_id"));
+        assert!(!human_event.attributes.contains_key("source_worker_id"));
+
+        let mut incomplete_source_headers = HeaderMap::new();
+        incomplete_source_headers.insert(
+            "x-yoi-runtime-id",
+            axum::http::HeaderValue::from_static(EMBEDDED_WORKER_RUNTIME_ID),
+        );
+        let incomplete_source = execute_worker_ticket_test_operation(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            incomplete_source_headers,
+            Json(TicketBackendOperation::AddEvent {
+                id: ticket_ref.id.clone().into(),
+                event: NewTicketEvent::new(TicketEventKind::Comment, "incomplete source"),
             }),
         )
         .await
         .unwrap_err()
         .into_response();
-        assert_eq!(invalid_source.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(incomplete_source.status(), StatusCode::BAD_REQUEST);
+
+        let mut incomplete_source_headers = HeaderMap::new();
+        incomplete_source_headers.insert(
+            "x-yoi-worker-id",
+            axum::http::HeaderValue::from_str(&source_worker.worker.worker_id).unwrap(),
+        );
+        let incomplete_source = execute_worker_ticket_test_operation(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            incomplete_source_headers,
+            Json(TicketBackendOperation::AddEvent {
+                id: ticket_ref.id.clone().into(),
+                event: NewTicketEvent::new(TicketEventKind::Comment, "incomplete source"),
+            }),
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(incomplete_source.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -19872,9 +19922,10 @@ mod tests {
     async fn companion_routes_report_disabled_without_spawning_worker() {
         let temp = tempfile::tempdir().unwrap();
         let config = test_server_config(temp.path().join("workspace"));
+        let store = test_control_store(&config);
         let api = WorkspaceApi::new_with_execution_backend(
             config,
-            Arc::new(SqliteWorkspaceStore::in_memory().unwrap()),
+            Arc::new(store),
             Arc::new(DeterministicExecutionBackend::default()),
         )
         .await
@@ -19932,11 +19983,11 @@ mod tests {
         let config = test_server_config(dir.path().join("workspace"));
         let store_root = config.embedded_runtime_store_root.clone();
         let bundle = runtime_test_bundle();
-        let bundle_id = bundle.metadata.id.clone();
+        let store = test_control_store(&config);
 
         let api = WorkspaceApi::new_with_execution_backend(
             config.clone(),
-            Arc::new(SqliteWorkspaceStore::in_memory().unwrap()),
+            Arc::new(store),
             Arc::new(DeterministicExecutionBackend::default()),
         )
         .await
@@ -20009,9 +20060,10 @@ mod tests {
         }
         drop(api);
 
+        let restored_store = test_control_store(&config);
         let restored = WorkspaceApi::new_with_execution_backend(
             config,
-            Arc::new(SqliteWorkspaceStore::in_memory().unwrap()),
+            Arc::new(restored_store),
             Arc::new(DeterministicExecutionBackend::default()),
         )
         .await
@@ -20028,10 +20080,8 @@ mod tests {
             .list_config_bundles("embedded-worker-runtime")
             .expect("config bundle list");
         assert!(
-            bundles
-                .bundles
-                .iter()
-                .any(|summary| summary.id == bundle_id)
+            bundles.bundles.is_empty(),
+            "transport-only config bundles must be re-delivered after Runtime restart"
         );
 
         let rejected_input = restored
@@ -20068,10 +20118,11 @@ mod tests {
         let mut config = ServerConfig::local_dev(workspace_root, test_identity())
             .with_embedded_runtime_store_root(default_root.clone());
         config.database_path = ServerConfig::server_database_path_for_data_dir(&data_dir);
+        let store = test_control_store(&config);
         let app = build_router(
             WorkspaceApi::new_with_execution_backend(
                 config,
-                Arc::new(SqliteWorkspaceStore::in_memory().unwrap()),
+                Arc::new(store),
                 Arc::new(DeterministicExecutionBackend::default()),
             )
             .await
@@ -20098,9 +20149,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut config = test_server_config(root.path());
         config.repositories.clear();
+        let store = test_control_store(&config);
         let api = WorkspaceApi::new_with_execution_backend(
             config,
-            Arc::new(SqliteWorkspaceStore::in_memory().unwrap()),
+            Arc::new(store),
             Arc::new(DeterministicExecutionBackend::default()),
         )
         .await
@@ -20128,9 +20180,10 @@ mod tests {
             display_name: None,
             default_selector: None,
         }];
+        let store = test_control_store(&config);
         let api = WorkspaceApi::new_with_execution_backend(
             config,
-            Arc::new(SqliteWorkspaceStore::in_memory().unwrap()),
+            Arc::new(store),
             Arc::new(DeterministicExecutionBackend::default()),
         )
         .await
@@ -20167,8 +20220,8 @@ mod tests {
     #[tokio::test]
     async fn embedded_runtime_api_routes_by_runtime_and_worker_ids_without_leaking_internals() {
         let dir = tempfile::tempdir().unwrap();
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
         let config = test_server_config(dir.path());
+        let store = test_control_store(&config);
         let api = WorkspaceApi::new_with_execution_backend(
             config,
             Arc::new(store),
@@ -20430,8 +20483,8 @@ mod tests {
         source: RuntimeObservationSourceConfig,
     ) -> (String, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
         let mut config = test_server_config(dir.path());
+        let store = test_control_store(&config);
         let runtime_id = source.worker.runtime_id.clone();
         let worker_id = source.worker.worker_id.clone();
         config.runtime_event_sources.push(source);
