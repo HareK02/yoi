@@ -8444,6 +8444,7 @@ async fn scoped_restore_runtime_worker(
                 .into());
             }
             assign_ticket_worker_from_lifecycle(&api, assignment, &runtime_id, &worker_id)?;
+            accept_queued_ticket_after_worker_spawn(&api, assignment)?;
             let worker = project_workspace_worker(&api, worker)?;
             return Ok(Json(workspace_api::WorkerRestoreResponse {
                 workspace_id,
@@ -8464,6 +8465,7 @@ async fn scoped_restore_runtime_worker(
     .await?;
     if let Some(assignment) = assignment_request.as_ref() {
         assign_ticket_worker_from_lifecycle(&api, assignment, &runtime_id, &worker_id)?;
+        accept_queued_ticket_after_worker_spawn(&api, assignment)?;
     }
     Ok(response)
 }
@@ -10747,6 +10749,7 @@ async fn create_runtime_worker(
             &runtime_id,
             &worker.worker.worker_id,
         )?;
+        accept_queued_ticket_after_worker_spawn(&api, assignment)?;
         return Ok(Json(WorkerSpawnResult {
             state: WorkerOperationState::Accepted,
             worker: Some(worker),
@@ -10850,6 +10853,13 @@ async fn create_runtime_worker(
                     &worker.worker.worker_id,
                 )
                 .map_err(ApiError::from),
+            )?;
+            finalize_worker_spawn_stage(
+                &api,
+                worker,
+                &compensation,
+                WorkerSpawnFinalizeStage::TicketStateAccept,
+                accept_queued_ticket_after_worker_spawn(&api, assignment).map_err(ApiError::from),
             )?;
         }
         if worker.working_directory.is_none() {
@@ -16364,7 +16374,7 @@ mod tests {
         let api = test_api(dir.path()).await;
         let backend = browser_ticket_backend(&api).unwrap();
         let mut first_ticket_input = ticket::NewTicket::new("Spawn assignment");
-        first_ticket_input.workflow_state = Some(TicketWorkflowState::InProgress);
+        first_ticket_input.workflow_state = Some(TicketWorkflowState::Queued);
         let first_ticket = backend.create(first_ticket_input).unwrap();
         assign_test_orchestrator(&api, &first_ticket.id);
         let request = WorkerSpawnRequest {
@@ -16421,6 +16431,14 @@ mod tests {
                 .map(|worker| worker.worker_id),
             Some(first_worker.worker.worker_id.clone())
         );
+        assert_eq!(
+            backend
+                .show(first_ticket.id.clone().into())
+                .unwrap()
+                .meta
+                .workflow_state,
+            TicketWorkflowState::InProgress
+        );
         let Json(retried) = scoped_create_runtime_worker(
             State(api.clone()),
             AxumPath(ScopedRuntimePath {
@@ -16469,7 +16487,7 @@ mod tests {
             )
             .unwrap();
         let mut second_ticket_input = ticket::NewTicket::new("Restore assignment");
-        second_ticket_input.workflow_state = Some(TicketWorkflowState::InProgress);
+        second_ticket_input.workflow_state = Some(TicketWorkflowState::Queued);
         let second_ticket = backend.create(second_ticket_input).unwrap();
         assign_test_orchestrator(&api, &second_ticket.id);
         let _ = scoped_restore_runtime_worker(
@@ -16517,6 +16535,14 @@ mod tests {
         assert_eq!(
             restored_assignment.worker.worker_id,
             first_worker.worker.worker_id
+        );
+        assert_eq!(
+            backend
+                .show(second_ticket.id.clone().into())
+                .unwrap()
+                .meta
+                .workflow_state,
+            TicketWorkflowState::InProgress
         );
 
         api.store
