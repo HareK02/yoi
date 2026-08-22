@@ -3842,7 +3842,7 @@ fn reject_unguarded_ticket_completion(operation: &TicketBackendOperation) -> Res
     Ok(())
 }
 
-async fn execute_worker_ticket_rest_operation(
+async fn execute_ticket_rest_operation(
     api: &WorkspaceApi,
     workspace_id: &str,
     headers: HeaderMap,
@@ -3863,7 +3863,10 @@ async fn execute_worker_ticket_rest_operation(
     let operation_kind = ticket_mutation_operation_kind(&operation);
     let is_mutation = operation_kind != "read";
     let target = ticket_mutation_target(&operation).cloned();
-    let source = authenticate_worker_mutation_source(api, workspace_id, &headers)?;
+    // Human clients are authorized by the Workspace route boundary. Runtime-forwarded Worker
+    // calls carry source headers; when either header is present, the complete pair is required
+    // and authenticated before source attribution is attached.
+    let source = optional_worker_mutation_source(api, workspace_id, &headers)?;
     reject_unguarded_ticket_completion(&operation)?;
     validate_ticket_repository_operation(api, &operation)?;
     let before = target.as_ref().and_then(|id| backend.show(id.clone()).ok());
@@ -3871,9 +3874,12 @@ async fn execute_worker_ticket_rest_operation(
         .as_ref()
         .map(|ticket| ticket.meta.workflow_state.as_str().to_string())
         .unwrap_or_else(|| ticket_operation_initial_state(&operation));
-    bind_worker_ticket_operation_source(&source, &mut operation);
-    let source_context = worker_ticket_source_context(api, workspace_id, &source, before.as_ref());
-    backend = backend.with_event_attributes(source_context.attributes(operation_kind));
+    if let Some(source) = source.as_ref() {
+        bind_worker_ticket_operation_source(source, &mut operation);
+        let source_context =
+            worker_ticket_source_context(api, workspace_id, source, before.as_ref());
+        backend = backend.with_event_attributes(source_context.attributes(operation_kind));
+    }
 
     let result = execute_ticket_backend_operation(&backend, operation).map_err(Error::from)?;
     if is_mutation
@@ -3886,7 +3892,7 @@ async fn execute_worker_ticket_rest_operation(
             &ticket.meta.id,
             &previous_state,
             ticket.meta.workflow_state.as_str(),
-            Some(source),
+            source,
         );
     }
     Ok(result)
@@ -3899,7 +3905,7 @@ async fn execute_worker_ticket_test_operation(
     headers: HeaderMap,
     Json(operation): Json<TicketBackendOperation>,
 ) -> ApiResult<Json<TicketBackendOperationResult>> {
-    execute_worker_ticket_rest_operation(&api, &path.workspace_id, headers, operation)
+    execute_ticket_rest_operation(&api, &path.workspace_id, headers, operation)
         .await
         .map(Json)
 }
@@ -3935,7 +3941,7 @@ async fn scoped_default_intake_ready_body(
     headers: HeaderMap,
     Json(request): Json<DefaultIntakeReadyBodyRequest>,
 ) -> ApiResult<Json<String>> {
-    let result = execute_worker_ticket_rest_operation(
+    let result = execute_ticket_rest_operation(
         &api,
         &path.workspace_id,
         headers,
@@ -3972,7 +3978,7 @@ async fn scoped_list_ticket_summaries(
             ticket::TicketListQuery::states(selected)
         }
     };
-    let result = execute_worker_ticket_rest_operation(
+    let result = execute_ticket_rest_operation(
         &api,
         &path.workspace_id,
         headers,
@@ -3990,7 +3996,7 @@ async fn scoped_get_ticket_record(
     AxumPath((workspace_id, id)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<ticket::Ticket>> {
-    let result = execute_worker_ticket_rest_operation(
+    let result = execute_ticket_rest_operation(
         &api,
         &workspace_id,
         headers,
@@ -4020,7 +4026,7 @@ async fn scoped_create_ticket_record(
             "Ticket creation must start in planning; use guarded workflow operations for later states",
         ));
     }
-    let result = execute_worker_ticket_rest_operation(
+    let result = execute_ticket_rest_operation(
         &api,
         &path.workspace_id,
         headers,
@@ -4039,7 +4045,7 @@ async fn scoped_edit_ticket_record_item(
     headers: HeaderMap,
     Json(edit): Json<TicketItemEdit>,
 ) -> ApiResult<Json<ticket::Ticket>> {
-    let result = execute_worker_ticket_rest_operation(
+    let result = execute_ticket_rest_operation(
         &api,
         &workspace_id,
         headers,
@@ -4060,7 +4066,7 @@ async fn scoped_ticket_dependency_check(
     AxumPath((workspace_id, id)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<ticket::TicketDependencyCheck>> {
-    let result = execute_worker_ticket_rest_operation(
+    let result = execute_ticket_rest_operation(
         &api,
         &workspace_id,
         headers,
@@ -4081,7 +4087,7 @@ async fn scoped_add_ticket_thread_event(
     headers: HeaderMap,
     Json(event): Json<NewTicketEvent>,
 ) -> ApiResult<StatusCode> {
-    let result = execute_worker_ticket_rest_operation(
+    let result = execute_ticket_rest_operation(
         &api,
         &workspace_id,
         headers,
@@ -4100,7 +4106,7 @@ async fn scoped_add_ticket_state_change(
     headers: HeaderMap,
     Json(change): Json<TicketStateChange>,
 ) -> ApiResult<StatusCode> {
-    let result = execute_worker_ticket_rest_operation(
+    let result = execute_ticket_rest_operation(
         &api,
         &workspace_id,
         headers,
@@ -4119,7 +4125,7 @@ async fn scoped_add_ticket_intake_summary(
     headers: HeaderMap,
     Json(summary): Json<ticket::TicketIntakeSummary>,
 ) -> ApiResult<StatusCode> {
-    let result = execute_worker_ticket_rest_operation(
+    let result = execute_ticket_rest_operation(
         &api,
         &workspace_id,
         headers,
@@ -4147,7 +4153,7 @@ async fn scoped_set_ticket_state_field(
     headers: HeaderMap,
     Json(change): Json<TicketStateChange>,
 ) -> ApiResult<StatusCode> {
-    let result = execute_worker_ticket_rest_operation(
+    let result = execute_ticket_rest_operation(
         &api,
         &workspace_id,
         headers,
@@ -4167,7 +4173,7 @@ async fn scoped_set_ticket_workflow_state(
     headers: HeaderMap,
     Json(change): Json<TicketStateChange>,
 ) -> ApiResult<StatusCode> {
-    let result = execute_worker_ticket_rest_operation(
+    let result = execute_ticket_rest_operation(
         &api,
         &workspace_id,
         headers,
@@ -4186,7 +4192,7 @@ async fn scoped_mark_ticket_ready(
     headers: HeaderMap,
     Json(request): Json<TicketMarkReadyRequest>,
 ) -> ApiResult<Json<ticket::Ticket>> {
-    let result = execute_worker_ticket_rest_operation(
+    let result = execute_ticket_rest_operation(
         &api,
         &workspace_id,
         headers,
@@ -4212,7 +4218,7 @@ async fn scoped_queue_ticket_record(
     AxumPath((workspace_id, id)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<StatusCode> {
-    let result = execute_worker_ticket_rest_operation(
+    let result = execute_ticket_rest_operation(
         &api,
         &workspace_id,
         headers,
@@ -4975,7 +4981,7 @@ async fn scoped_close_ticket_record(
     headers: HeaderMap,
     Json(resolution): Json<MarkdownText>,
 ) -> ApiResult<StatusCode> {
-    let result = execute_worker_ticket_rest_operation(
+    let result = execute_ticket_rest_operation(
         &api,
         &workspace_id,
         headers,
@@ -4994,7 +5000,7 @@ async fn scoped_record_ticket_relation(
     headers: HeaderMap,
     Json(relation): Json<ticket::NewTicketRelation>,
 ) -> ApiResult<Json<ticket::TicketRelation>> {
-    let result = execute_worker_ticket_rest_operation(
+    let result = execute_ticket_rest_operation(
         &api,
         &workspace_id,
         headers,
@@ -5022,7 +5028,7 @@ async fn scoped_remove_ticket_relation(
     headers: HeaderMap,
     Json(relation): Json<TicketRelationRemoveRequest>,
 ) -> ApiResult<Json<ticket::TicketRelation>> {
-    let result = execute_worker_ticket_rest_operation(
+    let result = execute_ticket_rest_operation(
         &api,
         &workspace_id,
         headers,
@@ -5051,7 +5057,7 @@ async fn scoped_query_ticket_relations(
     headers: HeaderMap,
     Json(query): Json<TicketRelationSearchRequest>,
 ) -> ApiResult<Json<Vec<ticket::TicketRelation>>> {
-    let result = execute_worker_ticket_rest_operation(
+    let result = execute_ticket_rest_operation(
         &api,
         &path.workspace_id,
         headers,
@@ -5072,7 +5078,7 @@ async fn scoped_ticket_relation_view(
     AxumPath((workspace_id, id)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<ticket::TicketRelationView>> {
-    let result = execute_worker_ticket_rest_operation(
+    let result = execute_ticket_rest_operation(
         &api,
         &workspace_id,
         headers,
@@ -5093,7 +5099,7 @@ async fn scoped_record_ticket_orchestration_plan(
     headers: HeaderMap,
     Json(record): Json<ticket::NewOrchestrationPlanRecord>,
 ) -> ApiResult<Json<ticket::OrchestrationPlanRecord>> {
-    let result = execute_worker_ticket_rest_operation(
+    let result = execute_ticket_rest_operation(
         &api,
         &workspace_id,
         headers,
@@ -5121,7 +5127,7 @@ async fn scoped_query_ticket_orchestration_plans(
     headers: HeaderMap,
     Json(query): Json<TicketOrchestrationPlanSearchRequest>,
 ) -> ApiResult<Json<Vec<ticket::OrchestrationPlanRecord>>> {
-    let result = execute_worker_ticket_rest_operation(
+    let result = execute_ticket_rest_operation(
         &api,
         &path.workspace_id,
         headers,
@@ -5142,7 +5148,7 @@ async fn scoped_ticket_doctor(
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
     headers: HeaderMap,
 ) -> ApiResult<Json<ticket::TicketDoctorReport>> {
-    let result = execute_worker_ticket_rest_operation(
+    let result = execute_ticket_rest_operation(
         &api,
         &path.workspace_id,
         headers,
@@ -15390,14 +15396,9 @@ mod tests {
             },
         ];
         for operation in operations {
-            execute_worker_ticket_rest_operation(
-                &api,
-                TEST_WORKSPACE_ID,
-                source_headers(),
-                operation,
-            )
-            .await
-            .unwrap();
+            execute_ticket_rest_operation(&api, TEST_WORKSPACE_ID, source_headers(), operation)
+                .await
+                .unwrap();
         }
 
         let inputs = execution.take_inputs();
@@ -18165,7 +18166,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_rest_search_requires_worker_source_identity_and_rpc_route_is_removed() {
+    async fn ticket_rest_search_allows_workspace_product_clients_and_rejects_invalid_worker_source()
+    {
         let dir = tempfile::tempdir().unwrap();
         let api = test_api(dir.path()).await;
         let app = build_router(api);
@@ -18183,7 +18185,23 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/w/{TEST_WORKSPACE_ID}/tickets"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&ticket::NewTicket::new("CLI Ticket")).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
         let response = app
             .clone()
