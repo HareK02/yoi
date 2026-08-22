@@ -3672,13 +3672,10 @@ impl ticket::TicketTargetAuthority for WorkspaceTicketTargetAuthority {
 }
 
 fn browser_ticket_backend(api: &WorkspaceApi) -> Result<SqliteTicketBackend> {
-    let config = ticket::config::TicketConfig::load_workspace(&api.config.workspace_root)
-        .map_err(|error| Error::Config(format!("load Ticket workspace settings: {error}")))?;
     Ok(SqliteTicketBackend::open_verified(
         api.config.database_path.clone(),
         api.config.workspace_id.clone(),
     )?
-    .with_record_language(config.ticket_record_language())
     .with_target_authority(Arc::new(WorkspaceTicketTargetAuthority {
         api: api.clone(),
     })))
@@ -3849,14 +3846,11 @@ async fn execute_ticket_rest_operation(
     mut operation: TicketBackendOperation,
 ) -> ApiResult<TicketBackendOperationResult> {
     validate_workspace_scope(api, workspace_id)?;
-    let config = ticket::config::TicketConfig::load_workspace(&api.config.workspace_root)
-        .map_err(|error| Error::Config(format!("load Ticket workspace settings: {error}")))?;
     let mut backend = SqliteTicketBackend::open_verified(
         api.config.database_path.clone(),
         api.config.workspace_id.clone(),
     )
     .map_err(Error::from)?
-    .with_record_language(config.ticket_record_language())
     .with_target_authority(Arc::new(WorkspaceTicketTargetAuthority {
         api: api.clone(),
     }));
@@ -16285,6 +16279,12 @@ mod tests {
     async fn ticket_browser_endpoints_mutate_typed_backend_and_return_thread() {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
+        fs::create_dir_all(dir.path().join(".yoi")).unwrap();
+        fs::write(
+            dir.path().join(".yoi/workspace.toml"),
+            "this is not valid workspace config",
+        )
+        .unwrap();
         let api = test_api(dir.path()).await;
         let ticket_ref = browser_ticket_backend(&api)
             .unwrap()

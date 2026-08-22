@@ -173,7 +173,7 @@ impl BackendWorkspaceProductClient {
         }
         self.send_json(
             Method::POST,
-            "/tickets/relations/search",
+            "/ticket-relations/query",
             Some(&Query { ticket, kind }),
         )
     }
@@ -568,7 +568,7 @@ impl TicketBackend for BackendWorkspaceProductClient {
         }
         self.send_json(
             Method::POST,
-            "/tickets/orchestration-plans/search",
+            "/ticket-orchestration-plans/query",
             Some(&Query { ticket, kind }),
         )
         .map_err(ticket_client_error)
@@ -727,6 +727,42 @@ mod tests {
                 .recv()
                 .unwrap()
                 .starts_with("POST /api/w/workspace-a/objectives ")
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn ticket_relation_query_uses_workspace_scoped_backend_route() {
+        let (base_url, request, handle) = one_response_server("200 OK", "[]");
+        let client = BackendWorkspaceProductClient::new(base_url, "workspace-a").unwrap();
+
+        let relations = client
+            .query_ticket_relations(
+                Some(&TicketIdOrSlug::Query("T-1".to_string())),
+                Some(TicketRelationKind::Related),
+            )
+            .unwrap();
+
+        assert!(relations.is_empty());
+        let request = request.recv().unwrap();
+        assert!(request.starts_with("POST /api/w/workspace-a/ticket-relations/query "));
+        assert!(request.contains("\"ticket\":{\"Query\":\"T-1\"}"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn orchestration_plan_query_uses_workspace_scoped_backend_route() {
+        let (base_url, request, handle) = one_response_server("200 OK", "[]");
+        let client = BackendWorkspaceProductClient::new(base_url, "workspace-a").unwrap();
+
+        let records = TicketBackend::query_orchestration_plan_records(&client, None, None).unwrap();
+
+        assert!(records.is_empty());
+        assert!(
+            request
+                .recv()
+                .unwrap()
+                .starts_with("POST /api/w/workspace-a/ticket-orchestration-plans/query ")
         );
         handle.join().unwrap();
     }

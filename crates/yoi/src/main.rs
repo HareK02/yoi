@@ -214,22 +214,15 @@ struct TargetSelection {
     workspace_id: Option<String>,
 }
 
-impl TargetSelection {
-    fn explicit_backend(&self) -> bool {
-        self.backend_url.is_some()
-    }
-}
-
 fn resolve_tui_target<R: CliConnectionResolver + ?Sized>(
     connection_resolver: &R,
     command: CliCommand,
     selection: &TargetSelection,
     workspace_root: &Path,
 ) -> Result<Box<dyn Target>, ParseError> {
-    let workspace_id = if selection.explicit_backend() && selection.workspace_id.is_none() {
-        resolve_workspace_id_from_root(workspace_root)?
-    } else {
-        selection.workspace_id.clone()
+    let workspace_id = match selection.workspace_id.clone() {
+        Some(workspace_id) => Some(workspace_id),
+        None => resolve_workspace_id_from_root(workspace_root)?,
     };
     resolve_connection_aware_cli_connection(
         connection_resolver,
@@ -1755,6 +1748,28 @@ mod tests {
         }
     }
 
+    struct DefaultBackendCliConnectionResolver {
+        backend_url: &'static str,
+    }
+
+    impl CliConnectionResolver for DefaultBackendCliConnectionResolver {
+        fn resolve_connection(
+            &self,
+            _command: CliCommand,
+            input: CliConnectionInput<'_>,
+        ) -> Result<Box<dyn Target>, ParseError> {
+            let workspace_id = match input {
+                CliConnectionInput::DefaultTarget { workspace_id }
+                | CliConnectionInput::BackendTarget { workspace_id, .. } => workspace_id,
+                CliConnectionInput::LocalTarget => return Ok(Box::new(LocalTarget::new())),
+            };
+            Ok(Box::new(BackendTarget::new(
+                self.backend_url,
+                workspace_id.map(str::to_string),
+            )))
+        }
+    }
+
     #[test]
     fn parser_uses_local_target_for_workers_without_backend_option() {
         let resolver = FixedCliConnectionResolver {
@@ -2134,6 +2149,36 @@ backend = "shared"
             }
             _ => panic!("expected Worker cleanup prune mode"),
         }
+    }
+
+    #[test]
+    fn default_backend_target_inherits_workspace_identity_from_workspace_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join(".yoi")).unwrap();
+        std::fs::write(
+            workspace.path().join(".yoi/workspace.toml"),
+            "workspace_id = \"workspace-from-root\"\n",
+        )
+        .unwrap();
+        let resolver = DefaultBackendCliConnectionResolver {
+            backend_url: "http://default-backend.example",
+        };
+
+        let target = resolve_tui_target(
+            &resolver,
+            CliCommand::Ticket,
+            &TargetSelection::default(),
+            workspace.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            target.resolve().unwrap(),
+            client::ResolvedTarget::Backend {
+                base_url: "http://default-backend.example".to_string(),
+                workspace_id: "workspace-from-root".to_string(),
+            }
+        );
     }
 
     #[test]
