@@ -3843,7 +3843,11 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 runtime_id,
                 worker_id,
             } => (None, Some(runtime_id.as_str()), Some(worker_id.as_str())),
-            TicketAssignmentPrincipal::WorkspaceAgent { .. } => unreachable!(),
+            TicketAssignmentPrincipal::WorkspaceAgent { .. } => {
+                return Err(Error::TicketAssignmentConflict(
+                    "Workspace agent principal cannot occupy the Coder role".to_string(),
+                ));
+            }
         };
         let principal_json = serde_json::to_string(&record.principal).map_err(|error| {
             Error::Store(format!("serialize Ticket assignment principal: {error}"))

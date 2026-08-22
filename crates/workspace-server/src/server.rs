@@ -15669,6 +15669,26 @@ mod tests {
                 updated_at: TEST_CREATED_AT.to_string(),
             })
             .unwrap();
+        let invalid_coder = scoped_set_ticket_assignment(
+            State(api.clone()),
+            AxumPath((
+                TEST_WORKSPACE_ID.to_string(),
+                ticket_id.clone(),
+                "coder".to_string(),
+            )),
+            Json(SetTicketRoleAssignmentRequest {
+                operation_id: "invalid-workspace-agent-coder".to_string(),
+                principal: TicketAssignmentPrincipal::WorkspaceAgent {
+                    agent_key: "workspace-orchestrator".to_string(),
+                },
+                expected_assignment_id: None,
+            }),
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(invalid_coder.status(), StatusCode::CONFLICT);
+
         let assignment = TicketCoderAssignmentRecord {
             workspace_id: TEST_WORKSPACE_ID.to_string(),
             ticket_id: ticket_id.clone(),
