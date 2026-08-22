@@ -3923,7 +3923,8 @@ async fn scoped_close_ticket(
 fn generic_ticket_state_change(operation: &TicketBackendOperation) -> Option<&TicketStateChange> {
     match operation {
         TicketBackendOperation::SetWorkflowState { change, .. }
-        | TicketBackendOperation::SetStateField { change, .. } => Some(change),
+        | TicketBackendOperation::SetStateField { change, .. }
+        | TicketBackendOperation::AddStateChanged { change, .. } => Some(change),
         _ => None,
     }
 }
@@ -13352,6 +13353,10 @@ mod tests {
                     field: "state".to_string(),
                     change: change(),
                 },
+                TicketBackendOperation::AddStateChanged {
+                    id: TicketIdOrSlug::Query("T1".to_string()),
+                    change: change(),
+                },
             ];
             for operation in operations {
                 let error = reject_unguarded_ticket_completion(&operation).unwrap_err();
@@ -13382,6 +13387,10 @@ mod tests {
             TicketBackendOperation::SetStateField {
                 id: TicketIdOrSlug::Query("T1".to_string()),
                 field: "state".to_string(),
+                change: change(),
+            },
+            TicketBackendOperation::AddStateChanged {
+                id: TicketIdOrSlug::Query("T1".to_string()),
                 change: change(),
             },
         ] {
