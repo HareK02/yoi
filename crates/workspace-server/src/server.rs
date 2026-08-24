@@ -7693,6 +7693,17 @@ fn registered_workdir_runtime_id(
         })
 }
 
+fn workdir_runtime_failure_code(error: &RuntimeRegistryError) -> String {
+    match error {
+        RuntimeRegistryError::UnknownRuntime(_) | RuntimeRegistryError::UnknownHost(_) => {
+            "runtime_unavailable".to_string()
+        }
+        RuntimeRegistryError::RuntimeOperationFailed { code, .. } => code.clone(),
+        RuntimeRegistryError::InvalidIdentifier { .. } => "invalid_runtime".to_string(),
+        RuntimeRegistryError::UnknownWorker { .. } => "runtime_workdir_lookup_failed".to_string(),
+    }
+}
+
 async fn create_workspace_working_directory(
     api: &WorkspaceApi,
     workspace_id: &str,
@@ -7762,9 +7773,16 @@ async fn create_workspace_working_directory(
             .clone()
             .or(runtime_projection.default_runtime_id.clone())
             .ok_or_else(|| {
-                Error::InvalidInput(
-                    "runtime_id was omitted and Workspace configuration has no runtime.default_runtime_id"
-                        .to_string(),
+                ApiError::with_diagnostics(
+                    Error::InvalidInput(
+                        "runtime_id was omitted and Workspace configuration has no runtime.default_runtime_id"
+                            .to_string(),
+                    ),
+                    vec![RuntimeDiagnostic {
+                        code: "default_runtime_not_configured".to_string(),
+                        severity: DiagnosticSeverity::Error,
+                        message: "Workspace default Runtime is not configured".to_string(),
+                    }],
                 )
             })?;
         let now = now_registry_timestamp();
@@ -7810,10 +7828,17 @@ async fn create_workspace_working_directory(
                 &operation_id,
                 &request_fingerprint,
                 false,
-                Some("resolved Runtime is not registered"),
+                Some("runtime_unavailable"),
                 &now_registry_timestamp(),
             )?;
-            return Err(Error::UnknownRuntime(reserved.resolved_runtime_id).into());
+            return Err(ApiError::with_diagnostics(
+                Error::UnknownRuntime(reserved.resolved_runtime_id),
+                vec![RuntimeDiagnostic {
+                    code: "runtime_unavailable".to_string(),
+                    severity: DiagnosticSeverity::Error,
+                    message: "Selected Runtime is not available".to_string(),
+                }],
+            ));
         }
     };
     if runtime.kind == "remote_http" && runtime.status != "connected" {
@@ -7822,15 +7847,21 @@ async fn create_workspace_working_directory(
             &operation_id,
             &request_fingerprint,
             false,
-            Some("resolved Runtime is unavailable"),
+            Some("runtime_unavailable"),
             &now_registry_timestamp(),
         )?;
-        return Err(Error::RuntimeOperationFailed {
-            runtime_id: reserved.resolved_runtime_id,
-            code: "runtime_unavailable".to_string(),
-            message: "Selected Runtime is not connected".to_string(),
-        }
-        .into());
+        return Err(ApiError::with_diagnostics(
+            Error::RuntimeOperationFailed {
+                runtime_id: reserved.resolved_runtime_id,
+                code: "runtime_unavailable".to_string(),
+                message: "Selected Runtime is not connected".to_string(),
+            },
+            vec![RuntimeDiagnostic {
+                code: "runtime_unavailable".to_string(),
+                severity: DiagnosticSeverity::Error,
+                message: "Selected Runtime is not available".to_string(),
+            }],
+        ));
     }
 
     if !runtime.capabilities.supports_worktrees {
@@ -7839,25 +7870,49 @@ async fn create_workspace_working_directory(
             &operation_id,
             &request_fingerprint,
             false,
-            Some("resolved Runtime does not support Workdir creation"),
+            Some("runtime_workdir_unsupported"),
             &now_registry_timestamp(),
         )?;
-        return Err(Error::RuntimeOperationFailed {
-            runtime_id: reserved.resolved_runtime_id,
-            code: "workdir_create_unsupported".to_string(),
-            message: "Selected Runtime does not support Workdir creation".to_string(),
-        }
-        .into());
+        return Err(ApiError::with_diagnostics(
+            Error::RuntimeOperationFailed {
+                runtime_id: reserved.resolved_runtime_id,
+                code: "runtime_workdir_unsupported".to_string(),
+                message: "Selected Runtime does not support Workdir creation".to_string(),
+            },
+            vec![RuntimeDiagnostic {
+                code: "runtime_workdir_unsupported".to_string(),
+                severity: DiagnosticSeverity::Error,
+                message: "Selected Runtime does not support Workdir creation".to_string(),
+            }],
+        ));
     }
 
     working_directory_request.backend_workdir_id = Some(reserved.working_directory_id.clone());
-    let existing = api
-        .runtime
-        .working_directory(
-            &reserved.resolved_runtime_id,
-            &reserved.working_directory_id,
-        )
-        .map_err(|err| err.into_error())?;
+    let existing = match api.runtime.working_directory(
+        &reserved.resolved_runtime_id,
+        &reserved.working_directory_id,
+    ) {
+        Ok(existing) => existing,
+        Err(error) => {
+            let failure_code = workdir_runtime_failure_code(&error);
+            api.config_store.finish_workdir_create_operation(
+                workspace_id,
+                &operation_id,
+                &request_fingerprint,
+                false,
+                Some(&failure_code),
+                &now_registry_timestamp(),
+            )?;
+            return Err(ApiError::with_diagnostics(
+                error.into_error(),
+                vec![RuntimeDiagnostic {
+                    code: failure_code,
+                    severity: DiagnosticSeverity::Error,
+                    message: "Selected Runtime could not inspect the reserved Workdir".to_string(),
+                }],
+            ));
+        }
+    };
     let result = if existing.working_directory.is_some() {
         existing
     } else {
@@ -7867,7 +7922,7 @@ async fn create_workspace_working_directory(
         {
             Ok(result) => result,
             Err(error) => {
-                let error = error.into_error();
+                let failure_code = workdir_runtime_failure_code(&error);
                 let _ = api
                     .store
                     .delete_workdir_registry(workspace_id, &reserved.working_directory_id);
@@ -7876,10 +7931,17 @@ async fn create_workspace_working_directory(
                     &operation_id,
                     &request_fingerprint,
                     false,
-                    Some("runtime rejected Workdir creation"),
+                    Some(&failure_code),
                     &now_registry_timestamp(),
                 )?;
-                return Err(error.into());
+                return Err(ApiError::with_diagnostics(
+                    error.into_error(),
+                    vec![RuntimeDiagnostic {
+                        code: failure_code,
+                        severity: DiagnosticSeverity::Error,
+                        message: "Selected Runtime rejected Workdir creation".to_string(),
+                    }],
+                ));
             }
         }
     };
@@ -7892,16 +7954,25 @@ async fn create_workspace_working_directory(
             &operation_id,
             &request_fingerprint,
             false,
-            Some("runtime did not create working directory"),
+            Some("runtime_workdir_create_failed"),
             &now_registry_timestamp(),
         )?;
+        let mut diagnostics = result.diagnostics;
+        diagnostics.insert(
+            0,
+            RuntimeDiagnostic {
+                code: "runtime_workdir_create_failed".to_string(),
+                severity: DiagnosticSeverity::Error,
+                message: "Runtime did not create the reserved Workdir".to_string(),
+            },
+        );
         return Err(ApiError::with_diagnostics(
             Error::RuntimeOperationFailed {
                 runtime_id: reserved.resolved_runtime_id,
-                code: "workspace_working_directory_create_failed".to_string(),
+                code: "runtime_workdir_create_failed".to_string(),
                 message: "Runtime did not create working directory".to_string(),
             },
-            result.diagnostics,
+            diagnostics,
         ));
     };
     let record = workdir_record_from_summary(
@@ -18937,6 +19008,10 @@ mod tests {
         )
         .await;
         assert_eq!(response["error"], "Bad Request");
+        assert_eq!(
+            response["diagnostics"][0]["code"],
+            "default_runtime_not_configured"
+        );
         let projected = serde_json::to_string(&response).unwrap();
         assert!(!projected.contains(dir.path().to_string_lossy().as_ref()));
     }
@@ -18963,6 +19038,7 @@ mod tests {
         )
         .await;
         assert_eq!(response["error"], "Not Found");
+        assert_eq!(response["diagnostics"][0]["code"], "runtime_unavailable");
         let operation = api
             .config_store
             .load_workdir_create_operation(TEST_WORKSPACE_ID, operation_id)
@@ -18974,6 +19050,7 @@ mod tests {
         );
         assert_eq!(operation.resolved_runtime_id, "missing-runtime");
         assert_eq!(operation.state, "failed");
+        assert_eq!(operation.failure.as_deref(), Some("runtime_unavailable"));
         assert!(
             api.store
                 .get_workdir_registry(TEST_WORKSPACE_ID, &operation.working_directory_id)
@@ -19004,7 +19081,10 @@ mod tests {
         )
         .await;
         assert_eq!(response["error"], "Bad Request");
-
+        assert_eq!(
+            response["diagnostics"][0]["code"],
+            "runtime_workdir_unsupported"
+        );
         set_test_default_runtime(&api, "not-a-registered-runtime");
         request_json(
             app,
@@ -19028,7 +19108,7 @@ mod tests {
         assert_eq!(operation.state, "failed");
         assert_eq!(
             operation.failure.as_deref(),
-            Some("resolved Runtime does not support Workdir creation")
+            Some("runtime_workdir_unsupported")
         );
         assert_eq!(operation.config_revision, 2);
         assert!(!operation.config_projection_digest.is_empty());
