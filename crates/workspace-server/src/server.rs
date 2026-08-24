@@ -20223,10 +20223,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
         let api = test_api(dir.path()).await;
+        let token = seed_test_api_token(api.store.as_ref(), "explicit-runtime-no-fallback");
         set_test_default_runtime(&api, EMBEDDED_WORKER_RUNTIME_ID);
         let operation_id = "workdir-create-explicit-runtime";
 
-        let response = request_json(
+        let response = request_json_authenticated(
             build_router(api.clone()),
             "POST",
             &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
@@ -20236,6 +20237,7 @@ mod tests {
                 "selector": "HEAD",
                 "operation_id": operation_id,
             })),
+            &token,
             StatusCode::NOT_FOUND,
         )
         .await;
@@ -20266,11 +20268,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
         let api = test_api(dir.path()).await;
+        let token = seed_test_api_token(api.store.as_ref(), "failed-default-resolution");
         set_test_default_runtime(&api, EMBEDDED_WORKER_RUNTIME_ID);
         let app = build_router(api.clone());
         let operation_id = "workdir-create-default-runtime";
 
-        let response = request_json(
+        let response = request_json_authenticated(
             app.clone(),
             "POST",
             &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
@@ -20279,6 +20282,7 @@ mod tests {
                 "selector": "HEAD",
                 "operation_id": operation_id,
             })),
+            &token,
             StatusCode::BAD_REQUEST,
         )
         .await;
@@ -20288,7 +20292,7 @@ mod tests {
             "runtime_workdir_unsupported"
         );
         set_test_default_runtime(&api, "not-a-registered-runtime");
-        request_json(
+        request_json_authenticated(
             app,
             "POST",
             &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
@@ -20297,6 +20301,7 @@ mod tests {
                 "selector": "HEAD",
                 "operation_id": operation_id,
             })),
+            &token,
             StatusCode::BAD_REQUEST,
         )
         .await;
@@ -22729,6 +22734,41 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
         expected_status: StatusCode,
     ) -> Value {
         let mut builder = Request::builder().method(method).uri(uri);
+        let request_body = if let Some(body) = body {
+            builder = builder.header(CONTENT_TYPE, "application/json");
+            Body::from(serde_json::to_vec(&body).unwrap())
+        } else {
+            Body::empty()
+        };
+        let response = app
+            .oneshot(builder.body(request_body).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            expected_status,
+            "{method} {uri}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        serde_json::from_slice(&bytes).unwrap_or_else(
+            |_| serde_json::json!({ "message": String::from_utf8_lossy(&bytes).to_string() }),
+        )
+    }
+
+    async fn request_json_authenticated(
+        app: Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+        token: &str,
+        expected_status: StatusCode,
+    ) -> Value {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
         let request_body = if let Some(body) = body {
             builder = builder.header(CONTENT_TYPE, "application/json");
             Body::from(serde_json::to_vec(&body).unwrap())
