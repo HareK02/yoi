@@ -7787,6 +7787,15 @@ async fn create_workspace_working_directory(
             })?
     };
 
+    if reserved.state == "succeeded" {
+        return working_directory_detail_for_runtime(
+            api.clone(),
+            &reserved.resolved_runtime_id,
+            &reserved.working_directory_id,
+        )
+        .map(|response| (StatusCode::OK, response));
+    }
+
     let runtime = match api
         .runtime
         .list_runtimes(usize::MAX)
@@ -7824,13 +7833,21 @@ async fn create_workspace_working_directory(
         .into());
     }
 
-    if reserved.state == "succeeded" {
-        return working_directory_detail_for_runtime(
-            api.clone(),
-            &reserved.resolved_runtime_id,
-            &reserved.working_directory_id,
-        )
-        .map(|response| (StatusCode::OK, response));
+    if !runtime.capabilities.supports_worktrees {
+        api.config_store.finish_workdir_create_operation(
+            workspace_id,
+            &operation_id,
+            &request_fingerprint,
+            false,
+            Some("resolved Runtime does not support Workdir creation"),
+            &now_registry_timestamp(),
+        )?;
+        return Err(Error::RuntimeOperationFailed {
+            runtime_id: reserved.resolved_runtime_id,
+            code: "workdir_create_unsupported".to_string(),
+            message: "Selected Runtime does not support Workdir creation".to_string(),
+        }
+        .into());
     }
 
     working_directory_request.backend_workdir_id = Some(reserved.working_directory_id.clone());
@@ -18983,10 +19000,10 @@ mod tests {
                 "selector": "HEAD",
                 "operation_id": operation_id,
             })),
-            StatusCode::BAD_GATEWAY,
+            StatusCode::BAD_REQUEST,
         )
         .await;
-        assert_eq!(response["error"], "Bad Gateway");
+        assert_eq!(response["error"], "Bad Request");
 
         set_test_default_runtime(&api, "not-a-registered-runtime");
         request_json(
@@ -18998,7 +19015,7 @@ mod tests {
                 "selector": "HEAD",
                 "operation_id": operation_id,
             })),
-            StatusCode::BAD_GATEWAY,
+            StatusCode::BAD_REQUEST,
         )
         .await;
 
@@ -19009,6 +19026,10 @@ mod tests {
             .unwrap();
         assert_eq!(operation.resolved_runtime_id, EMBEDDED_WORKER_RUNTIME_ID);
         assert_eq!(operation.state, "failed");
+        assert_eq!(
+            operation.failure.as_deref(),
+            Some("resolved Runtime does not support Workdir creation")
+        );
         assert_eq!(operation.config_revision, 2);
         assert!(!operation.config_projection_digest.is_empty());
         assert!(
