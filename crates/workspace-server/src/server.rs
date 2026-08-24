@@ -7704,6 +7704,42 @@ fn workdir_runtime_failure_code(error: &RuntimeRegistryError) -> String {
     }
 }
 
+fn workdir_rejection_failure_code(diagnostics: &[RuntimeDiagnostic]) -> String {
+    diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.severity == DiagnosticSeverity::Error
+                && !diagnostic.code.is_empty()
+                && diagnostic.code.len() <= 128
+                && diagnostic
+                    .code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+        .map(|diagnostic| diagnostic.code.clone())
+        .unwrap_or_else(|| "runtime_workdir_create_failed".to_string())
+}
+
+fn finish_rejected_workdir_create_operation(
+    store: &crate::SqliteWorkspaceStore,
+    workspace_id: &str,
+    operation_id: &str,
+    request_fingerprint: &str,
+    diagnostics: &[RuntimeDiagnostic],
+    updated_at: &str,
+) -> Result<String> {
+    let failure_code = workdir_rejection_failure_code(diagnostics);
+    store.finish_workdir_create_operation(
+        workspace_id,
+        operation_id,
+        request_fingerprint,
+        false,
+        Some(&failure_code),
+        updated_at,
+    )?;
+    Ok(failure_code)
+}
+
 async fn create_workspace_working_directory(
     api: &WorkspaceApi,
     workspace_id: &str,
@@ -7949,27 +7985,31 @@ async fn create_workspace_working_directory(
         let _ = api
             .store
             .delete_workdir_registry(workspace_id, &reserved.working_directory_id);
-        api.config_store.finish_workdir_create_operation(
+        let mut diagnostics = result.diagnostics;
+        let failure_code = finish_rejected_workdir_create_operation(
+            &api.config_store,
             workspace_id,
             &operation_id,
             &request_fingerprint,
-            false,
-            Some("runtime_workdir_create_failed"),
+            &diagnostics,
             &now_registry_timestamp(),
         )?;
-        let mut diagnostics = result.diagnostics;
-        diagnostics.insert(
-            0,
-            RuntimeDiagnostic {
-                code: "runtime_workdir_create_failed".to_string(),
-                severity: DiagnosticSeverity::Error,
-                message: "Runtime did not create the reserved Workdir".to_string(),
-            },
-        );
+        if !diagnostics.iter().any(|diagnostic| {
+            diagnostic.severity == DiagnosticSeverity::Error && diagnostic.code == failure_code
+        }) {
+            diagnostics.insert(
+                0,
+                RuntimeDiagnostic {
+                    code: failure_code.clone(),
+                    severity: DiagnosticSeverity::Error,
+                    message: "Runtime did not create the reserved Workdir".to_string(),
+                },
+            );
+        }
         return Err(ApiError::with_diagnostics(
             Error::RuntimeOperationFailed {
                 runtime_id: reserved.resolved_runtime_id,
-                code: "runtime_workdir_create_failed".to_string(),
+                code: failure_code,
                 message: "Runtime did not create working directory".to_string(),
             },
             diagnostics,
@@ -13582,6 +13622,12 @@ impl IntoResponse for ApiError {
             {
                 StatusCode::BAD_REQUEST
             }
+            Error::RuntimeOperationFailed { code, .. }
+                if code == "runtime_capacity_unavailable"
+                    || code == "runtime_workdir_capacity_unavailable" =>
+            {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Error::RuntimeOperationFailed { .. } => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -18988,6 +19034,100 @@ mod tests {
         runtime.store_config_bundle(runtime_test_bundle()).unwrap();
         let worker = runtime.create_worker(runtime_create_request()).unwrap();
         (runtime, worker.worker_ref)
+    }
+
+    #[test]
+    fn provider_rejection_classification_prefers_stable_error_diagnostic() {
+        let diagnostics = vec![
+            RuntimeDiagnostic {
+                code: "runtime_capacity_warning".to_string(),
+                severity: DiagnosticSeverity::Warning,
+                message: "capacity is low".to_string(),
+            },
+            RuntimeDiagnostic {
+                code: "runtime_capacity_unavailable".to_string(),
+                severity: DiagnosticSeverity::Error,
+                message: "capacity is exhausted".to_string(),
+            },
+        ];
+        assert_eq!(
+            workdir_rejection_failure_code(&diagnostics),
+            "runtime_capacity_unavailable"
+        );
+        assert_eq!(
+            workdir_rejection_failure_code(&[]),
+            "runtime_workdir_create_failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_rejection_persists_stable_failure_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let api = test_api(dir.path()).await;
+        let operation_id = "provider-rejection-classification";
+        let request_fingerprint = crate::workdir_create_operations::request_fingerprint(
+            TEST_REPOSITORY_ID,
+            Some("HEAD"),
+            Some(EMBEDDED_WORKER_RUNTIME_ID),
+        );
+        api.config_store
+            .reserve_workdir_create_operation(&WorkdirCreateOperationRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                operation_id: operation_id.to_string(),
+                request_fingerprint: request_fingerprint.clone(),
+                repository_id: TEST_REPOSITORY_ID.to_string(),
+                selector: Some("HEAD".to_string()),
+                requested_runtime_id: Some(EMBEDDED_WORKER_RUNTIME_ID.to_string()),
+                resolved_runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                config_revision: 1,
+                config_projection_digest: "sha256:test".to_string(),
+                working_directory_id: "workdir-provider-rejection".to_string(),
+                state: "pending".to_string(),
+                failure: None,
+                created_at: now_registry_timestamp(),
+                updated_at: now_registry_timestamp(),
+            })
+            .unwrap();
+        let diagnostics = vec![RuntimeDiagnostic {
+            code: "runtime_capacity_unavailable".to_string(),
+            severity: DiagnosticSeverity::Error,
+            message: "capacity is exhausted".to_string(),
+        }];
+
+        assert_eq!(
+            finish_rejected_workdir_create_operation(
+                &api.config_store,
+                TEST_WORKSPACE_ID,
+                operation_id,
+                &request_fingerprint,
+                &diagnostics,
+                &now_registry_timestamp(),
+            )
+            .unwrap(),
+            "runtime_capacity_unavailable"
+        );
+        let operation = api
+            .config_store
+            .load_workdir_create_operation(TEST_WORKSPACE_ID, operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.state, "failed");
+        assert_eq!(
+            operation.failure.as_deref(),
+            Some("runtime_capacity_unavailable")
+        );
+    }
+
+    #[test]
+    fn runtime_capacity_unavailable_maps_to_service_unavailable() {
+        let response = ApiError::from(Error::RuntimeOperationFailed {
+            runtime_id: "runtime".to_string(),
+            code: "runtime_capacity_unavailable".to_string(),
+            message: "Runtime capacity is exhausted".to_string(),
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
