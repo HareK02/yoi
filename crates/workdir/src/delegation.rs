@@ -311,7 +311,10 @@ impl DelegatingWorkdirSession {
         if !self.capabilities.supports(WorkdirSessionCapability::Read)
             || (writable
                 && (!self.capabilities.supports(WorkdirSessionCapability::Write)
-                    || !self.capabilities.supports(WorkdirSessionCapability::Edit)))
+                    || !self.capabilities.supports(WorkdirSessionCapability::Edit)
+                    || !self
+                        .capabilities
+                        .supports(WorkdirSessionCapability::Command)))
         {
             return Err(WorkdirError::Denied(
                 "parent workdir session cannot delegate the requested capabilities".into(),
@@ -342,6 +345,7 @@ impl DelegatingWorkdirSession {
         if writable {
             delegated.push(WorkdirSessionCapability::Write);
             delegated.push(WorkdirSessionCapability::Edit);
+            delegated.push(WorkdirSessionCapability::Command);
         }
         Ok(WorkdirSessionCapabilities::from_capabilities(delegated))
     }
@@ -929,6 +933,43 @@ mod tests {
             .delegate(request("leased", WorkdirDelegationPermission::Write))
             .await
             .unwrap();
+        assert!(
+            child
+                .capabilities
+                .supports(WorkdirSessionCapability::Command)
+        );
+        let command = child
+            .scoped_session
+            .start_command(CommandRequest {
+                command: "printf child-command".into(),
+                timeout_secs: 5,
+                output_limit: 1024,
+                tool_call_id: Some("delegated-child-command".into()),
+            })
+            .await
+            .unwrap();
+        let command_output = child
+            .scoped_session
+            .command_output(CommandOutputRequest {
+                handle: command,
+                cursor: 0,
+                limit: 1024,
+                wait: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(command_output.content, "child-command");
+        assert!(
+            parent
+                .start_command(CommandRequest {
+                    command: "printf parent-command".into(),
+                    timeout_secs: 5,
+                    output_limit: 1024,
+                    tool_call_id: Some("blocked-parent-command".into()),
+                })
+                .await
+                .is_err()
+        );
 
         assert!(matches!(
             parent.write(write("leased/file", "parent")).await,

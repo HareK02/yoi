@@ -242,7 +242,7 @@ Implementation normally happens in a child git worktree created by the Orchestra
 
 ### 5. Review
 
-The assigned Coder launches the Reviewer as an actual direct-child `builtin:reviewer` SubWorker with read-only scope and a structured handoff bound to the current immutable Merge Request revision. Server authority revalidates the parent assignment, Runtime-owned child session, effective profile, one-shot review attempt, and revision; prose output is not approval.
+The assigned Coder launches the Reviewer as an actual direct-child `builtin:reviewer` SubWorker with write scope, so it can use the Workdir command tools required for inspection and validation, and a structured handoff bound to the current immutable Merge Request revision. Server authority revalidates the parent assignment, Runtime-owned child session, effective profile, one-shot review attempt, and revision; prose output is not approval.
 
 The Reviewer records the structured result with `MergeRequestReview`. Request changes requires a new immutable revision and a fresh child attempt. The Orchestrator uses `MergeRequestReadinessCheck` and then `MergeRequestComplete` for guarded integration with operation-id dedupe/CAS semantics; Flow transitions are not completion authority.
 
