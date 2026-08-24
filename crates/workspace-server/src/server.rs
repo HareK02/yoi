@@ -1042,6 +1042,39 @@ async fn authorize_workspace_api_request(
     next.run(request).await
 }
 
+async fn enforce_server_cookie_mutation_origin(
+    State(api): State<WorkspaceServerApi>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    ) {
+        return next.run(request).await;
+    }
+    let actor = match resolve_server_actor(&api, request.headers()).await {
+        Ok(actor) => actor,
+        Err(error) => return server_error_response(error),
+    };
+    if actor
+        .as_ref()
+        .is_some_and(|actor| matches!(actor.auth_method, ActorAuthMethod::BrowserSession))
+    {
+        let AuthConfig::Passkey { origin, .. } = &api.template.auth;
+        let presented_origin = request
+            .headers()
+            .get(ORIGIN)
+            .and_then(|value| value.to_str().ok());
+        if presented_origin != Some(origin.as_str()) {
+            return forbidden_server_response(
+                "cookie-authenticated mutations require the configured Browser origin",
+            );
+        }
+    }
+    next.run(request).await
+}
+
 async fn dispatch_workspace_request(
     State(api): State<WorkspaceServerApi>,
     mut request: Request,
@@ -1159,8 +1192,13 @@ pub async fn build_workspace_server_router(
             get(list_server_workspaces).post(create_server_workspace),
         )
         .fallback(dispatch_workspace_request)
-        .with_state(api);
-    Ok(auth.merge(catalog))
+        .with_state(api.clone());
+    Ok(auth
+        .merge(catalog)
+        .layer(axum::middleware::from_fn_with_state(
+            api,
+            enforce_server_cookie_mutation_origin,
+        )))
 }
 
 impl WorkspaceApi {
@@ -15703,6 +15741,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(authenticated_catalog.status(), StatusCode::OK);
+
+        for path in ["/api/workspaces", "/api/auth/device-login/approve"] {
+            let cross_site = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(path)
+                        .header(
+                            axum::http::header::COOKIE,
+                            "yoi_workspace_session=browser-session-auth",
+                        )
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                cross_site.status(),
+                StatusCode::FORBIDDEN,
+                "{path} must reject a cookie-authenticated cross-site mutation"
+            );
+            let same_origin = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(path)
+                        .header(
+                            axum::http::header::COOKIE,
+                            "yoi_workspace_session=browser-session-auth",
+                        )
+                        .header(ORIGIN, expected_origin.as_str())
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                same_origin.status(),
+                StatusCode::FORBIDDEN,
+                "{path} must accept the configured Browser origin"
+            );
+        }
 
         let ws_uri = format!("/api/w/{}/protocol/ws", workspace.workspace.workspace_id);
         let anonymous_ws = app
