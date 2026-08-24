@@ -211,6 +211,7 @@ pub struct WorkingDirectoryListResponse {
 #[serde(deny_unknown_fields)]
 pub struct WorkingDirectoryDetailResponse {
     pub workspace_id: String,
+    pub runtime_id: String,
     pub item: WorkingDirectorySummary,
     pub diagnostics: Vec<WorkingDirectoryDiagnostic>,
 }
@@ -306,6 +307,7 @@ mod tests {
 
         let detail = WorkingDirectoryDetailResponse {
             workspace_id: decoded.workspace_id.clone(),
+            runtime_id: "arcadia".to_string(),
             item: decoded.items[0].clone(),
             diagnostics: decoded.diagnostics.clone(),
         };

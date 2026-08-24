@@ -110,14 +110,16 @@ use crate::repositories::{
     RepositoryRegistryReader, RepositorySummary,
 };
 use crate::resource_broker::BackendResourceBroker;
+use crate::runtime_settings::RuntimeConfigSchemaProvider;
 use crate::runtime_subscription::RuntimeSubscriptionBroker;
 use crate::skills;
 use crate::store::{
     AccountRecord, ApiTokenRecord, AuthChallengeRecord, BrowserSessionRecord, ControlPlaneStore,
     DeviceLoginFlowRecord, FlowSourceRecord, PasskeyCredentialRecord, RepositoryRecord,
     TicketAssignmentPrincipal, TicketAssignmentRole, TicketCoderAssignmentRecord,
-    TicketRoleAssignmentRecord, UserRecord, WorkdirRegistryRecord, WorkerControlGrantRecord,
-    WorkerRegistryRecord, WorkerWorkdirLinkRecord, WorkspaceRecord, WorkspaceResourceKind,
+    TicketRoleAssignmentRecord, UserRecord, WorkdirCreateOperationRecord, WorkdirRegistryRecord,
+    WorkerControlGrantRecord, WorkerRegistryRecord, WorkerWorkdirLinkRecord, WorkspaceRecord,
+    WorkspaceResourceKind,
 };
 use crate::workspace_catalog::{WorkspaceCatalogService, WorkspaceCreateRequest};
 use crate::{Error, Result};
@@ -133,10 +135,6 @@ use worker_runtime::http_server::{
 use worker_runtime::identity::{RuntimeWorkerRef, WorkerId};
 
 const EMBEDDED_WORKER_RUNTIME_ID: &str = "embedded-worker-runtime";
-
-fn embedded_runtime_id() -> String {
-    EMBEDDED_WORKER_RUNTIME_ID.to_string()
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AuthConfig {
@@ -1099,6 +1097,7 @@ impl WorkspaceApi {
                 crate::profile_settings::ProfileConfigSchemaProvider,
             ))
             .with_provider(Arc::new(crate::prompt_settings::PromptConfigSchemaProvider))
+            .with_provider(Arc::new(RuntimeConfigSchemaProvider))
             .with_provider(Arc::new(skills::SkillConfigSchemaProvider));
         config_store.ensure_workspace_config_materialized_with_schema(
             &config.workspace_id,
@@ -2548,14 +2547,16 @@ pub struct WorkingDirectoryRepositoryOption {
     pub default_selector: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserWorkingDirectoryCreateRequest {
-    #[serde(default = "embedded_runtime_id")]
-    pub runtime_id: String,
+    #[serde(default)]
+    pub runtime_id: Option<String>,
     pub repository_id: String,
     #[serde(default)]
     pub selector: Option<String>,
+    #[serde(default)]
+    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -7607,11 +7608,15 @@ async fn scoped_list_runtime_working_directories(
 async fn scoped_create_runtime_working_directory(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimePath>,
-    Json(mut request): Json<BrowserWorkingDirectoryCreateRequest>,
-) -> ApiResult<Json<BrowserWorkingDirectoryDetailResponse>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    request.runtime_id = path.runtime_id;
-    create_working_directory_for_runtime(api, request)
+    Json(request): Json<BrowserWorkingDirectoryCreateRequest>,
+) -> ApiResult<(StatusCode, Json<BrowserWorkingDirectoryDetailResponse>)> {
+    create_workspace_working_directory(
+        &api,
+        &path.workspace_id,
+        Some(path.runtime_id.as_str()),
+        request,
+    )
+    .await
 }
 
 async fn scoped_runtime_working_directory_detail(
@@ -7646,21 +7651,9 @@ async fn scoped_list_working_directories(
 async fn scoped_create_working_directory(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
-    Json(_request): Json<BrowserWorkingDirectoryCreateRequest>,
-) -> ApiResult<Json<BrowserWorkingDirectoryDetailResponse>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    Err(ApiError::with_diagnostics(
-        Error::RuntimeOperationFailed {
-            runtime_id: "workspace-backend".to_string(),
-            code: "backend_workdir_create_unsupported".to_string(),
-            message: "Working directory creation must be scoped to a concrete Runtime".to_string(),
-        },
-        vec![RuntimeDiagnostic {
-            code: "backend_workdir_create_unsupported".to_string(),
-            severity: DiagnosticSeverity::Error,
-            message: "Use runtime-scoped Worker creation or a runtime-scoped working-directory API; the backend does not own workdir lifecycle.".to_string(),
-        }],
-    ))
+    Json(request): Json<BrowserWorkingDirectoryCreateRequest>,
+) -> ApiResult<(StatusCode, Json<BrowserWorkingDirectoryDetailResponse>)> {
+    create_workspace_working_directory(&api, &path.workspace_id, None, request).await
 }
 
 async fn scoped_working_directory_detail(
@@ -7700,60 +7693,225 @@ fn registered_workdir_runtime_id(
         })
 }
 
-fn create_working_directory_for_runtime(
-    api: WorkspaceApi,
+async fn create_workspace_working_directory(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    route_runtime_id: Option<&str>,
     request: BrowserWorkingDirectoryCreateRequest,
-) -> ApiResult<Json<BrowserWorkingDirectoryDetailResponse>> {
-    let runtime_id = request.runtime_id.clone();
-    let mut working_directory_request = working_directory_request_for_browser(&api, request)?;
-    let workdir_id = next_backend_workdir_id(&working_directory_request.repository.id);
-    working_directory_request.backend_workdir_id = Some(workdir_id.clone());
-    let pending = WorkdirRegistryRecord {
-        workspace_id: api.config.workspace_id.clone(),
-        workdir_id: workdir_id.clone(),
-        runtime_id: runtime_id.clone(),
-        repository_id: working_directory_request.repository.id.clone(),
-        creation_selector: working_directory_request
-            .repository
-            .selector
-            .as_ref()
-            .map(|selector| selector.as_ref().to_string()),
-        creation_ref: None,
-        current_selector: None,
-        current_ref: None,
-        materialization_status: "pending".to_string(),
-        cleanliness: "unknown".to_string(),
-        created_at: now_registry_timestamp(),
-        updated_at: now_registry_timestamp(),
+) -> ApiResult<(StatusCode, Json<BrowserWorkingDirectoryDetailResponse>)> {
+    validate_workspace_scope(api, workspace_id)?;
+    if let (Some(route_runtime_id), Some(request_runtime_id)) =
+        (route_runtime_id, request.runtime_id.as_deref())
+        && route_runtime_id != request_runtime_id
+    {
+        return Err(Error::InvalidInput(
+            "runtime_id does not match the runtime-scoped route".to_string(),
+        )
+        .into());
+    }
+    let requested_runtime_id = route_runtime_id
+        .map(str::to_string)
+        .or_else(|| request.runtime_id.clone());
+    let mut working_directory_request =
+        working_directory_request_for_browser(api, request.clone())?;
+    let operation_id = request
+        .operation_id
+        .clone()
+        .unwrap_or_else(|| Uuid::now_v7().to_string());
+    if operation_id.trim().is_empty() || operation_id.len() > 256 {
+        return Err(Error::InvalidInput(
+            "operation_id must be non-empty and at most 256 bytes".to_string(),
+        )
+        .into());
+    }
+    let selector = working_directory_request
+        .repository
+        .selector
+        .as_ref()
+        .map(|selector| selector.as_ref().to_string());
+    let request_fingerprint = crate::workdir_create_operations::request_fingerprint(
+        &request.repository_id,
+        selector.as_deref(),
+        requested_runtime_id.as_deref(),
+    );
+    let reserved = if let Some(existing) = api
+        .config_store
+        .load_workdir_create_operation(workspace_id, &operation_id)?
+    {
+        if existing.request_fingerprint != request_fingerprint {
+            return Err(Error::InvalidInput(format!(
+                "Workdir create operation `{operation_id}` was reused with different input"
+            ))
+            .into());
+        }
+        existing
+    } else {
+        let config_state = api
+            .config_store
+            .load_workspace_config(workspace_id)?
+            .ok_or_else(|| {
+                Error::RegistryInconsistency(format!(
+                    "Workspace {workspace_id} has no active configuration"
+                ))
+            })?;
+        let runtime_projection = crate::runtime_settings::project_runtime_from_workspace_config(
+            workspace_id,
+            &config_state,
+        )?;
+        let resolved_runtime_id = requested_runtime_id
+            .clone()
+            .or(runtime_projection.default_runtime_id.clone())
+            .ok_or_else(|| {
+                Error::InvalidInput(
+                    "runtime_id was omitted and Workspace configuration has no runtime.default_runtime_id"
+                        .to_string(),
+                )
+            })?;
+        let now = now_registry_timestamp();
+        api.config_store
+            .reserve_workdir_create_operation(&WorkdirCreateOperationRecord {
+                workspace_id: workspace_id.to_string(),
+                operation_id: operation_id.clone(),
+                request_fingerprint: request_fingerprint.clone(),
+                repository_id: request.repository_id.clone(),
+                selector,
+                requested_runtime_id,
+                resolved_runtime_id,
+                config_revision: runtime_projection.config_revision,
+                config_projection_digest: runtime_projection.projection_digest,
+                working_directory_id: next_backend_workdir_id(&request.repository_id),
+                state: "pending".to_string(),
+                failure: None,
+                created_at: now.clone(),
+                updated_at: now,
+            })?
     };
-    api.store.upsert_workdir_registry(&pending)?;
-    let result = api
+
+    let runtime = match api
         .runtime
-        .create_working_directory(&runtime_id, working_directory_request)
+        .list_runtimes(usize::MAX)
+        .items
+        .into_iter()
+        .find(|runtime| runtime.runtime_id == reserved.resolved_runtime_id)
+    {
+        Some(runtime) => runtime,
+        None => {
+            api.config_store.finish_workdir_create_operation(
+                workspace_id,
+                &operation_id,
+                &request_fingerprint,
+                false,
+                Some("resolved Runtime is not registered"),
+                &now_registry_timestamp(),
+            )?;
+            return Err(Error::UnknownRuntime(reserved.resolved_runtime_id).into());
+        }
+    };
+    if runtime.kind == "remote_http" && runtime.status != "connected" {
+        api.config_store.finish_workdir_create_operation(
+            workspace_id,
+            &operation_id,
+            &request_fingerprint,
+            false,
+            Some("resolved Runtime is unavailable"),
+            &now_registry_timestamp(),
+        )?;
+        return Err(Error::RuntimeOperationFailed {
+            runtime_id: reserved.resolved_runtime_id,
+            code: "runtime_unavailable".to_string(),
+            message: "Selected Runtime is not connected".to_string(),
+        }
+        .into());
+    }
+
+    if reserved.state == "succeeded" {
+        return working_directory_detail_for_runtime(
+            api.clone(),
+            &reserved.resolved_runtime_id,
+            &reserved.working_directory_id,
+        )
+        .map(|response| (StatusCode::OK, response));
+    }
+
+    working_directory_request.backend_workdir_id = Some(reserved.working_directory_id.clone());
+    let existing = api
+        .runtime
+        .working_directory(
+            &reserved.resolved_runtime_id,
+            &reserved.working_directory_id,
+        )
         .map_err(|err| err.into_error())?;
+    let result = if existing.working_directory.is_some() {
+        existing
+    } else {
+        match api
+            .runtime
+            .create_working_directory(&reserved.resolved_runtime_id, working_directory_request)
+        {
+            Ok(result) => result,
+            Err(error) => {
+                let error = error.into_error();
+                let _ = api
+                    .store
+                    .delete_workdir_registry(workspace_id, &reserved.working_directory_id);
+                api.config_store.finish_workdir_create_operation(
+                    workspace_id,
+                    &operation_id,
+                    &request_fingerprint,
+                    false,
+                    Some("runtime rejected Workdir creation"),
+                    &now_registry_timestamp(),
+                )?;
+                return Err(error.into());
+            }
+        }
+    };
     let Some(working_directory) = result.working_directory else {
-        let mut failed = pending;
-        failed.materialization_status = "failed".to_string();
-        failed.updated_at = now_registry_timestamp();
-        api.store.upsert_workdir_registry(&failed)?;
+        let _ = api
+            .store
+            .delete_workdir_registry(workspace_id, &reserved.working_directory_id);
+        api.config_store.finish_workdir_create_operation(
+            workspace_id,
+            &operation_id,
+            &request_fingerprint,
+            false,
+            Some("runtime did not create working directory"),
+            &now_registry_timestamp(),
+        )?;
         return Err(ApiError::with_diagnostics(
             Error::RuntimeOperationFailed {
-                runtime_id,
+                runtime_id: reserved.resolved_runtime_id,
                 code: "workspace_working_directory_create_failed".to_string(),
                 message: "Runtime did not create working directory".to_string(),
             },
             result.diagnostics,
         ));
     };
-    let record = workdir_record_from_summary(&api, &runtime_id, &working_directory.summary);
+    let record = workdir_record_from_summary(
+        api,
+        &reserved.resolved_runtime_id,
+        &working_directory.summary,
+    );
     api.store.upsert_workdir_registry(&record)?;
+    api.config_store.finish_workdir_create_operation(
+        workspace_id,
+        &operation_id,
+        &request_fingerprint,
+        true,
+        None,
+        &now_registry_timestamp(),
+    )?;
     let mut summary = working_directory.summary;
-    apply_workdir_occupancy_projection(&api, &mut summary)?;
-    Ok(Json(BrowserWorkingDirectoryDetailResponse {
-        workspace_id: api.config.workspace_id.clone(),
-        item: summary,
-        diagnostics: working_directory_diagnostics(result.diagnostics),
-    }))
+    apply_workdir_occupancy_projection(api, &mut summary)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(BrowserWorkingDirectoryDetailResponse {
+            workspace_id: workspace_id.to_string(),
+            runtime_id: reserved.resolved_runtime_id,
+            item: summary,
+            diagnostics: working_directory_diagnostics(result.diagnostics),
+        }),
+    ))
 }
 
 fn working_directory_detail_for_runtime(
@@ -7772,6 +7930,7 @@ fn working_directory_detail_for_runtime(
         apply_workdir_occupancy_projection(&api, &mut summary)?;
         return Ok(Json(BrowserWorkingDirectoryDetailResponse {
             workspace_id: api.config.workspace_id.clone(),
+            runtime_id: runtime_id.to_string(),
             item: summary,
             diagnostics: working_directory_diagnostics(result.diagnostics),
         }));
@@ -7782,6 +7941,7 @@ fn working_directory_detail_for_runtime(
     {
         return Ok(Json(BrowserWorkingDirectoryDetailResponse {
             workspace_id: api.config.workspace_id.clone(),
+            runtime_id: runtime_id.to_string(),
             item: projected_workdir_summary_from_record(&api, &record)?,
             diagnostics: working_directory_diagnostics(result.diagnostics),
         }));
@@ -7841,6 +8001,7 @@ fn cleanup_working_directory_for_runtime(
     apply_workdir_occupancy_projection(&api, &mut summary)?;
     Ok(Json(BrowserWorkingDirectoryDetailResponse {
         workspace_id: api.config.workspace_id.clone(),
+        runtime_id: runtime_id.to_string(),
         item: summary,
         diagnostics: working_directory_diagnostics(result.diagnostics),
     }))
@@ -17446,6 +17607,38 @@ mod tests {
         test_api_with_recording_backend(workspace_root).await.0
     }
 
+    fn set_test_default_runtime(api: &WorkspaceApi, runtime_id: &str) {
+        let current = api
+            .config_store
+            .load_workspace_config(TEST_WORKSPACE_ID)
+            .unwrap()
+            .unwrap();
+        let main_path = config_source::VirtualPath::parse("main.dcdl").unwrap();
+        let request = crate::config_source::ConfigCommitRequest {
+            base_revision: current.snapshot.revision,
+            base_digest: current.snapshot.digest.clone(),
+            changes: vec![config_source::ConfigTreeChange::Update {
+                path: main_path.clone(),
+                expected_digest: current.snapshot.entries[&main_path].content_digest.clone(),
+                content: format!(
+                    "{{ runtime = {{ default_runtime_id = {runtime_id:?}; }}; }} as WorkspaceConfigSchema"
+                ),
+            }],
+            entrypoints: current.contract.entrypoints.clone(),
+        };
+        let candidate = api
+            .config_store
+            .evaluate_workspace_config_candidate_with_schema(
+                TEST_WORKSPACE_ID,
+                &request,
+                api.config_schema_registry.compose().unwrap(),
+            )
+            .unwrap();
+        api.config_store
+            .commit_evaluated_workspace_config(TEST_WORKSPACE_ID, &candidate)
+            .unwrap();
+    }
+
     fn assign_test_orchestrator(api: &WorkspaceApi, ticket_id: &str) {
         api.store
             .set_current_ticket_role_assignment(
@@ -18709,7 +18902,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_working_directory_create_is_rejected_as_backend_lifecycle() {
+    async fn browser_workspace_workdir_create_requires_configured_default_runtime() {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
         let app = test_app(dir.path()).await;
@@ -18726,16 +18919,104 @@ mod tests {
             StatusCode::BAD_REQUEST,
         )
         .await;
-        assert!(
-            response["diagnostics"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|diagnostic| diagnostic["code"] == "backend_workdir_create_unsupported"),
-            "expected backend lifecycle diagnostic, got {response}"
-        );
+        assert_eq!(response["error"], "Bad Request");
         let projected = serde_json::to_string(&response).unwrap();
         assert!(!projected.contains(dir.path().to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
+    async fn browser_workspace_workdir_create_does_not_fallback_from_explicit_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let api = test_api(dir.path()).await;
+        set_test_default_runtime(&api, EMBEDDED_WORKER_RUNTIME_ID);
+        let operation_id = "workdir-create-explicit-runtime";
+
+        let response = request_json(
+            build_router(api.clone()),
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
+            Some(serde_json::json!({
+                "runtime_id": "missing-runtime",
+                "repository_id": TEST_REPOSITORY_ID,
+                "selector": "HEAD",
+                "operation_id": operation_id,
+            })),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_eq!(response["error"], "Not Found");
+        let operation = api
+            .config_store
+            .load_workdir_create_operation(TEST_WORKSPACE_ID, operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            operation.requested_runtime_id.as_deref(),
+            Some("missing-runtime")
+        );
+        assert_eq!(operation.resolved_runtime_id, "missing-runtime");
+        assert_eq!(operation.state, "failed");
+        assert!(
+            api.store
+                .get_workdir_registry(TEST_WORKSPACE_ID, &operation.working_directory_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_workspace_workdir_create_records_failed_default_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let api = test_api(dir.path()).await;
+        set_test_default_runtime(&api, EMBEDDED_WORKER_RUNTIME_ID);
+        let app = build_router(api.clone());
+        let operation_id = "workdir-create-default-runtime";
+
+        let response = request_json(
+            app.clone(),
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
+            Some(serde_json::json!({
+                "repository_id": TEST_REPOSITORY_ID,
+                "selector": "HEAD",
+                "operation_id": operation_id,
+            })),
+            StatusCode::BAD_GATEWAY,
+        )
+        .await;
+        assert_eq!(response["error"], "Bad Gateway");
+
+        set_test_default_runtime(&api, "not-a-registered-runtime");
+        request_json(
+            app,
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
+            Some(serde_json::json!({
+                "repository_id": TEST_REPOSITORY_ID,
+                "selector": "HEAD",
+                "operation_id": operation_id,
+            })),
+            StatusCode::BAD_GATEWAY,
+        )
+        .await;
+
+        let operation = api
+            .config_store
+            .load_workdir_create_operation(TEST_WORKSPACE_ID, operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.resolved_runtime_id, EMBEDDED_WORKER_RUNTIME_ID);
+        assert_eq!(operation.state, "failed");
+        assert_eq!(operation.config_revision, 2);
+        assert!(!operation.config_projection_digest.is_empty());
+        assert!(
+            api.store
+                .get_workdir_registry(TEST_WORKSPACE_ID, &operation.working_directory_id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

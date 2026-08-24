@@ -398,24 +398,35 @@ impl WorkspaceHttpWorkdirBackend {
         workdir_output(format!("Listed {count} Workdir(s)"), &response)
     }
 
-    fn create(&self, input: WorkdirCreateInput) -> Result<ToolOutput, ToolError> {
-        let runtime_id = validate_identity(&input.runtime_id, CREATE_TOOL, "runtime_id")?;
+    fn create(
+        &self,
+        input: WorkdirCreateInput,
+        operation_id: String,
+    ) -> Result<ToolOutput, ToolError> {
+        let runtime_id = input
+            .runtime_id
+            .as_deref()
+            .map(|value| validate_identity(value, CREATE_TOOL, "runtime_id"))
+            .transpose()?;
         let repository_id = validate_identity(&input.repository_id, CREATE_TOOL, "repository_id")?;
         let selector = validate_optional_selector(input.selector)?;
         let workspace_id = encode_path_segment(self.workspace_id()?);
-        let runtime_path = encode_path_segment(runtime_id);
         let request = WorkdirCreateRequest {
-            runtime_id: runtime_id.to_string(),
+            runtime_id: runtime_id.map(str::to_string),
             repository_id: repository_id.to_string(),
             selector,
+            operation_id,
         };
         let response = self.execute_json::<WorkdirDetailResponse>(WorkspaceRequest::json(
             WorkspaceRequestMethod::Post,
-            format!("/api/w/{workspace_id}/runtimes/{runtime_path}/working-directories"),
+            format!("/api/w/{workspace_id}/working-directories"),
             serde_json::to_string(&request).map_err(decode_error)?,
         ))?;
         workdir_output(
-            format!("Created Workdir {}", response.item.working_directory_id),
+            format!(
+                "Created Workdir {} on Runtime {}",
+                response.item.working_directory_id, response.runtime_id
+            ),
             &response,
         )
     }
@@ -518,16 +529,17 @@ impl Tool for WorkspaceHttpWorkdirTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: ToolExecutionContext,
+        ctx: ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         match self.operation {
             WorkdirOperation::List => {
                 let _input = parse_input::<WorkdirListInput>(input_json)?;
                 self.backend.list()
             }
-            WorkdirOperation::Create => self
-                .backend
-                .create(parse_input::<WorkdirCreateInput>(input_json)?),
+            WorkdirOperation::Create => self.backend.create(
+                parse_input::<WorkdirCreateInput>(input_json)?,
+                ctx.call_id.to_string(),
+            ),
             WorkdirOperation::Attach => self
                 .backend
                 .attach(parse_input::<WorkdirAttachInput>(input_json)?),
@@ -635,9 +647,9 @@ fn create_schema() -> serde_json::Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["runtime_id", "repository_id"],
+        "required": ["repository_id"],
         "properties": {
-            "runtime_id": {"type": "string", "minLength": 1},
+            "runtime_id": {"type": ["string", "null"], "minLength": 1},
             "repository_id": {"type": "string", "minLength": 1},
             "selector": {"type": ["string", "null"], "minLength": 1}
         }
@@ -677,7 +689,8 @@ struct WorkdirListInput {}
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkdirCreateInput {
-    runtime_id: String,
+    #[serde(default)]
+    runtime_id: Option<String>,
     repository_id: String,
     #[serde(default)]
     selector: Option<String>,
@@ -685,10 +698,12 @@ struct WorkdirCreateInput {
 
 #[derive(Debug, Serialize)]
 struct WorkdirCreateRequest {
-    runtime_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_id: Option<String>,
     repository_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     selector: Option<String>,
+    operation_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -916,7 +931,11 @@ mod tests {
     #[test]
     fn schemas_expose_identities_without_paths_or_session_handles() {
         let create = create_schema();
-        assert_eq!(create["required"], json!(["runtime_id", "repository_id"]));
+        assert_eq!(create["required"], json!(["repository_id"]));
+        assert_eq!(
+            create["properties"]["runtime_id"]["type"],
+            json!(["string", "null"])
+        );
         assert!(create["properties"].get("path").is_none());
         assert!(create["properties"].get("session_id").is_none());
         assert_eq!(attach_schema()["required"], json!(["workdir_id"]));
@@ -946,6 +965,7 @@ mod tests {
             })),
             response(json!({
                 "workspace_id": "workspace/test",
+                "runtime_id": "runtime/one",
                 "item": workdir_json("wd-created"),
                 "diagnostics": []
             })),
@@ -961,6 +981,7 @@ mod tests {
             })),
             response(json!({
                 "workspace_id": "workspace/test",
+                "runtime_id": "runtime/one",
                 "item": {
                     "working_directory_id": "wd-created",
                     "repository_id": "main",
@@ -985,13 +1006,19 @@ mod tests {
                 .is_none()
         );
         let created = backend
-            .create(WorkdirCreateInput {
-                runtime_id: "runtime/one".to_string(),
-                repository_id: "main".to_string(),
-                selector: Some("refs/heads/topic".to_string()),
-            })
+            .create(
+                WorkdirCreateInput {
+                    runtime_id: Some("runtime/one".to_string()),
+                    repository_id: "main".to_string(),
+                    selector: Some("refs/heads/topic".to_string()),
+                },
+                "call-create-1".to_string(),
+            )
             .unwrap();
-        assert_eq!(created.summary, "Created Workdir wd-created");
+        assert_eq!(
+            created.summary,
+            "Created Workdir wd-created on Runtime runtime/one"
+        );
         let created: serde_json::Value =
             serde_json::from_str(created.content.as_deref().unwrap()).unwrap();
         assert_eq!(created["item"]["working_directory_id"], "wd-created");
@@ -1017,12 +1044,14 @@ mod tests {
         assert_eq!(requests[0].method, WorkspaceRequestMethod::Get);
         assert_eq!(
             requests[1].path,
-            "/api/w/workspace%2Ftest/runtimes/runtime%2Fone/working-directories"
+            "/api/w/workspace%2Ftest/working-directories"
         );
         assert_eq!(requests[1].method, WorkspaceRequestMethod::Post);
         let body: serde_json::Value =
             serde_json::from_str(requests[1].body.as_deref().unwrap()).unwrap();
         assert_eq!(body["repository_id"], "main");
+        assert_eq!(body["runtime_id"], "runtime/one");
+        assert_eq!(body["operation_id"], "call-create-1");
         assert_eq!(body["selector"], "refs/heads/topic");
         assert_eq!(
             requests[2].path,
@@ -1217,15 +1246,49 @@ mod tests {
     }
 
     #[test]
+    fn create_omits_runtime_for_backend_default_resolution() {
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![response(json!({
+            "workspace_id": "workspace/test",
+            "runtime_id": "arcadia",
+            "item": workdir_json("wd-default"),
+            "diagnostics": []
+        }))]));
+        let backend = WorkspaceHttpWorkdirBackend::new(client.clone());
+
+        let created = backend
+            .create(
+                WorkdirCreateInput {
+                    runtime_id: None,
+                    repository_id: "main".to_string(),
+                    selector: None,
+                },
+                "call-default".to_string(),
+            )
+            .unwrap();
+        assert_eq!(
+            created.summary,
+            "Created Workdir wd-default on Runtime arcadia"
+        );
+        let requests = client.requests();
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
+        assert!(body.get("runtime_id").is_none());
+        assert_eq!(body["operation_id"], "call-default");
+    }
+
+    #[test]
     fn invalid_or_extra_inputs_are_rejected_before_workspace_request() {
         let client = Arc::new(RecordingWorkspaceClient::new(Vec::new()));
         let backend = WorkspaceHttpWorkdirBackend::new(client.clone());
         let error = backend
-            .create(WorkdirCreateInput {
-                runtime_id: " ".to_string(),
-                repository_id: "main".to_string(),
-                selector: None,
-            })
+            .create(
+                WorkdirCreateInput {
+                    runtime_id: Some(" ".to_string()),
+                    repository_id: "main".to_string(),
+                    selector: None,
+                },
+                "call-invalid".to_string(),
+            )
             .unwrap_err();
         assert!(matches!(error, ToolError::InvalidArgument(_)));
         assert!(client.requests().is_empty());
