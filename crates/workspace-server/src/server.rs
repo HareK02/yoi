@@ -9263,18 +9263,23 @@ fn issue_browser_session_response(api: &ServerAuthApi, user: UserRecord) -> ApiR
         expires_at: rfc3339_after(Duration::days(14)),
         revoked_at: None,
     })?;
-    let cookie_name = auth_public_config(&api.config).cookie_name;
+    let auth = auth_public_config(&api.config);
     let mut headers = HeaderMap::new();
     headers.insert(
         SET_COOKIE,
-        session_set_cookie(&cookie_name, &session_token, 14 * 24 * 60 * 60)
-            .parse()
-            .map_err(|error| {
-                auth_error(
-                    "invalid_session_cookie",
-                    &format!("failed to build session cookie: {error}"),
-                )
-            })?,
+        session_set_cookie(
+            &auth.cookie_name,
+            &session_token,
+            14 * 24 * 60 * 60,
+            session_cookie_is_secure(&auth),
+        )
+        .parse()
+        .map_err(|error| {
+            auth_error(
+                "invalid_session_cookie",
+                &format!("failed to build session cookie: {error}"),
+            )
+        })?,
     );
     Ok((
         headers,
@@ -9443,7 +9448,7 @@ async fn post_auth_logout(
     let mut response_headers = HeaderMap::new();
     response_headers.insert(
         SET_COOKIE,
-        session_set_cookie(&auth.cookie_name, "", 0)
+        session_set_cookie(&auth.cookie_name, "", 0, session_cookie_is_secure(&auth))
             .parse()
             .map_err(|error| {
                 auth_error(
@@ -9543,6 +9548,13 @@ fn passkey_credential_id(passkey: &Passkey) -> ApiResult<String> {
             )
             .into()
         })
+}
+
+fn session_cookie_is_secure(auth: &AuthPublicConfig) -> bool {
+    [&auth.origin, &auth.public_base_url]
+        .into_iter()
+        .filter_map(|url| reqwest::Url::parse(url).ok())
+        .any(|url| url.scheme() == "https")
 }
 
 fn auth_public_config(config: &ServerConfig) -> AuthPublicConfig {
@@ -15725,6 +15737,41 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(csrf_accepted.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn browser_session_set_and_clear_cookies_follow_public_https_scheme() {
+        for (scheme, secure) in [("http", false), ("https", true)] {
+            let workspace = tempfile::tempdir().unwrap();
+            let mut api = test_api(workspace.path()).await;
+            let AuthConfig::Passkey {
+                origin,
+                public_base_url,
+                ..
+            } = &mut api.config.auth;
+            *origin = format!("{scheme}://workspace.test");
+            *public_base_url = format!("{scheme}://workspace.test");
+            seed_test_api_token(api.store.as_ref(), &format!("cookie-{scheme}"));
+            let user = api
+                .store
+                .get_user(&format!("user-cookie-{scheme}"))
+                .unwrap()
+                .unwrap();
+            let auth_api = ServerAuthApi::from(&api);
+
+            let login = issue_browser_session_response(&auth_api, user).unwrap();
+            let login_cookie = login.headers().get(SET_COOKIE).unwrap().to_str().unwrap();
+            assert_eq!(login_cookie.contains("; Secure"), secure, "{scheme}");
+            assert!(login_cookie.contains("; HttpOnly; SameSite=Lax"));
+
+            let logout = post_auth_logout(State(auth_api), HeaderMap::new())
+                .await
+                .unwrap();
+            let logout_cookie = logout.headers().get(SET_COOKIE).unwrap().to_str().unwrap();
+            assert_eq!(logout_cookie.contains("; Secure"), secure, "{scheme}");
+            assert!(logout_cookie.contains("Max-Age=0"));
+            assert!(logout_cookie.contains("; HttpOnly; SameSite=Lax"));
+        }
     }
 
     #[tokio::test]
