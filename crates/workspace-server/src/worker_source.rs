@@ -62,6 +62,11 @@ pub async fn verify_runtime_request_source_proof_with_store(
         .map_err(|error| WorkerMutationSourceProofError::Authority(error.to_string()))?
         .filter(|record| record.revoked_at.is_none())
         .ok_or(WorkerMutationSourceProofError::RevokedRuntimeTrust)?;
+    let trusted_for_workspace = trusted.workspace_id.as_deref() == Some(workspace_id)
+        || (unverified.iss == crate::hosts::EMBEDDED_RUNTIME_ID && trusted.workspace_id.is_none());
+    if !trusted_for_workspace {
+        return Err(WorkerMutationSourceProofError::WrongWorkspace);
+    }
     let expected = RuntimeRequestSourceExpectation {
         identity_id: &unverified.iss,
         audience: audience.as_ref(),
@@ -203,6 +208,9 @@ async fn verify_worker_remove_source_with(
                 .map_err(|error| WorkerMutationSourceProofError::Authority(error.to_string()))?
                 .filter(|record| record.revoked_at.is_none())
                 .ok_or(WorkerMutationSourceProofError::RevokedRuntimeTrust)?;
+            if trusted.workspace_id.as_deref() != Some(config.workspace_id.as_str()) {
+                return Err(WorkerMutationSourceProofError::WrongWorkspace);
+            }
             let expected = WorkerMutationSourceExpectation {
                 runtime_id: &unverified.iss,
                 audience: audience.as_ref(),

@@ -176,15 +176,27 @@ fn actor_for_user<S: ControlPlaneStore + ?Sized>(
     }))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionCookiePolicy<'a> {
+    pub cookie_name: &'a str,
+    pub path: &'a str,
+    pub domain: Option<&'a str>,
+    pub secure: bool,
+}
+
 pub fn session_set_cookie(
-    cookie_name: &str,
+    policy: SessionCookiePolicy<'_>,
     token: &str,
     max_age_seconds: i64,
-    secure: bool,
 ) -> String {
-    let secure = if secure { "; Secure" } else { "" };
+    let domain = policy
+        .domain
+        .map(|domain| format!("; Domain={domain}"))
+        .unwrap_or_default();
+    let secure = if policy.secure { "; Secure" } else { "" };
     format!(
-        "{cookie_name}={token}; Max-Age={max_age_seconds}; Path=/; HttpOnly; SameSite=Lax{secure}"
+        "{}={token}; Max-Age={max_age_seconds}; Path={}; HttpOnly; SameSite=Lax{domain}{secure}",
+        policy.cookie_name, policy.path
     )
 }
 

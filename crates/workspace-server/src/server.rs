@@ -63,9 +63,9 @@ use workspace_api::{
 };
 
 use crate::auth::{
-    AuthPublicConfig, AuthenticatedUser, RequestActor, auth_error, is_expired, mint_secret, new_id,
-    new_user_code, normalize_handle, parse_cookie, resolve_request_actor, rfc3339_after,
-    session_set_cookie, token_hash,
+    ActorAuthMethod, AuthPublicConfig, AuthenticatedUser, RequestActor, SessionCookiePolicy,
+    auth_error, is_expired, mint_secret, new_id, new_user_code, normalize_handle, parse_cookie,
+    resolve_request_actor, rfc3339_after, session_set_cookie, token_hash,
 };
 use crate::authority::{
     MemoryAuthority, ObjectiveAuthority, ObjectiveCreateInput, ObjectiveEditInput,
@@ -837,7 +837,11 @@ async fn list_server_workspaces(
 ) -> Response {
     let owner = match resolve_server_actor(&api, &headers).await {
         Ok(Some(actor)) => Some(actor.account_id),
-        Ok(None) => None,
+        Ok(None) => match api.catalog.list(None, 1) {
+            Ok(workspaces) if workspaces.is_empty() => return Json(workspaces).into_response(),
+            Ok(_) => return StatusCode::UNAUTHORIZED.into_response(),
+            Err(error) => return server_error_response(error),
+        },
         Err(error) => return server_error_response(error),
     };
     match api
@@ -936,15 +940,10 @@ async fn authorize_scoped_workspace_request(
 
     let actor = resolve_server_actor(api, request.headers())
         .await
-        .map_err(server_error_response)?;
-    if actor.is_none() {
-        return Err(StatusCode::UNAUTHORIZED.into_response());
-    }
+        .map_err(server_error_response)?
+        .ok_or_else(|| StatusCode::UNAUTHORIZED.into_response())?;
 
-    let cookie_authenticated = request
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .is_none();
+    let cookie_authenticated = matches!(actor.auth_method, ActorAuthMethod::BrowserSession);
     let mutating = !matches!(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS
@@ -1020,16 +1019,10 @@ async fn authorize_workspace_api_request(
     )
     .await
     {
-        Ok(actor) => actor,
-        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+        Ok(Some(actor)) => actor,
+        Ok(None) | Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
     };
-    if actor.is_none() {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    let cookie_authenticated = request
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .is_none();
+    let cookie_authenticated = matches!(actor.auth_method, ActorAuthMethod::BrowserSession);
     let mutating = !matches!(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS
@@ -9268,10 +9261,9 @@ fn issue_browser_session_response(api: &ServerAuthApi, user: UserRecord) -> ApiR
     headers.insert(
         SET_COOKIE,
         session_set_cookie(
-            &auth.cookie_name,
+            session_cookie_policy(&auth),
             &session_token,
             14 * 24 * 60 * 60,
-            session_cookie_is_secure(&auth),
         )
         .parse()
         .map_err(|error| {
@@ -9448,7 +9440,7 @@ async fn post_auth_logout(
     let mut response_headers = HeaderMap::new();
     response_headers.insert(
         SET_COOKIE,
-        session_set_cookie(&auth.cookie_name, "", 0, session_cookie_is_secure(&auth))
+        session_set_cookie(session_cookie_policy(&auth), "", 0)
             .parse()
             .map_err(|error| {
                 auth_error(
@@ -9550,11 +9542,17 @@ fn passkey_credential_id(passkey: &Passkey) -> ApiResult<String> {
         })
 }
 
-fn session_cookie_is_secure(auth: &AuthPublicConfig) -> bool {
-    [&auth.origin, &auth.public_base_url]
+fn session_cookie_policy(auth: &AuthPublicConfig) -> SessionCookiePolicy<'_> {
+    let secure = [&auth.origin, &auth.public_base_url]
         .into_iter()
         .filter_map(|url| reqwest::Url::parse(url).ok())
-        .any(|url| url.scheme() == "https")
+        .any(|url| url.scheme() == "https");
+    SessionCookiePolicy {
+        cookie_name: &auth.cookie_name,
+        path: "/",
+        domain: None,
+        secure,
+    }
 }
 
 fn auth_public_config(config: &ServerConfig) -> AuthPublicConfig {
@@ -15490,6 +15488,23 @@ mod tests {
         let app = build_workspace_server_router(template, store)
             .await
             .unwrap();
+        let empty_catalog = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/workspaces")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty_catalog.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(empty_catalog.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            "[]"
+        );
 
         for (uri, expected) in [
             ("/", "<main>Workspace chooser</main>"),
@@ -15665,6 +15680,30 @@ mod tests {
             .unwrap();
         assert_eq!(authenticated_legacy.status(), StatusCode::OK);
 
+        let anonymous_catalog = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/workspaces")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous_catalog.status(), StatusCode::UNAUTHORIZED);
+        let authenticated_catalog = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/workspaces")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer api-token-auth")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authenticated_catalog.status(), StatusCode::OK);
+
         let ws_uri = format!("/api/w/{}/protocol/ws", workspace.workspace.workspace_id);
         let anonymous_ws = app
             .clone()
@@ -15720,6 +15759,25 @@ mod tests {
             .unwrap();
         assert_eq!(csrf_rejected.status(), StatusCode::FORBIDDEN);
 
+        let mixed_auth_csrf_rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(&settings_uri)
+                    .header(
+                        axum::http::header::COOKIE,
+                        "yoi_workspace_session=browser-session-auth",
+                    )
+                    .header(axum::http::header::AUTHORIZATION, "Bearer invalid-token")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"display_name":"Renamed"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mixed_auth_csrf_rejected.status(), StatusCode::FORBIDDEN);
+
         let csrf_accepted = app
             .oneshot(
                 Request::builder()
@@ -15771,6 +15829,10 @@ mod tests {
             assert_eq!(logout_cookie.contains("; Secure"), secure, "{scheme}");
             assert!(logout_cookie.contains("Max-Age=0"));
             assert!(logout_cookie.contains("; HttpOnly; SameSite=Lax"));
+            for cookie in [login_cookie, logout_cookie] {
+                assert!(cookie.contains("; Path=/"));
+                assert!(!cookie.contains("; Domain="));
+            }
         }
     }
 
@@ -19222,6 +19284,45 @@ mod tests {
                 },
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_request_proof_rejects_trust_bound_to_another_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut api = test_api(workspace.path()).await;
+        let identity =
+            worker_runtime::auth::RuntimeIdentityMaterial::generate("runtime-test").unwrap();
+        configure_runtime_request_auth(&mut api, &identity, "runtime-test");
+        let other_workspace = "019d0000-0000-7000-8000-0000000000bb";
+        let path = format!("/api/runtime/v1/workspaces/{other_workspace}/resources/fetch");
+        let proof = worker_runtime::auth::RuntimeRequestSourceSigner::from_identity(&identity)
+            .issue(
+                "server-test",
+                other_workspace,
+                None,
+                worker_runtime::auth::BACKEND_RESOURCE_FETCH_PERMISSION,
+                "POST",
+                &path,
+                b"{}",
+                i64::try_from(worker_runtime::auth::unix_now_seconds()).unwrap_or(i64::MAX),
+                30,
+            )
+            .unwrap();
+        let result = crate::worker_source::verify_runtime_request_source_proof_with_store(
+            api.store.as_ref(),
+            &api.config,
+            &proof,
+            other_workspace,
+            worker_runtime::auth::BACKEND_RESOURCE_FETCH_PERMISSION,
+            "POST",
+            &path,
+            &worker_runtime::auth::request_body_digest(b"{}"),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(crate::worker_source::WorkerMutationSourceProofError::WrongWorkspace)
+        ));
     }
 
     #[tokio::test]
