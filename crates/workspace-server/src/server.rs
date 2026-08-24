@@ -269,30 +269,26 @@ impl ServerConfig {
         workspace: &WorkspaceRecord,
         repositories: Vec<RepositoryRecord>,
     ) -> Result<Self> {
-        let primary = repositories
-            .iter()
-            .find(|repository| repository.repository_id == "main")
-            .or_else(|| repositories.first())
-            .ok_or_else(|| {
-                Error::Config(format!(
-                    "Workspace {} has no registered repository",
-                    workspace.workspace_id
-                ))
-            })?;
-        let workspace_root = PathBuf::from(&primary.uri);
-        if !workspace_root.is_absolute() {
+        if repositories.is_empty() {
             return Err(Error::Config(format!(
-                "Workspace {} repository uri is not an absolute local path",
+                "Workspace {} has no registered repository",
                 workspace.workspace_id
             )));
         }
+        let workspace_data_root =
+            Self::default_workspace_backend_data_root(&workspace.workspace_id);
+        let workspace_root = workspace_data_root.clone();
         let repositories = repositories
             .into_iter()
             .map(|repository| ConfiguredRepository {
                 id: repository.repository_id,
                 provider: repository.provider.unwrap_or(repository.kind),
-                path: PathBuf::from(&repository.uri),
-                uri: repository.uri,
+                path: repository_local_path(&repository.source),
+                source: repository.source,
+                source_revision: repository.source_revision,
+                source_fingerprint: repository.source_fingerprint,
+                observed_status: repository.observed_status,
+                observed_at: repository.observed_at,
                 display_name: Some(repository.name),
                 default_selector: repository.default_ref,
             })
@@ -316,6 +312,19 @@ impl ServerConfig {
         });
         scoped.runtime_event_sources.clear();
         Ok(scoped)
+    }
+}
+
+fn repository_local_path(source: &workspace_api::RepositorySource) -> Option<PathBuf> {
+    match source.kind {
+        workspace_api::RepositorySourceKind::LocalPath => Some(PathBuf::from(&source.uri)),
+        workspace_api::RepositorySourceKind::File => url::Url::parse(&source.uri)
+            .ok()
+            .and_then(|uri| uri.to_file_path().ok()),
+        workspace_api::RepositorySourceKind::Ssh
+        | workspace_api::RepositorySourceKind::Http
+        | workspace_api::RepositorySourceKind::Https
+        | workspace_api::RepositorySourceKind::Invalid => None,
     }
 }
 
@@ -1516,10 +1525,12 @@ fn import_configured_repositories(
                 .unwrap_or_else(|| repository.id.clone()),
             kind: repository.provider.clone(),
             provider: Some(repository.provider.clone()),
-            uri: repository.uri.clone(),
+            source: repository.source.clone(),
             default_ref: repository.default_selector.clone(),
-            auth_ref_kind: None,
-            auth_ref_key: None,
+            source_revision: repository.source_revision,
+            source_fingerprint: repository.source_fingerprint.clone(),
+            observed_status: repository.observed_status,
+            observed_at: repository.observed_at.clone(),
             created_at: now.clone(),
             updated_at: now.clone(),
         })?;
@@ -1539,33 +1550,23 @@ fn load_configured_repositories_from_store(
 }
 
 fn configured_repository_from_record(
-    workspace_root: &Path,
+    _workspace_root: &Path,
     record: RepositoryRecord,
 ) -> Result<ConfiguredRepository> {
     let provider = record.provider.unwrap_or_else(|| record.kind.clone());
-    if record.uri.contains("://") {
-        return Err(Error::Config(format!(
-            "repository `{}` uses a remote URI, but remote repository materialization is not implemented",
-            record.repository_id
-        )));
-    }
-    let path = resolve_backend_path(workspace_root, Path::new(&record.uri));
+    let path = repository_local_path(&record.source);
     Ok(ConfiguredRepository {
         id: record.repository_id,
         provider,
-        uri: record.uri,
         path,
+        source: record.source,
+        source_revision: record.source_revision,
+        source_fingerprint: record.source_fingerprint,
+        observed_status: record.observed_status,
+        observed_at: record.observed_at,
         display_name: Some(record.name),
         default_selector: record.default_ref,
     })
-}
-
-fn resolve_backend_path(workspace_root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        workspace_root.join(path)
-    }
 }
 
 fn build_server_auth_router(api: ServerAuthApi) -> Router {
@@ -10107,8 +10108,9 @@ fn working_directory_request_from_repository(
         repository: WorkingDirectoryRepository {
             id: repository.id.clone(),
             provider: repository.provider.clone(),
-            uri: repository.uri.clone(),
-            local_path: Some(repository.path.clone()),
+            source: repository.source.clone(),
+            source_revision: repository.source_revision,
+            source_fingerprint: repository.source_fingerprint.clone(),
             selector: selector
                 .map(|selector| RuntimeRepositorySelector::from(selector.to_string()))
                 .or_else(|| {
@@ -13140,8 +13142,9 @@ fn working_directory_request_for_browser(
         repository: WorkingDirectoryRepository {
             id: repository.id.clone(),
             provider: "git".to_string(),
-            uri: repository.path.to_string_lossy().to_string(),
-            local_path: Some(repository.path.clone()),
+            source: repository.source.clone(),
+            source_revision: repository.source_revision,
+            source_fingerprint: repository.source_fingerprint.clone(),
             selector: selector.map(RuntimeRepositorySelector),
         },
         materializer: MaterializerKind::LocalGitWorktree,
@@ -14059,10 +14062,15 @@ mod tests {
                 name: "Foreign".to_string(),
                 kind: "git".to_string(),
                 provider: Some("git".to_string()),
-                uri: dir.path().join("foreign").display().to_string(),
+                source: workspace_api::RepositorySource {
+                    kind: workspace_api::RepositorySourceKind::LocalPath,
+                    uri: dir.path().join("foreign").display().to_string(),
+                },
                 default_ref: Some("HEAD".to_string()),
-                auth_ref_kind: None,
-                auth_ref_key: None,
+                source_revision: 1,
+                source_fingerprint: "sha256:test".to_string(),
+                observed_status: workspace_api::RepositoryObservedStatus::Unverified,
+                observed_at: None,
                 created_at: "1".to_string(),
                 updated_at: "1".to_string(),
             })
@@ -15319,6 +15327,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn catalog_workspace_with_remote_source_does_not_require_server_local_repository() {
+        let base = test_server_config(tempfile::tempdir().unwrap().path());
+        let workspace = WorkspaceRecord {
+            workspace_id: "remote-workspace".to_string(),
+            display_name: "Remote Workspace".to_string(),
+            state: "active".to_string(),
+            owner_account_id: None,
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+        let source = workspace_api::RepositorySource {
+            kind: workspace_api::RepositorySourceKind::Https,
+            uri: "https://example.test/org/repository.git".to_string(),
+        };
+        let repositories = vec![RepositoryRecord {
+            workspace_id: "remote-workspace".to_string(),
+            repository_id: "main".to_string(),
+            name: "Main".to_string(),
+            kind: "git".to_string(),
+            provider: Some("git".to_string()),
+            source_fingerprint: crate::repository_source::repository_source_fingerprint(&source),
+            source,
+            default_ref: Some("main".to_string()),
+            source_revision: 1,
+            observed_status: workspace_api::RepositoryObservedStatus::Unverified,
+            observed_at: None,
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        }];
+
+        let scoped = base
+            .for_catalog_workspace(&workspace, repositories)
+            .unwrap();
+        assert!(scoped.repositories[0].path.is_none());
+        assert_eq!(
+            scoped.repositories[0].source.kind,
+            workspace_api::RepositorySourceKind::Https
+        );
+        assert_eq!(
+            scoped.workspace_root,
+            ServerConfig::default_workspace_backend_data_root("remote-workspace")
+        );
+    }
+
     fn test_server_config(workspace_root: impl Into<PathBuf>) -> ServerConfig {
         let workspace_root = workspace_root.into();
         let store_root = workspace_root.join(".test-embedded-runtime-store");
@@ -15326,11 +15379,19 @@ mod tests {
             .with_embedded_runtime_store_root(store_root);
         config.database_path = workspace_root.join(".test-yoi-server.db");
         config.runtime_config_path = Some(workspace_root.join(".test-config/runtimes.toml"));
+        let source = workspace_api::RepositorySource {
+            kind: workspace_api::RepositorySourceKind::LocalPath,
+            uri: workspace_root.display().to_string(),
+        };
         config.repositories = vec![ConfiguredRepository {
             id: TEST_REPOSITORY_ID.to_string(),
             provider: "git".to_string(),
-            uri: workspace_root.display().to_string(),
-            path: workspace_root,
+            source_fingerprint: crate::repository_source::repository_source_fingerprint(&source),
+            source,
+            source_revision: 1,
+            observed_status: workspace_api::RepositoryObservedStatus::Unverified,
+            observed_at: None,
+            path: Some(workspace_root),
             display_name: Some("Test Repository".to_string()),
             default_selector: Some("HEAD".to_string()),
         }];
@@ -18478,10 +18539,15 @@ mod tests {
                 name: repository_id.to_string(),
                 kind: "git".to_string(),
                 provider: Some("git".to_string()),
-                uri: api.config.workspace_root.display().to_string(),
+                source: workspace_api::RepositorySource {
+                    kind: workspace_api::RepositorySourceKind::LocalPath,
+                    uri: api.config.workspace_root.display().to_string(),
+                },
                 default_ref: Some("HEAD".to_string()),
-                auth_ref_kind: None,
-                auth_ref_key: None,
+                source_revision: 1,
+                source_fingerprint: "sha256:test".to_string(),
+                observed_status: workspace_api::RepositoryObservedStatus::Unverified,
+                observed_at: None,
                 created_at: "1".to_string(),
                 updated_at: "1".to_string(),
             })
@@ -20709,8 +20775,15 @@ mod tests {
         config.repositories = vec![ConfiguredRepository {
             id: "files".to_string(),
             provider: "local_fs".to_string(),
-            uri: ".".to_string(),
-            path: root.path().to_path_buf(),
+            source: workspace_api::RepositorySource {
+                kind: workspace_api::RepositorySourceKind::LocalPath,
+                uri: root.path().display().to_string(),
+            },
+            source_revision: 1,
+            source_fingerprint: "sha256:test".to_string(),
+            observed_status: workspace_api::RepositoryObservedStatus::Unverified,
+            observed_at: None,
+            path: Some(root.path().to_path_buf()),
             display_name: None,
             default_selector: None,
         }];

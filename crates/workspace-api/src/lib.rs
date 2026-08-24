@@ -7,6 +7,88 @@
 use serde::{Deserialize, Serialize};
 use workdir::workspace::WorkingDirectorySummary;
 
+/// Provider-neutral classification of an authoritative Repository source.
+///
+/// Local paths remain distinct from network Git transports so callers cannot
+/// accidentally treat an unmaterialized remote as a server-local filesystem path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositorySourceKind {
+    LocalPath,
+    File,
+    Ssh,
+    Http,
+    Https,
+    /// A legacy value that could not be classified during migration. It remains
+    /// inspectable but every provider operation must fail closed.
+    Invalid,
+}
+
+impl RepositorySourceKind {
+    pub const fn is_remote(self) -> bool {
+        matches!(self, Self::Ssh | Self::Http | Self::Https)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalPath => "local_path",
+            Self::File => "file",
+            Self::Ssh => "ssh",
+            Self::Http => "http",
+            Self::Https => "https",
+            Self::Invalid => "invalid",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "local_path" => Self::LocalPath,
+            "file" => Self::File,
+            "ssh" => Self::Ssh,
+            "http" => Self::Http,
+            "https" => Self::Https,
+            "invalid" => Self::Invalid,
+            _ => return None,
+        })
+    }
+}
+
+/// Stable Repository source identity stored by Workspace authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositorySource {
+    pub kind: RepositorySourceKind,
+    /// Canonical source representation. This is an absolute local path for
+    /// `local_path`, and a normalized URI/remote specification otherwise.
+    pub uri: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryObservedStatus {
+    Unverified,
+    Ready,
+    Invalid,
+}
+
+impl RepositoryObservedStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unverified => "unverified",
+            Self::Ready => "ready",
+            Self::Invalid => "invalid",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "unverified" => Self::Unverified,
+            "ready" => Self::Ready,
+            "invalid" => Self::Invalid,
+            _ => return None,
+        })
+    }
+}
+
 pub const TICKET_RELATIONS_QUERY_PATH: &str = "/tickets/relations/search";
 pub const TICKET_ORCHESTRATION_PLANS_QUERY_PATH: &str = "/tickets/orchestration-plans/search";
 

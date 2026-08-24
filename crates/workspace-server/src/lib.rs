@@ -20,6 +20,7 @@ pub mod records;
 #[cfg(feature = "typescript")]
 pub use records::ticket_api_typescript;
 pub mod repositories;
+pub mod repository_source;
 pub mod resource_broker;
 pub mod retention;
 pub mod runtime_settings;

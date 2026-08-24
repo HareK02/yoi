@@ -318,18 +318,36 @@ impl LocalGitWorktreeMaterializer {
                 ),
             ));
         }
-        if is_remote_uri(&request.repository.uri) {
-            return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_remote_repository_unsupported",
-                "remote repository URI materialization is not implemented in v0",
-            ));
-        }
-
-        let source_path = request
-            .repository
-            .local_path
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(&request.repository.uri));
+        let source_path = match request.repository.source.kind {
+            workspace_api::RepositorySourceKind::LocalPath => {
+                PathBuf::from(&request.repository.source.uri)
+            }
+            workspace_api::RepositorySourceKind::File => {
+                url::Url::parse(&request.repository.source.uri)
+                    .ok()
+                    .and_then(|uri| uri.to_file_path().ok())
+                    .ok_or_else(|| {
+                        WorkingDirectoryDiagnostic::new(
+                            "working_directory_repository_source_invalid",
+                            "configured file Repository source is invalid",
+                        )
+                    })?
+            }
+            workspace_api::RepositorySourceKind::Ssh
+            | workspace_api::RepositorySourceKind::Http
+            | workspace_api::RepositorySourceKind::Https => {
+                return Err(WorkingDirectoryDiagnostic::new(
+                    "working_directory_remote_repository_access_required",
+                    "remote Repository materialization requires an explicit authenticated access and trust handle",
+                ));
+            }
+            workspace_api::RepositorySourceKind::Invalid => {
+                return Err(WorkingDirectoryDiagnostic::new(
+                    "working_directory_repository_source_invalid",
+                    "configured Repository source is invalid and cannot be materialized",
+                ));
+            }
+        };
         let source_root = git_stdout(&source_path, ["rev-parse", "--show-toplevel"])
             .map(|value| PathBuf::from(value.trim()))
             .map_err(|_| {
@@ -661,10 +679,6 @@ fn path_str(path: &Path) -> Result<String, WorkingDirectoryDiagnostic> {
     })
 }
 
-fn is_remote_uri(uri: &str) -> bool {
-    uri.contains("://") || uri.starts_with("git@") || uri.starts_with("ssh:")
-}
-
 fn sanitize_path_component(value: &str) -> String {
     let sanitized = value
         .chars()
@@ -793,8 +807,12 @@ mod tests {
             repository: WorkingDirectoryRepository {
                 id: "repo-main".to_string(),
                 provider: "git".to_string(),
-                uri: ".".to_string(),
-                local_path: Some(repo.to_path_buf()),
+                source: workspace_api::RepositorySource {
+                    kind: workspace_api::RepositorySourceKind::LocalPath,
+                    uri: repo.display().to_string(),
+                },
+                source_revision: 1,
+                source_fingerprint: "sha256:test".to_string(),
                 selector: Some(RepositorySelector::from("HEAD")),
             },
             materializer: MaterializerKind::LocalGitWorktree,
@@ -908,19 +926,21 @@ mod tests {
         let runtime_root = tempfile::tempdir().unwrap();
         let materializer = LocalGitWorktreeMaterializer::new(runtime_root.path());
         let mut remote = request(Path::new("."));
-        remote.repository.local_path = None;
-        remote.repository.uri = "https://example.invalid/repo.git".to_string();
+        remote.repository.source = workspace_api::RepositorySource {
+            kind: workspace_api::RepositorySourceKind::Https,
+            uri: "https://example.invalid/repo.git".to_string(),
+        };
         let error = materializer
             .materialize(&worker_ref(1), &remote)
             .unwrap_err();
         assert_eq!(
             error.code,
-            "working_directory_remote_repository_unsupported"
+            "working_directory_remote_repository_access_required"
         );
 
         let mut non_git = remote;
         non_git.repository.provider = "archive".to_string();
-        non_git.repository.uri = ".".to_string();
+        non_git.repository.source.uri = ".".to_string();
         let error = materializer
             .materialize(&worker_ref(2), &non_git)
             .unwrap_err();

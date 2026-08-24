@@ -2631,8 +2631,12 @@ mod tests {
             repository: WorkingDirectoryRepository {
                 id: "repo-main".to_string(),
                 provider: "git".to_string(),
-                uri: ".".to_string(),
-                local_path: Some(repo.to_path_buf()),
+                source: workspace_api::RepositorySource {
+                    kind: workspace_api::RepositorySourceKind::LocalPath,
+                    uri: repo.display().to_string(),
+                },
+                source_revision: 1,
+                source_fingerprint: "sha256:test".to_string(),
                 selector: Some(RepositorySelector::from("HEAD")),
             },
             materializer: MaterializerKind::LocalGitWorktree,

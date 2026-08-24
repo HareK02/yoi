@@ -711,14 +711,15 @@ fn infer_workspace_root_from_repositories(
         )));
     };
 
-    let repository_path = PathBuf::from(&repository.uri);
-    if !repository_path.is_absolute() {
+    if repository.source.kind == workspace_api::RepositorySourceKind::Invalid {
         return Err(CliError(format!(
-            "repository `{}` has relative URI `{}`; repository records used by serve must be absolute paths",
-            repository.repository_id, repository.uri
+            "repository `{}` has an invalid migrated source and cannot be used by serve",
+            repository.repository_id
         )));
     }
-    Ok(repository_path)
+    Ok(ServerConfig::default_workspace_backend_data_root(
+        &workspace.workspace_id,
+    ))
 }
 
 fn parse_config_command(args: &[String]) -> Result<Command, CliError> {

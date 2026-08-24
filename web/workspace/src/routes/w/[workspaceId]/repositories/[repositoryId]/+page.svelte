@@ -16,7 +16,7 @@
       <div>
         <h3>{data.repository.item.display_name}</h3>
       </div>
-      <span class="status-pill" class:warn={data.repository.item.git?.status !== 'clean'}>{data.repository.item.git?.status ?? 'not observed'}</span>
+      <span class="status-pill" class:warn={data.repository.item.observed_status !== 'ready'}>{data.repository.item.observed_status}</span>
     </div>
     <dl>
       <div>
@@ -26,6 +26,18 @@
       <div>
         <dt>Provider</dt>
         <dd>{data.repository.item.provider}</dd>
+      </div>
+      <div>
+        <dt>Source</dt>
+        <dd>{data.repository.item.source.kind} · {data.repository.item.source.uri}</dd>
+      </div>
+      <div>
+        <dt>Source revision</dt>
+        <dd>{data.repository.item.source_revision} · {data.repository.item.source_fingerprint}</dd>
+      </div>
+      <div>
+        <dt>Observed</dt>
+        <dd>{data.repository.item.observed_at ?? 'not observed'}</dd>
       </div>
       <div>
         <dt>Record authority</dt>

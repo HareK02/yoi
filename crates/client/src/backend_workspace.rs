@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use workspace_api::{RepositoryObservedStatus, RepositorySource};
 
 const DEFAULT_WORKSPACE_LIMIT: usize = 200;
 
@@ -44,8 +45,13 @@ pub struct CreateBackendWorkspaceRepositoryRecord {
     pub repository_id: String,
     pub name: String,
     pub kind: String,
-    pub uri: String,
+    pub provider: Option<String>,
+    pub source: RepositorySource,
     pub default_ref: Option<String>,
+    pub source_revision: u64,
+    pub source_fingerprint: String,
+    pub observed_status: RepositoryObservedStatus,
+    pub observed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

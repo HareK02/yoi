@@ -471,14 +471,18 @@ fn resolve_repository(
     let provider =
         normalize_required_string("repository provider", &config.provider)?.to_ascii_lowercase();
     let uri = normalize_required_string("repository uri", &config.uri)?;
-    let path = resolve_repository_uri(workspace_root, &id, &uri)?;
+    let (source, path) = resolve_repository_source(workspace_root, &id, &uri)?;
     let display_name = normalize_optional_string(config.display_name.as_deref());
     let default_selector = normalize_optional_string(config.default_selector.as_deref());
 
     Ok(ConfiguredRepository {
         id,
         provider,
-        uri,
+        source_fingerprint: crate::repository_source::repository_source_fingerprint(&source),
+        source,
+        source_revision: 1,
+        observed_status: workspace_api::RepositoryObservedStatus::Unverified,
+        observed_at: None,
         path,
         display_name,
         default_selector,
@@ -517,13 +521,41 @@ fn validate_repository_id(id: &str) -> Result<()> {
     }
 }
 
-fn resolve_repository_uri(workspace_root: &Path, id: &str, uri: &str) -> Result<PathBuf> {
-    if uri.contains("://") {
-        return Err(Error::Config(format!(
-            "repository `{id}` uses a remote URI, but remote repository materialization is not implemented"
-        )));
+fn resolve_repository_source(
+    workspace_root: &Path,
+    id: &str,
+    uri: &str,
+) -> Result<(workspace_api::RepositorySource, Option<PathBuf>)> {
+    match crate::repository_source::parse_repository_source(uri) {
+        Ok(source) => {
+            let path = match source.kind {
+                workspace_api::RepositorySourceKind::LocalPath => Some(PathBuf::from(&source.uri)),
+                workspace_api::RepositorySourceKind::File => url::Url::parse(&source.uri)
+                    .ok()
+                    .and_then(|uri| uri.to_file_path().ok()),
+                workspace_api::RepositorySourceKind::Ssh
+                | workspace_api::RepositorySourceKind::Http
+                | workspace_api::RepositorySourceKind::Https => None,
+                workspace_api::RepositorySourceKind::Invalid => {
+                    return Err(Error::Config(format!(
+                        "repository `{id}` has an invalid source"
+                    )));
+                }
+            };
+            Ok((source, path))
+        }
+        Err(_) if !Path::new(uri).is_absolute() && !uri.contains("://") => {
+            let path = resolve_workspace_path(workspace_root, Path::new(uri));
+            let source = workspace_api::RepositorySource {
+                kind: workspace_api::RepositorySourceKind::LocalPath,
+                uri: path.to_string_lossy().into_owned(),
+            };
+            Ok((source, Some(path)))
+        }
+        Err(error) => Err(Error::Config(format!(
+            "repository `{id}` has an invalid source: {error}"
+        ))),
     }
-    Ok(resolve_workspace_path(workspace_root, Path::new(uri)))
 }
 
 pub(crate) fn resolve_remote_runtime(
@@ -741,13 +773,13 @@ default_selector = "HEAD"
 
         assert_eq!(repository.id, "main");
         assert_eq!(repository.provider, "git");
-        assert_eq!(repository.path, dir.path());
+        assert_eq!(repository.path.as_deref(), Some(dir.path()));
         assert_eq!(repository.display_name.as_deref(), Some("Main"));
         assert_eq!(repository.default_selector.as_deref(), Some("HEAD"));
     }
 
     #[test]
-    fn remote_repository_uri_fails_closed() {
+    fn remote_repository_source_is_preserved_without_a_local_path() {
         let dir = tempfile::tempdir().unwrap();
         let config = WorkspaceBackendConfigFile::parse_str(
             r#"
@@ -759,17 +791,15 @@ uri = "https://example.com/org/repo.git"
             "test",
         )
         .unwrap();
-        let error = match config.resolve(dir.path(), identity()) {
-            Ok(_) => panic!("remote repository URI should fail closed"),
-            Err(error) => error,
-        };
+        let resolved = config.resolve(dir.path(), identity()).unwrap();
+        let repository = &resolved.server.repositories[0];
 
-        assert!(
-            error
-                .to_string()
-                .contains("remote repository materialization is not implemented"),
-            "unexpected error: {error}"
+        assert_eq!(
+            repository.source.kind,
+            workspace_api::RepositorySourceKind::Https
         );
+        assert_eq!(repository.source.uri, "https://example.com/org/repo.git");
+        assert!(repository.path.is_none());
     }
 
     #[test]

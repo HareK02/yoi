@@ -5,6 +5,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use workspace_api::{RepositoryObservedStatus, RepositorySource};
 
 pub type RepositoryId = String;
 pub type RepositorySelector = String;
@@ -13,8 +14,12 @@ pub type RepositorySelector = String;
 pub struct ConfiguredRepository {
     pub id: RepositoryId,
     pub provider: String,
-    pub uri: String,
-    pub path: PathBuf,
+    pub source: RepositorySource,
+    pub source_revision: u64,
+    pub source_fingerprint: String,
+    pub observed_status: RepositoryObservedStatus,
+    pub observed_at: Option<String>,
+    pub path: Option<PathBuf>,
     pub display_name: Option<String>,
     pub default_selector: Option<RepositorySelector>,
 }
@@ -25,6 +30,12 @@ pub struct RepositorySummary {
     pub display_name: String,
     pub kind: String,
     pub provider: String,
+    pub source: RepositorySource,
+    pub source_revision: u64,
+    pub source_fingerprint: String,
+    pub observed_status: RepositoryObservedStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_selector: Option<RepositorySelector>,
     pub record_authority: String,
@@ -262,9 +273,17 @@ impl RepositoryRegistryReader {
         descendant: &str,
     ) -> Result<(), RepositoryLookupError> {
         let repository = self.merge_repository(id)?;
+        let repository_path =
+            repository
+                .path
+                .as_ref()
+                .ok_or_else(|| RepositoryLookupError::ProviderFailure {
+                    id: id.into(),
+                    operation: "repository source is not materialized for local Git access".into(),
+                })?;
         let status = Command::new("git")
             .arg("-C")
-            .arg(&repository.path)
+            .arg(repository_path)
             .args(["merge-base", "--is-ancestor", ancestor, descendant])
             .status()
             .map_err(|_| RepositoryLookupError::ProviderFailure {
@@ -306,7 +325,24 @@ impl RepositoryRegistryReader {
             .clone()
             .unwrap_or_else(|| repository.id.clone());
         let mut diagnostics = Vec::new();
+        if repository.source.kind == workspace_api::RepositorySourceKind::Http {
+            diagnostics.push(RepositoryDiagnostic {
+                severity: "warning".to_string(),
+                code: "repository_source_insecure_http".to_string(),
+                message:
+                    "HTTP Repository source is unencrypted; prefer HTTPS or SSH when available."
+                        .to_string(),
+            });
+        }
         let git = match repository.provider.as_str() {
+            "git" if repository.path.is_none() => {
+                diagnostics.push(RepositoryDiagnostic {
+                    severity: "info".to_string(),
+                    code: "repository_source_unverified".to_string(),
+                    message: "Remote Repository source is registered but is not materialized for server-local inspection.".to_string(),
+                });
+                None
+            }
             "git" => match self.inspect_git(repository) {
                 Ok(git) => Some(git),
                 Err(message) => {
@@ -335,6 +371,11 @@ impl RepositoryRegistryReader {
             display_name,
             kind: repository.provider.clone(),
             provider: repository.provider.clone(),
+            source: repository.source.clone(),
+            source_revision: repository.source_revision,
+            source_fingerprint: repository.source_fingerprint.clone(),
+            observed_status: repository.observed_status,
+            observed_at: repository.observed_at.clone(),
             default_selector: repository.default_selector.clone(),
             record_authority: "workspace-control-plane".to_string(),
             git,
@@ -346,12 +387,15 @@ impl RepositoryRegistryReader {
         &self,
         repository: &ConfiguredRepository,
     ) -> Result<GitRepositorySummary, String> {
-        let head = git_stdout(&repository.path, ["rev-parse", "HEAD"])?;
-        let branch = git_stdout(&repository.path, ["branch", "--show-current"])
+        let path = repository.path.as_ref().ok_or_else(|| {
+            "Repository source is not materialized for local Git inspection.".to_string()
+        })?;
+        let head = git_stdout(path, ["rev-parse", "HEAD"])?;
+        let branch = git_stdout(path, ["branch", "--show-current"])
             .ok()
             .and_then(|value| non_empty_string(value.trim()));
-        let status = git_stdout(&repository.path, ["status", "--porcelain"])?;
-        let remotes = git_stdout(&repository.path, ["remote", "-v"])
+        let status = git_stdout(path, ["status", "--porcelain"])?;
+        let remotes = git_stdout(path, ["remote", "-v"])
             .map(|raw| parse_remotes(&raw))
             .unwrap_or_default();
         Ok(GitRepositorySummary {
@@ -369,8 +413,11 @@ impl RepositoryRegistryReader {
         limit: usize,
     ) -> Result<Vec<GitCommitSummary>, String> {
         let limit_arg = format!("-{limit}");
+        let path = repository.path.as_ref().ok_or_else(|| {
+            "Repository source is not materialized for local Git log access.".to_string()
+        })?;
         let output = git_stdout(
-            &repository.path,
+            path,
             [
                 "log",
                 "--date=iso-strict",
@@ -419,11 +466,16 @@ fn merge_git_stdout(
     operation: &str,
     args: &[&str],
 ) -> Result<String, RepositoryLookupError> {
-    git_stdout(&repository.path, args.iter().copied()).map_err(|_| {
-        RepositoryLookupError::ProviderFailure {
+    let path = repository
+        .path
+        .as_ref()
+        .ok_or_else(|| RepositoryLookupError::ProviderFailure {
             id: repository.id.clone(),
-            operation: operation.into(),
-        }
+            operation: "repository source is not materialized for local Git access".into(),
+        })?;
+    git_stdout(path, args.iter().copied()).map_err(|_| RepositoryLookupError::ProviderFailure {
+        id: repository.id.clone(),
+        operation: operation.into(),
     })
 }
 
@@ -594,6 +646,47 @@ mod tests {
     }
 
     #[test]
+    fn remote_source_is_visible_but_local_provider_operations_fail_closed() {
+        let source = RepositorySource {
+            kind: workspace_api::RepositorySourceKind::Ssh,
+            uri: "git@example.test:org/repository.git".to_string(),
+        };
+        let reader = RepositoryRegistryReader::new(vec![ConfiguredRepository {
+            id: "remote".into(),
+            display_name: Some("Remote".into()),
+            provider: "git".into(),
+            source_fingerprint: crate::repository_source::repository_source_fingerprint(&source),
+            source,
+            source_revision: 1,
+            observed_status: RepositoryObservedStatus::Unverified,
+            observed_at: None,
+            path: None,
+            default_selector: Some("main".into()),
+        }]);
+
+        let projection = reader.list();
+        let summary = &projection.items[0];
+        assert_eq!(
+            summary.source.kind,
+            workspace_api::RepositorySourceKind::Ssh
+        );
+        assert_eq!(
+            summary.observed_status,
+            RepositoryObservedStatus::Unverified
+        );
+        assert!(summary.git.is_none());
+        assert_eq!(summary.diagnostics[0].code, "repository_source_unverified");
+
+        let repository = reader.merge_repository("remote").unwrap();
+        let error = merge_git_stdout(&repository, "inspect", &["rev-parse", "HEAD"]).unwrap_err();
+        assert!(matches!(
+            error,
+            RepositoryLookupError::ProviderFailure { operation, .. }
+                if operation.contains("not materialized")
+        ));
+    }
+
+    #[test]
     fn merge_evidence_is_resolved_by_repository_identity() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path();
@@ -675,12 +768,22 @@ mod tests {
                 .success()
         );
 
+        let source_descriptor = RepositorySource {
+            kind: workspace_api::RepositorySourceKind::LocalPath,
+            uri: path.display().to_string(),
+        };
         let reader = RepositoryRegistryReader::new(vec![ConfiguredRepository {
             id: "main".into(),
             display_name: Some("Main".into()),
             provider: "git".into(),
-            path: path.to_path_buf(),
-            uri: path.display().to_string(),
+            source_fingerprint: crate::repository_source::repository_source_fingerprint(
+                &source_descriptor,
+            ),
+            source: source_descriptor,
+            source_revision: 1,
+            observed_status: RepositoryObservedStatus::Unverified,
+            observed_at: None,
+            path: Some(path.to_path_buf()),
             default_selector: Some("main".into()),
         }]);
         let target = reader.observe_merge_target("main", Some("main")).unwrap();
