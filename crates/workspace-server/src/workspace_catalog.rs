@@ -1,4 +1,3 @@
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{SecondsFormat, Utc};
@@ -6,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use workspace_api::{RepositoryObservedStatus, RepositorySource, RepositorySourceKind};
+use workspace_api::{RepositoryObservedStatus, RepositorySource};
 
 use crate::repository_source::{parse_repository_source, repository_source_fingerprint};
 use crate::store::{
@@ -200,53 +199,7 @@ fn normalize_required(field: &str, value: String, max_bytes: usize) -> Result<St
 }
 
 fn validate_repository_source(uri: &str) -> Result<RepositorySource> {
-    let mut source = parse_repository_source(uri)?;
-    match source.kind {
-        RepositorySourceKind::LocalPath => {
-            let canonical = validate_local_git_path(Path::new(&source.uri))?;
-            source.uri = canonical.to_string_lossy().into_owned();
-        }
-        RepositorySourceKind::File => {
-            let url = url::Url::parse(&source.uri).map_err(|error| {
-                Error::InvalidInput(format!("invalid file repository URI: {error}"))
-            })?;
-            let path = url.to_file_path().map_err(|_| {
-                Error::InvalidInput("file repository URI must contain an absolute path".to_string())
-            })?;
-            let canonical = validate_local_git_path(&path)?;
-            source.uri = url::Url::from_file_path(canonical)
-                .map_err(|_| {
-                    Error::InvalidInput("invalid canonical file repository path".to_string())
-                })?
-                .to_string();
-        }
-        RepositorySourceKind::Ssh | RepositorySourceKind::Http | RepositorySourceKind::Https => {}
-        RepositorySourceKind::Invalid => {
-            return Err(Error::InvalidInput(
-                "invalid initial repository source".to_string(),
-            ));
-        }
-    }
-    Ok(source)
-}
-
-fn validate_local_git_path(path: &Path) -> Result<PathBuf> {
-    let path = path.canonicalize().map_err(|error| {
-        Error::InvalidInput(format!("initial repository path is unavailable: {error}"))
-    })?;
-    if !path.is_dir() {
-        return Err(Error::InvalidInput(
-            "initial repository path must be a directory".to_string(),
-        ));
-    }
-    let normal_git = path.join(".git").exists();
-    let bare_git = path.join("HEAD").is_file() && path.join("objects").is_dir();
-    if !normal_git && !bare_git {
-        return Err(Error::InvalidInput(
-            "initial repository path is not a Git repository".to_string(),
-        ));
-    }
-    Ok(path)
+    parse_repository_source(uri)
 }
 
 fn workspace_create_fingerprint(
@@ -283,6 +236,7 @@ fn workspace_create_fingerprint(
 mod tests {
     use super::*;
     use crate::store::SqliteWorkspaceStore;
+    use workspace_api::RepositorySourceKind;
 
     fn git_repository() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -407,13 +361,18 @@ mod tests {
     }
 
     #[test]
-    fn repository_intent_accepts_remote_and_rejects_non_git_local_paths() {
+    fn repository_intent_accepts_unavailable_local_sources_without_server_io() {
         let remote = validate_repository_source("https://example.test/repo.git").unwrap();
         assert_eq!(remote.kind, RepositorySourceKind::Https);
 
-        let dir = tempfile::tempdir().unwrap();
-        let non_git = validate_repository_source(&dir.path().display().to_string()).unwrap_err();
-        assert!(non_git.to_string().contains("not a Git repository"));
+        let local = validate_repository_source("/runtime-only/missing/repository").unwrap();
+        assert_eq!(local.kind, RepositorySourceKind::LocalPath);
+        assert_eq!(local.uri, "/runtime-only/missing/repository");
+
+        let file = validate_repository_source("file:///runtime-only/missing/repository").unwrap();
+        assert_eq!(file.kind, RepositorySourceKind::File);
+
+        assert!(validate_repository_source("relative/repository").is_err());
     }
 
     #[test]

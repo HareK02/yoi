@@ -271,22 +271,15 @@ impl ServerConfig {
         workspace: &WorkspaceRecord,
         repositories: Vec<RepositoryRecord>,
     ) -> Result<Self> {
-        let primary = repositories
-            .iter()
-            .find(|repository| repository.repository_id == "main")
-            .or_else(|| repositories.first())
-            .ok_or_else(|| {
-                Error::Config(format!(
-                    "Workspace {} has no registered repository",
-                    workspace.workspace_id
-                ))
-            })?;
+        if repositories.is_empty() {
+            return Err(Error::Config(format!(
+                "Workspace {} has no registered repository",
+                workspace.workspace_id
+            )));
+        }
         let workspace_data_root =
             Self::default_workspace_backend_data_root(&workspace.workspace_id);
-        let primary_path = repository_local_path(&primary.source);
-        let workspace_root = primary_path
-            .clone()
-            .unwrap_or_else(|| workspace_data_root.clone());
+        let workspace_root = workspace_data_root.clone();
         let repositories = repositories
             .into_iter()
             .map(|repository| ConfiguredRepository {
@@ -15077,9 +15070,9 @@ mod tests {
             scoped.repositories[0].source.kind,
             workspace_api::RepositorySourceKind::Https
         );
-        assert_ne!(
+        assert_eq!(
             scoped.workspace_root,
-            PathBuf::from("https://example.test/org/repository.git")
+            ServerConfig::default_workspace_backend_data_root("remote-workspace")
         );
     }
 

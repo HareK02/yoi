@@ -325,6 +325,15 @@ impl RepositoryRegistryReader {
             .clone()
             .unwrap_or_else(|| repository.id.clone());
         let mut diagnostics = Vec::new();
+        if repository.source.kind == workspace_api::RepositorySourceKind::Http {
+            diagnostics.push(RepositoryDiagnostic {
+                severity: "warning".to_string(),
+                code: "repository_source_insecure_http".to_string(),
+                message:
+                    "HTTP Repository source is unencrypted; prefer HTTPS or SSH when available."
+                        .to_string(),
+            });
+        }
         let git = match repository.provider.as_str() {
             "git" if repository.path.is_none() => {
                 diagnostics.push(RepositoryDiagnostic {

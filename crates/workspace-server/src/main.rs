@@ -711,36 +711,15 @@ fn infer_workspace_root_from_repositories(
         )));
     };
 
-    match repository.source.kind {
-        workspace_api::RepositorySourceKind::LocalPath => {
-            let repository_path = PathBuf::from(&repository.source.uri);
-            if !repository_path.is_absolute() {
-                return Err(CliError(format!(
-                    "repository `{}` has relative local source `{}`; local repository sources used by serve must be absolute paths",
-                    repository.repository_id, repository.source.uri
-                )));
-            }
-            Ok(repository_path)
-        }
-        workspace_api::RepositorySourceKind::File => url::Url::parse(&repository.source.uri)
-            .ok()
-            .and_then(|uri| uri.to_file_path().ok())
-            .ok_or_else(|| {
-                CliError(format!(
-                    "repository `{}` has invalid file source `{}`",
-                    repository.repository_id, repository.source.uri
-                ))
-            }),
-        workspace_api::RepositorySourceKind::Ssh
-        | workspace_api::RepositorySourceKind::Http
-        | workspace_api::RepositorySourceKind::Https => Ok(
-            ServerConfig::default_workspace_backend_data_root(&workspace.workspace_id),
-        ),
-        workspace_api::RepositorySourceKind::Invalid => Err(CliError(format!(
+    if repository.source.kind == workspace_api::RepositorySourceKind::Invalid {
+        return Err(CliError(format!(
             "repository `{}` has an invalid migrated source and cannot be used by serve",
             repository.repository_id
-        ))),
+        )));
     }
+    Ok(ServerConfig::default_workspace_backend_data_root(
+        &workspace.workspace_id,
+    ))
 }
 
 fn parse_config_command(args: &[String]) -> Result<Command, CliError> {

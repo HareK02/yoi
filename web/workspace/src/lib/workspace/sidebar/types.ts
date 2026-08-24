@@ -269,6 +269,14 @@ export type RepositorySummary = {
   display_name: string;
   kind: string;
   provider: string;
+  source: {
+    kind: "local_path" | "file" | "ssh" | "http" | "https" | "invalid";
+    uri: string;
+  };
+  source_revision: number;
+  source_fingerprint: string;
+  observed_status: "unverified" | "ready" | "invalid";
+  observed_at?: string | null;
   default_selector?: string | null;
   record_authority: string;
   git?: GitRepositorySummary | null;
