@@ -1,3 +1,7 @@
+use crate::auth::{
+    BACKEND_RESOURCE_FETCH_PERMISSION, RUNTIME_REQUEST_SOURCE_PROOF_HEADER,
+    RuntimeIdentityMaterial, RuntimeRequestSourceSigner, unix_now_seconds,
+};
 use crate::identity::WorkerId;
 use crate::profile_archive::{ProfileSourceArchive, ProfileSourceArchiveRef, sha256_hex};
 use async_trait::async_trait;
@@ -108,6 +112,8 @@ pub trait BackendResourceClient: Send + Sync + 'static {
 pub struct HttpBackendResourceClient {
     endpoint: String,
     bearer_token: Option<String>,
+    request_source_signer: Option<RuntimeRequestSourceSigner>,
+    request_source_audience: Option<String>,
     client: reqwest::Client,
 }
 
@@ -117,8 +123,20 @@ impl HttpBackendResourceClient {
         Self {
             endpoint: endpoint.into(),
             bearer_token,
+            request_source_signer: None,
+            request_source_audience: None,
             client: reqwest::Client::new(),
         }
+    }
+
+    pub fn with_runtime_request_source(
+        mut self,
+        identity: &RuntimeIdentityMaterial,
+        audience: impl Into<String>,
+    ) -> Self {
+        self.request_source_signer = Some(RuntimeRequestSourceSigner::from_identity(identity));
+        self.request_source_audience = Some(audience.into());
+        self
     }
 }
 
@@ -129,7 +147,44 @@ impl BackendResourceClient for HttpBackendResourceClient {
         &self,
         request: BackendResourceFetchRequest,
     ) -> Result<BackendResourceFetchResponse, BackendResourceError> {
-        let builder = self.client.post(&self.endpoint).json(&request);
+        let body = serde_json::to_vec(&request).map_err(|error| {
+            BackendResourceError::InvalidResponse {
+                message: error.to_string(),
+            }
+        })?;
+        let endpoint = reqwest::Url::parse(&self.endpoint).map_err(|error| {
+            BackendResourceError::Transport {
+                message: error.to_string(),
+            }
+        })?;
+        let mut builder = self
+            .client
+            .post(endpoint.clone())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.clone());
+        if let Some(signer) = self.request_source_signer.as_ref() {
+            let audience = self.request_source_audience.as_deref().ok_or_else(|| {
+                BackendResourceError::Unauthorized {
+                    message: "Runtime request proof audience is unavailable".to_owned(),
+                }
+            })?;
+            let proof = signer
+                .issue(
+                    audience,
+                    &request.handle.workspace_id,
+                    None,
+                    BACKEND_RESOURCE_FETCH_PERMISSION,
+                    "POST",
+                    endpoint.path(),
+                    &body,
+                    i64::try_from(unix_now_seconds()).unwrap_or(i64::MAX),
+                    30,
+                )
+                .map_err(|error| BackendResourceError::Unauthorized {
+                    message: error.to_string(),
+                })?;
+            builder = builder.header(RUNTIME_REQUEST_SOURCE_PROOF_HEADER, proof);
+        }
         let builder = if let Some(token) = self.bearer_token.as_deref() {
             builder.bearer_auth(token)
         } else {
