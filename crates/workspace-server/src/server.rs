@@ -13574,6 +13574,7 @@ impl IntoResponse for ApiError {
                     || code.starts_with("unsupported_worker_profile")
                     || code.starts_with("working_directory_")
                     || code.starts_with("workspace_cleanup_")
+                    || code == "default_runtime_not_configured"
                     || code == "workspace_worker_workdir_required"
                     || code.ends_with("_already_exists")
                     || code.ends_with("_not_config_managed")
@@ -18987,6 +18988,17 @@ mod tests {
         runtime.store_config_bundle(runtime_test_bundle()).unwrap();
         let worker = runtime.create_worker(runtime_create_request()).unwrap();
         (runtime, worker.worker_ref)
+    }
+
+    #[test]
+    fn default_runtime_not_configured_operation_error_maps_to_bad_request() {
+        let response = ApiError::from(Error::RuntimeOperationFailed {
+            runtime_id: "workspace-config".to_string(),
+            code: "default_runtime_not_configured".to_string(),
+            message: "Workspace default Runtime is not configured".to_string(),
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
