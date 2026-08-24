@@ -44,23 +44,22 @@ pub fn project_runtime_from_workspace_config(
     workspace_id: &str,
     state: &WorkspaceConfigState,
 ) -> Result<RuntimeConfigProjection> {
-    let bundle = if state.contract.schema_bundle.contributions.is_empty() {
-        config_source::WorkspaceConfigSchemaBundle::compose([
-            RuntimeConfigSchemaProvider.contribution()?
-        ])
-        .map_err(|error| Error::Config(error.to_string()))?
-    } else {
-        state.contract.schema_bundle.clone()
-    };
-    let evaluation = evaluate_workspace_config_state(state, bundle)?;
-    if evaluation.projection_digest != state.projection_digest
-        && state
-            .contract
-            .schema_bundle
-            .contributions
-            .iter()
-            .any(|entry| entry.provider_id == "builtin:runtime")
-    {
+    let has_runtime_schema = state
+        .contract
+        .schema_bundle
+        .contributions
+        .iter()
+        .any(|entry| entry.provider_id == "builtin:runtime");
+    if !has_runtime_schema {
+        return Ok(RuntimeConfigProjection {
+            config_revision: state.snapshot.revision,
+            projection_digest: state.projection_digest.clone(),
+            default_runtime_id: None,
+        });
+    }
+
+    let evaluation = evaluate_workspace_config_state(state, state.contract.schema_bundle.clone())?;
+    if evaluation.projection_digest != state.projection_digest {
         return Err(Error::RegistryInconsistency(format!(
             "Runtime projection digest mismatch for Workspace {workspace_id}"
         )));
@@ -153,6 +152,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(projection.default_runtime_id, None);
+    }
+
+    #[test]
+    fn runtime_projection_treats_pre_runtime_schema_bundle_as_unconfigured() {
+        let bundle =
+            config_source::WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+                "builtin:legacy",
+                "legacy",
+                "1",
+                "{ legacy = { enabled = Bool default false; }; }",
+            )
+            .unwrap()])
+            .unwrap();
+        let snapshot = ConfigTreeSnapshot::from_entries(
+            6,
+            [ConfigEntry::new(
+                VirtualPath::parse("main.dcdl").unwrap(),
+                ConfigContentType::Decodal,
+                "{ legacy = { enabled = true; }; } as WorkspaceConfigSchema",
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let contract = config_source::ToolchainContract::with_schema_bundle(
+            config_source::DEFAULT_SCHEMA_VERSION,
+            vec![VirtualPath::parse("main.dcdl").unwrap()],
+            config_source::DEFAULT_IMPORT_POLICY_VERSION,
+            bundle,
+        );
+        let projection_digest = config_source::SnapshotEnvironment::new(snapshot.clone())
+            .evaluate_contract(&contract)
+            .unwrap()
+            .projection_digest;
+        let state = WorkspaceConfigState {
+            snapshot,
+            contract,
+            projection_digest: projection_digest.clone(),
+        };
+
+        let projection = project_runtime_from_workspace_config("workspace", &state).unwrap();
+        assert_eq!(projection.default_runtime_id, None);
+        assert_eq!(projection.config_revision, 6);
+        assert_eq!(projection.projection_digest, projection_digest);
     }
 
     #[test]
