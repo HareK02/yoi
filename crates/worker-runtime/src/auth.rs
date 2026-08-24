@@ -3,6 +3,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,6 +15,11 @@ pub const WORKER_MUTATION_SOURCE_PROOF_HEADER: &str = "x-yoi-worker-mutation-pro
 const WORKER_MUTATION_SOURCE_PROOF_PREFIX: &str = "yoi-worker-source-v1";
 const WORKER_MUTATION_SOURCE_SIGNING_INPUT_PREFIX: &str = "yoi-worker-source-v1.";
 pub const WORKER_REMOVE_PERMISSION: &str = "workspace:worker-remove";
+pub const RUNTIME_REQUEST_SOURCE_PROOF_HEADER: &str = "x-yoi-runtime-request-proof";
+pub const WORKSPACE_REQUEST_PERMISSION: &str = "workspace:request";
+pub const BACKEND_RESOURCE_FETCH_PERMISSION: &str = "workspace:resource-fetch";
+const RUNTIME_REQUEST_SOURCE_PROOF_PREFIX: &str = "yoi-runtime-request-v1";
+const RUNTIME_REQUEST_SOURCE_SIGNING_INPUT_PREFIX: &str = "yoi-runtime-request-v1.";
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeAuthError {
@@ -33,6 +39,10 @@ pub enum RuntimeAuthError {
     InvalidTokenFormat,
     #[error("malformed capability token claims: {0}")]
     MalformedClaims(#[from] serde_json::Error),
+    #[error("runtime request proof contains an invalid `{0}` claim")]
+    InvalidClaim(&'static str),
+    #[error("runtime request proof does not match the HTTP request")]
+    ClaimMismatch,
     #[error("unknown token issuer `{0}`")]
     UnknownIssuer(String),
     #[error("invalid token signature")]
@@ -222,6 +232,162 @@ pub fn verify_capability_token(
         token_id: claims.jti,
         expires_at: claims.exp,
     })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeRequestSourceClaims {
+    pub iss: String,
+    pub aud: String,
+    pub workspace_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    pub permission: String,
+    pub method: String,
+    pub path: String,
+    pub body_digest: String,
+    pub iat: i64,
+    pub exp: i64,
+    pub jti: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeRequestSourceSigner {
+    identity_id: String,
+    private_key: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeRequestSourceExpectation<'a> {
+    pub identity_id: &'a str,
+    pub audience: &'a str,
+    pub workspace_id: &'a str,
+    pub worker_id: Option<&'a str>,
+    pub permission: &'a str,
+    pub method: &'a str,
+    pub path: &'a str,
+    pub body_digest: &'a str,
+    pub now_unix: i64,
+}
+
+pub fn request_body_digest(body: &[u8]) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(body))
+}
+
+impl RuntimeRequestSourceSigner {
+    pub fn from_identity(identity: &RuntimeIdentityMaterial) -> Self {
+        Self {
+            identity_id: identity.identity_id.clone(),
+            private_key: identity.private_key.clone(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue(
+        &self,
+        audience: &str,
+        workspace_id: &str,
+        worker_id: Option<&str>,
+        permission: &str,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        now_unix: i64,
+        ttl_seconds: u64,
+    ) -> Result<String, RuntimeAuthError> {
+        for (name, value) in [
+            ("audience", audience),
+            ("workspace_id", workspace_id),
+            ("permission", permission),
+            ("method", method),
+            ("path", path),
+        ] {
+            if value.trim().is_empty() {
+                return Err(RuntimeAuthError::InvalidClaim(name));
+            }
+        }
+        if worker_id.is_some_and(str::is_empty) {
+            return Err(RuntimeAuthError::InvalidClaim("worker_id"));
+        }
+        let ttl_seconds = i64::try_from(ttl_seconds).unwrap_or(i64::MAX);
+        let claims = RuntimeRequestSourceClaims {
+            iss: self.identity_id.clone(),
+            aud: audience.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            worker_id: worker_id.map(str::to_owned),
+            permission: permission.to_owned(),
+            method: method.to_owned(),
+            path: path.to_owned(),
+            body_digest: request_body_digest(body),
+            iat: now_unix,
+            exp: now_unix.saturating_add(ttl_seconds),
+            jti: new_token_id()?,
+        };
+        let payload = serde_json::to_vec(&claims)?;
+        let payload = URL_SAFE_NO_PAD.encode(payload);
+        let signing_input = format!("{RUNTIME_REQUEST_SOURCE_SIGNING_INPUT_PREFIX}{payload}");
+        let private = decode_private_key(&self.private_key)?;
+        let key_pair = Ed25519KeyPair::from_pkcs8(&private)
+            .map_err(|_| RuntimeAuthError::InvalidPrivateKey)?;
+        let signature = URL_SAFE_NO_PAD.encode(key_pair.sign(signing_input.as_bytes()).as_ref());
+        Ok(format!(
+            "{RUNTIME_REQUEST_SOURCE_PROOF_PREFIX}.{payload}.{signature}"
+        ))
+    }
+}
+
+pub fn decode_runtime_request_source_claims(
+    proof: &str,
+) -> Result<RuntimeRequestSourceClaims, RuntimeAuthError> {
+    let (prefix, payload, _signature) = split_runtime_request_source_proof(proof)?;
+    if prefix != RUNTIME_REQUEST_SOURCE_PROOF_PREFIX {
+        return Err(RuntimeAuthError::InvalidTokenFormat);
+    }
+    let payload = URL_SAFE_NO_PAD.decode(payload)?;
+    serde_json::from_slice(&payload).map_err(RuntimeAuthError::from)
+}
+
+pub fn verify_runtime_request_source(
+    proof: &str,
+    public_key: &str,
+    expected: &RuntimeRequestSourceExpectation<'_>,
+) -> Result<RuntimeRequestSourceClaims, RuntimeAuthError> {
+    let (prefix, payload, signature) = split_runtime_request_source_proof(proof)?;
+    if prefix != RUNTIME_REQUEST_SOURCE_PROOF_PREFIX {
+        return Err(RuntimeAuthError::InvalidTokenFormat);
+    }
+    let signature = URL_SAFE_NO_PAD.decode(signature)?;
+    let signing_input = format!("{RUNTIME_REQUEST_SOURCE_SIGNING_INPUT_PREFIX}{payload}");
+    let public_key = decode_public_key(public_key)?;
+    UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(signing_input.as_bytes(), &signature)
+        .map_err(|_| RuntimeAuthError::InvalidSignature)?;
+    let claims = decode_runtime_request_source_claims(proof)?;
+    if claims.iss != expected.identity_id
+        || claims.aud != expected.audience
+        || claims.workspace_id != expected.workspace_id
+        || claims.worker_id.as_deref() != expected.worker_id
+        || claims.permission != expected.permission
+        || claims.method != expected.method
+        || claims.path != expected.path
+        || claims.body_digest != expected.body_digest
+    {
+        return Err(RuntimeAuthError::ClaimMismatch);
+    }
+    if claims.iat > expected.now_unix || claims.exp < expected.now_unix {
+        return Err(RuntimeAuthError::Expired);
+    }
+    Ok(claims)
+}
+
+fn split_runtime_request_source_proof(proof: &str) -> Result<(&str, &str, &str), RuntimeAuthError> {
+    let mut parts = proof.split('.');
+    let prefix = parts.next().unwrap_or_default();
+    let payload = parts.next().unwrap_or_default();
+    let signature = parts.next().unwrap_or_default();
+    if prefix.is_empty() || payload.is_empty() || signature.is_empty() || parts.next().is_some() {
+        return Err(RuntimeAuthError::InvalidTokenFormat);
+    }
+    Ok((prefix, payload, signature))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -589,6 +755,99 @@ mod tests {
         assert!(matches!(
             verify_worker_mutation_source_proof(&trusted.public_key, &token, &expected, 99),
             Err(RuntimeAuthError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn runtime_request_source_proof_binds_request_and_rejects_spoofed_signature() {
+        let trusted = RuntimeIdentityMaterial::generate("runtime-main").unwrap();
+        let signer = RuntimeRequestSourceSigner::from_identity(&trusted);
+        let body = br#"{"ticket":"T-1"}"#;
+        let proof = signer
+            .issue(
+                "server-main",
+                "workspace-a",
+                Some("worker-7"),
+                WORKSPACE_REQUEST_PERMISSION,
+                "POST",
+                "/api/w/workspace-a/tickets/comment",
+                body,
+                90,
+                10,
+            )
+            .unwrap();
+        let expected = RuntimeRequestSourceExpectation {
+            identity_id: "runtime-main",
+            audience: "server-main",
+            workspace_id: "workspace-a",
+            worker_id: Some("worker-7"),
+            permission: WORKSPACE_REQUEST_PERMISSION,
+            method: "POST",
+            path: "/api/w/workspace-a/tickets/comment",
+            body_digest: &request_body_digest(body),
+            now_unix: 99,
+        };
+        let claims = verify_runtime_request_source(&proof, &trusted.public_key, &expected).unwrap();
+        assert_eq!(claims.iss, "runtime-main");
+        let changed_body = RuntimeRequestSourceExpectation {
+            body_digest: &request_body_digest(br#"{"ticket":"T-2"}"#),
+            ..expected.clone()
+        };
+        assert!(matches!(
+            verify_runtime_request_source(&proof, &trusted.public_key, &changed_body),
+            Err(RuntimeAuthError::ClaimMismatch)
+        ));
+        let spoofed = RuntimeIdentityMaterial::generate("runtime-main").unwrap();
+        assert!(matches!(
+            verify_runtime_request_source(&proof, &spoofed.public_key, &expected),
+            Err(RuntimeAuthError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn runtime_request_source_proof_rejects_wrong_scope_and_expiry() {
+        let runtime = RuntimeIdentityMaterial::generate("runtime-main").unwrap();
+        let proof = RuntimeRequestSourceSigner::from_identity(&runtime)
+            .issue(
+                "server-main",
+                "workspace-a",
+                None,
+                BACKEND_RESOURCE_FETCH_PERMISSION,
+                "POST",
+                "/api/runtime/v1/workspaces/workspace-a/resources/fetch",
+                b"{}",
+                90,
+                10,
+            )
+            .unwrap();
+        let digest = request_body_digest(b"{}");
+        let expected = RuntimeRequestSourceExpectation {
+            identity_id: "runtime-main",
+            audience: "server-main",
+            workspace_id: "workspace-a",
+            worker_id: None,
+            permission: BACKEND_RESOURCE_FETCH_PERMISSION,
+            method: "POST",
+            path: "/api/runtime/v1/workspaces/workspace-a/resources/fetch",
+            body_digest: &digest,
+            now_unix: 99,
+        };
+        assert!(verify_runtime_request_source(&proof, &runtime.public_key, &expected).is_ok());
+        let wrong_workspace = RuntimeRequestSourceExpectation {
+            workspace_id: "workspace-b",
+            ..expected.clone()
+        };
+        assert!(matches!(
+            verify_runtime_request_source(&proof, &runtime.public_key, &wrong_workspace),
+            Err(RuntimeAuthError::ClaimMismatch)
+        ));
+        let expired = RuntimeRequestSourceExpectation {
+            now_unix: 101,
+            ..expected
+        };
+        assert!(matches!(
+            verify_runtime_request_source(&proof, &runtime.public_key, &expired),
+            Err(RuntimeAuthError::Expired)
         ));
     }
 

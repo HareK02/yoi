@@ -7,8 +7,9 @@ use worker::{
 };
 
 use crate::auth::{
-    RuntimeAuthError, RuntimeIdentityMaterial, RuntimeWorkerMutationSourceSigner,
-    WORKER_REMOVE_PERMISSION, WorkerMutationActorKind, WorkerMutationOperation,
+    RUNTIME_REQUEST_SOURCE_PROOF_HEADER, RuntimeAuthError, RuntimeIdentityMaterial,
+    RuntimeRequestSourceSigner, RuntimeWorkerMutationSourceSigner, WORKER_REMOVE_PERMISSION,
+    WORKSPACE_REQUEST_PERMISSION, WorkerMutationActorKind, WorkerMutationOperation,
     WorkerMutationSourceClaims, new_token_id,
 };
 use crate::runtime::RuntimeWorkspaceScope;
@@ -289,6 +290,8 @@ pub struct RuntimeOwnedWorkspaceClient {
     worker_id: String,
     request_timeout: Option<Duration>,
     worker_remove: Option<RuntimeWorkerMutationForwarder>,
+    request_source_signer: Option<RuntimeRequestSourceSigner>,
+    request_source_audience: Option<String>,
     prompt_projection_cache: Option<Arc<WorkspacePromptProjectionCache>>,
 }
 
@@ -306,12 +309,24 @@ impl RuntimeOwnedWorkspaceClient {
             worker_id: worker_id.into(),
             request_timeout: None,
             worker_remove: None,
+            request_source_signer: None,
+            request_source_audience: None,
             prompt_projection_cache: None,
         }
     }
 
     pub fn with_worker_remove(mut self, worker_remove: RuntimeWorkerMutationForwarder) -> Self {
         self.worker_remove = Some(worker_remove);
+        self
+    }
+
+    pub fn with_runtime_request_source(
+        mut self,
+        identity: &RuntimeIdentityMaterial,
+        audience: impl Into<String>,
+    ) -> Self {
+        self.request_source_signer = Some(RuntimeRequestSourceSigner::from_identity(identity));
+        self.request_source_audience = Some(audience.into());
         self
     }
 
@@ -363,15 +378,21 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
         request: WorkspaceRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         let base_url = self.base_url.clone();
+        let workspace_id = self.workspace_id.clone();
         let runtime_id = self.runtime_id.clone();
         let worker_id = self.worker_id.clone();
+        let request_source_signer = self.request_source_signer.clone();
+        let request_source_audience = self.request_source_audience.clone();
         let request_timeout = self.request_timeout;
         if tokio::runtime::Handle::try_current().is_ok() {
             std::thread::spawn(move || {
                 execute_runtime_owned_workspace_http(
                     &base_url,
+                    &workspace_id,
                     &runtime_id,
                     &worker_id,
+                    request_source_signer.as_ref(),
+                    request_source_audience.as_deref(),
                     request_timeout,
                     request,
                 )
@@ -383,8 +404,11 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
         } else {
             execute_runtime_owned_workspace_http(
                 &self.base_url,
+                &self.workspace_id,
                 &self.runtime_id,
                 &self.worker_id,
+                self.request_source_signer.as_ref(),
+                self.request_source_audience.as_deref(),
                 self.request_timeout,
                 request,
             )
@@ -484,8 +508,11 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
 
 fn execute_runtime_owned_workspace_http(
     base_url: &str,
+    workspace_id: &str,
     runtime_id: &str,
     worker_id: &str,
+    request_source_signer: Option<&RuntimeRequestSourceSigner>,
+    request_source_audience: Option<&str>,
     request_timeout: Option<Duration>,
     request: WorkspaceRequest,
 ) -> Result<WorkspaceResponse, WorkspaceClientError> {
@@ -510,11 +537,33 @@ fn execute_runtime_owned_workspace_http(
             ))
         })?;
     let request_label = format!("{method} {}", request.path);
+    let body = request.body.unwrap_or_default();
     let mut request_builder = client
-        .request(method, url)
+        .request(method.clone(), url)
         .header("x-yoi-runtime-id", runtime_id)
         .header("x-yoi-worker-id", worker_id);
-    if let Some(body) = request.body {
+    if let Some(signer) = request_source_signer {
+        let audience = request_source_audience.ok_or_else(|| {
+            WorkspaceClientError::Request(
+                "runtime request proof audience is unavailable".to_owned(),
+            )
+        })?;
+        let proof = signer
+            .issue(
+                audience,
+                workspace_id,
+                Some(worker_id),
+                WORKSPACE_REQUEST_PERMISSION,
+                method.as_str(),
+                &request.path,
+                body.as_bytes(),
+                i64::try_from(unix_now_seconds()).unwrap_or(i64::MAX),
+                30,
+            )
+            .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
+        request_builder = request_builder.header(RUNTIME_REQUEST_SOURCE_PROOF_HEADER, proof);
+    }
+    if !body.is_empty() {
         request_builder = request_builder
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body);
@@ -797,7 +846,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_workspace_forwarding_stamps_legacy_source_only_inside_runtime() {
+    fn ordinary_workspace_forwarding_stamps_runtime_identity_and_signed_source_proof() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::sync::Mutex;
@@ -817,12 +866,14 @@ mod tests {
                 .unwrap();
         });
 
+        let identity = RuntimeIdentityMaterial::generate("runtime-a").unwrap();
         let client = RuntimeOwnedWorkspaceClient::new(
             "workspace-a",
             format!("http://{address}"),
             "runtime-a",
             "worker-a",
-        );
+        )
+        .with_runtime_request_source(&identity, "server-a");
         let response = client
             .execute(WorkspaceRequest::get("/api/w/workspace-a/tickets/search"))
             .unwrap();
@@ -831,6 +882,7 @@ mod tests {
         let request = received.lock().unwrap().to_ascii_lowercase();
         assert!(request.contains("x-yoi-runtime-id: runtime-a"));
         assert!(request.contains("x-yoi-worker-id: worker-a"));
+        assert!(request.contains("x-yoi-runtime-request-proof: yoi-runtime-request-v1."));
         assert!(!request.contains("authorization:"));
     }
 

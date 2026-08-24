@@ -160,15 +160,33 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
     };
     let mut factory = ProfileRuntimeWorkerFactory::new(fs_paths.worker_dir.join("worker-root"))
         .with_runtime_store_dir(runtime_store_dir);
-    if let Some(identity) = read_runtime_auth_file(&runtime_auth_path(config))?.identity {
-        factory = factory.with_remote_worker_mutation_identity(identity);
+    let runtime_auth = read_runtime_auth_file(&runtime_auth_path(config))?;
+    if let Some(identity) = runtime_auth.identity.clone() {
+        if let [trusted_server] = runtime_auth.trusted_servers.as_slice() {
+            factory =
+                factory.with_runtime_request_identity(identity, trusted_server.server_id.clone());
+        } else {
+            factory = factory.with_remote_worker_mutation_identity(identity);
+        }
     }
     if let Some(endpoint) = config.backend_resource_endpoint.clone() {
+        let identity = runtime_auth.identity.as_ref().ok_or_else(|| {
+            ProcessError::Auth(
+                "--backend-resource-endpoint requires a configured Runtime identity".to_owned(),
+            )
+        })?;
+        let [trusted_server] = runtime_auth.trusted_servers.as_slice() else {
+            return Err(ProcessError::Auth(
+                "--backend-resource-endpoint requires exactly one trusted Server identity"
+                    .to_owned(),
+            ));
+        };
         factory = factory.with_resource_client(Arc::new(
             worker_runtime::resource::HttpBackendResourceClient::new(
                 endpoint,
                 config.backend_resource_token.clone(),
-            ),
+            )
+            .with_runtime_request_source(identity, trusted_server.server_id.clone()),
         ));
     }
     let backend = Arc::new(

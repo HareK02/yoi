@@ -14,7 +14,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-use crate::auth::RuntimeIdentityMaterial;
+use crate::auth::{
+    BACKEND_RESOURCE_FETCH_PERMISSION, RUNTIME_REQUEST_SOURCE_PROOF_HEADER,
+    RuntimeIdentityMaterial, RuntimeRequestSourceSigner, unix_now_seconds,
+};
 use crate::catalog::{
     CreateWorkerRequest, ProfileSourceArchiveHttpRef, ProfileSourceArchiveSource,
     WorkingDirectoryRequest, WorkingDirectoryStatus,
@@ -295,6 +298,7 @@ pub struct ProfileRuntimeWorkerFactory {
     prompt_projection_cache: Arc<WorkspacePromptProjectionCache>,
     runtime_id: Option<String>,
     worker_mutation_identity: Option<RuntimeIdentityMaterial>,
+    runtime_request_audience: Option<String>,
     embedded_worker_mutation_dispatcher: Option<Arc<dyn EmbeddedWorkerMutationDispatcher>>,
     controller_transport: WorkerControllerTransport,
 }
@@ -311,6 +315,7 @@ impl ProfileRuntimeWorkerFactory {
             prompt_projection_cache: Arc::new(WorkspacePromptProjectionCache::default()),
             runtime_id: None,
             worker_mutation_identity: None,
+            runtime_request_audience: None,
             embedded_worker_mutation_dispatcher: None,
             controller_transport: WorkerControllerTransport::UnixSocket,
         }
@@ -328,6 +333,17 @@ impl ProfileRuntimeWorkerFactory {
         self.runtime_id = Some(identity.identity_id.clone());
         self.worker_mutation_identity = Some(identity);
         self.embedded_worker_mutation_dispatcher = None;
+        self
+    }
+
+    pub fn with_runtime_request_identity(
+        mut self,
+        identity: RuntimeIdentityMaterial,
+        audience: impl Into<String>,
+    ) -> Self {
+        self.runtime_id = Some(identity.identity_id.clone());
+        self.worker_mutation_identity = Some(identity);
+        self.runtime_request_audience = Some(audience.into());
         self
     }
 
@@ -457,13 +473,15 @@ impl ProfileRuntimeWorkerFactory {
     async fn resolve_profile_source_archive(
         &self,
         source: &ProfileSourceArchiveSource,
+        request_audience: Option<&str>,
     ) -> Result<crate::profile_archive::VerifiedProfileSourceArchive, String> {
         match source {
             ProfileSourceArchiveSource::Embedded { archive } => archive
                 .verify()
                 .map_err(|err| format!("failed to verify embedded profile source archive: {err}")),
             ProfileSourceArchiveSource::Http { location } => {
-                self.fetch_profile_source_archive(location).await
+                self.fetch_profile_source_archive(location, request_audience)
+                    .await
             }
         }
     }
@@ -471,10 +489,18 @@ impl ProfileRuntimeWorkerFactory {
     async fn fetch_profile_source_archive(
         &self,
         location: &ProfileSourceArchiveHttpRef,
+        request_audience: Option<&str>,
     ) -> Result<crate::profile_archive::VerifiedProfileSourceArchive, String> {
         if let Some(cached) = self.profile_archive_cache.get(&location.archive.digest) {
-            let response =
-                fetch_profile_source_archive_http(location, Some(&location.archive.digest)).await?;
+            let response = fetch_profile_source_archive_http(
+                location,
+                Some(&location.archive.digest),
+                self.worker_mutation_identity.as_ref(),
+                self.runtime_request_audience
+                    .as_deref()
+                    .or(request_audience),
+            )
+            .await?;
             if let Some(fetched) = response {
                 self.profile_archive_cache.insert(fetched.clone());
                 fetched.verify().map_err(|err| {
@@ -486,12 +512,19 @@ impl ProfileRuntimeWorkerFactory {
                     .map_err(|err| format!("failed to verify cached profile source archive: {err}"))
             }
         } else {
-            let archive = fetch_profile_source_archive_http(location, None)
-                .await?
-                .ok_or_else(|| {
-                    "profile source archive HTTP revalidation returned 304 without a cached archive"
-                        .to_string()
-                })?;
+            let archive = fetch_profile_source_archive_http(
+                location,
+                None,
+                self.worker_mutation_identity.as_ref(),
+                self.runtime_request_audience
+                    .as_deref()
+                    .or(request_audience),
+            )
+            .await?
+            .ok_or_else(|| {
+                "profile source archive HTTP revalidation returned 304 without a cached archive"
+                    .to_string()
+            })?;
             self.profile_archive_cache.insert(archive.clone());
             archive
                 .verify()
@@ -527,6 +560,7 @@ impl RuntimeWorkspaceBackendRef {
         worker_ref: &WorkerRef,
         workspace_scope: Option<&crate::runtime::RuntimeWorkspaceScope>,
         mutation_identity: Option<&RuntimeIdentityMaterial>,
+        runtime_request_audience: Option<&str>,
         embedded_dispatcher: Option<&Arc<dyn EmbeddedWorkerMutationDispatcher>>,
         prompt_projection_cache: Option<Arc<WorkspacePromptProjectionCache>>,
     ) -> WorkerWorkspaceContext {
@@ -545,6 +579,13 @@ impl RuntimeWorkspaceBackendRef {
                 );
                 if let Some(cache) = prompt_projection_cache {
                     client = client.with_prompt_projection_cache(cache);
+                }
+                if let Some(identity) = mutation_identity {
+                    let audience = runtime_request_audience
+                        .or_else(|| workspace_scope.map(|scope| scope.server_id.as_str()));
+                    if let Some(audience) = audience {
+                        client = client.with_runtime_request_source(identity, audience.to_owned());
+                    }
                 }
                 if let (Some(scope), Some(identity)) = (workspace_scope, mutation_identity) {
                     client = client.with_worker_remove(RuntimeWorkerMutationForwarder::remote(
@@ -576,9 +617,40 @@ impl RuntimeWorkspaceBackendRef {
 async fn fetch_profile_source_archive_http(
     location: &ProfileSourceArchiveHttpRef,
     cached_digest: Option<&str>,
+    identity: Option<&RuntimeIdentityMaterial>,
+    audience: Option<&str>,
 ) -> Result<Option<crate::profile_archive::ProfileSourceArchive>, String> {
     let client = reqwest::Client::new();
-    let mut request = client.get(&location.url);
+    let url = reqwest::Url::parse(&location.url)
+        .map_err(|error| format!("profile source archive URL is invalid: {error}"))?;
+    let path = url.path().to_owned();
+    let workspace_id = path
+        .split('/')
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find_map(|parts| (parts[0] == "w").then_some(parts[1]))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "profile source archive URL is not workspace-scoped".to_owned())?;
+    let mut request = client.get(url);
+    if let Some(identity) = identity {
+        let audience = audience.ok_or_else(|| {
+            "profile source archive request proof audience is unavailable".to_owned()
+        })?;
+        let proof = RuntimeRequestSourceSigner::from_identity(identity)
+            .issue(
+                audience,
+                workspace_id,
+                None,
+                BACKEND_RESOURCE_FETCH_PERMISSION,
+                "GET",
+                &path,
+                b"",
+                i64::try_from(unix_now_seconds()).unwrap_or(i64::MAX),
+                30,
+            )
+            .map_err(|error| error.to_string())?;
+        request = request.header(RUNTIME_REQUEST_SOURCE_PROOF_HEADER, proof);
+    }
     if cached_digest == Some(location.archive.digest.as_str()) {
         if let Some(etag) = location.etag.as_deref() {
             request = request.header(reqwest::header::IF_NONE_MATCH, etag);
@@ -620,6 +692,8 @@ async fn fetch_profile_source_archive_http(
 async fn fetch_profile_source_archive_http(
     _location: &ProfileSourceArchiveHttpRef,
     _cached_digest: Option<&str>,
+    _identity: Option<&RuntimeIdentityMaterial>,
+    _audience: Option<&str>,
 ) -> Result<Option<crate::profile_archive::ProfileSourceArchive>, String> {
     Err(
         "HTTP profile source archive fetch requires the worker-runtime http-server feature"
@@ -743,12 +817,19 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             &request.worker_ref,
             request.workspace_scope.as_ref(),
             self.worker_mutation_identity.as_ref(),
+            self.runtime_request_audience.as_deref(),
             self.embedded_worker_mutation_dispatcher.as_ref(),
             Some(self.prompt_projection_cache.clone()),
         );
         let selector = profile.as_ref();
         let archive = self
-            .resolve_profile_source_archive(&request.request.profile_source)
+            .resolve_profile_source_archive(
+                &request.request.profile_source,
+                request
+                    .workspace_scope
+                    .as_ref()
+                    .map(|scope| scope.server_id.as_str()),
+            )
             .await?;
         let (mut manifest, mut loader) = {
             let manifest = archive
@@ -909,6 +990,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             &request.worker_ref,
             request.workspace_scope.as_ref(),
             self.worker_mutation_identity.as_ref(),
+            self.runtime_request_audience.as_deref(),
             self.embedded_worker_mutation_dispatcher.as_ref(),
             Some(self.prompt_projection_cache.clone()),
         );
@@ -2187,12 +2269,18 @@ mod tests {
         let scope = crate::runtime::RuntimeWorkspaceScope::new("workspace-a", "server-main");
 
         let before_restart =
-            backend.worker_context(&worker_ref, Some(&scope), Some(&identity), None, None);
+            backend.worker_context(&worker_ref, Some(&scope), Some(&identity), None, None, None);
         let adapter = WorkerRuntimeExecutionBackend::new(FailingFactory).unwrap();
         let (after_restore_kind, after_restore_workspace_id) = adapter
             .run_on_adapter_runtime(async move {
-                let after_restore =
-                    backend.worker_context(&worker_ref, Some(&scope), Some(&identity), None, None);
+                let after_restore = backend.worker_context(
+                    &worker_ref,
+                    Some(&scope),
+                    Some(&identity),
+                    None,
+                    None,
+                    None,
+                );
                 let client = after_restore.client_handle();
                 Ok((
                     client.kind().to_string(),
@@ -2380,6 +2468,7 @@ mod tests {
             let workspace_context = workspace_backend_ref.worker_context(
                 &request.worker_ref,
                 request.workspace_scope.as_ref(),
+                None,
                 None,
                 None,
                 None,
@@ -2785,7 +2874,7 @@ mod tests {
             archive: bundle.profile_source_archive.clone().unwrap(),
         };
         factory
-            .resolve_profile_source_archive(&source)
+            .resolve_profile_source_archive(&source, None)
             .await
             .expect("embedded archive should resolve without Backend resource client");
     }
