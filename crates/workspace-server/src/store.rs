@@ -730,6 +730,7 @@ pub trait ControlPlaneStore: Send + Sync {
         record: &WorkspaceBootstrapRecord,
     ) -> Result<WorkspaceBootstrapResult>;
     async fn get_trusted_runtime(&self, runtime_id: &str) -> Result<Option<TrustedRuntimeRecord>>;
+    async fn upsert_trusted_runtime_record(&self, record: &TrustedRuntimeRecord) -> Result<()>;
     async fn consume_worker_mutation_source_jti(
         &self,
         runtime_id: &str,
@@ -1935,6 +1936,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             .optional()
             .map_err(Error::from)
         })
+    }
+
+    async fn upsert_trusted_runtime_record(&self, record: &TrustedRuntimeRecord) -> Result<()> {
+        SqliteWorkspaceStore::upsert_trusted_runtime(self, record)
     }
 
     async fn consume_worker_mutation_source_jti(
