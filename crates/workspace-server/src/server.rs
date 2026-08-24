@@ -969,7 +969,8 @@ async fn authorize_workspace_api_request(
     mut request: Request,
     next: axum::middleware::Next,
 ) -> Response {
-    if !request.uri().path().starts_with("/api/w/") {
+    if !request.uri().path().starts_with("/api/") || is_server_global_forward(request.uri().path())
+    {
         return next.run(request).await;
     }
     let workspace_id = api.workspace_id().to_owned();
@@ -987,7 +988,9 @@ async fn authorize_workspace_api_request(
         };
         let digest = worker_runtime::auth::request_body_digest(&body);
         *request.body_mut() = axum::body::Body::from(body);
-        let permission = if path.contains("/profile-source-archive/") {
+        let permission = if path.starts_with("/api/runtime/v1/workspaces/")
+            || path.contains("/profile-source-archive/")
+        {
             worker_runtime::auth::BACKEND_RESOURCE_FETCH_PERMISSION
         } else {
             worker_runtime::auth::WORKSPACE_REQUEST_PERMISSION
@@ -1075,10 +1078,23 @@ async fn dispatch_workspace_request(
         }
         if workspaces.len() == 1 || is_server_global_forward(&path) {
             match workspaces.first() {
-                Some(workspace) => match api.router_for_workspace(&workspace.workspace_id).await {
-                    Ok(router) => router,
-                    Err(error) => return server_error_response(error),
-                },
+                Some(workspace) => {
+                    if path.starts_with("/api/")
+                        && !is_server_global_forward(&path)
+                        && let Err(response) = authorize_scoped_workspace_request(
+                            &api,
+                            &workspace.workspace_id,
+                            &mut request,
+                        )
+                        .await
+                    {
+                        return response;
+                    }
+                    match api.router_for_workspace(&workspace.workspace_id).await {
+                        Ok(router) => router,
+                        Err(error) => return server_error_response(error),
+                    }
+                }
                 None => None,
             }
         } else {
@@ -15607,6 +15623,36 @@ mod tests {
             .unwrap();
         assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 
+        for legacy_path in ["/api/workspace", "/api/runtimes", "/api/tickets"] {
+            let anonymous_legacy = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(legacy_path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                anonymous_legacy.status(),
+                StatusCode::UNAUTHORIZED,
+                "{legacy_path} must not bypass Workspace auth"
+            );
+        }
+        let authenticated_legacy = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/workspace")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer api-token-auth")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authenticated_legacy.status(), StatusCode::OK);
+
         let ws_uri = format!("/api/w/{}/protocol/ws", workspace.workspace.workspace_id);
         let anonymous_ws = app
             .clone()
@@ -19043,6 +19089,35 @@ mod tests {
         );
     }
 
+    const TEST_RUNTIME_HTTP_TOKEN: &str = "workspace-server-test-runtime-token";
+
+    async fn serve_runtime_http_with_injected_test_auth(
+        runtime: worker_runtime::Runtime,
+        listener: tokio::net::TcpListener,
+    ) -> std::io::Result<()> {
+        const TOKEN: &str = "workspace-server-test-runtime-token";
+
+        async fn inject_runtime_auth(
+            State(inner): State<Router>,
+            mut request: Request<Body>,
+        ) -> Response {
+            request.headers_mut().insert(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_static("Bearer workspace-server-test-runtime-token"),
+            );
+            match inner.oneshot(request).await {
+                Ok(response) => response,
+                Err(error) => match error {},
+            }
+        }
+
+        let protected = worker_runtime::http_server::runtime_http_router(runtime, TOKEN.to_owned());
+        let proxy = Router::new()
+            .fallback(axum::routing::any(inject_runtime_auth))
+            .with_state(protected);
+        axum::serve(listener, proxy).await
+    }
+
     async fn test_app(workspace_root: impl Into<PathBuf>) -> Router {
         build_inner_router(test_api(workspace_root).await)
     }
@@ -19217,6 +19292,8 @@ mod tests {
 
     fn runtime_create_request() -> worker_runtime::catalog::CreateWorkerRequest {
         let bundle = runtime_test_bundle();
+        let mut memory_settings = test_worker_memory_settings();
+        memory_settings.workspace_id = "local".to_owned();
         worker_runtime::catalog::CreateWorkerRequest {
             worker_id: WorkerId::now_v7(),
             create_fingerprint: "test-create".to_string(),
@@ -19251,7 +19328,7 @@ mod tests {
             worker_observation_enabled: false,
             worker_observation_grants: Vec::new(),
             workspace_api: None,
-            memory_settings: None,
+            memory_settings: Some(memory_settings),
         }
     }
 
@@ -19262,7 +19339,12 @@ mod tests {
         )
         .unwrap();
         runtime.store_config_bundle(runtime_test_bundle()).unwrap();
-        let worker = runtime.create_worker(runtime_create_request()).unwrap();
+        let worker = runtime
+            .create_worker_scoped(
+                &worker_runtime::RuntimeWorkspaceScope::new("local", "local-token"),
+                runtime_create_request(),
+            )
+            .unwrap();
         (runtime, worker.worker_ref)
     }
 
@@ -19427,7 +19509,7 @@ mod tests {
         tokio::spawn({
             let runtime = runtime.clone();
             async move {
-                worker_runtime::http_server::serve_runtime_http(runtime, runtime_listener, None)
+                serve_runtime_http_with_injected_test_auth(runtime, runtime_listener)
                     .await
                     .unwrap()
             }
@@ -19493,7 +19575,7 @@ mod tests {
         tokio::spawn({
             let runtime = runtime.clone();
             async move {
-                worker_runtime::http_server::serve_runtime_http(runtime, runtime_listener, None)
+                serve_runtime_http_with_injected_test_auth(runtime, runtime_listener)
                     .await
                     .unwrap()
             }
@@ -19558,7 +19640,7 @@ mod tests {
         let runtime_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let runtime_addr = runtime_listener.local_addr().unwrap();
         tokio::spawn(async move {
-            worker_runtime::http_server::serve_runtime_http(runtime, runtime_listener, None)
+            serve_runtime_http_with_injected_test_auth(runtime, runtime_listener)
                 .await
                 .unwrap()
         });
@@ -20946,7 +21028,7 @@ mod tests {
         let source = RuntimeObservationSourceConfig {
             worker: RuntimeWorkerRef::new("runtime-a", "worker-a"),
             endpoint,
-            bearer_token: None,
+            bearer_token: Some(TEST_RUNTIME_HTTP_TOKEN.to_owned()),
         };
         let (url, _dir) = spawn_workspace_proxy(source).await;
         let (mut stream, _) = connect_async(&url).await.unwrap();
@@ -20992,7 +21074,7 @@ mod tests {
         let source = RuntimeObservationSourceConfig {
             worker: RuntimeWorkerRef::new("runtime-a", "worker-a"),
             endpoint,
-            bearer_token: None,
+            bearer_token: Some(TEST_RUNTIME_HTTP_TOKEN.to_owned()),
         };
         let (url, _dir) = spawn_workspace_proxy(source).await;
         let (mut stream, _) = connect_async(&url).await.unwrap();
@@ -21025,9 +21107,13 @@ mod tests {
         tokio::spawn({
             let runtime = runtime.clone();
             async move {
-                worker_runtime::http_server::serve_runtime_http(runtime, runtime_listener, None)
-                    .await
-                    .unwrap()
+                worker_runtime::http_server::serve_runtime_http(
+                    runtime,
+                    runtime_listener,
+                    Some(TEST_RUNTIME_HTTP_TOKEN.to_owned()),
+                )
+                .await
+                .unwrap()
             }
         });
         let endpoint = format!(
