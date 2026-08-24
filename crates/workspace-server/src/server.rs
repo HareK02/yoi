@@ -17210,7 +17210,7 @@ mod tests {
             .add_ticket_relation(
                 ticket_id.clone().into(),
                 ticket::NewTicketRelation {
-                    kind: ticket::TicketRelationKind::Related,
+                    kind: ticket::TicketRelationKind::DependsOn,
                     target: related_ticket_id.clone(),
                     note: Some("Browser relation".to_string()),
                     author: Some("browser-user".to_string()),
@@ -17244,7 +17244,7 @@ mod tests {
         assert!(edited.assignment_diagnostics.is_empty());
         assert_eq!(edited.relations.outgoing.len(), 1);
         assert_eq!(edited.relations.outgoing[0].target, related_ticket_id);
-        assert_eq!(edited.relations.outgoing[0].kind, "related");
+        assert_eq!(edited.relations.outgoing[0].kind, "depends_on");
 
         let Json(commented) = scoped_append_ticket_event(
             State(api.clone()),
@@ -17274,6 +17274,13 @@ mod tests {
         .unwrap();
         assert_eq!(ready.state, "ready");
         assign_test_orchestrator(&api, &ticket_id);
+        let Json(ready_detail) = scoped_get_ticket(State(api.clone()), AxumPath(path()))
+            .await
+            .unwrap();
+        assert!(ready_detail.action_eligibility.can_queue);
+        assert!(ready_detail.action_eligibility.blockers.is_empty());
+        assert_eq!(ready_detail.relations.blockers.len(), 1);
+        assert_eq!(ready_detail.relations.blockers[0].reason_kind, "depends_on");
 
         let Json(queued) = scoped_queue_ticket(
             State(api.clone()),
@@ -17284,6 +17291,8 @@ mod tests {
         .unwrap();
         assert_eq!(queued.state, "queued");
         assert_eq!(queued.queued_by.as_deref(), Some("workspace-web"));
+        assert_eq!(queued.relations.blockers.len(), 1);
+        assert_eq!(queued.relations.blockers[0].reason_kind, "depends_on");
         let Json(closed) = scoped_close_ticket(
             State(api),
             AxumPath(path()),

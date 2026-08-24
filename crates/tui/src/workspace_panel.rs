@@ -2203,7 +2203,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_panel_marks_ready_ticket_with_unresolved_relation_waiting_gate() {
+    fn workspace_panel_queues_ready_ticket_with_unresolved_relation_context() {
         let temp = TempDir::new().unwrap();
         write_ticket_config(temp.path());
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
@@ -2233,14 +2233,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(row.kind, PanelRowKind::Ticket);
-        assert_eq!(row.next_action, Some(NextUserAction::Wait));
-        assert_eq!(row.priority, ActionPriority::Background);
-        assert!(
-            row.disabled_reason
-                .as_deref()
-                .unwrap()
-                .contains("Queue disabled: waiting for")
-        );
+        assert_eq!(row.next_action, Some(NextUserAction::Queue));
+        assert_eq!(row.priority, ActionPriority::ReadyForQueue);
+        assert!(row.disabled_reason.is_none());
         assert!(
             row.ticket
                 .as_ref()
@@ -2253,7 +2248,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_panel_allows_ready_ticket_when_relation_prerequisite_is_queued() {
+    fn workspace_panel_queues_ready_ticket_when_relation_prerequisite_is_queued() {
         let temp = TempDir::new().unwrap();
         write_ticket_config(temp.path());
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
@@ -2286,12 +2281,20 @@ mod tests {
         assert_eq!(row.next_action, Some(NextUserAction::Queue));
         assert_eq!(row.priority, ActionPriority::ReadyForQueue);
         assert!(row.disabled_reason.is_none());
-        assert!(row.ticket.as_ref().unwrap().blocked_reason.is_none());
+        assert!(
+            row.ticket
+                .as_ref()
+                .unwrap()
+                .blocked_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains(&dependency.id)
+        );
         assert!(
             row.key_hint
                 .as_deref()
                 .unwrap()
-                .contains("Queue allowed: prerequisites are already queued/in progress")
+                .contains("dependency relations remain scheduling context")
         );
         assert!(row.key_hint.as_deref().unwrap().contains(&dependency.id));
     }

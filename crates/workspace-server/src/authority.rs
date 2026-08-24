@@ -847,20 +847,16 @@ impl SqliteWorkspaceAuthority {
             can_queue: ticket.meta.workflow_state == TicketWorkflowState::Ready
                 && has_orchestrator
                 && !has_coder
-                && has_target
-                && !has_blockers,
+                && has_target,
             can_start_manual_coder: ticket.meta.workflow_state == TicketWorkflowState::Ready
                 && !has_orchestrator
                 && !has_coder
                 && has_target
                 && !has_blockers,
-            blockers: [
-                (!has_target).then_some("Ticket target is required".to_string()),
-                has_blockers.then_some("unresolved blocking relations remain".to_string()),
-            ]
-            .into_iter()
-            .flatten()
-            .collect(),
+            blockers: [(!has_target).then_some("Ticket target is required".to_string())]
+                .into_iter()
+                .flatten()
+                .collect(),
         };
         let merge_request = match self.merge_request_store.get(&self.workspace_id, id) {
             Ok(request) => {

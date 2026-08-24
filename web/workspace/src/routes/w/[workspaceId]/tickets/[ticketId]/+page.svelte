@@ -466,7 +466,9 @@
             {busy === "queue" ? "Queueing…" : "Queue ticket"}
           </button>
           {#if !ticket.action_eligibility.can_queue}
-            <p class="workspace-empty-copy">Assign the Orchestrator role and resolve the listed blockers before Queue.</p>
+            <p class="workspace-empty-copy">Queue requires a valid target, an active Orchestrator assignment, and no active Coder assignment.</p>
+          {:else if ticket.relations.blockers.length > 0}
+            <p class="workspace-empty-copy">Queue records orchestration demand. Dependency relations remain visible so the Orchestrator can decide whether to wait or start work in parallel.</p>
           {/if}
         {/if}
       </section>

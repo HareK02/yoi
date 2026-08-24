@@ -1117,7 +1117,7 @@ pub fn project_ticket_workspace_item(
 
 pub fn ticket_queue_guard(
     summary: &TicketSummary,
-    relation_blockers: &[TicketRelationBlocker],
+    _relation_blockers: &[TicketRelationBlocker],
     orchestration_overlay: Option<&TicketWorkspaceStateOverlay>,
 ) -> TicketQueueGuard {
     if orchestration_overlay.is_some() {
@@ -1140,18 +1140,6 @@ pub fn ticket_queue_guard(
             blocked_reason: None,
         };
     }
-    let active_blockers = relation_blockers
-        .iter()
-        .filter(|blocker| !relation_blocker_allows_ready_queue(blocker))
-        .collect::<Vec<_>>();
-    if !active_blockers.is_empty() {
-        let blockers = format_workspace_relation_blockers(&active_blockers);
-        return TicketQueueGuard {
-            can_queue_for_orchestrator: false,
-            reason: Some(format!("waiting for {blockers}")),
-            blocked_reason: Some(blockers),
-        };
-    }
     TicketQueueGuard {
         can_queue_for_orchestrator: true,
         reason: None,
@@ -1168,7 +1156,7 @@ fn derive_ticket_workspace_projection(
             .iter()
             .filter(|blocker| !relation_blocker_allows_ready_queue(blocker))
             .collect::<Vec<_>>();
-        if !active_blockers.is_empty() || summary.workflow_state != TicketWorkflowState::Ready {
+        if summary.workflow_state != TicketWorkflowState::Ready {
             let blockers_to_report = if active_blockers.is_empty() {
                 relation_blockers.iter().collect::<Vec<_>>()
             } else {
@@ -1188,9 +1176,9 @@ fn derive_ticket_workspace_projection(
                 visible_state: summary.workflow_state.as_str().to_string(),
                 visible_overlay: None,
                 disabled_reason: Some(format!(
-                    "Queue disabled: {waiting_reason}. Resolve dependency/blocker before ready -> queued."
+                    "Dependency context: {waiting_reason}. The Orchestrator decides whether work waits or starts in parallel."
                 )),
-                key_hint: Some(format!("Gate: {waiting_reason}")),
+                key_hint: Some(format!("Dependencies: {waiting_reason}")),
                 blocked_reason: Some(blockers),
                 queue_guard: TicketQueueGuard {
                     can_queue_for_orchestrator: false,
@@ -1213,9 +1201,9 @@ fn derive_ticket_workspace_projection(
             visible_overlay: None,
             disabled_reason: None,
             key_hint: Some(format!(
-                "Queue allowed: prerequisites are already queued/in progress; Orchestrator will preserve order ({blockers})."
+                "Queue records orchestration demand; dependency relations remain scheduling context ({blockers})."
             )),
-            blocked_reason: None,
+            blocked_reason: Some(blockers),
             queue_guard: TicketQueueGuard {
                 can_queue_for_orchestrator: true,
                 reason: None,
@@ -3921,16 +3909,6 @@ impl TicketBackend for SqliteTicketBackend {
                 &self.workspace_id,
                 &ticket,
             )?;
-            let blockers = ticket
-                .relations
-                .blockers
-                .iter()
-                .filter(|blocker| !relation_blocker_allows_queue(blocker))
-                .cloned()
-                .collect::<Vec<_>>();
-            if !blockers.is_empty() {
-                return Err(TicketError::BlockingRelations(format_relation_blockers(&blockers)));
-            }
             let at = now_utc();
             conn.execute("UPDATE typed_tickets SET workflow_state = 'queued', workflow_state_explicit = 1, queued_by = ?3, queued_at = ?4, repository_id = ?5, ref_selector = ?6, updated_at = ?4 WHERE workspace_id = ?1 AND ticket_id = ?2 AND workflow_state = 'ready'", params![self.workspace_id, ticket_id, queued_by, at, target.repository_id, target.ref_selector]).map_err(sqlite_err)?;
             self.insert_event(conn, &ticket_id, &TicketEvent { kind: TicketEventKind::StateChanged, author: Some(queued_by.to_string()), at: Some(at.clone()), status: None, from: Some("ready".to_string()), to: Some("queued".to_string()), reason: Some("queued".to_string()), state_field: Some("state".to_string()), heading: Some(TicketEventKind::StateChanged.heading()), body: MarkdownText::new(format!("Queued for Orchestrator by {queued_by}.")), references: Vec::new(), attributes: BTreeMap::from([("queued_by".to_owned(), queued_by.to_owned()), ("queued_at".to_owned(), at), ("repository_id".to_owned(), target.repository_id), ("ref_selector".to_owned(), target.ref_selector)]) })
@@ -4566,18 +4544,6 @@ impl TicketBackend for LocalTicketBackend {
         }
         let ticket = self.ticket_from_dir(&dir)?;
         let target = resolve_ready_target(self.target_authority.as_ref(), "local", &ticket)?;
-        let blockers = self.relation_blockers_for_meta(&meta)?;
-        let active_blockers = blockers
-            .into_iter()
-            .filter(|blocker| !relation_blocker_allows_queue(blocker))
-            .collect::<Vec<_>>();
-        if !active_blockers.is_empty() {
-            return Err(TicketError::BlockingRelations(format!(
-                "{}: {}",
-                meta.id,
-                format_relation_blockers(&active_blockers)
-            )));
-        }
         let at = now_utc();
         let mut change = TicketStateChange::new(
             TicketWorkflowState::Ready.as_str(),
@@ -6945,7 +6911,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_projection_blocks_ready_queue_on_unstarted_dependency() {
+    fn workspace_projection_queues_ready_ticket_with_unstarted_dependency_context() {
         let summary = summary_with_state(TicketWorkflowState::Ready);
         let blockers = [blocker_with_state(TicketWorkflowState::Planning)];
         let projection = project_ticket_workspace_item(&summary, &blockers, None);
@@ -6953,15 +6919,22 @@ mod tests {
         assert_eq!(projection.kind, TicketWorkspaceRowKind::Ticket);
         assert_eq!(
             projection.next_action,
-            Some(TicketWorkspaceNextAction::WaitForOrchestrator)
+            Some(TicketWorkspaceNextAction::QueueForOrchestrator)
         );
-        assert!(!projection.queue_guard.can_queue_for_orchestrator);
+        assert!(projection.queue_guard.can_queue_for_orchestrator);
         assert!(projection.blocked_reason.is_some());
-        assert!(projection.disabled_reason.is_some());
+        assert!(projection.disabled_reason.is_none());
+        assert!(
+            projection
+                .key_hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("scheduling context")
+        );
     }
 
     #[test]
-    fn workspace_projection_allows_ready_queue_when_dependency_is_already_queued() {
+    fn workspace_projection_queues_ready_ticket_with_queued_dependency_context() {
         let summary = summary_with_state(TicketWorkflowState::Ready);
         let blockers = [blocker_with_state(TicketWorkflowState::Queued)];
         let projection = project_ticket_workspace_item(&summary, &blockers, None);
@@ -6971,13 +6944,13 @@ mod tests {
             Some(TicketWorkspaceNextAction::QueueForOrchestrator)
         );
         assert!(projection.queue_guard.can_queue_for_orchestrator);
-        assert!(projection.blocked_reason.is_none());
+        assert!(projection.blocked_reason.is_some());
         assert!(
             projection
                 .key_hint
                 .as_deref()
                 .unwrap_or_default()
-                .contains("Orchestrator will preserve order")
+                .contains("scheduling context")
         );
     }
 
@@ -7238,7 +7211,7 @@ state: planning
     }
 
     #[test]
-    fn sqlite_mark_ready_and_queue_enforce_target_and_blockers_atomically() {
+    fn sqlite_mark_ready_and_queue_preserve_dependency_context_atomically() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteTicketBackend::open(tmp.path().join("workspace.db"), "workspace-test")
             .unwrap()
@@ -7284,43 +7257,17 @@ state: planning
                 .count(),
             1
         );
-        assert!(matches!(
-            backend.queue_ready(
-                TicketIdOrSlug::Id(implementation.id.clone()),
-                "orchestrator",
-            ),
-            Err(TicketError::BlockingRelations(_))
-        ));
-        let after_rejection = backend
-            .show(TicketIdOrSlug::Id(implementation.id.clone()))
-            .unwrap();
-        assert_eq!(
-            after_rejection.meta.workflow_state,
-            TicketWorkflowState::Ready
-        );
-        assert!(!after_rejection.events.iter().any(|event| {
-            event.from.as_deref() == Some("ready") && event.to.as_deref() == Some("queued")
-        }));
-        backend
-            .close(
-                TicketIdOrSlug::Id(dependency.id),
-                MarkdownText::new("resolved"),
-            )
-            .unwrap();
         backend
             .queue_ready(
                 TicketIdOrSlug::Id(implementation.id.clone()),
                 "orchestrator",
             )
             .unwrap();
-        assert_eq!(
-            backend
-                .show(TicketIdOrSlug::Id(implementation.id))
-                .unwrap()
-                .meta
-                .workflow_state,
-            TicketWorkflowState::Queued
-        );
+        let queued = backend.show(TicketIdOrSlug::Id(implementation.id)).unwrap();
+        assert_eq!(queued.meta.workflow_state, TicketWorkflowState::Queued);
+        assert_eq!(queued.meta.queued_by.as_deref(), Some("orchestrator"));
+        assert_eq!(queued.relations.blockers.len(), 1);
+        assert_eq!(queued.relations.blockers[0].blocking_ticket, dependency.id);
     }
 
     #[test]
@@ -8374,7 +8321,7 @@ state: planning
     }
 
     #[test]
-    fn queue_gate_rejects_unresolved_dependency_and_incoming_blocker() {
+    fn queue_accepts_unresolved_dependency_and_incoming_blocker_as_context() {
         let tmp = TempDir::new().unwrap();
         let backend = backend(&tmp);
         let mut blocked_input = NewTicket::new("Blocked Ready");
@@ -8392,12 +8339,15 @@ state: planning
                 },
             )
             .unwrap();
-        let err = backend
+        backend
             .queue_ready(TicketIdOrSlug::Id(blocked.id.clone()), "test")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("unresolved blocking relation"), "{err}");
-        assert!(err.contains(&dependency.id), "{err}");
+            .unwrap();
+        let queued = backend
+            .show(TicketIdOrSlug::Id(blocked.id.clone()))
+            .unwrap();
+        assert_eq!(queued.meta.workflow_state, TicketWorkflowState::Queued);
+        assert_eq!(queued.relations.blockers.len(), 1);
+        assert_eq!(queued.relations.blockers[0].blocking_ticket, dependency.id);
 
         let mut incoming_input = NewTicket::new("Incoming Blocked Ready");
         incoming_input.workflow_state = Some(TicketWorkflowState::Ready);
@@ -8414,12 +8364,21 @@ state: planning
                 },
             )
             .unwrap();
-        let err = backend
+        backend
             .queue_ready(TicketIdOrSlug::Id(incoming.id.clone()), "test")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("unresolved blocking relation"), "{err}");
-        assert!(err.contains(&blocker.id), "{err}");
+            .unwrap();
+        let queued_incoming = backend
+            .show(TicketIdOrSlug::Id(incoming.id.clone()))
+            .unwrap();
+        assert_eq!(
+            queued_incoming.meta.workflow_state,
+            TicketWorkflowState::Queued
+        );
+        assert_eq!(queued_incoming.relations.blockers.len(), 1);
+        assert_eq!(
+            queued_incoming.relations.blockers[0].blocking_ticket,
+            blocker.id
+        );
     }
 
     #[test]

@@ -143,7 +143,7 @@ The backend applies the same target validation and lock as TicketMarkReady and c
 state_changed event, effective target, and planning -> ready transition atomically.";
 const QUEUE_DESCRIPTION: &str = "Queue a ready Ticket for Orchestrator routing through the typed \
 Ticket backend. The backend performs the gated ready -> queued transition, records queued_by/queued_at, \
-and rejects unresolved blocking relations.";
+and preserves unresolved blocking relations as Orchestrator scheduling context rather than Queue admission gates.";
 const WORKFLOW_STATE_DESCRIPTION: &str = "Transition Ticket `state` through the typed \
 Ticket backend with a bounded `state_changed` event. Treat `queued -> inprogress` \
 as the implementation acceptance step: implementation side effects should happen only after that \

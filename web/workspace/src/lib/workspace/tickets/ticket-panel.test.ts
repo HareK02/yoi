@@ -119,6 +119,15 @@ Deno.test("ticket detail uses server-derived role assignment actions", async () 
   );
 
   assertEquals(source.includes("ticket.action_eligibility.can_queue"), true);
+  assertEquals(source.includes("ticket.relations.blockers.length > 0"), true);
+  assertEquals(
+    source.includes("Queue records orchestration demand. Dependency relations remain visible"),
+    true,
+  );
+  assertEquals(
+    source.includes("resolve the listed blockers before Queue"),
+    false,
+  );
   assertEquals(
     source.includes("ticket.action_eligibility.can_assign_orchestrator"),
     true,
