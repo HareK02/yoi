@@ -41,9 +41,11 @@ tar.workspace = true
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
 toml.workspace = true
+url.workspace = true
 uuid = { workspace = true, features = ["v7"] }
 tower = { workspace = true, features = ["util"], optional = true }
 worker.workspace = true
+workspace-api = { path = "../workspace-api" }
 workdir.workspace = true
 
 [dev-dependencies]

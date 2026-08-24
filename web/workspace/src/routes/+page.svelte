@@ -155,8 +155,7 @@
       <p class="workspace-catalog-eyebrow">New team space</p>
       <h2 id="workspace-create-title">Create Workspace</h2>
       <p>
-        Repository paths and URIs are interpreted by the Backend. Browser-local paths are
-        not authority.
+        Repository sources are interpreted by Backend authority. Supported Git sources are absolute local paths, file://, ssh://, http(s)://, and user@host:path; Browser-local paths and embedded credentials are not authority.
       </p>
     </div>
     <form onsubmit={submitCreation}>

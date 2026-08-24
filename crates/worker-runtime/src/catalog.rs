@@ -2,7 +2,6 @@ use crate::identity::{RuntimeWorkerRef, WorkerId, WorkerRef};
 use crate::interaction::WorkerInput;
 use crate::profile_archive::{ProfileSourceArchive, ProfileSourceArchiveRef};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 fn is_false(value: &bool) -> bool {
     !*value
@@ -85,9 +84,9 @@ impl std::ops::Deref for RepositorySelector {
 pub struct WorkingDirectoryRepository {
     pub id: String,
     pub provider: String,
-    pub uri: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub local_path: Option<PathBuf>,
+    pub source: workspace_api::RepositorySource,
+    pub source_revision: u64,
+    pub source_fingerprint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector: Option<RepositorySelector>,
 }

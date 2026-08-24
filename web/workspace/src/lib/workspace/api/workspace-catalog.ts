@@ -7,13 +7,29 @@ export type WorkspaceCatalogRecord = {
   updated_at: string;
 };
 
+export type RepositorySourceKind =
+  | "local_path"
+  | "file"
+  | "ssh"
+  | "http"
+  | "https"
+  | "invalid";
+
 export type WorkspaceRepositoryRecord = {
   workspace_id: string;
   repository_id: string;
   name: string;
   kind: string;
-  uri: string;
+  provider: string | null;
+  source: {
+    kind: RepositorySourceKind;
+    uri: string;
+  };
   default_ref: string | null;
+  source_revision: number;
+  source_fingerprint: string;
+  observed_status: "unverified" | "ready" | "invalid";
+  observed_at: string | null;
 };
 
 export type WorkspaceCatalogItem = WorkspaceCatalogRecord & {

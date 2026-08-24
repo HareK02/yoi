@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use workspace_api::{RepositoryObservedStatus, RepositorySource, RepositorySourceKind};
+
+use crate::repository_source::{parse_repository_source, repository_source_fingerprint};
 use crate::store::{
     ControlPlaneStore, RepositoryRecord, WorkspaceBootstrapRecord, WorkspaceRecord,
 };
@@ -109,8 +112,8 @@ impl WorkspaceCatalogService {
         )?;
         let display_name =
             normalize_required("display_name", request.display_name, MAX_DISPLAY_NAME_BYTES)?;
-        let repository_path = validate_repository_uri(&request.repository.uri)?;
-        let repository_uri = repository_path.to_string_lossy().into_owned();
+        let repository_source = validate_repository_source(&request.repository.uri)?;
+        let repository_uri = repository_source.uri.clone();
         let repository_name = request
             .repository
             .display_name
@@ -166,10 +169,12 @@ impl WorkspaceCatalogService {
                     name: repository_name,
                     kind: "git".to_string(),
                     provider: Some("git".to_string()),
-                    uri: repository_uri,
+                    source: repository_source.clone(),
                     default_ref: Some(default_ref),
-                    auth_ref_kind: None,
-                    auth_ref_key: None,
+                    source_revision: 1,
+                    source_fingerprint: repository_source_fingerprint(&repository_source),
+                    observed_status: RepositoryObservedStatus::Unverified,
+                    observed_at: None,
                     created_at: now.clone(),
                     updated_at: now,
                 },
@@ -194,19 +199,38 @@ fn normalize_required(field: &str, value: String, max_bytes: usize) -> Result<St
     Ok(value.to_string())
 }
 
-fn validate_repository_uri(uri: &str) -> Result<PathBuf> {
-    let uri = uri.trim();
-    if uri.is_empty() || uri.contains("://") {
-        return Err(Error::InvalidInput(
-            "initial repository uri must be an absolute server-local path".to_string(),
-        ));
+fn validate_repository_source(uri: &str) -> Result<RepositorySource> {
+    let mut source = parse_repository_source(uri)?;
+    match source.kind {
+        RepositorySourceKind::LocalPath => {
+            let canonical = validate_local_git_path(Path::new(&source.uri))?;
+            source.uri = canonical.to_string_lossy().into_owned();
+        }
+        RepositorySourceKind::File => {
+            let url = url::Url::parse(&source.uri).map_err(|error| {
+                Error::InvalidInput(format!("invalid file repository URI: {error}"))
+            })?;
+            let path = url.to_file_path().map_err(|_| {
+                Error::InvalidInput("file repository URI must contain an absolute path".to_string())
+            })?;
+            let canonical = validate_local_git_path(&path)?;
+            source.uri = url::Url::from_file_path(canonical)
+                .map_err(|_| {
+                    Error::InvalidInput("invalid canonical file repository path".to_string())
+                })?
+                .to_string();
+        }
+        RepositorySourceKind::Ssh | RepositorySourceKind::Http | RepositorySourceKind::Https => {}
+        RepositorySourceKind::Invalid => {
+            return Err(Error::InvalidInput(
+                "invalid initial repository source".to_string(),
+            ));
+        }
     }
-    let path = Path::new(uri);
-    if !path.is_absolute() {
-        return Err(Error::InvalidInput(
-            "initial repository uri must be an absolute server-local path".to_string(),
-        ));
-    }
+    Ok(source)
+}
+
+fn validate_local_git_path(path: &Path) -> Result<PathBuf> {
     let path = path.canonicalize().map_err(|error| {
         Error::InvalidInput(format!("initial repository path is unavailable: {error}"))
     })?;
@@ -383,12 +407,48 @@ mod tests {
     }
 
     #[test]
-    fn repository_intent_rejects_remote_and_non_git_paths() {
-        let remote = validate_repository_uri("https://example.test/repo.git").unwrap_err();
-        assert!(remote.to_string().contains("server-local path"));
+    fn repository_intent_accepts_remote_and_rejects_non_git_local_paths() {
+        let remote = validate_repository_source("https://example.test/repo.git").unwrap();
+        assert_eq!(remote.kind, RepositorySourceKind::Https);
 
         let dir = tempfile::tempdir().unwrap();
-        let non_git = validate_repository_uri(&dir.path().display().to_string()).unwrap_err();
+        let non_git = validate_repository_source(&dir.path().display().to_string()).unwrap_err();
         assert!(non_git.to_string().contains("not a Git repository"));
+    }
+
+    #[test]
+    fn remote_repository_creation_persists_typed_source_without_auth_metadata() {
+        let store = Arc::new(SqliteWorkspaceStore::in_memory().unwrap());
+        let service = WorkspaceCatalogService::new(store.clone());
+        let result = service
+            .create_first_ownerless(WorkspaceCreateRequest {
+                operation_key: "remote-create".to_string(),
+                display_name: "Remote Workspace".to_string(),
+                repository: InitialRepositoryIntent {
+                    uri: "ssh://git@example.test/org/repository.git".to_string(),
+                    display_name: Some("Remote Repository".to_string()),
+                    default_ref: Some("main".to_string()),
+                },
+            })
+            .unwrap();
+
+        let persisted = store
+            .get_repository(
+                &result.workspace.workspace_id,
+                &result.repository.repository_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.source.kind, RepositorySourceKind::Ssh);
+        assert_eq!(persisted.source_revision, 1);
+        assert!(persisted.source_fingerprint.starts_with("sha256:"));
+        assert_eq!(
+            persisted.observed_status,
+            RepositoryObservedStatus::Unverified
+        );
+        let json = serde_json::to_value(&persisted).unwrap();
+        assert!(json.get("source").is_some());
+        assert!(json.get("auth_ref_kind").is_none());
+        assert!(json.get("auth_ref_key").is_none());
     }
 }
