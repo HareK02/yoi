@@ -968,10 +968,10 @@ async fn authorize_workspace_api_request(
     mut request: Request,
     next: axum::middleware::Next,
 ) -> Response {
-    if !request.uri().path().starts_with("/api/") || is_server_global_forward(request.uri().path())
-    {
+    if !request.uri().path().starts_with("/api/") {
         return next.run(request).await;
     }
+    let public_server_api = is_server_global_forward(request.uri().path());
     let workspace_id = api.workspace_id().to_owned();
     let proof = request
         .headers()
@@ -1020,6 +1020,7 @@ async fn authorize_workspace_api_request(
     .await
     {
         Ok(Some(actor)) => actor,
+        Ok(None) if public_server_api => return next.run(request).await,
         Ok(None) | Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
     };
     let cookie_authenticated = matches!(actor.auth_method, ActorAuthMethod::BrowserSession);
@@ -15879,6 +15880,61 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(csrf_accepted.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn direct_workspace_router_enforces_origin_on_browser_auth_mutations() {
+        let workspace = tempfile::tempdir().unwrap();
+        let api = test_api(workspace.path()).await;
+        seed_test_api_token(api.store.as_ref(), "direct-cookie");
+        api.store
+            .create_browser_session(&BrowserSessionRecord {
+                token_hash: crate::auth::token_hash("direct-browser-session"),
+                session_id: "direct-session".to_owned(),
+                user_id: "user-direct-cookie".to_owned(),
+                created_at: "2026-01-01T00:00:00Z".to_owned(),
+                expires_at: "2099-01-01T00:00:00Z".to_owned(),
+                revoked_at: None,
+            })
+            .unwrap();
+        let AuthConfig::Passkey {
+            origin,
+            cookie_name,
+            ..
+        } = &api.config.auth;
+        let origin = origin.clone();
+        let cookie = format!("{cookie_name}=direct-browser-session");
+        let app = build_router(api.clone());
+
+        let cross_site = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/device-login/approve")
+                    .header(axum::http::header::COOKIE, &cookie)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross_site.status(), StatusCode::FORBIDDEN);
+
+        let same_origin = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/device-login/approve")
+                    .header(axum::http::header::COOKIE, cookie)
+                    .header(ORIGIN, origin)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(same_origin.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
