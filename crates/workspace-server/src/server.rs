@@ -916,7 +916,7 @@ async fn authorize_scoped_workspace_request(
         let digest = worker_runtime::auth::request_body_digest(&body);
         *request.body_mut() = axum::body::Body::from(body);
         let permission = if path.starts_with("/api/runtime/v1/workspaces/")
-            || path.contains("/profile-source-archive/")
+            || path.contains("/profile-source-archives/")
         {
             worker_runtime::auth::BACKEND_RESOURCE_FETCH_PERMISSION
         } else {
@@ -988,7 +988,7 @@ async fn authorize_workspace_api_request(
         let digest = worker_runtime::auth::request_body_digest(&body);
         *request.body_mut() = axum::body::Body::from(body);
         let permission = if path.starts_with("/api/runtime/v1/workspaces/")
-            || path.contains("/profile-source-archive/")
+            || path.contains("/profile-source-archives/")
         {
             worker_runtime::auth::BACKEND_RESOURCE_FETCH_PERMISSION
         } else {
@@ -19354,6 +19354,62 @@ mod tests {
             error,
             worker_runtime::resource::BackendResourceError::MissingResource
         ));
+    }
+
+    #[tokio::test]
+    async fn runtime_signed_profile_source_archive_fetch_uses_resource_permission() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let mut api = test_api(workspace.path()).await;
+        let identity =
+            worker_runtime::auth::RuntimeIdentityMaterial::generate("runtime-test").unwrap();
+        configure_runtime_request_auth(&mut api, &identity, "runtime-test");
+        let handle = api.resource_broker.issue_profile_source_archive_handle(
+            TEST_WORKSPACE_ID,
+            crate::resource_broker::BackendResourceTarget::Runtime("runtime-test"),
+            test_profile_archive(),
+        );
+        let path = format!(
+            "/api/w/{TEST_WORKSPACE_ID}/profile-source-archives/{}",
+            handle.digest
+        );
+        let proof = worker_runtime::auth::RuntimeRequestSourceSigner::from_identity(&identity)
+            .issue(
+                "server-test",
+                TEST_WORKSPACE_ID,
+                None,
+                worker_runtime::auth::BACKEND_RESOURCE_FETCH_PERMISSION,
+                "GET",
+                &path,
+                b"",
+                i64::try_from(worker_runtime::auth::unix_now_seconds()).unwrap_or(i64::MAX),
+                30,
+            )
+            .unwrap();
+        let response = build_router(api)
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header(
+                        worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER,
+                        proof,
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(ETAG).unwrap().to_str().unwrap(),
+            format!("\"profile-source:{}\"", handle.digest)
+        );
+        assert!(
+            !to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
