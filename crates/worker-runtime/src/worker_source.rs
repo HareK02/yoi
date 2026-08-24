@@ -639,8 +639,8 @@ fn unix_now_seconds() -> u64 {
 mod tests {
     use super::*;
     use crate::auth::{
-        WorkerMutationSourceExpectation, decode_worker_mutation_source_claims,
-        verify_worker_mutation_source_proof,
+        WorkerMutationSourceExpectation, decode_runtime_request_source_claims,
+        decode_worker_mutation_source_claims, verify_worker_mutation_source_proof,
     };
 
     #[test]
@@ -846,7 +846,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_workspace_forwarding_stamps_runtime_identity_and_signed_source_proof() {
+    fn ordinary_workspace_forwarding_stamps_runtime_identity_and_signs_path_and_query() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::sync::Mutex;
@@ -875,15 +875,32 @@ mod tests {
         )
         .with_runtime_request_source(&identity, "server-a");
         let response = client
-            .execute(WorkspaceRequest::get("/api/w/workspace-a/tickets/search"))
+            .execute(WorkspaceRequest::get(
+                "/api/w/workspace-a/tickets/search?state=planning&limit=20",
+            ))
             .unwrap();
         assert_eq!(response.status, 200);
         server.join().unwrap();
-        let request = received.lock().unwrap().to_ascii_lowercase();
-        assert!(request.contains("x-yoi-runtime-id: runtime-a"));
-        assert!(request.contains("x-yoi-worker-id: worker-a"));
-        assert!(request.contains("x-yoi-runtime-request-proof: yoi-runtime-request-v1."));
-        assert!(!request.contains("authorization:"));
+        let request = received.lock().unwrap().clone();
+        let lowercase_request = request.to_ascii_lowercase();
+        assert!(lowercase_request.contains("x-yoi-runtime-id: runtime-a"));
+        assert!(lowercase_request.contains("x-yoi-worker-id: worker-a"));
+        assert!(lowercase_request.contains("x-yoi-runtime-request-proof: yoi-runtime-request-v1."));
+        assert!(!lowercase_request.contains("authorization:"));
+        let token = request
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case(RUNTIME_REQUEST_SOURCE_PROOF_HEADER)
+                        .then(|| value.trim())
+                })
+            })
+            .expect("runtime proof header");
+        let claims = decode_runtime_request_source_claims(token).unwrap();
+        assert_eq!(
+            claims.path,
+            "/api/w/workspace-a/tickets/search?state=planning&limit=20"
+        );
     }
 
     #[test]

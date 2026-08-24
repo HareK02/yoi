@@ -903,6 +903,12 @@ async fn resolve_server_actor(
     resolve_request_actor(api.store.as_ref(), headers, &cookie_name).await
 }
 
+fn signed_request_target(uri: &Uri) -> &str {
+    uri.path_and_query()
+        .map(|path_and_query| path_and_query.as_str())
+        .unwrap_or_else(|| uri.path())
+}
+
 async fn authorize_scoped_workspace_request(
     api: &WorkspaceServerApi,
     workspace_id: &str,
@@ -915,7 +921,7 @@ async fn authorize_scoped_workspace_request(
         .map(str::to_owned);
     if let Some(proof) = proof {
         let method = request.method().as_str().to_owned();
-        let path = request.uri().path().to_owned();
+        let path = signed_request_target(request.uri()).to_owned();
         let body = std::mem::take(request.body_mut());
         let body = axum::body::to_bytes(body, 16 * 1024 * 1024)
             .await
@@ -987,7 +993,7 @@ async fn authorize_workspace_api_request(
         .map(str::to_owned);
     if let Some(proof) = proof {
         let method = request.method().as_str().to_owned();
-        let path = request.uri().path().to_owned();
+        let path = signed_request_target(request.uri()).to_owned();
         let body = std::mem::take(request.body_mut());
         let Ok(body) = axum::body::to_bytes(body, 16 * 1024 * 1024).await else {
             return StatusCode::BAD_REQUEST.into_response();
@@ -10851,7 +10857,7 @@ async fn scoped_post_internal_runtime_resource_fetch(
         .get::<crate::worker_source::VerifiedRuntimeRequestSource>()
         .cloned();
     let method = request.method().as_str().to_owned();
-    let path = request.uri().path().to_owned();
+    let path = signed_request_target(request.uri()).to_owned();
     let body = axum::body::to_bytes(request.into_body(), 16 * 1024 * 1024)
         .await
         .map_err(|error| {
@@ -19857,6 +19863,68 @@ mod tests {
             result,
             Err(crate::worker_source::WorkerMutationSourceProofError::WrongWorkspace)
         ));
+    }
+
+    #[tokio::test]
+    async fn runtime_request_proof_verifies_path_and_query_for_ticket_search() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut api = test_api(workspace.path()).await;
+        let identity =
+            worker_runtime::auth::RuntimeIdentityMaterial::generate("runtime-test").unwrap();
+        configure_runtime_request_auth(&mut api, &identity, "runtime-test");
+        seed_worker_source_member(&api, "runtime-test", "worker-test");
+        let signer = worker_runtime::auth::RuntimeRequestSourceSigner::from_identity(&identity);
+        let signed_target =
+            format!("/api/w/{TEST_WORKSPACE_ID}/tickets/search?state=active&limit=20");
+        let tampered_target =
+            format!("/api/w/{TEST_WORKSPACE_ID}/tickets/search?state=all&limit=20");
+        let issue = |target: &str| {
+            signer
+                .issue(
+                    "server-test",
+                    TEST_WORKSPACE_ID,
+                    Some("worker-test"),
+                    worker_runtime::auth::WORKSPACE_REQUEST_PERMISSION,
+                    "GET",
+                    target,
+                    b"",
+                    i64::try_from(worker_runtime::auth::unix_now_seconds()).unwrap_or(i64::MAX),
+                    30,
+                )
+                .unwrap()
+        };
+        let app = build_router(api);
+
+        let tampered = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&tampered_target)
+                    .header(
+                        worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER,
+                        issue(&signed_target),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tampered.status(), StatusCode::UNAUTHORIZED);
+
+        let valid = app
+            .oneshot(
+                Request::builder()
+                    .uri(&signed_target)
+                    .header(
+                        worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER,
+                        issue(&signed_target),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(valid.status(), StatusCode::OK);
     }
 
     #[tokio::test]
