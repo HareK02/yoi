@@ -6459,6 +6459,25 @@ fn validate_workspace_resource_references(conn: &Connection) -> Result<()> {
 
 fn workspace_resource_reference_diagnostics(conn: &Connection) -> Result<Vec<String>> {
     let mut diagnostics = Vec::new();
+    let current_assignment_reference_sql =
+        if column_exists(conn, "ticket_current_worker_assignments", "role")?
+            && column_exists(conn, "ticket_worker_assignments", "role")?
+        {
+            "SELECT current.workspace_id || '/' || current.assignment_id \
+             FROM ticket_current_worker_assignments AS current \
+             WHERE NOT EXISTS (SELECT 1 FROM ticket_worker_assignments AS assignment \
+                 WHERE assignment.workspace_id = current.workspace_id \
+                   AND assignment.ticket_id = current.ticket_id \
+                   AND assignment.role = current.role \
+                   AND assignment.assignment_id = current.assignment_id) LIMIT 100"
+        } else {
+            "SELECT current.workspace_id || '/' || current.assignment_id \
+             FROM ticket_current_worker_assignments AS current \
+             WHERE NOT EXISTS (SELECT 1 FROM ticket_worker_assignments AS assignment \
+                 WHERE assignment.workspace_id = current.workspace_id \
+                   AND assignment.ticket_id = current.ticket_id \
+                   AND assignment.assignment_id = current.assignment_id) LIMIT 100"
+        };
     for (table, repository_nullable) in [
         ("workdir_registry", false),
         ("artifacts", true),
@@ -6531,14 +6550,7 @@ fn workspace_resource_reference_diagnostics(conn: &Connection) -> Result<Vec<Str
         ),
         (
             "ticket_current_worker_assignments.assignment_id",
-            "SELECT current.workspace_id || '/' || current.assignment_id \
-             FROM ticket_current_worker_assignments AS current \
-             WHERE NOT EXISTS (SELECT 1 FROM ticket_worker_assignments AS assignment \
-                 WHERE assignment.workspace_id = current.workspace_id \
-                   AND assignment.ticket_id = current.ticket_id \
-                   AND assignment.assignment_id = current.assignment_id \
-                   AND assignment.runtime_id = current.runtime_id \
-                   AND assignment.worker_id = current.worker_id) LIMIT 100",
+            current_assignment_reference_sql,
         ),
         (
             "ticket_worker_assignment_events.assignment_id",
@@ -6678,11 +6690,17 @@ fn collect_assignment_worker_reference_diagnostics(
     } else {
         ""
     };
+    let worker_principal_filter =
+        if column_exists(conn, "ticket_worker_assignments", "principal_kind")? {
+            "assignment.principal_kind = 'worker' AND "
+        } else {
+            ""
+        };
     let sql = format!(
         "SELECT assignment.workspace_id, assignment.assignment_id, \
                 assignment.runtime_id, assignment.worker_id \
          FROM ticket_worker_assignments AS assignment \
-         WHERE NOT EXISTS (SELECT 1 FROM worker_registry AS worker \
+         WHERE {worker_principal_filter}NOT EXISTS (SELECT 1 FROM worker_registry AS worker \
              WHERE worker.workspace_id = assignment.workspace_id \
                AND worker.runtime_id = assignment.runtime_id \
                AND worker.worker_id = assignment.worker_id) \
@@ -9296,6 +9314,60 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn migration_dry_run_accepts_non_worker_ticket_assignments() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            configure_sqlite(&conn).unwrap();
+            apply_migrations(&conn).unwrap();
+            conn.execute_batch(
+                r#"
+                INSERT INTO workspaces (
+                    workspace_id, display_name, state, created_at, updated_at
+                ) VALUES ('workspace-a', 'Workspace A', 'active', '1', '1');
+                INSERT INTO typed_tickets (
+                    workspace_id, ticket_id, slug, title, status, kind, priority, body,
+                    workflow_state, workflow_state_explicit
+                ) VALUES (
+                    'workspace-a', 'ticket-a', 'ticket-a', 'Ticket A', 'open', 'task',
+                    'normal', '', 'planning', 1
+                );
+                INSERT INTO ticket_worker_assignments (
+                    workspace_id, ticket_id, assignment_id, role, principal_kind,
+                    principal_id, runtime_id, worker_id, assigned_by, assigned_at
+                ) VALUES (
+                    'workspace-a', 'ticket-a', 'assignment-a', 'orchestrator',
+                    'workspace_agent', 'workspace-orchestrator', NULL, NULL, 'tester', '2'
+                );
+                INSERT INTO ticket_current_worker_assignments (
+                    workspace_id, ticket_id, role, assignment_id, principal_kind,
+                    principal_id, runtime_id, worker_id, updated_at
+                ) VALUES (
+                    'workspace-a', 'ticket-a', 'orchestrator', 'assignment-a',
+                    'workspace_agent', 'workspace-orchestrator', NULL, NULL, '2'
+                );
+                INSERT INTO ticket_assignment_operations (
+                    workspace_id, operation_id, action, ticket_id, role, principal_kind,
+                    principal_id, runtime_id, worker_id, assignment_id, created_at
+                ) VALUES (
+                    'workspace-a', 'operation-a', 'assign', 'ticket-a', 'orchestrator',
+                    'workspace_agent', 'workspace-orchestrator', NULL, NULL, 'assignment-a', '2'
+                );
+                "#,
+            )
+            .unwrap();
+        }
+
+        let before = std::fs::read(&path).unwrap();
+        let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
+        assert_eq!(plan.current_schema_version, 43);
+        assert!(!plan.migration_required);
+        assert!(plan.repairs.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]
