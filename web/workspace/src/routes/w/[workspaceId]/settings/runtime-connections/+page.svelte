@@ -183,7 +183,7 @@
             built_in: true,
             config_managed: false,
             active: false,
-            can_spawn_worker: false,
+            worker_creation_available: false,
             restart_required: false,
             status: 'unknown',
             diagnostics: []

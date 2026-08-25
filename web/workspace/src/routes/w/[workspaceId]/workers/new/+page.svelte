@@ -313,7 +313,7 @@
           <select class="worker-inline-select runtime-select" bind:value={runtimeId} required aria-label="Runtime">
             {#if options?.runtimes.length}
               {#each options.runtimes as runtime}
-                <option value={runtime.runtime_id} disabled={!runtime.can_spawn_worker}>
+                <option value={runtime.runtime_id} disabled={!runtime.worker_creation_available}>
                   {runtime.display_name}
                 </option>
               {/each}

@@ -2728,7 +2728,7 @@ pub struct RuntimeConnectionSummary {
     pub built_in: bool,
     pub config_managed: bool,
     pub active: bool,
-    pub can_spawn_worker: bool,
+    pub worker_creation_available: bool,
     pub restart_required: bool,
     pub status: String,
     pub diagnostics: Vec<RuntimeDiagnostic>,
@@ -2788,7 +2788,7 @@ pub struct WorkerLaunchRuntimeOption {
     pub runtime_id: String,
     pub display_name: String,
     pub built_in: bool,
-    pub can_spawn_worker: bool,
+    pub worker_creation_available: bool,
     pub working_directory_required: bool,
     pub status: String,
     pub diagnostics: Vec<RuntimeDiagnostic>,
@@ -6985,14 +6985,13 @@ fn select_memory_consolidation_runtime(api: &WorkspaceApi) -> ApiResult<String> 
         .items
         .iter()
         .find(|runtime| {
-            runtime.runtime_id == EMBEDDED_WORKER_RUNTIME_ID
-                && runtime.capabilities.can_spawn_worker
+            runtime.runtime_id == EMBEDDED_WORKER_RUNTIME_ID && runtime.worker_creation_available
         })
         .or_else(|| {
             runtimes
                 .items
                 .iter()
-                .find(|runtime| runtime.capabilities.can_spawn_worker)
+                .find(|runtime| runtime.worker_creation_available)
         })
     {
         return Ok(runtime.runtime_id.clone());
@@ -8327,29 +8326,6 @@ async fn create_workspace_working_directory(
                 code: "runtime_unavailable".to_string(),
                 severity: DiagnosticSeverity::Error,
                 message: "Selected Runtime is not available".to_string(),
-            }],
-        ));
-    }
-
-    if !runtime.capabilities.supports_worktrees {
-        api.config_store.finish_workdir_create_operation(
-            workspace_id,
-            &operation_id,
-            &request_fingerprint,
-            false,
-            Some("runtime_workdir_unsupported"),
-            &now_registry_timestamp(),
-        )?;
-        return Err(ApiError::with_diagnostics(
-            Error::RuntimeOperationFailed {
-                runtime_id: reserved.resolved_runtime_id,
-                code: "runtime_workdir_unsupported".to_string(),
-                message: "Selected Runtime does not support Workdir creation".to_string(),
-            },
-            vec![RuntimeDiagnostic {
-                code: "runtime_workdir_unsupported".to_string(),
-                severity: DiagnosticSeverity::Error,
-                message: "Selected Runtime does not support Workdir creation".to_string(),
             }],
         ));
     }
@@ -12477,7 +12453,7 @@ fn embedded_runtime_connection_summary(api: &WorkspaceApi) -> RuntimeConnectionS
             built_in: true,
             config_managed: false,
             active: runtime.status == "active",
-            can_spawn_worker: runtime.capabilities.can_spawn_worker,
+            worker_creation_available: runtime.worker_creation_available,
             restart_required: false,
             status: runtime.status,
             diagnostics: runtime.diagnostics,
@@ -12489,7 +12465,7 @@ fn embedded_runtime_connection_summary(api: &WorkspaceApi) -> RuntimeConnectionS
             built_in: true,
             config_managed: false,
             active: false,
-            can_spawn_worker: false,
+            worker_creation_available: false,
             restart_required: false,
             status: "unavailable".to_string(),
             diagnostics: vec![settings_diagnostic(
@@ -12518,12 +12494,12 @@ fn remote_runtime_connection_summaries(
             let live = live_runtimes
                 .iter()
                 .find(|runtime| runtime.runtime_id == remote.id);
-            let (display_name, kind, active, can_spawn_worker, status, diagnostics) = match live {
+            let (display_name, kind, active, worker_creation_available, status, diagnostics) = match live {
                 Some(runtime) => (
                     runtime.label.clone(),
                     runtime.kind.clone(),
                     runtime.status == "active",
-                    runtime.capabilities.can_spawn_worker,
+                    runtime.worker_creation_available,
                     runtime.status.clone(),
                     runtime.diagnostics.clone(),
                 ),
@@ -12555,7 +12531,7 @@ fn remote_runtime_connection_summaries(
                     built_in: false,
                     config_managed: true,
                     active,
-                    can_spawn_worker,
+                    worker_creation_available,
                     restart_required,
                     status,
                     diagnostics,
@@ -13070,7 +13046,7 @@ fn worker_launch_options_response(api: &WorkspaceApi) -> ApiResult<WorkerLaunchO
                 runtime_id: runtime.runtime_id,
                 display_name: runtime.label,
                 built_in,
-                can_spawn_worker: runtime.capabilities.can_spawn_worker,
+                worker_creation_available: runtime.worker_creation_available,
                 working_directory_required: !built_in,
                 status: runtime.status,
                 diagnostics: runtime.diagnostics,
@@ -13459,11 +13435,9 @@ fn sync_all_runtime_workdir_observations(api: &WorkspaceApi) -> Vec<RuntimeDiagn
     let mut diagnostics = Vec::new();
     let runtimes = api.runtime.list_runtimes(api.config.max_records.min(200));
     for runtime in runtimes.items {
-        if runtime.capabilities.supports_worktrees {
-            match sync_runtime_workdir_observations(api, runtime.runtime_id.as_str()) {
-                Ok(mut runtime_diagnostics) => diagnostics.append(&mut runtime_diagnostics),
-                Err(err) => diagnostics.extend(err.diagnostics),
-            }
+        match sync_runtime_workdir_observations(api, runtime.runtime_id.as_str()) {
+            Ok(mut runtime_diagnostics) => diagnostics.append(&mut runtime_diagnostics),
+            Err(err) => diagnostics.extend(err.diagnostics),
         }
     }
     diagnostics
@@ -14240,8 +14214,8 @@ mod tests {
     use worker_runtime::working_directory::WorkingDirectoryMaterializer;
 
     use crate::hosts::{
-        RemoteRuntimeAuthConfig, RuntimeCapabilitySummary, TicketWorkerRole, WorkerInputKind,
-        WorkerOperationState, WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent,
+        RemoteRuntimeAuthConfig, TicketWorkerRole, WorkerInputKind, WorkerOperationState,
+        WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent,
     };
     use crate::store::{
         AccountRecord, ApiTokenRecord, BrowserSessionRecord, MemoryDocumentRecord,
@@ -14303,22 +14277,9 @@ mod tests {
                 server_id: "server-test".to_owned(),
                 server_private_key: "unused".to_owned(),
             }),
-            cached_capabilities: RuntimeCapabilitySummary {
-                can_list_hosts: true,
-                can_list_workers: true,
-                can_get_worker: true,
-                can_spawn_worker: true,
-                can_stop_worker: true,
-                has_workspace_fs: false,
-                has_shell: false,
-                has_git: false,
-                supports_worktrees: false,
-                supports_backend_internal_tools: false,
-                workspace_scope: api.workspace_id().to_owned(),
-                max_workers: 1,
-                os: "test".to_owned(),
-                arch: "test".to_owned(),
-            },
+            cached_worker_creation_available: true,
+            cached_os: "test".to_owned(),
+            cached_arch: "test".to_owned(),
             cached_status: "connected".to_owned(),
             timeout: std::time::Duration::from_secs(1),
         });
@@ -19590,22 +19551,9 @@ mod tests {
                 server_id: "server-main".to_string(),
                 server_private_key: identity.private_key.clone(),
             }),
-            cached_capabilities: RuntimeCapabilitySummary {
-                can_list_hosts: true,
-                can_list_workers: true,
-                can_get_worker: true,
-                can_spawn_worker: true,
-                can_stop_worker: true,
-                has_workspace_fs: false,
-                has_shell: false,
-                has_git: false,
-                supports_worktrees: false,
-                supports_backend_internal_tools: false,
-                workspace_scope: TEST_WORKSPACE_ID.to_string(),
-                max_workers: 1,
-                os: "test".to_string(),
-                arch: "test".to_string(),
-            },
+            cached_worker_creation_available: true,
+            cached_os: "test".to_string(),
+            cached_arch: "test".to_string(),
             cached_status: "connected".to_string(),
             timeout: std::time::Duration::from_secs(1),
         });
@@ -20906,7 +20854,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_workspace_workdir_create_records_failed_default_resolution() {
+    async fn browser_workspace_workdir_create_delegates_and_records_default_runtime_failure() {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
         let api = test_api(dir.path()).await;
@@ -20931,7 +20879,7 @@ mod tests {
         assert_eq!(response["error"], "Bad Request");
         assert_eq!(
             response["diagnostics"][0]["code"],
-            "runtime_workdir_unsupported"
+            "embedded_worker_workdir_unsupported"
         );
         set_test_default_runtime(&api, "not-a-registered-runtime");
         request_json_authenticated(
@@ -20957,7 +20905,7 @@ mod tests {
         assert_eq!(operation.state, "failed");
         assert_eq!(
             operation.failure.as_deref(),
-            Some("runtime_workdir_unsupported")
+            Some("embedded_worker_workdir_unsupported")
         );
         assert_eq!(operation.config_revision, 2);
         assert!(!operation.config_projection_digest.is_empty());
@@ -22005,10 +21953,8 @@ mod tests {
         assert_eq!(hosts["items"][0]["runtime_id"], "embedded-worker-runtime");
         let host_id = hosts["items"][0]["host_id"].as_str().unwrap().to_string();
         assert_eq!(hosts["items"][0]["kind"], "embedded-worker-runtime-host");
-        assert_eq!(
-            hosts["items"][0]["capabilities"]["workspace_scope"],
-            "backend_internal"
-        );
+        assert_eq!(hosts["items"][0]["os"], std::env::consts::OS);
+        assert!(hosts["items"][0].get("capabilities").is_none());
         assert!(!hosts.to_string().contains("metadata.json"));
 
         let runtimes = get_json(app.clone(), "/api/runtimes").await;
@@ -22481,11 +22427,8 @@ mod tests {
             "embedded_worker_runtime"
         );
         assert_eq!(embedded_summary["source"]["status"], "active");
-        assert_eq!(
-            embedded_summary["capabilities"]["workspace_scope"],
-            "backend_internal"
-        );
-        assert_eq!(embedded_summary["capabilities"]["has_workspace_fs"], false);
+        assert_eq!(embedded_summary["worker_creation_available"], true);
+        assert!(embedded_summary.get("capabilities").is_none());
 
         let spawned = post_json(
             app.clone(),

@@ -30,9 +30,9 @@ export function defaultWorkerLaunchForm(
 ): WorkerLaunchFormState {
   const preferredRuntime =
     options?.runtimes.find((runtime) =>
-      runtime.can_spawn_worker && runtime.status === "active"
+      runtime.worker_creation_available && runtime.status === "active"
     ) ??
-      options?.runtimes.find((runtime) => runtime.can_spawn_worker) ??
+      options?.runtimes.find((runtime) => runtime.worker_creation_available) ??
       options?.runtimes[0];
   const preferredProfile = options?.profiles.find((candidate) =>
     candidate.id === options.default_profile

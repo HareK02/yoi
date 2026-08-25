@@ -32,7 +32,7 @@ export type RuntimeConnectionSummary = {
   built_in: boolean;
   config_managed: boolean;
   active: boolean;
-  can_spawn_worker: boolean;
+  worker_creation_available: boolean;
   restart_required: boolean;
   status: string;
   diagnostics: Diagnostic[];
