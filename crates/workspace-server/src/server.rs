@@ -4025,6 +4025,20 @@ async fn execute_ticket_rest_operation(
             queue_assignment_candidates(&backend, &ticket.meta.id).map_err(Error::from)?;
         let mut assignment_ids = BTreeMap::new();
         for ticket_id in candidates {
+            if api
+                .store
+                .get_current_ticket_role_assignment(
+                    workspace_id,
+                    &ticket_id,
+                    TicketAssignmentRole::Coder,
+                )?
+                .is_some()
+            {
+                return Err(Error::TicketAssignmentConflict(format!(
+                    "Queue rejects Ticket {ticket_id} while a Coder assignment is active"
+                ))
+                .into());
+            }
             let assignment = active_orchestrator_assignment(api, workspace_id, &ticket_id)?
                 .ok_or_else(|| {
                     Error::TicketAssignmentConflict(format!(
@@ -17419,7 +17433,11 @@ mod tests {
         let Json(ready_detail) = scoped_get_ticket(State(api.clone()), AxumPath(path()))
             .await
             .unwrap();
-        assert!(ready_detail.action_eligibility.can_queue);
+        assert!(
+            ready_detail.action_eligibility.can_queue,
+            "Queue blockers: {:?}",
+            ready_detail.action_eligibility.blockers
+        );
         assert!(ready_detail.action_eligibility.blockers.is_empty());
         assert_eq!(ready_detail.relations.blockers.len(), 1);
         assert_eq!(ready_detail.relations.blockers[0].reason_kind, "depends_on");
