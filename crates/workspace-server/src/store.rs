@@ -9734,7 +9734,10 @@ mod tests {
 
         let before = std::fs::read(&path).unwrap();
         let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
-        assert_eq!(plan.current_schema_version, 43);
+        assert_eq!(
+            plan.current_schema_version,
+            i64::from(MIGRATIONS.last().expect("at least one migration").version)
+        );
         assert!(!plan.migration_required);
         assert!(plan.repairs.is_empty());
         assert_eq!(std::fs::read(&path).unwrap(), before);
