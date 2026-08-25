@@ -7934,9 +7934,19 @@ fn build_runtime_cleanup_plan(
         let links = api
             .store
             .list_worker_workdir_links(&api.config.workspace_id, &record.worker)?;
+        let current_assignment = api.store.get_current_ticket_role_assignment_for_worker(
+            &api.config.workspace_id,
+            &record.worker,
+        )?;
         let is_running = live_running_worker_ids.contains(&record.worker);
         let pinned = record.retention_state == "pinned";
-        let blocking_reason = if pinned {
+        let blocking_reason = if let Some(assignment) = current_assignment {
+            Some(format!(
+                "worker has current Ticket assignment `{}` (`{}`)",
+                assignment.ticket_id,
+                assignment.role.as_str()
+            ))
+        } else if pinned {
             Some("worker is pinned".to_string())
         } else if is_running {
             Some("worker is running".to_string())
@@ -8114,6 +8124,24 @@ async fn execute_runtime_cleanup(
         .iter()
         .filter(|candidate| worker_targets.contains(candidate.target_id.as_str()))
     {
+        let worker = RuntimeWorkerRef::new(
+            candidate.runtime_id.clone(),
+            candidate.runtime_worker_id.clone(),
+        );
+        if let Some(assignment) = api
+            .store
+            .get_current_ticket_role_assignment_for_worker(&api.config.workspace_id, &worker)?
+        {
+            return Err(cleanup_api_error(
+                runtime_id,
+                "workspace_cleanup_worker_assigned",
+                &format!(
+                    "Worker is assigned to Ticket `{}` as `{}` and cannot be deleted",
+                    assignment.ticket_id,
+                    assignment.role.as_str()
+                ),
+            ));
+        }
         if let Some(reason) = &candidate.blocking_reason {
             return Err(cleanup_api_error(
                 runtime_id,
@@ -8129,10 +8157,6 @@ async fn execute_runtime_cleanup(
             ));
         }
         parse_runtime_worker_id_for_registry(&candidate.runtime_worker_id)?;
-        let worker = RuntimeWorkerRef::new(
-            candidate.runtime_id.clone(),
-            candidate.runtime_worker_id.clone(),
-        );
         let session_lock = current_worker_session_lock(api, &worker);
         let _session_guard = session_lock.lock().await;
         close_current_worker_session_locked(api, &worker).await?;
@@ -18134,6 +18158,43 @@ mod tests {
         runtime_worker_id.to_string()
     }
 
+    fn seed_cleanup_worker_assignment(
+        api: &WorkspaceApi,
+        runtime_worker_id: &str,
+        ticket_id: &str,
+    ) {
+        let conn = rusqlite::Connection::open(&api.config.database_path).unwrap();
+        crate::store::configure_sqlite(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO typed_tickets (
+                 workspace_id, ticket_id, slug, title, status, kind, priority, body,
+                 workflow_state, workflow_state_explicit
+             ) VALUES (?1, ?2, ?2, ?2, 'open', 'task', 'normal', '', 'inprogress', 1)",
+            rusqlite::params![api.config.workspace_id, ticket_id],
+        )
+        .unwrap();
+        api.store
+            .set_current_ticket_role_assignment(
+                &TicketRoleAssignmentRecord {
+                    workspace_id: api.config.workspace_id.clone(),
+                    ticket_id: ticket_id.to_string(),
+                    assignment_id: format!("assignment-{ticket_id}"),
+                    role: TicketAssignmentRole::Coder,
+                    principal: TicketAssignmentPrincipal::Worker {
+                        runtime_id: "runtime-test".to_string(),
+                        worker_id: runtime_worker_id.to_string(),
+                    },
+                    assigned_by: "test".to_string(),
+                    assigned_at: "2026-08-25T00:00:00Z".to_string(),
+                },
+                None,
+                &format!("event-{ticket_id}"),
+                &format!("operation-{ticket_id}"),
+                false,
+            )
+            .unwrap();
+    }
+
     fn seed_test_repository(api: &WorkspaceApi, repository_id: &str) {
         if api
             .store
@@ -18428,6 +18489,56 @@ mod tests {
             execute_runtime_cleanup(&api, "runtime-test", pinned)
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_blocks_assigned_worker_before_runtime_deletion() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let worker_id = seed_cleanup_worker(&api, 3, "normal");
+        seed_cleanup_worker_assignment(&api, &worker_id, "ticket-assigned");
+
+        let plan = build_runtime_cleanup_plan(&api, "runtime-test")
+            .unwrap_or_else(|err| panic!("cleanup plan: {}", err.error));
+        let candidate = plan
+            .workers
+            .iter()
+            .find(|candidate| candidate.worker_id == worker_id)
+            .unwrap();
+        assert_eq!(
+            candidate.blocking_reason.as_deref(),
+            Some("worker has current Ticket assignment `ticket-assigned` (`coder`)")
+        );
+        let request = ExecuteRuntimeCleanupRequest {
+            expected_plan_revision: plan.revision.clone(),
+            expected_plan_digest: plan.digest.clone(),
+            worker_target_ids: vec![candidate.target_id.clone()],
+            workdir_target_ids: Vec::new(),
+            confirm_dirty_discard_target_ids: Vec::new(),
+        };
+
+        let error = execute_runtime_cleanup(&api, "runtime-test", request)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error.error,
+                Error::RuntimeOperationFailed { ref code, .. }
+                    if code == "workspace_cleanup_worker_assigned"
+            ),
+            "unexpected cleanup error: {:?}",
+            error.error
+        );
+        assert!(
+            api.store
+                .get_worker_registry(
+                    &api.config.workspace_id,
+                    &RuntimeWorkerRef::new("runtime-test", worker_id),
+                )
+                .unwrap()
+                .is_some()
         );
     }
 

@@ -1049,6 +1049,11 @@ pub trait ControlPlaneStore: Send + Sync {
         workspace_id: &str,
         ticket_id: &str,
     ) -> Result<Vec<TicketRoleAssignmentRecord>>;
+    fn get_current_ticket_role_assignment_for_worker(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<TicketRoleAssignmentRecord>>;
     fn get_current_ticket_role_assignment(
         &self,
         workspace_id: &str,
@@ -3604,6 +3609,28 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 .query_row(
                     &sql,
                     params![workspace_id, ticket_id, role.as_str()],
+                    read_ticket_role_assignment_record,
+                )
+                .optional()?)
+        })
+    }
+
+    fn get_current_ticket_role_assignment_for_worker(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<TicketRoleAssignmentRecord>> {
+        self.with_conn(|conn| {
+            let sql = ticket_role_assignment_select_sql(
+                "WHERE current.workspace_id = ?1 \
+                   AND current.principal_kind = 'worker' \
+                   AND current.runtime_id = ?2 AND current.worker_id = ?3 \
+                 ORDER BY a.assigned_at, a.assignment_id LIMIT 1",
+            );
+            Ok(conn
+                .query_row(
+                    &sql,
+                    params![workspace_id, worker.runtime_id, worker.worker_id],
                     read_ticket_role_assignment_record,
                 )
                 .optional()?)
