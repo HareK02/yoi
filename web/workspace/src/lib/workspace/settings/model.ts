@@ -8,6 +8,7 @@ export type SettingsSectionId =
   | "runtime-connections"
   | "runtime-inventory"
   | "configuration-sources"
+  | "repository-access"
   | "profile-sources"
   | "backend-config"
   | "workspace-identity";
@@ -72,7 +73,7 @@ export type RemoteRuntimeTestResponse = {
 export const SETTINGS_ROUTE = "/settings";
 
 export const SETTINGS_PERMISSION_NOTICE =
-  "Yoi currently has no browser user, role, permission, or multi-user authorization model. This local settings surface uses typed Backend APIs only; it does not create an admin role or grant broad mutation authority.";
+  "Workspace settings use authenticated account authority and Workspace-scoped typed Backend APIs. Repository secret management requires the current Workspace owner; this surface does not expose secret material or grant Runtime execution authority.";
 
 export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   {
@@ -109,6 +110,18 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
       "Virtual paths and imports resolve inside the committed Workspace tree, never from browser or Server host paths.",
       "Browser analysis is advisory; Server evaluation is required before an atomic revision commit.",
       "Profile launch data is projected from this active revision; remaining Skill, Prompt, and Plugin consumers migrate in their follow-up cutovers.",
+    ],
+  },
+  {
+    id: "repository-access",
+    label: "Repository Access",
+    status: "editable",
+    summary:
+      "Manage Workspace-scoped SSH credentials and pinned host keys without exposing stored secret material.",
+    bullets: [
+      "Private keys and passphrases are write-only; list and detail responses contain public metadata only.",
+      "Host trust requires an explicitly pinned key and never uses accept-new or TOFU.",
+      "Repository bindings are committed through the shared Workspace configuration editor and validated against these records.",
     ],
   },
   {
@@ -175,6 +188,8 @@ export function settingsSectionHref(id: SettingsSectionId): string {
       return `${SETTINGS_ROUTE}/runtimes`;
     case "configuration-sources":
       return `${SETTINGS_ROUTE}/configuration`;
+    case "repository-access":
+      return `${SETTINGS_ROUTE}/repository-access`;
     case "profile-sources":
       return `${SETTINGS_ROUTE}/profiles`;
     case "workspace-identity":

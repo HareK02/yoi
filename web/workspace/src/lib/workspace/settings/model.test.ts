@@ -38,14 +38,36 @@ Deno.test("settings section navigation stays under the settings route", () => {
   }
 });
 
-Deno.test("settings shell advertises no fake browser admin model", () => {
+Deno.test("settings shell advertises scoped account authority", () => {
   assert(
-    SETTINGS_PERMISSION_NOTICE.includes("no browser user, role, permission"),
-    "notice should explicitly deny a browser permission model",
+    SETTINGS_PERMISSION_NOTICE.includes("authenticated account authority"),
+    "notice should identify authenticated account authority",
   );
   assert(
-    SETTINGS_PERMISSION_NOTICE.includes("does not create an admin role"),
-    "notice should not imply an admin role exists",
+    SETTINGS_PERMISSION_NOTICE.includes("current Workspace owner"),
+    "notice should state the Repository secret permission boundary",
+  );
+  assert(
+    SETTINGS_PERMISSION_NOTICE.includes("does not expose secret material"),
+    "notice should not imply that stored secret material is readable",
+  );
+});
+
+Deno.test("Repository access settings are editable and canonically routed", () => {
+  const section = SETTINGS_SECTIONS.find((entry) =>
+    entry.id === "repository-access"
+  );
+  assert(
+    section?.status === "editable",
+    "Repository Access should be editable",
+  );
+  assert(
+    settingsSectionHref("repository-access") === "/settings/repository-access",
+    "Repository Access should have a dedicated settings route",
+  );
+  assert(
+    section?.bullets.join("\n").includes("write-only"),
+    "Repository Access copy should preserve write-only secret semantics",
   );
 });
 

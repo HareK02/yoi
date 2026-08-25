@@ -32,6 +32,10 @@
         <dd>{data.repository.item.source.kind} · {data.repository.item.source.uri}</dd>
       </div>
       <div>
+        <dt>Repository access</dt>
+        <dd><a href={`/w/${encodeURIComponent(data.workspace.workspace_id)}/settings/repository-access`}>Manage SSH credentials and pinned host keys</a></dd>
+      </div>
+      <div>
         <dt>Source revision</dt>
         <dd>{data.repository.item.source_revision} · {data.repository.item.source_fingerprint}</dd>
       </div>
