@@ -1828,6 +1828,10 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             put(scoped_set_ticket_assignment).delete(scoped_clear_ticket_assignment),
         )
         .route(
+            "/api/w/{workspace_id}/tickets/{id}/implementation-cancellations",
+            post(scoped_cancel_ticket_implementation),
+        )
+        .route(
             "/api/w/{workspace_id}/tickets/{id}/state",
             post(scoped_transition_ticket_state),
         )
@@ -3176,6 +3180,14 @@ struct SetTicketRoleAssignmentRequest {
     expected_assignment_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CancelTicketImplementationRequest {
+    operation_id: String,
+    assignment_id: String,
+    reason: String,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ClearTicketRoleAssignmentQuery {
@@ -3373,6 +3385,113 @@ async fn scoped_clear_ticket_assignment(
         assignment: None,
     }))
 }
+
+async fn scoped_cancel_ticket_implementation(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRecordPath>,
+    Json(request): Json<CancelTicketImplementationRequest>,
+) -> ApiResult<Json<TicketDetail>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let ticket = api.authority.ticket(&path.id)?;
+    let operation_id = require_ticket_assignment_value("operation_id", request.operation_id)?;
+    let assignment_id = require_ticket_assignment_value("assignment_id", request.assignment_id)?;
+    let reason = require_ticket_assignment_value("reason", request.reason)?;
+    if reason.len() > 512 {
+        return Err(Error::InvalidInput(
+            "implementation cancellation reason must be at most 512 bytes".to_string(),
+        )
+        .into());
+    }
+
+    if !matches!(
+        ticket.state.as_str(),
+        state if state == TicketWorkflowState::InProgress.as_str()
+            || state == TicketWorkflowState::Ready.as_str()
+    ) {
+        return Err(Error::TicketAssignmentConflict(format!(
+            "implementation cancellation requires an inprogress Ticket; current state is {}",
+            ticket.state
+        ))
+        .into());
+    }
+
+    let current = api.store.get_current_ticket_role_assignment(
+        &path.workspace_id,
+        &ticket.id,
+        TicketAssignmentRole::Coder,
+    )?;
+    if let Some(assignment) = current.filter(|value| value.assignment_id == assignment_id)
+        && let TicketAssignmentPrincipal::Worker {
+            runtime_id,
+            worker_id,
+        } = assignment.principal
+    {
+        if api
+            .store
+            .get_ticket_assignment_operation(&path.workspace_id, &operation_id)?
+            .is_some()
+        {
+            return Err(Error::TicketAssignmentConflict(format!(
+                "operation `{operation_id}` was already used for another Ticket assignment mutation"
+            ))
+            .into());
+        }
+        let worker = RuntimeWorkerRef::new(runtime_id, worker_id);
+        cancel_ticket_coder_worker(&api, &worker, &reason).await?;
+    }
+
+    let cancelled = api.store.cancel_current_ticket_coder_assignment(
+        &path.workspace_id,
+        &ticket.id,
+        &assignment_id,
+        &new_id("tasev"),
+        &new_id("tev"),
+        &operation_id,
+        "workspace-web",
+        &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        &reason,
+    )?;
+    if !cancelled {
+        return Err(Error::TicketAssignmentConflict(format!(
+            "assignment `{assignment_id}` is not the current Coder implementation"
+        ))
+        .into());
+    }
+    browser_ticket_detail(&api, &ticket.id)
+}
+
+async fn cancel_ticket_coder_worker(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    reason: &str,
+) -> ApiResult<()> {
+    let session_lock = current_worker_session_lock(api, worker);
+    let _session_guard = session_lock.lock().await;
+    match api.runtime.cancel_worker(
+        worker,
+        WorkerLifecycleRequest {
+            reason: Some(format!("Ticket implementation cancelled: {reason}")),
+            ticket_assignment: None,
+        },
+    ) {
+        Ok(result) if result.state == WorkerOperationState::Accepted => {}
+        Ok(result) => {
+            return Err(ApiError::with_diagnostics(
+                Error::RuntimeOperationFailed {
+                    runtime_id: worker.runtime_id.clone(),
+                    code: "workspace_ticket_implementation_cancel_rejected".to_string(),
+                    message: "Runtime did not cancel the assigned Coder Worker".to_string(),
+                },
+                result.diagnostics,
+            ));
+        }
+        Err(RuntimeRegistryError::UnknownWorker { .. }) => {}
+        Err(error) => return Err(error.into_error().into()),
+    }
+    close_current_worker_session_locked(api, worker).await?;
+    Ok(())
+}
+
 fn validate_ticket_assignment_state(
     api: &WorkspaceApi,
     assignment: &WorkerTicketAssignmentRequest,
@@ -16013,6 +16132,114 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(replayed_clear.assignment, None);
+    }
+
+    #[tokio::test]
+    async fn implementation_cancellation_cancels_coder_and_returns_ticket_to_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let worker = api
+            .runtime
+            .spawn_worker(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                test_create_binding(),
+                WorkerSpawnRequest {
+                    requested_worker_name: Some("cancelled-coder".to_string()),
+                    intent: WorkerSpawnIntent::TicketRole {
+                        ticket_id: "implementation-cancellation".to_string(),
+                        role: TicketWorkerRole::Coder,
+                    },
+                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                        expected_segments: 0,
+                    },
+                    profile: ProfileSelector::Builtin("builtin:coder".to_string()),
+                    ticket_assignment: None,
+                    initial_submit: Vec::new(),
+                    working_directory_request: None,
+                    resolved_working_directory_request: None,
+                    resolved_working_directory: None,
+                    resolved_config_bundle: None,
+                    resolved_worker_observation_enabled: false,
+                    resolved_worker_observation_grants: Vec::new(),
+                    resolved_workspace_api: Some(test_worker_workspace_api(
+                        EMBEDDED_WORKER_RUNTIME_ID,
+                    )),
+                    resolved_memory_settings: Some(test_worker_memory_settings()),
+                    resolved_control_operation: None,
+                },
+            )
+            .unwrap()
+            .worker
+            .unwrap()
+            .worker;
+        let worker = RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, worker.worker_id);
+        api.store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                worker: worker.clone(),
+                display_name: "Cancelled Coder".to_string(),
+                profile: Some("builtin:coder".to_string()),
+                retention_state: "normal".to_string(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: TEST_CREATED_AT.to_string(),
+                updated_at: TEST_CREATED_AT.to_string(),
+            })
+            .unwrap();
+        let backend = browser_ticket_backend(&api).unwrap();
+        let mut input = ticket::NewTicket::new("Implementation cancellation");
+        input.workflow_state = Some(TicketWorkflowState::InProgress);
+        let ticket = backend.create(input).unwrap();
+        api.store
+            .set_current_ticket_coder_assignment(
+                &TicketCoderAssignmentRecord {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    ticket_id: ticket.id.clone(),
+                    assignment_id: "cancelled-assignment".to_string(),
+                    worker: worker.clone(),
+                    assigned_by: "test-user".to_string(),
+                    assigned_at: TEST_CREATED_AT.to_string(),
+                },
+                None,
+                "cancelled-assignment-event",
+                "cancelled-assignment-operation",
+                false,
+            )
+            .unwrap();
+        let path = || {
+            AxumPath(ScopedRecordPath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                id: ticket.id.clone(),
+            })
+        };
+        let request = || {
+            Json(CancelTicketImplementationRequest {
+                operation_id: "cancel-implementation-operation".to_string(),
+                assignment_id: "cancelled-assignment".to_string(),
+                reason: "redo with the corrected design".to_string(),
+            })
+        };
+
+        let Json(cancelled) =
+            scoped_cancel_ticket_implementation(State(api.clone()), path(), request())
+                .await
+                .unwrap();
+        assert_eq!(cancelled.state, TicketWorkflowState::Ready.as_str());
+        assert!(cancelled.current_coder.is_none());
+        assert!(
+            !cancelled
+                .assignments
+                .iter()
+                .any(|assignment| assignment.role == "coder")
+        );
+        assert_eq!(api.runtime.worker(&worker).unwrap().state, "cancelled");
+
+        let Json(replayed) = scoped_cancel_ticket_implementation(State(api), path(), request())
+            .await
+            .unwrap();
+        assert_eq!(replayed.state, TicketWorkflowState::Ready.as_str());
     }
 
     #[tokio::test]

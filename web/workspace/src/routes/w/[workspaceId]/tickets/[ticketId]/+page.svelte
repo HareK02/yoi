@@ -55,6 +55,10 @@
   let readyOperationKey = $state<string | null>(null);
   let manualRuntimeId = $state("");
   let manualWorkerId = $state("");
+  let cancellationReason = $state("");
+  const coderAssignment = $derived(
+    ticket.assignments.find((assignment) => assignment.role === "coder") ?? null,
+  );
   const selectedRepository = $derived(
     (loadedRepositories?.items ?? []).find((repository: RepositorySummary) => repository.id === repositoryId) ?? null,
   );
@@ -160,6 +164,18 @@
       runtime_id: manualRuntimeId.trim(),
       worker_id: manualWorkerId.trim(),
     });
+  }
+
+  async function cancelImplementation(event: SubmitEvent): Promise<void> {
+    event.preventDefault();
+    if (!coderAssignment || !cancellationReason.trim()) return;
+    if (
+      await mutate("cancel-implementation", "/implementation-cancellations", {
+        operation_id: crypto.randomUUID(),
+        assignment_id: coderAssignment.assignment_id,
+        reason: cancellationReason.trim(),
+      })
+    ) cancellationReason = "";
   }
 
   async function saveEdit(event: SubmitEvent) {
@@ -415,6 +431,24 @@
               {busy === "start-manual" ? "Starting…" : "Assign Coder and start"}
             </button>
           </form>
+        {/if}
+        {#if ticket.state === "inprogress" && coderAssignment}
+          <details class="ticket-cancel-implementation">
+            <summary>Cancel implementation</summary>
+            <form class="ticket-control-form" onsubmit={cancelImplementation}>
+              <p class="workspace-empty-copy">
+                Cancel the assigned Coder, remove its assignment, and return this Ticket to ready.
+              </p>
+              <label>Reason<textarea bind:value={cancellationReason} rows="3" required></textarea></label>
+              <button
+                class="workspace-danger-button"
+                type="submit"
+                disabled={busy !== null || !cancellationReason.trim()}
+              >
+                {busy === "cancel-implementation" ? "Cancelling…" : "Cancel and return to ready"}
+              </button>
+            </form>
+          </details>
         {/if}
         {#if ticket.assignment_diagnostics.length > 0}
           {#each ticket.assignment_diagnostics as diagnostic}

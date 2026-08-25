@@ -1086,6 +1086,18 @@ pub trait ControlPlaneStore: Send + Sync {
         occurred_at: &str,
         reason: Option<&str>,
     ) -> Result<bool>;
+    fn cancel_current_ticket_coder_assignment(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+        assignment_id: &str,
+        assignment_event_id: &str,
+        state_event_id: &str,
+        operation_id: &str,
+        actor: &str,
+        occurred_at: &str,
+        reason: &str,
+    ) -> Result<bool>;
     fn get_current_ticket_coder_assignment(
         &self,
         workspace_id: &str,
@@ -4084,106 +4096,110 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<bool> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = read_ticket_role_assignment_by_id(&tx, workspace_id, assignment_id)?;
-        let Some(current) = current.filter(|value| {
-            value.ticket_id == ticket_id && value.role == role
-        }) else {
-            return Ok(false);
-        };
-        let principal_json = serde_json::to_string(&current.principal)
-            .map_err(|error| Error::Store(format!("serialize Ticket assignment principal: {error}")))?;
-        let mut hasher = Sha256::new();
-        for value in [
-            "ticket-role-assignment:clear:v1",
-            workspace_id,
-            ticket_id,
-            role.as_str(),
-            assignment_id,
-            principal_json.as_str(),
-            actor,
-            reason.unwrap_or(""),
-        ] {
-            hasher.update(value.as_bytes());
-            hasher.update([0]);
-        }
-        let fingerprint = hasher
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        let (principal_id, runtime_id, worker_id) = match &current.principal {
-            TicketAssignmentPrincipal::User { account_id } => {
-                (Some(account_id.as_str()), None, None)
-            }
-            TicketAssignmentPrincipal::Worker {
-                runtime_id,
-                worker_id,
-            } => (None, Some(runtime_id.as_str()), Some(worker_id.as_str())),
-            TicketAssignmentPrincipal::WorkspaceAgent { agent_key } => {
-                (Some(agent_key.as_str()), None, None)
-            }
-        };
-        let inserted = tx.execute(
-            "INSERT OR IGNORE INTO ticket_assignment_operations (
-                 workspace_id, operation_id, action, ticket_id, role, principal_kind,
-                 principal_id, runtime_id, worker_id, assignment_id,
-                 expected_assignment_id, created_at, request_fingerprint
-             ) VALUES (?1, ?2, 'unassign', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11)",
-            params![
+            let cleared = clear_current_ticket_role_assignment_in_tx(
+                &tx,
                 workspace_id,
-                operation_id,
                 ticket_id,
-                role.as_str(),
-                current.principal.kind(),
-                principal_id,
-                runtime_id,
-                worker_id,
+                role,
                 assignment_id,
+                event_id,
+                operation_id,
+                actor,
                 occurred_at,
-                fingerprint,
-            ],
-        )?;
-        if inserted == 0 {
-            let persisted: String = tx.query_row(
-                "SELECT request_fingerprint FROM ticket_assignment_operations
-                  WHERE workspace_id = ?1 AND operation_id = ?2",
-                params![workspace_id, operation_id],
+                reason,
+                "ticket-role-assignment:clear:v1",
+            )?;
+            tx.commit()?;
+            Ok(cleared)
+        })
+    }
+
+    fn cancel_current_ticket_coder_assignment(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+        assignment_id: &str,
+        assignment_event_id: &str,
+        state_event_id: &str,
+        operation_id: &str,
+        actor: &str,
+        occurred_at: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let state: String = tx.query_row(
+                "SELECT workflow_state FROM typed_tickets
+                  WHERE workspace_id = ?1 AND ticket_id = ?2",
+                params![workspace_id, ticket_id],
                 |row| row.get(0),
             )?;
-            if persisted != fingerprint {
+            if !matches!(state.as_str(), "inprogress" | "ready") {
                 return Err(Error::TicketAssignmentConflict(format!(
-                    "operation `{operation_id}` was already used for different Ticket assignment input"
+                    "implementation cancellation requires an inprogress Ticket; current state is `{state}`"
                 )));
             }
-            tx.commit()?;
-            return Ok(true);
-        }
-        let deleted = tx.execute(
-            "DELETE FROM ticket_current_worker_assignments
-              WHERE workspace_id = ?1 AND ticket_id = ?2 AND role = ?3 AND assignment_id = ?4",
-            params![workspace_id, ticket_id, role.as_str(), assignment_id],
-        )?;
-        if deleted != 0 {
-            tx.execute(
-                "INSERT INTO ticket_worker_assignment_events (
-                     workspace_id, ticket_id, role, event_id, action, assignment_id,
-                     previous_assignment_id, actor, created_at, operation_id, reason
-                 ) VALUES (?1, ?2, ?3, ?4, 'unassigned', NULL, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    workspace_id,
-                    ticket_id,
-                    role.as_str(),
-                    event_id,
-                    assignment_id,
-                    actor,
-                    occurred_at,
-                    operation_id,
-                    reason,
-                ],
+            let cleared = clear_current_ticket_role_assignment_in_tx(
+                &tx,
+                workspace_id,
+                ticket_id,
+                TicketAssignmentRole::Coder,
+                assignment_id,
+                assignment_event_id,
+                operation_id,
+                actor,
+                occurred_at,
+                Some(reason),
+                "ticket-role-assignment:cancel-implementation:v1",
             )?;
-        }
+            if !cleared {
+                return Ok(false);
+            }
+            if state == "inprogress" {
+                let event_index: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(event_index), -1) + 1 FROM typed_ticket_events
+                      WHERE workspace_id = ?1 AND ticket_id = ?2",
+                    params![workspace_id, ticket_id],
+                    |row| row.get(0),
+                )?;
+                tx.execute(
+                    "INSERT INTO typed_ticket_events (
+                         workspace_id, ticket_id, event_index, kind, author, at,
+                         from_state, to_state, reason, state_field, heading, body
+                     ) VALUES (?1, ?2, ?3, 'state_changed', ?4, ?5,
+                               'inprogress', 'ready', ?6, 'state',
+                               'Implementation cancelled', '')",
+                    params![workspace_id, ticket_id, event_index, actor, occurred_at, reason],
+                )?;
+                for (key, value) in [
+                    ("event_id", state_event_id),
+                    ("assignment_id", assignment_id),
+                    ("assignment_role", "coder"),
+                    ("operation_id", operation_id),
+                ] {
+                    tx.execute(
+                        "INSERT INTO typed_ticket_event_attributes (
+                             workspace_id, ticket_id, event_index, key, value
+                         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![workspace_id, ticket_id, event_index, key, value],
+                    )?;
+                }
+                let updated = tx.execute(
+                    "UPDATE typed_tickets SET workflow_state = 'ready',
+                             workflow_state_explicit = 1,
+                             queued_by = NULL, queued_at = NULL, updated_at = ?3
+                      WHERE workspace_id = ?1 AND ticket_id = ?2
+                        AND workflow_state = 'inprogress'",
+                    params![workspace_id, ticket_id, occurred_at],
+                )?;
+                if updated != 1 {
+                    return Err(Error::TicketAssignmentConflict(
+                        "Ticket state changed during implementation cancellation".to_string(),
+                    ));
+                }
+            }
             tx.commit()?;
-            Ok(deleted != 0)
+            Ok(true)
         })
     }
 
@@ -5538,6 +5554,117 @@ fn validate_ticket_assignment_role_principal(
             role.as_str()
         )))
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn clear_current_ticket_role_assignment_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    ticket_id: &str,
+    role: TicketAssignmentRole,
+    assignment_id: &str,
+    event_id: &str,
+    operation_id: &str,
+    actor: &str,
+    occurred_at: &str,
+    reason: Option<&str>,
+    fingerprint_domain: &str,
+) -> Result<bool> {
+    let current = read_ticket_role_assignment_by_id(tx, workspace_id, assignment_id)?;
+    let Some(current) = current.filter(|value| value.ticket_id == ticket_id && value.role == role)
+    else {
+        return Ok(false);
+    };
+    let principal_json = serde_json::to_string(&current.principal)
+        .map_err(|error| Error::Store(format!("serialize Ticket assignment principal: {error}")))?;
+    let mut hasher = Sha256::new();
+    for value in [
+        fingerprint_domain,
+        workspace_id,
+        ticket_id,
+        role.as_str(),
+        assignment_id,
+        principal_json.as_str(),
+        actor,
+        reason.unwrap_or(""),
+    ] {
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+    }
+    let fingerprint = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let (principal_id, runtime_id, worker_id) = match &current.principal {
+        TicketAssignmentPrincipal::User { account_id } => (Some(account_id.as_str()), None, None),
+        TicketAssignmentPrincipal::Worker {
+            runtime_id,
+            worker_id,
+        } => (None, Some(runtime_id.as_str()), Some(worker_id.as_str())),
+        TicketAssignmentPrincipal::WorkspaceAgent { agent_key } => {
+            (Some(agent_key.as_str()), None, None)
+        }
+    };
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO ticket_assignment_operations (
+             workspace_id, operation_id, action, ticket_id, role, principal_kind,
+             principal_id, runtime_id, worker_id, assignment_id,
+             expected_assignment_id, created_at, request_fingerprint
+         ) VALUES (?1, ?2, 'unassign', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11)",
+        params![
+            workspace_id,
+            operation_id,
+            ticket_id,
+            role.as_str(),
+            current.principal.kind(),
+            principal_id,
+            runtime_id,
+            worker_id,
+            assignment_id,
+            occurred_at,
+            fingerprint,
+        ],
+    )?;
+    if inserted == 0 {
+        let persisted: String = tx.query_row(
+            "SELECT request_fingerprint FROM ticket_assignment_operations
+              WHERE workspace_id = ?1 AND operation_id = ?2",
+            params![workspace_id, operation_id],
+            |row| row.get(0),
+        )?;
+        if persisted != fingerprint {
+            return Err(Error::TicketAssignmentConflict(format!(
+                "operation `{operation_id}` was already used for different Ticket assignment input"
+            )));
+        }
+        return Ok(true);
+    }
+    let deleted = tx.execute(
+        "DELETE FROM ticket_current_worker_assignments
+          WHERE workspace_id = ?1 AND ticket_id = ?2 AND role = ?3 AND assignment_id = ?4",
+        params![workspace_id, ticket_id, role.as_str(), assignment_id],
+    )?;
+    if deleted != 0 {
+        tx.execute(
+            "INSERT INTO ticket_worker_assignment_events (
+                 workspace_id, ticket_id, role, event_id, action, assignment_id,
+                 previous_assignment_id, actor, created_at, operation_id, reason
+             ) VALUES (?1, ?2, ?3, ?4, 'unassigned', NULL, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                workspace_id,
+                ticket_id,
+                role.as_str(),
+                event_id,
+                assignment_id,
+                actor,
+                occurred_at,
+                operation_id,
+                reason,
+            ],
+        )?;
+    }
+    Ok(deleted != 0)
 }
 
 fn current_ticket_worker_assignment_select_sql() -> String {
@@ -11052,18 +11179,58 @@ INSERT INTO worker_registry (
         );
         assert!(
             store
-                .clear_current_ticket_role_assignment(
+                .cancel_current_ticket_coder_assignment(
+                    "workspace-role",
+                    &ticket.meta.id,
+                    "coder-manual-1",
+                    "event-cancel-coder",
+                    "event-cancel-state",
+                    "op-cancel-coder",
+                    "user",
+                    "2026-09-01T00:03:00Z",
+                    "implementation needs to be redone",
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .cancel_current_ticket_coder_assignment(
+                    "workspace-role",
+                    &ticket.meta.id,
+                    "coder-manual-1",
+                    "event-cancel-coder-replay",
+                    "event-cancel-state-replay",
+                    "op-cancel-coder",
+                    "user",
+                    "2026-09-01T00:03:30Z",
+                    "implementation needs to be redone",
+                )
+                .unwrap(),
+            "same operation must be idempotent after the assignment is cleared"
+        );
+        let cancelled_ticket =
+            ticket::TicketBackend::show(&backend, ticket.meta.id.clone().into()).unwrap();
+        assert_eq!(
+            cancelled_ticket.meta.workflow_state,
+            ticket::TicketWorkflowState::Ready
+        );
+        assert_eq!(
+            cancelled_ticket
+                .events
+                .last()
+                .and_then(|event| event.attributes.get("assignment_id"))
+                .map(String::as_str),
+            Some("coder-manual-1")
+        );
+        assert!(
+            store
+                .get_current_ticket_role_assignment(
                     "workspace-role",
                     &ticket.meta.id,
                     TicketAssignmentRole::Coder,
-                    "coder-manual-1",
-                    "event-clear-coder",
-                    "op-clear-coder",
-                    "user",
-                    "2026-09-01T00:03:00Z",
-                    Some("test removal guard"),
                 )
                 .unwrap()
+                .is_none()
         );
         assert!(
             store
