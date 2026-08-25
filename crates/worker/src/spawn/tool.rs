@@ -329,13 +329,13 @@ fn validate_reviewer_handoff(input: &SubWorkerSpawnInput) -> Result<(), ToolErro
             "reviewer handoff requires the explicit effective profile builtin:reviewer".to_string(),
         ));
     }
-    if input
+    if !input
         .scope
         .iter()
         .any(|rule| matches!(rule.permission, PermissionInput::Write))
     {
         return Err(ToolError::InvalidArgument(
-            "Merge Request Reviewer SubWorkers must have read-only delegated scope".to_string(),
+            "Merge Request Reviewer SubWorkers must include writable delegated scope".to_string(),
         ));
     }
     Ok(())
@@ -1008,28 +1008,28 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_handoff_requires_explicit_builtin_profile_and_read_only_scope() {
+    fn reviewer_handoff_requires_explicit_builtin_profile_and_writable_scope() {
         let valid: SubWorkerSpawnInput = serde_json::from_value(serde_json::json!({
             "name":"reviewer","task":"review","profile":"builtin:reviewer",
-            "scope":[{"target":"work","permission":"read"}],
+            "scope":[{"target":"work","permission":"write"}],
             "review":{"ticket_id":"T1"}
         }))
         .unwrap();
         assert!(validate_reviewer_handoff(&valid).is_ok());
         let wrong_profile: SubWorkerSpawnInput = serde_json::from_value(serde_json::json!({
             "name":"reviewer","task":"review","profile":"builtin:coder",
-            "scope":[{"target":"work","permission":"read"}],
-            "review":{"ticket_id":"T1"}
-        }))
-        .unwrap();
-        assert!(validate_reviewer_handoff(&wrong_profile).is_err());
-        let writable: SubWorkerSpawnInput = serde_json::from_value(serde_json::json!({
-            "name":"reviewer","task":"review","profile":"builtin:reviewer",
             "scope":[{"target":"work","permission":"write"}],
             "review":{"ticket_id":"T1"}
         }))
         .unwrap();
-        assert!(validate_reviewer_handoff(&writable).is_err());
+        assert!(validate_reviewer_handoff(&wrong_profile).is_err());
+        let read_only: SubWorkerSpawnInput = serde_json::from_value(serde_json::json!({
+            "name":"reviewer","task":"review","profile":"builtin:reviewer",
+            "scope":[{"target":"work","permission":"read"}],
+            "review":{"ticket_id":"T1"}
+        }))
+        .unwrap();
+        assert!(validate_reviewer_handoff(&read_only).is_err());
     }
 
     fn abs_rule(path: &Path, permission: Permission) -> ScopeRule {
@@ -1079,7 +1079,7 @@ extract_threshold = 4000
     }
 
     #[tokio::test]
-    async fn reviewer_profile_spawns_and_notifies_parent_controller() {
+    async fn reviewer_profile_write_scope_exposes_command_tools_and_notifies_parent_controller() {
         let runtime = TempDir::new().unwrap();
         let workspace_root = runtime.path().join("project");
         let available_profiles = write_project_profile_registry(
@@ -1140,7 +1140,7 @@ extract_threshold = 4000
             "task": "review immutable commit",
             "scope": [{
                 "target": ".",
-                "permission": "read",
+                "permission": "write",
                 "recursive": true
             }]
         });
@@ -1171,11 +1171,10 @@ extract_threshold = 4000
         let record = registry
             .get_internal("reviewer-child")
             .expect("Internal reviewer registry record");
-        assert!(record.installed_tools.iter().any(|name| name == "Read"));
-        for denied in ["Write", "Edit", "Bash"] {
+        for required in ["Read", "Write", "Edit", "Glob", "Grep", "Bash"] {
             assert!(
-                !record.installed_tools.iter().any(|name| name == denied),
-                "read-only child unexpectedly received {denied}: {:?}",
+                record.installed_tools.iter().any(|name| name == required),
+                "write-scoped child is missing {required}: {:?}",
                 record.installed_tools
             );
         }
