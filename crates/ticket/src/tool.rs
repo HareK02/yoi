@@ -142,8 +142,8 @@ const INTAKE_READY_DESCRIPTION: &str = "Record a bounded intake summary and mark
 The backend applies the same target validation and lock as TicketMarkReady and commits the summary, \
 state_changed event, effective target, and planning -> ready transition atomically.";
 const QUEUE_DESCRIPTION: &str = "Queue a ready Ticket for Orchestrator routing through the typed \
-Ticket backend. The backend performs the gated ready -> queued transition, records queued_by/queued_at, \
-and preserves unresolved blocking relations as Orchestrator scheduling context rather than Queue admission gates.";
+Ticket backend. The backend rejects transitive planning dependencies and cycles, atomically queues the \
+requested Ticket plus every transitive ready dependency, and leaves queued or in-progress dependencies unchanged.";
 const WORKFLOW_STATE_DESCRIPTION: &str = "Transition Ticket `state` through the typed \
 Ticket backend with a bounded `state_changed` event. Treat `queued -> inprogress` \
 as the implementation acceptance step: implementation side effects should happen only after that \
@@ -316,7 +316,11 @@ impl TicketBackend for TicketToolBackend {
         self.backend.mark_ready(id, request)
     }
 
-    fn queue_ready(&self, id: TicketIdOrSlug, queued_by: &str) -> TicketResult<()> {
+    fn queue_ready(
+        &self,
+        id: TicketIdOrSlug,
+        queued_by: &str,
+    ) -> TicketResult<crate::TicketQueueOutcome> {
         self.backend.queue_ready(id, queued_by)
     }
 
@@ -1219,12 +1223,22 @@ impl Tool for TicketQueueTool {
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketQueueParams = parse_input("TicketQueue", input_json)?;
         let queued_by = default_author();
-        self.backend
+        let outcome = self
+            .backend
             .queue_ready(TicketIdOrSlug::Query(params.ticket.clone()), &queued_by)
             .map_err(|error| backend_error("TicketQueue", error))?;
         Ok(json_output(
-            format!("Queued ticket {} for Orchestrator", params.ticket),
-            json!({ "ticket": params.ticket, "state": "queued", "queued_by": queued_by, "ok": true }),
+            format!(
+                "Queued {} ticket(s) for Orchestrator",
+                outcome.queued_tickets.len()
+            ),
+            json!({
+                "ticket": outcome.requested_ticket,
+                "queued_tickets": outcome.queued_tickets,
+                "state": "queued",
+                "queued_by": queued_by,
+                "ok": true
+            }),
         ))
     }
 }

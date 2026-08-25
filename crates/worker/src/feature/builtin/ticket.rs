@@ -873,12 +873,13 @@ impl WorkspaceHttpTicketBackend {
                 })?),
             )
             .map(TicketBackendOperationResult::Ticket),
-            TicketBackendOperation::QueueReady { id, .. } => Self::request_unit(
+            TicketBackendOperation::QueueReady { id, .. } => Self::request(
                 client,
                 WorkspaceRequestMethod::Post,
                 format!("{base}/{}/workflow/queue", Self::ticket_path(&id)),
                 None,
-            ),
+            )
+            .map(TicketBackendOperationResult::QueueOutcome),
             TicketBackendOperation::Close { id, resolution } => Self::request_unit(
                 client,
                 WorkspaceRequestMethod::Post,
@@ -1099,16 +1100,18 @@ impl TicketBackend for WorkspaceHttpTicketBackend {
         )
     }
 
-    fn queue_ready(&self, id: TicketIdOrSlug, queued_by: &str) -> TicketResult<()> {
-        match self.invoke(TicketBackendOperation::QueueReady {
-            id,
-            queued_by: queued_by.to_string(),
-        })? {
-            TicketBackendOperationResult::Unit => Ok(()),
-            other => Err(TicketError::Conflict(format!(
-                "unexpected ticket backend response: {other:?}"
-            ))),
-        }
+    fn queue_ready(
+        &self,
+        id: TicketIdOrSlug,
+        queued_by: &str,
+    ) -> TicketResult<ticket::TicketQueueOutcome> {
+        expect_ticket_result!(
+            self.invoke(TicketBackendOperation::QueueReady {
+                id,
+                queued_by: queued_by.to_string(),
+            }),
+            TicketBackendOperationResult::QueueOutcome
+        )
     }
 
     fn close(&self, id: TicketIdOrSlug, resolution: MarkdownText) -> TicketResult<()> {

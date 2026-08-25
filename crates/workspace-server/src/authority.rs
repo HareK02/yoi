@@ -3047,10 +3047,7 @@ VALUES ('workspace-test', 'ticket', 4);
         assert_eq!(tickets.items[0].record_source, "sqlite_yoi_ticket");
         assert_eq!(tickets.items[0].id, "00000000001J2");
         assert_eq!(tickets.items[0].state, "ready");
-        assert_eq!(
-            tickets.items[0].workspace_action_priority,
-            "ready_for_queue"
-        );
+        assert_eq!(tickets.items[0].workspace_action_priority, "background");
         let ticket_by_key = authority.ticket(&tickets.items[0].resource_key).unwrap();
         assert_eq!(ticket_by_key.id, tickets.items[0].id);
 

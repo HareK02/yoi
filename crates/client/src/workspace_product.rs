@@ -473,8 +473,12 @@ impl TicketBackend for BackendWorkspaceProductClient {
         .map_err(ticket_client_error)
     }
 
-    fn queue_ready(&self, id: TicketIdOrSlug, _queued_by: &str) -> ticket::Result<()> {
-        self.send_unit::<()>(
+    fn queue_ready(
+        &self,
+        id: TicketIdOrSlug,
+        _queued_by: &str,
+    ) -> ticket::Result<ticket::TicketQueueOutcome> {
+        self.send_json::<(), _>(
             Method::POST,
             &format!(
                 "/tickets/{}/workflow/queue",

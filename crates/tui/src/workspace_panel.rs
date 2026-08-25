@@ -2203,7 +2203,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_panel_queues_ready_ticket_with_unresolved_relation_context() {
+    fn workspace_panel_blocks_ready_ticket_with_planning_relation() {
         let temp = TempDir::new().unwrap();
         write_ticket_config(temp.path());
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
@@ -2233,9 +2233,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(row.kind, PanelRowKind::Ticket);
-        assert_eq!(row.next_action, Some(NextUserAction::Queue));
-        assert_eq!(row.priority, ActionPriority::ReadyForQueue);
-        assert!(row.disabled_reason.is_none());
+        assert_eq!(row.next_action, Some(NextUserAction::Wait));
+        assert_eq!(row.priority, ActionPriority::Background);
+        assert!(row.disabled_reason.is_some());
         assert!(
             row.ticket
                 .as_ref()
@@ -2294,7 +2294,7 @@ mod tests {
             row.key_hint
                 .as_deref()
                 .unwrap()
-                .contains("dependency relations remain scheduling context")
+                .contains("dependency relations remain orchestration context")
         );
         assert!(row.key_hint.as_deref().unwrap().contains(&dependency.id));
     }

@@ -466,9 +466,9 @@
             {busy === "queue" ? "Queueing…" : "Queue ticket"}
           </button>
           {#if !ticket.action_eligibility.can_queue}
-            <p class="workspace-empty-copy">Queue requires a valid target, an active Orchestrator assignment, and no active Coder assignment.</p>
+            <p class="workspace-empty-copy">Queue requires a valid target, an active Orchestrator assignment, no active Coder assignment, and no dependency still in planning.</p>
           {:else if ticket.relations.blockers.length > 0}
-            <p class="workspace-empty-copy">Queue records orchestration demand. Dependency relations remain visible so the Orchestrator can decide whether to wait or start work in parallel.</p>
+            <p class="workspace-empty-copy">Ready dependencies are queued atomically. Queued or in-progress dependencies remain unchanged for the Orchestrator to schedule.</p>
           {/if}
         {/if}
       </section>
