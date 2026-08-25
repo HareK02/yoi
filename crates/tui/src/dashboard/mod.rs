@@ -4,6 +4,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use client::ticket_role::{
@@ -4125,7 +4126,10 @@ async fn dispatch_ticket_action(
     let config = TicketConfig::load_workspace(&request.workspace_root)
         .map_err(|error| TicketActionError::BackendConfig(error.to_string()))?;
     let backend = LocalTicketBackend::new(config.backend_root())
-        .with_record_language(config.ticket_record_language());
+        .with_record_language(config.ticket_record_language())
+        .with_target_authority(Arc::new(DashboardTicketTargetAuthority {
+            workspace_root: request.workspace_root.clone(),
+        }));
     if request.action == NextUserAction::Close {
         return dispatch_panel_close(&backend, &request.ticket_id);
     }
@@ -4233,6 +4237,45 @@ async fn dispatch_panel_queue(
             notification.sentence()
         ),
     })
+}
+
+struct DashboardTicketTargetAuthority {
+    workspace_root: PathBuf,
+}
+
+impl ticket::TicketTargetAuthority for DashboardTicketTargetAuthority {
+    fn resolve_target(
+        &self,
+        _workspace_id: &str,
+        repository_id: Option<&str>,
+        ref_selector: Option<&str>,
+    ) -> ticket::Result<ticket::ResolvedTicketTarget> {
+        let repository_id = repository_id.unwrap_or("main");
+        if repository_id != "main" {
+            return Err(ticket::TicketError::UnknownTargetRepository(
+                repository_id.to_string(),
+            ));
+        }
+        let ref_selector = ref_selector.unwrap_or("HEAD");
+        git_capture(
+            &self.workspace_root,
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("{ref_selector}^{{commit}}"),
+            ],
+            "resolve Queue Ticket target",
+        )
+        .map_err(|reason| ticket::TicketError::InvalidTargetSelector {
+            repository_id: repository_id.to_string(),
+            selector: ref_selector.to_string(),
+            reason,
+        })?;
+        Ok(ticket::ResolvedTicketTarget {
+            repository_id: repository_id.to_string(),
+            ref_selector: ref_selector.to_string(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

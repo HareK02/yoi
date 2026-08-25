@@ -3677,20 +3677,11 @@ impl TicketBackend for SqliteTicketBackend {
                         let target_error = queue_tickets.iter().find_map(|candidate| {
                             self.load_ticket(conn, candidate)
                                 .and_then(|ticket| {
-                                    match resolve_ready_target(
+                                    resolve_ready_target(
                                         self.target_authority.as_ref(),
                                         &self.workspace_id,
                                         &ticket,
-                                    ) {
-                                        Ok(_) => Ok(()),
-                                        Err(TicketError::TargetAuthorityUnavailable)
-                                            if ticket.meta.repository_id.is_some()
-                                                && ticket.meta.ref_selector.is_some() =>
-                                        {
-                                            Ok(())
-                                        }
-                                        Err(error) => Err(error),
-                                    }
+                                    )
                                 })
                                 .err()
                         });
@@ -4487,15 +4478,11 @@ impl TicketBackend for LocalTicketBackend {
                         self.find_ticket_dir(&TicketIdOrSlug::Id(candidate.clone()))
                             .and_then(|dir| self.ticket_from_dir(&dir))
                             .and_then(|ticket| {
-                                match resolve_ready_target(
+                                resolve_ready_target(
                                     self.target_authority.as_ref(),
                                     "local",
                                     &ticket,
-                                ) {
-                                    Ok(_) => Ok(()),
-                                    Err(TicketError::TargetAuthorityUnavailable) => Ok(()),
-                                    Err(error) => Err(error),
-                                }
+                                )
                             })
                             .err()
                     });
@@ -7788,6 +7775,59 @@ state: planning
                 .queue_guard
                 .can_queue_for_orchestrator
         );
+    }
+
+    #[test]
+    fn dependency_checks_fail_closed_without_target_authority() {
+        let sqlite_temp = TempDir::new().unwrap();
+        let sqlite =
+            SqliteTicketBackend::open(sqlite_temp.path().join("tickets.db"), "workspace-test")
+                .unwrap();
+        let mut sqlite_input = NewTicket::new("SQLite ready Ticket");
+        sqlite_input.workflow_state = Some(TicketWorkflowState::Ready);
+        sqlite_input.repository_id = Some("main".to_string());
+        sqlite_input.ref_selector = Some("develop".to_string());
+        let sqlite_ticket = sqlite.create(sqlite_input).unwrap();
+        let sqlite_check = sqlite
+            .dependency_check(TicketIdOrSlug::Id(sqlite_ticket.id.clone()))
+            .unwrap();
+        assert!(!sqlite_check.queue_guard.can_queue_for_orchestrator);
+        assert!(
+            sqlite_check
+                .queue_guard
+                .blocked_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("target authority is unavailable")
+        );
+        assert!(matches!(
+            sqlite.queue_ready(TicketIdOrSlug::Id(sqlite_ticket.id), "test"),
+            Err(TicketError::TargetAuthorityUnavailable)
+        ));
+
+        let local_temp = TempDir::new().unwrap();
+        let local = LocalTicketBackend::new(local_temp.path());
+        let mut local_input = NewTicket::new("Local ready Ticket");
+        local_input.workflow_state = Some(TicketWorkflowState::Ready);
+        local_input.repository_id = Some("main".to_string());
+        local_input.ref_selector = Some("develop".to_string());
+        let local_ticket = local.create(local_input).unwrap();
+        let local_check = local
+            .dependency_check(TicketIdOrSlug::Id(local_ticket.id.clone()))
+            .unwrap();
+        assert!(!local_check.queue_guard.can_queue_for_orchestrator);
+        assert!(
+            local_check
+                .queue_guard
+                .blocked_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("target authority is unavailable")
+        );
+        assert!(matches!(
+            local.queue_ready(TicketIdOrSlug::Id(local_ticket.id), "test"),
+            Err(TicketError::TargetAuthorityUnavailable)
+        ));
     }
 
     #[test]
