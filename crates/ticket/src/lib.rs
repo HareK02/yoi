@@ -5629,14 +5629,12 @@ fn transitive_dependency_blockers(
 
     fn collect(
         ticket: &str,
+        requested_ticket: &str,
         states: &HashMap<String, TicketWorkflowState>,
         prerequisites: &BTreeMap<String, Vec<DependencyEdge>>,
-        visited: &mut BTreeSet<String>,
+        marks: &mut BTreeMap<String, u8>,
         blockers: &mut BTreeMap<String, TicketRelationBlocker>,
     ) -> Result<()> {
-        if !visited.insert(ticket.to_owned()) {
-            return Ok(());
-        }
         let state = states
             .get(ticket)
             .copied()
@@ -5644,6 +5642,30 @@ fn transitive_dependency_blockers(
         if ticket_state_resolved(state) {
             return Ok(());
         }
+        match marks.get(ticket).copied() {
+            Some(2) => return Ok(()),
+            Some(1) => {
+                let requested_state = states
+                    .get(requested_ticket)
+                    .copied()
+                    .ok_or_else(|| TicketError::NotFound(requested_ticket.to_owned()))?;
+                blockers.insert(
+                    requested_ticket.to_owned(),
+                    TicketRelationBlocker {
+                        blocking_ticket: requested_ticket.to_owned(),
+                        reason_kind: "dependency_cycle".to_string(),
+                        relation_kind: TicketRelationKind::DependsOn,
+                        note: Some(format!(
+                            "dependency cycle reachable through Ticket {ticket}"
+                        )),
+                        blocking_state: requested_state,
+                    },
+                );
+                return Ok(());
+            }
+            _ => {}
+        }
+        marks.insert(ticket.to_owned(), 1);
         if let Some(dependencies) = prerequisites.get(ticket) {
             for (dependency, reason_kind, relation_kind, note) in dependencies {
                 let dependency_state = states
@@ -5660,19 +5682,28 @@ fn transitive_dependency_blockers(
                             note: note.clone(),
                             blocking_state: dependency_state,
                         });
-                    collect(dependency, states, prerequisites, visited, blockers)?;
+                    collect(
+                        dependency,
+                        requested_ticket,
+                        states,
+                        prerequisites,
+                        marks,
+                        blockers,
+                    )?;
                 }
             }
         }
+        marks.insert(ticket.to_owned(), 2);
         Ok(())
     }
 
     let mut blockers = BTreeMap::new();
     collect(
         requested_ticket,
+        requested_ticket,
         states,
         &prerequisites,
-        &mut BTreeSet::new(),
+        &mut BTreeMap::new(),
         &mut blockers,
     )?;
     Ok(blockers.into_values().collect())
@@ -7350,6 +7381,37 @@ mod tests {
     }
 
     #[test]
+    fn transitive_blockers_project_internal_dependency_cycle_as_blocking() {
+        let states = HashMap::from([
+            ("root".to_owned(), TicketWorkflowState::Ready),
+            ("branch".to_owned(), TicketWorkflowState::Ready),
+            ("cycle".to_owned(), TicketWorkflowState::Ready),
+        ]);
+        let relations = [
+            dependency_relation("root", "branch"),
+            dependency_relation("branch", "cycle"),
+            dependency_relation("cycle", "branch"),
+        ];
+
+        let blockers = transitive_dependency_blockers("root", &states, &relations).unwrap();
+        assert!(blockers.iter().any(|blocker| {
+            blocker.blocking_ticket == "root" && blocker.reason_kind == "dependency_cycle"
+        }));
+        let summary = summary_with_state(TicketWorkflowState::Ready);
+        let mut summary = summary;
+        summary.id = "root".to_string();
+        assert!(
+            !project_ticket_workspace_item(&summary, &blockers, None)
+                .queue_guard
+                .can_queue_for_orchestrator
+        );
+        assert!(matches!(
+            dependency_queue_plan("root", &states, &relations),
+            Err(TicketError::Conflict(_))
+        ));
+    }
+
+    #[test]
     fn dependency_queue_plan_stops_at_resolved_dependency() {
         let states = HashMap::from([
             ("root".to_owned(), TicketWorkflowState::Ready),
@@ -7897,9 +7959,14 @@ state: planning
         second_input.workflow_state = Some(TicketWorkflowState::Ready);
         second_input.repository_id = Some("main".to_string());
         let second = backend.create(second_input).unwrap();
+        let mut third_input = NewTicket::new("Third ready Ticket");
+        third_input.workflow_state = Some(TicketWorkflowState::Ready);
+        third_input.repository_id = Some("main".to_string());
+        let third = backend.create(third_input).unwrap();
         for (ticket, target) in [
             (first.id.clone(), second.id.clone()),
-            (second.id.clone(), first.id.clone()),
+            (second.id.clone(), third.id.clone()),
+            (third.id.clone(), second.id.clone()),
         ] {
             backend
                 .add_ticket_relation(
@@ -7948,7 +8015,7 @@ state: planning
             .unwrap_err();
         assert!(matches!(error, TicketError::Conflict(_)));
         assert!(error.to_string().contains(" -> "));
-        for ticket_id in [first.id, second.id] {
+        for ticket_id in [first.id, second.id, third.id] {
             assert_eq!(
                 backend
                     .show(TicketIdOrSlug::Id(ticket_id))
