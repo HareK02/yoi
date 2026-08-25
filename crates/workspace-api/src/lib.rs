@@ -373,6 +373,116 @@ pub struct UpdateWorkspaceMemorySettingsRequest {
     pub language: String,
 }
 
+/// Public metadata for one Workspace-scoped Repository SSH credential.
+///
+/// Secret references and secret material are deliberately not part of this DTO.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RepositorySshCredential {
+    pub credential_id: String,
+    pub workspace_id: String,
+    pub name: String,
+    pub public_key_algorithm: String,
+    pub public_key_fingerprint: String,
+    pub current_revision: u64,
+    pub status: String,
+    pub created_at: String,
+    pub rotated_at: Option<String>,
+    #[serde(default)]
+    pub referenced_repositories: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CreateRepositorySshCredentialRequest {
+    pub operation_id: String,
+    pub credential_id: String,
+    pub name: String,
+    pub private_key: String,
+    #[serde(default)]
+    pub passphrase: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RotateRepositorySshCredentialRequest {
+    pub operation_id: String,
+    pub expected_revision: u64,
+    pub private_key: String,
+    #[serde(default)]
+    pub passphrase: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteRepositorySshCredentialRequest {
+    pub operation_id: String,
+    pub expected_revision: u64,
+}
+
+/// Public metadata for an explicitly pinned SSH host key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RepositorySshHostTrust {
+    pub host_trust_id: String,
+    pub workspace_id: String,
+    pub hostname: String,
+    pub port: u16,
+    pub key_algorithm: String,
+    pub host_key: String,
+    pub fingerprint: String,
+    pub current_revision: u64,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub referenced_repositories: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PutRepositorySshHostTrustRequest {
+    pub operation_id: String,
+    pub host_trust_id: String,
+    pub hostname: String,
+    pub port: u16,
+    pub host_key: String,
+    #[serde(default)]
+    pub expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteRepositorySshHostTrustRequest {
+    pub operation_id: String,
+    pub expected_revision: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryAccessMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RepositorySshAccessBinding {
+    pub repository_id: String,
+    pub credential_id: String,
+    pub host_trust_id: String,
+    pub access: RepositoryAccessMode,
+}
+
+/// Secret-free active Repository access projection consumed by later Runtime work.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryAccessProjection {
+    pub workspace_id: String,
+    pub config_revision: u64,
+    pub projection_digest: String,
+    pub bindings: Vec<RepositorySshAccessBinding>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -20,6 +20,7 @@ pub mod records;
 #[cfg(feature = "typescript")]
 pub use records::ticket_api_typescript;
 pub mod repositories;
+pub mod repository_access;
 pub mod repository_source;
 pub mod resource_broker;
 pub mod retention;
@@ -116,6 +117,8 @@ pub enum Error {
     TicketAssignmentConflict(String),
     #[error("Workdir attachment conflict: {0}")]
     WorkdirAttachmentConflict(String),
+    #[error("Workspace permission denied: {0}")]
+    WorkspacePermissionDenied(String),
     #[error("Workspace config update conflict: {0}")]
     WorkspaceConfigConflict(String),
     #[error("Registry inconsistency: {0}")]

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path as AxumPath, Query, Request, State};
+use axum::extract::{Extension, Path as AxumPath, Query, Request, State};
 use axum::http::header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION, ORIGIN, SET_COOKIE};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
@@ -58,8 +58,12 @@ use worker::feature::builtin::{WorkerObservationSubject, WorkerObservationSubjec
 use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest};
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
 use workspace_api::{
-    ObjectiveCreateRequest, ObjectiveEditRequest, ObjectiveLinkTicketRequest,
-    ObjectiveStateRequest, TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_PATH,
+    CreateRepositorySshCredentialRequest, DeleteRepositorySshCredentialRequest,
+    DeleteRepositorySshHostTrustRequest, ObjectiveCreateRequest, ObjectiveEditRequest,
+    ObjectiveLinkTicketRequest, ObjectiveStateRequest, PutRepositorySshHostTrustRequest,
+    RepositoryAccessProjection, RepositorySshCredential, RepositorySshHostTrust,
+    RotateRepositorySshCredentialRequest, TICKET_ORCHESTRATION_PLANS_QUERY_PATH,
+    TICKET_RELATIONS_QUERY_PATH,
 };
 
 use crate::auth::{
@@ -108,6 +112,10 @@ use crate::records::{
 use crate::repositories::{
     ConfiguredRepository, RepositoryListProjection, RepositoryLogRead, RepositoryLookupError,
     RepositoryRegistryReader, RepositorySummary,
+};
+use crate::repository_access::{
+    RepositoryAccessConfigSchemaProvider, RepositorySecretService,
+    project_repository_access_candidate, project_repository_access_state,
 };
 use crate::resource_broker::BackendResourceBroker;
 use crate::runtime_settings::RuntimeConfigSchemaProvider;
@@ -342,6 +350,7 @@ pub struct WorkspaceApi {
     pub(crate) config: ServerConfig,
     pub(crate) store: Arc<dyn ControlPlaneStore>,
     config_store: Arc<crate::SqliteWorkspaceStore>,
+    repository_secrets: Arc<RepositorySecretService>,
     config_schema_registry: crate::config_source::WorkspaceConfigSchemaRegistry,
     prompt_projection_cache: crate::prompt_settings::WorkspacePromptProjectionCache,
     authority: SqliteWorkspaceAuthority,
@@ -1053,6 +1062,7 @@ async fn authorize_workspace_api_request(
             return StatusCode::FORBIDDEN.into_response();
         }
     }
+    request.extensions_mut().insert(actor);
     next.run(request).await
 }
 
@@ -1343,12 +1353,17 @@ impl WorkspaceApi {
         let config_store = Arc::new(crate::SqliteWorkspaceStore::open(
             config.database_path.clone(),
         )?);
+        let repository_secrets = Arc::new(RepositorySecretService::open(
+            config_store.clone(),
+            &config.database_path,
+        )?);
         let config_schema_registry = crate::config_source::WorkspaceConfigSchemaRegistry::default()
             .with_provider(Arc::new(
                 crate::profile_settings::ProfileConfigSchemaProvider,
             ))
             .with_provider(Arc::new(crate::prompt_settings::PromptConfigSchemaProvider))
             .with_provider(Arc::new(RuntimeConfigSchemaProvider))
+            .with_provider(Arc::new(RepositoryAccessConfigSchemaProvider))
             .with_provider(Arc::new(skills::SkillConfigSchemaProvider));
         config_store.ensure_workspace_config_materialized_with_schema(
             &config.workspace_id,
@@ -1357,6 +1372,7 @@ impl WorkspaceApi {
         )?;
         let api = Self {
             config_store,
+            repository_secrets,
             config_schema_registry,
             prompt_projection_cache:
                 crate::prompt_settings::WorkspacePromptProjectionCache::default(),
@@ -1862,6 +1878,32 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
             "/api/w/{workspace_id}/settings/memory",
             get(scoped_get_workspace_memory_settings)
                 .put(scoped_update_workspace_memory_settings),
+        )
+        .route(
+            "/api/w/{workspace_id}/settings/repository-access",
+            get(scoped_get_repository_access_projection),
+        )
+        .route(
+            "/api/w/{workspace_id}/settings/repository-access/credentials",
+            get(scoped_list_repository_ssh_credentials)
+                .post(scoped_create_repository_ssh_credential),
+        )
+        .route(
+            "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}",
+            delete(scoped_delete_repository_ssh_credential),
+        )
+        .route(
+            "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}/rotate",
+            post(scoped_rotate_repository_ssh_credential),
+        )
+        .route(
+            "/api/w/{workspace_id}/settings/repository-access/host-trusts",
+            get(scoped_list_repository_ssh_host_trusts)
+                .post(scoped_put_repository_ssh_host_trust),
+        )
+        .route(
+            "/api/w/{workspace_id}/settings/repository-access/host-trusts/{host_trust_id}",
+            delete(scoped_delete_repository_ssh_host_trust),
         )
         .route(
             "/api/w/{workspace_id}/config/source-tree",
@@ -2987,6 +3029,18 @@ struct ScopedRepositoryPath {
 }
 
 #[derive(Debug, Deserialize)]
+struct ScopedRepositoryCredentialPath {
+    workspace_id: String,
+    credential_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScopedRepositoryHostTrustPath {
+    workspace_id: String,
+    host_trust_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ScopedProfileArchivePath {
     workspace_id: String,
     digest: String,
@@ -3274,6 +3328,162 @@ async fn scoped_update_workspace_memory_settings(
     }))
 }
 
+async fn require_manage_repository_secrets(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    actor: &RequestActor,
+) -> ApiResult<()> {
+    validate_workspace_scope(api, workspace_id)?;
+    let workspace = api
+        .store
+        .get_workspace(workspace_id)
+        .await?
+        .ok_or(Error::WorkspaceIdMismatch)?;
+    if workspace.owner_account_id.as_deref() != Some(actor.account_id.as_str()) {
+        return Err(Error::WorkspacePermissionDenied(
+            "ManageSecrets requires the Workspace owner account".to_string(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn active_repository_access_projection(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+) -> ApiResult<RepositoryAccessProjection> {
+    let state = api
+        .config_store
+        .load_workspace_config(workspace_id)?
+        .ok_or_else(|| Error::InvalidRecordId("virtual config source tree".into()))?;
+    Ok(project_repository_access_state(
+        &*api.store,
+        &api.repository_secrets,
+        workspace_id,
+        &state,
+    )?)
+}
+
+async fn scoped_get_repository_access_projection(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Extension(actor): Extension<RequestActor>,
+) -> ApiResult<Json<RepositoryAccessProjection>> {
+    require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
+    Ok(Json(active_repository_access_projection(
+        &api,
+        &path.workspace_id,
+    )?))
+}
+
+async fn scoped_list_repository_ssh_credentials(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Extension(actor): Extension<RequestActor>,
+) -> ApiResult<Json<Vec<RepositorySshCredential>>> {
+    require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
+    let projection = active_repository_access_projection(&api, &path.workspace_id)?;
+    Ok(Json(
+        api.repository_secrets
+            .list_credentials(&path.workspace_id, &projection)?,
+    ))
+}
+
+async fn scoped_create_repository_ssh_credential(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Extension(actor): Extension<RequestActor>,
+    Json(request): Json<CreateRepositorySshCredentialRequest>,
+) -> ApiResult<(StatusCode, Json<RepositorySshCredential>)> {
+    require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
+    let credential =
+        api.repository_secrets
+            .create_credential(&path.workspace_id, request, &actor.account_id)?;
+    Ok((StatusCode::CREATED, Json(credential)))
+}
+
+async fn scoped_rotate_repository_ssh_credential(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRepositoryCredentialPath>,
+    Extension(actor): Extension<RequestActor>,
+    Json(request): Json<RotateRepositorySshCredentialRequest>,
+) -> ApiResult<Json<RepositorySshCredential>> {
+    require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
+    Ok(Json(api.repository_secrets.rotate_credential(
+        &path.workspace_id,
+        &path.credential_id,
+        request,
+        &actor.account_id,
+    )?))
+}
+
+async fn scoped_delete_repository_ssh_credential(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRepositoryCredentialPath>,
+    Extension(actor): Extension<RequestActor>,
+    Json(request): Json<DeleteRepositorySshCredentialRequest>,
+) -> ApiResult<StatusCode> {
+    require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
+    let projection = active_repository_access_projection(&api, &path.workspace_id)?;
+    api.repository_secrets.delete_credential(
+        &path.workspace_id,
+        &path.credential_id,
+        request,
+        &actor.account_id,
+        &projection,
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn scoped_list_repository_ssh_host_trusts(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Extension(actor): Extension<RequestActor>,
+) -> ApiResult<Json<Vec<RepositorySshHostTrust>>> {
+    require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
+    let projection = active_repository_access_projection(&api, &path.workspace_id)?;
+    Ok(Json(
+        api.repository_secrets
+            .list_host_trusts(&path.workspace_id, &projection)?,
+    ))
+}
+
+async fn scoped_put_repository_ssh_host_trust(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Extension(actor): Extension<RequestActor>,
+    Json(request): Json<PutRepositorySshHostTrustRequest>,
+) -> ApiResult<(StatusCode, Json<RepositorySshHostTrust>)> {
+    require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
+    let status = if request.expected_revision.is_some() {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    let host_trust =
+        api.repository_secrets
+            .put_host_trust(&path.workspace_id, request, &actor.account_id)?;
+    Ok((status, Json(host_trust)))
+}
+
+async fn scoped_delete_repository_ssh_host_trust(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRepositoryHostTrustPath>,
+    Extension(actor): Extension<RequestActor>,
+    Json(request): Json<DeleteRepositorySshHostTrustRequest>,
+) -> ApiResult<StatusCode> {
+    require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
+    let projection = active_repository_access_projection(&api, &path.workspace_id)?;
+    api.repository_secrets.delete_host_trust(
+        &path.workspace_id,
+        &path.host_trust_id,
+        request,
+        &actor.account_id,
+        &projection,
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn scoped_get_workspace_config_tree(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
@@ -3333,6 +3543,12 @@ async fn scoped_commit_workspace_config_tree(
             api.config_schema_registry.compose()?,
         )?;
     crate::prompt_settings::validate_evaluated_prompt_catalog(&candidate.evaluation)?;
+    project_repository_access_candidate(
+        &*api.store,
+        &api.repository_secrets,
+        &path.workspace_id,
+        &candidate,
+    )?;
     let state = api
         .config_store
         .commit_evaluated_workspace_config(&path.workspace_id, &candidate)?;
@@ -14070,7 +14286,9 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.error {
-            Error::BrowserReopenConfirmationRequired => StatusCode::FORBIDDEN,
+            Error::BrowserReopenConfirmationRequired | Error::WorkspacePermissionDenied(_) => {
+                StatusCode::FORBIDDEN
+            }
             Error::TicketAssignmentConflict(_)
             | Error::WorkdirAttachmentConflict(_)
             | Error::WorkspaceConfigConflict(_) => StatusCode::CONFLICT,
@@ -19155,6 +19373,54 @@ mod tests {
         .unwrap_or_else(|error| panic!("skill detail failed: {}", error.error));
         assert!(detail.body.contains("# Triage Errors"));
         assert_eq!(detail.provenance.id, "workspace:triage-errors");
+    }
+
+    #[tokio::test]
+    async fn repository_secret_management_is_owner_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        let timestamp = Utc::now().to_rfc3339();
+        api.store
+            .upsert_account(&crate::store::AccountRecord {
+                account_id: "owner-account".to_string(),
+                kind: "user".to_string(),
+                handle: "owner".to_string(),
+                display_name: "Owner".to_string(),
+                created_at: timestamp.clone(),
+                updated_at: timestamp,
+            })
+            .unwrap();
+        let mut workspace = api
+            .store
+            .get_workspace(TEST_WORKSPACE_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        workspace.owner_account_id = Some("owner-account".to_string());
+        api.store.upsert_workspace(&workspace).await.unwrap();
+
+        let owner = RequestActor {
+            user_id: "owner-user".to_string(),
+            account_id: "owner-account".to_string(),
+            handle: "owner".to_string(),
+            display_name: "Owner".to_string(),
+            auth_method: ActorAuthMethod::BrowserSession,
+        };
+        require_manage_repository_secrets(&api, TEST_WORKSPACE_ID, &owner)
+            .await
+            .unwrap();
+
+        let non_owner = RequestActor {
+            user_id: "other-user".to_string(),
+            account_id: "other-account".to_string(),
+            handle: "other".to_string(),
+            display_name: "Other".to_string(),
+            auth_method: ActorAuthMethod::ApiToken,
+        };
+        let error = require_manage_repository_secrets(&api, TEST_WORKSPACE_ID, &non_owner)
+            .await
+            .unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
     }
 
     async fn test_api_with_recording_backend(
