@@ -462,7 +462,7 @@ pub(super) fn panel_ticket_detail(row: &PanelRow) -> String {
         .as_ref()
         .and_then(|ticket| ticket.blocked_reason.as_deref())
     {
-        parts.push(format!("Gate: waiting for {blocked_reason}"));
+        parts.push(format!("Dependencies: {blocked_reason}"));
     } else {
         parts.push("Gate: clear".to_string());
     }

@@ -21,7 +21,7 @@ export type TicketRoleAssignmentSummary = { assignment_id: string, role: string,
 
 export type TicketAssignmentPrincipalSummary = { "kind": "user", account_id: string, } | { "kind": "worker", runtime_id: string, worker_id: string, } | { "kind": "workspace_agent", agent_key: string, };
 
-export type TicketActionEligibility = { can_assign_orchestrator: boolean, can_unassign_orchestrator: boolean, can_queue: boolean, can_start_manual_coder: boolean, blockers: Array<string>, };
+export type TicketActionEligibility = { can_assign_orchestrator: boolean, can_unassign_orchestrator: boolean, can_queue: boolean, can_start_manual_coder: boolean, queue_tickets: Array<string>, blockers: Array<string>, };
 
 export type TicketMergeRequestSummary = { merge_request_id: string, repository_id: string, state: string, review_status: string, selector_from: string | null, selector_to: string, updated_at: string, current_subject_ref: string | null, review_subject_ref: string | null, review_requested_at: string | null, review_submitted_at: string | null, review_excerpt: string | null, };
 

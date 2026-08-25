@@ -3388,7 +3388,7 @@ async fn scoped_get_ticket(
     AxumPath(path): AxumPath<ScopedRecordPath>,
 ) -> ApiResult<Json<TicketDetail>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    get_ticket(State(api), AxumPath(path.id)).await
+    browser_ticket_detail(&api, &path.id)
 }
 
 async fn scoped_query_tickets(
@@ -3406,7 +3406,10 @@ async fn scoped_show_ticket(
     Json(query): Json<TicketShowRequest>,
 ) -> ApiResult<Json<TicketDetail>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    Ok(Json(api.authority.show_ticket(&path.id, query)?))
+    let backend = browser_ticket_backend(&api)?;
+    Ok(Json(api.authority.read_ticket_detail_with_backend(
+        &path.id, query, &backend,
+    )?))
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -4136,7 +4139,12 @@ fn browser_ticket_backend(api: &WorkspaceApi) -> Result<SqliteTicketBackend> {
 }
 
 fn browser_ticket_detail(api: &WorkspaceApi, ticket_id: &str) -> ApiResult<Json<TicketDetail>> {
-    Ok(Json(api.authority.ticket(ticket_id)?))
+    let backend = browser_ticket_backend(api)?;
+    Ok(Json(api.authority.read_ticket_detail_with_backend(
+        ticket_id,
+        TicketShowRequest::default(),
+        &backend,
+    )?))
 }
 
 async fn scoped_edit_ticket_item(
@@ -4358,27 +4366,58 @@ async fn execute_ticket_rest_operation(
                     .to_string(),
             )
         })?;
-        let assignment = active_orchestrator_assignment(api, workspace_id, &ticket.meta.id)?
-            .ok_or_else(|| {
-                Error::TicketAssignmentConflict(
-                    "Queue requires role=orchestrator assignment to workspace-orchestrator"
-                        .to_string(),
-                )
-            })?;
+        let dependency_check = backend
+            .dependency_check(TicketIdOrSlug::Id(ticket.meta.id.clone()))
+            .map_err(Error::from)?;
+        if !dependency_check.queue_guard.can_queue_for_orchestrator {
+            let reason = dependency_check
+                .queue_guard
+                .blocked_reason
+                .or(dependency_check.queue_guard.reason)
+                .unwrap_or_else(|| "Queue dependency validation failed".to_string());
+            return Err(Error::TicketAssignmentConflict(reason).into());
+        }
+        let candidates = dependency_check.queue_tickets;
+        let mut assignment_ids = BTreeMap::new();
+        for ticket_id in candidates {
+            if api
+                .store
+                .get_current_ticket_role_assignment(
+                    workspace_id,
+                    &ticket_id,
+                    TicketAssignmentRole::Coder,
+                )?
+                .is_some()
+            {
+                return Err(Error::TicketAssignmentConflict(format!(
+                    "Queue rejects Ticket {ticket_id} while a Coder assignment is active"
+                ))
+                .into());
+            }
+            let assignment = active_orchestrator_assignment(api, workspace_id, &ticket_id)?
+                .ok_or_else(|| {
+                    Error::TicketAssignmentConflict(format!(
+                        "Queue requires role=orchestrator assignment for Ticket {ticket_id}"
+                    ))
+                })?;
+            assignment_ids.insert(ticket_id, assignment.assignment_id);
+        }
+        let assignment_json = serde_json::to_string(&assignment_ids).map_err(|error| {
+            Error::Config(format!("failed to encode Queue assignment fence: {error}"))
+        })?;
         let operation_id = new_id("tqueue");
         let fingerprint = Sha256::digest(format!(
-            "ticket-queue:v1\0{workspace_id}\0{}\0{}\0{}",
+            "ticket-queue:v2\0{workspace_id}\0{}\0{}\0{assignment_json}",
             ticket.meta.id,
             ticket.meta.workflow_state.as_str(),
-            assignment.assignment_id
         ))
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
         event_attributes.extend([
             (
-                "orchestrator_assignment_id".to_string(),
-                assignment.assignment_id,
+                "queue_orchestrator_assignments".to_string(),
+                assignment_json,
             ),
             (
                 "routing_principal".to_string(),
@@ -4399,18 +4438,30 @@ async fn execute_ticket_rest_operation(
     }
 
     let result = execute_ticket_backend_operation(&backend, operation).map_err(Error::from)?;
-    if is_mutation
-        && let Some(target) = target
-        && let Ok(ticket) = backend.show(target)
-    {
-        notify_ticket_recipients(
-            api,
-            workspace_id,
-            &ticket.meta.id,
-            &previous_state,
-            ticket.meta.workflow_state.as_str(),
-            source,
-        );
+    if is_mutation {
+        if let TicketBackendOperationResult::QueueOutcome(outcome) = &result {
+            for ticket_id in &outcome.queued_tickets {
+                notify_ticket_recipients(
+                    api,
+                    workspace_id,
+                    ticket_id,
+                    TicketWorkflowState::Ready.as_str(),
+                    TicketWorkflowState::Queued.as_str(),
+                    source.clone(),
+                );
+            }
+        } else if let Some(target) = target
+            && let Ok(ticket) = backend.show(target)
+        {
+            notify_ticket_recipients(
+                api,
+                workspace_id,
+                &ticket.meta.id,
+                &previous_state,
+                ticket.meta.workflow_state.as_str(),
+                source,
+            );
+        }
     }
     Ok(result)
 }
@@ -4734,7 +4785,7 @@ async fn scoped_queue_ticket_record(
     State(api): State<WorkspaceApi>,
     AxumPath((workspace_id, id)): AxumPath<(String, String)>,
     headers: HeaderMap,
-) -> ApiResult<StatusCode> {
+) -> ApiResult<Json<ticket::TicketQueueOutcome>> {
     let result = execute_ticket_rest_operation(
         &api,
         &workspace_id,
@@ -4745,7 +4796,10 @@ async fn scoped_queue_ticket_record(
         },
     )
     .await?;
-    ticket_rest_unit(result)
+    ticket_rest_result(result, |result| match result {
+        TicketBackendOperationResult::QueueOutcome(outcome) => Some(outcome),
+        _ => None,
+    })
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -17871,7 +17925,7 @@ mod tests {
         );
 
         assign_test_orchestrator(&api, &ticket.id);
-        scoped_queue_ticket_record(State(api.clone()), AxumPath(path), HeaderMap::new())
+        let _ = scoped_queue_ticket_record(State(api.clone()), AxumPath(path), HeaderMap::new())
             .await
             .unwrap();
         let queued = backend.show(ticket.id.into()).unwrap();
@@ -17887,6 +17941,195 @@ mod tests {
         );
         assert!(event.attributes.contains_key("routing_operation_id"));
         assert!(event.attributes.contains_key("routing_request_fingerprint"));
+    }
+
+    #[tokio::test]
+    async fn queue_reports_dependency_cycle_before_assignment_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let api = test_api(dir.path()).await;
+        let backend = browser_ticket_backend(&api).unwrap();
+        let mut first_input = ticket::NewTicket::new("First cycle Ticket");
+        first_input.workflow_state = Some(TicketWorkflowState::Ready);
+        first_input.repository_id = Some(TEST_REPOSITORY_ID.to_string());
+        first_input.ref_selector = Some("develop".to_string());
+        let first = backend.create(first_input).unwrap();
+        let mut second_input = ticket::NewTicket::new("Second cycle Ticket");
+        second_input.workflow_state = Some(TicketWorkflowState::Ready);
+        second_input.repository_id = Some(TEST_REPOSITORY_ID.to_string());
+        second_input.ref_selector = Some("develop".to_string());
+        let second = backend.create(second_input).unwrap();
+        for (ticket_id, target) in [
+            (first.id.clone(), second.id.clone()),
+            (second.id.clone(), first.id.clone()),
+        ] {
+            backend
+                .add_ticket_relation(
+                    ticket_id.into(),
+                    ticket::NewTicketRelation {
+                        kind: ticket::TicketRelationKind::DependsOn,
+                        target,
+                        note: None,
+                        author: Some("test".to_string()),
+                    },
+                )
+                .unwrap();
+        }
+
+        let error = execute_ticket_rest_operation(
+            &api,
+            TEST_WORKSPACE_ID,
+            HeaderMap::new(),
+            TicketBackendOperation::QueueReady {
+                id: TicketIdOrSlug::Id(first.id.clone()),
+                queued_by: "workspace-web".to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.error.to_string().contains("cycle"));
+        for ticket_id in [first.id, second.id] {
+            assert_eq!(
+                backend.show(ticket_id.into()).unwrap().meta.workflow_state,
+                TicketWorkflowState::Ready
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_queue_eligibility_uses_authoritative_dependency_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let api = test_api(dir.path()).await;
+        let backend = browser_ticket_backend(&api).unwrap();
+        let mut dependency_input = ticket::NewTicket::new("Invalid target dependency");
+        dependency_input.workflow_state = Some(TicketWorkflowState::Ready);
+        dependency_input.repository_id = Some(TEST_REPOSITORY_ID.to_string());
+        dependency_input.ref_selector = Some("missing-ref".to_string());
+        let dependency = backend.create(dependency_input).unwrap();
+        let mut root_input = ticket::NewTicket::new("Queue root");
+        root_input.workflow_state = Some(TicketWorkflowState::Ready);
+        root_input.repository_id = Some(TEST_REPOSITORY_ID.to_string());
+        root_input.ref_selector = Some("develop".to_string());
+        let root = backend.create(root_input).unwrap();
+        backend
+            .add_ticket_relation(
+                root.id.clone().into(),
+                ticket::NewTicketRelation {
+                    kind: ticket::TicketRelationKind::DependsOn,
+                    target: dependency.id.clone(),
+                    note: None,
+                    author: Some("test".to_string()),
+                },
+            )
+            .unwrap();
+        assign_test_orchestrator(&api, &root.id);
+        assign_test_orchestrator(&api, &dependency.id);
+
+        let Json(detail) = browser_ticket_detail(&api, &root.id).unwrap();
+        assert!(!detail.action_eligibility.can_queue);
+        assert!(
+            detail
+                .action_eligibility
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("missing-ref"))
+        );
+        let result = scoped_queue_ticket_record(
+            State(api.clone()),
+            AxumPath((TEST_WORKSPACE_ID.to_string(), root.id.clone())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(result.is_err());
+        for ticket_id in [dependency.id, root.id] {
+            assert_eq!(
+                backend.show(ticket_id.into()).unwrap().meta.workflow_state,
+                TicketWorkflowState::Ready
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_requires_assignments_for_every_ready_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let api = test_api(dir.path()).await;
+        let backend = browser_ticket_backend(&api).unwrap();
+        let mut dependency_input = ticket::NewTicket::new("Ready dependency");
+        dependency_input.workflow_state = Some(TicketWorkflowState::Ready);
+        dependency_input.repository_id = Some(TEST_REPOSITORY_ID.to_string());
+        dependency_input.ref_selector = Some("develop".to_string());
+        let dependency = backend.create(dependency_input).unwrap();
+        let mut root_input = ticket::NewTicket::new("Queue root");
+        root_input.workflow_state = Some(TicketWorkflowState::Ready);
+        root_input.repository_id = Some(TEST_REPOSITORY_ID.to_string());
+        root_input.ref_selector = Some("develop".to_string());
+        let root = backend.create(root_input).unwrap();
+        backend
+            .add_ticket_relation(
+                root.id.clone().into(),
+                ticket::NewTicketRelation {
+                    kind: ticket::TicketRelationKind::DependsOn,
+                    target: dependency.id.clone(),
+                    note: Some("must queue first".to_string()),
+                    author: Some("test".to_string()),
+                },
+            )
+            .unwrap();
+
+        assign_test_orchestrator(&api, &root.id);
+        let error = scoped_queue_ticket_record(
+            State(api.clone()),
+            AxumPath((TEST_WORKSPACE_ID.to_string(), root.id.clone())),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(error.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            backend
+                .show(root.id.clone().into())
+                .unwrap()
+                .meta
+                .workflow_state,
+            TicketWorkflowState::Ready
+        );
+        assert_eq!(
+            backend
+                .show(dependency.id.clone().into())
+                .unwrap()
+                .meta
+                .workflow_state,
+            TicketWorkflowState::Ready
+        );
+
+        assign_test_orchestrator(&api, &dependency.id);
+        let Json(outcome) = scoped_queue_ticket_record(
+            State(api.clone()),
+            AxumPath((TEST_WORKSPACE_ID.to_string(), root.id.clone())),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.requested_ticket, root.id);
+        assert_eq!(
+            outcome.queued_tickets,
+            vec![dependency.id.clone(), root.id.clone()]
+        );
+        for ticket_id in [dependency.id, root.id] {
+            let queued = backend.show(ticket_id.clone().into()).unwrap();
+            assert_eq!(queued.meta.workflow_state, TicketWorkflowState::Queued);
+            assert_eq!(
+                queued
+                    .events
+                    .last()
+                    .and_then(|event| event.attributes.get("orchestrator_assignment_id"))
+                    .cloned(),
+                Some(format!("orchestrator-{ticket_id}"))
+            );
+        }
     }
 
     #[tokio::test]
@@ -18667,9 +18910,13 @@ mod tests {
             workspace_id: TEST_WORKSPACE_ID.to_string(),
             id: ticket_id.clone(),
         };
+        let mut related_input = ticket::NewTicket::new("Related Browser Ticket");
+        related_input.workflow_state = Some(TicketWorkflowState::Ready);
+        related_input.repository_id = Some(TEST_REPOSITORY_ID.to_string());
+        related_input.ref_selector = Some("develop".to_string());
         let related_ticket_id = browser_ticket_backend(&api)
             .unwrap()
-            .create(ticket::NewTicket::new("Related Browser Ticket"))
+            .create(related_input)
             .unwrap()
             .id;
         browser_ticket_backend(&api)
@@ -18677,7 +18924,7 @@ mod tests {
             .add_ticket_relation(
                 ticket_id.clone().into(),
                 ticket::NewTicketRelation {
-                    kind: ticket::TicketRelationKind::Related,
+                    kind: ticket::TicketRelationKind::DependsOn,
                     target: related_ticket_id.clone(),
                     note: Some("Browser relation".to_string()),
                     author: Some("browser-user".to_string()),
@@ -18711,7 +18958,7 @@ mod tests {
         assert!(edited.assignment_diagnostics.is_empty());
         assert_eq!(edited.relations.outgoing.len(), 1);
         assert_eq!(edited.relations.outgoing[0].target, related_ticket_id);
-        assert_eq!(edited.relations.outgoing[0].kind, "related");
+        assert_eq!(edited.relations.outgoing[0].kind, "depends_on");
 
         let Json(commented) = scoped_append_ticket_event(
             State(api.clone()),
@@ -18741,6 +18988,18 @@ mod tests {
         .unwrap();
         assert_eq!(ready.state, "ready");
         assign_test_orchestrator(&api, &ticket_id);
+        assign_test_orchestrator(&api, &related_ticket_id);
+        let Json(ready_detail) = scoped_get_ticket(State(api.clone()), AxumPath(path()))
+            .await
+            .unwrap();
+        assert!(
+            ready_detail.action_eligibility.can_queue,
+            "Queue blockers: {:?}",
+            ready_detail.action_eligibility.blockers
+        );
+        assert!(ready_detail.action_eligibility.blockers.is_empty());
+        assert_eq!(ready_detail.relations.blockers.len(), 1);
+        assert_eq!(ready_detail.relations.blockers[0].reason_kind, "depends_on");
 
         let Json(queued) = scoped_queue_ticket(
             State(api.clone()),
@@ -18751,6 +19010,8 @@ mod tests {
         .unwrap();
         assert_eq!(queued.state, "queued");
         assert_eq!(queued.queued_by.as_deref(), Some("workspace-web"));
+        assert_eq!(queued.relations.blockers.len(), 1);
+        assert_eq!(queued.relations.blockers[0].reason_kind, "depends_on");
         let Json(closed) = scoped_close_ticket(
             State(api),
             AxumPath(path()),

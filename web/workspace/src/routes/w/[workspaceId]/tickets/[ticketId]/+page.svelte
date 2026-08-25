@@ -38,6 +38,11 @@
   if (!loadedTicket) throw new Error(initialData.ticket.error ?? "ticket load failed");
   const loadedRepositories = initialData.repositories.data;
 
+  type QueueOutcome = {
+    requested_ticket: string;
+    queued_tickets: string[];
+  };
+
   let ticket = $state<TicketDetail>(loadedTicket);
   const mergeRequest = $derived(ticket.merge_request);
   let editing = $state(false);
@@ -52,6 +57,7 @@
   let resolution = $state("");
   let busy = $state<string | null>(null);
   let errorMessage = $state<string | null>(null);
+  let queueMessage = $state<string | null>(null);
   let readyOperationKey = $state<string | null>(null);
   let manualRuntimeId = $state("");
   let manualWorkerId = $state("");
@@ -116,6 +122,25 @@
     } catch (error) {
       errorMessage = error instanceof Error ? error.message : String(error);
       return false;
+    } finally {
+      busy = null;
+    }
+  }
+
+  async function queueTicket(): Promise<void> {
+    if (busy) return;
+    busy = "queue";
+    errorMessage = null;
+    queueMessage = null;
+    try {
+      const outcome = await workspaceApiJsonWithBody<QueueOutcome>(
+        `${ticketPath}/queue`,
+        { method: "POST", body: JSON.stringify({}) },
+      );
+      queueMessage = `Queued ${outcome.queued_tickets.length} Ticket(s): ${outcome.queued_tickets.join(", ")}`;
+      applyTicket(await workspaceApiJson<TicketDetail>(ticketPath));
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : String(error);
     } finally {
       busy = null;
     }
@@ -286,6 +311,10 @@
 
   {#if errorMessage}
     <div class="workspace-callout is-error" role="alert">{errorMessage}</div>
+  {/if}
+
+  {#if queueMessage}
+    <div class="workspace-callout" role="status">{queueMessage}</div>
   {/if}
 
   {#if editing}
@@ -496,11 +525,16 @@
             <p class="workspace-empty-copy">Choose a healthy repository and an effective ref selector before marking ready.</p>
           {/if}
         {:else if ticket.state === "ready"}
-          <button class="workspace-primary-button ticket-queue-button" type="button" disabled={busy === "queue" || !ticket.action_eligibility.can_queue} onclick={() => mutate("queue", "/queue", {})}>
-            {busy === "queue" ? "Queueing…" : "Queue ticket"}
+          <button class="workspace-primary-button ticket-queue-button" type="button" disabled={busy === "queue" || !ticket.action_eligibility.can_queue} onclick={() => void queueTicket()}>
+            {busy === "queue" ? "Queueing…" : `Queue ${ticket.action_eligibility.queue_tickets.length} Ticket(s)`}
           </button>
           {#if !ticket.action_eligibility.can_queue}
-            <p class="workspace-empty-copy">Assign the Orchestrator role and resolve the listed blockers before Queue.</p>
+            <p class="workspace-empty-copy">Queue requires a valid target, an active Orchestrator assignment, no active Coder assignment, and no dependency still in planning.</p>
+          {:else if ticket.action_eligibility.queue_tickets.length > 0}
+            <p class="workspace-empty-copy">This operation queues: {ticket.action_eligibility.queue_tickets.join(", ")}.</p>
+            {#if ticket.relations.blockers.length > 0}
+              <p class="workspace-empty-copy">Ready dependencies are queued atomically. Queued or in-progress dependencies remain unchanged for the Orchestrator to schedule.</p>
+            {/if}
           {/if}
         {/if}
       </section>

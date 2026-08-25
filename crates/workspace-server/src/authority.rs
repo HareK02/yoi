@@ -705,6 +705,15 @@ impl SqliteWorkspaceAuthority {
         reference: &str,
         request: TicketShowRequest,
     ) -> Result<TicketDetail> {
+        self.read_ticket_detail_with_backend(reference, request, &self.ticket_backend)
+    }
+
+    pub(crate) fn read_ticket_detail_with_backend(
+        &self,
+        reference: &str,
+        request: TicketShowRequest,
+        backend: &SqliteTicketBackend,
+    ) -> Result<TicketDetail> {
         let id = self
             .store
             .resolve_resource_reference(
@@ -713,16 +722,19 @@ impl SqliteWorkspaceAuthority {
                 reference,
             )?
             .ok_or_else(|| Error::Ticket(ticket::TicketError::NotFound(reference.to_string())))?;
-        let ticket = self.ticket_backend.show(TicketIdOrSlug::Id(id))?;
-        self.ticket_detail_from_ticket(ticket, request)
+        let ticket = backend.show(TicketIdOrSlug::Id(id))?;
+        self.ticket_detail_from_ticket(ticket, request, backend)
     }
 
     fn ticket_detail_from_ticket(
         &self,
         ticket: ticket::Ticket,
         request: TicketShowRequest,
+        dependency_backend: &SqliteTicketBackend,
     ) -> Result<TicketDetail> {
         let id = ticket.meta.id.as_str();
+        let dependency_check =
+            dependency_backend.dependency_check(TicketIdOrSlug::Id(id.to_string()))?;
         let (body, body_truncated) =
             truncate_body(ticket.document.body.as_str(), DETAIL_BODY_LIMIT);
         let event_limit = request
@@ -822,6 +834,27 @@ impl SqliteWorkspaceAuthority {
             .any(|assignment| assignment.role == TicketAssignmentRole::Coder);
         let has_target = ticket.meta.repository_id.is_some() && ticket.meta.ref_selector.is_some();
         let has_blockers = !ticket.relations.blockers.is_empty();
+        let mut queue_assignment_blockers = Vec::new();
+        for ticket_id in &dependency_check.queue_tickets {
+            let assignments = self
+                .store
+                .list_current_ticket_role_assignments(&self.workspace_id, ticket_id)?;
+            if !assignments
+                .iter()
+                .any(|assignment| assignment.role == TicketAssignmentRole::Orchestrator)
+            {
+                queue_assignment_blockers.push(format!(
+                    "Ticket {ticket_id} requires an active Orchestrator assignment"
+                ));
+            }
+            if assignments
+                .iter()
+                .any(|assignment| assignment.role == TicketAssignmentRole::Coder)
+            {
+                queue_assignment_blockers
+                    .push(format!("Ticket {ticket_id} has an active Coder assignment"));
+            }
+        }
         let mut assignment_diagnostics = Vec::new();
         if let Some(legacy_assignee) = ticket
             .meta
@@ -833,6 +866,19 @@ impl SqliteWorkspaceAuthority {
                 "legacy Ticket assignee `{legacy_assignee}` is not assignment authority"
             ));
         }
+        let mut action_blockers = Vec::new();
+        if !has_target {
+            action_blockers.push("Ticket target is required".to_string());
+        }
+        if !dependency_check.queue_guard.can_queue_for_orchestrator {
+            if let Some(reason) = dependency_check.queue_guard.blocked_reason.clone() {
+                action_blockers.push(reason);
+            } else if let Some(reason) = dependency_check.queue_guard.reason.clone() {
+                action_blockers.push(reason);
+            }
+        }
+        let queue_assignments_valid = queue_assignment_blockers.is_empty();
+        action_blockers.extend(queue_assignment_blockers);
         let action_eligibility = TicketActionEligibility {
             can_assign_orchestrator: matches!(
                 ticket.meta.workflow_state,
@@ -848,19 +894,15 @@ impl SqliteWorkspaceAuthority {
                 && has_orchestrator
                 && !has_coder
                 && has_target
-                && !has_blockers,
+                && dependency_check.queue_guard.can_queue_for_orchestrator
+                && queue_assignments_valid,
             can_start_manual_coder: ticket.meta.workflow_state == TicketWorkflowState::Ready
                 && !has_orchestrator
                 && !has_coder
                 && has_target
                 && !has_blockers,
-            blockers: [
-                (!has_target).then_some("Ticket target is required".to_string()),
-                has_blockers.then_some("unresolved blocking relations remain".to_string()),
-            ]
-            .into_iter()
-            .flatten()
-            .collect(),
+            queue_tickets: dependency_check.queue_tickets.clone(),
+            blockers: action_blockers,
         };
         let merge_request = match self.merge_request_store.get(&self.workspace_id, id) {
             Ok(request) => {
@@ -1084,6 +1126,7 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
                     event_limit: Some(TICKET_EVENT_LIMIT),
                     event_cursor: None,
                 },
+                &self.ticket_backend,
             )?;
             if ticket_matches_query(
                 &summary,
@@ -2927,7 +2970,7 @@ mod tests {
     async fn sqlite_workspace_authority_reads_sqlite_records_without_filesystem_authority() {
         let dir = tempfile::tempdir().unwrap();
         write_ticket(dir.path(), "00000000001J2", "Read bridge", "ready");
-        write_ticket(dir.path(), "00000000001J5", "Second ticket", "planning");
+        write_ticket(dir.path(), "00000000001J5", "Second ticket", "queued");
         write_ticket(dir.path(), "00000000001J6", "Third ticket", "planning");
         let db_path = dir.path().join("workspace.db");
         let store = SqliteWorkspaceStore::open(&db_path).unwrap();
@@ -3040,8 +3083,20 @@ VALUES ('workspace-test', 'ticket', 4);
                 TicketIdOrSlug::Id("00000000001J2".to_string()),
                 ticket::NewTicketRelation {
                     kind: ticket::TicketRelationKind::DependsOn,
+                    target: "00000000001J5".to_string(),
+                    note: Some("queued dependency with a transitive blocker".to_string()),
+                    author: Some("tester".to_string()),
+                },
+            )
+            .unwrap();
+        authority
+            .ticket_backend
+            .add_ticket_relation(
+                TicketIdOrSlug::Id("00000000001J5".to_string()),
+                ticket::NewTicketRelation {
+                    kind: ticket::TicketRelationKind::DependsOn,
                     target: "00000000001J6".to_string(),
-                    note: Some("separate dependency relation".to_string()),
+                    note: Some("transitive planning dependency".to_string()),
                     author: Some("tester".to_string()),
                 },
             )
@@ -3056,6 +3111,14 @@ VALUES ('workspace-test', 'ticket', 4);
         assert_eq!(ticket_by_key.id, tickets.items[0].id);
 
         let ticket = authority.ticket("00000000001J2").unwrap();
+        assert!(!ticket.action_eligibility.can_queue);
+        assert!(
+            ticket
+                .action_eligibility
+                .blockers
+                .iter()
+                .any(|reason| reason.contains("00000000001J6"))
+        );
         assert!(ticket.body.contains("Ticket body"));
         assert!(ticket.body_truncated);
         assert!(!ticket.body.contains("Deep Ticket marker"));
@@ -3139,8 +3202,8 @@ VALUES ('workspace-test', 'ticket', 4);
         assert!(note_only_kind.items.is_empty());
         let crossed_relation_filters = authority
             .query_tickets(TicketQueryRequest {
-                related_ticket_id: Some("00000000001J5".to_string()),
-                relation_kind: Some("depends_on".to_string()),
+                related_ticket_id: Some("00000000001J6".to_string()),
+                relation_kind: Some("related".to_string()),
                 ..TicketQueryRequest::default()
             })
             .unwrap();

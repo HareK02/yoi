@@ -804,7 +804,14 @@ pub struct TicketDependencyCheck {
     pub ticket: TicketSummary,
     pub blockers: Vec<TicketRelationBlocker>,
     pub queue_guard: TicketQueueGuard,
+    pub queue_tickets: Vec<String>,
     pub recommended_action: TicketWorkspaceNextAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketQueueOutcome {
+    pub requested_ticket: String,
+    pub queued_tickets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1140,21 +1147,47 @@ pub fn ticket_queue_guard(
             blocked_reason: None,
         };
     }
-    let active_blockers = relation_blockers
+    if relation_blockers
         .iter()
-        .filter(|blocker| !relation_blocker_allows_ready_queue(blocker))
-        .collect::<Vec<_>>();
-    if !active_blockers.is_empty() {
-        let blockers = format_workspace_relation_blockers(&active_blockers);
+        .any(|blocker| blocker.blocking_ticket == summary.id)
+    {
         return TicketQueueGuard {
             can_queue_for_orchestrator: false,
-            reason: Some(format!("waiting for {blockers}")),
-            blocked_reason: Some(blockers),
+            reason: Some("Dependency cycle must be resolved before Queue".to_string()),
+            blocked_reason: Some(format!(
+                "Ticket {} is part of a dependency cycle",
+                summary.id
+            )),
+        };
+    }
+    if relation_blockers
+        .iter()
+        .any(|blocker| blocker.blocking_state == TicketWorkflowState::Planning)
+    {
+        let blocked_reason = relation_blockers
+            .iter()
+            .filter(|blocker| blocker.blocking_state == TicketWorkflowState::Planning)
+            .map(|blocker| {
+                format!(
+                    "{} ({})",
+                    blocker.blocking_ticket,
+                    blocker.blocking_state.as_str()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return TicketQueueGuard {
+            can_queue_for_orchestrator: false,
+            reason: Some("Dependencies must leave planning before Queue can proceed".to_string()),
+            blocked_reason: Some(blocked_reason),
         };
     }
     TicketQueueGuard {
         can_queue_for_orchestrator: true,
-        reason: None,
+        reason: (!relation_blockers.is_empty()).then(|| {
+            "Ready dependencies will be queued atomically; active dependencies remain unchanged"
+                .to_string()
+        }),
         blocked_reason: None,
     }
 }
@@ -1166,9 +1199,12 @@ fn derive_ticket_workspace_projection(
     if !relation_blockers.is_empty() {
         let active_blockers = relation_blockers
             .iter()
-            .filter(|blocker| !relation_blocker_allows_ready_queue(blocker))
+            .filter(|blocker| {
+                blocker.blocking_ticket == summary.id
+                    || !relation_blocker_allows_ready_queue(blocker)
+            })
             .collect::<Vec<_>>();
-        if !active_blockers.is_empty() || summary.workflow_state != TicketWorkflowState::Ready {
+        if summary.workflow_state != TicketWorkflowState::Ready || !active_blockers.is_empty() {
             let blockers_to_report = if active_blockers.is_empty() {
                 relation_blockers.iter().collect::<Vec<_>>()
             } else {
@@ -1188,9 +1224,9 @@ fn derive_ticket_workspace_projection(
                 visible_state: summary.workflow_state.as_str().to_string(),
                 visible_overlay: None,
                 disabled_reason: Some(format!(
-                    "Queue disabled: {waiting_reason}. Resolve dependency/blocker before ready -> queued."
+                    "Dependency context: {waiting_reason}. The Orchestrator decides whether work waits or starts in parallel."
                 )),
-                key_hint: Some(format!("Gate: {waiting_reason}")),
+                key_hint: Some(format!("Dependencies: {waiting_reason}")),
                 blocked_reason: Some(blockers),
                 queue_guard: TicketQueueGuard {
                     can_queue_for_orchestrator: false,
@@ -1205,6 +1241,15 @@ fn derive_ticket_workspace_projection(
                 .iter()
                 .collect::<Vec<&TicketRelationBlocker>>(),
         );
+        let mut queue_targets = vec![summary.id.clone()];
+        queue_targets.extend(
+            relation_blockers
+                .iter()
+                .filter(|blocker| blocker.blocking_state == TicketWorkflowState::Ready)
+                .map(|blocker| blocker.blocking_ticket.clone()),
+        );
+        queue_targets.sort();
+        queue_targets.dedup();
         return TicketWorkspaceProjection {
             kind: TicketWorkspaceRowKind::Ticket,
             priority: TicketWorkspaceActionPriority::ReadyForQueue,
@@ -1213,9 +1258,10 @@ fn derive_ticket_workspace_projection(
             visible_overlay: None,
             disabled_reason: None,
             key_hint: Some(format!(
-                "Queue allowed: prerequisites are already queued/in progress; Orchestrator will preserve order ({blockers})."
+                "Queue targets: {}; active dependencies remain orchestration context ({blockers}).",
+                queue_targets.join(", ")
             )),
-            blocked_reason: None,
+            blocked_reason: Some(blockers),
             queue_guard: TicketQueueGuard {
                 can_queue_for_orchestrator: true,
                 reason: None,
@@ -1421,7 +1467,7 @@ fn compact_ticket_state_label(state: TicketWorkflowState) -> &'static str {
 fn relation_blocker_allows_ready_queue(blocker: &TicketRelationBlocker) -> bool {
     matches!(
         blocker.blocking_state,
-        TicketWorkflowState::Queued | TicketWorkflowState::InProgress
+        TicketWorkflowState::Ready | TicketWorkflowState::Queued | TicketWorkflowState::InProgress
     )
 }
 
@@ -1745,7 +1791,7 @@ pub trait TicketBackend {
     ) -> Result<()>;
     fn set_workflow_state(&self, id: TicketIdOrSlug, change: TicketStateChange) -> Result<()>;
     fn mark_ready(&self, id: TicketIdOrSlug, request: TicketMarkReady) -> Result<Ticket>;
-    fn queue_ready(&self, id: TicketIdOrSlug, queued_by: &str) -> Result<()>;
+    fn queue_ready(&self, id: TicketIdOrSlug, queued_by: &str) -> Result<TicketQueueOutcome>;
     fn close(&self, id: TicketIdOrSlug, resolution: MarkdownText) -> Result<()>;
     fn add_ticket_relation(
         &self,
@@ -1868,6 +1914,7 @@ pub enum TicketBackendOperationResult {
     Ticket(Ticket),
     TicketRef(TicketRef),
     DependencyCheck(TicketDependencyCheck),
+    QueueOutcome(TicketQueueOutcome),
     Relation(TicketRelation),
     Relations(Vec<TicketRelation>),
     RelationView(TicketRelationView),
@@ -1928,8 +1975,7 @@ where
             TicketBackendOperationResult::Ticket(backend.mark_ready(id, request)?)
         }
         TicketBackendOperation::QueueReady { id, queued_by } => {
-            backend.queue_ready(id, &queued_by)?;
-            TicketBackendOperationResult::Unit
+            TicketBackendOperationResult::QueueOutcome(backend.queue_ready(id, &queued_by)?)
         }
         TicketBackendOperation::Close { id, resolution } => {
             backend.close(id, resolution)?;
@@ -2791,97 +2837,17 @@ impl SqliteTicketBackend {
         conn: &Connection,
         summaries: &[TicketSummary],
     ) -> Result<HashMap<String, Vec<TicketRelationBlocker>>> {
-        let listed_ids = summaries
+        let states = self.state_index(conn)?;
+        let relations = self.all_relations(conn)?;
+        summaries
             .iter()
-            .map(|summary| summary.id.as_str())
-            .collect::<BTreeSet<_>>();
-        let mut statement = conn
-            .prepare(
-                "SELECT relation.ticket_id, relation.kind, relation.target, relation.note,
-                        source.workflow_state, target.workflow_state
-                 FROM typed_ticket_relations AS relation
-                 LEFT JOIN typed_tickets AS source
-                   ON source.workspace_id = relation.workspace_id
-                  AND source.ticket_id = relation.ticket_id
-                 LEFT JOIN typed_tickets AS target
-                   ON target.workspace_id = relation.workspace_id
-                  AND target.ticket_id = relation.target
-                 WHERE relation.workspace_id = ?1
-                   AND relation.kind IN ('depends_on', 'blocks')
-                   AND EXISTS (
-                       SELECT 1 FROM json_each(?2) AS listed
-                       WHERE listed.value = relation.ticket_id
-                          OR listed.value = relation.target
-                   )",
-            )
-            .map_err(sqlite_err)?;
-        let listed_ids_json = serde_json::to_string(
-            &summaries
-                .iter()
-                .map(|summary| summary.id.as_str())
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|error| TicketError::Sqlite(error.to_string()))?;
-        let rows = statement
-            .query_map(params![self.workspace_id, listed_ids_json], |row| {
+            .map(|summary| {
                 Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
+                    summary.id.clone(),
+                    transitive_dependency_blockers(&summary.id, &states, &relations)?,
                 ))
             })
-            .map_err(sqlite_err)?;
-        let mut blockers = HashMap::<String, Vec<TicketRelationBlocker>>::new();
-        for row in rows {
-            let (source, kind, target, note, source_state, target_state) =
-                row.map_err(sqlite_err)?;
-            let (listed_ticket, blocking_ticket, reason_kind, relation_kind, blocking_state) =
-                match kind.as_str() {
-                    "depends_on" if listed_ids.contains(source.as_str()) => (
-                        source,
-                        target,
-                        "depends_on",
-                        TicketRelationKind::DependsOn,
-                        target_state,
-                    ),
-                    "blocks" if listed_ids.contains(target.as_str()) => (
-                        target,
-                        source,
-                        "blocked_by",
-                        TicketRelationKind::Blocks,
-                        source_state,
-                    ),
-                    _ => continue,
-                };
-            let blocking_state = blocking_state
-                .as_deref()
-                .and_then(TicketWorkflowState::parse)
-                .unwrap_or(TicketWorkflowState::Planning);
-            if ticket_state_resolved(blocking_state) {
-                continue;
-            }
-            blockers
-                .entry(listed_ticket)
-                .or_default()
-                .push(TicketRelationBlocker {
-                    blocking_ticket,
-                    reason_kind: reason_kind.to_string(),
-                    relation_kind,
-                    note,
-                    blocking_state,
-                });
-        }
-        for ticket_blockers in blockers.values_mut() {
-            ticket_blockers.sort_by(|a, b| {
-                a.reason_kind
-                    .cmp(&b.reason_kind)
-                    .then_with(|| a.blocking_ticket.cmp(&b.blocking_ticket))
-            });
-        }
-        Ok(blockers)
+            .collect()
     }
 
     pub fn import_from_local_backend(&self, local: &LocalTicketBackend) -> Result<()> {
@@ -3697,17 +3663,62 @@ impl TicketBackend for SqliteTicketBackend {
     }
 
     fn dependency_check(&self, id: TicketIdOrSlug) -> Result<TicketDependencyCheck> {
-        let ticket = self.show(id)?;
-        let blockers = ticket.relations.blockers.clone();
-        let summary = ticket_summary_from_meta(ticket.meta.clone());
-        let projection = project_ticket_workspace_item(&summary, &blockers, None);
-        Ok(TicketDependencyCheck {
-            ticket: summary,
-            blockers,
-            queue_guard: projection.queue_guard,
-            recommended_action: projection
-                .next_action
-                .unwrap_or(TicketWorkspaceNextAction::WaitForOrchestrator),
+        self.with_read(|conn| {
+            let ticket_id = self.resolve_ticket_id(conn, id)?;
+            let ticket = self.load_ticket(conn, &ticket_id)?;
+            let states = self.state_index(conn)?;
+            let relations = self.all_relations(conn)?;
+            let blockers = transitive_dependency_blockers(&ticket_id, &states, &relations)?;
+            let summary = ticket_summary_from_meta(ticket.meta);
+            let mut projection = project_ticket_workspace_item(&summary, &blockers, None);
+            let queue_tickets = if summary.workflow_state == TicketWorkflowState::Ready {
+                match dependency_queue_plan(&ticket_id, &states, &relations) {
+                    Ok(queue_tickets) => {
+                        let target_error = queue_tickets.iter().find_map(|candidate| {
+                            self.load_ticket(conn, candidate)
+                                .and_then(|ticket| {
+                                    resolve_ready_target(
+                                        self.target_authority.as_ref(),
+                                        &self.workspace_id,
+                                        &ticket,
+                                    )
+                                })
+                                .err()
+                        });
+                        if let Some(error) = target_error {
+                            projection.queue_guard = TicketQueueGuard {
+                                can_queue_for_orchestrator: false,
+                                reason: Some(
+                                    "Queue dependency target validation failed".to_string(),
+                                ),
+                                blocked_reason: Some(error.to_string()),
+                            };
+                            Vec::new()
+                        } else {
+                            queue_tickets
+                        }
+                    }
+                    Err(error) => {
+                        projection.queue_guard = TicketQueueGuard {
+                            can_queue_for_orchestrator: false,
+                            reason: Some("Queue dependency validation failed".to_string()),
+                            blocked_reason: Some(error.to_string()),
+                        };
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            Ok(TicketDependencyCheck {
+                ticket: summary,
+                blockers,
+                queue_guard: projection.queue_guard,
+                queue_tickets,
+                recommended_action: projection
+                    .next_action
+                    .unwrap_or(TicketWorkspaceNextAction::WaitForOrchestrator),
+            })
         })
     }
 
@@ -3905,35 +3916,90 @@ impl TicketBackend for SqliteTicketBackend {
         })
     }
 
-    fn queue_ready(&self, id: TicketIdOrSlug, queued_by: &str) -> Result<()> {
+    fn queue_ready(&self, id: TicketIdOrSlug, queued_by: &str) -> Result<TicketQueueOutcome> {
         validate_required_event_value("queued_by", queued_by)?;
         self.with_write(|conn| {
-            let ticket_id = self.resolve_ticket_id(conn, id)?;
-            let ticket = self.load_ticket(conn, &ticket_id)?;
-            if ticket.meta.workflow_state != TicketWorkflowState::Ready {
-                return Err(TicketError::StaleWorkflowState {
-                    expected: TicketWorkflowState::Ready.as_str().to_owned(),
-                    actual: ticket.meta.workflow_state.as_str().to_owned(),
-                });
+            let requested_ticket = self.resolve_ticket_id(conn, id)?;
+            let states = self.state_index(conn)?;
+            let relations = self.all_relations(conn)?;
+            let queued_tickets = dependency_queue_plan(&requested_ticket, &states, &relations)?;
+            if let Some(json) = self
+                .event_attributes
+                .get("queue_orchestrator_assignments")
+            {
+                let assignments = serde_json::from_str::<BTreeMap<String, String>>(json).map_err(
+                    |error| {
+                        TicketError::Conflict(format!(
+                            "invalid Queue assignment fence: {error}"
+                        ))
+                    },
+                )?;
+                let planned = assignments.keys().cloned().collect::<BTreeSet<_>>();
+                let actual = queued_tickets.iter().cloned().collect::<BTreeSet<_>>();
+                if planned != actual || assignments.values().any(|value| value.trim().is_empty()) {
+                    return Err(TicketError::Conflict(
+                        "Queue dependency plan changed after assignment validation".to_string(),
+                    ));
+                }
             }
-            let target = resolve_ready_target(
-                self.target_authority.as_ref(),
-                &self.workspace_id,
-                &ticket,
-            )?;
-            let blockers = ticket
-                .relations
-                .blockers
-                .iter()
-                .filter(|blocker| !relation_blocker_allows_queue(blocker))
-                .cloned()
-                .collect::<Vec<_>>();
-            if !blockers.is_empty() {
-                return Err(TicketError::BlockingRelations(format_relation_blockers(&blockers)));
+
+            let mut targets = Vec::with_capacity(queued_tickets.len());
+            for ticket_id in &queued_tickets {
+                let ticket = self.load_ticket(conn, ticket_id)?;
+                let target = resolve_ready_target(
+                    self.target_authority.as_ref(),
+                    &self.workspace_id,
+                    &ticket,
+                )?;
+                targets.push((ticket_id.clone(), target));
             }
+
             let at = now_utc();
-            conn.execute("UPDATE typed_tickets SET workflow_state = 'queued', workflow_state_explicit = 1, queued_by = ?3, queued_at = ?4, repository_id = ?5, ref_selector = ?6, updated_at = ?4 WHERE workspace_id = ?1 AND ticket_id = ?2 AND workflow_state = 'ready'", params![self.workspace_id, ticket_id, queued_by, at, target.repository_id, target.ref_selector]).map_err(sqlite_err)?;
-            self.insert_event(conn, &ticket_id, &TicketEvent { kind: TicketEventKind::StateChanged, author: Some(queued_by.to_string()), at: Some(at.clone()), status: None, from: Some("ready".to_string()), to: Some("queued".to_string()), reason: Some("queued".to_string()), state_field: Some("state".to_string()), heading: Some(TicketEventKind::StateChanged.heading()), body: MarkdownText::new(format!("Queued for Orchestrator by {queued_by}.")), references: Vec::new(), attributes: BTreeMap::from([("queued_by".to_owned(), queued_by.to_owned()), ("queued_at".to_owned(), at), ("repository_id".to_owned(), target.repository_id), ("ref_selector".to_owned(), target.ref_selector)]) })
+            for (ticket_id, target) in targets {
+                let updated = conn.execute(
+                    "UPDATE typed_tickets SET workflow_state = 'queued', workflow_state_explicit = 1, queued_by = ?3, queued_at = ?4, repository_id = ?5, ref_selector = ?6, updated_at = ?4 WHERE workspace_id = ?1 AND ticket_id = ?2 AND workflow_state = 'ready'",
+                    params![self.workspace_id, ticket_id, queued_by, at, target.repository_id, target.ref_selector],
+                ).map_err(sqlite_err)?;
+                if updated != 1 {
+                    return Err(TicketError::Conflict(format!(
+                        "Ticket {ticket_id} changed while the dependency queue plan was being applied"
+                    )));
+                }
+                let mut attributes = BTreeMap::from([
+                    ("queued_by".to_owned(), queued_by.to_owned()),
+                    ("queued_at".to_owned(), at.clone()),
+                    ("repository_id".to_owned(), target.repository_id),
+                    ("ref_selector".to_owned(), target.ref_selector),
+                    ("queue_root_ticket".to_owned(), requested_ticket.clone()),
+                ]);
+                if let Some(assignment_id) = self
+                    .event_attributes
+                    .get("queue_orchestrator_assignments")
+                    .and_then(|json| serde_json::from_str::<BTreeMap<String, String>>(json).ok())
+                    .and_then(|assignments| assignments.get(&ticket_id).cloned())
+                {
+                    attributes.insert("orchestrator_assignment_id".to_owned(), assignment_id);
+                }
+                self.insert_event(conn, &ticket_id, &TicketEvent {
+                    kind: TicketEventKind::StateChanged,
+                    author: Some(queued_by.to_string()),
+                    at: Some(at.clone()),
+                    status: None,
+                    from: Some("ready".to_string()),
+                    to: Some("queued".to_string()),
+                    reason: Some("queued".to_string()),
+                    state_field: Some("state".to_string()),
+                    heading: Some(TicketEventKind::StateChanged.heading()),
+                    body: MarkdownText::new(format!("Queued for Orchestrator by {queued_by}.")),
+                    references: Vec::new(),
+                    attributes,
+                })?;
+            }
+
+            Ok(TicketQueueOutcome {
+                requested_ticket,
+                queued_tickets,
+            })
         })
     }
 
@@ -4392,13 +4458,62 @@ impl TicketBackend for LocalTicketBackend {
     }
 
     fn dependency_check(&self, id: TicketIdOrSlug) -> Result<TicketDependencyCheck> {
-        let ticket = self.show(id)?;
-        let summary = ticket_summary_from_meta(ticket.meta.clone());
-        let projection = project_ticket_workspace_item(&summary, &ticket.relations.blockers, None);
+        let requested_dir = self.find_ticket_dir(&id)?;
+        let requested_ticket = ticket_id_from_dir(&requested_dir)?;
+        let mut states = HashMap::new();
+        for dir in self.iter_ticket_dirs(TicketListQuery::all())? {
+            let item = dir.join("item.md");
+            let meta = ticket_meta_for_dir(&dir, read_item_file(&item)?.frontmatter)?;
+            states.insert(meta.id, meta.workflow_state);
+        }
+        let relations = self.all_ticket_relation_records()?;
+        let blockers = transitive_dependency_blockers(&requested_ticket, &states, &relations)?;
+        let ticket = self.ticket_from_dir(&requested_dir)?;
+        let summary = ticket_summary_from_meta(ticket.meta);
+        let mut projection = project_ticket_workspace_item(&summary, &blockers, None);
+        let queue_tickets = if summary.workflow_state == TicketWorkflowState::Ready {
+            match dependency_queue_plan(&requested_ticket, &states, &relations) {
+                Ok(queue_tickets) => {
+                    let target_error = queue_tickets.iter().find_map(|candidate| {
+                        self.find_ticket_dir(&TicketIdOrSlug::Id(candidate.clone()))
+                            .and_then(|dir| self.ticket_from_dir(&dir))
+                            .and_then(|ticket| {
+                                resolve_ready_target(
+                                    self.target_authority.as_ref(),
+                                    "local",
+                                    &ticket,
+                                )
+                            })
+                            .err()
+                    });
+                    if let Some(error) = target_error {
+                        projection.queue_guard = TicketQueueGuard {
+                            can_queue_for_orchestrator: false,
+                            reason: Some("Queue dependency target validation failed".to_string()),
+                            blocked_reason: Some(error.to_string()),
+                        };
+                        Vec::new()
+                    } else {
+                        queue_tickets
+                    }
+                }
+                Err(error) => {
+                    projection.queue_guard = TicketQueueGuard {
+                        can_queue_for_orchestrator: false,
+                        reason: Some("Queue dependency validation failed".to_string()),
+                        blocked_reason: Some(error.to_string()),
+                    };
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
         Ok(TicketDependencyCheck {
             ticket: summary,
-            blockers: ticket.relations.blockers,
+            blockers,
             queue_guard: projection.queue_guard,
+            queue_tickets,
             recommended_action: projection
                 .next_action
                 .unwrap_or(TicketWorkspaceNextAction::WaitForOrchestrator),
@@ -4552,52 +4667,96 @@ impl TicketBackend for LocalTicketBackend {
         self.ticket_from_dir(&dir)
     }
 
-    fn queue_ready(&self, id: TicketIdOrSlug, queued_by: &str) -> Result<()> {
+    fn queue_ready(&self, id: TicketIdOrSlug, queued_by: &str) -> Result<TicketQueueOutcome> {
         validate_required_event_value("queued_by", queued_by)?;
         let _lock = self.acquire_lock()?;
-        let dir = self.find_ticket_dir(&id)?;
-        let item = dir.join("item.md");
-        let meta = ticket_meta_for_dir(&dir, read_item_file(&item)?.frontmatter)?;
-        if meta.workflow_state != TicketWorkflowState::Ready {
-            return Err(TicketError::StaleWorkflowState {
-                expected: TicketWorkflowState::Ready.as_str().to_owned(),
-                actual: meta.workflow_state.as_str().to_owned(),
-            });
+        let requested_dir = self.find_ticket_dir(&id)?;
+        let requested_ticket = ticket_id_from_dir(&requested_dir)?;
+        let mut states = HashMap::new();
+        for dir in self.iter_ticket_dirs(TicketListQuery::all())? {
+            let item = dir.join("item.md");
+            let meta = ticket_meta_for_dir(&dir, read_item_file(&item)?.frontmatter)?;
+            states.insert(meta.id, meta.workflow_state);
         }
-        let ticket = self.ticket_from_dir(&dir)?;
-        let target = resolve_ready_target(self.target_authority.as_ref(), "local", &ticket)?;
-        let blockers = self.relation_blockers_for_meta(&meta)?;
-        let active_blockers = blockers
-            .into_iter()
-            .filter(|blocker| !relation_blocker_allows_queue(blocker))
-            .collect::<Vec<_>>();
-        if !active_blockers.is_empty() {
-            return Err(TicketError::BlockingRelations(format!(
-                "{}: {}",
-                meta.id,
-                format_relation_blockers(&active_blockers)
-            )));
+        let relations = self.all_ticket_relation_records()?;
+        let queued_tickets = dependency_queue_plan(&requested_ticket, &states, &relations)?;
+
+        let mut planned = Vec::with_capacity(queued_tickets.len());
+        for ticket_id in &queued_tickets {
+            let dir = self.find_ticket_dir(&TicketIdOrSlug::Id(ticket_id.clone()))?;
+            let ticket = self.ticket_from_dir(&dir)?;
+            let target = resolve_ready_target(self.target_authority.as_ref(), "local", &ticket)?;
+            planned.push((dir, target));
         }
-        let at = now_utc();
-        let mut change = TicketStateChange::new(
-            TicketWorkflowState::Ready.as_str(),
-            TicketWorkflowState::Queued.as_str(),
-            "queued",
-            self.queued_ready_body(queued_by),
-        );
-        change.author = Some(queued_by.to_string());
-        self.apply_workflow_state_change(
-            &dir,
-            TicketWorkflowState::Ready,
-            TicketWorkflowState::Queued,
-            change,
-            &[
-                ("queued_by", queued_by),
-                ("queued_at", at.as_str()),
-                ("repository_id", target.repository_id.as_str()),
-                ("ref_selector", target.ref_selector.as_str()),
-            ],
-        )
+
+        let snapshots = planned
+            .iter()
+            .map(|(dir, _)| {
+                let item_path = dir.join("item.md");
+                let thread_path = dir.join("thread.md");
+                Ok((
+                    item_path.clone(),
+                    fs::read(&item_path).map_err(|error| io_err(&item_path, error))?,
+                    thread_path.clone(),
+                    if thread_path.exists() {
+                        Some(fs::read(&thread_path).map_err(|error| io_err(&thread_path, error))?)
+                    } else {
+                        None
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        for (dir, target) in planned {
+            let at = now_utc();
+            let mut change = TicketStateChange::new(
+                TicketWorkflowState::Ready.as_str(),
+                TicketWorkflowState::Queued.as_str(),
+                "queued",
+                self.queued_ready_body(queued_by),
+            );
+            change.author = Some(queued_by.to_string());
+            if let Err(error) = self.apply_workflow_state_change(
+                &dir,
+                TicketWorkflowState::Ready,
+                TicketWorkflowState::Queued,
+                change,
+                &[
+                    ("queued_by", queued_by),
+                    ("queued_at", at.as_str()),
+                    ("repository_id", target.repository_id.as_str()),
+                    ("ref_selector", target.ref_selector.as_str()),
+                    ("queue_root_ticket", requested_ticket.as_str()),
+                ],
+            ) {
+                for (item_path, item_before, thread_path, thread_before) in &snapshots {
+                    if fs::read(item_path).ok().as_deref() != Some(item_before.as_slice()) {
+                        fs::write(item_path, item_before)
+                            .map_err(|rollback| io_err(item_path, rollback))?;
+                    }
+                    match thread_before {
+                        Some(thread_before)
+                            if fs::read(thread_path).ok().as_deref()
+                                != Some(thread_before.as_slice()) =>
+                        {
+                            fs::write(thread_path, thread_before)
+                                .map_err(|rollback| io_err(thread_path, rollback))?;
+                        }
+                        None if thread_path.exists() => {
+                            fs::remove_file(thread_path)
+                                .map_err(|rollback| io_err(thread_path, rollback))?;
+                        }
+                        _ => {}
+                    }
+                }
+                return Err(error);
+            }
+        }
+
+        Ok(TicketQueueOutcome {
+            requested_ticket,
+            queued_tickets,
+        })
     }
 
     fn close(&self, id: TicketIdOrSlug, resolution: MarkdownText) -> Result<()> {
@@ -5427,6 +5586,272 @@ fn ticket_state_resolved(state: TicketWorkflowState) -> bool {
         state,
         TicketWorkflowState::Done | TicketWorkflowState::Closed
     )
+}
+
+fn transitive_dependency_blockers(
+    requested_ticket: &str,
+    states: &HashMap<String, TicketWorkflowState>,
+    relations: &[TicketRelation],
+) -> Result<Vec<TicketRelationBlocker>> {
+    type DependencyEdge = (String, String, TicketRelationKind, Option<String>);
+    let mut prerequisites = BTreeMap::<String, Vec<DependencyEdge>>::new();
+    for relation in relations {
+        let edge = match relation.kind {
+            TicketRelationKind::DependsOn => Some((
+                relation.ticket_id.clone(),
+                (
+                    relation.target.clone(),
+                    "depends_on".to_string(),
+                    relation.kind,
+                    relation.note.clone(),
+                ),
+            )),
+            TicketRelationKind::Blocks => Some((
+                relation.target.clone(),
+                (
+                    relation.ticket_id.clone(),
+                    "blocked_by".to_string(),
+                    relation.kind,
+                    relation.note.clone(),
+                ),
+            )),
+            TicketRelationKind::Related
+            | TicketRelationKind::Supersedes
+            | TicketRelationKind::DuplicateOf => None,
+        };
+        if let Some((ticket, edge)) = edge {
+            prerequisites.entry(ticket).or_default().push(edge);
+        }
+    }
+    for dependencies in prerequisites.values_mut() {
+        dependencies.sort_by(|left, right| left.0.cmp(&right.0));
+    }
+
+    fn collect(
+        ticket: &str,
+        requested_ticket: &str,
+        states: &HashMap<String, TicketWorkflowState>,
+        prerequisites: &BTreeMap<String, Vec<DependencyEdge>>,
+        marks: &mut BTreeMap<String, u8>,
+        blockers: &mut BTreeMap<String, TicketRelationBlocker>,
+    ) -> Result<()> {
+        let state = states
+            .get(ticket)
+            .copied()
+            .ok_or_else(|| TicketError::NotFound(ticket.to_owned()))?;
+        if ticket_state_resolved(state) {
+            return Ok(());
+        }
+        match marks.get(ticket).copied() {
+            Some(2) => return Ok(()),
+            Some(1) => {
+                let requested_state = states
+                    .get(requested_ticket)
+                    .copied()
+                    .ok_or_else(|| TicketError::NotFound(requested_ticket.to_owned()))?;
+                blockers.insert(
+                    requested_ticket.to_owned(),
+                    TicketRelationBlocker {
+                        blocking_ticket: requested_ticket.to_owned(),
+                        reason_kind: "dependency_cycle".to_string(),
+                        relation_kind: TicketRelationKind::DependsOn,
+                        note: Some(format!(
+                            "dependency cycle reachable through Ticket {ticket}"
+                        )),
+                        blocking_state: requested_state,
+                    },
+                );
+                return Ok(());
+            }
+            _ => {}
+        }
+        marks.insert(ticket.to_owned(), 1);
+        if let Some(dependencies) = prerequisites.get(ticket) {
+            for (dependency, reason_kind, relation_kind, note) in dependencies {
+                let dependency_state = states
+                    .get(dependency)
+                    .copied()
+                    .ok_or_else(|| TicketError::NotFound(dependency.clone()))?;
+                if !ticket_state_resolved(dependency_state) {
+                    blockers
+                        .entry(dependency.clone())
+                        .or_insert_with(|| TicketRelationBlocker {
+                            blocking_ticket: dependency.clone(),
+                            reason_kind: reason_kind.clone(),
+                            relation_kind: *relation_kind,
+                            note: note.clone(),
+                            blocking_state: dependency_state,
+                        });
+                    collect(
+                        dependency,
+                        requested_ticket,
+                        states,
+                        prerequisites,
+                        marks,
+                        blockers,
+                    )?;
+                }
+            }
+        }
+        marks.insert(ticket.to_owned(), 2);
+        Ok(())
+    }
+
+    let mut blockers = BTreeMap::new();
+    collect(
+        requested_ticket,
+        requested_ticket,
+        states,
+        &prerequisites,
+        &mut BTreeMap::new(),
+        &mut blockers,
+    )?;
+    Ok(blockers.into_values().collect())
+}
+
+fn dependency_queue_plan(
+    requested_ticket: &str,
+    states: &HashMap<String, TicketWorkflowState>,
+    relations: &[TicketRelation],
+) -> Result<Vec<String>> {
+    let requested_state = states
+        .get(requested_ticket)
+        .copied()
+        .ok_or_else(|| TicketError::NotFound(requested_ticket.to_owned()))?;
+    if requested_state != TicketWorkflowState::Ready {
+        return Err(TicketError::StaleWorkflowState {
+            expected: TicketWorkflowState::Ready.as_str().to_owned(),
+            actual: requested_state.as_str().to_owned(),
+        });
+    }
+
+    let mut prerequisites = BTreeMap::<String, BTreeSet<String>>::new();
+    for relation in relations {
+        match relation.kind {
+            TicketRelationKind::DependsOn => {
+                prerequisites
+                    .entry(relation.ticket_id.clone())
+                    .or_default()
+                    .insert(relation.target.clone());
+            }
+            TicketRelationKind::Blocks => {
+                prerequisites
+                    .entry(relation.target.clone())
+                    .or_default()
+                    .insert(relation.ticket_id.clone());
+            }
+            TicketRelationKind::Related
+            | TicketRelationKind::Supersedes
+            | TicketRelationKind::DuplicateOf => {}
+        }
+    }
+
+    fn visit(
+        ticket: &str,
+        states: &HashMap<String, TicketWorkflowState>,
+        prerequisites: &BTreeMap<String, BTreeSet<String>>,
+        marks: &mut BTreeMap<String, u8>,
+        stack: &mut Vec<String>,
+        ordered: &mut Vec<String>,
+    ) -> Result<()> {
+        let state = states
+            .get(ticket)
+            .copied()
+            .ok_or_else(|| TicketError::NotFound(ticket.to_owned()))?;
+        if ticket_state_resolved(state) {
+            return Ok(());
+        }
+        match marks.get(ticket).copied() {
+            Some(2) => return Ok(()),
+            Some(1) => {
+                let start = stack.iter().position(|item| item == ticket).unwrap_or(0);
+                let mut cycle = stack[start..].to_vec();
+                cycle.push(ticket.to_owned());
+                return Err(TicketError::Conflict(format!(
+                    "ticket dependency cycle detected: {}",
+                    cycle.join(" -> ")
+                )));
+            }
+            _ => {}
+        }
+
+        marks.insert(ticket.to_owned(), 1);
+        stack.push(ticket.to_owned());
+        if let Some(dependencies) = prerequisites.get(ticket) {
+            for dependency in dependencies {
+                visit(dependency, states, prerequisites, marks, stack, ordered)?;
+            }
+        }
+        stack.pop();
+        marks.insert(ticket.to_owned(), 2);
+        ordered.push(ticket.to_owned());
+        Ok(())
+    }
+
+    let mut ordered = Vec::new();
+    visit(
+        requested_ticket,
+        states,
+        &prerequisites,
+        &mut BTreeMap::new(),
+        &mut Vec::new(),
+        &mut ordered,
+    )?;
+
+    fn collect_ready(
+        ticket: &str,
+        requested_ticket: &str,
+        states: &HashMap<String, TicketWorkflowState>,
+        prerequisites: &BTreeMap<String, BTreeSet<String>>,
+        collected: &mut BTreeSet<String>,
+        ready: &mut Vec<String>,
+    ) -> Result<()> {
+        if !collected.insert(ticket.to_owned()) {
+            return Ok(());
+        }
+        let state = states
+            .get(ticket)
+            .copied()
+            .ok_or_else(|| TicketError::NotFound(ticket.to_owned()))?;
+        if ticket != requested_ticket && state == TicketWorkflowState::Planning {
+            return Err(TicketError::BlockingRelations(format!(
+                "dependency {ticket} is still planning"
+            )));
+        }
+        if matches!(
+            state,
+            TicketWorkflowState::Done | TicketWorkflowState::Closed
+        ) {
+            return Ok(());
+        }
+        if let Some(dependencies) = prerequisites.get(ticket) {
+            for dependency in dependencies {
+                collect_ready(
+                    dependency,
+                    requested_ticket,
+                    states,
+                    prerequisites,
+                    collected,
+                    ready,
+                )?;
+            }
+        }
+        if state == TicketWorkflowState::Ready {
+            ready.push(ticket.to_owned());
+        }
+        Ok(())
+    }
+
+    let mut ready = Vec::new();
+    collect_ready(
+        requested_ticket,
+        requested_ticket,
+        states,
+        &prerequisites,
+        &mut BTreeSet::new(),
+        &mut ready,
+    )?;
+    Ok(ready)
 }
 
 fn relation_view_from_records(
@@ -6926,6 +7351,118 @@ mod tests {
         }
     }
 
+    fn dependency_relation(ticket_id: &str, target: &str) -> TicketRelation {
+        TicketRelation {
+            ticket_id: ticket_id.to_owned(),
+            kind: TicketRelationKind::DependsOn,
+            target: target.to_owned(),
+            note: None,
+            author: "test".to_owned(),
+            at: String::new(),
+        }
+    }
+
+    #[test]
+    fn dependency_queue_plan_orders_transitive_ready_dependencies() {
+        let states = HashMap::from([
+            ("root".to_owned(), TicketWorkflowState::Ready),
+            ("middle".to_owned(), TicketWorkflowState::Ready),
+            ("leaf".to_owned(), TicketWorkflowState::Ready),
+        ]);
+        let relations = [
+            dependency_relation("root", "middle"),
+            dependency_relation("middle", "leaf"),
+        ];
+
+        assert_eq!(
+            dependency_queue_plan("root", &states, &relations).unwrap(),
+            vec!["leaf", "middle", "root"]
+        );
+    }
+
+    #[test]
+    fn transitive_blockers_project_internal_dependency_cycle_as_blocking() {
+        let states = HashMap::from([
+            ("root".to_owned(), TicketWorkflowState::Ready),
+            ("branch".to_owned(), TicketWorkflowState::Ready),
+            ("cycle".to_owned(), TicketWorkflowState::Ready),
+        ]);
+        let relations = [
+            dependency_relation("root", "branch"),
+            dependency_relation("branch", "cycle"),
+            dependency_relation("cycle", "branch"),
+        ];
+
+        let blockers = transitive_dependency_blockers("root", &states, &relations).unwrap();
+        assert!(blockers.iter().any(|blocker| {
+            blocker.blocking_ticket == "root" && blocker.reason_kind == "dependency_cycle"
+        }));
+        let summary = summary_with_state(TicketWorkflowState::Ready);
+        let mut summary = summary;
+        summary.id = "root".to_string();
+        assert!(
+            !project_ticket_workspace_item(&summary, &blockers, None)
+                .queue_guard
+                .can_queue_for_orchestrator
+        );
+        assert!(matches!(
+            dependency_queue_plan("root", &states, &relations),
+            Err(TicketError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn dependency_queue_plan_stops_at_resolved_dependency() {
+        let states = HashMap::from([
+            ("root".to_owned(), TicketWorkflowState::Ready),
+            ("done".to_owned(), TicketWorkflowState::Done),
+            ("planning".to_owned(), TicketWorkflowState::Planning),
+        ]);
+        let relations = [
+            dependency_relation("root", "done"),
+            dependency_relation("done", "planning"),
+            dependency_relation("done", "root"),
+        ];
+
+        assert_eq!(
+            dependency_queue_plan("root", &states, &relations).unwrap(),
+            vec!["root"]
+        );
+    }
+
+    #[test]
+    fn dependency_queue_plan_rejects_transitive_planning_dependency() {
+        let states = HashMap::from([
+            ("root".to_owned(), TicketWorkflowState::Ready),
+            ("middle".to_owned(), TicketWorkflowState::Queued),
+            ("leaf".to_owned(), TicketWorkflowState::Planning),
+        ]);
+        let relations = [
+            dependency_relation("root", "middle"),
+            dependency_relation("middle", "leaf"),
+        ];
+
+        let error = dependency_queue_plan("root", &states, &relations).unwrap_err();
+        assert!(matches!(error, TicketError::BlockingRelations(_)));
+        assert!(error.to_string().contains("leaf"));
+    }
+
+    #[test]
+    fn dependency_queue_plan_reports_cycle_path() {
+        let states = HashMap::from([
+            ("root".to_owned(), TicketWorkflowState::Ready),
+            ("middle".to_owned(), TicketWorkflowState::Ready),
+        ]);
+        let relations = [
+            dependency_relation("root", "middle"),
+            dependency_relation("middle", "root"),
+        ];
+
+        let error = dependency_queue_plan("root", &states, &relations).unwrap_err();
+        assert!(matches!(error, TicketError::Conflict(_)));
+        assert!(error.to_string().contains("root -> middle -> root"));
+    }
+
     #[test]
     fn workspace_projection_queues_ready_ticket_for_orchestrator() {
         let summary = summary_with_state(TicketWorkflowState::Ready);
@@ -6945,7 +7482,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_projection_blocks_ready_queue_on_unstarted_dependency() {
+    fn workspace_projection_blocks_ready_ticket_with_planning_dependency() {
         let summary = summary_with_state(TicketWorkflowState::Ready);
         let blockers = [blocker_with_state(TicketWorkflowState::Planning)];
         let projection = project_ticket_workspace_item(&summary, &blockers, None);
@@ -6961,7 +7498,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_projection_allows_ready_queue_when_dependency_is_already_queued() {
+    fn workspace_projection_queues_ready_ticket_with_queued_dependency_context() {
         let summary = summary_with_state(TicketWorkflowState::Ready);
         let blockers = [blocker_with_state(TicketWorkflowState::Queued)];
         let projection = project_ticket_workspace_item(&summary, &blockers, None);
@@ -6971,13 +7508,13 @@ mod tests {
             Some(TicketWorkspaceNextAction::QueueForOrchestrator)
         );
         assert!(projection.queue_guard.can_queue_for_orchestrator);
-        assert!(projection.blocked_reason.is_none());
+        assert!(projection.blocked_reason.is_some());
         assert!(
             projection
                 .key_hint
                 .as_deref()
                 .unwrap_or_default()
-                .contains("Orchestrator will preserve order")
+                .contains("orchestration context")
         );
     }
 
@@ -7238,13 +7775,321 @@ state: planning
     }
 
     #[test]
-    fn sqlite_mark_ready_and_queue_enforce_target_and_blockers_atomically() {
+    fn sqlite_dependency_check_blocks_transitive_planning_dependency() {
+        let temp = TempDir::new().unwrap();
+        let backend = SqliteTicketBackend::open(temp.path().join("tickets.db"), "workspace-test")
+            .unwrap()
+            .with_target_authority(Arc::new(TestTargetAuthority));
+        let mut root_input = NewTicket::new("Ready root");
+        root_input.workflow_state = Some(TicketWorkflowState::Ready);
+        root_input.repository_id = Some("main".to_string());
+        let root = backend.create(root_input).unwrap();
+        let mut middle_input = NewTicket::new("Queued middle");
+        middle_input.workflow_state = Some(TicketWorkflowState::Queued);
+        middle_input.repository_id = Some("main".to_string());
+        let middle = backend.create(middle_input).unwrap();
+        let leaf = backend.create(NewTicket::new("Planning leaf")).unwrap();
+        for (ticket, target) in [
+            (root.id.clone(), middle.id.clone()),
+            (middle.id.clone(), leaf.id.clone()),
+        ] {
+            backend
+                .add_ticket_relation(
+                    TicketIdOrSlug::Id(ticket),
+                    NewTicketRelation {
+                        kind: TicketRelationKind::DependsOn,
+                        target,
+                        note: None,
+                        author: None,
+                    },
+                )
+                .unwrap();
+        }
+
+        let check = backend
+            .dependency_check(TicketIdOrSlug::Id(root.id))
+            .unwrap();
+        assert!(!check.queue_guard.can_queue_for_orchestrator);
+        assert!(check.queue_tickets.is_empty());
+        assert!(check.blockers.iter().any(|blocker| {
+            blocker.blocking_ticket == leaf.id
+                && blocker.blocking_state == TicketWorkflowState::Planning
+        }));
+
+        let page = backend
+            .list_workspace_projection_page(SqliteTicketListPageQuery {
+                states: vec![TicketWorkflowState::Ready],
+                limit: 10,
+                after: None,
+            })
+            .unwrap();
+        let item = page
+            .items
+            .iter()
+            .find(|item| item.summary.id == check.ticket.id)
+            .unwrap();
+        assert!(item.relation_blockers.iter().any(|blocker| {
+            blocker.blocking_ticket == leaf.id
+                && blocker.blocking_state == TicketWorkflowState::Planning
+        }));
+        assert!(
+            !project_ticket_workspace_item(&item.summary, &item.relation_blockers, None)
+                .queue_guard
+                .can_queue_for_orchestrator
+        );
+    }
+
+    #[test]
+    fn dependency_checks_fail_closed_without_target_authority() {
+        let sqlite_temp = TempDir::new().unwrap();
+        let sqlite =
+            SqliteTicketBackend::open(sqlite_temp.path().join("tickets.db"), "workspace-test")
+                .unwrap();
+        let mut sqlite_input = NewTicket::new("SQLite ready Ticket");
+        sqlite_input.workflow_state = Some(TicketWorkflowState::Ready);
+        sqlite_input.repository_id = Some("main".to_string());
+        sqlite_input.ref_selector = Some("develop".to_string());
+        let sqlite_ticket = sqlite.create(sqlite_input).unwrap();
+        let sqlite_check = sqlite
+            .dependency_check(TicketIdOrSlug::Id(sqlite_ticket.id.clone()))
+            .unwrap();
+        assert!(!sqlite_check.queue_guard.can_queue_for_orchestrator);
+        assert!(
+            sqlite_check
+                .queue_guard
+                .blocked_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("target authority is unavailable")
+        );
+        assert!(matches!(
+            sqlite.queue_ready(TicketIdOrSlug::Id(sqlite_ticket.id), "test"),
+            Err(TicketError::TargetAuthorityUnavailable)
+        ));
+
+        let local_temp = TempDir::new().unwrap();
+        let local = LocalTicketBackend::new(local_temp.path());
+        let mut local_input = NewTicket::new("Local ready Ticket");
+        local_input.workflow_state = Some(TicketWorkflowState::Ready);
+        local_input.repository_id = Some("main".to_string());
+        local_input.ref_selector = Some("develop".to_string());
+        let local_ticket = local.create(local_input).unwrap();
+        let local_check = local
+            .dependency_check(TicketIdOrSlug::Id(local_ticket.id.clone()))
+            .unwrap();
+        assert!(!local_check.queue_guard.can_queue_for_orchestrator);
+        assert!(
+            local_check
+                .queue_guard
+                .blocked_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("target authority is unavailable")
+        );
+        assert!(matches!(
+            local.queue_ready(TicketIdOrSlug::Id(local_ticket.id), "test"),
+            Err(TicketError::TargetAuthorityUnavailable)
+        ));
+    }
+
+    #[test]
+    fn sqlite_queue_ignores_cycle_behind_done_dependency() {
+        let temp = TempDir::new().unwrap();
+        let backend = SqliteTicketBackend::open(temp.path().join("tickets.db"), "workspace-test")
+            .unwrap()
+            .with_target_authority(Arc::new(TestTargetAuthority));
+        let mut root_input = NewTicket::new("Ready root");
+        root_input.workflow_state = Some(TicketWorkflowState::Ready);
+        root_input.repository_id = Some("main".to_string());
+        let root = backend.create(root_input).unwrap();
+        let mut done_input = NewTicket::new("Done dependency");
+        done_input.workflow_state = Some(TicketWorkflowState::Done);
+        done_input.repository_id = Some("main".to_string());
+        let done = backend.create(done_input).unwrap();
+        for (ticket_id, target) in [
+            (root.id.clone(), done.id.clone()),
+            (done.id.clone(), root.id.clone()),
+        ] {
+            backend
+                .add_ticket_relation(
+                    TicketIdOrSlug::Id(ticket_id),
+                    NewTicketRelation {
+                        kind: TicketRelationKind::DependsOn,
+                        target,
+                        note: None,
+                        author: None,
+                    },
+                )
+                .unwrap();
+        }
+
+        let outcome = backend
+            .queue_ready(TicketIdOrSlug::Id(root.id.clone()), "orchestrator")
+            .unwrap();
+        assert_eq!(outcome.queued_tickets, vec![root.id.clone()]);
+        assert_eq!(
+            backend
+                .show(TicketIdOrSlug::Id(root.id))
+                .unwrap()
+                .meta
+                .workflow_state,
+            TicketWorkflowState::Queued
+        );
+        assert_eq!(
+            backend
+                .show(TicketIdOrSlug::Id(done.id))
+                .unwrap()
+                .meta
+                .workflow_state,
+            TicketWorkflowState::Done
+        );
+    }
+
+    #[test]
+    fn sqlite_queue_cycle_diagnostic_leaves_all_tickets_ready() {
+        let temp = TempDir::new().unwrap();
+        let backend = SqliteTicketBackend::open(temp.path().join("tickets.db"), "workspace-test")
+            .unwrap()
+            .with_target_authority(Arc::new(TestTargetAuthority));
+        let mut first_input = NewTicket::new("First ready Ticket");
+        first_input.workflow_state = Some(TicketWorkflowState::Ready);
+        first_input.repository_id = Some("main".to_string());
+        let first = backend.create(first_input).unwrap();
+        let mut second_input = NewTicket::new("Second ready Ticket");
+        second_input.workflow_state = Some(TicketWorkflowState::Ready);
+        second_input.repository_id = Some("main".to_string());
+        let second = backend.create(second_input).unwrap();
+        let mut third_input = NewTicket::new("Third ready Ticket");
+        third_input.workflow_state = Some(TicketWorkflowState::Ready);
+        third_input.repository_id = Some("main".to_string());
+        let third = backend.create(third_input).unwrap();
+        for (ticket, target) in [
+            (first.id.clone(), second.id.clone()),
+            (second.id.clone(), third.id.clone()),
+            (third.id.clone(), second.id.clone()),
+        ] {
+            backend
+                .add_ticket_relation(
+                    TicketIdOrSlug::Id(ticket),
+                    NewTicketRelation {
+                        kind: TicketRelationKind::DependsOn,
+                        target,
+                        note: None,
+                        author: None,
+                    },
+                )
+                .unwrap();
+        }
+
+        let check = backend
+            .dependency_check(TicketIdOrSlug::Id(first.id.clone()))
+            .unwrap();
+        assert!(!check.queue_guard.can_queue_for_orchestrator);
+        assert!(
+            check
+                .queue_guard
+                .blocked_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cycle")
+        );
+        let page = backend
+            .list_workspace_projection_page(SqliteTicketListPageQuery {
+                states: vec![TicketWorkflowState::Ready],
+                limit: 10,
+                after: None,
+            })
+            .unwrap();
+        let item = page
+            .items
+            .iter()
+            .find(|item| item.summary.id == check.ticket.id)
+            .unwrap();
+        assert!(
+            !project_ticket_workspace_item(&item.summary, &item.relation_blockers, None)
+                .queue_guard
+                .can_queue_for_orchestrator
+        );
+        let error = backend
+            .queue_ready(TicketIdOrSlug::Id(first.id.clone()), "orchestrator")
+            .unwrap_err();
+        assert!(matches!(error, TicketError::Conflict(_)));
+        assert!(error.to_string().contains(" -> "));
+        for ticket_id in [first.id, second.id, third.id] {
+            assert_eq!(
+                backend
+                    .show(TicketIdOrSlug::Id(ticket_id))
+                    .unwrap()
+                    .meta
+                    .workflow_state,
+                TicketWorkflowState::Ready
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_queue_target_failure_rolls_back_entire_ready_closure() {
+        let temp = TempDir::new().unwrap();
+        let backend = SqliteTicketBackend::open(temp.path().join("tickets.db"), "workspace-test")
+            .unwrap()
+            .with_target_authority(Arc::new(TestTargetAuthority));
+        let mut dependency_input = NewTicket::new("Invalid ready dependency");
+        dependency_input.workflow_state = Some(TicketWorkflowState::Ready);
+        dependency_input.repository_id = Some("unknown".to_string());
+        let dependency = backend.create(dependency_input).unwrap();
+        let mut root_input = NewTicket::new("Queue root");
+        root_input.workflow_state = Some(TicketWorkflowState::Ready);
+        root_input.repository_id = Some("main".to_string());
+        let root = backend.create(root_input).unwrap();
+        backend
+            .add_ticket_relation(
+                TicketIdOrSlug::Id(root.id.clone()),
+                NewTicketRelation {
+                    kind: TicketRelationKind::DependsOn,
+                    target: dependency.id.clone(),
+                    note: None,
+                    author: None,
+                },
+            )
+            .unwrap();
+
+        let check = backend
+            .dependency_check(TicketIdOrSlug::Id(root.id.clone()))
+            .unwrap();
+        assert!(!check.queue_guard.can_queue_for_orchestrator);
+        assert!(
+            check
+                .queue_guard
+                .blocked_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unknown")
+        );
+        let error = backend
+            .queue_ready(TicketIdOrSlug::Id(root.id.clone()), "orchestrator")
+            .unwrap_err();
+        assert!(matches!(error, TicketError::UnknownTargetRepository(_)));
+        for ticket_id in [dependency.id, root.id] {
+            assert_eq!(
+                backend
+                    .show(TicketIdOrSlug::Id(ticket_id))
+                    .unwrap()
+                    .meta
+                    .workflow_state,
+                TicketWorkflowState::Ready
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_queue_atomically_queues_ready_dependency_closure() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteTicketBackend::open(tmp.path().join("workspace.db"), "workspace-test")
             .unwrap()
             .with_target_authority(Arc::new(TestTargetAuthority));
         let mut dependency = NewTicket::new("Dependency");
         dependency.repository_id = Some("main".to_owned());
+        dependency.workflow_state = Some(TicketWorkflowState::Ready);
         let dependency = backend.create(dependency).unwrap();
         let mut implementation = NewTicket::new("Implementation");
         implementation.repository_id = Some("main".to_owned());
@@ -7284,43 +8129,31 @@ state: planning
                 .count(),
             1
         );
-        assert!(matches!(
-            backend.queue_ready(
-                TicketIdOrSlug::Id(implementation.id.clone()),
-                "orchestrator",
-            ),
-            Err(TicketError::BlockingRelations(_))
-        ));
-        let after_rejection = backend
-            .show(TicketIdOrSlug::Id(implementation.id.clone()))
-            .unwrap();
-        assert_eq!(
-            after_rejection.meta.workflow_state,
-            TicketWorkflowState::Ready
-        );
-        assert!(!after_rejection.events.iter().any(|event| {
-            event.from.as_deref() == Some("ready") && event.to.as_deref() == Some("queued")
-        }));
-        backend
-            .close(
-                TicketIdOrSlug::Id(dependency.id),
-                MarkdownText::new("resolved"),
-            )
-            .unwrap();
-        backend
+        let outcome = backend
             .queue_ready(
                 TicketIdOrSlug::Id(implementation.id.clone()),
                 "orchestrator",
             )
             .unwrap();
+        assert_eq!(outcome.requested_ticket, implementation.id);
         assert_eq!(
-            backend
-                .show(TicketIdOrSlug::Id(implementation.id))
-                .unwrap()
-                .meta
-                .workflow_state,
+            outcome.queued_tickets,
+            vec![dependency.id.clone(), implementation.id.clone()]
+        );
+        let queued = backend
+            .show(TicketIdOrSlug::Id(implementation.id.clone()))
+            .unwrap();
+        let queued_dependency = backend
+            .show(TicketIdOrSlug::Id(dependency.id.clone()))
+            .unwrap();
+        assert_eq!(queued.meta.workflow_state, TicketWorkflowState::Queued);
+        assert_eq!(
+            queued_dependency.meta.workflow_state,
             TicketWorkflowState::Queued
         );
+        assert_eq!(queued.meta.queued_by.as_deref(), Some("orchestrator"));
+        assert_eq!(queued.relations.blockers.len(), 1);
+        assert_eq!(queued.relations.blockers[0].blocking_ticket, dependency.id);
     }
 
     #[test]
@@ -7642,7 +8475,7 @@ state: planning
             .expect("following method");
         let projection_source = &source[start..end];
         assert_eq!(projection_source.matches("self.with_read(").count(), 2);
-        assert_eq!(projection_source.matches(".prepare(").count(), 3);
+        assert_eq!(projection_source.matches(".prepare(").count(), 2);
         let item_loop = projection_source
             .split("items: summaries")
             .nth(1)
@@ -8057,6 +8890,61 @@ state: planning
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn local_queue_rolls_back_ready_dependency_when_later_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let backend = backend(&tmp);
+        let mut dependency_input = NewTicket::new("Ready dependency");
+        dependency_input.workflow_state = Some(TicketWorkflowState::Ready);
+        dependency_input.repository_id = Some("main".to_string());
+        dependency_input.ref_selector = Some("develop".to_string());
+        let dependency = backend.create(dependency_input).unwrap();
+        let mut root_input = NewTicket::new("Ready root");
+        root_input.workflow_state = Some(TicketWorkflowState::Ready);
+        root_input.repository_id = Some("main".to_string());
+        root_input.ref_selector = Some("develop".to_string());
+        let root = backend.create(root_input).unwrap();
+        backend
+            .add_ticket_relation(
+                TicketIdOrSlug::Id(root.id.clone()),
+                NewTicketRelation {
+                    kind: TicketRelationKind::DependsOn,
+                    target: dependency.id.clone(),
+                    note: None,
+                    author: None,
+                },
+            )
+            .unwrap();
+
+        let root_dir = backend
+            .find_ticket_dir(&TicketIdOrSlug::Id(root.id.clone()))
+            .unwrap();
+        let root_item = root_dir.join("item.md");
+        fs::set_permissions(&root_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(&root_item, fs::Permissions::from_mode(0o444)).unwrap();
+        let result = backend.queue_ready(TicketIdOrSlug::Id(root.id.clone()), "test");
+        fs::set_permissions(&root_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&root_item, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(result.is_err());
+        for ticket_id in [dependency.id, root.id] {
+            let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
+            assert_eq!(ticket.meta.workflow_state, TicketWorkflowState::Ready);
+            assert!(
+                !ticket
+                    .events
+                    .iter()
+                    .any(|event| event.to.as_deref() == Some("queued")),
+                "Ticket {} retained queued events: {:?}",
+                ticket.meta.id,
+                ticket.events
+            );
+        }
+    }
+
     #[test]
     fn state_cannot_be_changed_through_generic_field_api() {
         let tmp = TempDir::new().unwrap();
@@ -8374,7 +9262,7 @@ state: planning
     }
 
     #[test]
-    fn queue_gate_rejects_unresolved_dependency_and_incoming_blocker() {
+    fn queue_rejects_planning_dependency_and_incoming_blocker_without_mutation() {
         let tmp = TempDir::new().unwrap();
         let backend = backend(&tmp);
         let mut blocked_input = NewTicket::new("Blocked Ready");
@@ -8392,12 +9280,19 @@ state: planning
                 },
             )
             .unwrap();
-        let err = backend
+        let error = backend
             .queue_ready(TicketIdOrSlug::Id(blocked.id.clone()), "test")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("unresolved blocking relation"), "{err}");
-        assert!(err.contains(&dependency.id), "{err}");
+            .unwrap_err();
+        assert!(matches!(error, TicketError::BlockingRelations(_)));
+        let unchanged = backend
+            .show(TicketIdOrSlug::Id(blocked.id.clone()))
+            .unwrap();
+        assert_eq!(unchanged.meta.workflow_state, TicketWorkflowState::Ready);
+        assert_eq!(unchanged.relations.blockers.len(), 1);
+        assert_eq!(
+            unchanged.relations.blockers[0].blocking_ticket,
+            dependency.id
+        );
 
         let mut incoming_input = NewTicket::new("Incoming Blocked Ready");
         incoming_input.workflow_state = Some(TicketWorkflowState::Ready);
@@ -8414,12 +9309,22 @@ state: planning
                 },
             )
             .unwrap();
-        let err = backend
+        let error = backend
             .queue_ready(TicketIdOrSlug::Id(incoming.id.clone()), "test")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("unresolved blocking relation"), "{err}");
-        assert!(err.contains(&blocker.id), "{err}");
+            .unwrap_err();
+        assert!(matches!(error, TicketError::BlockingRelations(_)));
+        let unchanged_incoming = backend
+            .show(TicketIdOrSlug::Id(incoming.id.clone()))
+            .unwrap();
+        assert_eq!(
+            unchanged_incoming.meta.workflow_state,
+            TicketWorkflowState::Ready
+        );
+        assert_eq!(unchanged_incoming.relations.blockers.len(), 1);
+        assert_eq!(
+            unchanged_incoming.relations.blockers[0].blocking_ticket,
+            blocker.id
+        );
     }
 
     #[test]

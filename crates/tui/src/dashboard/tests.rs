@@ -1846,24 +1846,23 @@ fn panel_orchestration_overlay_uses_compact_status_column_and_detail_line() {
 }
 
 #[test]
-fn ready_ticket_with_waiting_gate_shows_queue_disabled_reason() {
+fn ready_ticket_with_dependency_context_keeps_queue_action_available() {
     let mut row = panel_test_ticket_row(
         "00001WAITING",
-        "Ready but gated",
-        ActionPriority::Background,
-        NextUserAction::Wait,
+        "Ready with dependency context",
+        ActionPriority::ReadyForQueue,
+        NextUserAction::Queue,
         "ready",
     );
-    row.disabled_reason = Some("Queue disabled: waiting for BLOCKER-1".to_string());
     row.ticket.as_mut().unwrap().blocked_reason = Some("BLOCKER-1 via depends_on".to_string());
 
     let lines = panel_row_lines(&row, true, 160);
     let detail = &lines[1];
     let detail_line = plain_line(&detail);
 
-    assert!(detail_line.contains("Gate: waiting for BLOCKER-1 via depends_on"));
-    assert!(detail_line.contains("Action: queue disabled"));
-    assert!(detail_line.contains("Reason: Queue disabled: waiting for BLOCKER-1"));
+    assert!(detail_line.contains("Dependencies: BLOCKER-1 via depends_on"));
+    assert!(detail_line.contains("Action: Queue"));
+    assert!(!detail_line.contains("Queue disabled"));
 }
 
 #[test]
