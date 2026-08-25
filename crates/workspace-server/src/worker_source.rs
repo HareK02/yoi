@@ -106,7 +106,10 @@ pub async fn verify_runtime_request_source_proof_with_store(
         let member = store
             .get_worker_registry(workspace_id, &worker)
             .map_err(|error| WorkerMutationSourceProofError::Authority(error.to_string()))?;
-        if member.is_none() {
+        let reserved = store
+            .has_active_worker_create_reservation(workspace_id, &worker)
+            .map_err(|error| WorkerMutationSourceProofError::Authority(error.to_string()))?;
+        if member.is_none() && !reserved {
             return Err(WorkerMutationSourceProofError::WorkerCatalogMembership);
         }
     }

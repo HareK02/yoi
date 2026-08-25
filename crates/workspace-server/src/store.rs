@@ -1002,6 +1002,11 @@ pub trait ControlPlaneStore: Send + Sync {
         workspace_id: &str,
         worker: &RuntimeWorkerRef,
     ) -> Result<Option<WorkerRegistryRecord>>;
+    fn has_active_worker_create_reservation(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<bool>;
     fn list_worker_registry(
         &self,
         workspace_id: &str,
@@ -3264,6 +3269,28 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 read_worker_registry_record,
             )
             .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn has_active_worker_create_reservation(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<bool> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                r#"SELECT EXISTS(
+                     SELECT 1
+                     FROM worker_create_reservations
+                     WHERE workspace_id = ?1
+                       AND runtime_id = ?2
+                       AND worker_id = ?3
+                       AND state = 'reserved'
+                   )"#,
+                params![workspace_id, worker.runtime_id, worker.worker_id],
+                |row| row.get::<_, bool>(0),
+            )
             .map_err(Error::from)
         })
     }
@@ -10476,6 +10503,12 @@ INSERT INTO workdir_registry (
         );
         assert_eq!(reserved.memory_settings.settings_revision, 1);
         assert_eq!(reserved.memory_settings.language, "English");
+        let reserved_worker = RuntimeWorkerRef::new("arcadia", reserved.worker_id.to_string());
+        assert!(
+            store
+                .has_active_worker_create_reservation("workspace-a", &reserved_worker)
+                .unwrap()
+        );
         let unchanged_memory_settings = store
             .update_workspace_memory_settings("workspace-a", 1, " English ")
             .unwrap();
@@ -10549,6 +10582,11 @@ INSERT INTO workdir_registry (
         store
             .complete_worker_create_reservation("workspace-a", reserved.worker_id)
             .unwrap();
+        assert!(
+            !store
+                .has_active_worker_create_reservation("workspace-a", &reserved_worker)
+                .unwrap()
+        );
         let state: String = store
             .with_conn(|conn| {
                 conn.query_row(

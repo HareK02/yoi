@@ -20388,6 +20388,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_request_proof_accepts_active_worker_create_reservation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut api = test_api(workspace.path()).await;
+        let identity =
+            worker_runtime::auth::RuntimeIdentityMaterial::generate("runtime-test").unwrap();
+        configure_runtime_request_auth(&mut api, &identity, "runtime-test");
+        let store = SqliteWorkspaceStore::open(&api.config.database_path).unwrap();
+        let memory_settings = store
+            .get_workspace_memory_settings(TEST_WORKSPACE_ID)
+            .unwrap();
+        let reserved = store
+            .reserve_worker_create(
+                TEST_WORKSPACE_ID,
+                "runtime-test",
+                "spawn-flow-race",
+                &"f".repeat(64),
+                &memory_settings,
+            )
+            .unwrap();
+        let worker_id = reserved.worker_id.to_string();
+        let path = format!("/api/w/{TEST_WORKSPACE_ID}/flows/resolve");
+        let signer = worker_runtime::auth::RuntimeRequestSourceSigner::from_identity(&identity);
+        let issue = || {
+            signer
+                .issue(
+                    "server-test",
+                    TEST_WORKSPACE_ID,
+                    Some(worker_id.as_str()),
+                    worker_runtime::auth::WORKSPACE_REQUEST_PERMISSION,
+                    "POST",
+                    &path,
+                    b"{}",
+                    i64::try_from(worker_runtime::auth::unix_now_seconds()).unwrap_or(i64::MAX),
+                    30,
+                )
+                .unwrap()
+        };
+
+        let proof = issue();
+        let source = crate::worker_source::verify_runtime_request_source_proof_with_store(
+            api.store.as_ref(),
+            &api.config,
+            &proof,
+            TEST_WORKSPACE_ID,
+            worker_runtime::auth::WORKSPACE_REQUEST_PERMISSION,
+            "POST",
+            &path,
+            &worker_runtime::auth::request_body_digest(b"{}"),
+        )
+        .await
+        .expect("active create reservation should establish provisional Worker membership");
+        assert_eq!(source.worker_id, Some(worker_id.clone()));
+
+        store
+            .complete_worker_create_reservation(TEST_WORKSPACE_ID, reserved.worker_id)
+            .unwrap();
+        let proof = issue();
+        let result = crate::worker_source::verify_runtime_request_source_proof_with_store(
+            api.store.as_ref(),
+            &api.config,
+            &proof,
+            TEST_WORKSPACE_ID,
+            worker_runtime::auth::WORKSPACE_REQUEST_PERMISSION,
+            "POST",
+            &path,
+            &worker_runtime::auth::request_body_digest(b"{}"),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(crate::worker_source::WorkerMutationSourceProofError::WorkerCatalogMembership)
+        ));
+    }
+
+    #[tokio::test]
     async fn runtime_request_proof_verifies_path_and_query_for_ticket_search() {
         let workspace = tempfile::tempdir().unwrap();
         let mut api = test_api(workspace.path()).await;
