@@ -4138,7 +4138,7 @@ fn remote_runtime_capabilities(
         has_workspace_fs: false,
         has_shell: false,
         has_git: false,
-        supports_worktrees: false,
+        supports_worktrees: true,
         supports_backend_internal_tools: false,
         workspace_scope: "remote_runtime_backend_private".to_string(),
         max_workers: limit,
@@ -5532,6 +5532,12 @@ mod tests {
         );
         assert!(browser_payload.contains("runtime_id"));
         assert!(browser_payload.contains("worker_id"));
+    }
+
+    #[test]
+    fn remote_runtime_projection_allows_workdir_creation() {
+        let capabilities = remote_runtime_capabilities(8, true, true, "linux", "x86_64");
+        assert!(capabilities.supports_worktrees);
     }
 
     #[test]
