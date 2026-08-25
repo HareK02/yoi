@@ -892,6 +892,7 @@ impl SqliteWorkspaceAuthority {
                 && !has_coder
                 && has_target
                 && !has_blockers,
+            queue_tickets: dependency_check.queue_tickets.clone(),
             blockers: action_blockers,
         };
         let merge_request = match self.merge_request_store.get(&self.workspace_id, id) {

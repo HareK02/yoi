@@ -2290,12 +2290,7 @@ mod tests {
                 .unwrap_or_default()
                 .contains(&dependency.id)
         );
-        assert!(
-            row.key_hint
-                .as_deref()
-                .unwrap()
-                .contains("dependency relations remain orchestration context")
-        );
+        assert!(row.key_hint.as_deref().unwrap().contains("Queue targets:"));
         assert!(row.key_hint.as_deref().unwrap().contains(&dependency.id));
     }
 

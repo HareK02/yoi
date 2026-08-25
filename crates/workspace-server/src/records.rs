@@ -296,6 +296,7 @@ pub struct TicketActionEligibility {
     pub can_unassign_orchestrator: bool,
     pub can_queue: bool,
     pub can_start_manual_coder: bool,
+    pub queue_tickets: Vec<String>,
     pub blockers: Vec<String>,
 }
 

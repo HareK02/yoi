@@ -4201,17 +4201,32 @@ async fn dispatch_panel_queue(
         "root-ticket-state-after-orchestration-merge",
         &preflight.root_top_level,
     )?;
-    backend
+    let queue_outcome = backend
         .queue_ready(TicketIdOrSlug::Id(ticket_id.to_owned()), "workspace-panel")
         .map_err(|error| TicketActionError::Ticket(error.to_string()))?;
+    let expected_queue_tickets = preflight
+        .queue_tickets
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let actual_queue_tickets = queue_outcome
+        .queued_tickets
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if actual_queue_tickets != expected_queue_tickets {
+        return Err(TicketActionError::Stale(format!(
+            "Queue dependency plan changed after confirmation for Ticket {ticket_id}; reload and retry"
+        )));
+    }
     let commit = commit_panel_queue_ticket_record(&preflight)?;
     let sync = sync_panel_queue_to_orchestration(&preflight, &commit)?;
     verify_panel_queue_synced(&preflight, &commit)?;
     let notification = notify_workspace_orchestrator(orchestrator, current_ticket).await;
     Ok(TicketActionOutcome {
         notice: format!(
-            "Queued Ticket {}; root Queue commit {}; {}; orchestration sync {}; {}. Orchestrator routing is authorized; implementation side effects still require queued -> inprogress acceptance.",
-            ticket_id,
+            "Queued Ticket closure [{}]; root Queue commit {}; {}; orchestration sync {}; {}. Orchestrator routing is authorized; implementation side effects still require queued -> inprogress acceptance.",
+            queue_outcome.queued_tickets.join(", "),
             commit.sha,
             root_merge.sentence(),
             sync.sentence(),
@@ -4225,7 +4240,8 @@ struct PanelQueueHandoffPreflight {
     ticket_id: String,
     root_top_level: PathBuf,
     orchestration: OrchestrationWorktreeLayout,
-    ticket_record_dir: PathBuf,
+    queue_tickets: Vec<String>,
+    ticket_record_dirs: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4393,27 +4409,53 @@ fn prepare_panel_queue_handoff(
         &root_top_level,
     )?;
 
-    let ticket_record_dir = backend.root().join(ticket_id);
-    if !ticket_record_dir.join("item.md").is_file() {
+    let dependency_check = backend
+        .dependency_check(TicketIdOrSlug::Id(ticket_id.to_owned()))
+        .map_err(|error| TicketActionError::Ticket(error.to_string()))?;
+    if !dependency_check.queue_guard.can_queue_for_orchestrator {
         return Err(queue_check_failed(
-            "target-ticket-record",
+            "dependency-queue-plan",
             ticket_id,
-            &ticket_record_dir,
-            "target Ticket item.md is missing".to_string(),
+            &root_top_level,
+            dependency_check
+                .queue_guard
+                .blocked_reason
+                .or(dependency_check.queue_guard.reason)
+                .unwrap_or_else(|| "Queue dependency validation failed".to_string()),
         ));
     }
-    ensure_git_path_clean(
-        "root-ticket-clean",
-        ticket_id,
-        &root_top_level,
-        &ticket_record_dir,
-    )?;
+    let queue_tickets = dependency_check.queue_tickets;
+    let mut ticket_record_dirs = Vec::with_capacity(queue_tickets.len());
+    for queue_ticket in &queue_tickets {
+        let ticket_record_dir = backend.root().join(queue_ticket);
+        if !ticket_record_dir.join("item.md").is_file() {
+            return Err(queue_check_failed(
+                "target-ticket-record",
+                &queue_ticket,
+                &ticket_record_dir,
+                "Queue Ticket item.md is missing".to_string(),
+            ));
+        }
+        let clean_stage = if queue_ticket == ticket_id {
+            "root-ticket-clean"
+        } else {
+            "queue-dependency-clean"
+        };
+        ensure_git_path_clean(
+            clean_stage,
+            &queue_ticket,
+            &root_top_level,
+            &ticket_record_dir,
+        )?;
+        ticket_record_dirs.push(ticket_record_dir);
+    }
 
     Ok(PanelQueueHandoffPreflight {
         ticket_id: ticket_id.to_string(),
         root_top_level,
         orchestration,
-        ticket_record_dir,
+        queue_tickets,
+        ticket_record_dirs,
     })
 }
 
@@ -4504,37 +4546,36 @@ fn sync_orchestration_to_root_before_queue(
 fn commit_panel_queue_ticket_record(
     preflight: &PanelQueueHandoffPreflight,
 ) -> Result<PanelQueueCommit, TicketActionError> {
-    let ticket_rel = path_relative_to_root(
-        &preflight.root_top_level,
-        &preflight.ticket_record_dir,
-        "target-ticket-record",
-        &preflight.ticket_id,
-    )?;
+    let ticket_rels = preflight
+        .ticket_record_dirs
+        .iter()
+        .map(|ticket_record_dir| {
+            path_relative_to_root(
+                &preflight.root_top_level,
+                ticket_record_dir,
+                "target-ticket-record",
+                &preflight.ticket_id,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut add = Command::new("git");
     add.arg("-C")
         .arg(&preflight.root_top_level)
         .arg("add")
         .arg("--")
-        .arg(&ticket_rel);
-    run_git_command(add, "stage Queue Ticket record").map_err(|message| {
+        .args(&ticket_rels);
+    run_git_command(add, "stage Queue Ticket records").map_err(|message| {
         queue_check_failed(
             "queue-commit-stage",
             &preflight.ticket_id,
-            &preflight.ticket_record_dir,
+            &preflight.root_top_level,
             message,
         )
     })?;
 
-    let ticket_rel_string = git_path_string(&ticket_rel);
     let staged = git_capture(
         &preflight.root_top_level,
-        &[
-            "diff",
-            "--cached",
-            "--name-only",
-            "--",
-            ticket_rel_string.as_str(),
-        ],
+        &["diff", "--cached", "--name-only"],
         "list staged Queue Ticket files",
     )
     .map_err(|message| {
@@ -4545,19 +4586,31 @@ fn commit_panel_queue_ticket_record(
             message,
         )
     })?;
+    let allowed = ticket_rels
+        .iter()
+        .map(|path| format!("{}/", git_path_string(path).trim_end_matches('/')))
+        .collect::<Vec<_>>();
     let staged_paths = staged
         .lines()
         .filter(|line| !line.trim().is_empty())
         .collect::<Vec<_>>();
-    if staged_paths.is_empty() {
+    if staged_paths.is_empty()
+        || staged_paths
+            .iter()
+            .any(|path| !allowed.iter().any(|root| path.starts_with(root)))
+    {
         return Err(queue_check_failed(
             "queue-commit-pathscope",
             &preflight.ticket_id,
-            &preflight.ticket_record_dir,
-            "Queue mutation produced no staged Ticket record changes".to_string(),
+            &preflight.root_top_level,
+            "Queue mutation staged no Ticket records or included files outside the confirmed dependency closure"
+                .to_string(),
         ));
     }
-    let message = format!("ticket: queue {}", preflight.ticket_id);
+    let message = format!(
+        "chore: queue Ticket dependency closure {}",
+        preflight.ticket_id
+    );
     let mut commit = Command::new("git");
     commit
         .arg("-C")
@@ -4567,8 +4620,8 @@ fn commit_panel_queue_ticket_record(
         .arg("-m")
         .arg(message)
         .arg("--")
-        .arg(&ticket_rel);
-    run_git_command(commit, "commit Queue Ticket record").map_err(|message| {
+        .args(&ticket_rels);
+    run_git_command(commit, "commit Queue Ticket records").map_err(|message| {
         queue_check_failed(
             "queue-commit-create",
             &preflight.ticket_id,

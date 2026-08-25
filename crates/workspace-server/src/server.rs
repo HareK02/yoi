@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -3951,39 +3951,6 @@ fn reject_unguarded_ticket_completion(operation: &TicketBackendOperation) -> Res
     Ok(())
 }
 
-fn queue_assignment_candidates(
-    backend: &dyn TicketBackend,
-    requested_ticket_id: &str,
-) -> ticket::Result<Vec<String>> {
-    fn visit(
-        backend: &dyn TicketBackend,
-        ticket_id: &str,
-        visited: &mut BTreeSet<String>,
-        ready: &mut BTreeSet<String>,
-    ) -> ticket::Result<()> {
-        if !visited.insert(ticket_id.to_owned()) {
-            return Ok(());
-        }
-        let ticket = backend.show(TicketIdOrSlug::Id(ticket_id.to_owned()))?;
-        if ticket.meta.workflow_state == TicketWorkflowState::Ready {
-            ready.insert(ticket.meta.id.clone());
-        }
-        for blocker in ticket.relations.blockers {
-            visit(backend, &blocker.blocking_ticket, visited, ready)?;
-        }
-        Ok(())
-    }
-
-    let mut ready = BTreeSet::new();
-    visit(
-        backend,
-        requested_ticket_id,
-        &mut BTreeSet::new(),
-        &mut ready,
-    )?;
-    Ok(ready.into_iter().collect())
-}
-
 async fn execute_ticket_rest_operation(
     api: &WorkspaceApi,
     workspace_id: &str,
@@ -4021,8 +3988,18 @@ async fn execute_ticket_rest_operation(
                     .to_string(),
             )
         })?;
-        let candidates =
-            queue_assignment_candidates(&backend, &ticket.meta.id).map_err(Error::from)?;
+        let dependency_check = backend
+            .dependency_check(TicketIdOrSlug::Id(ticket.meta.id.clone()))
+            .map_err(Error::from)?;
+        if !dependency_check.queue_guard.can_queue_for_orchestrator {
+            let reason = dependency_check
+                .queue_guard
+                .blocked_reason
+                .or(dependency_check.queue_guard.reason)
+                .unwrap_or_else(|| "Queue dependency validation failed".to_string());
+            return Err(Error::TicketAssignmentConflict(reason).into());
+        }
+        let candidates = dependency_check.queue_tickets;
         let mut assignment_ids = BTreeMap::new();
         for ticket_id in candidates {
             if api
@@ -16489,6 +16466,59 @@ mod tests {
         );
         assert!(event.attributes.contains_key("routing_operation_id"));
         assert!(event.attributes.contains_key("routing_request_fingerprint"));
+    }
+
+    #[tokio::test]
+    async fn queue_reports_dependency_cycle_before_assignment_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let api = test_api(dir.path()).await;
+        let backend = browser_ticket_backend(&api).unwrap();
+        let mut first_input = ticket::NewTicket::new("First cycle Ticket");
+        first_input.workflow_state = Some(TicketWorkflowState::Ready);
+        first_input.repository_id = Some(TEST_REPOSITORY_ID.to_string());
+        first_input.ref_selector = Some("develop".to_string());
+        let first = backend.create(first_input).unwrap();
+        let mut second_input = ticket::NewTicket::new("Second cycle Ticket");
+        second_input.workflow_state = Some(TicketWorkflowState::Ready);
+        second_input.repository_id = Some(TEST_REPOSITORY_ID.to_string());
+        second_input.ref_selector = Some("develop".to_string());
+        let second = backend.create(second_input).unwrap();
+        for (ticket_id, target) in [
+            (first.id.clone(), second.id.clone()),
+            (second.id.clone(), first.id.clone()),
+        ] {
+            backend
+                .add_ticket_relation(
+                    ticket_id.into(),
+                    ticket::NewTicketRelation {
+                        kind: ticket::TicketRelationKind::DependsOn,
+                        target,
+                        note: None,
+                        author: Some("test".to_string()),
+                    },
+                )
+                .unwrap();
+        }
+
+        let error = execute_ticket_rest_operation(
+            &api,
+            TEST_WORKSPACE_ID,
+            HeaderMap::new(),
+            TicketBackendOperation::QueueReady {
+                id: TicketIdOrSlug::Id(first.id.clone()),
+                queued_by: "workspace-web".to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.error.to_string().contains("cycle"));
+        for ticket_id in [first.id, second.id] {
+            assert_eq!(
+                backend.show(ticket_id.into()).unwrap().meta.workflow_state,
+                TicketWorkflowState::Ready
+            );
+        }
     }
 
     #[tokio::test]
