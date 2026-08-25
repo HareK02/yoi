@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::hosts::RemoteRuntimeConfig;
 use crate::identity::WorkspaceIdentity;
@@ -15,22 +16,12 @@ pub const BACKEND_RUNTIMES_CONFIG_FILE_NAME: &str = "runtimes.toml";
 pub const WORKSPACE_BACKEND_CONFIG_TEMPLATE: &str =
     include_str!("../../../resources/workspace-backend.default.toml");
 const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
-const DEFAULT_FRONTEND_URL: &str = "http://127.0.0.1:5173";
-const DEFAULT_AUTH_PUBLIC_BASE_URL: &str = "http://localhost:8787";
-const DEFAULT_AUTH_RP_ID: &str = "localhost";
+const DEFAULT_BROWSER_PUBLIC_URL: &str = "http://localhost:5173";
 const DEFAULT_AUTH_COOKIE_NAME: &str = "yoi_workspace_session";
 const DEFAULT_MAX_RECORDS: usize = 200;
 
-fn default_auth_rp_id() -> String {
-    DEFAULT_AUTH_RP_ID.to_string()
-}
-
-fn default_auth_origin() -> String {
-    DEFAULT_AUTH_PUBLIC_BASE_URL.to_string()
-}
-
-fn default_auth_public_base_url() -> String {
-    DEFAULT_AUTH_PUBLIC_BASE_URL.to_string()
+fn default_browser_public_url() -> String {
+    DEFAULT_BROWSER_PUBLIC_URL.to_string()
 }
 
 fn default_auth_cookie_name() -> String {
@@ -65,8 +56,6 @@ pub struct WorkspaceBackendServerConfig {
     #[serde(default)]
     pub listen: Option<String>,
     #[serde(default)]
-    pub frontend_url: Option<String>,
-    #[serde(default)]
     pub static_assets_dir: Option<PathBuf>,
 }
 
@@ -91,12 +80,8 @@ pub struct WorkspaceBackendLimitsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceBackendAuthConfig {
-    #[serde(default = "default_auth_rp_id")]
-    pub rp_id: String,
-    #[serde(default = "default_auth_origin")]
-    pub origin: String,
-    #[serde(default = "default_auth_public_base_url")]
-    pub public_base_url: String,
+    #[serde(default = "default_browser_public_url")]
+    pub browser_public_url: String,
     #[serde(default = "default_auth_cookie_name")]
     pub cookie_name: String,
 }
@@ -104,9 +89,7 @@ pub struct WorkspaceBackendAuthConfig {
 impl Default for WorkspaceBackendAuthConfig {
     fn default() -> Self {
         Self {
-            rp_id: default_auth_rp_id(),
-            origin: default_auth_origin(),
-            public_base_url: default_auth_public_base_url(),
+            browser_public_url: default_browser_public_url(),
             cookie_name: default_auth_cookie_name(),
         }
     }
@@ -398,13 +381,10 @@ impl WorkspaceBackendConfigFile {
                 ))
             })?;
 
+        let (browser_public_url, browser_rp_id) =
+            resolve_browser_public_url(&self.auth.browser_public_url)?;
         let mut server = ServerConfig::local_dev(workspace_root.to_path_buf(), identity);
         server.database_path = database_path.clone();
-        server.frontend_url = self
-            .server
-            .frontend_url
-            .clone()
-            .unwrap_or_else(|| DEFAULT_FRONTEND_URL.to_string());
         server.static_assets_dir = self
             .server
             .static_assets_dir
@@ -424,10 +404,10 @@ impl WorkspaceBackendConfigFile {
             .map(resolve_remote_runtime)
             .collect::<Result<Vec<_>>>()?;
         server.auth = AuthConfig::Passkey {
-            rp_id: self.auth.rp_id.trim().to_string(),
-            origin: self.auth.origin.trim().to_string(),
-            public_base_url: self.auth.public_base_url.trim().to_string(),
-            cookie_name: self.auth.cookie_name.trim().to_string(),
+            rp_id: browser_rp_id,
+            origin: browser_public_url.clone(),
+            public_base_url: browser_public_url,
+            cookie_name: normalize_required_string("auth.cookie_name", &self.auth.cookie_name)?,
         };
 
         Ok(ResolvedWorkspaceBackendConfig {
@@ -449,6 +429,20 @@ impl ResolvedWorkspaceBackendConfig {
     pub fn with_static_assets_dir(mut self, path: Option<PathBuf>) -> Self {
         self.server.static_assets_dir = path;
         self
+    }
+
+    pub fn with_browser_public_url(mut self, public_url: &str) -> Result<Self> {
+        let (origin, rp_id) = resolve_browser_public_url(public_url)?;
+        let AuthConfig::Passkey {
+            rp_id: configured_rp_id,
+            origin: configured_origin,
+            public_base_url,
+            ..
+        } = &mut self.server.auth;
+        *configured_rp_id = rp_id;
+        *configured_origin = origin.clone();
+        *public_base_url = origin;
+        Ok(self)
     }
 
     pub fn with_backend_base_url(mut self, base_url: impl Into<String>) -> Self {
@@ -578,6 +572,36 @@ pub(crate) fn resolve_remote_runtime(
     ))
 }
 
+fn resolve_browser_public_url(value: &str) -> Result<(String, String)> {
+    let value = normalize_required_string("auth.browser_public_url", value)?;
+    let url = Url::parse(&value).map_err(|error| {
+        Error::Config(format!(
+            "auth.browser_public_url must be an absolute http(s) URL: {error}"
+        ))
+    })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(Error::Config(
+            "auth.browser_public_url must use the http or https scheme".to_string(),
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(Error::Config(
+            "auth.browser_public_url must not contain user information".to_string(),
+        ));
+    }
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        return Err(Error::Config(
+            "auth.browser_public_url must contain only an origin without a path, query, or fragment"
+                .to_string(),
+        ));
+    }
+    let rp_id = url
+        .host_str()
+        .ok_or_else(|| Error::Config("auth.browser_public_url must contain a host".to_string()))?
+        .to_string();
+    Ok((url.origin().ascii_serialization(), rp_id))
+}
+
 fn resolve_workspace_path(workspace_root: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
@@ -605,7 +629,15 @@ mod tests {
         let resolved = config.resolve(dir.path(), identity()).unwrap();
 
         assert_eq!(resolved.listen, "127.0.0.1:8787".parse().unwrap());
-        assert_eq!(resolved.server.frontend_url, DEFAULT_FRONTEND_URL);
+        let AuthConfig::Passkey {
+            rp_id,
+            origin,
+            public_base_url,
+            ..
+        } = &resolved.server.auth;
+        assert_eq!(rp_id, "localhost");
+        assert_eq!(origin, DEFAULT_BROWSER_PUBLIC_URL);
+        assert_eq!(public_base_url, DEFAULT_BROWSER_PUBLIC_URL);
         assert_eq!(resolved.server.max_records, DEFAULT_MAX_RECORDS);
         assert!(resolved.database_path.ends_with("server.db"));
         assert!(
@@ -632,6 +664,87 @@ mod tests {
             resolved.server.backend_base_url.as_deref(),
             Some("http://127.0.0.1:48787")
         );
+    }
+
+    #[test]
+    fn browser_public_url_drives_all_browser_auth_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = WorkspaceBackendConfigFile::parse_str(
+            "[auth]\nbrowser_public_url = \"https://Yoi.Example:443/\"\n",
+            "test",
+        )
+        .unwrap()
+        .resolve(dir.path(), identity())
+        .unwrap();
+
+        let AuthConfig::Passkey {
+            rp_id,
+            origin,
+            public_base_url,
+            ..
+        } = &resolved.server.auth;
+        assert_eq!(rp_id, "yoi.example");
+        assert_eq!(origin, "https://yoi.example");
+        assert_eq!(public_base_url, "https://yoi.example");
+    }
+
+    #[test]
+    fn browser_public_url_override_replaces_the_derived_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = WorkspaceBackendConfigFile::default()
+            .resolve(dir.path(), identity())
+            .unwrap()
+            .with_browser_public_url("https://deploy.example.test:8443")
+            .unwrap();
+
+        let AuthConfig::Passkey {
+            rp_id,
+            origin,
+            public_base_url,
+            ..
+        } = &resolved.server.auth;
+        assert_eq!(rp_id, "deploy.example.test");
+        assert_eq!(origin, "https://deploy.example.test:8443");
+        assert_eq!(public_base_url, "https://deploy.example.test:8443");
+    }
+
+    #[test]
+    fn browser_public_url_rejects_non_origin_urls() {
+        for value in [
+            "https://example.test/path",
+            "https://example.test?query=true",
+            "file:///tmp/web",
+        ] {
+            let result = WorkspaceBackendConfigFile::parse_str(
+                &format!("[auth]\nbrowser_public_url = {value:?}\n"),
+                "test",
+            )
+            .unwrap()
+            .resolve(tempfile::tempdir().unwrap().path(), identity());
+            let error = match result {
+                Ok(_) => panic!("expected {value} to be rejected"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("auth.browser_public_url"),
+                "unexpected error for {value}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_legacy_independent_browser_auth_settings() {
+        for key in ["rp_id", "origin", "public_base_url"] {
+            let error = WorkspaceBackendConfigFile::parse_str(
+                &format!("[auth]\n{key} = \"legacy.example\"\n"),
+                "test",
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("unknown field"),
+                "unexpected error for {key}: {error}"
+            );
+        }
     }
 
     #[test]

@@ -19,6 +19,8 @@ services:
       - runtime
     expose:
       - "8787"
+    environment:
+      YOI_BROWSER_PUBLIC_URL: "${YOI_BROWSER_PUBLIC_URL:-http://localhost:8080}"
     volumes:
       - server-data:/server-data
       - ./docker/workspace:/workspace:ro

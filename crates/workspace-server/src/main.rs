@@ -16,6 +16,8 @@ use yoi_workspace_server::{
     WorkspaceCreateRequest, WorkspaceIdentity, WorkspaceRecord, serve_workspace_catalog,
 };
 
+const BROWSER_PUBLIC_URL_ENV: &str = "YOI_BROWSER_PUBLIC_URL";
+
 #[derive(Debug)]
 enum Command {
     Serve(ServeOptions),
@@ -634,6 +636,9 @@ async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Erro
     )?;
     resolved.database_path = database_path.clone();
     resolved.server.database_path = database_path.clone();
+    if let Some(browser_public_url) = browser_public_url_from_environment()? {
+        resolved = resolved.with_browser_public_url(&browser_public_url)?;
+    }
     append_trusted_runtime_sources(store.as_ref(), &mut resolved.server.remote_runtime_sources)?;
     if let Some(listen) = options.listen {
         resolved = resolved.with_listen(listen);
@@ -653,6 +658,16 @@ async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Erro
     );
     serve_workspace_catalog(resolved.server, store, listener).await?;
     Ok(())
+}
+
+fn browser_public_url_from_environment() -> Result<Option<String>, CliError> {
+    match std::env::var(BROWSER_PUBLIC_URL_ENV) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(CliError(format!(
+            "{BROWSER_PUBLIC_URL_ENV} must contain valid UTF-8"
+        ))),
+    }
 }
 
 fn append_trusted_runtime_sources(
@@ -966,7 +981,7 @@ fn print_skills_help() {
 fn print_serve_help() {
     println!(
         "yoi-server serve\n\nUsage:\n  yoi-server migrate --dry-run [--database <PATH>]
-  yoi-server serve [OPTIONS]\n\nDescription:\n  Serves the Workspace recorded in the Yoi server DB. Workspace records are stored in the XDG/Yoi data directory, and runtime sources are loaded from XDG runtimes.toml.\n\nOptions:\n      --listen <ADDR>     Listen address (default 127.0.0.1:8787)\n  -h, --help              Print help"
+  yoi-server serve [OPTIONS]\n\nDescription:\n  Serves the Workspace recorded in the Yoi server DB. Workspace records are stored in the XDG/Yoi data directory, and runtime sources are loaded from XDG runtimes.toml.\n\nOptions:\n      --listen <ADDR>     Listen address (default 127.0.0.1:8787)\n  -h, --help              Print help\n\nEnvironment:\n  YOI_BROWSER_PUBLIC_URL  Browser-facing Vite/Nginx origin used by WebAuthn, device login, cookies, and CSRF checks"
     );
 }
 

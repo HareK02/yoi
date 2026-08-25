@@ -17,9 +17,6 @@
 # Backend HTTP/WebSocket listen address.
 listen = "127.0.0.1:8787"
 
-# Browser-facing frontend URL used by local tooling/display.
-frontend_url = "http://127.0.0.1:5173"
-
 # Static SPA build directory override. Leave commented for dev/API-only mode.
 # Relative paths are resolved from the workspace root.
 # static_assets_dir = "web/workspace/dist"
@@ -43,11 +40,10 @@ frontend_url = "http://127.0.0.1:5173"
 max_records = 200
 
 [auth]
-# WebAuthn / Passkey relying-party settings. For local development keep rp_id
-# aligned with the browser host in public_base_url/origin.
-rp_id = "localhost"
-origin = "http://localhost:8787"
-public_base_url = "http://localhost:8787"
+# Vite owns this origin in local development. Set YOI_BROWSER_PUBLIC_URL to the
+# browser-facing Nginx origin in deployments. The Server derives the WebAuthn
+# origin, RP ID, device-login URL, cookie policy, and CSRF check from this URL.
+browser_public_url = "http://localhost:5173"
 cookie_name = "yoi_workspace_session"
 
 # Repository registry. Browser/API repository projection reads only configured
