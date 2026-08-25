@@ -705,6 +705,15 @@ impl SqliteWorkspaceAuthority {
         reference: &str,
         request: TicketShowRequest,
     ) -> Result<TicketDetail> {
+        self.read_ticket_detail_with_backend(reference, request, &self.ticket_backend)
+    }
+
+    pub(crate) fn read_ticket_detail_with_backend(
+        &self,
+        reference: &str,
+        request: TicketShowRequest,
+        backend: &SqliteTicketBackend,
+    ) -> Result<TicketDetail> {
         let id = self
             .store
             .resolve_resource_reference(
@@ -713,19 +722,19 @@ impl SqliteWorkspaceAuthority {
                 reference,
             )?
             .ok_or_else(|| Error::Ticket(ticket::TicketError::NotFound(reference.to_string())))?;
-        let ticket = self.ticket_backend.show(TicketIdOrSlug::Id(id))?;
-        self.ticket_detail_from_ticket(ticket, request)
+        let ticket = backend.show(TicketIdOrSlug::Id(id))?;
+        self.ticket_detail_from_ticket(ticket, request, backend)
     }
 
     fn ticket_detail_from_ticket(
         &self,
         ticket: ticket::Ticket,
         request: TicketShowRequest,
+        dependency_backend: &SqliteTicketBackend,
     ) -> Result<TicketDetail> {
         let id = ticket.meta.id.as_str();
-        let dependency_check = self
-            .ticket_backend
-            .dependency_check(TicketIdOrSlug::Id(id.to_string()))?;
+        let dependency_check =
+            dependency_backend.dependency_check(TicketIdOrSlug::Id(id.to_string()))?;
         let (body, body_truncated) =
             truncate_body(ticket.document.body.as_str(), DETAIL_BODY_LIMIT);
         let event_limit = request
@@ -1117,6 +1126,7 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
                     event_limit: Some(TICKET_EVENT_LIMIT),
                     event_cursor: None,
                 },
+                &self.ticket_backend,
             )?;
             if ticket_matches_query(
                 &summary,

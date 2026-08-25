@@ -3133,7 +3133,7 @@ async fn scoped_get_ticket(
     AxumPath(path): AxumPath<ScopedRecordPath>,
 ) -> ApiResult<Json<TicketDetail>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    get_ticket(State(api), AxumPath(path.id)).await
+    browser_ticket_detail(&api, &path.id)
 }
 
 async fn scoped_query_tickets(
@@ -3151,7 +3151,10 @@ async fn scoped_show_ticket(
     Json(query): Json<TicketShowRequest>,
 ) -> ApiResult<Json<TicketDetail>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    Ok(Json(api.authority.show_ticket(&path.id, query)?))
+    let backend = browser_ticket_backend(&api)?;
+    Ok(Json(api.authority.read_ticket_detail_with_backend(
+        &path.id, query, &backend,
+    )?))
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -3766,7 +3769,12 @@ fn browser_ticket_backend(api: &WorkspaceApi) -> Result<SqliteTicketBackend> {
 }
 
 fn browser_ticket_detail(api: &WorkspaceApi, ticket_id: &str) -> ApiResult<Json<TicketDetail>> {
-    Ok(Json(api.authority.ticket(ticket_id)?))
+    let backend = browser_ticket_backend(api)?;
+    Ok(Json(api.authority.read_ticket_detail_with_backend(
+        ticket_id,
+        TicketShowRequest::default(),
+        &backend,
+    )?))
 }
 
 async fn scoped_edit_ticket_item(
@@ -16514,6 +16522,60 @@ mod tests {
         .unwrap_err();
         assert!(error.error.to_string().contains("cycle"));
         for ticket_id in [first.id, second.id] {
+            assert_eq!(
+                backend.show(ticket_id.into()).unwrap().meta.workflow_state,
+                TicketWorkflowState::Ready
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_queue_eligibility_uses_authoritative_dependency_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let api = test_api(dir.path()).await;
+        let backend = browser_ticket_backend(&api).unwrap();
+        let mut dependency_input = ticket::NewTicket::new("Invalid target dependency");
+        dependency_input.workflow_state = Some(TicketWorkflowState::Ready);
+        dependency_input.repository_id = Some(TEST_REPOSITORY_ID.to_string());
+        dependency_input.ref_selector = Some("missing-ref".to_string());
+        let dependency = backend.create(dependency_input).unwrap();
+        let mut root_input = ticket::NewTicket::new("Queue root");
+        root_input.workflow_state = Some(TicketWorkflowState::Ready);
+        root_input.repository_id = Some(TEST_REPOSITORY_ID.to_string());
+        root_input.ref_selector = Some("develop".to_string());
+        let root = backend.create(root_input).unwrap();
+        backend
+            .add_ticket_relation(
+                root.id.clone().into(),
+                ticket::NewTicketRelation {
+                    kind: ticket::TicketRelationKind::DependsOn,
+                    target: dependency.id.clone(),
+                    note: None,
+                    author: Some("test".to_string()),
+                },
+            )
+            .unwrap();
+        assign_test_orchestrator(&api, &root.id);
+        assign_test_orchestrator(&api, &dependency.id);
+
+        let Json(detail) = browser_ticket_detail(&api, &root.id).unwrap();
+        assert!(!detail.action_eligibility.can_queue);
+        assert!(
+            detail
+                .action_eligibility
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("missing-ref"))
+        );
+        let result = scoped_queue_ticket_record(
+            State(api.clone()),
+            AxumPath((TEST_WORKSPACE_ID.to_string(), root.id.clone())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(result.is_err());
+        for ticket_id in [dependency.id, root.id] {
             assert_eq!(
                 backend.show(ticket_id.into()).unwrap().meta.workflow_state,
                 TicketWorkflowState::Ready
