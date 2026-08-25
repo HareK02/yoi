@@ -58,19 +58,18 @@ The Compose files live at:
 
 ```text
 compose.yaml
-docker/workspace/.yoi/workspace.toml
-docker/workspace/.yoi/workspace-backend.local.toml
 ```
 
 The WebUI container serves static assets and proxies `/api` to the Backend Server. The Backend Server registers the Runtime container as a remote Runtime such as `docker-runtime`. The Runtime container runs `yoi-runtime` and owns Worker spawning/materialization for that runtime.
 
-`YOI_BROWSER_PUBLIC_URL` is the single browser-facing deployment setting used by the Server for WebAuthn, device-login URLs, cookie policy, and cookie-authenticated mutation origin checks. Compose defaults it to `http://localhost:8080`; deployments exposed through another host, port, or HTTPS endpoint must set the exact Nginx-facing origin, for example:
+The operator-owned `/etc/yoi/server.toml` is mounted read-only at `/server-config/server.toml`. Its `browser.public_url` is the single browser-facing setting used for WebAuthn, device-login URLs, cookie policy, and cookie-authenticated mutation origin checks:
 
-```text
-YOI_BROWSER_PUBLIC_URL=https://yoi.example.com docker compose up
+```toml
+[browser]
+public_url = "https://yoi.example.com"
 ```
 
-The value is an origin, not an API/backend URL, and must not include a path, query, or fragment.
+Create this host file before starting Compose and set it to the exact Nginx-facing origin. It is not an API/backend URL and must not include a path, query, or fragment. It is deployment topology outside the source and Workspace repositories, not Workspace DB state or repository-local configuration.
 
 Container user and writable data directories matter: runtime/server images must be able to write their configured data directories and named volumes. The current local-image Compose setup avoids an image-level `User` override and sets data-directory permissions accordingly.
 

@@ -264,6 +264,8 @@ in
         "serve"
         "--listen"
         "0.0.0.0:8787"
+        "--config"
+        "/server-config/server.toml"
       ];
       Env = [
         "PATH=/bin"
@@ -274,7 +276,7 @@ in
       };
       Volumes = {
         "/server-data" = { };
-        "/workspace" = { };
+        "/server-config" = { };
       };
       WorkingDir = "/server-data";
     };

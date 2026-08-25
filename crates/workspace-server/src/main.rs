@@ -11,19 +11,13 @@ use worker_runtime::auth::{RuntimeIdentityMaterial, decode_public_key};
 use yoi_workspace_server::hosts::{RemoteRuntimeAuthConfig, RemoteRuntimeConfig};
 use yoi_workspace_server::store::{SqliteWorkspaceStore, TrustedRuntimeRecord};
 use yoi_workspace_server::{
-    BackendRuntimesConfigFile, ControlPlaneStore, InitialRepositoryIntent, ServerConfig,
-    WORKSPACE_BACKEND_CONFIG_TEMPLATE, WorkspaceBackendConfigFile, WorkspaceCatalogService,
-    WorkspaceCreateRequest, WorkspaceIdentity, WorkspaceRecord, serve_workspace_catalog,
+    BackendRuntimesConfigFile, ControlPlaneStore, ResolvedWorkspaceBackendConfig, ServerConfig,
+    ServerHostConfigFile, WorkspaceIdentity, WorkspaceRecord, serve_workspace_catalog,
 };
-
-const BROWSER_PUBLIC_URL_ENV: &str = "YOI_BROWSER_PUBLIC_URL";
 
 #[derive(Debug)]
 enum Command {
     Serve(ServeOptions),
-    Init(InitOptions),
-    ConfigDefault,
-    ConfigDiff(WorkspacePathOptions),
     Identity(Vec<String>),
     TrustRuntime(Vec<String>),
     MigrateDryRun { database: Option<PathBuf> },
@@ -34,16 +28,7 @@ enum Command {
 #[derive(Debug)]
 struct ServeOptions {
     listen: Option<SocketAddr>,
-}
-
-#[derive(Debug)]
-struct InitOptions {
-    workspace: PathBuf,
-}
-
-#[derive(Debug)]
-struct WorkspacePathOptions {
-    workspace: PathBuf,
+    config: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -84,9 +69,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     match parse_command(&args)? {
         Command::Serve(options) => run_serve(options).await,
-        Command::Init(options) => run_init(options).await,
-        Command::ConfigDefault => run_config_default(),
-        Command::ConfigDiff(options) => run_config_diff(options),
         Command::Identity(args) => run_identity_command(args),
         Command::TrustRuntime(args) => run_trust_runtime_command(args),
         Command::MigrateDryRun { database } => {
@@ -112,14 +94,6 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
     };
 
     match command.as_str() {
-        "init" => {
-            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
-                print_init_help();
-                return Ok(Command::Help);
-            }
-            Ok(Command::Init(parse_init_options(rest)?))
-        }
-        "config" => parse_config_command(rest),
         "identity" => Ok(Command::Identity(rest.to_vec())),
         "trust-runtime" => Ok(Command::TrustRuntime(rest.to_vec())),
         "migrate" => parse_migrate_command(rest),
@@ -136,59 +110,9 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
             Ok(Command::Help)
         }
         other => Err(CliError(format!(
-            "unknown command `{other}`; expected `init`, `config`, `identity`, `trust-runtime`, `migrate`, `skills`, or `serve`"
+            "unknown command `{other}`; expected `identity`, `trust-runtime`, `migrate`, `skills`, or `serve`"
         ))),
     }
-}
-
-async fn run_init(options: InitOptions) -> Result<(), Box<dyn std::error::Error>> {
-    run_init_with_database_path(options, ServerConfig::default_server_database_path()).await
-}
-
-async fn run_init_with_database_path(
-    options: InitOptions,
-    database_path: PathBuf,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let identity = WorkspaceIdentity::load_or_init(&options.workspace)?;
-    WorkspaceBackendConfigFile::ensure_local_config_for_workspace(&options.workspace)?;
-
-    if let Some(parent) = database_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let store = Arc::new(SqliteWorkspaceStore::open(&database_path)?);
-    let service = WorkspaceCatalogService::new(store);
-    service.create_with_workspace_id(
-        WorkspaceCreateRequest {
-            operation_key: format!("cli-init:{}", identity.workspace_id),
-            display_name: identity.display_name.clone(),
-            repository: InitialRepositoryIntent {
-                uri: options.workspace.display().to_string(),
-                display_name: Some("Main repository".to_string()),
-                default_ref: Some("HEAD".to_string()),
-            },
-        },
-        None,
-        Some(identity.workspace_id.clone()),
-    )?;
-
-    eprintln!(
-        "yoi-server: initialized workspace `{}` ({}) in server DB `{}`",
-        options.workspace.display(),
-        identity.workspace_id,
-        database_path.display()
-    );
-    Ok(())
-}
-
-fn run_config_default() -> Result<(), Box<dyn std::error::Error>> {
-    print!("{WORKSPACE_BACKEND_CONFIG_TEMPLATE}");
-    Ok(())
-}
-
-fn run_config_diff(options: WorkspacePathOptions) -> Result<(), Box<dyn std::error::Error>> {
-    let diff = WorkspaceBackendConfigFile::local_config_diff_for_workspace(&options.workspace)?;
-    print!("{}", diff.text);
-    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -628,22 +552,23 @@ async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Erro
                 .to_path_buf(),
         )
     };
+    let host_config = match options.config.as_ref() {
+        Some(path) => ServerHostConfigFile::load_from_path(path)?,
+        None => ServerHostConfigFile::load_default()?,
+    };
     let runtime_config = BackendRuntimesConfigFile::load_default()?;
-    let mut resolved = WorkspaceBackendConfigFile::default().resolve_with_runtime_config(
+    let mut resolved = ResolvedWorkspaceBackendConfig::local_dev(
         &workspace_root,
         identity,
+        &host_config,
         &runtime_config,
     )?;
     resolved.database_path = database_path.clone();
     resolved.server.database_path = database_path.clone();
-    if let Some(browser_public_url) = browser_public_url_from_environment()? {
-        resolved = resolved.with_browser_public_url(&browser_public_url)?;
-    }
     append_trusted_runtime_sources(store.as_ref(), &mut resolved.server.remote_runtime_sources)?;
     if let Some(listen) = options.listen {
         resolved = resolved.with_listen(listen);
     }
-    resolved.server.allow_local_workspace_bootstrap = resolved.listen.ip().is_loopback();
 
     let listener = TcpListener::bind(resolved.listen).await?;
     let local_addr = listener.local_addr()?;
@@ -658,16 +583,6 @@ async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Erro
     );
     serve_workspace_catalog(resolved.server, store, listener).await?;
     Ok(())
-}
-
-fn browser_public_url_from_environment() -> Result<Option<String>, CliError> {
-    match std::env::var(BROWSER_PUBLIC_URL_ENV) {
-        Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(CliError(format!(
-            "{BROWSER_PUBLIC_URL_ENV} must contain valid UTF-8"
-        ))),
-    }
 }
 
 fn append_trusted_runtime_sources(
@@ -735,41 +650,6 @@ fn infer_workspace_root_from_repositories(
     Ok(ServerConfig::default_workspace_backend_data_root(
         &workspace.workspace_id,
     ))
-}
-
-fn parse_config_command(args: &[String]) -> Result<Command, CliError> {
-    let Some((subcommand, rest)) = args.split_first() else {
-        print_config_help();
-        return Ok(Command::Help);
-    };
-    match subcommand.as_str() {
-        "default" => {
-            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
-                print_config_help();
-                return Ok(Command::Help);
-            }
-            if !rest.is_empty() {
-                return Err(CliError(
-                    "config default does not accept options".to_string(),
-                ));
-            }
-            Ok(Command::ConfigDefault)
-        }
-        "diff" => {
-            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
-                print_config_help();
-                return Ok(Command::Help);
-            }
-            Ok(Command::ConfigDiff(parse_workspace_path_options(rest)?))
-        }
-        "--help" | "-h" => {
-            print_config_help();
-            Ok(Command::Help)
-        }
-        other => Err(CliError(format!(
-            "unknown config subcommand `{other}`; expected `default` or `diff`"
-        ))),
-    }
 }
 
 fn parse_migrate_command(args: &[String]) -> Result<Command, CliError> {
@@ -855,57 +735,9 @@ fn parse_skill_workspace_options(args: &[String]) -> Result<SkillWorkspaceOption
     Ok(SkillWorkspaceOptions { workspace_id })
 }
 
-fn parse_workspace_path_options(args: &[String]) -> Result<WorkspacePathOptions, CliError> {
-    let mut workspace = std::env::current_dir()
-        .map_err(|error| CliError(format!("failed to read current dir: {error}")))?;
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--workspace" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| CliError("--workspace requires a path".to_string()))?;
-                workspace = PathBuf::from(value);
-            }
-            value if value.starts_with("--workspace=") => {
-                workspace = PathBuf::from(value_after_equals(arg, "--workspace")?);
-            }
-            other => return Err(CliError(format!("unknown workspace option `{other}`"))),
-        }
-    }
-    let workspace = workspace
-        .canonicalize()
-        .map_err(|error| CliError(format!("failed to canonicalize workspace: {error}")))?;
-    Ok(WorkspacePathOptions { workspace })
-}
-
-fn parse_init_options(args: &[String]) -> Result<InitOptions, CliError> {
-    let mut workspace = std::env::current_dir()
-        .map_err(|error| CliError(format!("failed to read current dir: {error}")))?;
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--workspace" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| CliError("--workspace requires a path".to_string()))?;
-                workspace = PathBuf::from(value);
-            }
-            value if value.starts_with("--workspace=") => {
-                workspace = PathBuf::from(value_after_equals(arg, "--workspace")?);
-            }
-            other => return Err(CliError(format!("unknown init option `{other}`"))),
-        }
-    }
-
-    let workspace = workspace
-        .canonicalize()
-        .map_err(|error| CliError(format!("failed to canonicalize workspace: {error}")))?;
-    Ok(InitOptions { workspace })
-}
-
 fn parse_serve_options(args: &[String]) -> Result<ServeOptions, CliError> {
     let mut listen = None;
+    let mut config = None;
 
     let mut index = 0;
     while index < args.len() {
@@ -921,6 +753,16 @@ fn parse_serve_options(args: &[String]) -> Result<ServeOptions, CliError> {
             _ if arg.starts_with("--listen=") => {
                 listen = Some(parse_listen(value_after_equals(arg, "--listen")?)?);
             }
+            "--config" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| CliError("--config requires a path".to_string()))?;
+                config = Some(PathBuf::from(value));
+            }
+            _ if arg.starts_with("--config=") => {
+                config = Some(PathBuf::from(value_after_equals(arg, "--config")?));
+            }
             _ if arg.starts_with('-') => {
                 return Err(CliError(format!("unknown serve option `{arg}`")));
             }
@@ -933,7 +775,7 @@ fn parse_serve_options(args: &[String]) -> Result<ServeOptions, CliError> {
         index += 1;
     }
 
-    Ok(ServeOptions { listen })
+    Ok(ServeOptions { listen, config })
 }
 
 fn value_after_equals<'a>(arg: &'a str, flag: &str) -> Result<&'a str, CliError> {
@@ -955,20 +797,8 @@ fn parse_listen(value: &str) -> Result<SocketAddr, CliError> {
 
 fn print_help() {
     println!(
-        "yoi-server\n\nUsage:\n  yoi-server init [OPTIONS]\n  yoi-server config <COMMAND> [OPTIONS]\n  yoi-server identity init --server-id <SERVER_ID> [--replace]\n  yoi-server identity show [--json]\n  yoi-server trust-runtime add --runtime-id <RUNTIME_ID> --workspace-id <WORKSPACE_ID> --base-url <URL> --public-key <KEY> [--display-name <NAME>] [--replace]\n  yoi-server trust-runtime list [--json] [--include-revoked]\n  yoi-server trust-runtime revoke --runtime-id <RUNTIME_ID>\n  yoi-server skills <COMMAND> [OPTIONS]\n  yoi-server migrate --dry-run [--database <PATH>]
+        "yoi-server\n\nUsage:\n  yoi-server identity init --server-id <SERVER_ID> [--replace]\n  yoi-server identity show [--json]\n  yoi-server trust-runtime add --runtime-id <RUNTIME_ID> --workspace-id <WORKSPACE_ID> --base-url <URL> --public-key <KEY> [--display-name <NAME>] [--replace]\n  yoi-server trust-runtime list [--json] [--include-revoked]\n  yoi-server trust-runtime revoke --runtime-id <RUNTIME_ID>\n  yoi-server skills <COMMAND> [OPTIONS]\n  yoi-server migrate --dry-run [--database <PATH>]
   yoi-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
-    );
-}
-
-fn print_init_help() {
-    println!(
-        "yoi-server init\n\nUsage:\n  yoi-server init [OPTIONS]\n\nDescription:\n  Initializes a Workspace identity, copies the packaged Backend config template to .yoi/workspace-backend.local.toml, and registers the Workspace in the Yoi server DB.\n\nOptions:\n      --workspace <PATH>  Workspace root to initialize (defaults to cwd)\n  -h, --help              Print help"
-    );
-}
-
-fn print_config_help() {
-    println!(
-        "yoi-server config\n\nUsage:\n  yoi-server config default\n  yoi-server config diff [OPTIONS]\n\nDescription:\n  Prints the packaged Workspace Backend config template or compares it with the workspace-local config.\n\nOptions for diff:\n      --workspace <PATH>  Workspace root (defaults to cwd)\n  -h, --help              Print help"
     );
 }
 
@@ -981,24 +811,23 @@ fn print_skills_help() {
 fn print_serve_help() {
     println!(
         "yoi-server serve\n\nUsage:\n  yoi-server migrate --dry-run [--database <PATH>]
-  yoi-server serve [OPTIONS]\n\nDescription:\n  Serves the Workspace recorded in the Yoi server DB. Workspace records are stored in the XDG/Yoi data directory, and runtime sources are loaded from XDG runtimes.toml.\n\nOptions:\n      --listen <ADDR>     Listen address (default 127.0.0.1:8787)\n  -h, --help              Print help\n\nEnvironment:\n  YOI_BROWSER_PUBLIC_URL  Browser-facing Vite/Nginx origin used by WebAuthn, device login, cookies, and CSRF checks"
+  yoi-server serve [OPTIONS]\n\nDescription:\n  Serves Workspaces recorded in the Yoi server DB. Host-level deployment settings are loaded from the explicit --config path or the canonical XDG yoi/server.toml path, and runtime sources are loaded from XDG runtimes.toml.\n\nOptions:\n      --listen <ADDR>     Listen address (default 127.0.0.1:8787)\n      --config <PATH>     Host-level Server config path\n  -h, --help              Print help"
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yoi_workspace_server::{
-        WORKSPACE_BACKEND_CONFIG_RELATIVE_PATH, WORKSPACE_BACKEND_CONFIG_TEMPLATE,
-        WORKSPACE_IDENTITY_RELATIVE_PATH,
-    };
 
     #[test]
-    fn parse_init_defaults_workspace_to_cwd_or_flag() {
-        let temp = tempfile::tempdir().unwrap();
-        let args = vec!["--workspace".to_string(), temp.path().display().to_string()];
-        let options = parse_init_options(&args).unwrap();
-        assert_eq!(options.workspace, temp.path().canonicalize().unwrap());
+    fn removed_repository_local_commands_are_rejected() {
+        for command in ["init", "config"] {
+            let error = parse_command(&[command.to_string()]).unwrap_err();
+            assert!(
+                error.to_string().contains("unknown command"),
+                "unexpected error for {command}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -1038,10 +867,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_serve_accepts_listen_only() {
-        let args = vec!["--listen".to_string(), "127.0.0.1:0".to_string()];
+    fn parse_serve_accepts_listen_and_host_config() {
+        let args = vec![
+            "--listen".to_string(),
+            "127.0.0.1:0".to_string(),
+            "--config=/etc/yoi/server.toml".to_string(),
+        ];
         let options = parse_serve_options(&args).unwrap();
         assert_eq!(options.listen.unwrap(), "127.0.0.1:0".parse().unwrap());
+        assert_eq!(
+            options.config.unwrap(),
+            PathBuf::from("/etc/yoi/server.toml")
+        );
     }
 
     #[test]
@@ -1095,50 +932,5 @@ mod tests {
             "trusted runtime `runtime-a` already exists; pass --replace to update it"
         );
         ensure_trusted_runtime_replace_allowed(&store, "runtime-a", true).unwrap();
-    }
-
-    #[tokio::test]
-    async fn init_creates_identity_local_config_and_server_records() {
-        let temp = tempfile::tempdir().unwrap();
-        let database_path = temp.path().join("data").join("server").join("server.db");
-        std::fs::create_dir(temp.path().join(".git")).unwrap();
-        run_init_with_database_path(
-            InitOptions {
-                workspace: temp.path().canonicalize().unwrap(),
-            },
-            database_path.clone(),
-        )
-        .await
-        .unwrap();
-
-        assert!(temp.path().join(WORKSPACE_IDENTITY_RELATIVE_PATH).exists());
-        let local_config_path = temp.path().join(WORKSPACE_BACKEND_CONFIG_RELATIVE_PATH);
-        assert!(local_config_path.exists());
-        assert_eq!(
-            std::fs::read_to_string(local_config_path).unwrap(),
-            WORKSPACE_BACKEND_CONFIG_TEMPLATE
-        );
-        assert!(
-            !temp
-                .path()
-                .join(".yoi/workspace-backend.default.toml")
-                .exists()
-        );
-        assert!(!temp.path().join(".yoi/workspace.db").exists());
-        assert!(!temp.path().join(".yoi/embedded-runtime").exists());
-        assert!(database_path.exists());
-
-        let store = SqliteWorkspaceStore::open(&database_path).unwrap();
-        let workspaces = store.list_workspaces().unwrap();
-        assert_eq!(workspaces.len(), 1);
-        let repositories = store
-            .list_repositories(&workspaces[0].workspace_id)
-            .unwrap();
-        assert_eq!(repositories.len(), 1);
-        assert_eq!(repositories[0].repository_id, "main");
-        assert_eq!(
-            repositories[0].uri,
-            temp.path().canonicalize().unwrap().display().to_string()
-        );
     }
 }

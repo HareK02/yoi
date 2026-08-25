@@ -153,11 +153,7 @@ For repository builds:
 cargo run -p yoi-workspace-server --bin yoi-server -- serve --listen 127.0.0.1:8787
 ```
 
-If the Server DB has no workspace record yet, initialize it first:
-
-```bash
-yoi-server init --workspace <WORKSPACE_ROOT>
-```
+An empty Server DB is valid. Open the Web UI, create or authenticate the Account, and register the first Workspace through the normal Workspace creation flow. Server startup does not create a Workspace from its current working directory or repository-local configuration.
 
 ## Smoke checks
 

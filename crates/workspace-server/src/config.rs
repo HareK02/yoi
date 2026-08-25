@@ -7,40 +7,48 @@ use url::Url;
 
 use crate::hosts::RemoteRuntimeConfig;
 use crate::identity::WorkspaceIdentity;
-use crate::repositories::ConfiguredRepository;
 use crate::server::{AuthConfig, ServerConfig};
 use crate::{Error, Result};
 
-pub const WORKSPACE_BACKEND_CONFIG_RELATIVE_PATH: &str = ".yoi/workspace-backend.local.toml";
 pub const BACKEND_RUNTIMES_CONFIG_FILE_NAME: &str = "runtimes.toml";
-pub const WORKSPACE_BACKEND_CONFIG_TEMPLATE: &str =
-    include_str!("../../../resources/workspace-backend.default.toml");
+pub const SERVER_HOST_CONFIG_FILE_NAME: &str = "server.toml";
 const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
 const DEFAULT_BROWSER_PUBLIC_URL: &str = "http://localhost:5173";
 const DEFAULT_AUTH_COOKIE_NAME: &str = "yoi_workspace_session";
 const DEFAULT_MAX_RECORDS: usize = 200;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ServerHostConfigFile {
+    #[serde(default)]
+    pub browser: ServerBrowserConfig,
+}
+
+impl Default for ServerHostConfigFile {
+    fn default() -> Self {
+        Self {
+            browser: ServerBrowserConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ServerBrowserConfig {
+    #[serde(default = "default_browser_public_url")]
+    pub public_url: String,
+}
+
+impl Default for ServerBrowserConfig {
+    fn default() -> Self {
+        Self {
+            public_url: default_browser_public_url(),
+        }
+    }
+}
+
 fn default_browser_public_url() -> String {
     DEFAULT_BROWSER_PUBLIC_URL.to_string()
-}
-
-fn default_auth_cookie_name() -> String {
-    DEFAULT_AUTH_COOKIE_NAME.to_string()
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct WorkspaceBackendConfigFile {
-    #[serde(default)]
-    pub server: WorkspaceBackendServerConfig,
-    #[serde(default)]
-    pub data: WorkspaceBackendDataConfig,
-    #[serde(default)]
-    pub limits: WorkspaceBackendLimitsConfig,
-    #[serde(default)]
-    pub auth: WorkspaceBackendAuthConfig,
-    #[serde(default)]
-    pub repositories: Vec<WorkspaceRepositoryConfigFile>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -48,63 +56,6 @@ pub struct WorkspaceBackendConfigFile {
 pub struct BackendRuntimesConfigFile {
     #[serde(default)]
     pub runtimes: WorkspaceBackendRuntimesConfig,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct WorkspaceBackendServerConfig {
-    #[serde(default)]
-    pub listen: Option<String>,
-    #[serde(default)]
-    pub static_assets_dir: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct WorkspaceBackendDataConfig {
-    #[serde(default)]
-    pub root: Option<PathBuf>,
-    #[serde(default)]
-    pub workspace_database_path: Option<PathBuf>,
-    #[serde(default)]
-    pub embedded_runtime_store_root: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct WorkspaceBackendLimitsConfig {
-    #[serde(default)]
-    pub max_records: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct WorkspaceBackendAuthConfig {
-    #[serde(default = "default_browser_public_url")]
-    pub browser_public_url: String,
-    #[serde(default = "default_auth_cookie_name")]
-    pub cookie_name: String,
-}
-
-impl Default for WorkspaceBackendAuthConfig {
-    fn default() -> Self {
-        Self {
-            browser_public_url: default_browser_public_url(),
-            cookie_name: default_auth_cookie_name(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct WorkspaceRepositoryConfigFile {
-    pub id: String,
-    pub provider: String,
-    pub uri: String,
-    #[serde(default)]
-    pub display_name: Option<String>,
-    #[serde(default)]
-    pub default_selector: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -125,66 +76,52 @@ pub struct RemoteRuntimeConfigFile {
     pub token_ref: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfigDiff {
-    pub differs: bool,
-    pub text: String,
-}
-
-impl ConfigDiff {
-    fn new(default: &str, local: &str) -> Self {
-        if default == local {
-            return Self {
-                differs: false,
-                text: "workspace backend local config matches the packaged default\n".to_string(),
-            };
-        }
-
-        let mut text = String::from("--- packaged default\n+++ workspace local\n");
-        let default_lines = default.lines().collect::<Vec<_>>();
-        let local_lines = local.lines().collect::<Vec<_>>();
-        let max = default_lines.len().max(local_lines.len());
-        for index in 0..max {
-            match (default_lines.get(index), local_lines.get(index)) {
-                (Some(left), Some(right)) if left == right => {
-                    text.push(' ');
-                    text.push_str(left);
-                    text.push('\n');
-                }
-                (Some(left), Some(right)) => {
-                    text.push('-');
-                    text.push_str(left);
-                    text.push('\n');
-                    text.push('+');
-                    text.push_str(right);
-                    text.push('\n');
-                }
-                (Some(left), None) => {
-                    text.push('-');
-                    text.push_str(left);
-                    text.push('\n');
-                }
-                (None, Some(right)) => {
-                    text.push('+');
-                    text.push_str(right);
-                    text.push('\n');
-                }
-                (None, None) => {}
-            }
-        }
-
-        Self {
-            differs: true,
-            text,
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct ResolvedWorkspaceBackendConfig {
     pub server: ServerConfig,
     pub listen: SocketAddr,
     pub database_path: PathBuf,
+}
+
+impl ServerHostConfigFile {
+    pub fn path_for_config_dir(config_dir: impl AsRef<Path>) -> PathBuf {
+        config_dir.as_ref().join(SERVER_HOST_CONFIG_FILE_NAME)
+    }
+
+    pub fn default_path() -> Option<PathBuf> {
+        manifest::paths::config_dir().map(Self::path_for_config_dir)
+    }
+
+    pub fn load_default() -> Result<Self> {
+        let Some(path) = Self::default_path() else {
+            return Ok(Self::default());
+        };
+        match fs::read_to_string(&path) {
+            Ok(raw) => Self::parse_str(&raw, &path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(Error::Io(error)),
+        }
+    }
+
+    pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let raw = fs::read_to_string(path).map_err(|error| {
+            Error::Config(format!(
+                "failed to read Server host config `{}`: {error}",
+                path.display()
+            ))
+        })?;
+        Self::parse_str(&raw, path)
+    }
+
+    pub fn parse_str(raw: &str, path: impl AsRef<Path>) -> Result<Self> {
+        toml::from_str(raw).map_err(|error| {
+            Error::Config(format!(
+                "failed to parse Server host config `{}`: {error}",
+                path.as_ref().display()
+            ))
+        })
+    }
 }
 
 impl BackendRuntimesConfigFile {
@@ -255,148 +192,22 @@ impl BackendRuntimesConfigFile {
     }
 }
 
-impl WorkspaceBackendConfigFile {
-    pub fn path_for_workspace(workspace_root: impl AsRef<Path>) -> PathBuf {
-        workspace_root
-            .as_ref()
-            .join(WORKSPACE_BACKEND_CONFIG_RELATIVE_PATH)
-    }
-
-    pub fn ensure_local_config_for_workspace(workspace_root: impl AsRef<Path>) -> Result<()> {
-        let path = Self::path_for_workspace(workspace_root);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                use std::io::Write;
-                file.write_all(WORKSPACE_BACKEND_CONFIG_TEMPLATE.as_bytes())?;
-                file.sync_all()?;
-                Ok(())
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-            Err(error) => Err(Error::Io(error)),
-        }
-    }
-
-    pub fn local_config_diff_for_workspace(workspace_root: impl AsRef<Path>) -> Result<ConfigDiff> {
-        let workspace_root = workspace_root.as_ref();
-        let path = Self::path_for_workspace(workspace_root);
-        match fs::read_to_string(&path) {
-            Ok(local) => Ok(ConfigDiff::new(WORKSPACE_BACKEND_CONFIG_TEMPLATE, &local)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Err(Error::Config(format!(
-                "workspace backend local config `{}` does not exist; run `yoi-server init --workspace {}` first",
-                path.display(),
-                workspace_root.display()
-            ))),
-            Err(error) => Err(Error::Io(error)),
-        }
-    }
-
-    pub fn load_for_workspace(workspace_root: impl AsRef<Path>) -> Result<Self> {
-        let path = Self::path_for_workspace(workspace_root);
-        match fs::read_to_string(&path) {
-            Ok(raw) => Self::parse_str(&raw, &path),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(Error::Io(error)),
-        }
-    }
-
-    pub fn write_for_workspace(&self, workspace_root: impl AsRef<Path>) -> Result<()> {
-        let path = Self::path_for_workspace(workspace_root);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let raw = toml::to_string_pretty(self).map_err(|error| {
-            Error::Config(format!(
-                "failed to serialize workspace backend config: {error}"
-            ))
-        })?;
-        fs::write(path, raw)?;
-        Ok(())
-    }
-
-    pub fn parse_str(raw: &str, path: impl AsRef<Path>) -> Result<Self> {
-        toml::from_str(raw).map_err(|error| {
-            Error::Config(format!(
-                "failed to parse workspace backend config `{}`: {error}",
-                path.as_ref().display()
-            ))
-        })
-    }
-
-    pub fn resolve(
-        &self,
+impl ResolvedWorkspaceBackendConfig {
+    pub fn local_dev(
         workspace_root: impl AsRef<Path>,
         identity: WorkspaceIdentity,
-    ) -> Result<ResolvedWorkspaceBackendConfig> {
-        self.resolve_with_runtime_config(
-            workspace_root,
-            identity,
-            &BackendRuntimesConfigFile::default(),
-        )
-    }
-
-    pub fn resolve_with_runtime_config(
-        &self,
-        workspace_root: impl AsRef<Path>,
-        identity: WorkspaceIdentity,
+        host_config: &ServerHostConfigFile,
         runtime_config: &BackendRuntimesConfigFile,
-    ) -> Result<ResolvedWorkspaceBackendConfig> {
+    ) -> Result<Self> {
         let workspace_root = workspace_root.as_ref();
-        let data_root = self
-            .data
-            .root
-            .as_ref()
-            .map(|path| resolve_workspace_path(workspace_root, path))
-            .unwrap_or_else(|| {
-                ServerConfig::default_workspace_backend_data_root(&identity.workspace_id)
-            });
-        let database_path = self
-            .data
-            .workspace_database_path
-            .as_ref()
-            .map(|path| resolve_workspace_path(workspace_root, path))
-            .unwrap_or_else(ServerConfig::default_server_database_path);
-        let embedded_runtime_store_root = self
-            .data
-            .embedded_runtime_store_root
-            .as_ref()
-            .map(|path| resolve_workspace_path(workspace_root, path))
-            .unwrap_or_else(|| data_root.join("embedded-runtime"));
-        let listen = self
-            .server
-            .listen
-            .as_deref()
-            .unwrap_or(DEFAULT_LISTEN)
-            .parse::<SocketAddr>()
-            .map_err(|_| {
-                Error::Config(format!(
-                    "invalid workspace backend server.listen `{}`",
-                    self.server.listen.as_deref().unwrap_or(DEFAULT_LISTEN)
-                ))
-            })?;
-
+        let data_root = ServerConfig::default_workspace_backend_data_root(&identity.workspace_id);
+        let database_path = ServerConfig::default_server_database_path();
         let (browser_public_url, browser_rp_id) =
-            resolve_browser_public_url(&self.auth.browser_public_url)?;
+            resolve_browser_public_url(&host_config.browser.public_url)?;
         let mut server = ServerConfig::local_dev(workspace_root.to_path_buf(), identity);
         server.database_path = database_path.clone();
-        server.static_assets_dir = self
-            .server
-            .static_assets_dir
-            .as_ref()
-            .map(|path| resolve_workspace_path(workspace_root, path));
-        server.embedded_runtime_store_root = embedded_runtime_store_root;
-        server.max_records = self.limits.max_records.unwrap_or(DEFAULT_MAX_RECORDS);
-        server.repositories = self
-            .repositories
-            .iter()
-            .map(|repository| resolve_repository(workspace_root, repository))
-            .collect::<Result<Vec<_>>>()?;
+        server.embedded_runtime_store_root = data_root.join("embedded-runtime");
+        server.max_records = DEFAULT_MAX_RECORDS;
         server.remote_runtime_sources = runtime_config
             .runtimes
             .remote
@@ -407,10 +218,13 @@ impl WorkspaceBackendConfigFile {
             rp_id: browser_rp_id,
             origin: browser_public_url.clone(),
             public_base_url: browser_public_url,
-            cookie_name: normalize_required_string("auth.cookie_name", &self.auth.cookie_name)?,
+            cookie_name: DEFAULT_AUTH_COOKIE_NAME.to_string(),
         };
+        let listen = DEFAULT_LISTEN.parse::<SocketAddr>().map_err(|error| {
+            Error::Config(format!("invalid built-in Server listen address: {error}"))
+        })?;
 
-        Ok(ResolvedWorkspaceBackendConfig {
+        Ok(Self {
             server,
             listen,
             database_path,
@@ -419,32 +233,6 @@ impl WorkspaceBackendConfigFile {
 }
 
 impl ResolvedWorkspaceBackendConfig {
-    pub fn with_database_path(mut self, path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-        self.database_path = path.clone();
-        self.server.database_path = path;
-        self
-    }
-
-    pub fn with_static_assets_dir(mut self, path: Option<PathBuf>) -> Self {
-        self.server.static_assets_dir = path;
-        self
-    }
-
-    pub fn with_browser_public_url(mut self, public_url: &str) -> Result<Self> {
-        let (origin, rp_id) = resolve_browser_public_url(public_url)?;
-        let AuthConfig::Passkey {
-            rp_id: configured_rp_id,
-            origin: configured_origin,
-            public_base_url,
-            ..
-        } = &mut self.server.auth;
-        *configured_rp_id = rp_id;
-        *configured_origin = origin.clone();
-        *public_base_url = origin;
-        Ok(self)
-    }
-
     pub fn with_backend_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.server.backend_base_url = Some(base_url.into().trim_end_matches('/').to_string());
         self
@@ -456,33 +244,6 @@ impl ResolvedWorkspaceBackendConfig {
     }
 }
 
-fn resolve_repository(
-    workspace_root: &Path,
-    config: &WorkspaceRepositoryConfigFile,
-) -> Result<ConfiguredRepository> {
-    let id = normalize_required_string("repository id", &config.id)?;
-    validate_repository_id(&id)?;
-    let provider =
-        normalize_required_string("repository provider", &config.provider)?.to_ascii_lowercase();
-    let uri = normalize_required_string("repository uri", &config.uri)?;
-    let (source, path) = resolve_repository_source(workspace_root, &id, &uri)?;
-    let display_name = normalize_optional_string(config.display_name.as_deref());
-    let default_selector = normalize_optional_string(config.default_selector.as_deref());
-
-    Ok(ConfiguredRepository {
-        id,
-        provider,
-        source_fingerprint: crate::repository_source::repository_source_fingerprint(&source),
-        source,
-        source_revision: 1,
-        observed_status: workspace_api::RepositoryObservedStatus::Unverified,
-        observed_at: None,
-        path,
-        display_name,
-        default_selector,
-    })
-}
-
 fn normalize_required_string(field: &str, value: &str) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -491,73 +252,12 @@ fn normalize_required_string(field: &str, value: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
-fn normalize_optional_string(value: Option<&str>) -> Option<String> {
-    value.and_then(|value| {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    })
-}
-
-fn validate_repository_id(id: &str) -> Result<()> {
-    if id
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
-    {
-        Ok(())
-    } else {
-        Err(Error::Config(format!(
-            "repository id `{id}` must contain only ASCII letters, digits, `_`, `-`, or `.`"
-        )))
-    }
-}
-
-fn resolve_repository_source(
-    workspace_root: &Path,
-    id: &str,
-    uri: &str,
-) -> Result<(workspace_api::RepositorySource, Option<PathBuf>)> {
-    match crate::repository_source::parse_repository_source(uri) {
-        Ok(source) => {
-            let path = match source.kind {
-                workspace_api::RepositorySourceKind::LocalPath => Some(PathBuf::from(&source.uri)),
-                workspace_api::RepositorySourceKind::File => url::Url::parse(&source.uri)
-                    .ok()
-                    .and_then(|uri| uri.to_file_path().ok()),
-                workspace_api::RepositorySourceKind::Ssh
-                | workspace_api::RepositorySourceKind::Http
-                | workspace_api::RepositorySourceKind::Https => None,
-                workspace_api::RepositorySourceKind::Invalid => {
-                    return Err(Error::Config(format!(
-                        "repository `{id}` has an invalid source"
-                    )));
-                }
-            };
-            Ok((source, path))
-        }
-        Err(_) if !Path::new(uri).is_absolute() && !uri.contains("://") => {
-            let path = resolve_workspace_path(workspace_root, Path::new(uri));
-            let source = workspace_api::RepositorySource {
-                kind: workspace_api::RepositorySourceKind::LocalPath,
-                uri: path.to_string_lossy().into_owned(),
-            };
-            Ok((source, Some(path)))
-        }
-        Err(error) => Err(Error::Config(format!(
-            "repository `{id}` has an invalid source: {error}"
-        ))),
-    }
-}
-
 pub(crate) fn resolve_remote_runtime(
     config: &RemoteRuntimeConfigFile,
 ) -> Result<RemoteRuntimeConfig> {
     if let Some(token_ref) = config.token_ref.as_deref() {
         return Err(Error::Config(format!(
-            "remote runtime `{}` uses token_ref `{token_ref}`, but secret ref resolution is not implemented for workspace backend config yet",
+            "remote runtime `{}` uses token_ref `{token_ref}`, but secret ref resolution is not implemented for Backend runtime settings yet",
             config.id
         )));
     }
@@ -573,41 +273,33 @@ pub(crate) fn resolve_remote_runtime(
 }
 
 fn resolve_browser_public_url(value: &str) -> Result<(String, String)> {
-    let value = normalize_required_string("auth.browser_public_url", value)?;
+    let value = normalize_required_string("browser.public_url", value)?;
     let url = Url::parse(&value).map_err(|error| {
         Error::Config(format!(
-            "auth.browser_public_url must be an absolute http(s) URL: {error}"
+            "browser.public_url must be an absolute http(s) URL: {error}"
         ))
     })?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(Error::Config(
-            "auth.browser_public_url must use the http or https scheme".to_string(),
+            "browser.public_url must use the http or https scheme".to_string(),
         ));
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err(Error::Config(
-            "auth.browser_public_url must not contain user information".to_string(),
+            "browser.public_url must not contain user information".to_string(),
         ));
     }
     if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
         return Err(Error::Config(
-            "auth.browser_public_url must contain only an origin without a path, query, or fragment"
+            "browser.public_url must contain only an origin without a path, query, or fragment"
                 .to_string(),
         ));
     }
     let rp_id = url
         .host_str()
-        .ok_or_else(|| Error::Config("auth.browser_public_url must contain a host".to_string()))?
+        .ok_or_else(|| Error::Config("browser.public_url must contain a host".to_string()))?
         .to_string();
     Ok((url.origin().ascii_serialization(), rp_id))
-}
-
-fn resolve_workspace_path(workspace_root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        workspace_root.join(path)
-    }
 }
 
 #[cfg(test)]
@@ -622,11 +314,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn missing_config_path_uses_defaults() {
+    fn resolved_with_runtimes(
+        runtimes: &BackendRuntimesConfigFile,
+    ) -> ResolvedWorkspaceBackendConfig {
         let dir = tempfile::tempdir().unwrap();
-        let config = WorkspaceBackendConfigFile::load_for_workspace(dir.path()).unwrap();
-        let resolved = config.resolve(dir.path(), identity()).unwrap();
+        ResolvedWorkspaceBackendConfig::local_dev(
+            dir.path(),
+            identity(),
+            &ServerHostConfigFile::default(),
+            runtimes,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn default_settings_resolve_without_a_repository_file() {
+        let resolved = resolved_with_runtimes(&BackendRuntimesConfigFile::default());
 
         assert_eq!(resolved.listen, "127.0.0.1:8787".parse().unwrap());
         let AuthConfig::Passkey {
@@ -650,12 +353,8 @@ mod tests {
 
     #[test]
     fn backend_base_url_is_explicit_and_normalized() {
-        let dir = tempfile::tempdir().unwrap();
         let listen = "127.0.0.1:48787".parse().unwrap();
-        let resolved = WorkspaceBackendConfigFile::load_for_workspace(dir.path())
-            .unwrap()
-            .resolve(dir.path(), identity())
-            .unwrap()
+        let resolved = resolved_with_runtimes(&BackendRuntimesConfigFile::default())
             .with_listen(listen)
             .with_backend_base_url("http://127.0.0.1:48787/");
 
@@ -667,14 +366,18 @@ mod tests {
     }
 
     #[test]
-    fn browser_public_url_drives_all_browser_auth_settings() {
-        let dir = tempfile::tempdir().unwrap();
-        let resolved = WorkspaceBackendConfigFile::parse_str(
-            "[auth]\nbrowser_public_url = \"https://Yoi.Example:443/\"\n",
-            "test",
+    fn browser_public_url_from_host_config_drives_all_browser_auth_settings() {
+        let host_config = ServerHostConfigFile::parse_str(
+            "[browser]\npublic_url = \"https://Yoi.Example:443/\"\n",
+            "server.toml",
         )
-        .unwrap()
-        .resolve(dir.path(), identity())
+        .unwrap();
+        let resolved = ResolvedWorkspaceBackendConfig::local_dev(
+            tempfile::tempdir().unwrap().path(),
+            identity(),
+            &host_config,
+            &BackendRuntimesConfigFile::default(),
+        )
         .unwrap();
 
         let AuthConfig::Passkey {
@@ -689,230 +392,57 @@ mod tests {
     }
 
     #[test]
-    fn browser_public_url_override_replaces_the_derived_settings() {
-        let dir = tempfile::tempdir().unwrap();
-        let resolved = WorkspaceBackendConfigFile::default()
-            .resolve(dir.path(), identity())
-            .unwrap()
-            .with_browser_public_url("https://deploy.example.test:8443")
-            .unwrap();
-
-        let AuthConfig::Passkey {
-            rp_id,
-            origin,
-            public_base_url,
-            ..
-        } = &resolved.server.auth;
-        assert_eq!(rp_id, "deploy.example.test");
-        assert_eq!(origin, "https://deploy.example.test:8443");
-        assert_eq!(public_base_url, "https://deploy.example.test:8443");
-    }
-
-    #[test]
     fn browser_public_url_rejects_non_origin_urls() {
         for value in [
             "https://example.test/path",
             "https://example.test?query=true",
             "file:///tmp/web",
         ] {
-            let result = WorkspaceBackendConfigFile::parse_str(
-                &format!("[auth]\nbrowser_public_url = {value:?}\n"),
-                "test",
-            )
-            .unwrap()
-            .resolve(tempfile::tempdir().unwrap().path(), identity());
+            let host_config = ServerHostConfigFile {
+                browser: ServerBrowserConfig {
+                    public_url: value.to_string(),
+                },
+            };
+            let result = ResolvedWorkspaceBackendConfig::local_dev(
+                tempfile::tempdir().unwrap().path(),
+                identity(),
+                &host_config,
+                &BackendRuntimesConfigFile::default(),
+            );
             let error = match result {
                 Ok(_) => panic!("expected {value} to be rejected"),
                 Err(error) => error,
             };
             assert!(
-                error.to_string().contains("auth.browser_public_url"),
+                error.to_string().contains("browser.public_url"),
                 "unexpected error for {value}: {error}"
             );
         }
     }
 
     #[test]
-    fn rejects_legacy_independent_browser_auth_settings() {
-        for key in ["rp_id", "origin", "public_base_url"] {
-            let error = WorkspaceBackendConfigFile::parse_str(
-                &format!("[auth]\n{key} = \"legacy.example\"\n"),
-                "test",
-            )
-            .unwrap_err();
-            assert!(
-                error.to_string().contains("unknown field"),
-                "unexpected error for {key}: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_unknown_fields() {
-        let error = WorkspaceBackendConfigFile::parse_str("[server]\nunknown = true\n", "test")
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("unknown field"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn resolves_relative_paths_against_workspace_root() {
+    fn server_host_config_loads_only_from_the_explicit_host_path() {
         let dir = tempfile::tempdir().unwrap();
-        let config = WorkspaceBackendConfigFile::parse_str(
-            r#"
-[server]
-static_assets_dir = "web/build"
-
-[data]
-root = ".yoi/backend-data"
-workspace_database_path = ".yoi/custom.db"
-embedded_runtime_store_root = ".yoi/runtime-store"
-"#,
-            "test",
-        )
-        .unwrap();
-        let resolved = config.resolve(dir.path(), identity()).unwrap();
-
-        assert_eq!(
-            resolved.server.static_assets_dir,
-            Some(dir.path().join("web/build"))
-        );
-        assert_eq!(resolved.database_path, dir.path().join(".yoi/custom.db"));
-        assert_eq!(
-            resolved.server.embedded_runtime_store_root,
-            dir.path().join(".yoi/runtime-store")
-        );
-    }
-
-    #[test]
-    fn absolute_paths_are_preserved() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = WorkspaceBackendConfigFile::parse_str(
-            r#"
-[data]
-workspace_database_path = "/tmp/yoi-workspace.db"
-embedded_runtime_store_root = "/tmp/yoi-runtime"
-"#,
-            "test",
-        )
-        .unwrap();
-        let resolved = config.resolve(dir.path(), identity()).unwrap();
-
-        assert_eq!(
-            resolved.database_path,
-            PathBuf::from("/tmp/yoi-workspace.db")
-        );
-        assert_eq!(
-            resolved.server.embedded_runtime_store_root,
-            PathBuf::from("/tmp/yoi-runtime")
-        );
-    }
-
-    #[test]
-    fn data_root_derives_runtime_store_path_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = WorkspaceBackendConfigFile::parse_str(
-            r#"
-[data]
-root = ".local-data"
-"#,
-            "test",
-        )
-        .unwrap();
-        let resolved = config.resolve(dir.path(), identity()).unwrap();
-
-        assert!(resolved.database_path.ends_with("server.db"));
-        assert_eq!(
-            resolved.server.embedded_runtime_store_root,
-            dir.path().join(".local-data/embedded-runtime")
-        );
-    }
-
-    #[test]
-    fn copies_local_config_without_overwriting() {
-        let dir = tempfile::tempdir().unwrap();
-        WorkspaceBackendConfigFile::ensure_local_config_for_workspace(dir.path()).unwrap();
-        let path = WorkspaceBackendConfigFile::path_for_workspace(dir.path());
-        let raw = fs::read_to_string(&path).unwrap();
-        assert_eq!(raw, WORKSPACE_BACKEND_CONFIG_TEMPLATE);
-        WorkspaceBackendConfigFile::parse_str(&raw, &path).unwrap();
-
-        fs::write(&path, "# custom local config\n").unwrap();
-        WorkspaceBackendConfigFile::ensure_local_config_for_workspace(dir.path()).unwrap();
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            "# custom local config\n"
-        );
-    }
-
-    #[test]
-    fn local_config_diff_reports_match_and_difference() {
-        let dir = tempfile::tempdir().unwrap();
-        WorkspaceBackendConfigFile::ensure_local_config_for_workspace(dir.path()).unwrap();
-        let matched =
-            WorkspaceBackendConfigFile::local_config_diff_for_workspace(dir.path()).unwrap();
-        assert!(!matched.differs);
-
+        let path = ServerHostConfigFile::path_for_config_dir(dir.path());
         fs::write(
-            WorkspaceBackendConfigFile::path_for_workspace(dir.path()),
-            "[server]\nlisten = \"127.0.0.1:9999\"\n",
+            &path,
+            "[browser]\npublic_url = \"https://deploy.example.test\"\n",
         )
         .unwrap();
-        let diff = WorkspaceBackendConfigFile::local_config_diff_for_workspace(dir.path()).unwrap();
-        assert!(diff.differs);
-        assert!(diff.text.contains("+++ workspace local"));
-        assert!(diff.text.contains("127.0.0.1:9999"));
+
+        let loaded = ServerHostConfigFile::load_from_path(&path).unwrap();
+        assert_eq!(loaded.browser.public_url, "https://deploy.example.test");
+        assert_eq!(path, dir.path().join("server.toml"));
     }
 
     #[test]
-    fn resolves_repository_uri_relative_to_workspace_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = WorkspaceBackendConfigFile::parse_str(
-            r#"
-[[repositories]]
-id = "main"
-provider = "git"
-uri = "."
-display_name = "Main"
-default_selector = "HEAD"
-"#,
-            "test",
-        )
-        .unwrap();
-        let resolved = config.resolve(dir.path(), identity()).unwrap();
-        let repository = resolved.server.repositories.first().unwrap();
-
-        assert_eq!(repository.id, "main");
-        assert_eq!(repository.provider, "git");
-        assert_eq!(repository.path.as_deref(), Some(dir.path()));
-        assert_eq!(repository.display_name.as_deref(), Some("Main"));
-        assert_eq!(repository.default_selector.as_deref(), Some("HEAD"));
-    }
-
-    #[test]
-    fn remote_repository_source_is_preserved_without_a_local_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = WorkspaceBackendConfigFile::parse_str(
-            r#"
-[[repositories]]
-id = "main"
-provider = "git"
-uri = "https://example.com/org/repo.git"
-"#,
-            "test",
-        )
-        .unwrap();
-        let resolved = config.resolve(dir.path(), identity()).unwrap();
-        let repository = &resolved.server.repositories[0];
-
-        assert_eq!(
-            repository.source.kind,
-            workspace_api::RepositorySourceKind::Https
+    fn explicit_missing_server_host_config_fails_closed() {
+        let error = ServerHostConfigFile::load_from_path("/missing/yoi/server.toml").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to read Server host config")
         );
-        assert_eq!(repository.source.uri, "https://example.com/org/repo.git");
-        assert!(repository.path.is_none());
     }
 
     #[test]
@@ -938,27 +468,7 @@ uri = "https://example.com/org/repo.git"
     }
 
     #[test]
-    fn workspace_backend_config_rejects_runtime_entries() {
-        let error = WorkspaceBackendConfigFile::parse_str(
-            r#"
-[[runtimes.remote]]
-id = "arc"
-endpoint = "http://legacy.example.test"
-display_name = "legacy arc"
-"#,
-            "test",
-        )
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("unknown field `runtimes`"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
     fn backend_runtimes_config_is_the_only_runtime_source() {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace_config = WorkspaceBackendConfigFile::parse_str("", "test").unwrap();
         let runtime_config = BackendRuntimesConfigFile::parse_str(
             r#"
 [[runtimes.remote]]
@@ -969,9 +479,7 @@ display_name = "xdg arc"
             "runtimes.toml",
         )
         .unwrap();
-        let resolved = workspace_config
-            .resolve_with_runtime_config(dir.path(), identity(), &runtime_config)
-            .unwrap();
+        let resolved = resolved_with_runtimes(&runtime_config);
         assert_eq!(resolved.server.remote_runtime_sources.len(), 1);
         assert_eq!(resolved.server.remote_runtime_sources[0].runtime_id, "arc");
         assert_eq!(
@@ -1000,8 +508,6 @@ token = "secret"
 
     #[test]
     fn token_ref_fails_closed_until_secret_resolution_exists() {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace_config = WorkspaceBackendConfigFile::parse_str("", "test").unwrap();
         let runtime_config = BackendRuntimesConfigFile::parse_str(
             r#"
 [[runtimes.remote]]
@@ -1012,9 +518,10 @@ token_ref = "local:remote-token"
             "runtimes.toml",
         )
         .unwrap();
-        let error = match workspace_config.resolve_with_runtime_config(
-            dir.path(),
+        let error = match ResolvedWorkspaceBackendConfig::local_dev(
+            tempfile::tempdir().unwrap().path(),
             identity(),
+            &ServerHostConfigFile::default(),
             &runtime_config,
         ) {
             Ok(_) => panic!("token_ref should fail closed until secret resolution exists"),

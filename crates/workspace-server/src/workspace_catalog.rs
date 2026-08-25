@@ -54,6 +54,10 @@ impl WorkspaceCatalogService {
         Self { store }
     }
 
+    pub fn is_empty(&self) -> Result<bool> {
+        Ok(self.store.list_workspaces()?.is_empty())
+    }
+
     pub fn list(
         &self,
         owner_account_id: Option<&str>,
@@ -76,33 +80,16 @@ impl WorkspaceCatalogService {
     pub fn create(
         &self,
         request: WorkspaceCreateRequest,
-        owner_account_id: Option<String>,
+        owner_account_id: String,
     ) -> Result<WorkspaceCreateResponse> {
-        self.create_internal(request, owner_account_id, None, false)
-    }
-
-    pub fn create_first_ownerless(
-        &self,
-        request: WorkspaceCreateRequest,
-    ) -> Result<WorkspaceCreateResponse> {
-        self.create_internal(request, None, None, true)
-    }
-
-    pub fn create_with_workspace_id(
-        &self,
-        request: WorkspaceCreateRequest,
-        owner_account_id: Option<String>,
-        requested_workspace_id: Option<String>,
-    ) -> Result<WorkspaceCreateResponse> {
-        self.create_internal(request, owner_account_id, requested_workspace_id, false)
+        self.create_internal(request, owner_account_id, None)
     }
 
     fn create_internal(
         &self,
         request: WorkspaceCreateRequest,
-        owner_account_id: Option<String>,
+        owner_account_id: String,
         requested_workspace_id: Option<String>,
-        require_empty_catalog: bool,
     ) -> Result<WorkspaceCreateResponse> {
         let operation_key = normalize_required(
             "operation_key",
@@ -142,7 +129,7 @@ impl WorkspaceCatalogService {
         let fingerprint = workspace_create_fingerprint(
             requested_workspace_id.as_deref(),
             &display_name,
-            owner_account_id.as_deref(),
+            Some(&owner_account_id),
             &repository_uri,
             &repository_name,
             &default_ref,
@@ -153,10 +140,10 @@ impl WorkspaceCatalogService {
             .create_workspace_bootstrap(&WorkspaceBootstrapRecord {
                 operation_key,
                 request_fingerprint: fingerprint.clone(),
-                require_empty_catalog,
+                require_empty_catalog: false,
                 workspace: WorkspaceRecord {
                     workspace_id: workspace_id.clone(),
-                    owner_account_id,
+                    owner_account_id: Some(owner_account_id),
                     display_name,
                     state: "active".to_string(),
                     created_at: now.clone(),
@@ -235,13 +222,29 @@ fn workspace_create_fingerprint(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::SqliteWorkspaceStore;
+    use crate::store::{AccountRecord, SqliteWorkspaceStore};
     use workspace_api::RepositorySourceKind;
 
     fn git_repository() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".git")).unwrap();
         dir
+    }
+
+    fn owner_account(store: &SqliteWorkspaceStore) -> String {
+        let account_id = Uuid::now_v7().to_string();
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        store
+            .upsert_account(&AccountRecord {
+                account_id: account_id.clone(),
+                kind: "user".to_string(),
+                handle: format!("owner-{}", &account_id[..8]),
+                display_name: "Workspace Owner".to_string(),
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .unwrap();
+        account_id
     }
 
     #[tokio::test]
@@ -259,8 +262,11 @@ mod tests {
             },
         };
 
-        let created = service.create(request.clone(), None).unwrap();
-        let replayed = service.create(request, None).unwrap();
+        let owner_account_id = owner_account(store.as_ref());
+        let created = service
+            .create(request.clone(), owner_account_id.clone())
+            .unwrap();
+        let replayed = service.create(request, owner_account_id).unwrap();
 
         assert!(!created.replayed);
         assert!(replayed.replayed);
@@ -284,64 +290,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn concurrent_ownerless_bootstrap_commits_exactly_one_workspace() {
-        let store = Arc::new(SqliteWorkspaceStore::in_memory().unwrap());
-        let service = WorkspaceCatalogService::new(store.clone());
-        let repository_a = git_repository();
-        let repository_b = git_repository();
-        let requests = [
-            WorkspaceCreateRequest {
-                operation_key: "bootstrap-a".to_string(),
-                display_name: "Workspace A".to_string(),
-                repository: InitialRepositoryIntent {
-                    uri: repository_a.path().display().to_string(),
-                    display_name: None,
-                    default_ref: None,
-                },
-            },
-            WorkspaceCreateRequest {
-                operation_key: "bootstrap-b".to_string(),
-                display_name: "Workspace B".to_string(),
-                repository: InitialRepositoryIntent {
-                    uri: repository_b.path().display().to_string(),
-                    display_name: None,
-                    default_ref: None,
-                },
-            },
-        ];
-        let barrier = Arc::new(std::sync::Barrier::new(2));
-        let results = std::thread::scope(|scope| {
-            requests
-                .into_iter()
-                .map(|request| {
-                    let service = service.clone();
-                    let barrier = barrier.clone();
-                    scope.spawn(move || {
-                        barrier.wait();
-                        service.create_first_ownerless(request)
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|handle| handle.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-
-        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
-        assert_eq!(store.list_workspaces().unwrap().len(), 1);
-        let error = results
-            .into_iter()
-            .find_map(Result::err)
-            .unwrap()
-            .to_string();
-        assert!(error.contains("catalog is empty"), "{error}");
-    }
-
     #[tokio::test]
     async fn idempotency_key_reuse_with_different_payload_is_rejected() {
         let store = Arc::new(SqliteWorkspaceStore::in_memory().unwrap());
+        let owner_account_id = owner_account(store.as_ref());
         let service = WorkspaceCatalogService::new(store);
         let repository = git_repository();
         let mut request = WorkspaceCreateRequest {
@@ -353,10 +305,15 @@ mod tests {
                 default_ref: None,
             },
         };
-        service.create(request.clone(), None).unwrap();
+        service
+            .create(request.clone(), owner_account_id.clone())
+            .unwrap();
         request.display_name = "Workspace B".to_string();
 
-        let error = service.create(request, None).unwrap_err().to_string();
+        let error = service
+            .create(request, owner_account_id)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("different input"), "{error}");
     }
 
@@ -378,17 +335,21 @@ mod tests {
     #[test]
     fn remote_repository_creation_persists_typed_source_without_auth_metadata() {
         let store = Arc::new(SqliteWorkspaceStore::in_memory().unwrap());
+        let owner_account_id = owner_account(store.as_ref());
         let service = WorkspaceCatalogService::new(store.clone());
         let result = service
-            .create_first_ownerless(WorkspaceCreateRequest {
-                operation_key: "remote-create".to_string(),
-                display_name: "Remote Workspace".to_string(),
-                repository: InitialRepositoryIntent {
-                    uri: "ssh://git@example.test/org/repository.git".to_string(),
-                    display_name: Some("Remote Repository".to_string()),
-                    default_ref: Some("main".to_string()),
+            .create(
+                WorkspaceCreateRequest {
+                    operation_key: "remote-create".to_string(),
+                    display_name: "Remote Workspace".to_string(),
+                    repository: InitialRepositoryIntent {
+                        uri: "ssh://git@example.test/org/repository.git".to_string(),
+                        display_name: Some("Remote Repository".to_string()),
+                        default_ref: Some("main".to_string()),
+                    },
                 },
-            })
+                owner_account_id,
+            )
             .unwrap();
 
         let persisted = store
