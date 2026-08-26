@@ -12,7 +12,7 @@
 //! ordinary feature reports/diagnostics instead of a separate authority layer.
 
 use std::any::{Any, type_name};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -446,6 +446,16 @@ impl ServiceVersionReq {
         Self {
             requirement: "*".into(),
         }
+    }
+
+    pub fn exact(version: impl Into<String>) -> Self {
+        Self {
+            requirement: version.into(),
+        }
+    }
+
+    fn matches(&self, provider_version: &str) -> bool {
+        self.requirement == "*" || self.requirement == provider_version
     }
 }
 
@@ -1430,30 +1440,34 @@ impl FeatureInstallContext<'_> {
 pub struct FeatureRegistryInstallReport {
     pub reports: Vec<FeatureInstallReport>,
     pub services: FeatureServiceRegistry,
+    pub plan_error: Option<FeaturePlanError>,
 }
 
 impl FeatureRegistryInstallReport {
     pub fn has_errors(&self) -> bool {
-        self.reports.iter().any(|report| {
-            report
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.severity == FeatureDiagnosticSeverity::Error)
-        })
-    }
-
-    pub fn error_message(&self) -> String {
-        self.reports
-            .iter()
-            .flat_map(|report| {
+        self.plan_error.is_some()
+            || self.reports.iter().any(|report| {
                 report
                     .diagnostics
                     .iter()
-                    .filter(|diagnostic| diagnostic.severity == FeatureDiagnosticSeverity::Error)
-                    .map(move |diagnostic| format!("{}: {}", report.feature_id, diagnostic.message))
+                    .any(|diagnostic| diagnostic.severity == FeatureDiagnosticSeverity::Error)
             })
-            .collect::<Vec<_>>()
-            .join("; ")
+    }
+
+    pub fn error_message(&self) -> String {
+        let mut errors = self
+            .plan_error
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        errors.extend(self.reports.iter().flat_map(|report| {
+            report
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.severity == FeatureDiagnosticSeverity::Error)
+                .map(move |diagnostic| format!("{}: {}", report.feature_id, diagnostic.message))
+        }));
+        errors.join("; ")
     }
 
     pub fn installed_tool_names(&self) -> Vec<String> {
@@ -1485,10 +1499,325 @@ pub fn dedupe_instruction_contributions(
     deduped
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedServiceProvider {
+    pub service: ServiceId,
+    pub provider: FeatureId,
+    pub version: String,
+}
+
+/// A validated, deterministic installation order and its selected service providers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeatureInstallPlan {
+    ordered_features: Vec<FeatureId>,
+    service_providers: BTreeMap<ServiceId, PlannedServiceProvider>,
+    ordered_indices: Vec<usize>,
+}
+
+impl FeatureInstallPlan {
+    pub fn ordered_features(&self) -> &[FeatureId] {
+        &self.ordered_features
+    }
+
+    pub fn service_providers(&self) -> &BTreeMap<ServiceId, PlannedServiceProvider> {
+        &self.service_providers
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum FeaturePlanError {
+    #[error("feature `{feature}` is registered more than once")]
+    DuplicateFeature { feature: FeatureId },
+    #[error("service `{service}` has multiple selected providers: {providers:?}")]
+    AmbiguousServiceProvider {
+        service: ServiceId,
+        providers: Vec<FeatureId>,
+    },
+    #[error("feature `{consumer}` requires service `{service}`, but no provider is selected")]
+    MissingServiceProvider {
+        consumer: FeatureId,
+        service: ServiceId,
+    },
+    #[error(
+        "feature `{consumer}` requires service `{service}` version `{requirement}`, but provider `{provider}` provides `{provider_version}`"
+    )]
+    ServiceVersionMismatch {
+        consumer: FeatureId,
+        service: ServiceId,
+        requirement: String,
+        provider: FeatureId,
+        provider_version: String,
+    },
+    #[error(
+        "service dependency cycle involves features {features:?} through services {services:?}"
+    )]
+    ServiceDependencyCycle {
+        features: Vec<FeatureId>,
+        services: Vec<ServiceId>,
+    },
+    #[error(
+        "fallback service provider `{feature}` must contribute exactly one service and no other feature surface"
+    )]
+    InvalidFallbackProvider { feature: FeatureId },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServiceProviderPreference {
+    Primary,
+    Fallback,
+}
+
+struct FeatureRegistryContribution {
+    module: Arc<dyn FeatureModule>,
+    provider_preference: ServiceProviderPreference,
+}
+
 /// Builder/installer for enabled feature modules.
-#[derive(Default)]
 pub struct FeatureRegistryBuilder {
-    modules: Vec<Arc<dyn FeatureModule>>,
+    contributions: Vec<FeatureRegistryContribution>,
+}
+
+fn build_feature_install_plan(
+    descriptors: &[FeatureDescriptor],
+    preferences: &[ServiceProviderPreference],
+) -> Result<FeatureInstallPlan, FeaturePlanError> {
+    debug_assert_eq!(descriptors.len(), preferences.len());
+
+    let mut feature_ids = BTreeSet::new();
+    for descriptor in descriptors {
+        if !feature_ids.insert(descriptor.id.clone()) {
+            return Err(FeaturePlanError::DuplicateFeature {
+                feature: descriptor.id.clone(),
+            });
+        }
+    }
+
+    let mut provider_candidates: BTreeMap<ServiceId, Vec<(usize, ServiceDeclaration)>> =
+        BTreeMap::new();
+    for (index, descriptor) in descriptors.iter().enumerate() {
+        if preferences[index] == ServiceProviderPreference::Fallback
+            && (descriptor.provides_services.len() != 1
+                || !descriptor.tools.is_empty()
+                || !descriptor.hooks.is_empty()
+                || !descriptor.instructions.is_empty()
+                || !descriptor.background_tasks.is_empty()
+                || !descriptor.requires_services.is_empty()
+                || !descriptor.protocol_providers.is_empty())
+        {
+            return Err(FeaturePlanError::InvalidFallbackProvider {
+                feature: descriptor.id.clone(),
+            });
+        }
+        for service in &descriptor.provides_services {
+            provider_candidates
+                .entry(service.id.clone())
+                .or_default()
+                .push((index, service.clone()));
+        }
+    }
+
+    let mut selected_providers = BTreeMap::new();
+    let mut selected_fallbacks = BTreeSet::new();
+    for (service, candidates) in provider_candidates {
+        let primary = candidates
+            .iter()
+            .filter(|(index, _)| preferences[*index] == ServiceProviderPreference::Primary)
+            .collect::<Vec<_>>();
+        let selected = if primary.len() == 1 {
+            primary[0]
+        } else if primary.len() > 1 {
+            let mut providers = primary
+                .iter()
+                .map(|(index, _)| descriptors[*index].id.clone())
+                .collect::<Vec<_>>();
+            providers.sort();
+            return Err(FeaturePlanError::AmbiguousServiceProvider { service, providers });
+        } else {
+            let fallback = candidates
+                .iter()
+                .filter(|(index, _)| preferences[*index] == ServiceProviderPreference::Fallback)
+                .collect::<Vec<_>>();
+            if fallback.len() > 1 {
+                let mut providers = fallback
+                    .iter()
+                    .map(|(index, _)| descriptors[*index].id.clone())
+                    .collect::<Vec<_>>();
+                providers.sort();
+                return Err(FeaturePlanError::AmbiguousServiceProvider { service, providers });
+            }
+            let Some(selected) = fallback.first() else {
+                continue;
+            };
+            selected_fallbacks.insert(selected.0);
+            *selected
+        };
+        selected_providers.insert(service.clone(), (selected.0, selected.1.clone()));
+    }
+
+    let active = descriptors
+        .iter()
+        .enumerate()
+        .filter_map(|(index, _)| {
+            (preferences[index] == ServiceProviderPreference::Primary
+                || selected_fallbacks.contains(&index))
+            .then_some(index)
+        })
+        .collect::<BTreeSet<_>>();
+    let mut adjacency = vec![BTreeSet::new(); descriptors.len()];
+    let mut indegree = vec![0usize; descriptors.len()];
+    let mut edge_services: BTreeMap<(usize, usize), BTreeSet<ServiceId>> = BTreeMap::new();
+
+    for &consumer_index in &active {
+        let consumer = &descriptors[consumer_index];
+        for requirement in &consumer.requires_services {
+            let provider = selected_providers.get(&requirement.id);
+            let Some((provider_index, declaration)) = provider else {
+                if requirement.required {
+                    return Err(FeaturePlanError::MissingServiceProvider {
+                        consumer: consumer.id.clone(),
+                        service: requirement.id.clone(),
+                    });
+                }
+                continue;
+            };
+            if !requirement.version.matches(&declaration.version) {
+                return Err(FeaturePlanError::ServiceVersionMismatch {
+                    consumer: consumer.id.clone(),
+                    service: requirement.id.clone(),
+                    requirement: requirement.version.requirement.clone(),
+                    provider: descriptors[*provider_index].id.clone(),
+                    provider_version: declaration.version.clone(),
+                });
+            }
+            if requirement.required {
+                if adjacency[*provider_index].insert(consumer_index) {
+                    indegree[consumer_index] += 1;
+                }
+                edge_services
+                    .entry((*provider_index, consumer_index))
+                    .or_default()
+                    .insert(requirement.id.clone());
+            }
+        }
+    }
+
+    let mut ready = active
+        .iter()
+        .copied()
+        .filter(|index| indegree[*index] == 0)
+        .collect::<BTreeSet<_>>();
+    let mut ordered_indices = Vec::with_capacity(active.len());
+    while let Some(index) = ready.pop_first() {
+        ordered_indices.push(index);
+        for &dependent in &adjacency[index] {
+            indegree[dependent] -= 1;
+            if indegree[dependent] == 0 {
+                ready.insert(dependent);
+            }
+        }
+    }
+
+    if ordered_indices.len() != active.len() {
+        let cycle_indices = find_service_dependency_cycle(&active, &adjacency);
+        let features = cycle_indices
+            .iter()
+            .map(|index| descriptors[*index].id.clone())
+            .collect::<Vec<_>>();
+        let mut services = BTreeSet::new();
+        for edge in cycle_indices.windows(2) {
+            if let Some(ids) = edge_services.get(&(edge[0], edge[1])) {
+                services.extend(ids.iter().cloned());
+            }
+        }
+        if let (Some(first), Some(last)) = (cycle_indices.first(), cycle_indices.last())
+            && let Some(ids) = edge_services.get(&(*last, *first))
+        {
+            services.extend(ids.iter().cloned());
+        }
+        return Err(FeaturePlanError::ServiceDependencyCycle {
+            features,
+            services: services.into_iter().collect(),
+        });
+    }
+
+    let service_providers = selected_providers
+        .into_iter()
+        .map(|(service, (provider_index, declaration))| {
+            let planned = PlannedServiceProvider {
+                service: service.clone(),
+                provider: descriptors[provider_index].id.clone(),
+                version: declaration.version,
+            };
+            (service, planned)
+        })
+        .collect();
+    let ordered_features = ordered_indices
+        .iter()
+        .map(|index| descriptors[*index].id.clone())
+        .collect();
+    Ok(FeatureInstallPlan {
+        ordered_features,
+        service_providers,
+        ordered_indices,
+    })
+}
+
+fn find_service_dependency_cycle(
+    active: &BTreeSet<usize>,
+    adjacency: &[BTreeSet<usize>],
+) -> Vec<usize> {
+    fn visit(
+        index: usize,
+        active: &BTreeSet<usize>,
+        adjacency: &[BTreeSet<usize>],
+        state: &mut [u8],
+        stack: &mut Vec<usize>,
+    ) -> Option<Vec<usize>> {
+        state[index] = 1;
+        stack.push(index);
+        for &next in &adjacency[index] {
+            if !active.contains(&next) {
+                continue;
+            }
+            match state[next] {
+                0 => {
+                    if let Some(cycle) = visit(next, active, adjacency, state, stack) {
+                        return Some(cycle);
+                    }
+                }
+                1 => {
+                    let start = stack
+                        .iter()
+                        .position(|candidate| *candidate == next)
+                        .expect("visiting node is present in DFS stack");
+                    return Some(stack[start..].to_vec());
+                }
+                _ => {}
+            }
+        }
+        stack.pop();
+        state[index] = 2;
+        None
+    }
+
+    let mut state = vec![0u8; adjacency.len()];
+    let mut stack = Vec::new();
+    for &index in active {
+        if state[index] == 0
+            && let Some(cycle) = visit(index, active, adjacency, &mut state, &mut stack)
+        {
+            return cycle;
+        }
+    }
+    Vec::new()
+}
+
+impl Default for FeatureRegistryBuilder {
+    fn default() -> Self {
+        Self {
+            contributions: Vec::new(),
+        }
+    }
 }
 
 impl FeatureRegistryBuilder {
@@ -1500,7 +1829,23 @@ impl FeatureRegistryBuilder {
     where
         M: FeatureModule + 'static,
     {
-        self.modules.push(Arc::new(module));
+        self.contributions.push(FeatureRegistryContribution {
+            module: Arc::new(module),
+            provider_preference: ServiceProviderPreference::Primary,
+        });
+        self
+    }
+
+    /// Register a service-only provider that is selected only when no primary
+    /// contribution provides its service.
+    pub fn add_fallback_service_provider<M>(&mut self, module: M) -> &mut Self
+    where
+        M: FeatureModule + 'static,
+    {
+        self.contributions.push(FeatureRegistryContribution {
+            module: Arc::new(module),
+            provider_preference: ServiceProviderPreference::Fallback,
+        });
         self
     }
 
@@ -1513,14 +1858,24 @@ impl FeatureRegistryBuilder {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.modules.is_empty()
+        self.contributions.is_empty()
     }
 
     pub fn descriptors(&self) -> Vec<FeatureDescriptor> {
-        self.modules
+        self.contributions
             .iter()
-            .map(|module| module.descriptor())
+            .map(|contribution| contribution.module.descriptor())
             .collect()
+    }
+
+    pub fn plan(&self) -> Result<FeatureInstallPlan, FeaturePlanError> {
+        let descriptors = self.descriptors();
+        let preferences = self
+            .contributions
+            .iter()
+            .map(|contribution| contribution.provider_preference)
+            .collect::<Vec<_>>();
+        build_feature_install_plan(&descriptors, &preferences)
     }
 
     /// Install modules into the existing Engine tool path and hook builder.
@@ -1564,56 +1919,64 @@ impl FeatureRegistryBuilder {
         mut installed_tool_names: HashMap<String, FeatureId>,
     ) -> FeatureRegistryInstallReport {
         let descriptors: Vec<_> = self
-            .modules
+            .contributions
             .iter()
-            .map(|module| module.descriptor())
+            .map(|contribution| contribution.module.descriptor())
             .collect();
-        let mut service_registry = FeatureServiceRegistry::default();
-        let mut reports = Vec::with_capacity(self.modules.len());
-        let mut seen_features = HashSet::new();
-
-        let mut pending_modules: Vec<_> = self.modules.into_iter().zip(descriptors).collect();
-        let mut ordered_modules = Vec::with_capacity(pending_modules.len());
-        let mut declared_services = HashSet::new();
-        while !pending_modules.is_empty() {
-            let next = pending_modules
-                .iter()
-                .position(|(_, descriptor)| {
-                    descriptor
-                        .requires_services
-                        .iter()
-                        .filter(|requirement| requirement.required)
-                        .all(|requirement| declared_services.contains(&requirement.id))
-                })
-                .unwrap_or(0);
-            let entry = pending_modules.remove(next);
-            declared_services.extend(
-                entry
-                    .1
-                    .provides_services
+        let preferences = self
+            .contributions
+            .iter()
+            .map(|contribution| contribution.provider_preference)
+            .collect::<Vec<_>>();
+        let plan = match build_feature_install_plan(&descriptors, &preferences) {
+            Ok(plan) => plan,
+            Err(error) => {
+                let message = error.to_string();
+                let reports = descriptors
                     .iter()
-                    .map(|service| service.id.clone()),
-            );
-            ordered_modules.push(entry);
-        }
+                    .map(|descriptor| {
+                        let mut report = FeatureInstallReport::new(descriptor);
+                        report
+                            .diagnostics
+                            .push(FeatureDiagnostic::error(message.clone()));
+                        report.mark_skipped(
+                            FeatureContributionKind::Diagnostic,
+                            descriptor.id.to_string(),
+                            "feature installation plan rejected before installation",
+                        );
+                        report
+                    })
+                    .collect();
+                return FeatureRegistryInstallReport {
+                    reports,
+                    services: FeatureServiceRegistry::default(),
+                    plan_error: Some(error),
+                };
+            }
+        };
+        let mut service_registry = FeatureServiceRegistry::default();
+        let mut reports = Vec::with_capacity(plan.ordered_indices.len());
+        let mut modules = self
+            .contributions
+            .into_iter()
+            .map(|contribution| Some(contribution.module))
+            .collect::<Vec<_>>();
+        let ordered_modules = plan
+            .ordered_indices
+            .into_iter()
+            .map(|index| {
+                (
+                    modules[index]
+                        .take()
+                        .expect("planned feature module is selected exactly once"),
+                    descriptors[index].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
 
         for (module, descriptor) in ordered_modules {
             let declarations = FeatureContributionDeclarations::from_descriptor(&descriptor);
             let mut report = FeatureInstallReport::new(&descriptor);
-
-            if !seen_features.insert(descriptor.id.clone()) {
-                report.diagnostics.push(FeatureDiagnostic::error(format!(
-                    "duplicate feature id: {}",
-                    descriptor.id
-                )));
-                report.mark_skipped(
-                    FeatureContributionKind::Diagnostic,
-                    descriptor.id.to_string(),
-                    "duplicate feature id",
-                );
-                reports.push(report);
-                continue;
-            }
 
             let mut required_service_failed = false;
             for requirement in descriptor.requires_services.iter().cloned() {
@@ -1681,6 +2044,7 @@ impl FeatureRegistryBuilder {
         FeatureRegistryInstallReport {
             reports,
             services: service_registry,
+            plan_error: None,
         }
     }
 }
@@ -1821,6 +2185,59 @@ mod tests {
         }
     }
 
+    struct PlannedServiceFeature {
+        descriptor: FeatureDescriptor,
+        install_calls: Arc<AtomicUsize>,
+        fail_install: bool,
+    }
+
+    impl PlannedServiceFeature {
+        fn new(descriptor: FeatureDescriptor) -> Self {
+            Self {
+                descriptor,
+                install_calls: Arc::new(AtomicUsize::new(0)),
+                fail_install: false,
+            }
+        }
+    }
+
+    impl FeatureModule for PlannedServiceFeature {
+        fn descriptor(&self) -> FeatureDescriptor {
+            self.descriptor.clone()
+        }
+
+        fn install(
+            &self,
+            context: &mut FeatureInstallContext<'_>,
+        ) -> Result<(), FeatureInstallError> {
+            self.install_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_install {
+                return Err(FeatureInstallError::Install(
+                    "injected provider failure".into(),
+                ));
+            }
+            for service in &self.descriptor.provides_services {
+                context
+                    .services()
+                    .provide(service.clone(), Arc::new(service.id.to_string()))?;
+            }
+            Ok(())
+        }
+    }
+
+    fn provided_service(id: &'static str, version: &'static str) -> ServiceDeclaration {
+        ServiceDeclaration::new(ServiceId::builtin(id), version, "test service")
+    }
+
+    fn required_service(id: &'static str, version: ServiceVersionReq) -> ServiceRequirement {
+        {
+            let mut requirement =
+                ServiceRequirement::required(ServiceId::builtin(id), "test dependency");
+            requirement.version = version;
+            requirement
+        }
+    }
+
     fn instruction(id: &'static str, prompt_ref: &'static str) -> FeatureInstructionDeclaration {
         FeatureInstructionDeclaration::new(
             FeatureInstructionId::builtin(id),
@@ -1828,6 +2245,241 @@ mod tests {
             "test instruction",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn install_plan_orders_provider_before_consumer_stably() {
+        let consumer = PlannedServiceFeature::new(
+            FeatureDescriptor::builtin("consumer", "Consumer")
+                .with_service_requirement(required_service("catalog", ServiceVersionReq::any())),
+        );
+        let unrelated =
+            PlannedServiceFeature::new(FeatureDescriptor::builtin("unrelated", "Unrelated"));
+        let provider = PlannedServiceFeature::new(
+            FeatureDescriptor::builtin("provider", "Provider")
+                .with_provided_service(provided_service("catalog", "1")),
+        );
+        let builder = FeatureRegistryBuilder::new()
+            .with_module(consumer)
+            .with_module(unrelated)
+            .with_module(provider);
+
+        let plan = builder.plan().expect("service graph should be valid");
+        assert_eq!(
+            plan.ordered_features(),
+            &[
+                FeatureId::builtin("unrelated"),
+                FeatureId::builtin("provider"),
+                FeatureId::builtin("consumer"),
+            ]
+        );
+    }
+
+    #[test]
+    fn install_plan_rejects_missing_required_service() {
+        let builder = FeatureRegistryBuilder::new().with_module(PlannedServiceFeature::new(
+            FeatureDescriptor::builtin("consumer", "Consumer")
+                .with_service_requirement(required_service("missing", ServiceVersionReq::any())),
+        ));
+
+        assert_eq!(
+            builder.plan(),
+            Err(FeaturePlanError::MissingServiceProvider {
+                consumer: FeatureId::builtin("consumer"),
+                service: ServiceId::builtin("missing"),
+            })
+        );
+    }
+
+    #[test]
+    fn install_plan_rejects_ambiguous_provider_independent_of_registration_order() {
+        fn plan(reverse: bool) -> FeaturePlanError {
+            let provider_a = PlannedServiceFeature::new(
+                FeatureDescriptor::builtin("provider-a", "Provider A")
+                    .with_provided_service(provided_service("catalog", "1")),
+            );
+            let provider_b = PlannedServiceFeature::new(
+                FeatureDescriptor::builtin("provider-b", "Provider B")
+                    .with_provided_service(provided_service("catalog", "1")),
+            );
+            let mut builder = FeatureRegistryBuilder::new();
+            if reverse {
+                builder.add_module(provider_b).add_module(provider_a);
+            } else {
+                builder.add_module(provider_a).add_module(provider_b);
+            }
+            builder.plan().expect_err("duplicate providers must fail")
+        }
+
+        let expected = FeaturePlanError::AmbiguousServiceProvider {
+            service: ServiceId::builtin("catalog"),
+            providers: vec![
+                FeatureId::builtin("provider-a"),
+                FeatureId::builtin("provider-b"),
+            ],
+        };
+        assert_eq!(plan(false), expected);
+        assert_eq!(plan(true), expected);
+    }
+
+    #[test]
+    fn install_plan_rejects_service_version_mismatch() {
+        let builder = FeatureRegistryBuilder::new()
+            .with_module(PlannedServiceFeature::new(
+                FeatureDescriptor::builtin("consumer", "Consumer").with_service_requirement(
+                    required_service("catalog", ServiceVersionReq::exact("2")),
+                ),
+            ))
+            .with_module(PlannedServiceFeature::new(
+                FeatureDescriptor::builtin("provider", "Provider")
+                    .with_provided_service(provided_service("catalog", "1")),
+            ));
+
+        assert_eq!(
+            builder.plan(),
+            Err(FeaturePlanError::ServiceVersionMismatch {
+                consumer: FeatureId::builtin("consumer"),
+                service: ServiceId::builtin("catalog"),
+                requirement: "2".into(),
+                provider: FeatureId::builtin("provider"),
+                provider_version: "1".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn install_plan_reports_service_cycle_members() {
+        let builder = FeatureRegistryBuilder::new()
+            .with_module(PlannedServiceFeature::new(
+                FeatureDescriptor::builtin("alpha", "Alpha")
+                    .with_provided_service(provided_service("alpha-service", "1"))
+                    .with_service_requirement(required_service(
+                        "beta-service",
+                        ServiceVersionReq::any(),
+                    )),
+            ))
+            .with_module(PlannedServiceFeature::new(
+                FeatureDescriptor::builtin("beta", "Beta")
+                    .with_provided_service(provided_service("beta-service", "1"))
+                    .with_service_requirement(required_service(
+                        "alpha-service",
+                        ServiceVersionReq::any(),
+                    )),
+            ));
+
+        let error = builder.plan().expect_err("cycle must fail before install");
+        let FeaturePlanError::ServiceDependencyCycle { features, services } = error else {
+            panic!("unexpected plan error: {error:?}");
+        };
+        assert_eq!(
+            features.into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([FeatureId::builtin("alpha"), FeatureId::builtin("beta")])
+        );
+        assert_eq!(
+            services.into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                ServiceId::builtin("alpha-service"),
+                ServiceId::builtin("beta-service"),
+            ])
+        );
+    }
+
+    #[test]
+    fn primary_provider_supersedes_explicit_fallback_candidate() {
+        let primary = PlannedServiceFeature::new(
+            FeatureDescriptor::builtin("primary", "Primary")
+                .with_provided_service(provided_service("control", "1")),
+        );
+        let fallback = PlannedServiceFeature::new(
+            FeatureDescriptor::builtin("fallback", "Fallback")
+                .with_provided_service(provided_service("control", "1")),
+        );
+        let fallback_calls = Arc::clone(&fallback.install_calls);
+        let mut builder = FeatureRegistryBuilder::new().with_module(primary);
+        builder.add_fallback_service_provider(fallback);
+        let plan = builder
+            .plan()
+            .expect("primary plus fallback is unambiguous");
+
+        assert_eq!(
+            plan.service_providers()[&ServiceId::builtin("control")].provider,
+            FeatureId::builtin("primary")
+        );
+        assert!(
+            !plan
+                .ordered_features()
+                .contains(&FeatureId::builtin("fallback"))
+        );
+
+        let mut hook_builder = HookRegistryBuilder::default();
+        let mut pending_tools = Vec::new();
+        let report = builder.install_into_pending(&mut pending_tools, &mut hook_builder);
+        assert!(!report.has_errors());
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn plan_failure_has_no_install_side_effects_and_reports_identities() {
+        let first = PlannedServiceFeature::new(
+            FeatureDescriptor::builtin("first", "First")
+                .with_provided_service(provided_service("control", "1")),
+        );
+        let first_calls = Arc::clone(&first.install_calls);
+        let second = PlannedServiceFeature::new(
+            FeatureDescriptor::builtin("second", "Second")
+                .with_provided_service(provided_service("control", "1")),
+        );
+        let second_calls = Arc::clone(&second.install_calls);
+        let mut hook_builder = HookRegistryBuilder::default();
+        let mut pending_tools = Vec::new();
+
+        let report = FeatureRegistryBuilder::new()
+            .with_module(first)
+            .with_module(second)
+            .install_into_pending(&mut pending_tools, &mut hook_builder);
+
+        assert!(report.has_errors());
+        assert!(matches!(
+            report.plan_error,
+            Some(FeaturePlanError::AmbiguousServiceProvider { .. })
+        ));
+        assert!(report.error_message().contains("builtin:control"));
+        assert!(report.error_message().contains("builtin:first"));
+        assert!(report.error_message().contains("builtin:second"));
+        assert_eq!(first_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 0);
+        assert!(pending_tools.is_empty());
+    }
+
+    #[test]
+    fn provider_install_failure_is_fatal_and_does_not_queue_tools() {
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let provider = PlannedServiceFeature {
+            descriptor: FeatureDescriptor::builtin("provider", "Provider")
+                .with_provided_service(provided_service("control", "1")),
+            install_calls: Arc::clone(&provider_calls),
+            fail_install: true,
+        };
+        let consumer = ToolFeature {
+            descriptor: FeatureDescriptor::builtin("consumer", "Consumer")
+                .with_service_requirement(required_service("control", ServiceVersionReq::any()))
+                .with_tool(ToolDeclaration::new("Dependent", "dependent tool")),
+            contribution_name: "Dependent",
+            model_visible_name: "Dependent",
+        };
+        let mut hook_builder = HookRegistryBuilder::default();
+        let mut pending_tools = Vec::new();
+
+        let report = FeatureRegistryBuilder::new()
+            .with_module(consumer)
+            .with_module(provider)
+            .install_into_pending(&mut pending_tools, &mut hook_builder);
+
+        assert!(report.has_errors());
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert!(pending_tools.is_empty());
+        assert!(report.error_message().contains("builtin:provider"));
+        assert!(report.error_message().contains("injected provider failure"));
     }
 
     #[test]
@@ -2382,10 +3034,6 @@ mod tests {
         );
         let consumer = FeatureDescriptor::builtin("consumer", "Consumer")
             .with_service_requirement(ServiceRequirement::required(service.clone(), "needs demo"));
-        let missing_service = ServiceId::builtin("missing-service");
-        let missing = FeatureDescriptor::builtin("missing", "Missing").with_service_requirement(
-            ServiceRequirement::required(missing_service, "needs missing"),
-        );
         let optional_service = ServiceId::builtin("optional-service");
         let optional = FeatureDescriptor::builtin("optional", "Optional").with_service_requirement(
             ServiceRequirement::optional(optional_service, "nice to have"),
@@ -2400,9 +3048,6 @@ mod tests {
                 descriptor: consumer,
             })
             .with_module(ServiceFeature {
-                descriptor: missing,
-            })
-            .with_module(ServiceFeature {
                 descriptor: optional,
             })
             .install_into_pending(&mut pending_tools, &mut hook_builder);
@@ -2412,18 +3057,6 @@ mod tests {
         assert_eq!(
             report.reports[1].resolved_service_requirements[0].id,
             service
-        );
-        let missing_report = report
-            .reports
-            .iter()
-            .find(|feature| feature.feature_id == FeatureId::builtin("missing"))
-            .unwrap();
-        assert!(!missing_report.installed);
-        assert!(
-            missing_report
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message.contains("required service requirement"))
         );
         let optional_report = report
             .reports
@@ -2543,11 +3176,12 @@ mod tests {
             .with_module(ServiceFeature { descriptor })
             .install_into_pending(&mut pending_tools, &mut hook_builder);
         assert!(report.has_errors());
-        assert!(
-            report
-                .error_message()
-                .contains("required service requirement")
-        );
+        assert!(matches!(
+            report.plan_error,
+            Some(FeaturePlanError::MissingServiceProvider { .. })
+        ));
+        assert!(report.error_message().contains("builtin:consumer"));
+        assert!(report.error_message().contains("builtin:missing-service"));
     }
 
     #[test]

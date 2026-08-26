@@ -873,6 +873,14 @@ where
     }
 
     let mut feature_registry = FeatureRegistryBuilder::new();
+    if feature_config.sub_worker.enabled {
+        feature_registry.add_fallback_service_provider(
+            crate::feature::builtin::manage_worker::sub_worker_control_feature(
+                worker.workspace_client_handle(),
+                spawned_registry.clone(),
+            ),
+        );
+    }
     if feature_config.task.enabled {
         feature_registry.add_module(task_feature);
     }

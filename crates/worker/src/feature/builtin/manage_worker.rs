@@ -356,6 +356,52 @@ pub fn manage_worker_feature(
     }
 }
 
+pub struct SubWorkerControlFeature {
+    client: Arc<dyn WorkspaceClient>,
+    registry: Arc<SpawnedWorkerRegistry>,
+}
+
+impl SubWorkerControlFeature {
+    pub fn new(client: Arc<dyn WorkspaceClient>, registry: Arc<SpawnedWorkerRegistry>) -> Self {
+        Self { client, registry }
+    }
+}
+
+impl FeatureModule for SubWorkerControlFeature {
+    fn descriptor(&self) -> FeatureDescriptor {
+        FeatureDescriptor::builtin("sub-worker-control", "SubWorker Control")
+            .with_description("Parent-owned SubWorker control service provider")
+            .with_provided_service(ServiceDeclaration::new(
+                ServiceId::builtin(WORKER_CONTROL_SERVICE_ID),
+                WORKER_LIFECYCLE_SERVICE_VERSION,
+                "Parent-owned SubWorker discovery and control operations",
+            ))
+    }
+
+    fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
+        let control: Arc<dyn WorkerControlService> = Arc::new(WorkspaceWorkerControlService {
+            workspace_id: self.client.workspace_id().unwrap_or_default().to_string(),
+            client: self.client.clone(),
+            registry: Some(self.registry.clone()),
+        });
+        context.services().provide(
+            ServiceDeclaration::new(
+                ServiceId::builtin(WORKER_CONTROL_SERVICE_ID),
+                WORKER_LIFECYCLE_SERVICE_VERSION,
+                "Parent-owned SubWorker discovery and control operations",
+            ),
+            control,
+        )
+    }
+}
+
+pub fn sub_worker_control_feature(
+    client: Arc<dyn WorkspaceClient>,
+    registry: Arc<SpawnedWorkerRegistry>,
+) -> SubWorkerControlFeature {
+    SubWorkerControlFeature::new(client, registry)
+}
+
 impl FeatureModule for ManageWorkerFeature {
     fn descriptor(&self) -> FeatureDescriptor {
         let mut descriptor = FeatureDescriptor::builtin(FEATURE_ID, FEATURE_NAME)
@@ -1044,6 +1090,47 @@ mod tests {
             })
         );
         assert!(body.get("initial_text").is_none());
+    }
+
+    #[tokio::test]
+    async fn worker_provider_supersedes_sub_worker_fallback_without_duplicate_service() {
+        let runtime_base = tempfile::tempdir().unwrap();
+        let runtime_dir = Arc::new(
+            crate::runtime::dir::RuntimeDir::create(runtime_base.path(), "feature-plan")
+                .await
+                .unwrap(),
+        );
+        let registry = SpawnedWorkerRegistry::new(runtime_dir);
+        let client: Arc<dyn WorkspaceClient> = Arc::new(RecordingWorkspaceClient::default());
+        let mut builder = crate::feature::FeatureRegistryBuilder::new();
+        builder.add_fallback_service_provider(sub_worker_control_feature(
+            client.clone(),
+            registry.clone(),
+        ));
+        builder.add_module(manage_worker_feature(client, Some(registry), true));
+
+        let plan = builder
+            .plan()
+            .expect("primary worker provider must supersede fallback");
+        let provider = &plan.service_providers()[&ServiceId::builtin(WORKER_CONTROL_SERVICE_ID)];
+        assert_eq!(
+            provider.provider,
+            crate::feature::FeatureId::builtin("worker")
+        );
+        assert!(
+            !plan
+                .ordered_features()
+                .contains(&crate::feature::FeatureId::builtin("sub-worker-control"))
+        );
+
+        let mut hooks = crate::HookRegistryBuilder::default();
+        let mut pending_tools = Vec::new();
+        let report = builder.install_into_pending(&mut pending_tools, &mut hooks);
+        assert!(!report.has_errors(), "{}", report.error_message());
+        assert_eq!(
+            report.services.providers()[&ServiceId::builtin(WORKER_CONTROL_SERVICE_ID)].feature_id,
+            crate::feature::FeatureId::builtin("worker")
+        );
     }
 
     #[test]
