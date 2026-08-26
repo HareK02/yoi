@@ -63,12 +63,12 @@
       credentials = [...credentials, created].sort((a, b) => a.credential_id.localeCompare(b.credential_id));
       credentialId = '';
       credentialName = '';
-      privateKey = '';
-      passphrase = '';
       message = `Credential ${created.credential_id} created. Pasted secret fields were cleared.`;
     } catch (error) {
       message = error instanceof Error ? error.message : 'Credential creation failed';
     } finally {
+      privateKey = '';
+      passphrase = '';
       pending = false;
     }
   }
@@ -88,13 +88,13 @@
         }
       );
       credentials = credentials.map((entry) => entry.credential_id === rotated.credential_id ? rotated : entry);
-      rotatePrivateKey = '';
-      rotatePassphrase = '';
       rotateCredentialId = null;
       message = `Credential ${rotated.credential_id} rotated to revision ${rotated.current_revision}. Pasted secret fields were cleared.`;
     } catch (error) {
       message = error instanceof Error ? error.message : 'Credential rotation failed';
     } finally {
+      rotatePrivateKey = '';
+      rotatePassphrase = '';
       pending = false;
     }
   }

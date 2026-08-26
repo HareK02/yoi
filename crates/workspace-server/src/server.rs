@@ -1890,7 +1890,8 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
         )
         .route(
             "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}",
-            delete(scoped_delete_repository_ssh_credential),
+            get(scoped_get_repository_ssh_credential)
+                .delete(scoped_delete_repository_ssh_credential),
         )
         .route(
             "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}/rotate",
@@ -1903,7 +1904,8 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
         )
         .route(
             "/api/w/{workspace_id}/settings/repository-access/host-trusts/{host_trust_id}",
-            delete(scoped_delete_repository_ssh_host_trust),
+            get(scoped_get_repository_ssh_host_trust)
+                .delete(scoped_delete_repository_ssh_host_trust),
         )
         .route(
             "/api/w/{workspace_id}/config/source-tree",
@@ -3389,6 +3391,22 @@ async fn scoped_list_repository_ssh_credentials(
     ))
 }
 
+async fn scoped_get_repository_ssh_credential(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRepositoryCredentialPath>,
+    Extension(actor): Extension<RequestActor>,
+) -> ApiResult<Json<RepositorySshCredential>> {
+    require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
+    let projection = active_repository_access_projection(&api, &path.workspace_id)?;
+    let credential = api
+        .repository_secrets
+        .list_credentials(&path.workspace_id, &projection)?
+        .into_iter()
+        .find(|credential| credential.credential_id == path.credential_id)
+        .ok_or_else(|| Error::InvalidRecordId(path.credential_id.clone()))?;
+    Ok(Json(credential))
+}
+
 async fn scoped_create_repository_ssh_credential(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
@@ -3446,6 +3464,22 @@ async fn scoped_list_repository_ssh_host_trusts(
         api.repository_secrets
             .list_host_trusts(&path.workspace_id, &projection)?,
     ))
+}
+
+async fn scoped_get_repository_ssh_host_trust(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRepositoryHostTrustPath>,
+    Extension(actor): Extension<RequestActor>,
+) -> ApiResult<Json<RepositorySshHostTrust>> {
+    require_manage_repository_secrets(&api, &path.workspace_id, &actor).await?;
+    let projection = active_repository_access_projection(&api, &path.workspace_id)?;
+    let host_trust = api
+        .repository_secrets
+        .list_host_trusts(&path.workspace_id, &projection)?
+        .into_iter()
+        .find(|host_trust| host_trust.host_trust_id == path.host_trust_id)
+        .ok_or_else(|| Error::InvalidRecordId(path.host_trust_id.clone()))?;
+    Ok(Json(host_trust))
 }
 
 async fn scoped_put_repository_ssh_host_trust(
