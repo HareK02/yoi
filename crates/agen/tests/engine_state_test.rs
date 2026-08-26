@@ -9,9 +9,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agen::Item;
+use agen::interceptor::{
+    Interceptor, PreRequestAction, PreToolAction, ToolCallInfo, TurnEndAction,
+};
 use agen::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
-use agen::{Engine, EngineError};
+use agen::{Engine, EngineError, EngineResult};
 use async_trait::async_trait;
 use common::MockLlmClient;
 
@@ -560,4 +563,186 @@ fn test_system_prompt_change_after_unlock() {
 
     let relocked = unlocked.lock();
     assert_eq!(relocked.get_system_prompt(), Some("New prompt"));
+}
+
+fn completed_text_events() -> Vec<Event> {
+    vec![
+        Event::text_block_start(0),
+        Event::text_delta(0, "done"),
+        Event::text_block_stop(0, None),
+        Event::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        }),
+    ]
+}
+
+struct YieldOnce {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl Interceptor for YieldOnce {
+    async fn pre_llm_request(&self, _context: &mut Vec<Item>) -> PreRequestAction {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            PreRequestAction::Yield
+        } else {
+            PreRequestAction::Continue
+        }
+    }
+}
+
+struct PauseToolOnce {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl Interceptor for PauseToolOnce {
+    async fn pre_tool_call(&self, _info: &mut ToolCallInfo) -> PreToolAction {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            PreToolAction::Pause
+        } else {
+            PreToolAction::Continue
+        }
+    }
+}
+
+struct ContinueTurnOnce {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl Interceptor for ContinueTurnOnce {
+    async fn on_turn_end(&self, _history: &[Item]) -> TurnEndAction {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            TurnEndAction::ContinueWithMessages(vec![Item::system_message("continue")])
+        } else {
+            TurnEndAction::Finish
+        }
+    }
+}
+
+#[tokio::test]
+async fn max_turns_is_scoped_to_each_fresh_run() {
+    let responses = vec![completed_text_events(), completed_text_events()];
+    let mut engine = Engine::new(MockLlmClient::with_responses(responses));
+    engine.set_max_turns(Some(1));
+    let mut engine = engine.lock();
+
+    assert_eq!(engine.run("first").await.unwrap(), EngineResult::Finished);
+    assert_eq!(engine.turn_count(), 1);
+    assert_eq!(engine.active_run_turn_count(), None);
+
+    assert_eq!(engine.run("second").await.unwrap(), EngineResult::Finished);
+    assert_eq!(engine.turn_count(), 2);
+    assert_eq!(engine.active_run_turn_count(), None);
+}
+
+#[tokio::test]
+async fn yielded_resume_keeps_the_same_unspent_turn_budget() {
+    let mut engine = Engine::new(MockLlmClient::new(completed_text_events()));
+    engine.set_max_turns(Some(1));
+    engine.set_interceptor(YieldOnce {
+        calls: AtomicUsize::new(0),
+    });
+    let mut engine = engine.lock();
+
+    assert_eq!(engine.run("start").await.unwrap(), EngineResult::Yielded);
+    assert_eq!(engine.turn_count(), 0);
+    assert_eq!(engine.active_run_turn_count(), Some(0));
+
+    assert_eq!(engine.resume().await.unwrap(), EngineResult::Finished);
+    assert_eq!(engine.turn_count(), 1);
+    assert_eq!(engine.active_run_turn_count(), None);
+}
+
+#[tokio::test]
+async fn paused_tool_resume_does_not_reset_the_consumed_turn_budget() {
+    let events = vec![
+        Event::tool_use_start(0, "call_1", "count_tool"),
+        Event::tool_input_delta(0, "{}"),
+        Event::tool_use_stop(0),
+        Event::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        }),
+    ];
+    let tool = CountingTool::new("count_tool");
+    let mut engine = Engine::new(MockLlmClient::new(events));
+    engine.set_max_turns(Some(1));
+    engine.register_tool(tool.definition());
+    engine.set_interceptor(PauseToolOnce {
+        calls: AtomicUsize::new(0),
+    });
+    let mut engine = engine.lock();
+
+    assert_eq!(engine.run("call it").await.unwrap(), EngineResult::Paused);
+    assert_eq!(engine.turn_count(), 1);
+    assert_eq!(engine.active_run_turn_count(), Some(1));
+    assert_eq!(tool.call_count(), 0);
+
+    assert_eq!(engine.resume().await.unwrap(), EngineResult::LimitReached);
+    assert_eq!(engine.turn_count(), 1);
+    assert_eq!(engine.active_run_turn_count(), None);
+    assert_eq!(tool.call_count(), 1, "the consumed turn's tool still runs");
+}
+
+#[tokio::test]
+async fn fresh_input_abandons_a_paused_run_and_starts_a_new_budget() {
+    let tool_events = vec![
+        Event::tool_use_start(0, "call_1", "count_tool"),
+        Event::tool_input_delta(0, "{}"),
+        Event::tool_use_stop(0),
+        Event::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        }),
+    ];
+    let client = MockLlmClient::with_responses(vec![tool_events, completed_text_events()]);
+    let tool = CountingTool::new("count_tool");
+    let mut engine = Engine::new(client);
+    engine.set_max_turns(Some(1));
+    engine.register_tool(tool.definition());
+    engine.set_interceptor(PauseToolOnce {
+        calls: AtomicUsize::new(0),
+    });
+    let mut engine = engine.lock();
+
+    assert_eq!(engine.run("pause").await.unwrap(), EngineResult::Paused);
+    assert_eq!(engine.active_run_turn_count(), Some(1));
+
+    assert_eq!(engine.run("replace").await.unwrap(), EngineResult::Finished);
+    assert_eq!(engine.turn_count(), 2);
+    assert_eq!(engine.active_run_turn_count(), None);
+    assert_eq!(tool.call_count(), 1, "pending-tool semantics are unchanged");
+}
+
+#[tokio::test]
+async fn interceptor_continuation_consumes_the_logical_run_budget() {
+    let mut engine = Engine::new(MockLlmClient::new(completed_text_events()));
+    engine.set_max_turns(Some(1));
+    engine.set_interceptor(ContinueTurnOnce {
+        calls: AtomicUsize::new(0),
+    });
+    let mut engine = engine.lock();
+
+    assert_eq!(
+        engine.run("start").await.unwrap(),
+        EngineResult::LimitReached
+    );
+    assert_eq!(engine.turn_count(), 1);
+    assert_eq!(engine.llm_call_count(), 1);
+    assert_eq!(engine.active_run_turn_count(), None);
+}
+
+#[tokio::test]
+async fn restored_active_run_budget_is_enforced_before_another_llm_call() {
+    let mut engine = Engine::new(MockLlmClient::new(completed_text_events()));
+    engine.set_max_turns(Some(1));
+    engine.set_turn_count(7);
+    engine.set_last_run_interrupted(true);
+    engine.set_active_run_turn_count(Some(1));
+    let mut engine = engine.lock();
+
+    assert_eq!(engine.resume().await.unwrap(), EngineResult::LimitReached);
+    assert_eq!(engine.turn_count(), 7);
+    assert_eq!(engine.llm_call_count(), 0);
+    assert_eq!(engine.active_run_turn_count(), None);
 }

@@ -51,6 +51,7 @@ fn round_trip_write_and_read() {
             ts: 3200,
             interrupted: false,
             result: EngineResult::Finished,
+            active_run_turn_count: None,
         },
     ];
 

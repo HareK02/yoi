@@ -132,6 +132,7 @@ async fn run_and_persist(
                 segment_id,
                 r.clone(),
                 worker.last_run_interrupted(),
+                worker.active_run_turn_count(),
             )
             .unwrap();
         }
@@ -309,6 +310,7 @@ async fn session_resume_after_pause() {
     // Restore state and verify
     let state = session_store::restore(&store, sid, segid).unwrap();
     assert!(state.last_run_interrupted);
+    assert_eq!(state.active_run_turn_count, Some(2));
 }
 
 #[tokio::test]

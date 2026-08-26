@@ -179,14 +179,20 @@ pub struct Engine<C: LlmClient, S: EngineState = Mutable> {
     history: Vec<Item>,
     /// History length at lock time (only meaningful in Locked state)
     locked_prefix_len: usize,
-    /// AgentTurn count.
+    /// AgentTurn count across the lifetime of this Engine.
     ///
     /// Once retry (`agen-stream-continuation`) is implemented, an
     /// AgentTurn collapses N retried `LlmCall`s with identical input;
     /// today retry is not implemented so AgentTurn and LlmCall fire 1:1
     /// and the increment site (the LLM-call loop) is shared.
-    /// `max_turns` is interpreted as a per-`run()` AgentTurn cap.
     turn_count: usize,
+    /// AgentTurns consumed by the currently active logical run.
+    ///
+    /// A fresh [`run`](Self::run) starts at zero. Pause and Yield retain the
+    /// count for [`resume`](Self::resume), while terminal outcomes clear it.
+    /// `max_turns` is enforced against this run-scoped count rather than the
+    /// cumulative `turn_count` above.
+    active_run_turn_count: Option<usize>,
     /// LlmCall count (per-Engine running counter, monotonic). Unlike
     /// `turn_count` this never collapses retries.
     llm_call_count: usize,
@@ -266,6 +272,20 @@ pub struct Engine<C: LlmClient, S: EngineState = Mutable> {
 impl<C: LlmClient, S: EngineState> Engine<C, S> {
     fn reset_interruption_state(&mut self) {
         self.last_run_interrupted = false;
+    }
+
+    fn start_logical_run(&mut self) {
+        self.active_run_turn_count = Some(0);
+    }
+
+    fn ensure_logical_run(&mut self) {
+        self.active_run_turn_count.get_or_insert(0);
+    }
+
+    fn finish_logical_run(&mut self, result: &Result<EngineResult, EngineError>) {
+        if !matches!(result, Ok(EngineResult::Paused) | Ok(EngineResult::Yielded)) {
+            self.active_run_turn_count = None;
+        }
     }
 
     fn drain_cancel_queue(&mut self) {
@@ -648,6 +668,23 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
     /// caller specifically needs the per-LLM-call number.
     pub fn turn_count(&self) -> usize {
         self.turn_count
+    }
+
+    /// Get the AgentTurns consumed by an interrupted logical run.
+    ///
+    /// `Some` is retained only while Pause or Yield permits a later
+    /// [`resume`](Self::resume). Terminal outcomes return this to `None`.
+    pub fn active_run_turn_count(&self) -> Option<usize> {
+        self.active_run_turn_count
+    }
+
+    /// Restore the persisted turn budget of an interrupted logical run.
+    ///
+    /// Session owners restore this together with the cumulative turn count and
+    /// history. `None` means there is no resumable logical run and the next
+    /// [`resume`](Self::resume) starts a fresh budget.
+    pub fn set_active_run_turn_count(&mut self, turn_count: Option<usize>) {
+        self.active_run_turn_count = turn_count;
     }
 
     /// Get the current LlmCall count (per-Engine running counter, never
@@ -1123,6 +1160,19 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                 return Err(EngineError::Cancelled);
             }
 
+            if let Some(max) = self.max_turns
+                && self.active_run_turn_count.unwrap_or(0) >= max as usize
+            {
+                info!(
+                    active_run_turn_count = self.active_run_turn_count.unwrap_or(0),
+                    total_turn_count = self.turn_count,
+                    max_turns = max,
+                    "Logical run turn limit reached"
+                );
+                self.last_run_interrupted = false;
+                return Ok(EngineResult::LimitReached);
+            }
+
             let current_turn = self.turn_count;
             if !continuing_stream {
                 debug!(turn = current_turn, "Turn start");
@@ -1314,6 +1364,7 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                 cb(current_turn);
             }
             self.turn_count += 1;
+            *self.active_run_turn_count.get_or_insert(0) += 1;
 
             // Collect and commit assistant items. Routed through
             // `append_history_items` so observers see each item as it lands.
@@ -1343,18 +1394,6 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
 
             if let Some(result) = self.execute_and_commit_tools(tool_calls).await? {
                 return Ok(result);
-            }
-
-            if let Some(max) = self.max_turns {
-                if self.turn_count >= max as usize {
-                    info!(
-                        turn_count = self.turn_count,
-                        max_turns = max,
-                        "Turn limit reached"
-                    );
-                    self.last_run_interrupted = false;
-                    return Ok(EngineResult::LimitReached);
-                }
             }
         }
     }
@@ -1664,6 +1703,7 @@ impl<C: LlmClient> Engine<C, Mutable> {
             history: Vec::new(),
             locked_prefix_len: 0,
             turn_count: 0,
+            active_run_turn_count: None,
             llm_call_count: 0,
             tool_execution_batch_count: 0,
             max_turns: None,
@@ -1866,6 +1906,9 @@ impl<C: LlmClient> Engine<C, Mutable> {
     /// Set the last_run_interrupted flag (for session restoration)
     pub fn set_last_run_interrupted(&mut self, interrupted: bool) {
         self.last_run_interrupted = interrupted;
+        if !interrupted {
+            self.active_run_turn_count = None;
+        }
     }
 
     /// Apply configuration (reserved for future extensions)
@@ -1934,6 +1977,7 @@ impl<C: LlmClient> Engine<C, Mutable> {
             history: self.history,
             locked_prefix_len,
             turn_count: self.turn_count,
+            active_run_turn_count: self.active_run_turn_count,
             llm_call_count: self.llm_call_count,
             tool_execution_batch_count: self.tool_execution_batch_count,
             max_turns: self.max_turns,
@@ -1974,6 +2018,8 @@ impl<C: LlmClient> Engine<C, Locked> {
         &mut self,
         user_input: impl Into<String>,
     ) -> Result<EngineResult, EngineError> {
+        // Supplying new user input abandons any paused/yielded logical run.
+        self.active_run_turn_count = None;
         self.reset_interruption_state();
         // Interceptor: on_prompt_submit
         let mut user_item = Item::user_message(user_input);
@@ -1991,8 +2037,11 @@ impl<C: LlmClient> Engine<C, Locked> {
         if !extras.is_empty() {
             self.append_history_items(extras)?;
         }
+        self.start_logical_run();
         let result = self.run_turn_loop().await;
-        self.finalize_interruption(result).await
+        let result = self.finalize_interruption(result).await;
+        self.finish_logical_run(&result);
+        result
     }
 
     /// Resume execution (from Paused state)
@@ -2000,8 +2049,11 @@ impl<C: LlmClient> Engine<C, Locked> {
     /// Resumes turn processing from current state without adding a new user message.
     pub async fn resume(&mut self) -> Result<EngineResult, EngineError> {
         self.reset_interruption_state();
+        self.ensure_logical_run();
         let result = self.run_turn_loop().await;
-        self.finalize_interruption(result).await
+        let result = self.finalize_interruption(result).await;
+        self.finish_logical_run(&result);
+        result
     }
 
     /// Get the prefix length at lock time
@@ -2027,6 +2079,7 @@ impl<C: LlmClient> Engine<C, Locked> {
             history: self.history,
             locked_prefix_len: 0,
             turn_count: self.turn_count,
+            active_run_turn_count: self.active_run_turn_count,
             llm_call_count: self.llm_call_count,
             tool_execution_batch_count: self.tool_execution_batch_count,
             max_turns: self.max_turns,

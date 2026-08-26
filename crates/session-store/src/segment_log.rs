@@ -125,11 +125,16 @@ pub enum LogEntry {
     TurnEnd { ts: u64, turn_count: usize },
 
     /// `run()` / `resume()` が `EngineResult` で正常終了した。
-    /// Audit-only metadata: replay は `interrupted` のみ反映する。
+    /// Replay restores both interruption state and any resumable logical-run
+    /// turn budget.
     RunCompleted {
         ts: u64,
         interrupted: bool,
         result: EngineResult,
+        /// AgentTurns consumed by a paused/yielded logical run. Terminal
+        /// outcomes persist `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_run_turn_count: Option<usize>,
     },
 
     /// `run()` / `resume()` が `EngineError` で終了した。
@@ -139,6 +144,15 @@ pub enum LogEntry {
         ts: u64,
         interrupted: bool,
         message: String,
+    },
+
+    /// Restores an active logical-run budget at a segment boundary, notably
+    /// after compaction replaced the segment that held the original Invoke and
+    /// RunCompleted entries.
+    ActiveRunCheckpoint {
+        ts: u64,
+        active_turn_count: usize,
+        total_turn_count: usize,
     },
 
     /// A paused interrupted turn was explicitly abandoned without calling
@@ -209,6 +223,8 @@ pub struct RestoredState {
     pub config: RequestConfig,
     pub history: Vec<Item>,
     pub turn_count: usize,
+    /// AgentTurns consumed by the active paused/yielded logical run.
+    pub active_run_turn_count: Option<usize>,
     pub last_run_interrupted: bool,
     /// Number of entries replayed. `0` means the segment log was empty.
     /// Writers track their own append count via the same counter so
@@ -238,6 +254,7 @@ pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
         config: RequestConfig::default(),
         history: Vec::new(),
         turn_count: 0,
+        active_run_turn_count: None,
         last_run_interrupted: false,
         entries_count: 0,
         usage_history: Vec::new(),
@@ -265,6 +282,7 @@ pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
                 // A terminal run record below clears or refines this. If the
                 // log ends first, restore must treat the turn as interrupted.
                 state.last_run_interrupted = true;
+                state.active_run_turn_count = Some(0);
             }
             LogEntry::UserInput {
                 segments,
@@ -290,16 +308,44 @@ pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
                 state.history.push(item.to_history_item());
             }
             LogEntry::TurnEnd { turn_count, .. } => {
+                if let Some(active_turn_count) = &mut state.active_run_turn_count {
+                    *active_turn_count += turn_count.saturating_sub(state.turn_count);
+                }
                 state.turn_count = *turn_count;
             }
-            LogEntry::RunCompleted { interrupted, .. } => {
+            LogEntry::RunCompleted {
+                interrupted,
+                result,
+                active_run_turn_count,
+                ..
+            } => {
                 state.last_run_interrupted = *interrupted;
+                if *interrupted && matches!(result, EngineResult::Paused | EngineResult::Yielded) {
+                    // Legacy entries omit the explicit field; retain the
+                    // Invoke/TurnEnd-derived count in that case.
+                    if let Some(turn_count) = active_run_turn_count {
+                        state.active_run_turn_count = Some(*turn_count);
+                    }
+                } else {
+                    state.active_run_turn_count = None;
+                }
             }
             LogEntry::RunErrored { interrupted, .. } => {
                 state.last_run_interrupted = *interrupted;
+                state.active_run_turn_count = None;
+            }
+            LogEntry::ActiveRunCheckpoint {
+                active_turn_count,
+                total_turn_count,
+                ..
+            } => {
+                state.active_run_turn_count = Some(*active_turn_count);
+                state.turn_count = *total_turn_count;
+                state.last_run_interrupted = true;
             }
             LogEntry::PausedTurnAbandoned { .. } => {
                 state.last_run_interrupted = false;
+                state.active_run_turn_count = None;
             }
             LogEntry::ConfigChanged { config, .. } => {
                 state.config = config.clone();
@@ -397,6 +443,7 @@ mod tests {
                 ts: 3200,
                 interrupted: false,
                 result: EngineResult::Finished,
+                active_run_turn_count: None,
             },
         ]);
         assert_eq!(state.history.len(), 2);
@@ -695,10 +742,93 @@ mod tests {
                 ts: 100,
                 interrupted: true,
                 result: EngineResult::Paused,
+                active_run_turn_count: Some(1),
             },
             LogEntry::PausedTurnAbandoned { ts: 200 },
         ]);
         assert!(!state.last_run_interrupted);
+        assert_eq!(state.active_run_turn_count, None);
+    }
+
+    #[test]
+    fn replay_restores_active_run_budget_across_compaction_checkpoint() {
+        let state = collect_state(&[
+            LogEntry::SegmentStart {
+                ts: 0,
+                session_id: uuid::Uuid::nil(),
+                system_prompt: None,
+                config: RequestConfig::default(),
+                history: vec![],
+                forked_from: None,
+                compacted_from: None,
+            },
+            LogEntry::ActiveRunCheckpoint {
+                ts: 100,
+                active_turn_count: 3,
+                total_turn_count: 9,
+            },
+        ]);
+
+        assert_eq!(state.turn_count, 9);
+        assert_eq!(state.active_run_turn_count, Some(3));
+        assert!(state.last_run_interrupted);
+    }
+
+    #[test]
+    fn legacy_interrupted_run_derives_budget_from_invoke_and_turn_end() {
+        let entry: LogEntry = serde_json::from_value(serde_json::json!({
+            "kind": "run_completed",
+            "ts": 300,
+            "interrupted": true,
+            "result": "paused"
+        }))
+        .expect("legacy run-completed entry");
+        let state = collect_state(&[
+            LogEntry::SegmentStart {
+                ts: 0,
+                session_id: uuid::Uuid::nil(),
+                system_prompt: None,
+                config: RequestConfig::default(),
+                history: vec![],
+                forked_from: None,
+                compacted_from: None,
+            },
+            LogEntry::Invoke {
+                ts: 100,
+                trigger: InvokeKind::UserSend,
+            },
+            LogEntry::TurnEnd {
+                ts: 200,
+                turn_count: 2,
+            },
+            entry,
+        ]);
+
+        assert_eq!(state.active_run_turn_count, Some(2));
+        assert!(state.last_run_interrupted);
+    }
+
+    #[test]
+    fn non_resumable_interruption_clears_the_active_run_budget() {
+        let state = collect_state(&[
+            LogEntry::Invoke {
+                ts: 100,
+                trigger: InvokeKind::UserSend,
+            },
+            LogEntry::TurnEnd {
+                ts: 200,
+                turn_count: 2,
+            },
+            LogEntry::RunCompleted {
+                ts: 300,
+                interrupted: true,
+                result: EngineResult::LimitReached,
+                active_run_turn_count: None,
+            },
+        ]);
+
+        assert!(state.last_run_interrupted);
+        assert_eq!(state.active_run_turn_count, None);
     }
 
     #[test]

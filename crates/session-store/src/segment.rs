@@ -307,6 +307,7 @@ pub fn save_run_completed(
     segment_id: SegmentId,
     result: EngineResult,
     interrupted: bool,
+    active_run_turn_count: Option<usize>,
 ) -> Result<(), StoreError> {
     append_entry(
         store,
@@ -316,6 +317,7 @@ pub fn save_run_completed(
             ts: segment_log::now_millis(),
             interrupted,
             result,
+            active_run_turn_count,
         },
     )
 }

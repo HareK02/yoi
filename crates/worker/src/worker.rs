@@ -781,6 +781,7 @@ struct EmptyTurnRollbackSnapshot {
     usage_history_len: usize,
     ai_activity_count: usize,
     last_run_interrupted: bool,
+    active_run_turn_count: Option<usize>,
     flow_runtime_state: Option<flow::FlowRuntimeState>,
 }
 
@@ -1777,6 +1778,8 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         self.engine_mut().set_turn_count(state.turn_count);
         self.engine_mut()
             .set_last_run_interrupted(state.last_run_interrupted);
+        self.engine_mut()
+            .set_active_run_turn_count(state.active_run_turn_count);
         self.user_segments = state.user_segments;
         *self.usage_history.lock().expect("usage_history poisoned") = state.usage_history;
         *self
@@ -2350,6 +2353,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             usage_history_len,
             ai_activity_count: self.ai_activity_counter.load(Ordering::SeqCst),
             last_run_interrupted: self.engine().last_run_interrupted(),
+            active_run_turn_count: self.engine().active_run_turn_count(),
             flow_runtime_state: self
                 .flow_runtime_state
                 .lock()
@@ -2381,6 +2385,8 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         self.engine_mut().truncate_history(snapshot.history_len);
         self.engine_mut()
             .set_last_run_interrupted(snapshot.last_run_interrupted);
+        self.engine_mut()
+            .set_active_run_turn_count(snapshot.active_run_turn_count);
         *self
             .flow_runtime_state
             .lock()
@@ -2774,6 +2780,10 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         // can enter `Engine::resume` and execute them again after a crash.
         if self.engine.as_ref().unwrap().last_run_interrupted() {
             self.apply_interrupt_prep()?;
+            // Notification delivery begins a new logical run over the
+            // prepared history rather than inheriting the abandoned run's
+            // max-turn budget.
+            self.engine_mut().set_last_run_interrupted(false);
         }
         self.prepare_for_run().await?;
 
@@ -3218,12 +3228,14 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         }
 
         let interrupted = self.engine.as_ref().unwrap().last_run_interrupted();
+        let active_run_turn_count = self.engine.as_ref().unwrap().active_run_turn_count();
         match result {
             Ok(r) => {
                 self.commit_entry(LogEntry::RunCompleted {
                     ts: segment_log::now_millis(),
                     interrupted,
                     result: r.clone(),
+                    active_run_turn_count,
                 })?;
             }
             Err(e) => {
@@ -3754,6 +3766,13 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             }),
         };
         let mut initial_entries = vec![entry.clone()];
+        if let Some(active_turn_count) = w.active_run_turn_count() {
+            initial_entries.push(LogEntry::ActiveRunCheckpoint {
+                ts: segment_log::now_millis(),
+                active_turn_count,
+                total_turn_count: source_turn_count,
+            });
+        }
         if let Some(flow_state) = self
             .flow_runtime_state
             .lock()
@@ -5179,6 +5198,7 @@ where
         worker.set_request_config(state.config.clone());
         worker.set_turn_count(state.turn_count);
         worker.set_last_run_interrupted(state.last_run_interrupted);
+        worker.set_active_run_turn_count(state.active_run_turn_count);
         if anchored_on_summary {
             worker.set_cache_anchor(Some(0));
         }
