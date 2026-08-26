@@ -1629,15 +1629,13 @@ fn build_feature_install_plan(
                     provider_version: declaration.version.clone(),
                 });
             }
-            if requirement.required {
-                if adjacency[*provider_index].insert(consumer_index) {
-                    indegree[consumer_index] += 1;
-                }
-                edge_services
-                    .entry((*provider_index, consumer_index))
-                    .or_default()
-                    .insert(requirement.id.clone());
+            if adjacency[*provider_index].insert(consumer_index) {
+                indegree[consumer_index] += 1;
             }
+            edge_services
+                .entry((*provider_index, consumer_index))
+                .or_default()
+                .insert(requirement.id.clone());
         }
     }
 
@@ -2181,6 +2179,48 @@ mod tests {
                 FeatureId::builtin("provider"),
                 FeatureId::builtin("consumer"),
             ]
+        );
+    }
+
+    #[test]
+    fn install_plan_orders_compatible_optional_provider_before_consumer() {
+        let service = ServiceId::builtin("catalog");
+        let consumer = PlannedServiceFeature::new(
+            FeatureDescriptor::builtin("consumer", "Consumer").with_service_requirement(
+                ServiceRequirement::optional(service.clone(), "optional catalog"),
+            ),
+        );
+        let provider = PlannedServiceFeature::new(
+            FeatureDescriptor::builtin("provider", "Provider")
+                .with_provided_service(provided_service("catalog", "1")),
+        );
+        let builder = FeatureRegistryBuilder::new()
+            .with_module(consumer)
+            .with_module(provider);
+
+        let plan = builder.plan().expect("optional binding should be valid");
+        assert_eq!(
+            plan.ordered_features(),
+            &[
+                FeatureId::builtin("provider"),
+                FeatureId::builtin("consumer"),
+            ]
+        );
+
+        let mut hooks = HookRegistryBuilder::default();
+        let mut pending_tools = Vec::new();
+        let report = builder.install_into_pending(&mut pending_tools, &mut hooks);
+        assert!(!report.has_errors());
+        let consumer = report
+            .reports
+            .iter()
+            .find(|report| report.feature_id == FeatureId::builtin("consumer"))
+            .expect("consumer report");
+        assert!(
+            consumer
+                .resolved_service_requirements
+                .iter()
+                .any(|requirement| requirement.id == service)
         );
     }
 
