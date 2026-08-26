@@ -1555,34 +1555,16 @@ pub enum FeaturePlanError {
         features: Vec<FeatureId>,
         services: Vec<ServiceId>,
     },
-    #[error(
-        "fallback service provider `{feature}` must contribute exactly one service and no other feature surface"
-    )]
-    InvalidFallbackProvider { feature: FeatureId },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ServiceProviderPreference {
-    Primary,
-    Fallback,
-}
-
-struct FeatureRegistryContribution {
-    module: Arc<dyn FeatureModule>,
-    provider_preference: ServiceProviderPreference,
 }
 
 /// Builder/installer for enabled feature modules.
 pub struct FeatureRegistryBuilder {
-    contributions: Vec<FeatureRegistryContribution>,
+    modules: Vec<Arc<dyn FeatureModule>>,
 }
 
 fn build_feature_install_plan(
     descriptors: &[FeatureDescriptor],
-    preferences: &[ServiceProviderPreference],
 ) -> Result<FeatureInstallPlan, FeaturePlanError> {
-    debug_assert_eq!(descriptors.len(), preferences.len());
-
     let mut feature_ids = BTreeSet::new();
     for descriptor in descriptors {
         if !feature_ids.insert(descriptor.id.clone()) {
@@ -1595,19 +1577,6 @@ fn build_feature_install_plan(
     let mut provider_candidates: BTreeMap<ServiceId, Vec<(usize, ServiceDeclaration)>> =
         BTreeMap::new();
     for (index, descriptor) in descriptors.iter().enumerate() {
-        if preferences[index] == ServiceProviderPreference::Fallback
-            && (descriptor.provides_services.len() != 1
-                || !descriptor.tools.is_empty()
-                || !descriptor.hooks.is_empty()
-                || !descriptor.instructions.is_empty()
-                || !descriptor.background_tasks.is_empty()
-                || !descriptor.requires_services.is_empty()
-                || !descriptor.protocol_providers.is_empty())
-        {
-            return Err(FeaturePlanError::InvalidFallbackProvider {
-                feature: descriptor.id.clone(),
-            });
-        }
         for service in &descriptor.provides_services {
             provider_candidates
                 .entry(service.id.clone())
@@ -1617,52 +1586,23 @@ fn build_feature_install_plan(
     }
 
     let mut selected_providers = BTreeMap::new();
-    let mut selected_fallbacks = BTreeSet::new();
     for (service, candidates) in provider_candidates {
-        let primary = candidates
-            .iter()
-            .filter(|(index, _)| preferences[*index] == ServiceProviderPreference::Primary)
-            .collect::<Vec<_>>();
-        let selected = if primary.len() == 1 {
-            primary[0]
-        } else if primary.len() > 1 {
-            let mut providers = primary
+        if candidates.len() > 1 {
+            let mut providers = candidates
                 .iter()
                 .map(|(index, _)| descriptors[*index].id.clone())
                 .collect::<Vec<_>>();
             providers.sort();
             return Err(FeaturePlanError::AmbiguousServiceProvider { service, providers });
-        } else {
-            let fallback = candidates
-                .iter()
-                .filter(|(index, _)| preferences[*index] == ServiceProviderPreference::Fallback)
-                .collect::<Vec<_>>();
-            if fallback.len() > 1 {
-                let mut providers = fallback
-                    .iter()
-                    .map(|(index, _)| descriptors[*index].id.clone())
-                    .collect::<Vec<_>>();
-                providers.sort();
-                return Err(FeaturePlanError::AmbiguousServiceProvider { service, providers });
-            }
-            let Some(selected) = fallback.first() else {
-                continue;
-            };
-            selected_fallbacks.insert(selected.0);
-            *selected
-        };
-        selected_providers.insert(service.clone(), (selected.0, selected.1.clone()));
+        }
+        let (provider_index, declaration) = candidates
+            .into_iter()
+            .next()
+            .expect("provider candidates are non-empty");
+        selected_providers.insert(service, (provider_index, declaration));
     }
 
-    let active = descriptors
-        .iter()
-        .enumerate()
-        .filter_map(|(index, _)| {
-            (preferences[index] == ServiceProviderPreference::Primary
-                || selected_fallbacks.contains(&index))
-            .then_some(index)
-        })
-        .collect::<BTreeSet<_>>();
+    let active = (0..descriptors.len()).collect::<BTreeSet<_>>();
     let mut adjacency = vec![BTreeSet::new(); descriptors.len()];
     let mut indegree = vec![0usize; descriptors.len()];
     let mut edge_services: BTreeMap<(usize, usize), BTreeSet<ServiceId>> = BTreeMap::new();
@@ -1815,7 +1755,7 @@ fn find_service_dependency_cycle(
 impl Default for FeatureRegistryBuilder {
     fn default() -> Self {
         Self {
-            contributions: Vec::new(),
+            modules: Vec::new(),
         }
     }
 }
@@ -1829,23 +1769,7 @@ impl FeatureRegistryBuilder {
     where
         M: FeatureModule + 'static,
     {
-        self.contributions.push(FeatureRegistryContribution {
-            module: Arc::new(module),
-            provider_preference: ServiceProviderPreference::Primary,
-        });
-        self
-    }
-
-    /// Register a service-only provider that is selected only when no primary
-    /// contribution provides its service.
-    pub fn add_fallback_service_provider<M>(&mut self, module: M) -> &mut Self
-    where
-        M: FeatureModule + 'static,
-    {
-        self.contributions.push(FeatureRegistryContribution {
-            module: Arc::new(module),
-            provider_preference: ServiceProviderPreference::Fallback,
-        });
+        self.modules.push(Arc::new(module));
         self
     }
 
@@ -1858,24 +1782,18 @@ impl FeatureRegistryBuilder {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.contributions.is_empty()
+        self.modules.is_empty()
     }
 
     pub fn descriptors(&self) -> Vec<FeatureDescriptor> {
-        self.contributions
+        self.modules
             .iter()
-            .map(|contribution| contribution.module.descriptor())
+            .map(|module| module.descriptor())
             .collect()
     }
 
     pub fn plan(&self) -> Result<FeatureInstallPlan, FeaturePlanError> {
-        let descriptors = self.descriptors();
-        let preferences = self
-            .contributions
-            .iter()
-            .map(|contribution| contribution.provider_preference)
-            .collect::<Vec<_>>();
-        build_feature_install_plan(&descriptors, &preferences)
+        build_feature_install_plan(&self.descriptors())
     }
 
     /// Install modules into the existing Engine tool path and hook builder.
@@ -1919,16 +1837,11 @@ impl FeatureRegistryBuilder {
         mut installed_tool_names: HashMap<String, FeatureId>,
     ) -> FeatureRegistryInstallReport {
         let descriptors: Vec<_> = self
-            .contributions
+            .modules
             .iter()
-            .map(|contribution| contribution.module.descriptor())
+            .map(|module| module.descriptor())
             .collect();
-        let preferences = self
-            .contributions
-            .iter()
-            .map(|contribution| contribution.provider_preference)
-            .collect::<Vec<_>>();
-        let plan = match build_feature_install_plan(&descriptors, &preferences) {
+        let plan = match build_feature_install_plan(&descriptors) {
             Ok(plan) => plan,
             Err(error) => {
                 let message = error.to_string();
@@ -1956,11 +1869,7 @@ impl FeatureRegistryBuilder {
         };
         let mut service_registry = FeatureServiceRegistry::default();
         let mut reports = Vec::with_capacity(plan.ordered_indices.len());
-        let mut modules = self
-            .contributions
-            .into_iter()
-            .map(|contribution| Some(contribution.module))
-            .collect::<Vec<_>>();
+        let mut modules = self.modules.into_iter().map(Some).collect::<Vec<_>>();
         let ordered_modules = plan
             .ordered_indices
             .into_iter()
@@ -2382,40 +2291,6 @@ mod tests {
                 ServiceId::builtin("beta-service"),
             ])
         );
-    }
-
-    #[test]
-    fn primary_provider_supersedes_explicit_fallback_candidate() {
-        let primary = PlannedServiceFeature::new(
-            FeatureDescriptor::builtin("primary", "Primary")
-                .with_provided_service(provided_service("control", "1")),
-        );
-        let fallback = PlannedServiceFeature::new(
-            FeatureDescriptor::builtin("fallback", "Fallback")
-                .with_provided_service(provided_service("control", "1")),
-        );
-        let fallback_calls = Arc::clone(&fallback.install_calls);
-        let mut builder = FeatureRegistryBuilder::new().with_module(primary);
-        builder.add_fallback_service_provider(fallback);
-        let plan = builder
-            .plan()
-            .expect("primary plus fallback is unambiguous");
-
-        assert_eq!(
-            plan.service_providers()[&ServiceId::builtin("control")].provider,
-            FeatureId::builtin("primary")
-        );
-        assert!(
-            !plan
-                .ordered_features()
-                .contains(&FeatureId::builtin("fallback"))
-        );
-
-        let mut hook_builder = HookRegistryBuilder::default();
-        let mut pending_tools = Vec::new();
-        let report = builder.install_into_pending(&mut pending_tools, &mut hook_builder);
-        assert!(!report.has_errors());
-        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
