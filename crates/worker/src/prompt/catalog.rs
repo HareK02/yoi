@@ -610,6 +610,47 @@ mod tests {
     }
 
     #[test]
+    fn merge_request_prompts_use_selector_refs_and_verb_first_operations() {
+        let catalog = PromptCatalog::builtins_only().unwrap();
+        let templates = &catalog.projection.templates;
+        let common = &templates["common.merge_request"];
+        let coder = &templates["role.coder"];
+        let orchestrator = &templates["role.orchestrator"];
+        let reviewer = &templates["role.reviewer"];
+        let combined = format!("{common}\n{coder}\n{orchestrator}\n{reviewer}");
+
+        for operation in [
+            "OpenMergeRequest",
+            "ShowMergeRequest",
+            "ReviewMergeRequest",
+            "CheckMergeRequestReadiness",
+            "CompleteMergeRequest",
+        ] {
+            assert!(combined.contains(operation), "missing {operation}");
+        }
+        for stale_operation in [
+            "MergeRequestOpen",
+            "MergeRequestShow",
+            "MergeRequestReview",
+            "MergeRequestReadinessCheck",
+            "MergeRequestComplete",
+            "MergeRequestAddRevision",
+        ] {
+            assert!(
+                !combined.contains(stale_operation),
+                "stale operation {stale_operation} remains in prompt authority"
+            );
+        }
+        assert!(common.contains("selector_from"));
+        assert!(common.contains("normal non-force push"));
+        assert!(common.contains("Moving only the target ref does not invalidate approval"));
+        assert!(common.contains("take precedence over stale Memory"));
+        assert!(coder.contains("Never invent an add-revision operation"));
+        assert!(orchestrator.contains("Target-only movement preserves source approval"));
+        assert!(reviewer.contains("target-only movement does not invalidate approval"));
+    }
+
+    #[test]
     fn graph_rejects_dynamic_legacy_missing_and_cycles() {
         let invalid = BTreeMap::from([
             ("a".into(), "{%- include target -%}".into()),

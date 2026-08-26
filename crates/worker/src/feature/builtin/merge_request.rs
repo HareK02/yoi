@@ -50,11 +50,11 @@ struct MergeRequestTool {
     kind: Kind,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
-struct ShowInput {
+struct TicketInput {
     ticket: String,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
-struct OpenInput {
+struct OpenMergeRequestInput {
     ticket: String,
     repository_id: String,
     selector_from: String,
@@ -63,7 +63,7 @@ struct OpenInput {
     summary: String,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
-struct CompleteInput {
+struct CompleteMergeRequestInput {
     ticket: String,
     operation_id: String,
     approval_event_id: String,
@@ -86,7 +86,7 @@ enum MergeResolutionInput {
     ConflictsResolved,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
-struct ReviewInput {
+struct ReviewMergeRequestInput {
     decision: ReviewDecisionInput,
     #[serde(default)]
     body: String,
@@ -133,19 +133,19 @@ impl Kind {
 
     fn name(self) -> &'static str {
         match self {
-            Self::Show => "MergeRequestShow",
-            Self::Readiness => "MergeRequestReadinessCheck",
-            Self::Open => "MergeRequestOpen",
-            Self::Complete => "MergeRequestComplete",
-            Self::Review => "MergeRequestReview",
+            Self::Show => "ShowMergeRequest",
+            Self::Readiness => "CheckMergeRequestReadiness",
+            Self::Open => "OpenMergeRequest",
+            Self::Complete => "CompleteMergeRequest",
+            Self::Review => "ReviewMergeRequest",
         }
     }
     fn schema(self) -> serde_json::Value {
         match self {
-            Self::Show | Self::Readiness => json!(schemars::schema_for!(ShowInput)),
-            Self::Open => json!(schemars::schema_for!(OpenInput)),
-            Self::Complete => json!(schemars::schema_for!(CompleteInput)),
-            Self::Review => json!(schemars::schema_for!(ReviewInput)),
+            Self::Show | Self::Readiness => json!(schemars::schema_for!(TicketInput)),
+            Self::Open => json!(schemars::schema_for!(OpenMergeRequestInput)),
+            Self::Complete => json!(schemars::schema_for!(CompleteMergeRequestInput)),
+            Self::Review => json!(schemars::schema_for!(ReviewMergeRequestInput)),
         }
     }
 }
@@ -156,13 +156,13 @@ impl Tool for MergeRequestTool {
             ToolError::ExecutionFailed("Merge Request tools require Workspace identity".into())
         })?;
         if matches!(self.kind, Kind::Show) {
-            let value: ShowInput = parse(input)?;
+            let value: TicketInput = parse(input)?;
             nonempty(&value.ticket)?;
             return self.show_current_merge_request(ws, &value.ticket);
         }
         let (method, path, body) = match self.kind {
             Kind::Readiness => {
-                let v: ShowInput = parse(input)?;
+                let v: TicketInput = parse(input)?;
                 nonempty(&v.ticket)?;
                 (
                     WorkspaceRequestMethod::Get,
@@ -170,9 +170,9 @@ impl Tool for MergeRequestTool {
                     None,
                 )
             }
-            Kind::Show => unreachable!("MergeRequestShow is handled above"),
+            Kind::Show => unreachable!("ShowMergeRequest is handled above"),
             Kind::Open => {
-                let v: OpenInput = parse(input)?;
+                let v: OpenMergeRequestInput = parse(input)?;
                 nonempty(&v.ticket)?;
                 (
                     WorkspaceRequestMethod::Post,
@@ -183,7 +183,7 @@ impl Tool for MergeRequestTool {
                 )
             }
             Kind::Complete => {
-                let v: CompleteInput = parse(input)?;
+                let v: CompleteMergeRequestInput = parse(input)?;
                 nonempty(&v.ticket)?;
                 (
                     WorkspaceRequestMethod::Post,
@@ -194,7 +194,7 @@ impl Tool for MergeRequestTool {
                 )
             }
             Kind::Review => {
-                let v: ReviewInput = parse(input)?;
+                let v: ReviewMergeRequestInput = parse(input)?;
                 let ctx = self.client.reviewer_context().ok_or_else(|| {
                     ToolError::ExecutionFailed(
                         "Review submit requires injected Reviewer capability".into(),
@@ -397,19 +397,21 @@ impl FeatureModule for MergeRequestFeature {
 
 pub fn description(n: &str) -> Option<&'static str> {
     match n {
-        "MergeRequestShow" => Some("Read the selector-based Merge Request and append-only thread."),
-        "MergeRequestReadinessCheck" => {
-            Some("Resolve current provider refs and derive readiness from valid review events.")
-        }
-        "MergeRequestOpen" => {
-            Some("Open a Merge Request with immutable source and target selectors.")
-        }
-        "MergeRequestComplete" => {
-            Some("Complete using an approved review event and final target-ref evidence.")
-        }
-        "MergeRequestReview" => {
-            Some("Submit the injected Reviewer capability result for its captured subject ref.")
-        }
+        "ShowMergeRequest" => Some(
+            "Read the selector-based Merge Request, append-only thread, source-review freshness, and target-integration evidence before review, fix, or handoff decisions.",
+        ),
+        "CheckMergeRequestReadiness" => Some(
+            "Resolve current provider refs and derive readiness from exact-source review evidence; source movement requires fresh review while target-only movement preserves unchanged-source approval.",
+        ),
+        "OpenMergeRequest" => Some(
+            "Open the Ticket's one Merge Request with immutable source and target selectors; reuse it and advance only selector_from with a normal non-force push for later fixes.",
+        ),
+        "CompleteMergeRequest" => Some(
+            "Record Orchestrator-owned integration using unchanged-source approval and refreshed final target-ref evidence.",
+        ),
+        "ReviewMergeRequest" => Some(
+            "Submit the injected Reviewer capability result for its captured exact source ref; source movement cancels it, while target-only movement does not.",
+        ),
         _ => None,
     }
 }
@@ -466,6 +468,31 @@ mod tests {
         WorkspaceResponse {
             status: 200,
             body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn model_facing_operations_use_only_verb_first_names() {
+        for name in [
+            "ShowMergeRequest",
+            "CheckMergeRequestReadiness",
+            "OpenMergeRequest",
+            "CompleteMergeRequest",
+            "ReviewMergeRequest",
+        ] {
+            assert!(description(name).is_some(), "missing operation {name}");
+        }
+        for legacy in [
+            "MergeRequestShow",
+            "MergeRequestReadinessCheck",
+            "MergeRequestOpen",
+            "MergeRequestComplete",
+            "MergeRequestReview",
+        ] {
+            assert!(
+                description(legacy).is_none(),
+                "legacy alias {legacy} must not remain registered"
+            );
         }
     }
 
@@ -546,7 +573,7 @@ mod tests {
             open: true,
             ..Default::default()
         };
-        assert_eq!(tool_names(coder), ["MergeRequestShow", "MergeRequestOpen"]);
+        assert_eq!(tool_names(coder), ["ShowMergeRequest", "OpenMergeRequest"]);
 
         let reviewer = MergeRequestFeatureConfig {
             show: true,
@@ -555,7 +582,7 @@ mod tests {
         };
         assert_eq!(
             tool_names(reviewer),
-            ["MergeRequestShow", "MergeRequestReview"]
+            ["ShowMergeRequest", "ReviewMergeRequest"]
         );
 
         let orchestrator = MergeRequestFeatureConfig {
@@ -567,9 +594,9 @@ mod tests {
         assert_eq!(
             tool_names(orchestrator),
             [
-                "MergeRequestShow",
-                "MergeRequestReadinessCheck",
-                "MergeRequestComplete"
+                "ShowMergeRequest",
+                "CheckMergeRequestReadiness",
+                "CompleteMergeRequest"
             ]
         );
         assert_eq!(install(coder).1, [FEATURE_PROMPT_REF]);
@@ -581,8 +608,8 @@ mod tests {
     #[test]
     fn schemas_hide_revision_and_commit_authority() {
         let schemas = [
-            schemars::schema_for!(OpenInput),
-            schemars::schema_for!(CompleteInput),
+            schemars::schema_for!(OpenMergeRequestInput),
+            schemars::schema_for!(CompleteMergeRequestInput),
         ];
         for s in schemas {
             let j = serde_json::to_string(&s).unwrap();

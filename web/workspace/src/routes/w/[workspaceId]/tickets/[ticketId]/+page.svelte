@@ -556,14 +556,22 @@
       <section class="ticket-control-card">
         <header><h2>Merge Request</h2></header>
         {#if mergeRequest}
-          <p><strong>{mergeRequest.state}</strong> · review {mergeRequest.review_status}</p>
+          <p><strong>{mergeRequest.state}</strong></p>
           <p>
             From <code>{mergeRequest.selector_from ?? "requires repair"}</code>
             to <code>{mergeRequest.selector_to}</code>
           </p>
-          {#if mergeRequest.current_subject_ref}
-            <p>Current source <code>{mergeRequest.current_subject_ref}</code></p>
+          {#if mergeRequest.current_subject_ref && mergeRequest.review_subject_ref === mergeRequest.current_subject_ref}
+            <p><strong>Source review:</strong> {mergeRequest.review_status} for exact ref <code>{mergeRequest.current_subject_ref}</code></p>
+          {:else if mergeRequest.current_subject_ref && mergeRequest.review_subject_ref}
+            <p><strong>Fresh source review required:</strong> selector_from moved from <code>{mergeRequest.review_subject_ref}</code> to <code>{mergeRequest.current_subject_ref}</code>.</p>
+          {:else if mergeRequest.current_subject_ref}
+            <p><strong>Fresh source review required:</strong> no effective verdict exists for <code>{mergeRequest.current_subject_ref}</code>.</p>
+          {:else}
+            <p><strong>Source review unavailable:</strong> selector_from is unresolved.</p>
           {/if}
+          <p><strong>Target integration:</strong> {mergeRequest.state === "merged" ? "recorded" : `awaiting Orchestrator integration into ${mergeRequest.selector_to}`}.</p>
+          <p class="workspace-empty-copy">Target-only movement refreshes integration evidence; it does not invalidate approval for an unchanged source.</p>
           <a
             class="workspace-secondary-button"
             href={mergeRequestPagePath(data.workspaceId, mergeRequest.merge_request_id)}

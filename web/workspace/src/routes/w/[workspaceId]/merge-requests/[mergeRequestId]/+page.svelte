@@ -1,5 +1,9 @@
 <script lang="ts">
   import { mergeRequestPagePath } from "$lib/workspace/api/merge-requests";
+  import {
+    sourceReviewFreshness,
+    targetIntegrationStatus,
+  } from "$lib/workspace/merge-request-status";
   import type { PageData } from "./$types";
 
   let { data }: { data: PageData } = $props();
@@ -13,6 +17,7 @@
     const value = event[key];
     return typeof value === "string" && value.length > 0 ? value : null;
   }
+
 </script>
 
 <svelte:head><title>Merge Request · Yoi</title></svelte:head>
@@ -50,6 +55,14 @@
             <div><dt>Target selector</dt><dd><code>{mergeRequest.selector_to}</code></dd></div>
             <div><dt>Target revision</dt><dd>{mergeRequest.target.status}{mergeRequest.target.ref ? ` · ${mergeRequest.target.ref}` : ""}</dd></div>
             <div><dt>Updated</dt><dd>{prettyDate(mergeRequest.updated_at)}</dd></div>
+          </dl>
+        </section>
+
+        <section class="ticket-detail-section">
+          <div class="ticket-section-heading"><h2>Review and integration status</h2></div>
+          <dl class="ticket-facts">
+            <div><dt>Source review freshness</dt><dd>{sourceReviewFreshness(mergeRequest)}</dd></div>
+            <div><dt>Target integration</dt><dd>{targetIntegrationStatus(mergeRequest)}</dd></div>
           </dl>
         </section>
 
