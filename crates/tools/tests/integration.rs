@@ -191,7 +191,7 @@ async fn write_then_grep_finds_content() {
 
 #[tokio::test]
 async fn glob_finds_written_files() {
-    let (dir, _spill, reg) = setup();
+    let (_dir, _spill, reg) = setup();
     let write = reg.get("Write");
     let glob = reg.get("Glob");
 
@@ -229,7 +229,10 @@ async fn absolute_path_is_rejected() {
     .await;
     // Absolute paths are rejected at the logical WorkdirSession boundary.
     let msg = format!("{err}");
-    assert!(msg.contains("invalid Workdir path"), "unexpected: {msg}");
+    assert!(
+        msg.contains("invalid logical filesystem path"),
+        "unexpected: {msg}"
+    );
 }
 
 #[tokio::test]
@@ -340,7 +343,7 @@ async fn tracker_recent_files_tracks_read_write_edit() {
     ));
 
     let a = dir.path().join("a.txt");
-    let b = dir.path().join("b.txt");
+    let _b = dir.path().join("b.txt");
     std::fs::write(&a, "one\n").unwrap();
 
     // Read `a` — should appear in recency.

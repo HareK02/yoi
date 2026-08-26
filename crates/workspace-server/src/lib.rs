@@ -39,11 +39,7 @@ pub use authority::{
     ObjectiveAuthority, SqliteWorkspaceAuthority, TicketAuthority, TicketMergeRevisionSource,
     WorkspaceAuthority,
 };
-pub use config::{
-    BackendRuntimesConfigFile, ConfigDiff, ResolvedWorkspaceBackendConfig,
-    WORKSPACE_BACKEND_CONFIG_RELATIVE_PATH, WORKSPACE_BACKEND_CONFIG_TEMPLATE,
-    WorkspaceBackendConfigFile,
-};
+pub use config::{BackendRuntimesConfigFile, ResolvedWorkspaceBackendConfig, ServerHostConfigFile};
 pub use identity::{WORKSPACE_IDENTITY_RELATIVE_PATH, WorkspaceIdentity};
 pub use records::{ObjectiveDetail, ObjectiveSummary, TicketDetail, TicketSummary};
 pub use repositories::{

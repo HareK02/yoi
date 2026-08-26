@@ -88,7 +88,7 @@
               </div>
               <div>
                 <dt>Platform</dt>
-                <dd>{host.capabilities.os} / {host.capabilities.arch}</dd>
+                <dd>{host.os} / {host.arch}</dd>
               </div>
             </dl>
           </article>

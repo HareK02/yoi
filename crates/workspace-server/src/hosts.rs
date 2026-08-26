@@ -178,26 +178,6 @@ impl RuntimeSourceSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RuntimeCapabilitySummary {
-    pub can_list_hosts: bool,
-    pub can_list_workers: bool,
-    pub can_get_worker: bool,
-    pub can_spawn_worker: bool,
-    pub can_stop_worker: bool,
-    pub has_workspace_fs: bool,
-    pub has_shell: bool,
-    pub has_git: bool,
-    pub supports_worktrees: bool,
-    pub supports_backend_internal_tools: bool,
-    pub workspace_scope: String,
-    pub max_workers: usize,
-    pub os: String,
-    pub arch: String,
-}
-
-pub type HostCapabilitySummary = RuntimeCapabilitySummary;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeSummary {
     pub runtime_id: String,
     pub label: String,
@@ -205,7 +185,9 @@ pub struct RuntimeSummary {
     pub status: String,
     pub source: RuntimeSourceSummary,
     pub host_ids: Vec<String>,
-    pub capabilities: RuntimeCapabilitySummary,
+    pub worker_creation_available: bool,
+    pub os: String,
+    pub arch: String,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -218,7 +200,8 @@ pub struct HostSummary {
     pub status: String,
     pub observed_at: String,
     pub last_seen_at: Option<String>,
-    pub capabilities: HostCapabilitySummary,
+    pub os: String,
+    pub arch: String,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -310,27 +293,6 @@ impl From<RuntimeSourceSummary> for workspace_api::RuntimeSourceSummary {
     }
 }
 
-impl From<RuntimeCapabilitySummary> for workspace_api::RuntimeCapabilitySummary {
-    fn from(capabilities: RuntimeCapabilitySummary) -> Self {
-        Self {
-            can_list_hosts: capabilities.can_list_hosts,
-            can_list_workers: capabilities.can_list_workers,
-            can_get_worker: capabilities.can_get_worker,
-            can_spawn_worker: capabilities.can_spawn_worker,
-            can_stop_worker: capabilities.can_stop_worker,
-            has_workspace_fs: capabilities.has_workspace_fs,
-            has_shell: capabilities.has_shell,
-            has_git: capabilities.has_git,
-            supports_worktrees: capabilities.supports_worktrees,
-            supports_backend_internal_tools: capabilities.supports_backend_internal_tools,
-            workspace_scope: capabilities.workspace_scope,
-            max_workers: capabilities.max_workers,
-            os: capabilities.os,
-            arch: capabilities.arch,
-        }
-    }
-}
-
 impl From<RuntimeSummary> for workspace_api::RuntimeSummary {
     fn from(runtime: RuntimeSummary) -> Self {
         Self {
@@ -340,7 +302,9 @@ impl From<RuntimeSummary> for workspace_api::RuntimeSummary {
             status: runtime.status,
             source: runtime.source.into(),
             host_ids: runtime.host_ids,
-            capabilities: runtime.capabilities.into(),
+            worker_creation_available: runtime.worker_creation_available,
+            os: runtime.os,
+            arch: runtime.arch,
             diagnostics: runtime.diagnostics.into_iter().map(Into::into).collect(),
         }
     }
@@ -1890,7 +1854,9 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                     status: "unavailable".to_string(),
                     source: RuntimeSourceSummary::embedded_worker_runtime(),
                     host_ids: Vec::new(),
-                    capabilities: embedded_runtime_capabilities(limit, false, false),
+                    worker_creation_available: false,
+                    os: std::env::consts::OS.to_string(),
+                    arch: std::env::consts::ARCH.to_string(),
                     diagnostics,
                 };
             }
@@ -1910,7 +1876,9 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             } else {
                 vec![self.host_id.clone()]
             },
-            capabilities: embedded_runtime_capabilities(limit, true, self.execution_enabled),
+            worker_creation_available: true,
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
             diagnostics,
         }
     }
@@ -1928,7 +1896,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 status: "available".to_string(),
                 observed_at: Utc::now().to_rfc3339(),
                 last_seen_at: None,
-                capabilities: embedded_runtime_capabilities(limit, true, self.execution_enabled),
+                os: std::env::consts::OS.to_string(),
+                arch: std::env::consts::ARCH.to_string(),
                 diagnostics: vec![diagnostic(
                     "embedded_runtime_host_boundary",
                     DiagnosticSeverity::Info,
@@ -2576,7 +2545,9 @@ pub struct RemoteRuntimeConfig {
     pub base_url: String,
     pub bearer_token: Option<String>,
     pub auth: Option<RemoteRuntimeAuthConfig>,
-    pub cached_capabilities: RuntimeCapabilitySummary,
+    pub cached_worker_creation_available: bool,
+    pub cached_os: String,
+    pub cached_arch: String,
     pub cached_status: String,
     pub timeout: Duration,
 }
@@ -2598,7 +2569,12 @@ impl std::fmt::Debug for RemoteRuntimeConfig {
                 &self.bearer_token.as_ref().map(|_| "<redacted>"),
             )
             .field("auth", &self.auth.as_ref().map(|_| "<capability-signer>"))
-            .field("cached_capabilities", &self.cached_capabilities)
+            .field(
+                "cached_worker_creation_available",
+                &self.cached_worker_creation_available,
+            )
+            .field("cached_os", &self.cached_os)
+            .field("cached_arch", &self.cached_arch)
             .field("cached_status", &self.cached_status)
             .field("timeout", &self.timeout)
             .finish()
@@ -2619,9 +2595,9 @@ impl RemoteRuntimeConfig {
             base_url: base_url.into(),
             bearer_token,
             auth: None,
-            cached_capabilities: remote_runtime_capabilities(
-                200, false, false, "unknown", "unknown",
-            ),
+            cached_worker_creation_available: false,
+            cached_os: "unknown".to_string(),
+            cached_arch: "unknown".to_string(),
             cached_status: "configured".to_string(),
             timeout: Duration::from_secs(10),
         }
@@ -2629,11 +2605,6 @@ impl RemoteRuntimeConfig {
 
     pub fn with_workspace_id(mut self, workspace_id: impl Into<String>) -> Self {
         self.workspace_id = Some(workspace_id.into());
-        self
-    }
-
-    pub fn with_cached_capabilities(mut self, capabilities: RuntimeCapabilitySummary) -> Self {
-        self.cached_capabilities = capabilities;
         self
     }
 
@@ -2708,7 +2679,9 @@ pub struct RemoteWorkerRuntime {
     workspace_id: String,
     bearer_token: Option<String>,
     auth: Option<RemoteRuntimeAuthConfig>,
-    cached_capabilities: RuntimeCapabilitySummary,
+    cached_worker_creation_available: bool,
+    cached_os: String,
+    cached_arch: String,
     cached_status: String,
     host_id: String,
     resource_broker: BackendResourceBroker,
@@ -2768,7 +2741,9 @@ impl RemoteWorkerRuntime {
             workspace_id,
             bearer_token: config.bearer_token,
             auth: config.auth,
-            cached_capabilities: config.cached_capabilities,
+            cached_worker_creation_available: config.cached_worker_creation_available,
+            cached_os: config.cached_os,
+            cached_arch: config.cached_arch,
             cached_status: config.cached_status,
             resource_broker: BackendResourceBroker::default(),
             http,
@@ -3045,13 +3020,9 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 } else {
                     vec![self.host_id.clone()]
                 },
-                capabilities: remote_runtime_capabilities(
-                    limit,
-                    true,
-                    response.runtime.worker_creation_available,
-                    response.runtime.os,
-                    response.runtime.arch,
-                ),
+                worker_creation_available: response.runtime.worker_creation_available,
+                os: response.runtime.os,
+                arch: response.runtime.arch,
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => RuntimeSummary {
@@ -3065,7 +3036,9 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 } else {
                     vec![self.host_id.clone()]
                 },
-                capabilities: self.cached_capabilities.clone(),
+                worker_creation_available: self.cached_worker_creation_available,
+                os: self.cached_os.clone(),
+                arch: self.cached_arch.clone(),
                 diagnostics: vec![diagnostic],
             },
         }
@@ -3084,7 +3057,8 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 status: "configured".to_string(),
                 observed_at: Utc::now().to_rfc3339(),
                 last_seen_at: None,
-                capabilities: remote_runtime_capabilities(limit, true, false, "unknown", "unknown"),
+                os: self.cached_os.clone(),
+                arch: self.cached_arch.clone(),
                 diagnostics: Vec::new(),
             }],
             Vec::new(),
@@ -3550,29 +3524,6 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 diagnostics: vec![diagnostic],
             },
         }
-    }
-}
-
-fn embedded_runtime_capabilities(
-    limit: usize,
-    available: bool,
-    execution_enabled: bool,
-) -> RuntimeCapabilitySummary {
-    RuntimeCapabilitySummary {
-        can_list_hosts: true,
-        can_list_workers: available,
-        can_get_worker: available,
-        can_spawn_worker: available,
-        can_stop_worker: available && execution_enabled,
-        has_workspace_fs: false,
-        has_shell: false,
-        has_git: false,
-        supports_worktrees: false,
-        supports_backend_internal_tools: true,
-        workspace_scope: "backend_internal".to_string(),
-        max_workers: limit,
-        os: std::env::consts::OS.to_string(),
-        arch: std::env::consts::ARCH.to_string(),
     }
 }
 
@@ -4120,31 +4071,6 @@ fn percent_encode(input: &str, keep: impl Fn(u8) -> bool) -> String {
         }
     }
     encoded
-}
-
-fn remote_runtime_capabilities(
-    limit: usize,
-    available: bool,
-    worker_creation_available: bool,
-    os: impl Into<String>,
-    arch: impl Into<String>,
-) -> RuntimeCapabilitySummary {
-    RuntimeCapabilitySummary {
-        can_list_hosts: true,
-        can_list_workers: available,
-        can_get_worker: available,
-        can_spawn_worker: available && worker_creation_available,
-        can_stop_worker: available,
-        has_workspace_fs: false,
-        has_shell: false,
-        has_git: false,
-        supports_worktrees: false,
-        supports_backend_internal_tools: false,
-        workspace_scope: "remote_runtime_backend_private".to_string(),
-        max_workers: limit,
-        os: os.into(),
-        arch: arch.into(),
-    }
 }
 
 fn remote_reqwest_diagnostic(runtime_id: &str, err: reqwest::Error) -> RuntimeDiagnostic {
@@ -4800,22 +4726,9 @@ mod tests {
                 status: "available".to_string(),
                 source: RuntimeSourceSummary::embedded_worker_runtime_reserved(),
                 host_ids: vec![self.host_id.clone()],
-                capabilities: RuntimeCapabilitySummary {
-                    can_list_hosts: true,
-                    can_list_workers: true,
-                    can_get_worker: true,
-                    can_spawn_worker: false,
-                    can_stop_worker: false,
-                    has_workspace_fs: false,
-                    has_shell: false,
-                    has_git: false,
-                    supports_worktrees: false,
-                    supports_backend_internal_tools: false,
-                    workspace_scope: "none".to_string(),
-                    max_workers: self.workers.len(),
-                    os: "test".to_string(),
-                    arch: "test".to_string(),
-                },
+                worker_creation_available: false,
+                os: "test".to_string(),
+                arch: "test".to_string(),
                 diagnostics: Vec::new(),
             }
         }
@@ -4830,7 +4743,8 @@ mod tests {
                     status: "available".to_string(),
                     observed_at: "unknown".to_string(),
                     last_seen_at: None,
-                    capabilities: self.runtime_summary(1).capabilities,
+                    os: "test".to_string(),
+                    arch: "test".to_string(),
                     diagnostics: Vec::new(),
                 }],
                 Vec::new(),
@@ -5234,7 +5148,7 @@ mod tests {
             RuntimeSourceKind::EmbeddedWorkerRuntime
         );
         assert_eq!(embedded_summary.source.status, RuntimeSourceStatus::Active);
-        assert!(embedded_summary.capabilities.can_spawn_worker);
+        assert!(embedded_summary.worker_creation_available);
 
         let spawned = registry
             .spawn_worker(

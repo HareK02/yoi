@@ -26,7 +26,7 @@ struct BackendWorkerLaunchOptions {
 #[derive(Debug, Deserialize)]
 struct BackendWorkerLaunchRuntime {
     runtime_id: String,
-    can_spawn_worker: bool,
+    worker_creation_available: bool,
     working_directory_required: bool,
 }
 
@@ -261,7 +261,7 @@ impl BackendWorkspaceProductClient {
         let runtime = options
             .runtimes
             .iter()
-            .find(|runtime| runtime.can_spawn_worker && !runtime.working_directory_required)
+            .find(|runtime| runtime.worker_creation_available && !runtime.working_directory_required)
             .ok_or_else(|| {
                 BackendWorkspaceClientError::InvalidTarget(
                     "Backend has no spawn-capable Runtime that supports a Workdir-less Intake Worker"
@@ -777,7 +777,7 @@ mod tests {
         let (base_url, requests, handle) = response_sequence_server(vec![
             (
                 "200 OK",
-                r#"{"runtimes":[{"runtime_id":"embedded","can_spawn_worker":true,"working_directory_required":false}]}"#,
+                r#"{"runtimes":[{"runtime_id":"embedded","worker_creation_available":true,"working_directory_required":false}]}"#,
             ),
             (
                 "200 OK",

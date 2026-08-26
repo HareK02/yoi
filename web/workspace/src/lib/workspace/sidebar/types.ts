@@ -29,30 +29,15 @@ export type Diagnostic = {
   message: string;
 };
 
-export type RuntimeCapabilities = {
-  can_list_hosts: boolean;
-  can_list_workers: boolean;
-  can_get_worker: boolean;
-  can_spawn_worker: boolean;
-  can_stop_worker: boolean;
-  has_workspace_fs: boolean;
-  has_shell: boolean;
-  has_git: boolean;
-  supports_worktrees: boolean;
-  supports_backend_internal_tools: boolean;
-  workspace_scope: string;
-  os: string;
-  arch: string;
-  max_workers: number;
-};
-
 export type Runtime = {
   runtime_id: string;
   label: string;
   kind: string;
   status: string;
   host_ids: string[];
-  capabilities: RuntimeCapabilities;
+  worker_creation_available: boolean;
+  os: string;
+  arch: string;
   diagnostics: Diagnostic[];
 };
 
@@ -64,7 +49,8 @@ export type Host = {
   status: string;
   observed_at: string;
   last_seen_at: string | null;
-  capabilities: RuntimeCapabilities;
+  os: string;
+  arch: string;
   diagnostics: Diagnostic[];
 };
 
@@ -100,7 +86,7 @@ export type WorkerLaunchRuntimeOption = {
   runtime_id: string;
   display_name: string;
   built_in: boolean;
-  can_spawn_worker: boolean;
+  worker_creation_available: boolean;
   working_directory_required: boolean;
   status: string;
   diagnostics: Diagnostic[];

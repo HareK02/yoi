@@ -5,7 +5,7 @@
   let { data }: PageProps = $props();
 
   function runtimePlatform(runtime: Runtime): string {
-    return `${runtime.capabilities.os} / ${runtime.capabilities.arch}`;
+    return `${runtime.os} / ${runtime.arch}`;
   }
 </script>
 
@@ -37,7 +37,6 @@
             <th>Kind</th>
             <th>Status</th>
             <th>Platform</th>
-            <th>Capacity</th>
             <th>Workdirs</th>
           </tr>
         </thead>
@@ -51,7 +50,6 @@
               <td>{runtime.kind}</td>
               <td>{runtime.status}</td>
               <td>{runtimePlatform(runtime)}</td>
-              <td>{runtime.capabilities.max_workers} workers</td>
               <td>
                 <a class="inline-link" href={`/w/${data.workspaceId}/settings/runtimes/${encodeURIComponent(runtime.runtime_id)}/workdirs`}>
                   Open workdirs

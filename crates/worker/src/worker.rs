@@ -2494,7 +2494,10 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                         .map(ToOwned::to_owned)
                 })
                 .unwrap_or_else(|| "Workspace rejected Flow source resolution".to_string());
-            return Err(WorkerError::FlowInput(message));
+            return Err(WorkerError::FlowInput(format!(
+                "{message} (HTTP {})",
+                response.status
+            )));
         }
         let source: flow::ResolvedFlowSource = serde_json::from_str(&response.body)
             .map_err(|error| WorkerError::FlowInput(format!("decode Flow source: {error}")))?;

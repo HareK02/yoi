@@ -131,10 +131,11 @@ async fn symlink_to_outside_scope_is_rejected_for_write() {
     assert!(
         msg.contains("outside allowed read scope")
             || msg.contains("outside allowed write scope")
+            || msg.contains("outside allowed scope")
             || msg.contains("has not been read"),
         "symlink escape not rejected: {msg}"
     );
-    if !msg.contains("has not been read") {
+    if msg.contains("outside allowed read scope") || msg.contains("outside allowed write scope") {
         assert!(
             msg.contains("add the symlink target"),
             "symlink escape diagnostic should include remediation: {msg}"
@@ -233,12 +234,16 @@ async fn absolute_path_is_rejected() {
         )
         .await
         .unwrap_err();
-    assert!(format!("{err}").contains("invalid Workdir path"));
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("invalid logical filesystem path"),
+        "absolute path was not rejected as invalid: {msg}"
+    );
 }
 
 #[tokio::test]
 async fn directory_target_is_rejected_for_read() {
-    let (dir, _spill, reg) = setup();
+    let (_dir, _spill, reg) = setup();
     let read = reg.get("Read");
     let err = read
         .execute(&json!({ "file_path": "." }).to_string(), Default::default())

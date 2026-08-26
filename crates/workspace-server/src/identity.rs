@@ -46,8 +46,7 @@ impl WorkspaceIdentity {
             Ok(raw) => Self::parse_str(&raw, &path),
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 Err(Error::WorkspaceIdentity(format!(
-                    "workspace is not initialized at {}; run `yoi-server init --workspace {}` first",
-                    workspace_root.as_ref().display(),
+                    "workspace identity is missing at {}; register the Workspace through the Server before using repository-local client routing",
                     workspace_root.as_ref().display()
                 )))
             }
@@ -219,7 +218,7 @@ mod tests {
         let error = WorkspaceIdentity::load_required(&workspace_root).unwrap_err();
 
         assert!(
-            error.to_string().contains("workspace is not initialized"),
+            error.to_string().contains("workspace identity is missing"),
             "unexpected error: {error}"
         );
         assert!(!WorkspaceIdentity::path(&workspace_root).exists());

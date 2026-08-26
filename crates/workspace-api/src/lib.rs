@@ -248,24 +248,6 @@ pub struct RuntimeSourceSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RuntimeCapabilitySummary {
-    pub can_list_hosts: bool,
-    pub can_list_workers: bool,
-    pub can_get_worker: bool,
-    pub can_spawn_worker: bool,
-    pub can_stop_worker: bool,
-    pub has_workspace_fs: bool,
-    pub has_shell: bool,
-    pub has_git: bool,
-    pub supports_worktrees: bool,
-    pub supports_backend_internal_tools: bool,
-    pub workspace_scope: String,
-    pub max_workers: usize,
-    pub os: String,
-    pub arch: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeSummary {
     pub runtime_id: String,
     pub label: String,
@@ -274,7 +256,9 @@ pub struct RuntimeSummary {
     pub source: RuntimeSourceSummary,
     #[serde(default)]
     pub host_ids: Vec<String>,
-    pub capabilities: RuntimeCapabilitySummary,
+    pub worker_creation_available: bool,
+    pub os: String,
+    pub arch: String,
     #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,
 }

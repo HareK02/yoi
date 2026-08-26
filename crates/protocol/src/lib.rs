@@ -1405,7 +1405,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["event"], "completions");
         assert_eq!(parsed["data"]["kind"], "file");
-        assert_eq!(parsed["data"]["entries"][0]["value"], "clear");
+        assert_eq!(parsed["data"]["entries"][0]["value"], "src/main.rs");
 
         // is_dir defaults to false on inbound payloads that omit it.
         let inbound =

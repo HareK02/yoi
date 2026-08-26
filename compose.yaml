@@ -21,7 +21,7 @@ services:
       - "8787"
     volumes:
       - server-data:/server-data
-      - ./docker/workspace:/workspace:ro
+      - /etc/yoi/server.toml:/server-config/server.toml:ro
 
   webui:
     image: yoi-webui:latest

@@ -115,14 +115,12 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
     "top workspace page should not own the Worker list",
   );
   assert(
-    workersPage.includes("workerConsoleHref(worker, data.workspaceId)") &&
-      workersPage.includes('<table class="workers-table">') &&
-      workersPage.includes(
-        "workerDisplayName = worker.display_name || worker.label",
-      ) &&
-      workersPage.includes("worker <code>{worker.worker_id}</code>") &&
+    workersPage.includes("workerHref") &&
+      workersPage.includes("workers-table") &&
+      workersPage.includes("workerDisplayName") &&
+      workersPage.includes("worker.resource_key") &&
       workersPage.includes("Delete ${workerDisplayName}"),
-    "dedicated Workers page should expose a table, console link target, and icon actions per Worker",
+    "dedicated Workers page should expose a table, canonical Worker link target, and icon actions per Worker",
   );
   assert(
     workersNav.includes("href={`/w/${workspaceId}/workers`}") &&
@@ -218,14 +216,16 @@ Deno.test("workspace Tickets surface provides Kanban and lifecycle controls", as
     "Tickets and Objectives should each be a single sidebar link",
   );
   assert(
-    ticketsLoad.includes("?limit=1000") &&
+    ticketsLoad.includes("Object.entries(LANE_STATES)") &&
+      ticketsLoad.includes('limit: "30"') &&
+      ticketsLoad.includes('states: states.join(",")') &&
+      ticketsLoad.includes("/tickets?${search}") &&
       !ticketsLoad.includes("/tickets/query") &&
       ticketsPage.includes('class="ticket-kanban"') &&
-      ticketsPage.includes('class="ticket-lane-cards"') &&
-      ticketsPage.includes("lane.tickets.slice(0, lane.visibleCount)") &&
-      ticketsPage.includes("handleLaneScroll") &&
-      ticketsPage.includes("revealNextTickets"),
-    "Tickets list should fetch lightweight summaries once and incrementally reveal each Kanban lane",
+      ticketsPage.includes("laneState") &&
+      ticketsPage.includes("loadMore(lane.id)") &&
+      ticketsPage.includes("handleLaneScroll(event, lane.id)"),
+    "Tickets list should fetch lightweight paginated summaries for each Kanban lane",
   );
   assert(
     ticketPanelModel.includes('label: "Ready + Planning"') &&
@@ -250,16 +250,17 @@ Deno.test("workspace Tickets surface provides Kanban and lifecycle controls", as
   assert(
     ticketDetailLoad.includes("/repositories") &&
       ticketDetailPage.includes('mutate("state", "/state"') &&
-      ticketDetailPage.includes('mutate("queue", "/queue"') &&
+      ticketDetailPage.includes("async function queueTicket") &&
+      ticketDetailPage.includes("`${ticketPath}/queue`") &&
       !ticketDetailPage.includes("/merge-request/merge") &&
       ticketDetailPage.includes("mergeRequest.selector_from") &&
-      ticketDetailPage.includes("currentReview?.kind") &&
-      ticketDetailPage.includes("mergeEvent?.kind") &&
-      !ticketDetailPage.includes('mutate("review", "/review"') &&
+      ticketDetailPage.includes("mergeRequest.review_status") &&
+      ticketDetailPage.includes("mergeRequestPagePath") &&
       ticketDetailPage.includes('mutate("close", "/close"') &&
-      ticketDetailPage.includes("ticketWorkerLaunchHref") &&
+      ticketDetailPage.includes("mutateAssignment") &&
+      ticketDetailPage.includes("can_start_manual_coder") &&
       ticketDetailPage.includes("ticket.relations.outgoing"),
-    "Ticket detail should expose typed lifecycle actions, relations, target selection, and role Worker launch",
+    "Ticket detail should expose typed lifecycle actions, relations, target selection, assignments, and Merge Request navigation",
   );
 });
 
@@ -319,17 +320,19 @@ Deno.test("workspace Memory surfaces use read-only scoped memory APIs", async ()
   );
 });
 
-Deno.test("root layout does not keep legacy unscoped route compatibility", async () => {
+Deno.test("root layout keeps Workspace selection explicit", async () => {
   const layoutLoad = await Deno.readTextFile(
     new URL("./../../../routes/+layout.ts", import.meta.url),
   );
 
   assert(
-    !layoutLoad.includes("scopedCompatibilityRoute") &&
-      !layoutLoad.includes('pathname === "/runtimes"') &&
-      !layoutLoad.includes("return workspaceRoute(workspaceId, pathname)") &&
-      layoutLoad.includes("workspaceRoute(workspace.data.workspace_id)"),
-    "root layout should bootstrap the workspace entry only, not preserve legacy unscoped routes",
+    layoutLoad.includes("export const load") &&
+      layoutLoad.includes("() => ({})") &&
+      !layoutLoad.includes("scopedCompatibilityRoute") &&
+      !layoutLoad.includes("/api/workspace") &&
+      !layoutLoad.includes("workspaceRoute") &&
+      !layoutLoad.includes("redirect("),
+    "root layout should not infer, bootstrap, or redirect through a singleton Workspace",
   );
 });
 
@@ -811,9 +814,11 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
     "SidebarOverride should register and clean up the child-provided sidebar snippet",
   );
   assert(
-    rootLayoutLoad.includes('"/account"') &&
-      rootLayoutLoad.includes('"/login/device"'),
-    "Root layout should not redirect account and device-login public routes to a workspace",
+    rootLayoutLoad.includes("export const load") &&
+      rootLayoutLoad.includes("() => ({})") &&
+      !rootLayoutLoad.includes("workspaceRoute") &&
+      !rootLayoutLoad.includes("redirect("),
+    "Root layout should leave account and device-login routes public by avoiding Workspace redirects entirely",
   );
 });
 
