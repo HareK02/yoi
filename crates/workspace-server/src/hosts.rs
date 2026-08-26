@@ -4409,6 +4409,8 @@ mod tests {
             .resolve_profile("builtin:companion", root.path(), "embedded-test-companion")
             .unwrap();
         assert!(companion.feature.manage_workdir.enabled);
+        assert!(companion.feature.sub_worker.enabled);
+        assert!(!companion.feature.worker.enabled);
     }
 
     #[test]

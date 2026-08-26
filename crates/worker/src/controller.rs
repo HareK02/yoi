@@ -983,14 +983,6 @@ where
 
     if feature_config.sub_worker.enabled {
         worker.register_worker_orchestration_instruction();
-        if !feature_config.worker.enabled {
-            feature_registry.add_module(
-                crate::feature::builtin::manage_worker::sub_worker_control_feature(
-                    worker.workspace_client_handle(),
-                    spawned_registry.clone(),
-                ),
-            );
-        }
     }
 
     let host_worker_observation_provider = worker.worker_observation_provider();
