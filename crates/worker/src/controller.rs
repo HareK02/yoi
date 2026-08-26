@@ -383,6 +383,7 @@ impl WorkerController {
         worker.attach_alerter(alerter.clone());
         // Also hand the raw broadcast sender so Worker-internal operations
         // can emit typed lifecycle `Event`s (currently: compact progress).
+        worker.attach_internal_worker_registry(spawned_registry.clone());
         worker.attach_event_tx(event_tx.clone());
 
         // Bash spills long outputs to a per-worker subdir under the runtime
@@ -421,7 +422,6 @@ impl WorkerController {
         wire_event_bridges_on_engine(&mut worker, &event_tx, &alerter, &in_flight);
 
         // === 3. Tool registration (builtin / memory / spawn-orchestration) ===
-        spawned_registry.attach_parent_protocol(event_tx.clone(), worker.session_id().to_string());
         let fs_for_view = register_worker_tools(
             &mut worker,
             bash_output_dir,

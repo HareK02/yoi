@@ -281,11 +281,44 @@ impl Method {
 /// Presentation category for an Internal Worker exposed through its parent's
 /// protocol stream. Internal Workers never become independently addressable
 /// protocol subjects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum InternalWorkerKind {
     SubWorker,
+    Service { kind: String },
+}
+
+/// Stable parent-owned lifecycle for one compaction run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct CompactionLifecycle {
+    pub schema_version: u32,
+    pub compaction_id: String,
+    pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_worker: Option<InternalWorkerRef>,
+    pub state: CompactionLifecycleState,
+    /// Milliseconds since the Unix epoch.
+    pub started_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_segment_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionLifecycleState {
+    Running,
+    Done,
+    Failed,
+    Interrupted,
 }
 
 /// Stable presentation identity for one parent-owned Internal Worker session.
@@ -607,23 +640,18 @@ pub enum Event {
     /// This is not part of LLM history or prompt context; clients may display it
     /// briefly as operational status.
     MemoryWorker(MemoryWorkerEvent),
-    /// Worker has started compacting the current session.
-    ///
-    /// Fired immediately before a compaction run. Success is signalled by
-    /// `CompactDone` (with the new `SegmentId`); failure by `CompactFailed`.
-    /// Broadcast to all clients; not replayed to late subscribers.
-    CompactStart,
-    /// Compaction completed and the session was rotated.
-    ///
-    /// `new_segment_id` is the UUID of the freshly created session that
-    /// replaced the old history.
-    CompactDone {
-        #[cfg_attr(feature = "typescript", ts(type = "string"))]
-        new_segment_id: uuid::Uuid,
+    /// Worker has started compacting the current session, or bound the run to its
+    /// observable Internal Worker. Revisions upsert one stable lifecycle item.
+    CompactStart {
+        lifecycle: CompactionLifecycle,
     },
-    /// Compaction failed. The session is unchanged.
+    /// Compaction completed and the session was rotated.
+    CompactDone {
+        lifecycle: CompactionLifecycle,
+    },
+    /// Compaction failed or was cancelled. The session is unchanged.
     CompactFailed {
-        error: String,
+        lifecycle: CompactionLifecycle,
     },
     Shutdown,
 }
@@ -1732,45 +1760,74 @@ mod tests {
         assert_eq!(parsed["data"]["timestamp_ms"], 1_700_000_000_000i64);
     }
 
+    fn test_compaction_lifecycle(state: CompactionLifecycleState) -> CompactionLifecycle {
+        CompactionLifecycle {
+            schema_version: 2,
+            compaction_id: "0192f0e8-4d84-7d6e-a000-000000000000".into(),
+            revision: 1,
+            internal_worker: None,
+            state,
+            started_at_ms: 1_700_000_000_000,
+            ended_at_ms: None,
+            summary: None,
+            error: None,
+            new_segment_id: None,
+        }
+    }
+
     #[test]
     fn event_compact_start_roundtrip() {
-        let event = Event::CompactStart;
+        let event = Event::CompactStart {
+            lifecycle: test_compaction_lifecycle(CompactionLifecycleState::Running),
+        };
         let json = serde_json::to_string(&event).unwrap();
-        assert_eq!(json, r#"{"event":"compact_start"}"#);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "compact_start");
+        assert_eq!(parsed["data"]["lifecycle"]["state"], "running");
         let decoded: Event = serde_json::from_str(&json).unwrap();
-        assert!(matches!(decoded, Event::CompactStart));
+        assert!(matches!(decoded, Event::CompactStart { lifecycle } if lifecycle.revision == 1));
     }
 
     #[test]
     fn event_compact_done_roundtrip() {
         let id = uuid::Uuid::parse_str("0192f0e8-4d84-7d6e-a000-000000000001").unwrap();
-        let event = Event::CompactDone { new_segment_id: id };
+        let mut lifecycle = test_compaction_lifecycle(CompactionLifecycleState::Done);
+        lifecycle.new_segment_id = Some(id.to_string());
+        lifecycle.summary = Some("accepted summary".into());
+        let event = Event::CompactDone { lifecycle };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["event"], "compact_done");
         assert_eq!(
-            parsed["data"]["new_segment_id"],
+            parsed["data"]["lifecycle"]["new_segment_id"],
             "0192f0e8-4d84-7d6e-a000-000000000001"
         );
         let decoded: Event = serde_json::from_str(&json).unwrap();
         match decoded {
-            Event::CompactDone { new_segment_id } => assert_eq!(new_segment_id, id),
+            Event::CompactDone { lifecycle } => {
+                assert_eq!(
+                    lifecycle.new_segment_id.as_deref(),
+                    Some(id.to_string().as_str())
+                )
+            }
             other => panic!("expected CompactDone, got {other:?}"),
         }
     }
 
     #[test]
     fn event_compact_failed_roundtrip() {
-        let event = Event::CompactFailed {
-            error: "provider 429".into(),
-        };
+        let mut lifecycle = test_compaction_lifecycle(CompactionLifecycleState::Failed);
+        lifecycle.error = Some("provider 429".into());
+        let event = Event::CompactFailed { lifecycle };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["event"], "compact_failed");
-        assert_eq!(parsed["data"]["error"], "provider 429");
+        assert_eq!(parsed["data"]["lifecycle"]["error"], "provider 429");
         let decoded: Event = serde_json::from_str(&json).unwrap();
         match decoded {
-            Event::CompactFailed { error } => assert_eq!(error, "provider 429"),
+            Event::CompactFailed { lifecycle } => {
+                assert_eq!(lifecycle.error.as_deref(), Some("provider 429"))
+            }
             other => panic!("expected CompactFailed, got {other:?}"),
         }
     }

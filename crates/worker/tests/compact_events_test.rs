@@ -431,7 +431,7 @@ async fn pre_run_compact_success_broadcasts_start_and_done() {
     let kinds: Vec<&str> = events
         .iter()
         .map(|e| match e {
-            Event::CompactStart => "start",
+            Event::CompactStart { .. } => "start",
             Event::CompactDone { .. } => "done",
             Event::CompactFailed { .. } => "failed",
             _ => "other",
@@ -445,10 +445,61 @@ async fn pre_run_compact_success_broadcasts_start_and_done() {
         !kinds.contains(&"failed"),
         "unexpected CompactFailed in {kinds:?}"
     );
+    let starts = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::CompactStart { lifecycle } => Some(lifecycle),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        starts.len(),
+        2,
+        "start and Internal Worker binding revisions"
+    );
+    assert_eq!(starts[0].compaction_id, starts[1].compaction_id);
+    assert_eq!(starts[0].revision, 1);
+    assert!(starts[0].internal_worker.is_none());
+    assert_eq!(starts[1].revision, 2);
+    assert!(matches!(
+        starts[1].internal_worker.as_ref().map(|worker| &worker.kind),
+        Some(protocol::InternalWorkerKind::Service { kind }) if kind == "compaction"
+    ));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::InternalWorker { worker, .. }
+            if matches!(&worker.kind, protocol::InternalWorkerKind::Service { kind } if kind == "compaction")
+    )), "compactor activity must be projected through the parent stream");
+    let completed = events
+        .iter()
+        .find_map(|event| match event {
+            Event::CompactDone { lifecycle } => Some(lifecycle),
+            _ => None,
+        })
+        .expect("completed lifecycle");
+    assert_eq!(completed.compaction_id, starts[0].compaction_id);
+    assert_eq!(completed.revision, 3);
+    assert_eq!(completed.summary.as_deref(), Some("summary"));
+    assert_eq!(completed.state, protocol::CompactionLifecycleState::Done);
+    let done_index = events
+        .iter()
+        .position(|event| matches!(event, Event::CompactDone { .. }))
+        .expect("done event");
+    let removed_index = events
+        .iter()
+        .position(|event| matches!(event, Event::InternalWorkerRemoved { .. }))
+        .expect("terminal compactor session must be released");
+    assert!(
+        done_index < removed_index,
+        "terminal lifecycle precedes release fence"
+    );
 
     // CompactDone carries the new Segment ID; the Session ID is unchanged.
     let new_id_in_event = events.iter().find_map(|e| match e {
-        Event::CompactDone { new_segment_id } => Some(*new_segment_id),
+        Event::CompactDone { lifecycle } => lifecycle
+            .new_segment_id
+            .as_deref()
+            .and_then(|value| uuid::Uuid::parse_str(value).ok()),
         _ => None,
     });
     assert!(new_id_in_event.is_some(), "CompactDone missing");
@@ -488,7 +539,7 @@ async fn mid_turn_compact_success_broadcasts_start_and_done() {
     let kinds: Vec<&str> = events
         .iter()
         .map(|e| match e {
-            Event::CompactStart => "start",
+            Event::CompactStart { .. } => "start",
             Event::CompactDone { .. } => "done",
             Event::CompactFailed { .. } => "failed",
             _ => "other",
@@ -504,7 +555,10 @@ async fn mid_turn_compact_success_broadcasts_start_and_done() {
     );
 
     let new_id_in_event = events.iter().find_map(|e| match e {
-        Event::CompactDone { new_segment_id } => Some(*new_segment_id),
+        Event::CompactDone { lifecycle } => lifecycle
+            .new_segment_id
+            .as_deref()
+            .and_then(|value| uuid::Uuid::parse_str(value).ok()),
         _ => None,
     });
     assert_eq!(new_id_in_event, Some(worker.segment_id()));
@@ -659,7 +713,7 @@ async fn pre_run_compact_failure_broadcasts_start_and_failed() {
     let kinds: Vec<&str> = events
         .iter()
         .map(|e| match e {
-            Event::CompactStart => "start",
+            Event::CompactStart { .. } => "start",
             Event::CompactDone { .. } => "done",
             Event::CompactFailed { .. } => "failed",
             _ => "other",
@@ -817,11 +871,14 @@ async fn controller_compact_method_emits_start_and_done() {
             .expect("timeout waiting for compact events")
             .expect("event")
         {
-            Event::CompactStart => saw_start = true,
+            Event::CompactStart { .. } => saw_start = true,
             Event::CompactDone { .. } => {
                 break;
             }
-            Event::CompactFailed { error } => panic!("manual compact failed: {error}"),
+            Event::CompactFailed { lifecycle } => panic!(
+                "manual compact failed: {}",
+                lifecycle.error.as_deref().unwrap_or("unknown error")
+            ),
             _ => {}
         }
     }

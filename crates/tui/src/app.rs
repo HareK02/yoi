@@ -1342,13 +1342,20 @@ impl App {
                     }
                 }
             }
-            Event::CompactStart => {
-                self.blocks.push(Block::Compact(CompactEvent::Streaming {
-                    started_at: Instant::now(),
-                }));
+            Event::CompactStart { .. } => {
+                if self.last_streaming_compact_mut().is_none() {
+                    self.blocks.push(Block::Compact(CompactEvent::Streaming {
+                        started_at: Instant::now(),
+                    }));
+                }
             }
-            Event::CompactDone { new_segment_id } => {
+            Event::CompactDone { lifecycle } => {
                 self.session_context_tokens = 0;
+                let new_segment_id = lifecycle
+                    .new_segment_id
+                    .as_deref()
+                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                    .unwrap_or_default();
                 if let Some(evt) = self.last_streaming_compact_mut() {
                     let elapsed_secs = match evt {
                         CompactEvent::Streaming { started_at } => {
@@ -1367,7 +1374,10 @@ impl App {
                     }));
                 }
             }
-            Event::CompactFailed { error } => {
+            Event::CompactFailed { lifecycle } => {
+                let error = lifecycle
+                    .error
+                    .unwrap_or_else(|| "compaction failed".to_string());
                 if let Some(evt) = self.last_streaming_compact_mut() {
                     let elapsed_secs = match evt {
                         CompactEvent::Streaming { started_at } => {
@@ -2486,7 +2496,7 @@ fn event_is_stale_after_rewind(event: &Event) -> bool {
         event,
         Event::Alert(_)
             | Event::MemoryWorker(_)
-            | Event::CompactStart
+            | Event::CompactStart { .. }
             | Event::CompactDone { .. }
             | Event::CompactFailed { .. }
             | Event::SegmentRotated { .. }
@@ -4076,13 +4086,34 @@ mod completion_flow_tests {
         }
     }
 
+    fn test_compaction_lifecycle(
+        state: protocol::CompactionLifecycleState,
+    ) -> protocol::CompactionLifecycle {
+        protocol::CompactionLifecycle {
+            schema_version: 2,
+            compaction_id: "compaction-test".into(),
+            revision: 1,
+            internal_worker: None,
+            state,
+            started_at_ms: 1,
+            ended_at_ms: None,
+            summary: None,
+            error: None,
+            new_segment_id: None,
+        }
+    }
+
     #[test]
     fn compact_done_replaces_live_block() {
         let mut app = App::new("test".into());
         let id = uuid::Uuid::parse_str("12345678-1234-5678-1234-567812345678").unwrap();
 
-        app.handle_worker_event(Event::CompactStart);
-        app.handle_worker_event(Event::CompactDone { new_segment_id: id });
+        app.handle_worker_event(Event::CompactStart {
+            lifecycle: test_compaction_lifecycle(protocol::CompactionLifecycleState::Running),
+        });
+        let mut lifecycle = test_compaction_lifecycle(protocol::CompactionLifecycleState::Done);
+        lifecycle.new_segment_id = Some(id.to_string());
+        app.handle_worker_event(Event::CompactDone { lifecycle });
 
         assert_eq!(compact_block_count(&app), 1);
         assert!(matches!(
@@ -4098,10 +4129,12 @@ mod completion_flow_tests {
     fn compact_failed_replaces_live_block() {
         let mut app = App::new("test".into());
 
-        app.handle_worker_event(Event::CompactStart);
-        app.handle_worker_event(Event::CompactFailed {
-            error: "provider 429".into(),
+        app.handle_worker_event(Event::CompactStart {
+            lifecycle: test_compaction_lifecycle(protocol::CompactionLifecycleState::Running),
         });
+        let mut lifecycle = test_compaction_lifecycle(protocol::CompactionLifecycleState::Failed);
+        lifecycle.error = Some("provider 429".into());
+        app.handle_worker_event(Event::CompactFailed { lifecycle });
 
         assert_eq!(compact_block_count(&app), 1);
         assert!(matches!(
@@ -4117,7 +4150,9 @@ mod completion_flow_tests {
     fn shutdown_marks_live_compact_incomplete() {
         let mut app = App::new("test".into());
 
-        app.handle_worker_event(Event::CompactStart);
+        app.handle_worker_event(Event::CompactStart {
+            lifecycle: test_compaction_lifecycle(protocol::CompactionLifecycleState::Running),
+        });
         app.handle_worker_event(Event::Shutdown);
 
         assert!(app.quit);
@@ -4208,9 +4243,9 @@ mod completion_flow_tests {
         let mut app = App::new("test".into());
         app.session_context_tokens = 42_000;
 
-        app.handle_worker_event(Event::CompactDone {
-            new_segment_id: uuid::Uuid::nil(),
-        });
+        let mut lifecycle = test_compaction_lifecycle(protocol::CompactionLifecycleState::Done);
+        lifecycle.new_segment_id = Some(uuid::Uuid::nil().to_string());
+        app.handle_worker_event(Event::CompactDone { lifecycle });
 
         assert_eq!(app.session_context_tokens, 0);
     }

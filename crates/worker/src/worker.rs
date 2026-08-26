@@ -46,12 +46,11 @@ use crate::hook::{
 };
 use crate::in_flight::InFlightEvents;
 use crate::internal_worker::{
-    InternalWorkerAuthority, InternalWorkerIdentity, InternalWorkerSpec, run_internal_worker,
-    run_internal_worker_with_cancel_sender,
+    InternalWorkerAuthority, InternalWorkerIdentity, InternalWorkerSpec, InternalWorkerVisibility,
+    prepare_internal_worker_from_spec, run_internal_worker, run_internal_worker_with_cancel_sender,
 };
 
 const COMPACTION_EXTENSION_DOMAIN: &str = "yoi.compaction";
-const COMPACTION_BLOCK_ID: &str = "compact";
 const WORKER_ORCHESTRATION_INSTRUCTION_ID: &str = "worker.orchestration";
 const WORKER_ORCHESTRATION_PROMPT_REF: &str = "common.worker_orchestration";
 
@@ -76,7 +75,8 @@ use crate::skill::{SkillActivationResponse, SkillClientError};
 #[cfg(test)]
 use async_trait::async_trait;
 use protocol::{
-    AlertLevel, AlertSource, Event, RewindSummary, RewindTarget, RewindTargetId, Segment,
+    AlertLevel, AlertSource, CompactionLifecycle, CompactionLifecycleState, Event, RewindSummary,
+    RewindTarget, RewindTargetId, Segment,
 };
 use tokio::net::UnixStream;
 use tokio::sync::broadcast;
@@ -971,6 +971,9 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// notifications, events sent here are NOT replayed to clients that
     /// connect after the fact — they are fire-and-forget broadcasts.
     event_tx: Option<broadcast::Sender<Event>>,
+    /// Parent-owned projection/control boundary for observable Internal service Workers.
+    /// Service Workers are never exposed through the model-facing SubWorker control surface.
+    internal_worker_registry: Option<Arc<crate::spawn::registry::SpawnedWorkerRegistry>>,
     in_flight: Option<InFlightEvents>,
     /// Monotonic counter incremented by worker event bridges when an
     /// assistant-side execution artifact becomes visible to clients before
@@ -1115,6 +1118,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
             feature_instructions: self.feature_instructions.clone(),
             alerter: self.alerter.clone(),
             event_tx: self.event_tx.clone(),
+            internal_worker_registry: self.internal_worker_registry.clone(),
             in_flight: self.in_flight.clone(),
             ai_activity_counter: self.ai_activity_counter.clone(),
             pending_notifies: NotifyBuffer::new(),
@@ -1315,6 +1319,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             feature_instructions: Vec::new(),
             alerter: None,
             event_tx: None,
+            internal_worker_registry: None,
             in_flight: None,
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
@@ -1957,7 +1962,19 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// Worker-internal operations (currently: compaction) can surface
     /// progress to connected clients.
     pub fn attach_event_tx(&mut self, event_tx: broadcast::Sender<Event>) {
+        let session_id = self.session_id().to_string();
+        let registry = self.internal_worker_registry.get_or_insert_with(
+            crate::spawn::registry::SpawnedWorkerRegistry::new_for_internal_services,
+        );
+        registry.attach_parent_protocol(event_tx.clone(), session_id);
         self.event_tx = Some(event_tx);
+    }
+
+    pub(crate) fn attach_internal_worker_registry(
+        &mut self,
+        registry: Arc<crate::spawn::registry::SpawnedWorkerRegistry>,
+    ) {
+        self.internal_worker_registry = Some(registry);
     }
 
     /// Shared activity counter incremented by worker event bridges when any
@@ -2895,52 +2912,46 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             .map_err(WorkerError::Engine)
     }
 
-    fn persist_compaction_block(
+    fn persist_compaction_lifecycle(
         &mut self,
-        state: &str,
-        message: &str,
-        error: Option<&str>,
-        new_segment_id: Option<SegmentId>,
+        lifecycle: &CompactionLifecycle,
     ) -> Result<(), WorkerError> {
-        let payload = serde_json::json!({
-            "kind": "compaction_block",
-            "schema_version": 1,
-            "block_id": COMPACTION_BLOCK_ID,
-            "state": state,
-            "message": message,
-            "error": error,
-            "new_segment_id": new_segment_id.map(|id| id.to_string()),
-        });
         Ok(self.commit_entry(LogEntry::Extension {
             ts: segment_log::now_millis(),
             domain: COMPACTION_EXTENSION_DOMAIN.into(),
-            payload,
+            payload: serde_json::to_value(lifecycle).map_err(|error| {
+                WorkerError::InvalidState(format!(
+                    "serialize compaction lifecycle {}: {error}",
+                    lifecycle.compaction_id
+                ))
+            })?,
         })?)
     }
 
-    fn persist_and_send_compact_start(&mut self) -> Result<(), WorkerError> {
-        self.persist_compaction_block("running", "Compacting…", None, None)?;
-        self.send_event(Event::CompactStart);
+    fn persist_and_send_compact_start(
+        &mut self,
+        lifecycle: CompactionLifecycle,
+    ) -> Result<(), WorkerError> {
+        self.persist_compaction_lifecycle(&lifecycle)?;
+        self.send_event(Event::CompactStart { lifecycle });
         Ok(())
     }
 
     fn persist_and_send_compact_done(
         &mut self,
-        new_segment_id: SegmentId,
+        lifecycle: CompactionLifecycle,
     ) -> Result<(), WorkerError> {
-        self.persist_compaction_block("done", "Compacted.", None, Some(new_segment_id))?;
-        self.send_event(Event::CompactDone { new_segment_id });
+        self.persist_compaction_lifecycle(&lifecycle)?;
+        self.send_event(Event::CompactDone { lifecycle });
         Ok(())
     }
 
-    fn persist_and_send_compact_failed(&mut self, error: String) -> Result<(), WorkerError> {
-        self.persist_compaction_block(
-            "failed",
-            &format!("Compact failed: {error}"),
-            Some(error.as_str()),
-            None,
-        )?;
-        self.send_event(Event::CompactFailed { error });
+    fn persist_and_send_compact_failed(
+        &mut self,
+        lifecycle: CompactionLifecycle,
+    ) -> Result<(), WorkerError> {
+        self.persist_compaction_lifecycle(&lifecycle)?;
+        self.send_event(Event::CompactFailed { lifecycle });
         Ok(())
     }
 
@@ -2969,14 +2980,12 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 .map(|s| s.retained_tokens())
                 .unwrap_or(manifest::defaults::COMPACT_RETAINED_TOKENS);
 
-            self.persist_and_send_compact_start()?;
             match self.compact(retained).await {
                 Ok(new_segment_id) => {
                     info!(
                         new_segment_id = %new_segment_id,
                         "Compaction succeeded, resuming execution"
                     );
-                    self.persist_and_send_compact_done(new_segment_id)?;
                     if let Some(ref state) = self.compact_state {
                         state.record_compact_success();
                     }
@@ -2984,7 +2993,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 }
                 Err(e) => {
                     warn!(error = %e, "Compaction failed during run");
-                    self.persist_and_send_compact_failed(e.to_string())?;
                     self.alert(
                         AlertLevel::Error,
                         AlertSource::Compactor,
@@ -3017,45 +3025,16 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         }
 
         let retained = state.retained_tokens();
-        if let Err(err) = self.persist_and_send_compact_start() {
-            warn!(error = %err, "failed to persist proactive compact start");
-            self.alert(
-                AlertLevel::Warn,
-                AlertSource::Compactor,
-                format!("pre-run compaction not started: failed to persist status block: {err}"),
-            );
-            return;
-        }
         match self.compact(retained).await {
             Ok(new_segment_id) => {
                 info!(
                     new_segment_id = %new_segment_id,
                     "Proactive pre-run compaction succeeded"
                 );
-                if let Err(err) = self.persist_and_send_compact_done(new_segment_id) {
-                    warn!(error = %err, "failed to persist proactive compact completion");
-                    self.alert(
-                        AlertLevel::Warn,
-                        AlertSource::Compactor,
-                        format!(
-                            "pre-run compaction completed but status block was not persisted: {err}"
-                        ),
-                    );
-                }
                 state.record_compact_success();
             }
             Err(e) => {
                 warn!(error = %e, "Proactive pre-run compaction failed");
-                if let Err(err) = self.persist_and_send_compact_failed(e.to_string()) {
-                    warn!(error = %err, "failed to persist proactive compact failure");
-                    self.alert(
-                        AlertLevel::Warn,
-                        AlertSource::Compactor,
-                        format!(
-                            "pre-run compaction failed and status block was not persisted: {err}"
-                        ),
-                    );
-                }
                 self.alert(
                     AlertLevel::Warn,
                     AlertSource::Compactor,
@@ -3113,11 +3092,9 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         }
 
         self.join_memory_task().await;
-        self.persist_and_send_compact_start()?;
         match self.compact(retained).await {
             Ok(new_segment_id) => {
                 info!(new_segment_id = %new_segment_id, "Manual compaction succeeded");
-                self.persist_and_send_compact_done(new_segment_id)?;
                 if let Some(ref state) = state {
                     state.record_compact_success();
                 }
@@ -3125,7 +3102,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             }
             Err(e) => {
                 warn!(error = %e, "Manual compaction failed");
-                self.persist_and_send_compact_failed(e.to_string())?;
                 self.alert(
                     AlertLevel::Error,
                     AlertSource::Compactor,
@@ -3262,20 +3238,79 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         Ok(())
     }
 
-    /// Compact the current session by summarising history via a
-    /// disposable Engine, then replacing history with
-    /// `[summary, ...recent_turns]` in a new Segment of the same Session.
-    ///
-    /// The summary Engine uses:
-    /// - `compaction.model` from the manifest if configured, or
-    /// - a clone of the main LlmClient via `clone_boxed()`.
-    ///
-    /// Returns the new Segment ID. The Worker keeps its Session ID.
+    /// Runs one parent-owned observable compaction service and returns the new
+    /// Segment ID. Lifecycle revisions are committed before they are broadcast.
     pub async fn compact(&mut self, retained_tokens: u64) -> Result<SegmentId, WorkerError> {
+        let mut lifecycle = CompactionLifecycle {
+            schema_version: 2,
+            compaction_id: uuid::Uuid::now_v7().to_string(),
+            revision: 1,
+            internal_worker: None,
+            state: CompactionLifecycleState::Running,
+            started_at_ms: segment_log::now_millis(),
+            ended_at_ms: None,
+            summary: None,
+            error: None,
+            new_segment_id: None,
+        };
+        self.persist_and_send_compact_start(lifecycle.clone())?;
+        match self.compact_impl(retained_tokens, &mut lifecycle).await {
+            Ok((new_segment_id, summary)) => {
+                lifecycle.revision = lifecycle.revision.saturating_add(1);
+                lifecycle.state = CompactionLifecycleState::Done;
+                lifecycle.ended_at_ms = Some(segment_log::now_millis());
+                lifecycle.summary = Some(summary);
+                lifecycle.new_segment_id = Some(new_segment_id.to_string());
+                let terminal = self.persist_and_send_compact_done(lifecycle.clone());
+                self.release_compaction_service(&lifecycle).await;
+                terminal?;
+                Ok(new_segment_id)
+            }
+            Err(error) => {
+                lifecycle.revision = lifecycle.revision.saturating_add(1);
+                lifecycle.state = if matches!(error, WorkerError::CompactCancelled) {
+                    CompactionLifecycleState::Interrupted
+                } else {
+                    CompactionLifecycleState::Failed
+                };
+                lifecycle.ended_at_ms = Some(segment_log::now_millis());
+                lifecycle.error = Some(error.to_string().chars().take(2_000).collect());
+                let terminal = self.persist_and_send_compact_failed(lifecycle.clone());
+                self.release_compaction_service(&lifecycle).await;
+                terminal?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn release_compaction_service(&self, lifecycle: &CompactionLifecycle) {
+        let Some(session_id) = lifecycle
+            .internal_worker
+            .as_ref()
+            .map(|worker| worker.session_id.as_str())
+        else {
+            return;
+        };
+        let Some(registry) = &self.internal_worker_registry else {
+            return;
+        };
+        if let Err(error) = registry.stop_service(session_id).await {
+            warn!(
+                compaction_id = %lifecycle.compaction_id,
+                internal_worker_session_id = %session_id,
+                error = %error,
+                "failed to release terminal compaction Internal Worker"
+            );
+        }
+    }
+
+    async fn compact_impl(
+        &mut self,
+        retained_tokens: u64,
+        lifecycle: &mut CompactionLifecycle,
+    ) -> Result<(SegmentId, String), WorkerError> {
         use crate::compact::worker::{
-            CompactWorkerContext, CompactWorkerInterceptor, add_reference_tool,
-            mark_read_required_tool, read_session_items_tool, search_session_log_tool,
-            write_summary_tool,
+            CompactWorkerContext, CompactWorkerInterceptor, CompactionOutputFeature,
         };
         use crate::fs_view::WorkerFsView;
 
@@ -3385,10 +3420,12 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             auto_read_budget,
         )));
 
-        // Build an independent compact worker. It clones the main Worker's
-        // provider handle, so compact-time reads use the same WorkdirSession instance.
-        // No-workdir Workers deliberately omit compact-time filesystem tools.
+        // Build a normal parent-owned Internal Worker over a pinned immutable
+        // capture. Only SessionExplore and compaction output tools are installed.
         let workdir = self.workdir_session.clone();
+        let read_only_workdir = workdir.clone().map(|session| {
+            Arc::new(ReadOnlyWorkdirSession::new(session)) as workdir::WorkdirSessionHandle
+        });
         let summary_tracker = tools::Tracker::new();
         let summary_client: Box<dyn LlmClient> = self.build_compactor_client()?;
         let summary_system_prompt = self
@@ -3396,51 +3433,129 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             .load_full()
             .compact_system()
             .map_err(WorkerError::PromptCatalog)?;
-        let mut summary_worker = Engine::new(summary_client).system_prompt(summary_system_prompt);
-        summary_worker.set_cache_key(Some(self.segment_id().to_string()));
-
-        // Occupancy-based input-token meter + interceptor. The tracker pairs
-        // each pre-request history length with the following UsageEvent, then
-        // the interceptor projects current prompt occupancy with the same
-        // UsageRecord counter used by the main Worker thresholds.
         let summary_usage_tracker = Arc::new(UsageTracker::new());
-        {
-            let tracker = summary_usage_tracker.clone();
-            summary_worker.on_usage(move |event| {
-                tracker.record_usage(event);
-            });
-        }
         let compactor_warning_cb = self.alerter.clone().map(|alerter| {
             Arc::new(move |message: String| {
                 alerter.alert(AlertLevel::Warn, AlertSource::Compactor, message);
             }) as Arc<dyn Fn(String) + Send + Sync>
         });
-        summary_worker.set_interceptor(CompactWorkerInterceptor::new(
-            summary_usage_tracker,
+        let interceptor = CompactWorkerInterceptor::new(
+            summary_usage_tracker.clone(),
             worker_context_max_tokens,
             finish_warning_remaining_tokens,
             final_reserve_tokens,
             compactor_warning_cb,
-        ));
-        summary_worker.set_max_turns(worker_max_turns);
+        );
+        let tracker_for_engine = summary_usage_tracker.clone();
+        let features = crate::feature::FeatureRegistryBuilder::new()
+            .with_module(
+                crate::feature::builtin::session_explore::SessionExploreFeature::new(
+                    crate::feature::builtin::session_explore::SessionExploreState::new(
+                        crate::session_capture::SessionCapture::new(
+                            self.segment_id().to_string(),
+                            items_to_summarise.clone(),
+                        ),
+                    ),
+                ),
+            )
+            .with_module(CompactionOutputFeature::new(
+                read_only_workdir.clone(),
+                summary_tracker,
+                ctx.clone(),
+            ));
+        let required_tools: &'static [&'static str] = if read_only_workdir.is_some() {
+            &[
+                "ShowOverview",
+                "SearchEntries",
+                "ReadEntry",
+                "Read",
+                "mark_read_required",
+                "add_reference",
+                "write_summary",
+            ]
+        } else {
+            &[
+                "ShowOverview",
+                "SearchEntries",
+                "ReadEntry",
+                "add_reference",
+                "write_summary",
+            ]
+        };
+        let handle = prepare_internal_worker_from_spec(
+            InternalWorkerSpec {
+                identity: InternalWorkerIdentity {
+                    kind: "compaction",
+                    run_id: uuid::Uuid::parse_str(&lifecycle.compaction_id).map_err(|error| {
+                        WorkerError::InvalidState(format!("invalid compaction id: {error}"))
+                    })?,
+                },
+                manifest: self.manifest.clone(),
+                client: summary_client,
+                system_prompt: summary_system_prompt,
+                input: summary_input.text.clone(),
+                cache_key: Some(self.segment_id().to_string()),
+                max_turns: worker_max_turns,
+                engine_configurator: Some(Box::new(move |engine| {
+                    let tracker = tracker_for_engine;
+                    engine.on_usage(move |event| {
+                        tracker.record_usage(event);
+                    });
+                    engine.set_interceptor(interceptor);
+                })),
+                features,
+                required_tools,
+                authority: InternalWorkerAuthority {
+                    workspace: WorkerWorkspaceContext::no_workspace(),
+                    filesystem: WorkerFilesystemAuthority::None,
+                    scope: Scope::empty(),
+                    workdir_session: read_only_workdir,
+                },
+            },
+            InternalWorkerVisibility::ParentClient,
+        )
+        .await
+        .map_err(|error| WorkerError::InvalidState(error.to_string()))?;
+        let registry = self
+            .internal_worker_registry
+            .get_or_insert_with(
+                crate::spawn::registry::SpawnedWorkerRegistry::new_for_internal_services,
+            )
+            .clone();
+        let internal_ref = registry
+            .attach_service(crate::spawn::registry::InternalServiceWorkerRecord::new(
+                "compaction",
+                "Compaction",
+                handle.clone(),
+            ))
+            .map_err(|error| WorkerError::InvalidState(error.to_string()))?;
+        lifecycle.revision = lifecycle.revision.saturating_add(1);
+        lifecycle.internal_worker = Some(internal_ref);
+        self.persist_and_send_compact_start(lifecycle.clone())?;
 
-        // Tools: read_file (shared scope, fresh tracker), bounded session
-        // history exploration, and compact-specific tools that populate `ctx`.
-        let compact_target_items = Arc::new(items_to_summarise.clone());
-        if let Some(workdir) = workdir.clone() {
-            summary_worker.register_tool(tools::read_tool(workdir.clone(), summary_tracker));
-            summary_worker.register_tool(mark_read_required_tool(workdir, ctx.clone()));
+        if let Err(error) = handle.send(summary_input.text).await {
+            let _ = registry.remove_service(&handle.session_id_string());
+            return Err(WorkerError::InvalidState(error.to_string()));
         }
-        summary_worker.register_tool(search_session_log_tool(compact_target_items.clone()));
-        summary_worker.register_tool(read_session_items_tool(compact_target_items));
-        summary_worker.register_tool(add_reference_tool(ctx.clone()));
-        summary_worker.register_tool(write_summary_tool(ctx.clone()));
-
-        let out = summary_worker
-            .run(summary_input.text)
-            .await
-            .map_err(WorkerError::Engine)?;
-        let mut locked_engine = out.engine;
+        match handle.wait_until_idle().await {
+            crate::internal_worker::InternalWorkerSessionStatus::Idle => {}
+            crate::internal_worker::InternalWorkerSessionStatus::Stopped => {
+                return Err(WorkerError::CompactCancelled);
+            }
+            crate::internal_worker::InternalWorkerSessionStatus::Failed => {
+                return Err(WorkerError::InvalidState(
+                    handle
+                        .protocol_snapshot()
+                        .error
+                        .unwrap_or_else(|| "compactor Internal Worker failed".into()),
+                ));
+            }
+            status => {
+                return Err(WorkerError::InvalidState(format!(
+                    "compactor Internal Worker ended in {status:?}"
+                )));
+            }
+        }
 
         // Guard: nudge the worker once more if the expected outputs
         // (summary, and any auto-read nominations when default refs
@@ -3469,10 +3584,24 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             }
         };
         if let Some(prompt) = nudge {
-            let _ = locked_engine
-                .run(prompt)
+            handle
+                .send(prompt)
                 .await
-                .map_err(WorkerError::Engine)?;
+                .map_err(|error| WorkerError::InvalidState(error.to_string()))?;
+            match handle.wait_until_idle().await {
+                crate::internal_worker::InternalWorkerSessionStatus::Idle => {}
+                crate::internal_worker::InternalWorkerSessionStatus::Stopped => {
+                    return Err(WorkerError::CompactCancelled);
+                }
+                _ => {
+                    return Err(WorkerError::InvalidState(
+                        handle
+                            .protocol_snapshot()
+                            .error
+                            .unwrap_or_else(|| "compactor Internal Worker failed".into()),
+                    ));
+                }
+            }
         }
 
         let mut final_ctx = ctx.lock().expect("compact ctx poisoned").clone();
@@ -3487,10 +3616,24 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                  {summary_max_tokens}). Rewrite it now with `write_summary`, preserving the \
                  same five sections but making it concise. Target ≈{summary_target_tokens} tokens."
             );
-            let _ = locked_engine
-                .run(prompt)
+            handle
+                .send(prompt)
                 .await
-                .map_err(WorkerError::Engine)?;
+                .map_err(|error| WorkerError::InvalidState(error.to_string()))?;
+            match handle.wait_until_idle().await {
+                crate::internal_worker::InternalWorkerSessionStatus::Idle => {}
+                crate::internal_worker::InternalWorkerSessionStatus::Stopped => {
+                    return Err(WorkerError::CompactCancelled);
+                }
+                _ => {
+                    return Err(WorkerError::InvalidState(
+                        handle
+                            .protocol_snapshot()
+                            .error
+                            .unwrap_or_else(|| "compactor Internal Worker failed".into()),
+                    ));
+                }
+            }
             final_ctx = ctx.lock().expect("compact ctx poisoned").clone();
             summary_text = final_ctx
                 .summary
@@ -3694,7 +3837,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             .lock()
             .expect("extract_pointer poisoned") = None;
 
-        Ok(new_segment_id)
+        Ok((new_segment_id, summary_text))
     }
 
     /// Build the LlmClient for the compactor Engine.
@@ -4080,6 +4223,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             input: input_text,
             cache_key: Some(self.segment_id().to_string()),
             max_turns: extract_worker_max_turns,
+            engine_configurator: None,
             features,
             required_tools: &[
                 "ShowOverview",
@@ -4092,6 +4236,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 workspace: self.workspace_context.clone(),
                 filesystem: WorkerFilesystemAuthority::None,
                 scope: Scope::empty(),
+                workdir_session: None,
             },
         };
         let internal_result = match cancel_observer {
@@ -4566,6 +4711,7 @@ where
             feature_instructions: common.feature_instructions,
             alerter: None,
             event_tx: None,
+            internal_worker_registry: None,
             in_flight: None,
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
@@ -4643,6 +4789,7 @@ where
             feature_instructions: common.feature_instructions,
             alerter: None,
             event_tx: None,
+            internal_worker_registry: None,
             in_flight: None,
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
@@ -4755,6 +4902,7 @@ where
             feature_instructions: common.feature_instructions,
             alerter: None,
             event_tx: None,
+            internal_worker_registry: None,
             in_flight: None,
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
@@ -5071,6 +5219,7 @@ where
             feature_instructions: common.feature_instructions,
             alerter: None,
             event_tx: None,
+            internal_worker_registry: None,
             in_flight: None,
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
@@ -5724,6 +5873,9 @@ pub enum WorkerError {
 
     #[error("compact worker did not produce a summary (write_summary was never called)")]
     CompactSummaryMissing,
+
+    #[error("compaction was cancelled")]
+    CompactCancelled,
 
     #[error("compact summary too large: {tokens} tokens exceeds max {max}")]
     CompactSummaryTooLarge { tokens: u64, max: u64 },

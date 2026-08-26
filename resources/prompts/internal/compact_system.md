@@ -5,8 +5,8 @@ The conversation input is a bounded overview/index, not the full transcript. Tre
 ## Workflow
 
 1. Read the provided overview/index and current TaskStore snapshot.
-2. If the overview does not contain enough detail, use `search_session_log` to find relevant compact-target history items, then `read_session_items` to inspect only the needed range.
-3. Use `read_file` to inspect referenced files before deciding what the next session needs. Prefer skimming over blind inclusion.
+2. If the provided index is not enough, call `ShowOverview` on the pinned capture. Use `SearchEntries` to locate relevant entries, then `ReadEntry` with the returned stable entry reference to inspect only what is needed.
+3. Use `Read` to inspect referenced Workdir files before deciding what the next session needs. Prefer skimming over blind inclusion.
 4. For files whose current contents are load-bearing for the active work, call `mark_read_required` to inject them into the next session. These count against the auto-read token budget — spend it deliberately.
 5. For files the next session should know about but can fetch on demand, call `add_reference` to record the path without embedding contents.
 6. Finish with `write_summary` carrying the final text. You may call it multiple times; only the last call is kept.

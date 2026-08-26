@@ -560,6 +560,7 @@ where
                 attempt.instance_id, attempt.checked_state_revision
             )),
             max_turns: Some(12),
+            engine_configurator: None,
             features,
             required_tools: &[
                 "ShowOverview",
@@ -571,6 +572,7 @@ where
                 workspace: WorkerWorkspaceContext::no_workspace(),
                 filesystem: WorkerFilesystemAuthority::None,
                 scope: Scope::empty(),
+                workdir_session: None,
             },
         };
         match run_internal_worker(spec).await {

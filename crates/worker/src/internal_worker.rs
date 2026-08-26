@@ -43,6 +43,8 @@ pub(crate) struct InternalWorkerAuthority {
     pub workspace: WorkerWorkspaceContext,
     pub filesystem: WorkerFilesystemAuthority,
     pub scope: Scope,
+    /// Provider-bound session inherited in an attenuated form from the owner.
+    pub workdir_session: Option<workdir::WorkdirSessionHandle>,
 }
 
 pub(crate) struct InternalWorkerSpec {
@@ -53,6 +55,7 @@ pub(crate) struct InternalWorkerSpec {
     pub input: String,
     pub cache_key: Option<String>,
     pub max_turns: Option<u32>,
+    pub engine_configurator: Option<Box<dyn FnOnce(&mut Engine<Box<dyn LlmClient>>) + Send>>,
     pub features: FeatureRegistryBuilder,
     pub required_tools: &'static [&'static str],
     pub authority: InternalWorkerAuthority,
@@ -102,6 +105,7 @@ where
         input,
         cache_key,
         max_turns,
+        engine_configurator,
         features,
         required_tools,
         authority,
@@ -128,7 +132,11 @@ where
     });
     engine.set_cache_key(cache_key);
     engine.set_max_turns(max_turns);
+    if let Some(configure) = engine_configurator {
+        configure(&mut engine);
+    }
     let store = EphemeralSessionStore::default();
+    let inherited_workdir_session = authority.workdir_session.clone();
     let mut worker = Worker::new(
         manifest,
         engine,
@@ -144,6 +152,9 @@ where
         identity: identity.clone(),
         history_entries: 0,
     })?;
+    if let Some(session) = inherited_workdir_session {
+        worker.bind_workdir_session(Some(session));
+    }
 
     let install_report = worker.install_features(features);
     let installed_tools = install_report.installed_tool_names();
@@ -250,7 +261,6 @@ impl InternalWorkerSessionStatus {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum InternalWorkerSessionError {
-    #[cfg(test)]
     #[error("failed to build internal Worker session: {message}")]
     Build { message: String },
     #[error("internal Worker session is busy")]
@@ -410,7 +420,6 @@ impl InternalWorkerSessionHandle {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) async fn wait_until_idle(&self) -> InternalWorkerSessionStatus {
         loop {
             let notified = self.state_changed.notified();
@@ -475,6 +484,7 @@ pub(crate) async fn spawn_internal_worker_session(
         input,
         cache_key,
         max_turns,
+        engine_configurator,
         features,
         required_tools,
         authority,
@@ -492,7 +502,11 @@ pub(crate) async fn spawn_internal_worker_session(
     });
     engine.set_cache_key(cache_key);
     engine.set_max_turns(max_turns);
+    if let Some(configure) = engine_configurator {
+        configure(&mut engine);
+    }
     let store = EphemeralSessionStore::default();
+    let inherited_workdir_session = authority.workdir_session.clone();
     let mut worker = Worker::new(
         manifest,
         engine,
@@ -505,6 +519,9 @@ pub(crate) async fn spawn_internal_worker_session(
     .map_err(|source| InternalWorkerSessionError::Build {
         message: source.to_string(),
     })?;
+    if let Some(session) = inherited_workdir_session {
+        worker.bind_workdir_session(Some(session));
+    }
     let install_report = worker.install_features(features);
     let installed_tools = install_report.installed_tool_names();
     let install_failed = install_report
@@ -537,6 +554,102 @@ pub(crate) async fn spawn_internal_worker_session(
     }
 
     spawn_prepared_internal_worker_session(worker, store, input, None).await
+}
+
+/// Prepare an observable Internal Worker from the same bounded spec as one-shot
+/// helpers, but do not start its first turn. The owner must register the returned
+/// handle before calling `send`, preserving the snapshot/live boundary.
+pub(crate) fn prepare_internal_worker_from_spec(
+    spec: InternalWorkerSpec,
+    visibility: InternalWorkerVisibility,
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<InternalWorkerSessionHandle, InternalWorkerSessionError>,
+            > + Send,
+    >,
+> {
+    Box::pin(async move {
+        let InternalWorkerSpec {
+            identity,
+            mut manifest,
+            client,
+            system_prompt,
+            input: _,
+            cache_key,
+            max_turns,
+            engine_configurator,
+            features,
+            required_tools,
+            authority,
+        } = spec;
+        manifest.worker.name = format!("internal-{}-{}", identity.kind, identity.run_id);
+        manifest.feature = Default::default();
+        manifest.plugins = Default::default();
+        manifest.mcp = Default::default();
+        manifest.skills = None;
+        manifest.compaction = None;
+        manifest.memory = None;
+
+        let mut engine = Engine::new(client).system_prompt(system_prompt);
+        engine.set_cache_key(cache_key);
+        engine.set_max_turns(max_turns);
+        if let Some(configure) = engine_configurator {
+            configure(&mut engine);
+        }
+        let store = EphemeralSessionStore::default();
+        let inherited_workdir_session = authority.workdir_session.clone();
+        let mut worker = Worker::new(
+            manifest,
+            engine,
+            store.clone(),
+            authority.workspace,
+            authority.filesystem,
+            authority.scope,
+        )
+        .await
+        .map_err(|source| InternalWorkerSessionError::Build {
+            message: source.to_string(),
+        })?;
+        if let Some(session) = inherited_workdir_session {
+            worker.bind_workdir_session(Some(session));
+        }
+        let install_report = worker.install_features(features);
+        let installed_tools = install_report.installed_tool_names();
+        let install_failed = install_report
+            .reports
+            .iter()
+            .any(|report| !report.installed);
+        let missing = required_tools
+            .iter()
+            .filter(|required| {
+                !installed_tools
+                    .iter()
+                    .any(|installed| installed == **required)
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        if install_failed || !missing.is_empty() {
+            let diagnostics = install_report
+                .reports
+                .iter()
+                .flat_map(|report| report.diagnostics.iter())
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(InternalWorkerSessionError::Build {
+                message: format!(
+                    "internal Worker feature installation failed: {diagnostics}; missing tools: {}",
+                    missing.join(", ")
+                ),
+            });
+        }
+
+        Box::pin(prepare_internal_worker_session(
+            worker, store, visibility, None, None,
+        ))
+        .await
+    })
 }
 
 fn spawn_internal_log_event_bridge(sink: SegmentLogSink, event_tx: broadcast::Sender<Event>) {
@@ -1076,12 +1189,14 @@ permission = "write"
             input: "input".to_string(),
             cache_key: Some("internal-test".to_string()),
             max_turns: Some(1),
+            engine_configurator: None,
             features: FeatureRegistryBuilder::new(),
             required_tools,
             authority: InternalWorkerAuthority {
                 workspace: WorkerWorkspaceContext::no_workspace(),
                 filesystem: WorkerFilesystemAuthority::None,
                 scope: Scope::empty(),
+                workdir_session: None,
             },
         }
     }

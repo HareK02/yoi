@@ -926,8 +926,9 @@ Deno.test("Web Console switches main and direct SubWorker views from the Tasks r
   );
   assert(
     consoleModel.includes("consoleWorkerViews") &&
-      consoleModel.includes("projection.internalWorkers.map") &&
+      consoleModel.includes('worker.worker.kind === "sub_worker"') &&
+      consoleModel.includes("children.map") &&
       consoleModel.includes("resolveConsoleWorkerView"),
-    "Worker view selection should use direct Internal Worker session identities with main fallback",
+    "Worker view selection should expose only direct SubWorker session identities with main fallback",
   );
 });

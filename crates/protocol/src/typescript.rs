@@ -4,11 +4,11 @@ use ts_rs::{Config, TS};
 
 use crate::{
     Alert, AlertLevel, AlertSource, CommandEvent, CommandSnapshot, CommandStatus, CommandStream,
-    CommandStreamSlice, CompletionEntry, CompletionKind, ErrorCode, Event, Greeting, InFlightBlock,
-    InFlightSnapshot, InFlightToolCallState, InternalWorkerKind, InternalWorkerRef,
-    InternalWorkerSnapshot, InvokeKind, MemoryWorkerEvent, Method, Permission, RewindSummary,
-    RewindTarget, RewindTargetId, RunResult, ScopeRule, Segment, TurnResult, WorkerEvent,
-    WorkerStatus,
+    CommandStreamSlice, CompactionLifecycle, CompactionLifecycleState, CompletionEntry,
+    CompletionKind, ErrorCode, Event, Greeting, InFlightBlock, InFlightSnapshot,
+    InFlightToolCallState, InternalWorkerKind, InternalWorkerRef, InternalWorkerSnapshot,
+    InvokeKind, MemoryWorkerEvent, Method, Permission, RewindSummary, RewindTarget, RewindTargetId,
+    RunResult, ScopeRule, Segment, TurnResult, WorkerEvent, WorkerStatus,
     subscription::{
         EventSubscriptionSelector, SubscriptionEvent, SubscriptionEventPayload, SubscriptionFrame,
         SubscriptionFramePayload, SubscriptionId, SubscriptionRejectionCode, SubscriptionRequest,
@@ -53,6 +53,8 @@ pub fn generated_protocol_types() -> String {
     push_decl::<CommandStreamSlice>(&cfg, &mut output);
     push_decl::<CommandSnapshot>(&cfg, &mut output);
     push_decl::<CommandEvent>(&cfg, &mut output);
+    push_decl::<CompactionLifecycleState>(&cfg, &mut output);
+    push_decl::<CompactionLifecycle>(&cfg, &mut output);
     push_decl::<ScopeRule>(&cfg, &mut output);
     push_decl::<CompletionEntry>(&cfg, &mut output);
     push_decl::<RewindTargetId>(&cfg, &mut output);
