@@ -30,8 +30,8 @@ const REPOSITORY_ACCESS_SCHEMA_SOURCE: &str = r#"{
     repository_access = {
         ...{
             ssh = {
-                credential_id = String;
-                host_trust_id = String;
+                credential = String;
+                host_trust = String;
                 access = String;
             };
         }
@@ -74,8 +74,8 @@ struct VirtualRepositoryAccess {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VirtualRepositorySshAccess {
-    credential_id: String,
-    host_trust_id: String,
+    credential: String,
+    host_trust: String,
     access: RepositoryAccessMode,
 }
 
@@ -149,8 +149,8 @@ fn project_repository_access_evaluation(
     let mut bindings = Vec::with_capacity(config.repository_access.len());
     for (repository_id, access) in config.repository_access {
         validate_identifier("repository_id", &repository_id)?;
-        validate_identifier("credential_id", &access.ssh.credential_id)?;
-        validate_identifier("host_trust_id", &access.ssh.host_trust_id)?;
+        validate_identifier("credential_id", &access.ssh.credential)?;
+        validate_identifier("host_trust_id", &access.ssh.host_trust)?;
         let repository = store
             .get_repository(workspace_id, &repository_id)?
             .ok_or_else(|| Error::InvalidInput(format!("unknown Repository `{repository_id}`")))?;
@@ -160,25 +160,25 @@ fn project_repository_access_evaluation(
             )));
         }
         let credential = secrets
-            .get_credential(workspace_id, &access.ssh.credential_id, &[])?
+            .get_credential(workspace_id, &access.ssh.credential, &[])?
             .ok_or_else(|| {
                 Error::InvalidInput(format!(
                     "unknown Repository SSH credential `{}`",
-                    access.ssh.credential_id
+                    access.ssh.credential
                 ))
             })?;
         if credential.status != "active" {
             return Err(Error::InvalidInput(format!(
                 "Repository SSH credential `{}` is not active",
-                access.ssh.credential_id
+                access.ssh.credential
             )));
         }
         let host_trust = secrets
-            .get_host_trust(workspace_id, &access.ssh.host_trust_id, &[])?
+            .get_host_trust(workspace_id, &access.ssh.host_trust, &[])?
             .ok_or_else(|| {
                 Error::InvalidInput(format!(
                     "unknown Repository SSH host trust `{}`",
-                    access.ssh.host_trust_id
+                    access.ssh.host_trust
                 ))
             })?;
         let uri = url::Url::parse(&repository.source.uri).map_err(|_| {
@@ -200,13 +200,13 @@ fn project_repository_access_evaluation(
         if hostname != host_trust.hostname || port != host_trust.port {
             return Err(Error::InvalidInput(format!(
                 "Repository `{repository_id}` SSH host does not match host trust `{}`",
-                access.ssh.host_trust_id
+                access.ssh.host_trust
             )));
         }
         bindings.push(RepositorySshAccessBinding {
             repository_id,
-            credential_id: access.ssh.credential_id,
-            host_trust_id: access.ssh.host_trust_id,
+            credential_id: access.ssh.credential,
+            host_trust_id: access.ssh.host_trust,
             access: access.ssh.access,
         });
     }
@@ -1675,8 +1675,8 @@ mod tests {
                 repository_access = {
                     remote = {
                         ssh = {
-                            credential_id = "deploy";
-                            host_trust_id = "example";
+                            credential = "deploy";
+                            host_trust = "example";
                             access = "read_only";
                         };
                     };
@@ -1697,8 +1697,8 @@ mod tests {
                 repository_access = {
                     remote = {
                         ssh = {
-                            credential_id = "missing";
-                            host_trust_id = "example";
+                            credential = "missing";
+                            host_trust = "example";
                             access = "read_only";
                         };
                     };
