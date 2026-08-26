@@ -87,6 +87,7 @@ impl Tool for BigContentTool {
         Ok(ToolOutput {
             summary: self.summary.into(),
             content: Some(self.content.clone()),
+            attachments: Vec::new(),
         })
     }
 }
