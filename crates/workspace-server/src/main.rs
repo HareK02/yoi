@@ -1122,7 +1122,7 @@ mod tests {
         assert_eq!(repositories.len(), 1);
         assert_eq!(repositories[0].repository_id, "main");
         assert_eq!(
-            repositories[0].uri,
+            repositories[0].source.uri,
             temp.path().canonicalize().unwrap().display().to_string()
         );
     }
