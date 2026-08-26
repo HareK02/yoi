@@ -785,6 +785,17 @@ struct EmptyTurnRollbackSnapshot {
     flow_runtime_state: Option<flow::FlowRuntimeState>,
 }
 
+fn active_run_checkpoint_entry(
+    active_run_turn_count: Option<usize>,
+    total_turn_count: usize,
+) -> Option<LogEntry> {
+    active_run_turn_count.map(|active_turn_count| LogEntry::ActiveRunCheckpoint {
+        ts: segment_log::now_millis(),
+        active_turn_count,
+        total_turn_count,
+    })
+}
+
 fn is_ai_materialized_item(item: &Item) -> bool {
     match item {
         Item::Message { role, .. } => *role == Role::Assistant,
@@ -2547,9 +2558,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         // `last_run_interrupted` flag; `Worker::resume` reuses the prior
         // context via a different entry point and never triggers this
         // path.
-        if self.engine.as_ref().unwrap().last_run_interrupted() {
-            self.apply_interrupt_prep()?;
-        }
+        self.prepare_interrupted_history_for_fresh_run()?;
 
         self.prepare_for_run().await?;
 
@@ -2658,6 +2667,19 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             }
         }
         out
+    }
+
+    /// Close interrupted history before a fresh user/notification run.
+    ///
+    /// Clearing the interrupted flag also ends the old logical-run budget and
+    /// must happen before `prepare_for_run`: proactive compaction checkpoints
+    /// only resumable runs, never the run this invocation is abandoning.
+    fn prepare_interrupted_history_for_fresh_run(&mut self) -> Result<(), WorkerError> {
+        if self.engine().last_run_interrupted() {
+            self.apply_interrupt_prep()?;
+            self.engine_mut().set_last_run_interrupted(false);
+        }
+        Ok(())
     }
 
     /// Stage the post-interruption cleanup at the front of worker
@@ -2775,16 +2797,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             ),
             "run_for_notification expects a non-UserSend InvokeKind; got {kind:?}"
         );
-        // This is a fresh Invoke, not an explicit resume of the interrupted
-        // turn. Close any dangling tool calls before an auto-run notification
-        // can enter `Engine::resume` and execute them again after a crash.
-        if self.engine.as_ref().unwrap().last_run_interrupted() {
-            self.apply_interrupt_prep()?;
-            // Notification delivery begins a new logical run over the
-            // prepared history rather than inheriting the abandoned run's
-            // max-turn budget.
-            self.engine_mut().set_last_run_interrupted(false);
-        }
+        self.prepare_interrupted_history_for_fresh_run()?;
         self.prepare_for_run().await?;
 
         // IDLE → active marker for the buffered notification / worker-event
@@ -3766,12 +3779,10 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             }),
         };
         let mut initial_entries = vec![entry.clone()];
-        if let Some(active_turn_count) = w.active_run_turn_count() {
-            initial_entries.push(LogEntry::ActiveRunCheckpoint {
-                ts: segment_log::now_millis(),
-                active_turn_count,
-                total_turn_count: source_turn_count,
-            });
+        if let Some(checkpoint) =
+            active_run_checkpoint_entry(w.active_run_turn_count(), source_turn_count)
+        {
+            initial_entries.push(checkpoint);
         }
         if let Some(flow_state) = self
             .flow_runtime_state
@@ -6975,6 +6986,49 @@ mod build_summary_prompt_tests {
         Segment::Text {
             content: text.into(),
         }
+    }
+
+    #[tokio::test]
+    async fn fresh_run_clears_interrupted_budget_before_pre_run_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let mut worker = Worker::new(
+            minimal_manifest(),
+            Engine::new(NoopClient),
+            store,
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        worker.ensure_segment_head().unwrap();
+        worker.engine_mut().set_last_run_interrupted(true);
+        worker.engine_mut().set_active_run_turn_count(Some(3));
+
+        worker.prepare_interrupted_history_for_fresh_run().unwrap();
+
+        assert!(!worker.engine().last_run_interrupted());
+        assert_eq!(worker.engine().active_run_turn_count(), None);
+        let checkpoint = active_run_checkpoint_entry(
+            worker.engine().active_run_turn_count(),
+            worker.engine().turn_count(),
+        );
+        assert!(checkpoint.is_none());
+
+        let mut replacement_entries = vec![LogEntry::SegmentStart {
+            ts: segment_log::now_millis(),
+            session_id: uuid::Uuid::nil(),
+            system_prompt: None,
+            config: RequestConfig::default(),
+            history: vec![],
+            forked_from: None,
+            compacted_from: None,
+        }];
+        replacement_entries.extend(checkpoint);
+        let restored = session_store::collect_state(&replacement_entries);
+        assert!(!restored.last_run_interrupted);
+        assert_eq!(restored.active_run_turn_count, None);
     }
 
     #[tokio::test]
