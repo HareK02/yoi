@@ -445,10 +445,12 @@ impl RuntimeGitCacheMaterializer {
                 access.stop();
             }
         });
-        binding.command_environment.insert(
-            "SSH_AUTH_SOCK".to_string(),
-            command_access.agent.socket.to_string_lossy().to_string(),
-        );
+        if access.access == workspace_api::RepositoryAccessMode::ReadWrite {
+            binding.command_environment.insert(
+                "SSH_AUTH_SOCK".to_string(),
+                command_access.agent.socket.to_string_lossy().to_string(),
+            );
+        }
         binding.command_environment.insert(
             "GIT_SSH_COMMAND".to_string(),
             command_access.ssh_command.to_string_lossy().to_string(),
@@ -1187,13 +1189,19 @@ impl RepositoryCommandAccess {
         let known_hosts = root.join("known_hosts");
         let ssh_command = root.join("ssh-command");
         write_owner_only(&known_hosts, ssh.known_hosts_entry.expose().as_bytes())?;
+        let agent = RepositorySshAgent::start(runtime_root, operation_id, ssh)?;
+        let read_only_guard = if ssh.access == workspace_api::RepositoryAccessMode::ReadOnly {
+            "case \" $* \" in\n  *\" -G \"*|*\" git-upload-pack \"*|*\" git-upload-archive \"*) ;;\n  *) echo 'read-only Repository SSH operation denied' >&2; exit 126 ;;\nesac\n"
+        } else {
+            ""
+        };
         let script = format!(
-            "#!/bin/sh\nexec ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=no -o IdentityFile=/dev/null -o StrictHostKeyChecking=yes -o UserKnownHostsFile={} \"$@\"\n",
+            "#!/bin/sh\n{read_only_guard}export SSH_AUTH_SOCK={}\nexec ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=no -o IdentityFile=/dev/null -o StrictHostKeyChecking=yes -o UserKnownHostsFile={} \"$@\"\n",
+            shell_quote_path(&agent.socket)?,
             shell_quote_path(&known_hosts)?,
         );
         write_owner_only(&ssh_command, script.as_bytes())?;
         set_file_owner_executable(&ssh_command)?;
-        let agent = RepositorySshAgent::start(runtime_root, operation_id, ssh)?;
         Ok(Self {
             root,
             ssh_command,
@@ -2115,10 +2123,16 @@ mod tests {
             rebound.working_directory.evidence.credential_revision,
             Some(2)
         );
-        assert_eq!(
-            rebound.command_environment()["YOI_REPOSITORY_ACCESS"],
-            "read_only"
-        );
+        let rebound_environment = rebound.command_environment();
+        assert_eq!(rebound_environment["YOI_REPOSITORY_ACCESS"], "read_only");
+        assert!(!rebound_environment.contains_key("SSH_AUTH_SOCK"));
+        let read_only_ssh = &rebound_environment["GIT_SSH_COMMAND"];
+        let denied = Command::new(read_only_ssh)
+            .args(["example.test", "git-receive-pack 'repo.git'"])
+            .env_remove("SSH_AUTH_SOCK")
+            .status()
+            .unwrap();
+        assert_eq!(denied.code(), Some(126));
         assert_eq!(
             git_stdout(
                 rebound.root(),
@@ -2144,6 +2158,7 @@ mod tests {
             rebound.command_environment()["YOI_REPOSITORY_ACCESS"],
             "read_write"
         );
+        assert!(rebound.command_environment().contains_key("SSH_AUTH_SOCK"));
         assert!(
             git_stdout(
                 rebound.root(),
