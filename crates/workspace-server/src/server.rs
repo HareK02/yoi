@@ -44,7 +44,6 @@ use webauthn_rs::prelude::{
     PublicKeyCredential, RegisterPublicKeyCredential, RequestChallengeResponse, Webauthn,
     WebauthnBuilder,
 };
-use workdir::WorkdirSessionHandle;
 use workdir::http::{WorkdirSessionOperation, WorkdirSessionOperationResult};
 use workdir::workspace::{
     MaterializerKind, WorkingDirectoryCleanupTarget,
@@ -54,6 +53,7 @@ use workdir::workspace::{
     WorkingDirectoryStatusKind, WorkingDirectorySummary, WorkspaceWorkdirSessionFence,
     WorkspaceWorkdirSessionOperationRequest,
 };
+use workdir::{CommandHandle, WorkdirSessionHandle};
 use worker::feature::builtin::{WorkerObservationSubject, WorkerObservationSubjectRef};
 use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest};
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
@@ -132,8 +132,10 @@ use crate::store::{
 use crate::workspace_catalog::{WorkspaceCatalogService, WorkspaceCreateRequest};
 use crate::{Error, Result};
 use worker_runtime::catalog::{
-    ConfigBundleRef, ProfileSelector, RepositorySelector as RuntimeRepositorySelector,
-    WorkingDirectoryClaim, WorkingDirectoryRepository, WorkingDirectoryRequest, WorkspaceApiRef,
+    ConfigBundleRef, ProfileSelector, RepositoryMaterializationContext,
+    RepositorySelector as RuntimeRepositorySelector, RepositorySshMaterializationAccess,
+    SensitiveString, WorkingDirectoryClaim, WorkingDirectoryRepository, WorkingDirectoryRequest,
+    WorkspaceApiRef,
 };
 use worker_runtime::config_bundle::ConfigBundle;
 use worker_runtime::http_server::{
@@ -335,6 +337,165 @@ static EMBEDDED_RUNTIME_REQUEST_IDENTITY: std::sync::LazyLock<
 });
 
 #[derive(Clone)]
+struct WorkdirCommandSession {
+    source: WorkdirSessionHandle,
+    provider_handle: CommandHandle,
+    delegations: Vec<workdir::WorkdirDelegationRequest>,
+}
+
+enum RegisteredWorkdirSession {
+    Attachment {
+        worker: RuntimeWorkerRef,
+        session: WorkdirSessionHandle,
+    },
+    Command {
+        worker: RuntimeWorkerRef,
+        external_handle: CommandHandle,
+        session: WorkdirCommandSession,
+    },
+}
+
+#[derive(Default)]
+struct WorkdirSessionRegistry {
+    attachments: HashMap<RuntimeWorkerRef, WorkdirSessionHandle>,
+    commands: HashMap<(RuntimeWorkerRef, CommandHandle), WorkdirCommandSession>,
+}
+
+impl WorkdirSessionRegistry {
+    fn attachment(&self, worker: &RuntimeWorkerRef) -> Option<WorkdirSessionHandle> {
+        self.attachments.get(worker).cloned()
+    }
+
+    fn insert_attachment(
+        &mut self,
+        worker: RuntimeWorkerRef,
+        session: WorkdirSessionHandle,
+    ) -> Option<WorkdirSessionHandle> {
+        self.attachments.insert(worker, session)
+    }
+
+    fn remove_attachment(&mut self, worker: &RuntimeWorkerRef) -> Option<WorkdirSessionHandle> {
+        self.attachments.remove(worker)
+    }
+
+    fn register_command(
+        &mut self,
+        worker: RuntimeWorkerRef,
+        source: WorkdirSessionHandle,
+        provider_handle: CommandHandle,
+        delegations: Vec<workdir::WorkdirDelegationRequest>,
+    ) -> CommandHandle {
+        let external_handle = loop {
+            let candidate = CommandHandle(Uuid::now_v7().to_string());
+            if !self
+                .commands
+                .contains_key(&(worker.clone(), candidate.clone()))
+            {
+                break candidate;
+            }
+        };
+        self.commands.insert(
+            (worker, external_handle.clone()),
+            WorkdirCommandSession {
+                source,
+                provider_handle,
+                delegations,
+            },
+        );
+        external_handle
+    }
+
+    fn command(
+        &self,
+        worker: &RuntimeWorkerRef,
+        external_handle: &CommandHandle,
+    ) -> Option<WorkdirCommandSession> {
+        self.commands
+            .get(&(worker.clone(), external_handle.clone()))
+            .cloned()
+    }
+
+    fn take_worker(&mut self, worker: &RuntimeWorkerRef) -> Vec<RegisteredWorkdirSession> {
+        let mut sessions = Vec::new();
+        if let Some(session) = self.attachments.remove(worker) {
+            sessions.push(RegisteredWorkdirSession::Attachment {
+                worker: worker.clone(),
+                session,
+            });
+        }
+        let command_handles = self
+            .commands
+            .keys()
+            .filter(|(owner, _)| owner == worker)
+            .map(|(_, handle)| handle.clone())
+            .collect::<Vec<_>>();
+        for external_handle in command_handles {
+            if let Some(session) = self
+                .commands
+                .remove(&(worker.clone(), external_handle.clone()))
+            {
+                sessions.push(RegisteredWorkdirSession::Command {
+                    worker: worker.clone(),
+                    external_handle,
+                    session,
+                });
+            }
+        }
+        sessions
+    }
+
+    fn restore(&mut self, registered: RegisteredWorkdirSession) {
+        match registered {
+            RegisteredWorkdirSession::Attachment { worker, session } => {
+                self.attachments.insert(worker, session);
+            }
+            RegisteredWorkdirSession::Command {
+                worker,
+                external_handle,
+                session,
+            } => {
+                self.commands.insert((worker, external_handle), session);
+            }
+        }
+    }
+}
+
+async fn close_worker_workdir_sessions(
+    registry: &Arc<Mutex<WorkdirSessionRegistry>>,
+    worker: &RuntimeWorkerRef,
+) -> std::result::Result<(), String> {
+    let registered = registry
+        .lock()
+        .map_err(|_| "Workdir session registry was poisoned".to_string())?
+        .take_worker(worker);
+    let mut failed = Vec::new();
+    let mut errors = Vec::new();
+    for item in registered {
+        let session = match &item {
+            RegisteredWorkdirSession::Attachment { session, .. } => session,
+            RegisteredWorkdirSession::Command { session, .. } => &session.source,
+        };
+        if let Err(error) = session.close().await {
+            errors.push(error.to_string());
+            failed.push(item);
+        }
+    }
+    if !failed.is_empty() {
+        let mut sessions = registry
+            .lock()
+            .map_err(|_| "Workdir session registry was poisoned".to_string())?;
+        for item in failed {
+            sessions.restore(item);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+#[derive(Clone)]
 pub struct WorkspaceApi {
     pub(crate) config: ServerConfig,
     pub(crate) store: Arc<dyn ControlPlaneStore>,
@@ -350,7 +511,7 @@ pub struct WorkspaceApi {
     observation_proxy: BackendObservationProxy,
     runtime_subscription_broker: RuntimeSubscriptionBroker,
     resource_broker: BackendResourceBroker,
-    workdir_sessions: Arc<Mutex<HashMap<RuntimeWorkerRef, WorkdirSessionHandle>>>,
+    workdir_sessions: Arc<Mutex<WorkdirSessionRegistry>>,
     workdir_session_locks: Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<tokio::sync::Mutex<()>>>>>,
     worker_remove_locks: Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<tokio::sync::Mutex<()>>>>>,
     worker_control_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
@@ -376,7 +537,7 @@ struct WorkspaceWorkerRemoveExecutor {
     workspace_id: String,
     store: Arc<dyn ControlPlaneStore>,
     runtime: Weak<RuntimeRegistry>,
-    workdir_sessions: Arc<Mutex<HashMap<RuntimeWorkerRef, WorkdirSessionHandle>>>,
+    workdir_sessions: Arc<Mutex<WorkdirSessionRegistry>>,
     workdir_session_locks: Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<tokio::sync::Mutex<()>>>>>,
     worker_remove_locks: Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<tokio::sync::Mutex<()>>>>>,
     worker_control_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
@@ -547,31 +708,21 @@ impl WorkspaceWorkerRemoveExecutor {
             } else {
                 prepared
             };
-            let session = {
-                self.workdir_sessions
-                    .lock()
-                    .map_err(|_| "Workdir session registry was poisoned".to_string())?
-                    .get(&target)
-                    .cloned()
-            };
-            if let Some(session) = session {
-                if session.close().await.is_err() {
-                    let _ = self.store.fail_worker_removal(
-                        &self.workspace_id,
-                        &prepared.plan.operation_id,
-                        &prepared.plan.input_fingerprint,
-                        "workdir_session_close_failed",
-                    );
-                    return Ok(worker_remove_error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "attachment_close_failed",
-                        "Worker Workdir session could not be closed; removal can be retried",
-                    ));
-                }
-                self.workdir_sessions
-                    .lock()
-                    .map_err(|_| "Workdir session registry was poisoned".to_string())?
-                    .remove(&target);
+            if close_worker_workdir_sessions(&self.workdir_sessions, &target)
+                .await
+                .is_err()
+            {
+                let _ = self.store.fail_worker_removal(
+                    &self.workspace_id,
+                    &prepared.plan.operation_id,
+                    &prepared.plan.input_fingerprint,
+                    "workdir_session_close_failed",
+                );
+                return Ok(worker_remove_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "attachment_close_failed",
+                    "Worker Workdir sessions could not be closed; removal can be retried",
+                ));
             }
             if self
                 .store
@@ -653,30 +804,21 @@ impl WorkspaceWorkerRemoveExecutor {
             Err(error) => return Ok(worker_retention_error_response(error)),
         };
 
-        let session = self
-            .workdir_sessions
-            .lock()
-            .map_err(|_| "Workdir session registry was poisoned".to_string())?
-            .get(&target)
-            .cloned();
-        if let Some(session) = session {
-            if session.close().await.is_err() {
-                let _ = self.store.fail_worker_removal(
-                    &self.workspace_id,
-                    &plan.operation_id,
-                    &plan.input_fingerprint,
-                    "workdir_session_close_failed",
-                );
-                return Ok(worker_remove_error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "attachment_close_failed",
-                    "Worker Workdir session could not be closed; removal can be retried",
-                ));
-            }
-            self.workdir_sessions
-                .lock()
-                .map_err(|_| "Workdir session registry was poisoned".to_string())?
-                .remove(&target);
+        if close_worker_workdir_sessions(&self.workdir_sessions, &target)
+            .await
+            .is_err()
+        {
+            let _ = self.store.fail_worker_removal(
+                &self.workspace_id,
+                &plan.operation_id,
+                &plan.input_fingerprint,
+                "workdir_session_close_failed",
+            );
+            return Ok(worker_remove_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "attachment_close_failed",
+                "Worker Workdir sessions could not be closed; removal can be retried",
+            ));
         }
 
         if let Err(_) = self.store.detach_worker_workdir(
@@ -1236,6 +1378,35 @@ async fn seed_test_registered_workspace(
     Ok(())
 }
 
+fn take_new_workdir_repository_access(
+    request: &mut WorkerSpawnRequest,
+) -> ApiResult<Option<worker_runtime::catalog::WorkingDirectoryRepositoryAccessRequest>> {
+    let Some(working_directory) = request.resolved_working_directory_request.as_mut() else {
+        return Ok(None);
+    };
+    let Some(materialization) = working_directory.materialization.as_mut() else {
+        return Ok(None);
+    };
+    if materialization.ssh.is_none() {
+        return Ok(None);
+    }
+    let working_directory_id = working_directory
+        .backend_workdir_id
+        .clone()
+        .ok_or_else(|| {
+            Error::Config(
+                "repository access authorization requires a Backend WorkingDirectory id"
+                    .to_string(),
+            )
+        })?;
+    let access = worker_runtime::catalog::WorkingDirectoryRepositoryAccessRequest {
+        working_directory_id,
+        materialization: materialization.clone(),
+    };
+    materialization.ssh = None;
+    Ok(Some(access))
+}
+
 impl WorkspaceApi {
     pub fn with_config_schema_provider(
         mut self,
@@ -1401,7 +1572,7 @@ impl WorkspaceApi {
             observation_proxy,
             runtime_subscription_broker,
             resource_broker,
-            workdir_sessions: Arc::new(Mutex::new(HashMap::new())),
+            workdir_sessions: Arc::new(Mutex::new(WorkdirSessionRegistry::default())),
             workdir_session_locks: Arc::new(Mutex::new(HashMap::new())),
             worker_remove_locks: Arc::new(Mutex::new(HashMap::new())),
             worker_control_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -1443,6 +1614,23 @@ impl WorkspaceApi {
         self.validate_worker_spawn_repository_scope(&request)?;
         let workspace_api = self.workspace_api_ref(runtime_id);
         request.resolved_workspace_api = Some(workspace_api.clone());
+        if let Some(access) = take_new_workdir_repository_access(&mut request)? {
+            self.runtime
+                .authorize_working_directory_repository_access(runtime_id, access)
+                .map_err(RuntimeRegistryError::into_error)?;
+        }
+        if let Some(working_directory) = request.resolved_working_directory.as_ref()
+            && let Some(access) = repository_access_request_for_workdir(
+                self,
+                runtime_id,
+                &working_directory.working_directory_id,
+                &format!("worker-spawn:{}", WorkerId::now_v7()),
+            )?
+        {
+            self.runtime
+                .authorize_working_directory_repository_access(runtime_id, access)
+                .map_err(RuntimeRegistryError::into_error)?;
+        }
         let attachment_reservation =
             request
                 .resolved_working_directory
@@ -1658,6 +1846,22 @@ impl WorkspaceApi {
         &self,
         worker: &RuntimeWorkerRef,
     ) -> ApiResult<WorkerRestoreResult> {
+        if let Some(link) = self
+            .store
+            .list_worker_workdir_links(&self.config.workspace_id, worker)?
+            .into_iter()
+            .find(|link| link.unlinked_at.is_none())
+            && let Some(access) = repository_access_request_for_workdir(
+                self,
+                &worker.runtime_id,
+                &link.workdir_id,
+                &format!("worker-restore:{}", WorkerId::now_v7()),
+            )?
+        {
+            self.runtime
+                .authorize_working_directory_repository_access(&worker.runtime_id, access)
+                .map_err(RuntimeRegistryError::into_error)?;
+        }
         let binding = self
             .runtime
             .replace_worker_workspace_api(worker, self.workspace_api_ref(&worker.runtime_id))
@@ -6450,15 +6654,6 @@ async fn open_current_worker_workdir_session_locked(
     worker: &RuntimeWorkerRef,
     link: &WorkerWorkdirLinkRecord,
 ) -> Result<WorkdirSessionHandle> {
-    if let Some(session) = api
-        .workdir_sessions
-        .lock()
-        .expect("Workdir session registry lock poisoned")
-        .get(worker)
-        .cloned()
-    {
-        return Ok(session);
-    }
     let workdir = api
         .store
         .list_workdir_registry(&api.config.workspace_id, 10_000)?
@@ -6472,30 +6667,52 @@ async fn open_current_worker_workdir_session_locked(
                 link.workdir_id
             ),
         })?;
+    let repository = api
+        .require_configured_workspace_repository(&workdir.repository_id)
+        .map_err(|error| error.error)?;
+    let repository_requires_access =
+        repository.source.kind == workspace_api::RepositorySourceKind::Ssh;
+    if repository_requires_access {
+        close_current_worker_attachment_session_locked(api, worker).await?;
+        let access = repository_access_request_for_workdir(
+            api,
+            &workdir.runtime_id,
+            &workdir.workdir_id,
+            &format!(
+                "workdir-session:{}:{}:{}",
+                worker.runtime_id, worker.worker_id, workdir.workdir_id
+            ),
+        )
+        .map_err(|error| error.error)?
+        .ok_or_else(|| Error::RuntimeOperationFailed {
+            runtime_id: workdir.runtime_id.clone(),
+            code: "working_directory_remote_repository_access_required".to_string(),
+            message: "current Repository SSH access authority is unavailable".to_string(),
+        })?;
+        api.runtime
+            .authorize_working_directory_repository_access(&workdir.runtime_id, access)
+            .map_err(RuntimeRegistryError::into_error)?;
+    } else if let Some(session) = api
+        .workdir_sessions
+        .lock()
+        .expect("Workdir session registry lock poisoned")
+        .attachment(worker)
+    {
+        return Ok(session);
+    }
     let owner_worker_id = runtime_local_owner_worker_id(worker, &workdir.runtime_id);
     let session = api
         .runtime
         .open_workdir_session(&workdir.runtime_id, &workdir.workdir_id, owner_worker_id)
         .await
         .map_err(|error| error.into_error())?;
-    let key = worker.clone();
-    let (selected, unused) = {
-        let mut sessions = api
-            .workdir_sessions
-            .lock()
-            .expect("Workdir session registry lock poisoned");
-        match sessions.entry(key) {
-            std::collections::hash_map::Entry::Occupied(entry) => {
-                (entry.get().clone(), Some(session))
-            }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(session.clone());
-                (session, None)
-            }
-        }
-    };
-    if let Some(unused) = unused {
-        unused
+    let replaced = api
+        .workdir_sessions
+        .lock()
+        .expect("Workdir session registry lock poisoned")
+        .insert_attachment(worker.clone(), session.clone());
+    if let Some(replaced) = replaced {
+        replaced
             .close()
             .await
             .map_err(|error| Error::RuntimeOperationFailed {
@@ -6504,35 +6721,45 @@ async fn open_current_worker_workdir_session_locked(
                 message: error.to_string(),
             })?;
     }
-    Ok(selected)
+    Ok(session)
+}
+
+async fn close_current_worker_attachment_session_locked(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+) -> Result<()> {
+    let session = api
+        .workdir_sessions
+        .lock()
+        .expect("Workdir session registry lock poisoned")
+        .remove_attachment(worker);
+    if let Some(session) = session {
+        if let Err(error) = session.close().await {
+            api.workdir_sessions
+                .lock()
+                .expect("Workdir session registry lock poisoned")
+                .insert_attachment(worker.clone(), session);
+            return Err(Error::RuntimeOperationFailed {
+                runtime_id: worker.runtime_id.clone(),
+                code: "workdir_session_close_failed".to_string(),
+                message: error.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 async fn close_current_worker_session_locked(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
 ) -> Result<()> {
-    let key = worker.clone();
-    let session = api
-        .workdir_sessions
-        .lock()
-        .expect("Workdir session registry lock poisoned")
-        .get(&key)
-        .cloned();
-    if let Some(session) = session {
-        session
-            .close()
-            .await
-            .map_err(|error| Error::RuntimeOperationFailed {
-                runtime_id: worker.runtime_id.clone(),
-                code: "workdir_session_close_failed".to_string(),
-                message: error.to_string(),
-            })?;
-        api.workdir_sessions
-            .lock()
-            .expect("Workdir session registry lock poisoned")
-            .remove(&key);
-    }
-    Ok(())
+    close_worker_workdir_sessions(&api.workdir_sessions, worker)
+        .await
+        .map_err(|message| Error::RuntimeOperationFailed {
+            runtime_id: worker.runtime_id.clone(),
+            code: "workdir_session_close_failed".to_string(),
+            message,
+        })
 }
 
 async fn scoped_attach_current_worker_workdir(
@@ -6642,6 +6869,16 @@ fn validate_current_worker_workdir_session_fence(
     }
 }
 
+fn validated_current_worker_attachment(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    expected_session_fence: Option<&str>,
+) -> ApiResult<WorkerWorkdirLinkRecord> {
+    let link = current_worker_active_attachment(api, worker)?;
+    validate_current_worker_workdir_session_fence(&link, expected_session_fence)?;
+    Ok(link)
+}
+
 async fn scoped_execute_current_worker_workdir_operation(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
@@ -6650,29 +6887,175 @@ async fn scoped_execute_current_worker_workdir_operation(
 ) -> ApiResult<Json<WorkdirSessionOperationResult>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let worker = current_worker_identity(&api, &path.workspace_id, &headers)?;
-    let session_lock = current_worker_session_lock(&api, &worker);
-    let _session_guard = session_lock.lock().await;
-    let link = current_worker_active_attachment(&api, &worker)?;
-    validate_current_worker_workdir_session_fence(
-        &link,
-        request.expected_session_fence.as_deref(),
-    )?;
-    let source = open_current_worker_workdir_session_locked(&api, &worker, &link).await?;
-    let applied = workdir::apply_delegation_chain(source, request.delegations)
+    let expected_session_fence = request.expected_session_fence;
+    let delegations = request.delegations;
+    let result = match request.operation {
+        WorkdirSessionOperation::CommandStart(command) => {
+            let session_lock = current_worker_session_lock(&api, &worker);
+            let _session_guard = session_lock.lock().await;
+            let link = validated_current_worker_attachment(
+                &api,
+                &worker,
+                expected_session_fence.as_deref(),
+            )?;
+            let source = open_current_worker_workdir_session_locked(&api, &worker, &link).await?;
+            let applied =
+                apply_current_worker_delegations(&worker, source.clone(), delegations.clone())
+                    .await?;
+            let provider_handle = applied
+                .scoped_session
+                .start_command(command)
+                .await
+                .map_err(|error| current_worker_workdir_operation_error(&worker, error))?;
+            let registered_source = api
+                .workdir_sessions
+                .lock()
+                .expect("Workdir session registry lock poisoned")
+                .remove_attachment(&worker)
+                .ok_or_else(|| Error::RuntimeOperationFailed {
+                    runtime_id: worker.runtime_id.clone(),
+                    code: "workdir_session_registration_failed".to_string(),
+                    message: "started command session was not registered as the active attachment session"
+                        .to_string(),
+                })?;
+            let external_handle = api
+                .workdir_sessions
+                .lock()
+                .expect("Workdir session registry lock poisoned")
+                .register_command(
+                    worker.clone(),
+                    registered_source,
+                    provider_handle,
+                    delegations,
+                );
+            WorkdirSessionOperationResult::CommandStart(external_handle)
+        }
+        WorkdirSessionOperation::CommandStatus(external_handle) => {
+            let (session, provider_handle) = current_worker_command_session(
+                &api,
+                &worker,
+                &external_handle,
+                &delegations,
+                expected_session_fence.as_deref(),
+            )
+            .await?;
+            session
+                .scoped_session
+                .command_status(provider_handle)
+                .await
+                .map(WorkdirSessionOperationResult::CommandStatus)
+                .map_err(|error| current_worker_workdir_operation_error(&worker, error))?
+        }
+        WorkdirSessionOperation::CommandOutput(mut output) => {
+            let (session, provider_handle) = current_worker_command_session(
+                &api,
+                &worker,
+                &output.handle,
+                &delegations,
+                expected_session_fence.as_deref(),
+            )
+            .await?;
+            output.handle = provider_handle;
+            session
+                .scoped_session
+                .command_output(output)
+                .await
+                .map(WorkdirSessionOperationResult::CommandOutput)
+                .map_err(|error| current_worker_workdir_operation_error(&worker, error))?
+        }
+        WorkdirSessionOperation::CommandCancel(external_handle) => {
+            let (session, provider_handle) = current_worker_command_session(
+                &api,
+                &worker,
+                &external_handle,
+                &delegations,
+                expected_session_fence.as_deref(),
+            )
+            .await?;
+            session
+                .scoped_session
+                .cancel_command(provider_handle)
+                .await
+                .map(|()| WorkdirSessionOperationResult::CommandCancel)
+                .map_err(|error| current_worker_workdir_operation_error(&worker, error))?
+        }
+        operation @ (WorkdirSessionOperation::Stat(_)
+        | WorkdirSessionOperation::Read(_)
+        | WorkdirSessionOperation::Write(_)
+        | WorkdirSessionOperation::Edit(_)
+        | WorkdirSessionOperation::List(_)
+        | WorkdirSessionOperation::Glob(_)
+        | WorkdirSessionOperation::Grep(_)) => {
+            let session_lock = current_worker_session_lock(&api, &worker);
+            let _session_guard = session_lock.lock().await;
+            let link = validated_current_worker_attachment(
+                &api,
+                &worker,
+                expected_session_fence.as_deref(),
+            )?;
+            let source = open_current_worker_workdir_session_locked(&api, &worker, &link).await?;
+            let applied = apply_current_worker_delegations(&worker, source, delegations).await?;
+            execute_workdir_session_operation(&applied.scoped_session, operation)
+                .await
+                .map_err(|error| current_worker_workdir_operation_error(&worker, error))?
+        }
+    };
+    Ok(Json(result))
+}
+
+async fn apply_current_worker_delegations(
+    worker: &RuntimeWorkerRef,
+    source: WorkdirSessionHandle,
+    delegations: Vec<workdir::WorkdirDelegationRequest>,
+) -> Result<workdir::AppliedWorkdirDelegation> {
+    workdir::apply_delegation_chain(source, delegations)
         .await
         .map_err(|error| Error::RuntimeOperationFailed {
             runtime_id: worker.runtime_id.clone(),
             code: "workdir_session_delegation_failed".to_string(),
             message: error.to_string(),
+        })
+}
+
+async fn current_worker_command_session(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    external_handle: &CommandHandle,
+    delegations: &[workdir::WorkdirDelegationRequest],
+    expected_session_fence: Option<&str>,
+) -> ApiResult<(workdir::AppliedWorkdirDelegation, CommandHandle)> {
+    let _link = validated_current_worker_attachment(api, worker, expected_session_fence)?;
+    let command = api
+        .workdir_sessions
+        .lock()
+        .expect("Workdir session registry lock poisoned")
+        .command(worker, external_handle)
+        .ok_or_else(|| {
+            ApiError::from(current_worker_workdir_operation_error(
+                worker,
+                workdir::WorkdirError::UnknownCommand(external_handle.0.clone()),
+            ))
         })?;
-    let result = execute_workdir_session_operation(&applied.scoped_session, request.operation)
-        .await
-        .map_err(|error| Error::RuntimeOperationFailed {
-            runtime_id: worker.runtime_id.clone(),
-            code: "workdir_session_operation_failed".to_string(),
-            message: error.to_string(),
-        })?;
-    Ok(Json(result))
+    if command.delegations != delegations {
+        return Err(Error::WorkdirAttachmentConflict(
+            "command lifecycle delegation differs from CommandStart".to_string(),
+        )
+        .into());
+    }
+    let session =
+        apply_current_worker_delegations(worker, command.source, command.delegations).await?;
+    Ok((session, command.provider_handle))
+}
+
+fn current_worker_workdir_operation_error(
+    worker: &RuntimeWorkerRef,
+    error: workdir::WorkdirError,
+) -> Error {
+    Error::RuntimeOperationFailed {
+        runtime_id: worker.runtime_id.clone(),
+        code: "workdir_session_operation_failed".to_string(),
+        message: error.to_string(),
+    }
 }
 
 async fn execute_workdir_session_operation(
@@ -8453,6 +8836,43 @@ async fn create_workspace_working_directory(
         )
         .into());
     }
+    if let Some(existing) = api
+        .config_store
+        .load_workdir_create_operation(workspace_id, &operation_id)?
+    {
+        working_directory_request.repository.selector =
+            crate::workdir_create_operations::selector_for_retry(
+                request.selector.as_deref(),
+                existing.selector.as_deref(),
+                working_directory_request.repository.selector.as_deref(),
+            )
+            .map(RuntimeRepositorySelector::from);
+        if let (Some(kind), Some(uri), Some(revision), Some(fingerprint)) = (
+            existing.source_kind.as_deref(),
+            existing.source_uri.clone(),
+            existing.source_revision,
+            existing.source_fingerprint.clone(),
+        ) {
+            let kind = match kind {
+                "local_path" => workspace_api::RepositorySourceKind::LocalPath,
+                "file" => workspace_api::RepositorySourceKind::File,
+                "https" => workspace_api::RepositorySourceKind::Https,
+                "http" => workspace_api::RepositorySourceKind::Http,
+                "ssh" => workspace_api::RepositorySourceKind::Ssh,
+                "invalid" => workspace_api::RepositorySourceKind::Invalid,
+                _ => {
+                    return Err(settings_bad_request(
+                        "working_directory_repository_source_invalid",
+                        "persisted Workdir create Repository source kind is invalid",
+                    ));
+                }
+            };
+            working_directory_request.repository.source =
+                workspace_api::RepositorySource { kind, uri };
+            working_directory_request.repository.source_revision = revision;
+            working_directory_request.repository.source_fingerprint = fingerprint;
+        }
+    }
     let selector = working_directory_request
         .repository
         .selector
@@ -8462,6 +8882,8 @@ async fn create_workspace_working_directory(
         &request.repository_id,
         selector.as_deref(),
         requested_runtime_id.as_deref(),
+        &working_directory_request.repository.source_fingerprint,
+        working_directory_request.repository.source_revision,
     );
     let reserved = if let Some(existing) = api
         .config_store
@@ -8515,6 +8937,28 @@ async fn create_workspace_working_directory(
                 resolved_runtime_id,
                 config_revision: runtime_projection.config_revision,
                 config_projection_digest: runtime_projection.projection_digest,
+                source_kind: Some(
+                    working_directory_request
+                        .repository
+                        .source
+                        .kind
+                        .as_str()
+                        .to_string(),
+                ),
+                source_uri: Some(working_directory_request.repository.source.uri.clone()),
+                source_revision: Some(working_directory_request.repository.source_revision),
+                source_fingerprint: Some(
+                    working_directory_request
+                        .repository
+                        .source_fingerprint
+                        .clone(),
+                ),
+                credential_id: None,
+                credential_revision: None,
+                host_trust_id: None,
+                host_trust_revision: None,
+                repository_access_mode: None,
+                cache_generation: 0,
                 working_directory_id: next_backend_workdir_id(&request.repository_id),
                 state: "pending".to_string(),
                 failure: None,
@@ -8582,6 +9026,22 @@ async fn create_workspace_working_directory(
         ));
     }
 
+    if let Err(error) = authorize_repository_materialization_operation(
+        api,
+        &reserved,
+        &request_fingerprint,
+        &mut working_directory_request,
+    ) {
+        api.config_store.finish_workdir_create_operation(
+            workspace_id,
+            &operation_id,
+            &request_fingerprint,
+            false,
+            Some("working_directory_remote_repository_access_required"),
+            &now_registry_timestamp(),
+        )?;
+        return Err(error);
+    }
     working_directory_request.backend_workdir_id = Some(reserved.working_directory_id.clone());
     let existing = match api.runtime.working_directory(
         &reserved.resolved_runtime_id,
@@ -10820,8 +11280,9 @@ fn working_directory_request_from_repository(
                 })
                 .or_else(|| Some(RuntimeRepositorySelector::from("HEAD"))),
         },
-        materializer: MaterializerKind::LocalGitWorktree,
+        materializer: MaterializerKind::RuntimeGitCache,
         backend_workdir_id: None,
+        materialization: None,
     }
 }
 
@@ -11348,7 +11809,7 @@ async fn scoped_post_internal_runtime_resource_fetch(
         ));
     }
     api.resource_broker
-        .fetch_profile_source_archive(request)
+        .fetch_resource(request)
         .map(Json)
         .map_err(|error| (backend_resource_error_status(&error), Json(error)))
 }
@@ -11915,14 +12376,31 @@ async fn create_runtime_worker(
         .as_ref()
         .map(|working_directory| configured_working_directory_request(&api, working_directory))
         .transpose()?;
+    let repository_operation_id = request
+        .resolved_control_operation
+        .as_ref()
+        .map(|operation| operation.operation_id.clone())
+        .or_else(|| {
+            request
+                .ticket_assignment
+                .as_ref()
+                .map(|assignment| assignment.operation_id.clone())
+        });
     let prepared_workdir_id = if let Some(working_directory_request) =
         request.resolved_working_directory_request.as_mut()
     {
-        Some(upsert_pending_backend_workdir(
+        let workdir_id =
+            upsert_pending_backend_workdir(&api, &runtime_id, working_directory_request)?;
+        let operation_id = repository_operation_id
+            .clone()
+            .unwrap_or_else(|| format!("worker-spawn-workdir:{workdir_id}"));
+        authorize_worker_spawn_workdir_materialization(
             &api,
             &runtime_id,
+            &operation_id,
             working_directory_request,
-        )?)
+        )?;
+        Some(workdir_id)
     } else {
         request
             .resolved_working_directory
@@ -13591,8 +14069,11 @@ fn upsert_pending_backend_workdir(
             .as_ref()
             .map(|selector| selector.as_ref().to_string()),
         creation_ref: None,
+        creation_tree: None,
         current_selector: None,
         current_ref: None,
+        current_tree: None,
+        observed_at_epoch_seconds: None,
         materialization_status: "pending".to_string(),
         cleanliness: "unknown".to_string(),
         created_at: timestamp.clone(),
@@ -13738,8 +14219,11 @@ fn workdir_record_from_summary(
         repository_id: summary.repository_id.clone(),
         creation_selector: summary.creation_selector.clone(),
         creation_ref: summary.creation_ref.clone(),
+        creation_tree: summary.creation_tree.clone(),
         current_selector: summary.current_selector.clone(),
         current_ref: summary.current_ref.clone(),
+        current_tree: summary.current_tree.clone(),
+        observed_at_epoch_seconds: summary.observed_at_epoch_seconds,
         materialization_status: match summary.status {
             WorkingDirectoryStatusKind::Active => "present",
             WorkingDirectoryStatusKind::CleanupPending => "pending",
@@ -13776,6 +14260,21 @@ fn preserve_workdir_identity_for_corrupted_summary(
     if record.creation_ref.is_none() {
         record.creation_ref = existing.creation_ref.clone();
     }
+    if record.creation_tree.is_none() {
+        record.creation_tree = existing.creation_tree.clone();
+    }
+    if record.current_selector.is_none() {
+        record.current_selector = existing.current_selector.clone();
+    }
+    if record.current_ref.is_none() {
+        record.current_ref = existing.current_ref.clone();
+    }
+    if record.current_tree.is_none() {
+        record.current_tree = existing.current_tree.clone();
+    }
+    if record.observed_at_epoch_seconds.is_none() {
+        record.observed_at_epoch_seconds = existing.observed_at_epoch_seconds;
+    }
 }
 
 fn workdir_summary_from_record(record: &WorkdirRegistryRecord) -> WorkingDirectorySummary {
@@ -13792,11 +14291,14 @@ fn workdir_summary_from_record(record: &WorkdirRegistryRecord) -> WorkingDirecto
         repository_id: record.repository_id.clone(),
         creation_selector: record.creation_selector.clone(),
         creation_ref: record.creation_ref.clone(),
+        creation_tree: record.creation_tree.clone(),
         current_selector: record.current_selector.clone(),
         current_ref: record.current_ref.clone(),
-        materializer_kind: MaterializerKind::LocalGitWorktree,
+        current_tree: record.current_tree.clone(),
+        observed_at_epoch_seconds: record.observed_at_epoch_seconds,
+        materializer_kind: MaterializerKind::RuntimeGitCache,
         cleanup_target: Some(WorkingDirectoryCleanupTarget {
-            kind: "local_git_worktree".to_string(),
+            kind: "runtime_git_cache_worktree".to_string(),
             working_directory_id: record.workdir_id.clone(),
             repository_id: record.repository_id.clone(),
         }),
@@ -13901,6 +14403,283 @@ fn validate_working_directory_claim_for_browser(
     Ok(())
 }
 
+fn authorize_repository_materialization_operation(
+    api: &WorkspaceApi,
+    operation: &WorkdirCreateOperationRecord,
+    request_fingerprint: &str,
+    request: &mut WorkingDirectoryRequest,
+) -> ApiResult<()> {
+    let context = if request.repository.source.kind == workspace_api::RepositorySourceKind::Ssh {
+        if let (
+            Some(credential_id),
+            Some(credential_revision),
+            Some(host_trust_id),
+            Some(host_trust_revision),
+            Some(access_mode),
+        ) = (
+            operation.credential_id.as_deref(),
+            operation.credential_revision,
+            operation.host_trust_id.as_deref(),
+            operation.host_trust_revision,
+            operation.repository_access_mode.as_deref(),
+        ) {
+            let lease = api
+                .repository_secrets
+                .lease_ssh_materialization_access_revision(
+                    &api.config.workspace_id,
+                    credential_id,
+                    credential_revision,
+                    host_trust_id,
+                    host_trust_revision,
+                )?;
+            let access = match access_mode {
+                "read_only" => workspace_api::RepositoryAccessMode::ReadOnly,
+                "read_write" => workspace_api::RepositoryAccessMode::ReadWrite,
+                _ => {
+                    return Err(settings_bad_request(
+                        "working_directory_repository_access_invalid",
+                        "persisted Repository access mode is invalid",
+                    ));
+                }
+            };
+            let expires_at_epoch_seconds = repository_access_expiry();
+            let secret_resource = api
+                .resource_broker
+                .issue_repository_ssh_access_handle(
+                    &api.config.workspace_id,
+                    &operation.resolved_runtime_id,
+                    format!("repository-ssh-access:{}", operation.operation_id),
+                    format!(
+                        "credential:{}:host-trust:{}",
+                        lease.credential_revision, lease.host_trust_revision
+                    ),
+                    i64::try_from(expires_at_epoch_seconds).unwrap_or(i64::MAX),
+                    worker_runtime::resource::RepositorySshAccessSecret {
+                        private_key: lease.private_key.as_str().to_string(),
+                        known_hosts_entry: lease.known_hosts_entry.clone(),
+                    },
+                )
+                .map_err(|_| {
+                    settings_bad_request(
+                        "working_directory_repository_access_resource_failed",
+                        "Repository SSH access resource could not be issued",
+                    )
+                })?;
+            RepositoryMaterializationContext {
+                workspace_id: api.config.workspace_id.clone(),
+                runtime_id: operation.resolved_runtime_id.clone(),
+                operation_id: operation.operation_id.clone(),
+                config_revision: operation.config_revision,
+                config_projection_digest: operation.config_projection_digest.clone(),
+                cache_generation: operation.cache_generation,
+                ssh: Some(RepositorySshMaterializationAccess {
+                    credential_id: lease.credential_id,
+                    credential_revision: lease.credential_revision,
+                    host_trust_id: lease.host_trust_id,
+                    host_trust_revision: lease.host_trust_revision,
+                    access,
+                    expires_at_epoch_seconds,
+                    repository_id: request.repository.id.clone(),
+                    repository_source_fingerprint: request.repository.source_fingerprint.clone(),
+                    repository_uri: request.repository.source.uri.clone(),
+                    secret_resource,
+                    private_key: SensitiveString::default(),
+                    known_hosts_entry: SensitiveString::default(),
+                }),
+            }
+        } else {
+            let projection = active_repository_access_projection(api, &api.config.workspace_id)?;
+            if projection.config_revision != operation.config_revision
+                || projection.projection_digest != operation.config_projection_digest
+            {
+                return Err(settings_bad_request(
+                    "working_directory_repository_access_revision_changed",
+                    "Workspace Repository access revision changed before operation reservation was bound",
+                ));
+            }
+            authorize_repository_materialization(
+                api,
+                &operation.resolved_runtime_id,
+                &operation.operation_id,
+                &projection,
+                request,
+            )?;
+            let context = request.materialization.take().ok_or_else(|| {
+                settings_bad_request(
+                    "working_directory_remote_repository_access_required",
+                    "SSH Repository access authority is unavailable",
+                )
+            })?;
+            let ssh = context.ssh.as_ref().ok_or_else(|| {
+                settings_bad_request(
+                    "working_directory_remote_repository_access_required",
+                    "SSH Repository access authority is unavailable",
+                )
+            })?;
+            api.config_store.bind_workdir_create_repository_access(
+                &api.config.workspace_id,
+                &operation.operation_id,
+                request_fingerprint,
+                &ssh.credential_id,
+                ssh.credential_revision,
+                &ssh.host_trust_id,
+                ssh.host_trust_revision,
+                match ssh.access {
+                    workspace_api::RepositoryAccessMode::ReadOnly => "read_only",
+                    workspace_api::RepositoryAccessMode::ReadWrite => "read_write",
+                },
+                context.cache_generation,
+                &now_registry_timestamp(),
+            )?;
+            context
+        }
+    } else {
+        RepositoryMaterializationContext {
+            workspace_id: api.config.workspace_id.clone(),
+            runtime_id: operation.resolved_runtime_id.clone(),
+            operation_id: operation.operation_id.clone(),
+            config_revision: operation.config_revision,
+            config_projection_digest: operation.config_projection_digest.clone(),
+            cache_generation: operation.cache_generation,
+            ssh: None,
+        }
+    };
+    request.materialization = Some(context);
+    Ok(())
+}
+
+fn repository_access_expiry() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_add(300)
+}
+
+fn authorize_worker_spawn_workdir_materialization(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+    operation_id: &str,
+    request: &mut WorkingDirectoryRequest,
+) -> ApiResult<()> {
+    let projection = active_repository_access_projection(api, &api.config.workspace_id)?;
+    authorize_repository_materialization(api, runtime_id, operation_id, &projection, request)
+}
+
+fn authorize_repository_materialization(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+    operation_id: &str,
+    projection: &RepositoryAccessProjection,
+    request: &mut WorkingDirectoryRequest,
+) -> ApiResult<()> {
+    let ssh = if request.repository.source.kind == workspace_api::RepositorySourceKind::Ssh {
+        let binding = projection
+            .bindings
+            .iter()
+            .find(|binding| binding.repository_id == request.repository.id)
+            .ok_or_else(|| {
+                settings_bad_request(
+                    "working_directory_remote_repository_access_required",
+                    "SSH Repository has no active Workspace credential and host-trust binding",
+                )
+            })?;
+        let lease = api
+            .repository_secrets
+            .lease_ssh_materialization_access(&api.config.workspace_id, binding)?;
+        let expires_at_epoch_seconds = repository_access_expiry();
+        let secret_resource = api
+            .resource_broker
+            .issue_repository_ssh_access_handle(
+                &api.config.workspace_id,
+                runtime_id,
+                format!("repository-ssh-access:{operation_id}"),
+                format!(
+                    "credential:{}:host-trust:{}",
+                    lease.credential_revision, lease.host_trust_revision
+                ),
+                i64::try_from(expires_at_epoch_seconds).unwrap_or(i64::MAX),
+                worker_runtime::resource::RepositorySshAccessSecret {
+                    private_key: lease.private_key.as_str().to_string(),
+                    known_hosts_entry: lease.known_hosts_entry.clone(),
+                },
+            )
+            .map_err(|_| {
+                settings_bad_request(
+                    "working_directory_repository_access_resource_failed",
+                    "Repository SSH access resource could not be issued",
+                )
+            })?;
+        Some(RepositorySshMaterializationAccess {
+            credential_id: lease.credential_id,
+            credential_revision: lease.credential_revision,
+            host_trust_id: lease.host_trust_id,
+            host_trust_revision: lease.host_trust_revision,
+            access: binding.access,
+            expires_at_epoch_seconds,
+            repository_id: request.repository.id.clone(),
+            repository_source_fingerprint: request.repository.source_fingerprint.clone(),
+            repository_uri: request.repository.source.uri.clone(),
+            secret_resource,
+            private_key: SensitiveString::default(),
+            known_hosts_entry: SensitiveString::default(),
+        })
+    } else {
+        None
+    };
+    request.materialization = Some(RepositoryMaterializationContext {
+        workspace_id: api.config.workspace_id.clone(),
+        runtime_id: runtime_id.to_string(),
+        operation_id: operation_id.to_string(),
+        config_revision: projection.config_revision,
+        config_projection_digest: projection.projection_digest.clone(),
+        cache_generation: 0,
+        ssh,
+    });
+    Ok(())
+}
+
+fn repository_access_request_for_workdir(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+    working_directory_id: &str,
+    operation_id: &str,
+) -> ApiResult<Option<worker_runtime::catalog::WorkingDirectoryRepositoryAccessRequest>> {
+    let record = api
+        .config_store
+        .get_workdir_registry(&api.config.workspace_id, working_directory_id)?
+        .ok_or_else(|| {
+            settings_bad_request(
+                "working_directory_not_found",
+                "Working directory is not registered in this Workspace",
+            )
+        })?;
+    if record.runtime_id != runtime_id {
+        return Err(settings_bad_request(
+            "working_directory_runtime_mismatch",
+            "Working directory is owned by a different Runtime",
+        ));
+    }
+    let repository = api.require_configured_workspace_repository(&record.repository_id)?;
+    if repository.source.kind != workspace_api::RepositorySourceKind::Ssh {
+        return Ok(None);
+    }
+    let projection = active_repository_access_projection(api, &api.config.workspace_id)?;
+    let mut request = working_directory_request_from_repository(&repository, None);
+    authorize_repository_materialization(api, runtime_id, operation_id, &projection, &mut request)?;
+    Ok(Some(
+        worker_runtime::catalog::WorkingDirectoryRepositoryAccessRequest {
+            working_directory_id: working_directory_id.to_string(),
+            materialization: request.materialization.ok_or_else(|| {
+                settings_bad_request(
+                    "working_directory_remote_repository_access_required",
+                    "SSH Repository access authority is unavailable",
+                )
+            })?,
+        },
+    ))
+}
+
 fn working_directory_request_for_browser(
     api: &WorkspaceApi,
     request: BrowserWorkingDirectoryCreateRequest,
@@ -13919,8 +14698,9 @@ fn working_directory_request_for_browser(
             source_fingerprint: repository.source_fingerprint.clone(),
             selector: selector.map(RuntimeRepositorySelector),
         },
-        materializer: MaterializerKind::LocalGitWorktree,
+        materializer: MaterializerKind::RuntimeGitCache,
         backend_workdir_id: None,
+        materialization: None,
     })
 }
 
@@ -14477,6 +15257,110 @@ mod tests {
         SqliteWorkspaceStore, TrustedRuntimeRecord, UserRecord, WorkspaceRecord,
     };
 
+    #[tokio::test]
+    async fn command_session_survives_attachment_refresh_until_worker_revocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let worker = RuntimeWorkerRef {
+            runtime_id: "runtime-command-session".to_string(),
+            worker_id: "worker-command-session".to_string(),
+        };
+        let source: WorkdirSessionHandle = Arc::new(workdir::LocalWorkdirSession::new(
+            manifest::Scope::writable(directory.path()).unwrap(),
+            directory.path().to_path_buf(),
+        ));
+        let provider_handle = source
+            .start_command(workdir::CommandRequest {
+                command: "printf ready; sleep 30".to_string(),
+                timeout_secs: 60,
+                output_limit: 4096,
+                tool_call_id: Some("tool-call-command-session".to_string()),
+            })
+            .await
+            .unwrap();
+
+        let mut registry = WorkdirSessionRegistry::default();
+        registry.insert_attachment(worker.clone(), source.clone());
+        let registered_source = registry.remove_attachment(&worker).unwrap();
+        let external_handle = registry.register_command(
+            worker.clone(),
+            registered_source,
+            provider_handle.clone(),
+            Vec::new(),
+        );
+        assert_ne!(external_handle, provider_handle);
+
+        let refreshed: WorkdirSessionHandle = Arc::new(workdir::LocalWorkdirSession::new(
+            manifest::Scope::writable(directory.path()).unwrap(),
+            directory.path().to_path_buf(),
+        ));
+        registry.insert_attachment(worker.clone(), refreshed);
+        registry
+            .remove_attachment(&worker)
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+
+        let command = registry.command(&worker, &external_handle).unwrap();
+        let output = command
+            .source
+            .command_output(workdir::CommandOutputRequest {
+                handle: command.provider_handle.clone(),
+                cursor: 0,
+                limit: 4096,
+                wait: false,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(output.status, workdir::CommandStatus::Running));
+        assert!(matches!(
+            command
+                .source
+                .command_status(command.provider_handle.clone())
+                .await
+                .unwrap(),
+            workdir::CommandStatus::Running
+        ));
+        let waiting_source = command.source.clone();
+        let waiting_handle = command.provider_handle.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_source
+                .command_output(workdir::CommandOutputRequest {
+                    handle: waiting_handle,
+                    cursor: output.next_cursor.unwrap_or(0),
+                    limit: 4096,
+                    wait: true,
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        command
+            .source
+            .cancel_command(command.provider_handle.clone())
+            .await
+            .unwrap();
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+            .await
+            .expect("cancel should unblock a waiting output read")
+            .unwrap()
+            .unwrap();
+        assert!(!matches!(terminal.status, workdir::CommandStatus::Running));
+
+        let registered = registry.take_worker(&worker);
+        assert_eq!(registered.len(), 1);
+        let RegisteredWorkdirSession::Command { session, .. } = &registered[0] else {
+            panic!("expected retained command session");
+        };
+        session.source.close().await.unwrap();
+        assert!(
+            session
+                .source
+                .command_status(session.provider_handle.clone())
+                .await
+                .is_err()
+        );
+    }
+
     fn seed_test_api_token(store: &dyn ControlPlaneStore, suffix: &str) -> String {
         let account_id = format!("account-{suffix}");
         let user_id = format!("user-{suffix}");
@@ -14767,8 +15651,11 @@ mod tests {
             repository_id: "repo".to_string(),
             creation_selector: Some("develop".to_string()),
             creation_ref: Some("abcdef".to_string()),
+            creation_tree: Some("tree-creation".to_string()),
             current_selector: None,
             current_ref: Some("fedcba".to_string()),
+            current_tree: Some("tree-current".to_string()),
+            observed_at_epoch_seconds: Some(3),
             materialization_status: "missing".to_string(),
             cleanliness: "clean".to_string(),
             created_at: "1".to_string(),
@@ -14979,6 +15866,21 @@ mod tests {
                 .is_err()
         );
 
+        let mut local_workdir_request =
+            working_directory_request_from_repository(&api.config.repositories[0], Some("HEAD"));
+        authorize_worker_spawn_workdir_materialization(
+            &api,
+            "runtime-1",
+            "worker-spawn-operation",
+            &mut local_workdir_request,
+        )
+        .unwrap();
+        let materialization = local_workdir_request.materialization.unwrap();
+        assert_eq!(materialization.workspace_id, api.config.workspace_id);
+        assert_eq!(materialization.runtime_id, "runtime-1");
+        assert_eq!(materialization.operation_id, "worker-spawn-operation");
+        assert!(materialization.ssh.is_none());
+
         let mut foreign_repository = api.config.repositories[0].clone();
         foreign_repository.id = "foreign".to_string();
         let workdir_flow_launch = WorkerSpawnRequest {
@@ -15009,6 +15911,78 @@ mod tests {
             api.validate_worker_spawn_repository_scope(&workdir_flow_launch)
                 .is_err()
         );
+
+        let mut repository_access_launch = workdir_flow_launch;
+        let secret_resource = api
+            .resource_broker
+            .issue_repository_ssh_access_handle(
+                &api.config.workspace_id,
+                "runtime-1",
+                "repository-access-test",
+                "1",
+                i64::MAX,
+                worker_runtime::resource::RepositorySshAccessSecret {
+                    private_key: "private-key-bytes".to_string(),
+                    known_hosts_entry: "known-hosts-entry".to_string(),
+                },
+            )
+            .unwrap();
+        let working_directory = repository_access_launch
+            .resolved_working_directory_request
+            .as_mut()
+            .unwrap();
+        working_directory.backend_workdir_id = Some("working-directory-1".to_string());
+        working_directory.materialization =
+            Some(worker_runtime::catalog::RepositoryMaterializationContext {
+                workspace_id: api.config.workspace_id.clone(),
+                runtime_id: "runtime-1".to_string(),
+                operation_id: "operation-1".to_string(),
+                config_revision: 1,
+                config_projection_digest: "sha256:projection".to_string(),
+                cache_generation: 0,
+                ssh: Some(
+                    worker_runtime::catalog::RepositorySshMaterializationAccess {
+                        credential_id: "credential-1".to_string(),
+                        credential_revision: 1,
+                        host_trust_id: "host-trust-1".to_string(),
+                        host_trust_revision: 1,
+                        access: workspace_api::RepositoryAccessMode::ReadOnly,
+                        expires_at_epoch_seconds: u64::MAX,
+                        repository_id: working_directory.repository.id.clone(),
+                        repository_source_fingerprint: working_directory
+                            .repository
+                            .source_fingerprint
+                            .clone(),
+                        repository_uri: working_directory.repository.source.uri.clone(),
+                        secret_resource,
+                        private_key: worker_runtime::catalog::SensitiveString::default(),
+                        known_hosts_entry: worker_runtime::catalog::SensitiveString::default(),
+                    },
+                ),
+            });
+
+        let access = take_new_workdir_repository_access(&mut repository_access_launch)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(access.working_directory_id, "working-directory-1");
+        assert!(access.materialization.ssh.is_some());
+        let serialized_access = serde_json::to_string(&access).unwrap();
+        assert!(!serialized_access.contains("private-key-bytes"));
+        assert!(!serialized_access.contains("known-hosts-entry"));
+        assert!(!serialized_access.contains("private_key"));
+        assert!(!serialized_access.contains("known_hosts_entry"));
+        assert!(
+            repository_access_launch
+                .resolved_working_directory_request
+                .as_ref()
+                .and_then(|request| request.materialization.as_ref())
+                .and_then(|materialization| materialization.ssh.as_ref())
+                .is_none()
+        );
+        let serialized = serde_json::to_string(&repository_access_launch).unwrap();
+        assert!(!serialized.contains("private-key-bytes"));
+        assert!(!serialized.contains("known-hosts-entry"));
     }
 
     #[test]
@@ -15848,8 +16822,11 @@ mod tests {
                 repository_id: "repo".to_string(),
                 creation_selector: None,
                 creation_ref: None,
+                creation_tree: None,
                 current_selector: None,
                 current_ref: None,
+                current_tree: None,
+                observed_at_epoch_seconds: None,
                 materialization_status: "present".to_string(),
                 cleanliness: "clean".to_string(),
                 created_at: "1".to_string(),
@@ -15864,8 +16841,11 @@ mod tests {
                 repository_id: "repo".to_string(),
                 creation_selector: None,
                 creation_ref: None,
+                creation_tree: None,
                 current_selector: None,
                 current_ref: None,
+                current_tree: None,
+                observed_at_epoch_seconds: None,
                 materialization_status: "present".to_string(),
                 cleanliness: "unknown".to_string(),
                 created_at: "1".to_string(),
@@ -15937,8 +16917,11 @@ mod tests {
             repository_id: "repo".to_string(),
             creation_selector: None,
             creation_ref: None,
+            creation_tree: None,
             current_selector: None,
             current_ref: None,
+            current_tree: None,
+            observed_at_epoch_seconds: None,
             materialization_status: "present".to_string(),
             cleanliness: "unknown".to_string(),
             created_at: "1".to_string(),
@@ -16003,7 +16986,7 @@ mod tests {
                 worker_runtime::execution::WorkerExecutionContext,
             >,
         >,
-        materializer: worker_runtime::working_directory::LocalGitWorktreeMaterializer,
+        materializer: worker_runtime::working_directory::RuntimeGitCacheMaterializer,
         spawn_failure: std::sync::Mutex<Option<String>>,
         input_failure: std::sync::Mutex<Option<String>>,
         inputs: std::sync::Mutex<Vec<(worker_runtime::identity::WorkerRef, String)>>,
@@ -16023,7 +17006,7 @@ mod tests {
             );
             Self {
                 contexts: std::sync::Mutex::new(std::collections::HashMap::new()),
-                materializer: worker_runtime::working_directory::LocalGitWorktreeMaterializer::new(
+                materializer: worker_runtime::working_directory::RuntimeGitCacheMaterializer::new(
                     std::env::temp_dir().join(unique),
                 ),
                 spawn_failure: std::sync::Mutex::new(None),
@@ -20206,8 +21189,11 @@ mod tests {
                 repository_id: "repo-test".to_string(),
                 creation_selector: Some("HEAD".to_string()),
                 creation_ref: None,
+                creation_tree: None,
                 current_selector: None,
                 current_ref: None,
+                current_tree: None,
+                observed_at_epoch_seconds: None,
                 materialization_status: status.to_string(),
                 cleanliness: cleanliness.to_string(),
                 created_at: now.clone(),
@@ -21091,10 +22077,15 @@ mod tests {
         init_clean_git_workspace(dir.path());
         let api = test_api(dir.path()).await;
         let operation_id = "provider-rejection-classification";
+        let repository = api
+            .require_configured_workspace_repository(TEST_REPOSITORY_ID)
+            .unwrap();
         let request_fingerprint = crate::workdir_create_operations::request_fingerprint(
             TEST_REPOSITORY_ID,
             Some("HEAD"),
             Some(EMBEDDED_WORKER_RUNTIME_ID),
+            &repository.source_fingerprint,
+            repository.source_revision,
         );
         api.config_store
             .reserve_workdir_create_operation(&WorkdirCreateOperationRecord {
@@ -21107,6 +22098,16 @@ mod tests {
                 resolved_runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 config_revision: 1,
                 config_projection_digest: "sha256:test".to_string(),
+                source_kind: Some("local_path".to_string()),
+                source_uri: Some("/tmp/repo".to_string()),
+                source_revision: Some(1),
+                source_fingerprint: Some("sha256:test".to_string()),
+                credential_id: None,
+                credential_revision: None,
+                host_trust_id: None,
+                host_trust_revision: None,
+                repository_access_mode: None,
+                cache_generation: 0,
                 working_directory_id: "workdir-provider-rejection".to_string(),
                 state: "pending".to_string(),
                 failure: None,
@@ -23642,8 +24643,11 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
                 repository_id: "main".to_string(),
                 creation_selector: None,
                 creation_ref: None,
+                creation_tree: None,
                 current_selector: Some("work/ticket".to_string()),
                 current_ref: Some("abc123".to_string()),
+                current_tree: Some("tree123".to_string()),
+                observed_at_epoch_seconds: Some(1_777_777_777),
                 materializer_kind: MaterializerKind::LocalGitWorktree,
                 cleanup_target: None,
                 status: WorkingDirectoryStatusKind::Active,

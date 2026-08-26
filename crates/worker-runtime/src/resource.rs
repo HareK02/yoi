@@ -11,18 +11,46 @@ use std::sync::Mutex;
 
 pub const PROFILE_SOURCE_ARCHIVE_CONTENT_TYPE: &str =
     "application/vnd.yoi.profile-source-archive+tar";
+pub const REPOSITORY_SSH_ACCESS_CONTENT_TYPE: &str =
+    "application/vnd.yoi.repository-ssh-access+json";
 pub const DEFAULT_PROFILE_SOURCE_ARCHIVE_MAX_BYTES: u64 = 2 * 1024 * 1024;
+pub const DEFAULT_REPOSITORY_SSH_ACCESS_MAX_BYTES: u64 = 64 * 1024;
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RepositorySshAccessSecret {
+    pub private_key: String,
+    pub known_hosts_entry: String,
+}
+
+impl Drop for RepositorySshAccessSecret {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.private_key);
+        zeroize::Zeroize::zeroize(&mut self.known_hosts_entry);
+    }
+}
+
+impl std::fmt::Debug for RepositorySshAccessSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RepositorySshAccessSecret")
+            .field("private_key", &"[REDACTED]")
+            .field("known_hosts_entry", &"[REDACTED]")
+            .finish()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendResourceKind {
     ProfileSourceArchive,
+    RepositorySshAccess,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendResourceOperation {
     FetchArchive,
+    FetchOnce,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,7 +94,7 @@ pub struct BackendResourceFetchRequest {
     pub audit_correlation_id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendResourceFetchResponse {
     pub kind: BackendResourceKind,
     pub resource_id: String,
@@ -74,6 +102,29 @@ pub struct BackendResourceFetchResponse {
     pub content_type: String,
     pub bytes: Vec<u8>,
     pub audit_correlation_id: String,
+}
+
+impl std::fmt::Debug for BackendResourceFetchResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BackendResourceFetchResponse")
+            .field("kind", &self.kind)
+            .field("resource_id", &self.resource_id)
+            .field("digest", &self.digest)
+            .field("content_type", &self.content_type)
+            .field(
+                "bytes",
+                &format_args!("[REDACTED; {} bytes]", self.bytes.len()),
+            )
+            .field("audit_correlation_id", &self.audit_correlation_id)
+            .finish()
+    }
+}
+
+impl Drop for BackendResourceFetchResponse {
+    fn drop(&mut self) {
+        self.bytes.fill(0);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -248,7 +299,7 @@ pub fn build_profile_source_archive_fetch_request(
 
 pub fn profile_source_archive_from_response(
     handle: &BackendResourceHandle,
-    response: BackendResourceFetchResponse,
+    mut response: BackendResourceFetchResponse,
 ) -> Result<ProfileSourceArchive, BackendResourceError> {
     if handle.kind != BackendResourceKind::ProfileSourceArchive
         || response.kind != BackendResourceKind::ProfileSourceArchive
@@ -263,7 +314,7 @@ pub fn profile_source_archive_from_response(
     if response.content_type != handle.content_type {
         return Err(BackendResourceError::ContentTypeMismatch {
             expected: handle.content_type.clone(),
-            actual: response.content_type,
+            actual: response.content_type.clone(),
         });
     }
     let actual_bytes = response.bytes.len() as u64;
@@ -278,7 +329,7 @@ pub fn profile_source_archive_from_response(
         return Err(BackendResourceError::DigestMismatch {
             expected: handle.digest.clone(),
             actual: if response.digest != handle.digest {
-                response.digest
+                response.digest.clone()
             } else {
                 actual_digest
             },
@@ -296,7 +347,7 @@ pub fn profile_source_archive_from_response(
                 }
             })?,
         },
-        content: response.bytes,
+        content: std::mem::take(&mut response.bytes),
     })
 }
 

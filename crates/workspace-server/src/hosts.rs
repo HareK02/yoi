@@ -25,8 +25,9 @@ use worker_runtime::auth::{CapabilityTokenSigner, capability_claims};
 use worker_runtime::catalog::{
     ConfigBundleRef, CreateWorkerRequest, ProfileSelector, ProfileSourceArchiveHttpRef,
     ProfileSourceArchiveSource, WorkerDetail as EmbeddedWorkerDetail,
-    WorkerStatus as EmbeddedWorkerStatus, WorkingDirectoryClaim, WorkingDirectoryRequest,
-    WorkingDirectoryStatus, WorkingDirectorySummary, WorkspaceApiRef,
+    WorkerStatus as EmbeddedWorkerStatus, WorkingDirectoryClaim,
+    WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest, WorkingDirectoryStatus,
+    WorkingDirectorySummary, WorkspaceApiRef,
 };
 use worker_runtime::config_bundle::{ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary};
 #[cfg(test)]
@@ -39,11 +40,11 @@ use worker_runtime::execution::WorkerExecutionRunState;
 use worker_runtime::fs_store::FsRuntimeStoreOptions;
 use worker_runtime::http_server::{
     RuntimeHttpConfigBundleAvailabilityResponse, RuntimeHttpConfigBundleSyncRequest,
-    RuntimeHttpErrorResponse, RuntimeHttpSummaryResponse, RuntimeHttpWorkerCompletionsRequest,
-    RuntimeHttpWorkerCompletionsResponse, RuntimeHttpWorkerDeleteResponse,
-    RuntimeHttpWorkerInputResponse, RuntimeHttpWorkerLifecycleRequest,
-    RuntimeHttpWorkerLifecycleResponse, RuntimeHttpWorkerResponse,
-    RuntimeHttpWorkerWorkspaceApiRequest, RuntimeHttpWorkersResponse,
+    RuntimeHttpErrorResponse, RuntimeHttpRepositoryAccessResponse, RuntimeHttpSummaryResponse,
+    RuntimeHttpWorkerCompletionsRequest, RuntimeHttpWorkerCompletionsResponse,
+    RuntimeHttpWorkerDeleteResponse, RuntimeHttpWorkerInputResponse,
+    RuntimeHttpWorkerLifecycleRequest, RuntimeHttpWorkerLifecycleResponse,
+    RuntimeHttpWorkerResponse, RuntimeHttpWorkerWorkspaceApiRequest, RuntimeHttpWorkersResponse,
     RuntimeHttpWorkingDirectoriesResponse, RuntimeHttpWorkingDirectoryResponse,
     RuntimeHttpWorkspacePromptProjectionRequest, RuntimeHttpWorkspacePromptProjectionResponse,
 };
@@ -818,6 +819,16 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         }
     }
 
+    fn authorize_working_directory_repository_access(
+        &self,
+        _request: WorkingDirectoryRepositoryAccessRequest,
+    ) -> std::result::Result<(), Error> {
+        Err(Error::InvalidInput(
+            "Runtime does not support working directory Repository access authorization"
+                .to_string(),
+        ))
+    }
+
     fn list_working_directories(&self) -> RuntimeList<WorkingDirectoryStatus> {
         RuntimeList::new(Vec::new(), Vec::new())
     }
@@ -1389,6 +1400,23 @@ impl RuntimeRegistry {
         validate_backend_identifier("runtime_id", runtime_id)?;
         let runtime = self.runtime(runtime_id)?;
         Ok(runtime.create_working_directory(request))
+    }
+
+    pub fn authorize_working_directory_repository_access(
+        &self,
+        runtime_id: &str,
+        request: WorkingDirectoryRepositoryAccessRequest,
+    ) -> Result<(), RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        validate_backend_identifier("working_directory_id", &request.working_directory_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        runtime
+            .authorize_working_directory_repository_access(request)
+            .map_err(|error| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: runtime_id.to_string(),
+                code: "working_directory_repository_access_failed".to_string(),
+                message: error.to_string(),
+            })
     }
 
     pub fn list_working_directories(
@@ -3179,6 +3207,18 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         }
     }
 
+    fn authorize_working_directory_repository_access(
+        &self,
+        request: WorkingDirectoryRepositoryAccessRequest,
+    ) -> std::result::Result<(), Error> {
+        self.post_json::<_, RuntimeHttpRepositoryAccessResponse>(
+            "/v1/working-directories/repository-access",
+            &request,
+        )
+        .map(|_| ())
+        .map_err(|diagnostic| Error::RegistryInconsistency(diagnostic.message))
+    }
+
     fn list_working_directories(&self) -> RuntimeList<WorkingDirectoryStatus> {
         match self.get_json::<RuntimeHttpWorkingDirectoriesResponse>("/v1/working-directories") {
             Ok(response) => RuntimeList::new(response.working_directories, Vec::new()),
@@ -4386,7 +4426,7 @@ mod tests {
         let handle = bundle.profile_source_archive_handle.as_ref().unwrap();
         assert!(bundle.profile_source_archive.is_none());
         let response = broker
-            .fetch_profile_source_archive(worker_runtime::resource::BackendResourceFetchRequest {
+            .fetch_resource(worker_runtime::resource::BackendResourceFetchRequest {
                 handle: handle.clone(),
                 runtime_id: runtime_id.to_string(),
                 worker_id: None,

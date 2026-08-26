@@ -30,6 +30,8 @@ impl RuntimeWorkerRef {
 #[serde(rename_all = "snake_case")]
 pub enum MaterializerKind {
     #[default]
+    RuntimeGitCache,
+    /// Legacy persisted value from the pre-cache local `git worktree` materializer.
     LocalGitWorktree,
 }
 
@@ -109,6 +111,8 @@ pub struct WorkingDirectoryProvenance {
     pub creation_selector: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creation_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_tree: Option<String>,
     pub materializer_kind: MaterializerKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanup_target: Option<WorkingDirectoryCleanupTarget>,
@@ -122,6 +126,10 @@ pub struct WorkingDirectoryCurrentObservation {
     pub current_selector: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_tree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at_epoch_seconds: Option<u64>,
     pub status: WorkingDirectoryStatusKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanliness: Option<String>,
@@ -141,9 +149,15 @@ pub struct WorkingDirectorySummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creation_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_tree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_selector: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_tree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at_epoch_seconds: Option<u64>,
     pub materializer_kind: MaterializerKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanup_target: Option<WorkingDirectoryCleanupTarget>,
@@ -166,6 +180,7 @@ impl WorkingDirectorySummary {
         WorkingDirectoryProvenance {
             creation_selector: self.creation_selector.clone(),
             creation_ref: self.creation_ref.clone(),
+            creation_tree: self.creation_tree.clone(),
             materializer_kind: self.materializer_kind.clone(),
             cleanup_target: self.cleanup_target.clone(),
         }
@@ -175,6 +190,8 @@ impl WorkingDirectorySummary {
         WorkingDirectoryCurrentObservation {
             current_selector: self.current_selector.clone(),
             current_ref: self.current_ref.clone(),
+            current_tree: self.current_tree.clone(),
+            observed_at_epoch_seconds: self.observed_at_epoch_seconds,
             status: self.status.clone(),
             cleanliness: self.cleanliness.clone(),
             primary_worker_id: self.primary_worker_id.clone(),
@@ -247,8 +264,11 @@ mod tests {
                     repository_id: "repo".to_string(),
                     creation_selector: Some("develop".to_string()),
                     creation_ref: Some("abc123".to_string()),
+                    creation_tree: Some("tree123".to_string()),
                     current_selector: Some("work/ticket".to_string()),
                     current_ref: Some("def456".to_string()),
+                    current_tree: Some("tree456".to_string()),
+                    observed_at_epoch_seconds: Some(1_777_777_777),
                     materializer_kind: MaterializerKind::LocalGitWorktree,
                     cleanup_target: Some(WorkingDirectoryCleanupTarget {
                         kind: "git_worktree".to_string(),
@@ -269,8 +289,11 @@ mod tests {
                     repository_id: "repo".to_string(),
                     creation_selector: None,
                     creation_ref: None,
+                    creation_tree: None,
                     current_selector: None,
                     current_ref: Some("987fed".to_string()),
+                    current_tree: None,
+                    observed_at_epoch_seconds: None,
                     materializer_kind: MaterializerKind::LocalGitWorktree,
                     cleanup_target: None,
                     status: WorkingDirectoryStatusKind::Active,

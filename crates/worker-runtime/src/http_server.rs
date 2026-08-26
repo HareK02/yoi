@@ -12,7 +12,8 @@ use crate::auth::{
 };
 use crate::catalog::{
     ConfigBundleRef, CreateWorkerRequest, WorkerDetail, WorkerLifecycleAck, WorkerSummary,
-    WorkingDirectoryRequest, WorkingDirectoryStatus, WorkspaceApiRef,
+    WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest, WorkingDirectoryStatus,
+    WorkspaceApiRef,
 };
 use crate::config_bundle::{ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary};
 use crate::error::RuntimeError;
@@ -204,6 +205,10 @@ fn runtime_http_router_with_optional_auth(
             get(list_working_directories).post(create_working_directory),
         )
         .route(
+            "/v1/working-directories/repository-access",
+            post(authorize_working_directory_repository_access),
+        )
+        .route(
             "/v1/working-directories/{working_directory_id}/sessions",
             post(open_workdir_session),
         )
@@ -333,6 +338,11 @@ pub struct RuntimeHttpWorkersResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeHttpWorkingDirectoriesResponse {
     pub working_directories: Vec<WorkingDirectoryStatus>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeHttpRepositoryAccessResponse {
+    pub authorized: bool,
 }
 
 /// Working directory response used by create/detail/delete endpoints.
@@ -513,6 +523,29 @@ async fn list_workers(
     Ok(Json(RuntimeHttpWorkersResponse { workers }))
 }
 
+async fn authorize_working_directory_repository_access(
+    State(state): State<RuntimeHttpState>,
+    Extension(auth): Extension<RuntimeAuthContext>,
+    body: Result<Json<WorkingDirectoryRepositoryAccessRequest>, JsonRejection>,
+) -> RestResult<RuntimeHttpRepositoryAccessResponse> {
+    let Json(request) = body.map_err(RuntimeHttpRestError::json_rejection)?;
+    if request.materialization.workspace_id != auth.workspace_id {
+        return Err(RuntimeHttpRestError::new(
+            StatusCode::FORBIDDEN,
+            "working_directory_materialization_workspace_mismatch",
+            "Repository access authority does not match the authenticated Workspace",
+        ));
+    }
+    state
+        .runtime
+        .authorize_working_directory_repository_access_from_resource(request)
+        .await
+        .map_err(RuntimeHttpRestError::runtime)?;
+    Ok(Json(RuntimeHttpRepositoryAccessResponse {
+        authorized: true,
+    }))
+}
+
 async fn list_working_directories(
     State(state): State<RuntimeHttpState>,
 ) -> RestResult<RuntimeHttpWorkingDirectoriesResponse> {
@@ -527,12 +560,23 @@ async fn list_working_directories(
 
 async fn create_working_directory(
     State(state): State<RuntimeHttpState>,
+    Extension(auth): Extension<RuntimeAuthContext>,
     body: Result<Json<WorkingDirectoryRequest>, JsonRejection>,
 ) -> RestResult<RuntimeHttpWorkingDirectoryResponse> {
     let Json(request) = body.map_err(RuntimeHttpRestError::json_rejection)?;
+    if let Some(materialization) = request.materialization.as_ref()
+        && materialization.workspace_id != auth.workspace_id
+    {
+        return Err(RuntimeHttpRestError::new(
+            StatusCode::FORBIDDEN,
+            "working_directory_materialization_workspace_mismatch",
+            "Repository materialization authority does not match the authenticated Workspace",
+        ));
+    }
     let working_directory = state
         .runtime
-        .create_working_directory(request)
+        .create_working_directory_from_resource(request)
+        .await
         .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkingDirectoryResponse {
         working_directory,
@@ -1559,6 +1603,9 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     if path == "/v1/workers" && *method == Method::POST {
         return Some("workers:create");
     }
+    if path == "/v1/working-directories/repository-access" && *method == Method::POST {
+        return Some("workdirs:operate");
+    }
     if path.starts_with("/v1/workdir-sessions")
         || (path.starts_with("/v1/working-directories/") && path.ends_with("/sessions"))
     {
@@ -2220,6 +2267,10 @@ mod tests {
 
     #[test]
     fn workdir_routes_require_dedicated_operation_permission() {
+        assert_eq!(
+            required_runtime_permission(&Method::POST, "/v1/working-directories/repository-access",),
+            Some("workdirs:operate")
+        );
         assert_eq!(
             required_runtime_permission(&Method::POST, "/v1/working-directories/wd-1/sessions"),
             Some("workdirs:operate")

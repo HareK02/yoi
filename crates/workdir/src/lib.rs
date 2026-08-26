@@ -28,7 +28,9 @@ pub use fs_operation::{
     GlobResult, GrepOutputMode, GrepRequest, GrepResult, ListEntry, ListRequest, ListResult,
     ReadRequest, ReadResult, StatRequest, StatResult, WriteRequest, WriteResult,
 };
-pub use local::{LocalWorkdirSession, SymlinkInfo, direct_symlink, first_symlink};
+pub use local::{
+    LocalWorkdirSession, SymlinkInfo, WorkdirSessionResource, direct_symlink, first_symlink,
+};
 pub use operation::*;
 
 /// Persistent, opaque identity of one materialized Workdir.

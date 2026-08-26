@@ -1,17 +1,33 @@
 use crate::catalog::{
-    MaterializerKind, WorkingDirectoryCleanupTarget, WorkingDirectoryRequest,
-    WorkingDirectoryStatus, WorkingDirectoryStatusKind, WorkingDirectorySummary,
+    MaterializerKind, RepositorySshMaterializationAccess, WorkingDirectoryCleanupTarget,
+    WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest, WorkingDirectoryStatus,
+    WorkingDirectoryStatusKind, WorkingDirectorySummary,
 };
 use crate::identity::WorkerRef;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::net::Shutdown;
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use workdir::WorkdirSessionResource;
 
 const CHECKOUT_DIR: &str = "checkout";
 const MATERIALIZATION_RECORD: &str = "materialization.json";
+const REPOSITORY_CACHE_DIR: &str = ".repository-cache";
+const REPOSITORY_ACCESS_DIR: &str = ".repository-access";
+const REPOSITORY_COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
+const REPOSITORY_MAX_OBJECTS: u64 = 5_000_000;
+const REPOSITORY_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 static NEXT_WORKING_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +39,22 @@ pub struct WorkingDirectoryEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_tree: Option<String>,
     pub materializer_kind: MaterializerKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_source_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_source_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_cache_key: Option<String>,
+    #[serde(default)]
+    pub cache_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_trust_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_warning: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,8 +74,11 @@ impl WorkingDirectory {
             repository_id: self.repository_id.clone(),
             creation_selector: self.evidence.requested_selector.clone(),
             creation_ref: Some(self.evidence.resolved_commit.clone()),
+            creation_tree: self.evidence.resolved_tree.clone(),
             current_selector: None,
             current_ref: None,
+            current_tree: None,
+            observed_at_epoch_seconds: None,
             materializer_kind: self.materializer_kind.clone(),
             cleanup_target: Some(self.cleanup_target.clone()),
             status: self.status.clone(),
@@ -54,13 +89,15 @@ impl WorkingDirectory {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct WorkingDirectoryBinding {
     pub working_directory: WorkingDirectory,
     pub root: PathBuf,
     pub cwd: PathBuf,
     working_directory_root: PathBuf,
     source_repository_path: PathBuf,
+    command_environment: BTreeMap<String, String>,
+    session_resources: Vec<Arc<dyn WorkdirSessionResource>>,
 }
 
 impl WorkingDirectoryBinding {
@@ -80,6 +117,14 @@ impl WorkingDirectoryBinding {
         &self.source_repository_path
     }
 
+    pub fn command_environment(&self) -> BTreeMap<String, String> {
+        self.command_environment.clone()
+    }
+
+    pub fn session_resources(&self) -> Vec<Arc<dyn WorkdirSessionResource>> {
+        self.session_resources.clone()
+    }
+
     pub fn status(&self) -> WorkingDirectoryStatus {
         let mut working_directory = self.working_directory.clone();
         if working_directory.status == WorkingDirectoryStatusKind::Active
@@ -89,9 +134,16 @@ impl WorkingDirectoryBinding {
         }
         let mut summary = working_directory.status_summary();
         summary.cleanliness = if summary.status == WorkingDirectoryStatusKind::Active {
-            let (current_selector, current_ref) = binding_current_revision(self);
+            let (current_selector, current_ref, current_tree) = binding_current_revision(self);
             summary.current_selector = current_selector;
             summary.current_ref = current_ref;
+            summary.current_tree = current_tree;
+            summary.observed_at_epoch_seconds = Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            );
             Some(binding_cleanliness(self))
         } else {
             Some("unknown".to_string())
@@ -139,6 +191,11 @@ pub trait WorkingDirectoryMaterializer: Send + Sync + 'static {
         request: &WorkingDirectoryRequest,
     ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic>;
 
+    fn authorize_repository_access(
+        &self,
+        request: &WorkingDirectoryRepositoryAccessRequest,
+    ) -> Result<(), WorkingDirectoryDiagnostic>;
+
     fn bind_working_directory(
         &self,
         working_directory_id: &str,
@@ -175,12 +232,14 @@ fn binding_paths_are_available(binding: &WorkingDirectoryBinding) -> bool {
     source_repository_path.is_dir()
 }
 
-fn binding_current_revision(binding: &WorkingDirectoryBinding) -> (Option<String>, Option<String>) {
+fn binding_current_revision(
+    binding: &WorkingDirectoryBinding,
+) -> (Option<String>, Option<String>, Option<String>) {
     let current_ref = git_stdout(binding.root(), ["rev-parse", "HEAD"])
         .ok()
         .filter(|value| !value.is_empty());
     if current_ref.is_none() {
-        return (None, None);
+        return (None, None, None);
     }
     let current_selector = git_stdout(
         binding.root(),
@@ -188,7 +247,10 @@ fn binding_current_revision(binding: &WorkingDirectoryBinding) -> (Option<String
     )
     .ok()
     .filter(|value| !value.is_empty());
-    (current_selector, current_ref)
+    let current_tree = git_stdout(binding.root(), ["rev-parse", "HEAD^{tree}"])
+        .ok()
+        .filter(|value| !value.is_empty());
+    (current_selector, current_ref, current_tree)
 }
 
 fn binding_cleanliness(binding: &WorkingDirectoryBinding) -> String {
@@ -200,14 +262,18 @@ fn binding_cleanliness(binding: &WorkingDirectoryBinding) -> String {
 }
 
 #[derive(Clone, Debug)]
-pub struct LocalGitWorktreeMaterializer {
+pub struct RuntimeGitCacheMaterializer {
     runtime_root: PathBuf,
+    repository_access: Arc<Mutex<HashMap<String, RepositorySshMaterializationAccess>>>,
+    cache_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
-impl LocalGitWorktreeMaterializer {
+impl RuntimeGitCacheMaterializer {
     pub fn new(runtime_root: impl Into<PathBuf>) -> Self {
         Self {
             runtime_root: runtime_root.into(),
+            repository_access: Arc::new(Mutex::new(HashMap::new())),
+            cache_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -223,6 +289,33 @@ impl LocalGitWorktreeMaterializer {
         self.runtime_root.join(working_directory_id)
     }
 
+    fn repository_cache_key(request: &WorkingDirectoryRequest) -> String {
+        let mut digest = Sha256::new();
+        if let Some(materialization) = &request.materialization {
+            digest.update(materialization.workspace_id.as_bytes());
+            digest.update([0]);
+            digest.update(materialization.cache_generation.to_be_bytes());
+        }
+        digest.update(request.repository.id.as_bytes());
+        digest.update([0]);
+        digest.update(request.repository.source.kind.as_str().as_bytes());
+        digest.update([0]);
+        digest.update(request.repository.source_revision.to_be_bytes());
+        digest.update([0]);
+        digest.update(request.repository.source_fingerprint.as_bytes());
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn repository_cache_path(&self, request: &WorkingDirectoryRequest) -> PathBuf {
+        self.runtime_root
+            .join(REPOSITORY_CACHE_DIR)
+            .join(format!("{}.git", Self::repository_cache_key(request)))
+    }
+
     fn corrupted_status(&self, working_directory_id: &str) -> WorkingDirectoryStatus {
         WorkingDirectoryStatus {
             summary: WorkingDirectorySummary {
@@ -230,11 +323,14 @@ impl LocalGitWorktreeMaterializer {
                 repository_id: "unknown".to_string(),
                 creation_selector: None,
                 creation_ref: None,
+                creation_tree: None,
                 current_selector: None,
                 current_ref: None,
-                materializer_kind: MaterializerKind::LocalGitWorktree,
+                current_tree: None,
+                observed_at_epoch_seconds: None,
+                materializer_kind: MaterializerKind::RuntimeGitCache,
                 cleanup_target: Some(WorkingDirectoryCleanupTarget {
-                    kind: "local_git_worktree".to_string(),
+                    kind: "runtime_git_cache_worktree".to_string(),
                     working_directory_id: working_directory_id.to_string(),
                     repository_id: "unknown".to_string(),
                 }),
@@ -294,7 +390,368 @@ impl LocalGitWorktreeMaterializer {
             cwd: record.root,
             working_directory_root,
             source_repository_path: record.source_repository_path,
+            command_environment: BTreeMap::new(),
+            session_resources: Vec::new(),
         })
+    }
+
+    fn cache_repository_access(
+        &self,
+        working_directory_id: &str,
+        ssh: &RepositorySshMaterializationAccess,
+    ) -> Result<(), WorkingDirectoryDiagnostic> {
+        validate_ssh_materialization_access(ssh)?;
+        let working_directory_id = working_directory_id.to_string();
+        let credential_revision = ssh.credential_revision;
+        let expires_at = ssh.expires_at_epoch_seconds;
+        self.repository_access
+            .lock()
+            .map_err(|_| {
+                WorkingDirectoryDiagnostic::new(
+                    "working_directory_repository_access_unavailable",
+                    "Runtime Repository access state is unavailable",
+                )
+            })?
+            .insert(working_directory_id.clone(), ssh.clone());
+        let repository_access = self.repository_access.clone();
+        std::thread::spawn(move || {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if expires_at > now {
+                std::thread::sleep(Duration::from_secs(expires_at - now));
+            }
+            if let Ok(mut access) = repository_access.lock()
+                && access
+                    .get(&working_directory_id)
+                    .is_some_and(|access| access.credential_revision == credential_revision)
+            {
+                access.remove(&working_directory_id);
+            }
+        });
+        Ok(())
+    }
+
+    fn bind_repository_access(
+        &self,
+        working_directory_id: &str,
+        mut binding: WorkingDirectoryBinding,
+    ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
+        let access = self
+            .repository_access
+            .lock()
+            .map_err(|_| {
+                WorkingDirectoryDiagnostic::new(
+                    "working_directory_repository_access_unavailable",
+                    "Runtime Repository access state is unavailable",
+                )
+            })?
+            .remove(working_directory_id);
+        let Some(access) = access else {
+            if binding
+                .working_directory
+                .evidence
+                .credential_revision
+                .is_some()
+            {
+                return Err(WorkingDirectoryDiagnostic::new(
+                    "working_directory_remote_repository_access_required",
+                    "SSH Repository access must be reacquired before opening the Workdir session",
+                ));
+            }
+            return Ok(binding);
+        };
+        validate_ssh_materialization_access(&access)?;
+        apply_worktree_access_policy(
+            binding.source_repository_path(),
+            binding.root(),
+            access.access,
+        )?;
+        let command_access = Arc::new(RepositoryCommandAccess::prepare_ssh(
+            &self.runtime_root,
+            &format!("attachment-{working_directory_id}"),
+            &binding.working_directory.repository_id,
+            &access,
+        )?);
+        let weak_access = Arc::downgrade(&command_access);
+        let expires_at = access.expires_at_epoch_seconds;
+        std::thread::spawn(move || {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if expires_at > now {
+                std::thread::sleep(Duration::from_secs(expires_at - now));
+            }
+            if let Some(access) = weak_access.upgrade() {
+                access.stop();
+            }
+        });
+        binding
+            .command_environment
+            .insert("SSH_AUTH_SOCK".to_string(), "/dev/null".to_string());
+        binding.command_environment.insert(
+            "GIT_SSH_COMMAND".to_string(),
+            command_access.ssh_command.to_string_lossy().to_string(),
+        );
+        binding.command_environment.insert(
+            "YOI_REPOSITORY_ACCESS".to_string(),
+            match access.access {
+                workspace_api::RepositoryAccessMode::ReadOnly => "read_only",
+                workspace_api::RepositoryAccessMode::ReadWrite => "read_write",
+            }
+            .to_string(),
+        );
+        binding.session_resources.push(command_access);
+        Ok(binding)
+    }
+
+    fn validate_request(
+        request: &WorkingDirectoryRequest,
+    ) -> Result<(), WorkingDirectoryDiagnostic> {
+        if !matches!(
+            request.materializer,
+            MaterializerKind::RuntimeGitCache | MaterializerKind::LocalGitWorktree
+        ) {
+            return Err(WorkingDirectoryDiagnostic::new(
+                "working_directory_materializer_unsupported",
+                "the requested working directory materializer is unsupported",
+            ));
+        }
+        if request.repository.provider != "git" {
+            return Err(WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_provider_unsupported",
+                "the configured Repository provider is unsupported",
+            ));
+        }
+        if matches!(
+            request.repository.source.kind,
+            workspace_api::RepositorySourceKind::Https
+                | workspace_api::RepositorySourceKind::Http
+                | workspace_api::RepositorySourceKind::Ssh
+        ) {
+            validate_remote_source_uri(request)?;
+            let materialization = request.materialization.as_ref().ok_or_else(|| {
+                WorkingDirectoryDiagnostic::new(
+                    "working_directory_repository_materialization_authority_required",
+                    "remote Repository materialization requires Backend-authored operation authority",
+                )
+            })?;
+            if materialization.workspace_id.trim().is_empty()
+                || materialization.runtime_id.trim().is_empty()
+                || materialization.operation_id.trim().is_empty()
+                || materialization.config_revision == 0
+                || materialization.config_projection_digest.trim().is_empty()
+            {
+                return Err(WorkingDirectoryDiagnostic::new(
+                    "working_directory_repository_materialization_authority_invalid",
+                    "remote Repository materialization authority is invalid",
+                ));
+            }
+        }
+        match request.repository.source.kind {
+            workspace_api::RepositorySourceKind::LocalPath
+            | workspace_api::RepositorySourceKind::File
+            | workspace_api::RepositorySourceKind::Https
+            | workspace_api::RepositorySourceKind::Http => {}
+            workspace_api::RepositorySourceKind::Ssh => {
+                let ssh = request
+                    .materialization
+                    .as_ref()
+                    .and_then(|materialization| materialization.ssh.as_ref())
+                    .ok_or_else(|| {
+                        WorkingDirectoryDiagnostic::new(
+                            "working_directory_remote_repository_access_required",
+                            "SSH Repository materialization requires operation-scoped credential and host-trust authority",
+                        )
+                    })?;
+                validate_ssh_materialization_access(ssh)?;
+            }
+            workspace_api::RepositorySourceKind::Invalid => {
+                return Err(WorkingDirectoryDiagnostic::new(
+                    "working_directory_repository_source_invalid",
+                    "configured Repository source is invalid and cannot be materialized",
+                ));
+            }
+        }
+        validate_selector(request.repository.selector.as_deref().unwrap_or("HEAD"))
+    }
+
+    fn ensure_repository_cache(
+        &self,
+        request: &WorkingDirectoryRequest,
+    ) -> Result<PathBuf, WorkingDirectoryDiagnostic> {
+        Self::validate_request(request)?;
+        let cache_key = Self::repository_cache_key(request);
+        let cache_lock = self
+            .cache_locks
+            .lock()
+            .map_err(|_| {
+                WorkingDirectoryDiagnostic::new(
+                    "working_directory_repository_cache_unavailable",
+                    "Runtime Repository cache coordination is unavailable",
+                )
+            })?
+            .entry(cache_key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _cache_guard = cache_lock.lock().map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_cache_unavailable",
+                "Runtime Repository cache coordination is unavailable",
+            )
+        })?;
+        let cache_path = self.repository_cache_path(request);
+        let cache_parent = cache_path.parent().ok_or_else(|| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_cache_invalid",
+                "Runtime Repository cache path is invalid",
+            )
+        })?;
+        fs::create_dir_all(cache_parent).map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_cache_create_failed",
+                "Runtime Repository cache could not be created; backend-private path details were omitted",
+            )
+        })?;
+
+        let access = RepositoryCommandAccess::prepare(&self.runtime_root, request)?;
+        if cache_path.exists() {
+            if git_dir_stdout(&cache_path, ["rev-parse", "--is-bare-repository"])? != "true"
+                || git_dir_stdout(&cache_path, ["remote", "get-url", "origin"])?
+                    != request.repository.source.uri
+            {
+                return Err(WorkingDirectoryDiagnostic::new(
+                    "working_directory_repository_cache_identity_mismatch",
+                    "Runtime Repository cache identity does not match the requested source",
+                ));
+            }
+            fetch_repository_cache(request, access.as_ref(), &cache_path)?;
+        } else {
+            let staging = cache_path.with_extension(format!(
+                "staging-{}",
+                next_working_directory_id(&request.repository.id)
+            ));
+            if staging.exists() {
+                let _ = fs::remove_dir_all(&staging);
+            }
+            fs::create_dir_all(&staging).map_err(|_| {
+                WorkingDirectoryDiagnostic::new(
+                    "working_directory_repository_cache_create_failed",
+                    "Runtime Repository cache could not be created; backend-private path details were omitted",
+                )
+            })?;
+            let mut init = isolated_git_command();
+            init.args(["init", "--bare"]).arg(&staging);
+            let mut add_origin = repository_git_command(request, access.as_ref());
+            add_origin
+                .arg("--git-dir")
+                .arg(&staging)
+                .args(["remote", "add", "origin"])
+                .arg(&request.repository.source.uri);
+            let mut configure_fetch = isolated_git_command();
+            configure_fetch.arg("--git-dir").arg(&staging).args([
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ]);
+            let initialized =
+                run_repository_git(init, "working_directory_repository_cache_create_failed")
+                    .and_then(|_| {
+                        run_repository_git(
+                            add_origin,
+                            "working_directory_repository_cache_create_failed",
+                        )
+                    })
+                    .and_then(|_| {
+                        run_repository_git(
+                            configure_fetch,
+                            "working_directory_repository_cache_create_failed",
+                        )
+                    })
+                    .and_then(|_| fetch_repository_cache(request, access.as_ref(), &staging));
+            if let Err(error) = initialized {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(error);
+            }
+            if let Err(error) = fs::rename(&staging, &cache_path) {
+                let _ = fs::remove_dir_all(&staging);
+                if !cache_path.exists() {
+                    return Err(WorkingDirectoryDiagnostic::new(
+                        "working_directory_repository_cache_publish_failed",
+                        format!(
+                            "Runtime Repository cache could not be published: {}",
+                            error.kind()
+                        ),
+                    ));
+                }
+            }
+        }
+        validate_repository_cache_limits(&cache_path)?;
+        Ok(cache_path)
+    }
+
+    fn request_with_authorized_repository_access(
+        &self,
+        working_directory_id: &str,
+        request: &WorkingDirectoryRequest,
+    ) -> Result<WorkingDirectoryRequest, WorkingDirectoryDiagnostic> {
+        let mut request = request.clone();
+        if request.repository.provider != "git"
+            || request.repository.source.kind != workspace_api::RepositorySourceKind::Ssh
+        {
+            return Ok(request);
+        }
+        if let Some(access) = request
+            .materialization
+            .as_ref()
+            .and_then(|materialization| materialization.ssh.as_ref())
+        {
+            validate_ssh_materialization_access(access)?;
+            validate_repository_access_binding(
+                access,
+                &request.repository.id,
+                &request.repository.source_fingerprint,
+                Some(request.repository.source.uri.as_str()),
+            )?;
+            return Ok(request);
+        }
+        let access = self
+            .repository_access
+            .lock()
+            .map_err(|_| {
+                WorkingDirectoryDiagnostic::new(
+                    "working_directory_repository_access_unavailable",
+                    "Runtime Repository access state is unavailable",
+                )
+            })?
+            .get(working_directory_id)
+            .cloned()
+            .ok_or_else(|| {
+                WorkingDirectoryDiagnostic::new(
+                    "working_directory_remote_repository_access_required",
+                    "SSH Repository materialization requires pre-authorized credential and host-trust authority",
+                )
+            })?;
+        validate_ssh_materialization_access(&access)?;
+        validate_repository_access_binding(
+            &access,
+            &request.repository.id,
+            &request.repository.source_fingerprint,
+            Some(request.repository.source.uri.as_str()),
+        )?;
+        request
+            .materialization
+            .as_mut()
+            .ok_or_else(|| {
+                WorkingDirectoryDiagnostic::new(
+                    "working_directory_repository_materialization_authority_required",
+                    "remote Repository materialization requires Backend-authored operation authority",
+                )
+            })?
+            .ssh = Some(access);
+        Ok(request)
     }
 
     fn materialize_with_working_directory_id(
@@ -303,83 +760,14 @@ impl LocalGitWorktreeMaterializer {
         request: &WorkingDirectoryRequest,
     ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
         validate_working_directory_id(&working_directory_id)?;
-        if request.materializer != MaterializerKind::LocalGitWorktree {
-            return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_materializer_unsupported",
-                "only local_git_worktree working directory materialization is supported in v0",
-            ));
-        }
-        if request.repository.provider != "git" {
-            return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_repository_provider_unsupported",
-                format!(
-                    "repository provider `{}` is not supported by the v0 working directory materializer",
-                    request.repository.provider
-                ),
-            ));
-        }
-        let source_path = match request.repository.source.kind {
-            workspace_api::RepositorySourceKind::LocalPath => {
-                PathBuf::from(&request.repository.source.uri)
-            }
-            workspace_api::RepositorySourceKind::File => {
-                url::Url::parse(&request.repository.source.uri)
-                    .ok()
-                    .and_then(|uri| uri.to_file_path().ok())
-                    .ok_or_else(|| {
-                        WorkingDirectoryDiagnostic::new(
-                            "working_directory_repository_source_invalid",
-                            "configured file Repository source is invalid",
-                        )
-                    })?
-            }
-            workspace_api::RepositorySourceKind::Ssh
-            | workspace_api::RepositorySourceKind::Http
-            | workspace_api::RepositorySourceKind::Https => {
-                return Err(WorkingDirectoryDiagnostic::new(
-                    "working_directory_remote_repository_access_required",
-                    "remote Repository materialization requires an explicit authenticated access and trust handle",
-                ));
-            }
-            workspace_api::RepositorySourceKind::Invalid => {
-                return Err(WorkingDirectoryDiagnostic::new(
-                    "working_directory_repository_source_invalid",
-                    "configured Repository source is invalid and cannot be materialized",
-                ));
-            }
-        };
-        let source_root = git_stdout(&source_path, ["rev-parse", "--show-toplevel"])
-            .map(|value| PathBuf::from(value.trim()))
-            .map_err(|_| {
-                WorkingDirectoryDiagnostic::new(
-                    "working_directory_git_repository_unavailable",
-                    "configured local repository is not an available Git worktree; backend-private path details were omitted",
-                )
-            })?;
-
-        let selector = request
-            .repository
-            .selector
-            .as_deref()
-            .unwrap_or("HEAD")
-            .to_string();
-        if selector == "HEAD" {
-            let status = git_stdout(&source_root, ["status", "--porcelain"])?;
-            if !status.trim().is_empty() {
-                return Err(WorkingDirectoryDiagnostic::new(
-                    "working_directory_dirty_source_rejected",
-                    "working directory materialization rejects dirty source repository state",
-                ));
-            }
-        }
-        let commit_spec = format!("{selector}^{{commit}}");
-        let resolved_commit = git_stdout(&source_root, ["rev-parse", commit_spec.as_str()])?
-            .trim()
-            .to_string();
+        let request =
+            self.request_with_authorized_repository_access(&working_directory_id, request)?;
+        let repository_cache = self.ensure_repository_cache(&request)?;
+        let selector = request.repository.selector.as_deref().unwrap_or("HEAD");
+        let resolved_commit = resolve_cached_commit(&repository_cache, selector)?;
         let tree_spec = format!("{resolved_commit}^{{tree}}");
-        let resolved_tree = git_stdout(&source_root, ["rev-parse", tree_spec.as_str()])
+        let resolved_tree = git_dir_stdout(&repository_cache, ["rev-parse", tree_spec.as_str()])
             .ok()
-            .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
 
         let working_directory_root = self.working_directory_root(&working_directory_id);
@@ -387,38 +775,43 @@ impl LocalGitWorktreeMaterializer {
         if worktree_root.exists() {
             return Err(WorkingDirectoryDiagnostic::new(
                 "working_directory_exists",
-                "working directory working_directory target already exists; cleanup or choose a new working_directory",
+                "working directory target already exists; cleanup or choose a new working_directory",
             ));
         }
-        fs::create_dir_all(worktree_root.parent().ok_or_else(|| {
-            WorkingDirectoryDiagnostic::new(
-                "working_directory_invalid_target",
-                "working directory working_directory target has no parent directory",
-            )
-        })?)
-        .map_err(|_| {
+        fs::create_dir_all(&working_directory_root).map_err(|_| {
             WorkingDirectoryDiagnostic::new(
                 "working_directory_create_failed",
-                "failed to create working directory working_directory directory; backend-private path details were omitted",
+                "failed to create working directory; backend-private path details were omitted",
             )
         })?;
+        let mut command = isolated_git_command();
+        command
+            .arg("--git-dir")
+            .arg(&repository_cache)
+            .args(["worktree", "add", "--detach"])
+            .arg(&worktree_root)
+            .arg(&resolved_commit);
+        if let Err(error) = run_repository_git(command, "working_directory_git_failed") {
+            let _ = fs::remove_dir_all(&working_directory_root);
+            return Err(error);
+        }
+        if let Some(ssh) = request
+            .materialization
+            .as_ref()
+            .and_then(|materialization| materialization.ssh.as_ref())
+            && let Err(error) =
+                apply_worktree_access_policy(&repository_cache, &worktree_root, ssh.access)
+        {
+            remove_cached_worktree(&repository_cache, &worktree_root);
+            let _ = fs::remove_dir_all(&working_directory_root);
+            return Err(error);
+        }
 
-        let workspace_worktree_root_arg = path_str(&worktree_root)?;
-        git_status(
-            &source_root,
-            [
-                "worktree",
-                "add",
-                "--detach",
-                workspace_worktree_root_arg.as_str(),
-                resolved_commit.as_str(),
-            ],
-        )?;
-
+        let context = request.materialization.as_ref();
         let working_directory = WorkingDirectory {
             id: working_directory_id.clone(),
             repository_id: request.repository.id.clone(),
-            materializer_kind: MaterializerKind::LocalGitWorktree,
+            materializer_kind: MaterializerKind::RuntimeGitCache,
             evidence: WorkingDirectoryEvidence {
                 repository_id: request.repository.id.clone(),
                 requested_selector: request
@@ -428,11 +821,26 @@ impl LocalGitWorktreeMaterializer {
                     .map(|selector| selector.as_ref().to_string()),
                 resolved_commit,
                 resolved_tree,
-                materializer_kind: MaterializerKind::LocalGitWorktree,
+                materializer_kind: MaterializerKind::RuntimeGitCache,
+                repository_source_revision: Some(request.repository.source_revision),
+                repository_source_fingerprint: Some(request.repository.source_fingerprint.clone()),
+                repository_cache_key: Some(Self::repository_cache_key(&request)),
+                cache_generation: context
+                    .map(|value| value.cache_generation)
+                    .unwrap_or_default(),
+                operation_id: context.map(|value| value.operation_id.clone()),
+                credential_revision: context
+                    .and_then(|value| value.ssh.as_ref())
+                    .map(|value| value.credential_revision),
+                host_trust_revision: context
+                    .and_then(|value| value.ssh.as_ref())
+                    .map(|value| value.host_trust_revision),
+                transport_warning: repository_transport_warning(request.repository.source.kind)
+                    .map(str::to_string),
             },
             cleanup_target: WorkingDirectoryCleanupTarget {
-                kind: "git_worktree".to_string(),
-                working_directory_id,
+                kind: "runtime_git_cache_worktree".to_string(),
+                working_directory_id: working_directory_id.clone(),
                 repository_id: request.repository.id.clone(),
             },
             status: WorkingDirectoryStatusKind::Active,
@@ -440,16 +848,32 @@ impl LocalGitWorktreeMaterializer {
         let binding = WorkingDirectoryBinding {
             working_directory,
             root: worktree_root.clone(),
-            cwd: worktree_root,
-            working_directory_root,
-            source_repository_path: source_root,
+            cwd: worktree_root.clone(),
+            working_directory_root: working_directory_root.clone(),
+            source_repository_path: repository_cache.clone(),
+            command_environment: BTreeMap::new(),
+            session_resources: Vec::new(),
         };
-        self.write_record(&binding)?;
+        if let Err(error) = self.write_record(&binding) {
+            remove_cached_worktree(&repository_cache, &worktree_root);
+            let _ = fs::remove_dir_all(&working_directory_root);
+            return Err(error);
+        }
+        if let Some(ssh) = request
+            .materialization
+            .as_ref()
+            .and_then(|materialization| materialization.ssh.as_ref())
+            && let Err(error) = self.cache_repository_access(&working_directory_id, ssh)
+        {
+            remove_cached_worktree(&repository_cache, &worktree_root);
+            let _ = fs::remove_dir_all(&working_directory_root);
+            return Err(error);
+        }
         Ok(binding)
     }
 }
 
-impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
+impl WorkingDirectoryMaterializer for RuntimeGitCacheMaterializer {
     fn materialize(
         &self,
         worker_ref: &WorkerRef,
@@ -470,6 +894,55 @@ impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
         self.materialize_with_working_directory_id(working_directory_id, request)
     }
 
+    fn authorize_repository_access(
+        &self,
+        request: &WorkingDirectoryRepositoryAccessRequest,
+    ) -> Result<(), WorkingDirectoryDiagnostic> {
+        validate_working_directory_id(&request.working_directory_id)?;
+        let ssh = request.materialization.ssh.as_ref().ok_or_else(|| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_remote_repository_access_required",
+                "SSH Repository access authority is required",
+            )
+        })?;
+        validate_ssh_materialization_access(ssh)?;
+        let mut binding = match self.read_binding(&request.working_directory_id) {
+            Ok(binding) => binding,
+            Err(error) if error.code == "working_directory_not_found" => {
+                return self.cache_repository_access(&request.working_directory_id, ssh);
+            }
+            Err(error) => return Err(error),
+        };
+        if binding
+            .working_directory
+            .evidence
+            .credential_revision
+            .is_none()
+        {
+            return Err(WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_access_not_applicable",
+                "Workdir is not backed by an SSH Repository",
+            ));
+        }
+        validate_repository_access_binding(
+            ssh,
+            &binding.working_directory.evidence.repository_id,
+            binding
+                .working_directory
+                .evidence
+                .repository_source_fingerprint
+                .as_deref()
+                .unwrap_or_default(),
+            None,
+        )?;
+        binding.working_directory.evidence.operation_id =
+            Some(request.materialization.operation_id.clone());
+        binding.working_directory.evidence.credential_revision = Some(ssh.credential_revision);
+        binding.working_directory.evidence.host_trust_revision = Some(ssh.host_trust_revision);
+        self.write_record(&binding)?;
+        self.cache_repository_access(&request.working_directory_id, ssh)
+    }
+
     fn bind_working_directory(
         &self,
         working_directory_id: &str,
@@ -483,6 +956,7 @@ impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
                 "working directory working_directory is not active",
             ));
         }
+        let binding = self.bind_repository_access(working_directory_id, binding)?;
         let cwd = validate_relative_cwd(binding.root(), relative_cwd)?;
         Ok(WorkingDirectoryBinding { cwd, ..binding })
     }
@@ -510,7 +984,9 @@ impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
                 continue;
             }
             let working_directory_id = entry.file_name().to_string_lossy().to_string();
-            if validate_working_directory_id(&working_directory_id).is_err() {
+            if working_directory_id.starts_with('.')
+                || validate_working_directory_id(&working_directory_id).is_err()
+            {
                 continue;
             }
             match self.read_binding(&working_directory_id) {
@@ -601,9 +1077,19 @@ impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
             ));
         }
         let workspace_worktree_root_arg = path_str(&root)?;
-        let remove_result = git_status(
-            binding.source_repository_path(),
-            ["worktree", "remove", "--force", workspace_worktree_root_arg.as_str()],
+        let mut remove_command = isolated_git_command();
+        remove_command
+            .arg("--git-dir")
+            .arg(binding.source_repository_path())
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                workspace_worktree_root_arg.as_str(),
+            ]);
+        let remove_result = run_repository_git(
+            remove_command,
+            "working_directory_cleanup_failed",
         )
         .or_else(|_| {
             if root.exists() {
@@ -625,11 +1111,1178 @@ impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
                 cwd: binding.cwd.clone(),
                 working_directory_root: binding.working_directory_root.clone(),
                 source_repository_path: binding.source_repository_path.clone(),
+                command_environment: BTreeMap::new(),
+                session_resources: Vec::new(),
             };
             let _ = self.write_record(&updated);
+        } else if let Ok(mut access) = self.repository_access.lock() {
+            access.remove(&binding.working_directory.id);
         }
         remove_result
     }
+}
+
+#[derive(Debug)]
+struct RepositorySshAgent {
+    root: PathBuf,
+    socket: PathBuf,
+    child: Mutex<Option<std::process::Child>>,
+}
+
+impl RepositorySshAgent {
+    fn start(
+        runtime_root: &Path,
+        working_directory_id: &str,
+        access: &RepositorySshMaterializationAccess,
+    ) -> Result<Self, WorkingDirectoryDiagnostic> {
+        let root = runtime_root.join(".repository-agents").join(format!(
+            "{}-{}",
+            sanitize_path_component(working_directory_id),
+            next_working_directory_id("agent")
+        ));
+        fs::create_dir_all(&root).map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_agent_failed",
+                "Runtime-managed Repository SSH agent could not be created",
+            )
+        })?;
+        set_directory_owner_only(&root)?;
+        let socket = root.join("agent.sock");
+        let mut child = Command::new("ssh-agent")
+            .args(["-D", "-a"])
+            .arg(&socket)
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| {
+                WorkingDirectoryDiagnostic::new(
+                    "working_directory_repository_agent_unavailable",
+                    "Runtime-managed Repository SSH agent is unavailable",
+                )
+            })?;
+        let started = Instant::now();
+        loop {
+            if socket.exists() {
+                break;
+            }
+            if matches!(child.try_wait(), Ok(Some(_)) | Err(_))
+                || started.elapsed() >= Duration::from_secs(2)
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = fs::remove_dir_all(&root);
+                return Err(WorkingDirectoryDiagnostic::new(
+                    "working_directory_repository_agent_failed",
+                    "Runtime-managed Repository SSH agent could not be started",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let agent = Self {
+            root,
+            socket,
+            child: Mutex::new(Some(child)),
+        };
+        let mut add = match Command::new("ssh-add")
+            .arg("-")
+            .env("SSH_AUTH_SOCK", &agent.socket)
+            .env("SSH_ASKPASS", "/bin/false")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(add) => add,
+            Err(_) => {
+                drop(agent);
+                return Err(WorkingDirectoryDiagnostic::new(
+                    "working_directory_repository_agent_unavailable",
+                    "Runtime-managed Repository SSH agent is unavailable",
+                ));
+            }
+        };
+        let write_result = add.stdin.as_mut().map_or_else(
+            || Err(std::io::Error::other("ssh-add stdin unavailable")),
+            |stdin| stdin.write_all(access.private_key.expose().as_bytes()),
+        );
+        let status = add.wait();
+        if write_result.is_err() || !matches!(status, Ok(status) if status.success()) {
+            drop(agent);
+            return Err(WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_agent_failed",
+                "Runtime-managed Repository SSH agent rejected credential material",
+            ));
+        }
+        Ok(agent)
+    }
+
+    fn stop(&self) {
+        if let Ok(mut child) = self.child.lock()
+            && let Some(mut child) = child.take()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+impl Drop for RepositorySshAgent {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "channel", rename_all = "snake_case")]
+enum RepositorySshBrokerHeader {
+    Data {
+        request_id: String,
+        args: Vec<String>,
+    },
+    Stderr {
+        request_id: String,
+    },
+    Status {
+        request_id: String,
+    },
+}
+
+#[derive(Default)]
+struct PendingRepositorySshRequest {
+    created_at: Option<Instant>,
+    args: Option<Vec<String>>,
+    data: Option<UnixStream>,
+    stderr: Option<UnixStream>,
+    status: Option<UnixStream>,
+}
+
+impl std::fmt::Debug for PendingRepositorySshRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingRepositorySshRequest")
+            .field("args", &self.args)
+            .field("data_ready", &self.data.is_some())
+            .field("stderr_ready", &self.stderr.is_some())
+            .field("status_ready", &self.status.is_some())
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+struct RepositorySshBroker {
+    socket: PathBuf,
+    stopped: Arc<AtomicBool>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl RepositorySshBroker {
+    fn start(
+        root: &Path,
+        agent: Arc<RepositorySshAgent>,
+        known_hosts: PathBuf,
+        policy: RepositorySshCommandPolicy,
+    ) -> Result<Self, WorkingDirectoryDiagnostic> {
+        let socket = root.join("b.sock");
+        let listener = UnixListener::bind(&socket).map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_access_setup_failed",
+                "Repository SSH broker could not be prepared",
+            )
+        })?;
+        listener.set_nonblocking(true).map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_access_setup_failed",
+                "Repository SSH broker could not be prepared",
+            )
+        })?;
+        let stopped = Arc::new(AtomicBool::new(false));
+        let broker_stopped = Arc::clone(&stopped);
+        let thread = std::thread::spawn(move || {
+            let mut pending = HashMap::<String, PendingRepositorySshRequest>::new();
+            while !broker_stopped.load(Ordering::Acquire) {
+                pending.retain(|_, request| {
+                    request
+                        .created_at
+                        .is_some_and(|created_at| created_at.elapsed() < Duration::from_secs(5))
+                });
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        if let Some((request_id, request)) =
+                            receive_repository_ssh_channel(stream, &mut pending)
+                        {
+                            let request_agent = Arc::clone(&agent);
+                            let request_known_hosts = known_hosts.clone();
+                            let request_policy = policy.clone();
+                            std::thread::spawn(move || {
+                                run_brokered_repository_ssh(
+                                    request,
+                                    &request_agent.socket,
+                                    &request_known_hosts,
+                                    &request_policy,
+                                );
+                            });
+                            pending.remove(&request_id);
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(Self {
+            socket,
+            stopped,
+            thread: Mutex::new(Some(thread)),
+        })
+    }
+
+    fn stop(&self) {
+        if self.stopped.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _ = UnixStream::connect(&self.socket);
+        if let Ok(mut thread) = self.thread.lock()
+            && let Some(thread) = thread.take()
+        {
+            let _ = thread.join();
+        }
+        let _ = fs::remove_file(&self.socket);
+    }
+}
+
+impl Drop for RepositorySshBroker {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn receive_repository_ssh_channel(
+    stream: UnixStream,
+    pending: &mut HashMap<String, PendingRepositorySshRequest>,
+) -> Option<(String, PendingRepositorySshRequest)> {
+    let mut header = String::new();
+    if BufReader::new(stream.try_clone().ok()?)
+        .take(8_193)
+        .read_line(&mut header)
+        .ok()?
+        == 0
+        || header.len() > 8_192
+    {
+        return None;
+    }
+    let header: RepositorySshBrokerHeader = serde_json::from_str(header.trim_end()).ok()?;
+    let request_id = match &header {
+        RepositorySshBrokerHeader::Data { request_id, .. }
+        | RepositorySshBrokerHeader::Stderr { request_id }
+        | RepositorySshBrokerHeader::Status { request_id } => request_id.clone(),
+    };
+    if request_id.is_empty() || request_id.len() > 128 {
+        return None;
+    }
+    if !pending.contains_key(&request_id) && pending.len() >= 16 {
+        return None;
+    }
+    let request = pending.entry(request_id.clone()).or_default();
+    request.created_at.get_or_insert_with(Instant::now);
+    match header {
+        RepositorySshBrokerHeader::Data { args, .. } => {
+            request.args = Some(args);
+            request.data = Some(stream);
+        }
+        RepositorySshBrokerHeader::Stderr { .. } => request.stderr = Some(stream),
+        RepositorySshBrokerHeader::Status { .. } => request.status = Some(stream),
+    }
+    if request.args.is_some()
+        && request.data.is_some()
+        && request.stderr.is_some()
+        && request.status.is_some()
+    {
+        pending
+            .remove(&request_id)
+            .map(|request| (request_id, request))
+    } else {
+        None
+    }
+}
+
+fn run_brokered_repository_ssh(
+    mut request: PendingRepositorySshRequest,
+    agent_socket: &Path,
+    known_hosts: &Path,
+    policy: &RepositorySshCommandPolicy,
+) {
+    let args = request.args.take().unwrap_or_default();
+    let mut data = request.data.take().expect("complete broker request data");
+    let mut stderr_stream = request
+        .stderr
+        .take()
+        .expect("complete broker request stderr");
+    let mut status_stream = request
+        .status
+        .take()
+        .expect("complete broker request status");
+    let status = if !validate_repository_ssh_args(&args, policy) {
+        let _ = stderr_stream.write_all(b"Repository SSH operation denied\n");
+        let _ = stderr_stream.shutdown(Shutdown::Write);
+        let _ = data.shutdown(Shutdown::Both);
+        126
+    } else if args.iter().any(|argument| argument == "-G") {
+        let _ = stderr_stream.shutdown(Shutdown::Write);
+        let _ = data.shutdown(Shutdown::Both);
+        0
+    } else {
+        let mut command = Command::new("ssh");
+        command
+            .args(["-F", "/dev/null"])
+            .args(["-o", "BatchMode=yes"])
+            .args(["-o", "IdentitiesOnly=no"])
+            .args(["-o", "IdentityFile=/dev/null"])
+            .args(["-o", "IdentityAgent=SSH_AUTH_SOCK"])
+            .args(["-o", "StrictHostKeyChecking=yes"])
+            .arg("-o")
+            .arg(format!(
+                "UserKnownHostsFile={}",
+                known_hosts.to_string_lossy()
+            ))
+            .args(["-o", "ClearAllForwardings=yes"])
+            .args(["-o", "PermitLocalCommand=no"])
+            .args(&args)
+            .env("SSH_AUTH_SOCK", agent_socket)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        match command.spawn() {
+            Ok(mut child) => {
+                let mut child_stdin = child.stdin.take().expect("piped ssh stdin");
+                let mut input = data.try_clone().expect("clone broker data stream");
+                let input_thread = std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut input, &mut child_stdin);
+                });
+                let mut child_stdout = child.stdout.take().expect("piped ssh stdout");
+                let output_thread = std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut child_stdout, &mut data);
+                    let _ = data.shutdown(Shutdown::Write);
+                });
+                let mut child_stderr = child.stderr.take().expect("piped ssh stderr");
+                let error_thread = std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut child_stderr, &mut stderr_stream);
+                    let _ = stderr_stream.shutdown(Shutdown::Write);
+                });
+                let status = child
+                    .wait()
+                    .ok()
+                    .and_then(|status| status.code())
+                    .unwrap_or(1);
+                let _ = input_thread.join();
+                let _ = output_thread.join();
+                let _ = error_thread.join();
+                status
+            }
+            Err(_) => 1,
+        }
+    };
+    let _ = writeln!(status_stream, "{status}");
+    let _ = status_stream.shutdown(Shutdown::Write);
+}
+
+#[derive(Clone, Debug)]
+struct RepositorySshCommandPolicy {
+    host: String,
+    username: Option<String>,
+    port: Option<u16>,
+    repository_path: String,
+    access: workspace_api::RepositoryAccessMode,
+}
+
+impl RepositorySshCommandPolicy {
+    fn from_access(
+        access: &RepositorySshMaterializationAccess,
+    ) -> Result<Self, WorkingDirectoryDiagnostic> {
+        let uri = url::Url::parse(&access.repository_uri).map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_access_binding_mismatch",
+                "Repository SSH access URI is invalid",
+            )
+        })?;
+        if uri.scheme() != "ssh"
+            || uri.password().is_some()
+            || uri.query().is_some()
+            || uri.fragment().is_some()
+        {
+            return Err(WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_access_binding_mismatch",
+                "Repository SSH access URI is not an authorized SSH endpoint",
+            ));
+        }
+        let host = uri
+            .host_str()
+            .filter(|host| !host.is_empty())
+            .ok_or_else(|| {
+                WorkingDirectoryDiagnostic::new(
+                    "working_directory_repository_access_binding_mismatch",
+                    "Repository SSH access host is missing",
+                )
+            })?;
+        let username = (!uri.username().is_empty()).then(|| uri.username().to_string());
+        if username
+            .as_deref()
+            .is_some_and(|username| !is_safe_ssh_destination(username))
+            || uri.path().is_empty()
+            || !is_safe_repository_path(uri.path())
+        {
+            return Err(WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_access_binding_mismatch",
+                "Repository SSH access endpoint or path is invalid",
+            ));
+        }
+        Ok(Self {
+            host: host.to_string(),
+            username,
+            port: uri.port(),
+            repository_path: uri.path().to_string(),
+            access: access.access,
+        })
+    }
+
+    fn destination_matches(&self, destination: &str, login: Option<&str>) -> bool {
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        match self.username.as_deref() {
+            Some(username) => {
+                (login.is_none() && destination == format!("{username}@{host}"))
+                    || (login == Some(username) && destination == host)
+            }
+            None => login.is_none() && destination == host,
+        }
+    }
+}
+
+fn validate_repository_ssh_args(args: &[String], policy: &RepositorySshCommandPolicy) -> bool {
+    let mut index = 0;
+    let mut probe = false;
+    let mut port = None;
+    let mut login = None;
+    let mut positional = Vec::new();
+    while index < args.len() {
+        match args[index].as_str() {
+            "-G" => probe = true,
+            "-4" | "-6" | "-v" | "-vv" | "-vvv" => {}
+            "-p" => {
+                if port.is_some() {
+                    return false;
+                }
+                index += 1;
+                let Some(value) = args.get(index).and_then(|value| value.parse::<u16>().ok())
+                else {
+                    return false;
+                };
+                port = Some(value);
+            }
+            "-l" => {
+                if login.is_some() {
+                    return false;
+                }
+                index += 1;
+                let Some(value) = args
+                    .get(index)
+                    .filter(|value| is_safe_ssh_destination(value))
+                else {
+                    return false;
+                };
+                login = Some(value.as_str());
+            }
+            "-o" => {
+                index += 1;
+                if index >= args.len() || !is_safe_git_ssh_option(&args[index]) {
+                    return false;
+                }
+            }
+            option if option.starts_with("-o") => {
+                if !is_safe_git_ssh_option(&option[2..]) {
+                    return false;
+                }
+            }
+            option if option.starts_with('-') => return false,
+            value => positional.push(value),
+        }
+        index += 1;
+    }
+    if port != policy.port
+        || positional.is_empty()
+        || !policy.destination_matches(positional[0], login)
+    {
+        return false;
+    }
+    if probe {
+        positional.len() == 1
+    } else {
+        positional.len() == 2 && repository_command_matches(positional[1], policy)
+    }
+}
+
+fn is_safe_git_ssh_option(option: &str) -> bool {
+    option == "SendEnv=GIT_PROTOCOL"
+        || option
+            .strip_prefix("SetEnv=GIT_PROTOCOL=")
+            .is_some_and(|value| {
+                !value.is_empty()
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+            })
+}
+
+fn is_safe_ssh_destination(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'-' | b'_' | b'@' | b':' | b'[' | b']')
+        })
+}
+
+fn is_safe_repository_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'/' | b'.' | b'-' | b'_' | b'@' | b':' | b'+' | b'~' | b' ' | b'%'
+                )
+        })
+}
+
+fn repository_command_matches(command: &str, policy: &RepositorySshCommandPolicy) -> bool {
+    let (operation, argument) = if let Some(argument) = command.strip_prefix("git-upload-pack ") {
+        ("upload-pack", argument)
+    } else if let Some(argument) = command.strip_prefix("git-upload-archive ") {
+        ("upload-archive", argument)
+    } else if let Some(argument) = command.strip_prefix("git-receive-pack ") {
+        ("receive-pack", argument)
+    } else {
+        return false;
+    };
+    if operation == "receive-pack"
+        && policy.access != workspace_api::RepositoryAccessMode::ReadWrite
+    {
+        return false;
+    }
+    let argument = argument
+        .strip_prefix('\'')
+        .and_then(|argument| argument.strip_suffix('\''))
+        .unwrap_or(argument);
+    is_safe_repository_path(argument) && argument == policy.repository_path
+}
+
+pub fn run_repository_ssh_client(arguments: &[String]) -> Result<i32, String> {
+    let (socket, ssh_args) = arguments
+        .split_first()
+        .ok_or_else(|| "Repository SSH broker socket is missing".to_string())?;
+    let request_id = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let mut data = connect_repository_ssh_broker_channel(
+        socket,
+        &RepositorySshBrokerHeader::Data {
+            request_id: request_id.clone(),
+            args: ssh_args.to_vec(),
+        },
+    )?;
+    let mut stderr_stream = connect_repository_ssh_broker_channel(
+        socket,
+        &RepositorySshBrokerHeader::Stderr {
+            request_id: request_id.clone(),
+        },
+    )?;
+    let mut status_stream = connect_repository_ssh_broker_channel(
+        socket,
+        &RepositorySshBrokerHeader::Status { request_id },
+    )?;
+    let mut input = data
+        .try_clone()
+        .map_err(|_| "Repository SSH broker input failed".to_string())?;
+    let input_thread = std::thread::spawn(move || {
+        let _ = std::io::copy(&mut std::io::stdin(), &mut input);
+        let _ = input.shutdown(Shutdown::Write);
+    });
+    let error_thread = std::thread::spawn(move || {
+        let _ = std::io::copy(&mut stderr_stream, &mut std::io::stderr());
+    });
+    std::io::copy(&mut data, &mut std::io::stdout())
+        .map_err(|_| "Repository SSH broker output failed".to_string())?;
+    let _ = input_thread.join();
+    let _ = error_thread.join();
+    let mut status = String::new();
+    status_stream
+        .read_to_string(&mut status)
+        .map_err(|_| "Repository SSH broker status failed".to_string())?;
+    status
+        .trim()
+        .parse::<i32>()
+        .map_err(|_| "Repository SSH broker status was invalid".to_string())
+}
+
+fn connect_repository_ssh_broker_channel(
+    socket: &str,
+    header: &RepositorySshBrokerHeader,
+) -> Result<UnixStream, String> {
+    let mut stream = UnixStream::connect(socket)
+        .map_err(|_| "Repository SSH broker is unavailable".to_string())?;
+    serde_json::to_writer(&mut stream, header)
+        .map_err(|_| "Repository SSH broker request failed".to_string())?;
+    stream
+        .write_all(b"\n")
+        .map_err(|_| "Repository SSH broker request failed".to_string())?;
+    Ok(stream)
+}
+
+#[derive(Debug)]
+struct RepositoryCommandAccess {
+    root: PathBuf,
+    ssh_command: PathBuf,
+    agent: Arc<RepositorySshAgent>,
+    ssh_broker: Option<RepositorySshBroker>,
+}
+
+impl RepositoryCommandAccess {
+    fn prepare(
+        runtime_root: &Path,
+        request: &WorkingDirectoryRequest,
+    ) -> Result<Option<Self>, WorkingDirectoryDiagnostic> {
+        if request.repository.source.kind != workspace_api::RepositorySourceKind::Ssh {
+            return Ok(None);
+        }
+        let Some(ssh) = request
+            .materialization
+            .as_ref()
+            .and_then(|materialization| materialization.ssh.as_ref())
+        else {
+            return Ok(None);
+        };
+        let operation_id = request
+            .materialization
+            .as_ref()
+            .map(|materialization| materialization.operation_id.as_str())
+            .unwrap_or("operation");
+        Ok(Some(Self::prepare_ssh(
+            runtime_root,
+            operation_id,
+            &request.repository.id,
+            ssh,
+        )?))
+    }
+
+    fn prepare_ssh(
+        runtime_root: &Path,
+        operation_id: &str,
+        repository_id: &str,
+        ssh: &RepositorySshMaterializationAccess,
+    ) -> Result<Self, WorkingDirectoryDiagnostic> {
+        let root = runtime_root.join(REPOSITORY_ACCESS_DIR).join(format!(
+            "{}-{}",
+            sanitize_path_component(operation_id),
+            next_working_directory_id(repository_id)
+        ));
+        fs::create_dir_all(&root).map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_access_setup_failed",
+                "operation-scoped Repository access could not be prepared",
+            )
+        })?;
+        set_directory_owner_only(&root)?;
+        let known_hosts = root.join("known_hosts");
+        let ssh_command = root.join("ssh-command");
+        write_owner_only(&known_hosts, ssh.known_hosts_entry.expose().as_bytes())?;
+        let agent = Arc::new(RepositorySshAgent::start(runtime_root, operation_id, ssh)?);
+        let policy = RepositorySshCommandPolicy::from_access(ssh)?;
+        let ssh_broker = Some(RepositorySshBroker::start(
+            &root,
+            Arc::clone(&agent),
+            known_hosts.clone(),
+            policy,
+        )?);
+        let broker = ssh_broker.as_ref().expect("Repository SSH broker");
+        let executable = std::env::current_exe().map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_access_setup_failed",
+                "Repository SSH broker client could not be resolved",
+            )
+        })?;
+        let script = format!(
+            "#!/bin/sh\nexec {} __repository-ssh {} \"$@\"\n",
+            shell_quote_path(&executable)?,
+            shell_quote_path(&broker.socket)?,
+        );
+        write_owner_only(&ssh_command, script.as_bytes())?;
+        set_file_owner_executable(&ssh_command)?;
+        Ok(Self {
+            root,
+            ssh_command,
+            agent,
+            ssh_broker,
+        })
+    }
+
+    fn stop(&self) {
+        if let Some(broker) = self.ssh_broker.as_ref() {
+            broker.stop();
+        }
+        self.agent.stop();
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+impl Drop for RepositoryCommandAccess {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn validate_repository_access_binding(
+    access: &RepositorySshMaterializationAccess,
+    repository_id: &str,
+    repository_source_fingerprint: &str,
+    repository_uri: Option<&str>,
+) -> Result<(), WorkingDirectoryDiagnostic> {
+    if access.repository_id != repository_id
+        || access.repository_source_fingerprint != repository_source_fingerprint
+        || repository_uri.is_some_and(|repository_uri| access.repository_uri != repository_uri)
+    {
+        return Err(WorkingDirectoryDiagnostic::new(
+            "working_directory_repository_access_binding_mismatch",
+            "Repository SSH access authority does not match the requested Repository source",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ssh_materialization_access(
+    access: &RepositorySshMaterializationAccess,
+) -> Result<(), WorkingDirectoryDiagnostic> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if access.expires_at_epoch_seconds <= now {
+        return Err(WorkingDirectoryDiagnostic::new(
+            "working_directory_repository_access_expired",
+            "operation-scoped SSH credential and host-trust authority has expired",
+        ));
+    }
+    if access.credential_id.trim().is_empty()
+        || access.credential_revision == 0
+        || access.host_trust_id.trim().is_empty()
+        || access.host_trust_revision == 0
+        || !access.private_key.expose().contains("PRIVATE KEY")
+        || access.known_hosts_entry.expose().trim().is_empty()
+    {
+        return Err(WorkingDirectoryDiagnostic::new(
+            "working_directory_remote_repository_access_invalid",
+            "operation-scoped SSH credential or host-trust authority is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn repository_transport_warning(kind: workspace_api::RepositorySourceKind) -> Option<&'static str> {
+    (kind == workspace_api::RepositorySourceKind::Http).then_some("plain_http_transport")
+}
+
+fn validate_remote_source_uri(
+    request: &WorkingDirectoryRequest,
+) -> Result<(), WorkingDirectoryDiagnostic> {
+    let url = url::Url::parse(&request.repository.source.uri).map_err(|_| {
+        WorkingDirectoryDiagnostic::new(
+            "working_directory_repository_source_invalid",
+            "remote Repository source URI is invalid",
+        )
+    })?;
+    let expected_scheme = match request.repository.source.kind {
+        workspace_api::RepositorySourceKind::Https => "https",
+        workspace_api::RepositorySourceKind::Http => "http",
+        workspace_api::RepositorySourceKind::Ssh => "ssh",
+        _ => return Ok(()),
+    };
+    if url.scheme() != expected_scheme
+        || url.host_str().is_none()
+        || url.password().is_some()
+        || !url.query().is_none()
+        || !url.fragment().is_none()
+        || (matches!(expected_scheme, "https" | "http") && !url.username().is_empty())
+    {
+        return Err(WorkingDirectoryDiagnostic::new(
+            "working_directory_repository_source_invalid",
+            "remote Repository source URI is invalid or contains forbidden credentials",
+        ));
+    }
+    if expected_scheme == "ssh" {
+        let access = request
+            .materialization
+            .as_ref()
+            .and_then(|materialization| materialization.ssh.as_ref())
+            .ok_or_else(|| {
+                WorkingDirectoryDiagnostic::new(
+                    "working_directory_remote_repository_access_required",
+                    "SSH Repository materialization requires operation-scoped credential and host-trust authority",
+                )
+            })?;
+        let host = url.host_str().unwrap_or_default();
+        let known_host = if url.port().unwrap_or(22) == 22 {
+            format!("{host} ")
+        } else {
+            format!("[{host}]:{} ", url.port().unwrap_or(22))
+        };
+        if !access.known_hosts_entry.expose().starts_with(&known_host) {
+            return Err(WorkingDirectoryDiagnostic::new(
+                "working_directory_remote_repository_host_trust_mismatch",
+                "SSH Repository source does not match the operation-scoped host-trust authority",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_selector(selector: &str) -> Result<(), WorkingDirectoryDiagnostic> {
+    let valid = !selector.is_empty()
+        && selector.len() <= 512
+        && !selector.starts_with('-')
+        && !selector.ends_with('.')
+        && !selector.contains("..")
+        && !selector.contains("@{")
+        && !selector.contains("//")
+        && !selector.chars().any(|ch| {
+            ch.is_control()
+                || ch.is_whitespace()
+                || matches!(ch, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+        });
+    if !valid {
+        return Err(WorkingDirectoryDiagnostic::new(
+            "working_directory_repository_selector_invalid",
+            "configured Repository selector is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn isolated_git_command() -> Command {
+    let mut command = Command::new("git");
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_ASKPASS", "/bin/false")
+        .env("SSH_ASKPASS", "/bin/false")
+        .env("LC_ALL", "C")
+        .args([
+            "-c",
+            "credential.helper=",
+            "-c",
+            "core.askPass=/bin/false",
+            "-c",
+            "http.followRedirects=false",
+            "-c",
+            "protocol.ext.allow=never",
+            "-c",
+            "submodule.recurse=false",
+        ]);
+    command
+}
+
+fn repository_git_command(
+    request: &WorkingDirectoryRequest,
+    access: Option<&RepositoryCommandAccess>,
+) -> Command {
+    let mut command = isolated_git_command();
+    let file_policy = if matches!(
+        request.repository.source.kind,
+        workspace_api::RepositorySourceKind::LocalPath | workspace_api::RepositorySourceKind::File
+    ) {
+        "always"
+    } else {
+        "never"
+    };
+    command.args(["-c", &format!("protocol.file.allow={file_policy}")]);
+    if let Some(access) = access {
+        command
+            .env("GIT_SSH_COMMAND", &access.ssh_command)
+            .env("SSH_AUTH_SOCK", &access.agent.socket);
+    }
+    command
+}
+
+fn run_repository_git(
+    mut command: Command,
+    code: &'static str,
+) -> Result<(), WorkingDirectoryDiagnostic> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_git_unavailable",
+                "Git command could not be executed; backend-private path details were omitted",
+            )
+        })?;
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                code,
+                "Git Repository operation failed; credentials and backend-private path details were omitted",
+            )
+        })? {
+            break status;
+        }
+        if started.elapsed() >= REPOSITORY_COMMAND_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_timeout",
+                "Git Repository operation exceeded the Runtime time limit",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    if status.success() {
+        Ok(())
+    } else {
+        Err(WorkingDirectoryDiagnostic::new(
+            code,
+            "Git Repository operation failed; credentials and backend-private path details were omitted",
+        ))
+    }
+}
+
+fn resolve_cached_commit(
+    repository_cache: &Path,
+    selector: &str,
+) -> Result<String, WorkingDirectoryDiagnostic> {
+    let mut candidates = Vec::new();
+    if selector == "HEAD" {
+        candidates.push("FETCH_HEAD".to_string());
+    } else if let Some(branch) = selector.strip_prefix("refs/heads/") {
+        candidates.push(format!("refs/remotes/origin/{branch}"));
+    } else if selector.starts_with("refs/") || selector.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        candidates.push(selector.to_string());
+    } else {
+        candidates.push(format!("refs/remotes/origin/{selector}"));
+        candidates.push(selector.to_string());
+    }
+    for candidate in candidates {
+        let spec = format!("{candidate}^{{commit}}");
+        if let Ok(commit) = git_dir_stdout(repository_cache, ["rev-parse", spec.as_str()])
+            && !commit.is_empty()
+        {
+            return Ok(commit);
+        }
+    }
+    Err(WorkingDirectoryDiagnostic::new(
+        "working_directory_repository_selector_unresolved",
+        "configured Repository selector could not be resolved to a commit",
+    ))
+}
+
+fn fetch_repository_cache(
+    request: &WorkingDirectoryRequest,
+    access: Option<&RepositoryCommandAccess>,
+    repository_cache: &Path,
+) -> Result<(), WorkingDirectoryDiagnostic> {
+    let mut refs = repository_git_command(request, access);
+    refs.arg("--git-dir").arg(repository_cache).args([
+        "fetch",
+        "--prune",
+        "--tags",
+        "origin",
+        "+refs/heads/*:refs/remotes/origin/*",
+    ]);
+    let mut head = repository_git_command(request, access);
+    head.arg("--git-dir")
+        .arg(repository_cache)
+        .args(["fetch", "--no-tags", "origin", "HEAD"]);
+    run_repository_git(refs, "working_directory_repository_fetch_failed")?;
+    run_repository_git(head, "working_directory_repository_fetch_failed")
+}
+
+fn apply_worktree_access_policy(
+    repository_cache: &Path,
+    worktree_root: &Path,
+    access: workspace_api::RepositoryAccessMode,
+) -> Result<(), WorkingDirectoryDiagnostic> {
+    let mut enable_worktree_config = isolated_git_command();
+    enable_worktree_config
+        .arg("--git-dir")
+        .arg(repository_cache)
+        .args(["config", "extensions.worktreeConfig", "true"]);
+    run_repository_git(
+        enable_worktree_config,
+        "working_directory_repository_policy_failed",
+    )?;
+    match access {
+        workspace_api::RepositoryAccessMode::ReadOnly => {
+            let mut disable_push = isolated_git_command();
+            disable_push.arg("-C").arg(worktree_root).args([
+                "config",
+                "--worktree",
+                "remote.origin.pushurl",
+                "yoi-read-only://repository-push-disabled",
+            ]);
+            run_repository_git(disable_push, "working_directory_repository_policy_failed")
+        }
+        workspace_api::RepositoryAccessMode::ReadWrite => {
+            if git_stdout(
+                worktree_root,
+                ["config", "--worktree", "--get-all", "remote.origin.pushurl"],
+            )
+            .is_err()
+            {
+                return Ok(());
+            }
+            let mut enable_push = isolated_git_command();
+            enable_push.arg("-C").arg(worktree_root).args([
+                "config",
+                "--worktree",
+                "--unset-all",
+                "remote.origin.pushurl",
+            ]);
+            run_repository_git(enable_push, "working_directory_repository_policy_failed")
+        }
+    }
+}
+
+fn validate_repository_cache_limits(
+    repository_cache: &Path,
+) -> Result<(), WorkingDirectoryDiagnostic> {
+    let report = git_dir_stdout(repository_cache, ["count-objects", "-v"])?;
+    let mut objects = 0u64;
+    let mut kibibytes = 0u64;
+    for line in report.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim().parse::<u64>().unwrap_or(u64::MAX);
+        match key {
+            "count" | "in-pack" | "garbage" => objects = objects.saturating_add(value),
+            "size" | "size-pack" | "size-garbage" => kibibytes = kibibytes.saturating_add(value),
+            _ => {}
+        }
+    }
+    if objects > REPOSITORY_MAX_OBJECTS || kibibytes.saturating_mul(1024) > REPOSITORY_MAX_BYTES {
+        return Err(WorkingDirectoryDiagnostic::new(
+            "working_directory_repository_limit_exceeded",
+            "Git Repository exceeds Runtime object or storage limits",
+        ));
+    }
+    Ok(())
+}
+
+fn remove_cached_worktree(repository_cache: &Path, worktree_root: &Path) {
+    let mut command = isolated_git_command();
+    command
+        .arg("--git-dir")
+        .arg(repository_cache)
+        .args(["worktree", "remove", "--force"])
+        .arg(worktree_root);
+    let _ = run_repository_git(command, "working_directory_cleanup_failed");
+}
+
+fn git_dir_stdout<'a, I>(
+    repository_path: &Path,
+    args: I,
+) -> Result<String, WorkingDirectoryDiagnostic>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut command = isolated_git_command();
+    let output = command
+        .arg("--git-dir")
+        .arg(repository_path)
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_git_unavailable",
+                "Git command could not be executed; backend-private path details were omitted",
+            )
+        })?;
+    if !output.status.success() || output.stdout.len() > 4096 {
+        return Err(WorkingDirectoryDiagnostic::new(
+            "working_directory_repository_selector_unresolved",
+            "configured Repository selector could not be resolved to a commit",
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn write_owner_only(path: &Path, content: &[u8]) -> Result<(), WorkingDirectoryDiagnostic> {
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|_| {
+        WorkingDirectoryDiagnostic::new(
+            "working_directory_repository_access_setup_failed",
+            "operation-scoped Repository access could not be prepared",
+        )
+    })?;
+    file.write_all(content).map_err(|_| {
+        WorkingDirectoryDiagnostic::new(
+            "working_directory_repository_access_setup_failed",
+            "operation-scoped Repository access could not be prepared",
+        )
+    })
+}
+
+fn set_directory_owner_only(path: &Path) -> Result<(), WorkingDirectoryDiagnostic> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_access_setup_failed",
+                "operation-scoped Repository access could not be prepared",
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn set_file_owner_executable(path: &Path) -> Result<(), WorkingDirectoryDiagnostic> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_access_setup_failed",
+                "operation-scoped Repository access could not be prepared",
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn shell_quote_path(path: &Path) -> Result<String, WorkingDirectoryDiagnostic> {
+    let value = path_str(path)?;
+    Ok(format!("'{}'", value.replace('\'', "'\\''")))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -661,13 +2314,6 @@ where
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn git_status<'a, I>(repository_path: &Path, args: I) -> Result<(), WorkingDirectoryDiagnostic>
-where
-    I: IntoIterator<Item = &'a str>,
-{
-    git_stdout(repository_path, args).map(|_| ())
 }
 
 fn path_str(path: &Path) -> Result<String, WorkingDirectoryDiagnostic> {
@@ -778,6 +2424,28 @@ mod tests {
     use crate::catalog::{RepositorySelector, WorkingDirectoryRepository};
     use crate::identity::{WorkerId, WorkerRef};
 
+    fn repository_resource_handle() -> crate::resource::BackendResourceHandle {
+        crate::resource::BackendResourceHandle {
+            kind: crate::resource::BackendResourceKind::RepositorySshAccess,
+            workspace_id: "workspace-1".to_string(),
+            scope_id: Some("repository-ssh-access".to_string()),
+            runtime_id: Some("runtime-1".to_string()),
+            worker_id: None,
+            resource_id: "repository-access-1".to_string(),
+            digest: "opaque:repository-access-1".to_string(),
+            operation: crate::resource::BackendResourceOperation::FetchOnce,
+            expires_at_unix_seconds: i64::MAX,
+            nonce: "repository-access-1".to_string(),
+            revision: "1".to_string(),
+            generation: None,
+            max_bytes: crate::resource::DEFAULT_REPOSITORY_SSH_ACCESS_MAX_BYTES,
+            content_type: crate::resource::REPOSITORY_SSH_ACCESS_CONTENT_TYPE.to_string(),
+            redaction: crate::resource::ResourceRedactionPolicy::RuntimeInternalOnly,
+            audit_correlation_id: "repository-access-1".to_string(),
+            profile_source_graph: None,
+        }
+    }
+
     fn git(path: &Path, args: &[&str]) {
         let status = Command::new("git")
             .arg("-C")
@@ -815,8 +2483,9 @@ mod tests {
                 source_fingerprint: "sha256:test".to_string(),
                 selector: Some(RepositorySelector::from("HEAD")),
             },
-            materializer: MaterializerKind::LocalGitWorktree,
+            materializer: MaterializerKind::RuntimeGitCache,
             backend_workdir_id: None,
+            materialization: None,
         }
     }
 
@@ -828,7 +2497,7 @@ mod tests {
     fn local_git_repo_materializes_detached_worktree_under_runtime_root() {
         let repo = create_clean_repo();
         let runtime_root = tempfile::tempdir().unwrap();
-        let materializer = LocalGitWorktreeMaterializer::new(runtime_root.path());
+        let materializer = RuntimeGitCacheMaterializer::new(runtime_root.path());
         let binding = materializer
             .materialize(&worker_ref(1), &request(repo.path()))
             .unwrap();
@@ -853,7 +2522,7 @@ mod tests {
         );
         assert_eq!(
             binding.working_directory.materializer_kind,
-            MaterializerKind::LocalGitWorktree
+            MaterializerKind::RuntimeGitCache
         );
         assert!(
             binding
@@ -867,7 +2536,7 @@ mod tests {
     fn multiple_workers_materialize_distinct_paths_for_same_source_repo() {
         let repo = create_clean_repo();
         let runtime_root = tempfile::tempdir().unwrap();
-        let materializer = LocalGitWorktreeMaterializer::new(runtime_root.path());
+        let materializer = RuntimeGitCacheMaterializer::new(runtime_root.path());
         let first = materializer
             .materialize(&worker_ref(1), &request(repo.path()))
             .unwrap();
@@ -883,18 +2552,18 @@ mod tests {
     }
 
     #[test]
-    fn dirty_source_is_rejected_by_materialization() {
+    fn dirty_source_is_ignored_by_commit_only_materialization() {
         let repo = create_clean_repo();
         fs::write(repo.path().join("dirty.txt"), "dirty\n").unwrap();
         let runtime_root = tempfile::tempdir().unwrap();
-        let materializer = LocalGitWorktreeMaterializer::new(runtime_root.path());
+        let materializer = RuntimeGitCacheMaterializer::new(runtime_root.path());
 
-        let error = materializer
+        let binding = materializer
             .materialize(&worker_ref(1), &request(repo.path()))
-            .unwrap_err();
+            .unwrap();
 
-        assert_eq!(error.code, "working_directory_dirty_source_rejected");
-        assert!(error.message.contains("dirty source"));
+        assert!(binding.root.join("README.md").exists());
+        assert!(!binding.root.join("dirty.txt").exists());
     }
 
     #[test]
@@ -903,7 +2572,7 @@ mod tests {
         git(repo.path(), &["branch", "pinned"]);
         fs::write(repo.path().join("dirty.txt"), "dirty\n").unwrap();
         let runtime_root = tempfile::tempdir().unwrap();
-        let materializer = LocalGitWorktreeMaterializer::new(runtime_root.path());
+        let materializer = RuntimeGitCacheMaterializer::new(runtime_root.path());
         let mut request = request(repo.path());
         request.repository.selector = Some(RepositorySelector::from("pinned"));
 
@@ -922,14 +2591,606 @@ mod tests {
     }
 
     #[test]
+    fn file_and_local_sources_share_the_runtime_cache_pipeline() {
+        let repo = create_clean_repo();
+        let runtime_root = tempfile::tempdir().unwrap();
+        let materializer = RuntimeGitCacheMaterializer::new(runtime_root.path());
+        let local = materializer
+            .materialize(&worker_ref(1), &request(repo.path()))
+            .unwrap();
+        let second = materializer
+            .materialize(&worker_ref(2), &request(repo.path()))
+            .unwrap();
+
+        assert_eq!(
+            local.working_directory.evidence.repository_cache_key,
+            second.working_directory.evidence.repository_cache_key
+        );
+        assert_eq!(
+            git_dir_stdout(
+                local.source_repository_path(),
+                ["config", "--get-all", "remote.origin.fetch"],
+            )
+            .unwrap(),
+            "+refs/heads/*:refs/remotes/origin/*"
+        );
+        assert!(
+            git_dir_stdout(
+                local.source_repository_path(),
+                ["config", "--get", "remote.origin.mirror"],
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read_dir(runtime_root.path().join(REPOSITORY_CACHE_DIR))
+                .unwrap()
+                .count(),
+            1
+        );
+
+        let mut file_request = request(repo.path());
+        file_request.repository.source.kind = workspace_api::RepositorySourceKind::File;
+        file_request.repository.source.uri = format!("file://{}", repo.path().display());
+        file_request.repository.source_revision = 2;
+        file_request.repository.source_fingerprint = "sha256:file-source".to_string();
+        let file = materializer
+            .materialize(&worker_ref(3), &file_request)
+            .unwrap();
+        assert!(file.root.join("README.md").exists());
+        assert_ne!(
+            local.working_directory.evidence.repository_cache_key,
+            file.working_directory.evidence.repository_cache_key
+        );
+    }
+
+    #[test]
+    fn materialization_context_is_audited_without_secret_values() {
+        let repo = create_clean_repo();
+        let runtime_root = tempfile::tempdir().unwrap();
+        let materializer = RuntimeGitCacheMaterializer::new(runtime_root.path());
+        let mut request = request(repo.path());
+        request.materialization = Some(crate::catalog::RepositoryMaterializationContext {
+            workspace_id: "workspace-1".to_string(),
+            runtime_id: "runtime-1".to_string(),
+            operation_id: "operation-1".to_string(),
+            config_revision: 7,
+            config_projection_digest: "sha256:projection".to_string(),
+            cache_generation: 3,
+            ssh: None,
+        });
+
+        let binding = materializer.materialize(&worker_ref(1), &request).unwrap();
+        assert_eq!(
+            binding.working_directory.evidence.operation_id.as_deref(),
+            Some("operation-1")
+        );
+        assert_eq!(binding.working_directory.evidence.cache_generation, 3);
+        let record = fs::read_to_string(
+            binding
+                .working_directory_root()
+                .join(MATERIALIZATION_RECORD),
+        )
+        .unwrap();
+        assert!(!record.contains("private key"));
+    }
+
+    #[test]
+    fn sensitive_repository_access_debug_output_is_redacted() {
+        let access = crate::catalog::RepositorySshMaterializationAccess {
+            credential_id: "credential-1".to_string(),
+            credential_revision: 2,
+            host_trust_id: "trust-1".to_string(),
+            host_trust_revision: 4,
+            access: workspace_api::RepositoryAccessMode::ReadOnly,
+            expires_at_epoch_seconds: u64::MAX,
+            repository_id: "repo-main".to_string(),
+            repository_source_fingerprint: "sha256:test".to_string(),
+            repository_uri: "ssh://git@example.test/repo.git".to_string(),
+            secret_resource: repository_resource_handle(),
+            private_key: crate::catalog::SensitiveString::new("PRIVATE KEY secret bytes"),
+            known_hosts_entry: crate::catalog::SensitiveString::new("host key secret bytes"),
+        };
+
+        let debug = format!("{access:?}");
+        assert!(!debug.contains("secret bytes"));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn bound_ssh_workdir_uses_attachment_scoped_agent_and_cleans_it_up() {
+        let repo = create_clean_repo();
+        let runtime_root = tempfile::tempdir().unwrap();
+        let key_root = tempfile::tempdir().unwrap();
+        let key_path = key_root.path().join("id_ed25519");
+        let status = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(&key_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let materializer = RuntimeGitCacheMaterializer::new(runtime_root.path());
+        let mut request = request(repo.path());
+        request.materialization = Some(crate::catalog::RepositoryMaterializationContext {
+            workspace_id: "workspace-1".to_string(),
+            runtime_id: "runtime-1".to_string(),
+            operation_id: "operation-agent".to_string(),
+            config_revision: 2,
+            config_projection_digest: "sha256:projection".to_string(),
+            cache_generation: 0,
+            ssh: Some(crate::catalog::RepositorySshMaterializationAccess {
+                credential_id: "credential-1".to_string(),
+                credential_revision: 1,
+                host_trust_id: "trust-1".to_string(),
+                host_trust_revision: 1,
+                access: workspace_api::RepositoryAccessMode::ReadWrite,
+                expires_at_epoch_seconds: u64::MAX,
+                repository_id: "repo-main".to_string(),
+                repository_source_fingerprint: "sha256:test".to_string(),
+                repository_uri: "ssh://git@example.test/repo.git".to_string(),
+                secret_resource: repository_resource_handle(),
+                private_key: crate::catalog::SensitiveString::new(
+                    fs::read_to_string(&key_path).unwrap(),
+                ),
+                known_hosts_entry: crate::catalog::SensitiveString::new(
+                    "example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample",
+                ),
+            }),
+        });
+        let mut ssh_operation = request.clone();
+        ssh_operation.repository.source = workspace_api::RepositorySource {
+            kind: workspace_api::RepositorySourceKind::Ssh,
+            uri: "ssh://git@example.test/repo.git".to_string(),
+        };
+        let command_access = RepositoryCommandAccess::prepare(runtime_root.path(), &ssh_operation)
+            .unwrap()
+            .unwrap();
+        assert!(!command_access.root.join("identity").exists());
+        assert!(command_access.agent.socket.exists());
+        let operation_socket = command_access.agent.socket.clone();
+        drop(command_access);
+        assert!(!operation_socket.exists());
+
+        let initial_materialization = request.materialization.clone().unwrap();
+        let working_directory_id = "working-directory-agent".to_string();
+        materializer
+            .authorize_repository_access(&WorkingDirectoryRepositoryAccessRequest {
+                working_directory_id: working_directory_id.clone(),
+                materialization: initial_materialization.clone(),
+            })
+            .unwrap();
+        request.backend_workdir_id = Some(working_directory_id.clone());
+        request.materialization.as_mut().unwrap().ssh = None;
+        let mut authorized_ssh_request = request.clone();
+        authorized_ssh_request.repository.source = workspace_api::RepositorySource {
+            kind: workspace_api::RepositorySourceKind::Ssh,
+            uri: "ssh://git@example.test/repo.git".to_string(),
+        };
+        assert!(
+            materializer
+                .request_with_authorized_repository_access(
+                    &working_directory_id,
+                    &authorized_ssh_request,
+                )
+                .unwrap()
+                .materialization
+                .unwrap()
+                .ssh
+                .is_some()
+        );
+        let mut mismatched_source_request = authorized_ssh_request.clone();
+        mismatched_source_request.repository.source.uri =
+            "ssh://git@example.test/other.git".to_string();
+        assert_eq!(
+            materializer
+                .request_with_authorized_repository_access(
+                    &working_directory_id,
+                    &mismatched_source_request,
+                )
+                .unwrap_err()
+                .code,
+            "working_directory_repository_access_binding_mismatch"
+        );
+        let mut mismatched_repository_request = authorized_ssh_request.clone();
+        mismatched_repository_request.repository.id = "repo-other".to_string();
+        assert_eq!(
+            materializer
+                .request_with_authorized_repository_access(
+                    &working_directory_id,
+                    &mismatched_repository_request,
+                )
+                .unwrap_err()
+                .code,
+            "working_directory_repository_access_binding_mismatch"
+        );
+        let created = materializer.create(&request).unwrap();
+        let id = created.working_directory.id;
+        assert_eq!(id, working_directory_id);
+        let mut ssh_backed_binding = materializer.read_binding(&id).unwrap();
+        ssh_backed_binding
+            .working_directory
+            .evidence
+            .credential_revision = Some(1);
+        ssh_backed_binding
+            .working_directory
+            .evidence
+            .host_trust_revision = Some(1);
+        materializer.write_record(&ssh_backed_binding).unwrap();
+        materializer
+            .authorize_repository_access(&WorkingDirectoryRepositoryAccessRequest {
+                working_directory_id: id.clone(),
+                materialization: initial_materialization.clone(),
+            })
+            .unwrap();
+        assert_eq!(materializer.list_working_directories().unwrap().len(), 1);
+        assert_eq!(
+            fs::read_dir(runtime_root.path().join(".repository-agents"))
+                .map(|entries| entries.count())
+                .unwrap_or_default(),
+            0
+        );
+        let binding = materializer.bind_working_directory(&id, None).unwrap();
+        let environment = binding.command_environment();
+        assert_eq!(environment["SSH_AUTH_SOCK"], "/dev/null");
+        let ssh_command = PathBuf::from(environment["GIT_SSH_COMMAND"].clone());
+        assert!(ssh_command.exists());
+        let ssh_policy = fs::read_to_string(&ssh_command).unwrap();
+        assert!(ssh_policy.contains("__repository-ssh"));
+        assert!(!ssh_policy.contains("SSH_AUTH_SOCK"));
+        assert_eq!(
+            fs::read_dir(runtime_root.path().join(".repository-agents"))
+                .map(|entries| entries.count())
+                .unwrap_or_default(),
+            1
+        );
+        assert_eq!(environment["YOI_REPOSITORY_ACCESS"], "read_write");
+        drop(binding);
+        assert!(!ssh_command.exists());
+        assert_eq!(
+            fs::read_dir(runtime_root.path().join(".repository-agents"))
+                .map(|entries| entries.count())
+                .unwrap_or_default(),
+            0
+        );
+        assert_eq!(
+            materializer
+                .bind_working_directory(&id, None)
+                .unwrap_err()
+                .code,
+            "working_directory_remote_repository_access_required"
+        );
+        let mut rotated = initial_materialization.clone();
+        rotated.operation_id = "operation-agent-rotated".to_string();
+        rotated.ssh.as_mut().unwrap().credential_revision = 2;
+        rotated.ssh.as_mut().unwrap().access = workspace_api::RepositoryAccessMode::ReadOnly;
+        materializer
+            .authorize_repository_access(&WorkingDirectoryRepositoryAccessRequest {
+                working_directory_id: id.clone(),
+                materialization: rotated.clone(),
+            })
+            .unwrap();
+        let rebound = materializer.bind_working_directory(&id, None).unwrap();
+        assert_eq!(
+            rebound.working_directory.evidence.credential_revision,
+            Some(2)
+        );
+        let rebound_environment = rebound.command_environment();
+        assert_eq!(rebound_environment["YOI_REPOSITORY_ACCESS"], "read_only");
+        assert_eq!(rebound_environment["SSH_AUTH_SOCK"], "/dev/null");
+        let read_only_ssh = &rebound_environment["GIT_SSH_COMMAND"];
+        let read_only_policy = fs::read_to_string(read_only_ssh).unwrap();
+        assert!(read_only_policy.contains("__repository-ssh"));
+        assert!(!read_only_policy.contains("SSH_AUTH_SOCK"));
+        assert!(!read_only_policy.contains(".repository-agents"));
+        assert!(!read_only_policy.contains("known_hosts"));
+        let read_only_command_policy =
+            RepositorySshCommandPolicy::from_access(rotated.ssh.as_ref().unwrap()).unwrap();
+        assert!(!validate_repository_ssh_args(
+            &[
+                "git@example.test".to_string(),
+                "git-receive-pack '/repo.git'".to_string(),
+            ],
+            &read_only_command_policy,
+        ));
+        let broker_socket = fs::read_dir(runtime_root.path().join(REPOSITORY_ACCESS_DIR))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("b.sock"))
+            .find(|path| path.exists())
+            .expect("read-only broker socket");
+        assert_eq!(
+            run_repository_ssh_client(&[
+                broker_socket.to_string_lossy().to_string(),
+                "-G".to_string(),
+                "git@example.test".to_string(),
+            ])
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            run_repository_ssh_client(&[
+                broker_socket.to_string_lossy().to_string(),
+                "git@example.test".to_string(),
+                "git-receive-pack '/repo.git'".to_string(),
+            ])
+            .unwrap(),
+            126
+        );
+        assert!(!validate_repository_ssh_args(
+            &[
+                "-o".to_string(),
+                "ProxyCommand=sh -c exploit".to_string(),
+                "git@example.test".to_string(),
+                "git-upload-pack '/repo.git'".to_string(),
+            ],
+            &read_only_command_policy,
+        ));
+        assert!(validate_repository_ssh_args(
+            &[
+                "-o".to_string(),
+                "SendEnv=GIT_PROTOCOL".to_string(),
+                "git@example.test".to_string(),
+                "git-upload-pack '/repo.git'".to_string(),
+            ],
+            &read_only_command_policy,
+        ));
+        assert!(!validate_repository_ssh_args(
+            &[
+                "git@other.test".to_string(),
+                "git-upload-pack '/repo.git'".to_string(),
+            ],
+            &read_only_command_policy,
+        ));
+        let mut port_bound_access = rotated.ssh.as_ref().unwrap().clone();
+        port_bound_access.repository_uri = "ssh://git@example.test:2222/repo.git".to_string();
+        let port_bound_policy =
+            RepositorySshCommandPolicy::from_access(&port_bound_access).unwrap();
+        assert!(validate_repository_ssh_args(
+            &[
+                "-p".to_string(),
+                "2222".to_string(),
+                "git@example.test".to_string(),
+                "git-upload-pack '/repo.git'".to_string(),
+            ],
+            &port_bound_policy,
+        ));
+        assert!(!validate_repository_ssh_args(
+            &[
+                "-p".to_string(),
+                "22".to_string(),
+                "git@example.test".to_string(),
+                "git-upload-pack '/repo.git'".to_string(),
+            ],
+            &port_bound_policy,
+        ));
+        assert!(!validate_repository_ssh_args(
+            &[
+                "git@example.test".to_string(),
+                "git-upload-pack '/other.git'".to_string(),
+            ],
+            &read_only_command_policy,
+        ));
+        assert_eq!(
+            git_stdout(
+                rebound.root(),
+                ["config", "--worktree", "--get", "remote.origin.pushurl"],
+            )
+            .unwrap(),
+            "yoi-read-only://repository-push-disabled"
+        );
+        drop(rebound);
+        assert!(!broker_socket.exists());
+
+        let mut read_write = rotated;
+        read_write.operation_id = "operation-agent-read-write".to_string();
+        read_write.ssh.as_mut().unwrap().credential_revision = 3;
+        read_write.ssh.as_mut().unwrap().access = workspace_api::RepositoryAccessMode::ReadWrite;
+        let read_write_command_policy =
+            RepositorySshCommandPolicy::from_access(read_write.ssh.as_ref().unwrap()).unwrap();
+        materializer
+            .authorize_repository_access(&WorkingDirectoryRepositoryAccessRequest {
+                working_directory_id: id.clone(),
+                materialization: read_write,
+            })
+            .unwrap();
+        let rebound = materializer.bind_working_directory(&id, None).unwrap();
+        assert_eq!(
+            rebound.command_environment()["YOI_REPOSITORY_ACCESS"],
+            "read_write"
+        );
+        assert_eq!(rebound.command_environment()["SSH_AUTH_SOCK"], "/dev/null");
+        assert!(validate_repository_ssh_args(
+            &[
+                "git@example.test".to_string(),
+                "git-receive-pack '/repo.git'".to_string(),
+            ],
+            &read_write_command_policy,
+        ));
+        assert!(!validate_repository_ssh_args(
+            &[
+                "git@example.test".to_string(),
+                "git-receive-pack '/other.git'".to_string(),
+            ],
+            &read_write_command_policy,
+        ));
+        assert!(
+            git_stdout(
+                rebound.root(),
+                ["config", "--worktree", "--get", "remote.origin.pushurl"],
+            )
+            .is_err()
+        );
+        drop(rebound);
+
+        let mut expired = initial_materialization;
+        expired.ssh.as_mut().unwrap().expires_at_epoch_seconds = 1;
+        assert_eq!(
+            materializer
+                .authorize_repository_access(&WorkingDirectoryRepositoryAccessRequest {
+                    working_directory_id: id.clone(),
+                    materialization: expired,
+                })
+                .unwrap_err()
+                .code,
+            "working_directory_repository_access_expired"
+        );
+        let restored = RuntimeGitCacheMaterializer::new(runtime_root.path());
+        assert_eq!(
+            restored.bind_working_directory(&id, None).unwrap_err().code,
+            "working_directory_remote_repository_access_required"
+        );
+    }
+
+    #[test]
+    fn read_only_repository_access_disables_default_push_target() {
+        let repo = create_clean_repo();
+        let runtime_root = tempfile::tempdir().unwrap();
+        let materializer = RuntimeGitCacheMaterializer::new(runtime_root.path());
+        let mut request = request(repo.path());
+        request.materialization = Some(crate::catalog::RepositoryMaterializationContext {
+            workspace_id: "workspace-1".to_string(),
+            runtime_id: "runtime-1".to_string(),
+            operation_id: "operation-read-only".to_string(),
+            config_revision: 2,
+            config_projection_digest: "sha256:projection".to_string(),
+            cache_generation: 0,
+            ssh: Some(crate::catalog::RepositorySshMaterializationAccess {
+                credential_id: "credential-1".to_string(),
+                credential_revision: 1,
+                host_trust_id: "trust-1".to_string(),
+                host_trust_revision: 1,
+                access: workspace_api::RepositoryAccessMode::ReadOnly,
+                expires_at_epoch_seconds: u64::MAX,
+                repository_id: "repo-main".to_string(),
+                repository_source_fingerprint: "sha256:test".to_string(),
+                repository_uri: "ssh://git@example.test/repo.git".to_string(),
+                secret_resource: repository_resource_handle(),
+                private_key: crate::catalog::SensitiveString::new("PRIVATE KEY placeholder"),
+                known_hosts_entry: crate::catalog::SensitiveString::new(
+                    "example.test ssh-ed25519 placeholder",
+                ),
+            }),
+        });
+
+        let binding = materializer.create(&request).unwrap();
+        assert_eq!(
+            git_stdout(
+                binding.root(),
+                ["config", "--worktree", "--get", "remote.origin.pushurl"],
+            )
+            .unwrap(),
+            "yoi-read-only://repository-push-disabled"
+        );
+    }
+
+    #[test]
+    fn selector_is_not_accepted_as_a_git_option_or_refspec() {
+        let repo = create_clean_repo();
+        let runtime_root = tempfile::tempdir().unwrap();
+        let materializer = RuntimeGitCacheMaterializer::new(runtime_root.path());
+        for selector in ["--upload-pack=evil", "refs/heads/main:evil", "main@{1}"] {
+            let mut request = request(repo.path());
+            request.repository.selector = Some(RepositorySelector::from(selector));
+            assert_eq!(
+                materializer
+                    .materialize(&worker_ref(1), &request)
+                    .unwrap_err()
+                    .code,
+                "working_directory_repository_selector_invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_source_rejects_uri_credentials_and_mismatched_host_trust() {
+        let repo = create_clean_repo();
+        let runtime_root = tempfile::tempdir().unwrap();
+        let materializer = RuntimeGitCacheMaterializer::new(runtime_root.path());
+        let context = |ssh| crate::catalog::RepositoryMaterializationContext {
+            workspace_id: "workspace-1".to_string(),
+            runtime_id: "runtime-1".to_string(),
+            operation_id: "operation-1".to_string(),
+            config_revision: 1,
+            config_projection_digest: "sha256:projection".to_string(),
+            cache_generation: 0,
+            ssh,
+        };
+
+        let mut https = request(repo.path());
+        https.repository.source = workspace_api::RepositorySource {
+            kind: workspace_api::RepositorySourceKind::Https,
+            uri: "https://token@example.test/repo.git".to_string(),
+        };
+        https.materialization = Some(context(None));
+        assert_eq!(
+            materializer
+                .materialize(&worker_ref(1), &https)
+                .unwrap_err()
+                .code,
+            "working_directory_repository_source_invalid"
+        );
+
+        let mut http = request(repo.path());
+        http.repository.source = workspace_api::RepositorySource {
+            kind: workspace_api::RepositorySourceKind::Http,
+            uri: "http://example.test/repo.git".to_string(),
+        };
+        http.materialization = Some(context(None));
+        RuntimeGitCacheMaterializer::validate_request(&http).unwrap();
+        assert_eq!(
+            repository_transport_warning(http.repository.source.kind),
+            Some("plain_http_transport")
+        );
+
+        let mut ssh = request(repo.path());
+        ssh.repository.source = workspace_api::RepositorySource {
+            kind: workspace_api::RepositorySourceKind::Ssh,
+            uri: "ssh://git@example.test/repo.git".to_string(),
+        };
+        ssh.materialization = Some(context(Some(
+            crate::catalog::RepositorySshMaterializationAccess {
+                credential_id: "credential-1".to_string(),
+                credential_revision: 1,
+                host_trust_id: "trust-1".to_string(),
+                host_trust_revision: 1,
+                access: workspace_api::RepositoryAccessMode::ReadOnly,
+                expires_at_epoch_seconds: u64::MAX,
+                repository_id: "repo-main".to_string(),
+                repository_source_fingerprint: "sha256:test".to_string(),
+                repository_uri: "ssh://git@example.test/repo.git".to_string(),
+                secret_resource: repository_resource_handle(),
+                private_key: crate::catalog::SensitiveString::new("PRIVATE KEY placeholder"),
+                known_hosts_entry: crate::catalog::SensitiveString::new(
+                    "other.test ssh-ed25519 placeholder",
+                ),
+            },
+        )));
+        assert_eq!(
+            materializer
+                .materialize(&worker_ref(2), &ssh)
+                .unwrap_err()
+                .code,
+            "working_directory_remote_repository_host_trust_mismatch"
+        );
+    }
+
+    #[test]
     fn unsupported_remote_and_non_git_provider_return_typed_diagnostics() {
         let runtime_root = tempfile::tempdir().unwrap();
-        let materializer = LocalGitWorktreeMaterializer::new(runtime_root.path());
+        let materializer = RuntimeGitCacheMaterializer::new(runtime_root.path());
         let mut remote = request(Path::new("."));
         remote.repository.source = workspace_api::RepositorySource {
-            kind: workspace_api::RepositorySourceKind::Https,
-            uri: "https://example.invalid/repo.git".to_string(),
+            kind: workspace_api::RepositorySourceKind::Ssh,
+            uri: "ssh://git@example.invalid/repo.git".to_string(),
         };
+        remote.materialization = Some(crate::catalog::RepositoryMaterializationContext {
+            workspace_id: "workspace-1".to_string(),
+            runtime_id: "runtime-1".to_string(),
+            operation_id: "operation-1".to_string(),
+            config_revision: 1,
+            config_projection_digest: "sha256:projection".to_string(),
+            cache_generation: 0,
+            ssh: None,
+        });
         let error = materializer
             .materialize(&worker_ref(1), &remote)
             .unwrap_err();
@@ -958,7 +3219,7 @@ mod tests {
         git(repo.path(), &["add", "crates/yoi/lib.rs"]);
         git(repo.path(), &["commit", "-m", "add crate"]);
         let runtime_root = tempfile::tempdir().unwrap();
-        let materializer = LocalGitWorktreeMaterializer::new(runtime_root.path());
+        let materializer = RuntimeGitCacheMaterializer::new(runtime_root.path());
         let working_directory = materializer.create(&request(repo.path())).unwrap();
 
         let bound = materializer
@@ -983,7 +3244,7 @@ mod tests {
     fn working_directory_observes_current_selector_and_ref_without_changing_creation_evidence() {
         let repo = create_clean_repo();
         let runtime_root = tempfile::tempdir().unwrap();
-        let materializer = LocalGitWorktreeMaterializer::new(runtime_root.path());
+        let materializer = RuntimeGitCacheMaterializer::new(runtime_root.path());
         let working_directory = materializer.create(&request(repo.path())).unwrap();
         let bound = materializer
             .bind_working_directory(&working_directory.working_directory.id, None)
@@ -1002,6 +3263,21 @@ mod tests {
         assert_eq!(summary.creation_ref.as_deref(), Some(initial_ref.as_str()));
         assert_eq!(summary.current_selector.as_deref(), Some("observed-branch"));
         assert_ne!(summary.current_ref.as_deref(), Some(initial_ref.as_str()));
+        assert!(summary.creation_tree.is_some());
+        assert!(summary.current_tree.is_some());
+        assert_ne!(summary.current_tree, summary.creation_tree);
+        assert!(summary.observed_at_epoch_seconds.is_some());
+        assert_eq!(summary.cleanliness.as_deref(), Some("clean"));
+
+        fs::write(bound.root.join("dirty.txt"), "dirty\n").unwrap();
+        let dirty = materializer.list_working_directories().unwrap()[0]
+            .summary
+            .clone();
+        assert_eq!(dirty.creation_ref, summary.creation_ref);
+        assert_eq!(dirty.current_ref, summary.current_ref);
+        assert_eq!(dirty.current_tree, summary.current_tree);
+        assert_eq!(dirty.cleanliness.as_deref(), Some("dirty"));
+        assert!(dirty.observed_at_epoch_seconds.is_some());
     }
 
     #[test]
@@ -1012,7 +3288,7 @@ mod tests {
         git(repo.path(), &["add", "inside/file.txt"]);
         git(repo.path(), &["commit", "-m", "add inside"]);
         let runtime_root = tempfile::tempdir().unwrap();
-        let materializer = LocalGitWorktreeMaterializer::new(runtime_root.path());
+        let materializer = RuntimeGitCacheMaterializer::new(runtime_root.path());
         let working_directory = materializer.create(&request(repo.path())).unwrap();
 
         assert_eq!(
@@ -1064,7 +3340,7 @@ mod tests {
     fn cleanup_working_directory_removes_worktree_and_record() {
         let repo = create_clean_repo();
         let runtime_root = tempfile::tempdir().unwrap();
-        let materializer = LocalGitWorktreeMaterializer::new(runtime_root.path());
+        let materializer = RuntimeGitCacheMaterializer::new(runtime_root.path());
         let binding = materializer
             .materialize(&worker_ref(1), &request(repo.path()))
             .unwrap();

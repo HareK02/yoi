@@ -20,7 +20,7 @@ use crate::auth::{
 };
 use crate::catalog::{
     CreateWorkerRequest, ProfileSourceArchiveHttpRef, ProfileSourceArchiveSource,
-    WorkingDirectoryRequest, WorkingDirectoryStatus,
+    WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest, WorkingDirectoryStatus,
 };
 use crate::execution::{
     WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation,
@@ -706,13 +706,17 @@ fn runtime_local_workdir_session(
     root: &Path,
     cwd: &Path,
     scope: manifest::SharedScope,
+    command_environment: std::collections::BTreeMap<String, String>,
+    resources: Vec<Arc<dyn workdir::WorkdirSessionResource>>,
 ) -> WorkdirSessionHandle {
-    Arc::new(LocalWorkdirSession::materialized_bound(
+    Arc::new(LocalWorkdirSession::materialized_bound_with_environment(
         Workdir::new(workdir_id),
         root.to_path_buf(),
         cwd.to_path_buf(),
         scope,
         WorkdirSessionCapabilities::ALL,
+        command_environment,
+        resources,
     ))
 }
 
@@ -893,6 +897,8 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 binding.root(),
                 binding.cwd(),
                 worker.scope().clone(),
+                binding.command_environment(),
+                binding.session_resources(),
             )));
         } else {
             worker.bind_workdir_session(None);
@@ -1071,6 +1077,8 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 binding.root(),
                 binding.cwd(),
                 worker.scope().clone(),
+                binding.command_environment(),
+                binding.session_resources(),
             )));
         } else {
             worker.bind_workdir_session(None);
@@ -1582,6 +1590,19 @@ where
         Ok(materializer.create(request)?.status())
     }
 
+    fn authorize_working_directory_repository_access(
+        &self,
+        request: &WorkingDirectoryRepositoryAccessRequest,
+    ) -> Result<(), WorkingDirectoryDiagnostic> {
+        let materializer = self.working_directory_materializer.as_ref().ok_or_else(|| {
+            WorkingDirectoryDiagnostic::rejected(
+                "working_directory_materializer_unavailable",
+                "working directory Repository access requested, but no materializer is configured for this runtime backend",
+            )
+        })?;
+        materializer.authorize_repository_access(request)
+    }
+
     fn list_working_directories(&self) -> Vec<WorkingDirectoryStatus> {
         self.working_directory_materializer
             .as_ref()
@@ -1624,6 +1645,8 @@ where
             binding.root(),
             binding.cwd(),
             manifest::SharedScope::new(scope),
+            binding.command_environment(),
+            binding.session_resources(),
         ))
     }
 
@@ -2142,7 +2165,7 @@ mod tests {
     use crate::identity::WorkerRef;
     use crate::management::RuntimeOptions;
     use crate::observation::WorkerObservationCursor;
-    use crate::working_directory::LocalGitWorktreeMaterializer;
+    use crate::working_directory::RuntimeGitCacheMaterializer;
     use agen::Engine;
     use agen::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
     use agen::llm_client::{ClientError, LlmClient, Request};
@@ -2728,8 +2751,9 @@ mod tests {
                 source_fingerprint: "sha256:test".to_string(),
                 selector: Some(RepositorySelector::from("HEAD")),
             },
-            materializer: MaterializerKind::LocalGitWorktree,
+            materializer: MaterializerKind::RuntimeGitCache,
             backend_workdir_id: None,
+            materialization: None,
         }
     }
 
@@ -2853,12 +2877,16 @@ mod tests {
             root.path(),
             root.path(),
             manifest::SharedScope::new(Scope::writable(root.path()).unwrap()),
+            Default::default(),
+            Vec::new(),
         );
         let restored = runtime_local_workdir_session(
             "working-directory-42",
             root.path(),
             root.path(),
             manifest::SharedScope::new(Scope::writable(root.path()).unwrap()),
+            Default::default(),
+            Vec::new(),
         );
 
         assert_eq!(spawned.workdir().id().as_str(), "working-directory-42");
@@ -3330,7 +3358,7 @@ mod tests {
         };
         let backend = WorkerRuntimeExecutionBackend::new(factory)
             .unwrap()
-            .with_working_directory_materializer(LocalGitWorktreeMaterializer::new(
+            .with_working_directory_materializer(RuntimeGitCacheMaterializer::new(
                 runtime_base.path(),
             ));
         let runtime =
@@ -3485,7 +3513,7 @@ mod tests {
         };
         let backend = WorkerRuntimeExecutionBackend::new(factory)
             .unwrap()
-            .with_working_directory_materializer(LocalGitWorktreeMaterializer::new(
+            .with_working_directory_materializer(RuntimeGitCacheMaterializer::new(
                 runtime_base.path(),
             ));
         let runtime =
@@ -3524,7 +3552,7 @@ mod tests {
         let repo = create_clean_repo();
         let backend = WorkerRuntimeExecutionBackend::new(FailingFactory)
             .unwrap()
-            .with_working_directory_materializer(LocalGitWorktreeMaterializer::new(
+            .with_working_directory_materializer(RuntimeGitCacheMaterializer::new(
                 runtime_base.path(),
             ));
         let runtime =
@@ -3560,7 +3588,7 @@ mod tests {
         let repo = create_clean_repo();
         let backend = WorkerRuntimeExecutionBackend::new(FailingFactory)
             .unwrap()
-            .with_working_directory_materializer(LocalGitWorktreeMaterializer::new(
+            .with_working_directory_materializer(RuntimeGitCacheMaterializer::new(
                 runtime_base.path(),
             ));
         let runtime =
@@ -3574,9 +3602,15 @@ mod tests {
 
         assert!(format!("{error:?}").contains("spawn failed"));
         let working_directories_root = runtime_base.path();
-        let remaining_entries = fs::read_dir(working_directories_root)
-            .map(|entries| entries.count())
+        let remaining_workdirs = fs::read_dir(working_directories_root)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+                    .count()
+            })
             .unwrap_or(0);
-        assert_eq!(remaining_entries, 0);
+        assert_eq!(remaining_workdirs, 0);
+        assert!(working_directories_root.join(".repository-cache").is_dir());
     }
 }

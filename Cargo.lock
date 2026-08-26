@@ -6652,6 +6652,7 @@ dependencies = [
  "workdir",
  "worker",
  "workspace-api",
+ "zeroize",
 ]
 
 [[package]]
@@ -6798,6 +6799,7 @@ dependencies = [
  "worker",
  "worker-runtime",
  "workspace-api",
+ "zeroize",
 ]
 
 [[package]]
