@@ -6504,15 +6504,6 @@ async fn open_current_worker_workdir_session_locked(
     worker: &RuntimeWorkerRef,
     link: &WorkerWorkdirLinkRecord,
 ) -> Result<WorkdirSessionHandle> {
-    if let Some(session) = api
-        .workdir_sessions
-        .lock()
-        .expect("Workdir session registry lock poisoned")
-        .get(worker)
-        .cloned()
-    {
-        return Ok(session);
-    }
     let workdir = api
         .store
         .list_workdir_registry(&api.config.workspace_id, 10_000)?
@@ -6526,6 +6517,40 @@ async fn open_current_worker_workdir_session_locked(
                 link.workdir_id
             ),
         })?;
+    let repository = api
+        .require_configured_workspace_repository(&workdir.repository_id)
+        .map_err(|error| error.error)?;
+    let repository_requires_access =
+        repository.source.kind == workspace_api::RepositorySourceKind::Ssh;
+    if repository_requires_access {
+        close_current_worker_session_locked(api, worker).await?;
+        let access = repository_access_request_for_workdir(
+            api,
+            &workdir.runtime_id,
+            &workdir.workdir_id,
+            &format!(
+                "workdir-session:{}:{}:{}",
+                worker.runtime_id, worker.worker_id, workdir.workdir_id
+            ),
+        )
+        .map_err(|error| error.error)?
+        .ok_or_else(|| Error::RuntimeOperationFailed {
+            runtime_id: workdir.runtime_id.clone(),
+            code: "working_directory_remote_repository_access_required".to_string(),
+            message: "current Repository SSH access authority is unavailable".to_string(),
+        })?;
+        api.runtime
+            .authorize_working_directory_repository_access(&workdir.runtime_id, access)
+            .map_err(RuntimeRegistryError::into_error)?;
+    } else if let Some(session) = api
+        .workdir_sessions
+        .lock()
+        .expect("Workdir session registry lock poisoned")
+        .get(worker)
+        .cloned()
+    {
+        return Ok(session);
+    }
     let owner_worker_id = runtime_local_owner_worker_id(worker, &workdir.runtime_id);
     let session = api
         .runtime
@@ -12071,14 +12096,31 @@ async fn create_runtime_worker(
         .as_ref()
         .map(|working_directory| configured_working_directory_request(&api, working_directory))
         .transpose()?;
+    let repository_operation_id = request
+        .resolved_control_operation
+        .as_ref()
+        .map(|operation| operation.operation_id.clone())
+        .or_else(|| {
+            request
+                .ticket_assignment
+                .as_ref()
+                .map(|assignment| assignment.operation_id.clone())
+        });
     let prepared_workdir_id = if let Some(working_directory_request) =
         request.resolved_working_directory_request.as_mut()
     {
-        Some(upsert_pending_backend_workdir(
+        let workdir_id =
+            upsert_pending_backend_workdir(&api, &runtime_id, working_directory_request)?;
+        let operation_id = repository_operation_id
+            .clone()
+            .unwrap_or_else(|| format!("worker-spawn-workdir:{workdir_id}"));
+        authorize_worker_spawn_workdir_materialization(
             &api,
             &runtime_id,
+            &operation_id,
             working_directory_request,
-        )?)
+        )?;
+        Some(workdir_id)
     } else {
         request
             .resolved_working_directory
@@ -14236,6 +14278,16 @@ fn repository_access_expiry() -> u64 {
         .saturating_add(300)
 }
 
+fn authorize_worker_spawn_workdir_materialization(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+    operation_id: &str,
+    request: &mut WorkingDirectoryRequest,
+) -> ApiResult<()> {
+    let projection = active_repository_access_projection(api, &api.config.workspace_id)?;
+    authorize_repository_materialization(api, runtime_id, operation_id, &projection, request)
+}
+
 fn authorize_repository_materialization(
     api: &WorkspaceApi,
     runtime_id: &str,
@@ -15444,6 +15496,21 @@ mod tests {
                 .create(create_input)
                 .is_err()
         );
+
+        let mut local_workdir_request =
+            working_directory_request_from_repository(&api.config.repositories[0], Some("HEAD"));
+        authorize_worker_spawn_workdir_materialization(
+            &api,
+            "runtime-1",
+            "worker-spawn-operation",
+            &mut local_workdir_request,
+        )
+        .unwrap();
+        let materialization = local_workdir_request.materialization.unwrap();
+        assert_eq!(materialization.workspace_id, api.config.workspace_id);
+        assert_eq!(materialization.runtime_id, "runtime-1");
+        assert_eq!(materialization.operation_id, "worker-spawn-operation");
+        assert!(materialization.ssh.is_none());
 
         let mut foreign_repository = api.config.repositories[0].clone();
         foreign_repository.id = "foreign".to_string();
