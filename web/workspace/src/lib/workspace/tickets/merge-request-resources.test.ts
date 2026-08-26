@@ -37,6 +37,9 @@ const detailPage = await Deno.readTextFile(
     import.meta.url,
   ),
 );
+const statusProjection = await Deno.readTextFile(
+  new URL("../merge-request-status.ts", import.meta.url),
+);
 const sidebar = await Deno.readTextFile(
   new URL("../sidebar/WorkspaceSidebar.svelte", import.meta.url),
 );
@@ -72,7 +75,12 @@ Deno.test("Workspace exposes Merge Request collection and detail pages", () => {
 });
 
 Deno.test("Merge Request UI separates source review freshness from target integration", () => {
-  for (const source of [detailPage, ticketPage]) {
+  assert(
+    detailPage.includes("sourceReviewFreshness") &&
+      detailPage.includes("targetIntegrationStatus"),
+    "MR detail page does not render authority status projections",
+  );
+  for (const source of [`${detailPage}\n${statusProjection}`, ticketPage]) {
     assert(
       source.includes("Fresh source review required"),
       "missing source-review freshness diagnostic",
@@ -88,11 +96,11 @@ Deno.test("Merge Request UI separates source review freshness from target integr
     );
   }
   assert(
-    detailPage.includes("selector_from moved from"),
+    statusProjection.includes("selector_from moved from"),
     "source ref mismatch is not explained",
   );
   assert(
-    detailPage.includes("CompleteMergeRequest"),
+    statusProjection.includes("CompleteMergeRequest"),
     "target integration authority is not named",
   );
 });

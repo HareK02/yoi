@@ -1,8 +1,9 @@
 <script lang="ts">
+  import { mergeRequestPagePath } from "$lib/workspace/api/merge-requests";
   import {
-    mergeRequestPagePath,
-    type MergeRequestDetail,
-  } from "$lib/workspace/api/merge-requests";
+    sourceReviewFreshness,
+    targetIntegrationStatus,
+  } from "$lib/workspace/merge-request-status";
   import type { PageData } from "./$types";
 
   let { data }: { data: PageData } = $props();
@@ -17,51 +18,6 @@
     return typeof value === "string" && value.length > 0 ? value : null;
   }
 
-  function sourceReviewFreshness(mergeRequest: MergeRequestDetail): string {
-    const source = mergeRequest.source.ref;
-    if (!source) return "Source review unavailable: selector_from is unresolved.";
-
-    const effectiveReview = [...mergeRequest.thread].reverse().find((event) => {
-      if (event.kind !== "review" || event.subject_ref !== source) return false;
-      return !mergeRequest.thread.some(
-        (candidate) =>
-          candidate.kind === "review_revoked" &&
-          candidate.review_event_id === event.event_id,
-      );
-    });
-    if (effectiveReview) {
-      return effectiveReview.decision === "approve"
-        ? `Current source approved at exact ref ${source}.`
-        : `Current source requests changes at exact ref ${source}.`;
-    }
-
-    const latestEvidence = [...mergeRequest.thread].reverse().find(
-      (event) =>
-        (event.kind === "review" || event.kind === "review_requested") &&
-        typeof event.subject_ref === "string",
-    );
-    if (latestEvidence?.subject_ref && latestEvidence.subject_ref !== source) {
-      return `Fresh source review required: selector_from moved from ${latestEvidence.subject_ref} to ${source}.`;
-    }
-    if (
-      mergeRequest.thread.some(
-        (event) => event.kind === "review_requested" && event.subject_ref === source,
-      )
-    ) {
-      return `Current source review pending for exact ref ${source}.`;
-    }
-    return `Fresh source review required: no effective verdict exists for ${source}.`;
-  }
-
-  function targetIntegrationStatus(mergeRequest: MergeRequestDetail): string {
-    if (mergeRequest.state === "merged") {
-      return "Target integration recorded by CompleteMergeRequest.";
-    }
-    if (!mergeRequest.target.ref) {
-      return "Target integration unavailable: selector_to is unresolved.";
-    }
-    return `Target integration awaits Orchestrator action at ${mergeRequest.target.ref}. Target-only movement refreshes integration evidence; it does not invalidate approval for an unchanged source.`;
-  }
 </script>
 
 <svelte:head><title>Merge Request · Yoi</title></svelte:head>
