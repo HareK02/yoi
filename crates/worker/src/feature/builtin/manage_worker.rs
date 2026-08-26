@@ -356,6 +356,57 @@ pub fn manage_worker_feature(
     }
 }
 
+#[derive(Clone)]
+pub struct SubWorkerControlFeature {
+    control: Arc<dyn WorkerControlService>,
+}
+
+impl std::fmt::Debug for SubWorkerControlFeature {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SubWorkerControlFeature")
+            .finish_non_exhaustive()
+    }
+}
+
+pub fn sub_worker_control_feature(
+    client: Arc<dyn WorkspaceClient>,
+    registry: Arc<SpawnedWorkerRegistry>,
+) -> SubWorkerControlFeature {
+    let workspace_id = client.workspace_id().unwrap_or_default().to_string();
+    SubWorkerControlFeature {
+        control: Arc::new(WorkspaceWorkerControlService {
+            client,
+            workspace_id,
+            registry: Some(registry),
+        }),
+    }
+}
+
+impl FeatureModule for SubWorkerControlFeature {
+    fn descriptor(&self) -> FeatureDescriptor {
+        FeatureDescriptor::builtin("sub_worker", "SubWorker")
+            .with_description("Parent-owned SubWorker control authority.")
+            .with_provided_service(ServiceDeclaration::new(
+                ServiceId::builtin(WORKER_CONTROL_SERVICE_ID),
+                WORKER_LIFECYCLE_SERVICE_VERSION,
+                "Known-SubWorker discovery and permission-fenced control operations",
+            ))
+    }
+
+    fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
+        context.services().provide(
+            ServiceDeclaration::new(
+                ServiceId::builtin(WORKER_CONTROL_SERVICE_ID),
+                WORKER_LIFECYCLE_SERVICE_VERSION,
+                "Known-SubWorker discovery and permission-fenced control operations",
+            ),
+            self.control.clone(),
+        )?;
+        Ok(())
+    }
+}
+
 impl FeatureModule for ManageWorkerFeature {
     fn descriptor(&self) -> FeatureDescriptor {
         let mut descriptor = FeatureDescriptor::builtin(FEATURE_ID, FEATURE_NAME)
