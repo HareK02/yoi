@@ -1408,6 +1408,21 @@ mod tests {
     }
 
     #[test]
+    fn builtin_coder_uses_sub_worker_control_without_worker_control() {
+        let tmp = TempDir::new().unwrap();
+        let resolved = ProfileResolver::new()
+            .with_workspace_base(tmp.path())
+            .resolve(
+                &ProfileSelector::source_named(ProfileRegistrySource::Builtin, "coder"),
+                ProfileResolveOptions::with_worker_name("coder-worker"),
+            )
+            .unwrap();
+
+        assert!(resolved.manifest.feature.sub_worker.enabled);
+        assert!(!resolved.manifest.feature.worker.enabled);
+    }
+
+    #[test]
     fn builtin_companion_uses_sub_worker_control_without_worker_control() {
         let tmp = TempDir::new().unwrap();
         let resolved = ProfileResolver::new()

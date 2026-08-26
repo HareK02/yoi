@@ -10,7 +10,6 @@ import "./base.dcdl" // {
         web = { enabled = true; };
         sub_worker = { enabled = true; };
         flow = { enabled = true; };
-        worker = { enabled = true; };
         ticket = { enabled = true; thread = true; };
         merge_request = {
             show = true;

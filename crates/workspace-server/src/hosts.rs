@@ -4411,6 +4411,11 @@ mod tests {
         assert!(companion.feature.manage_workdir.enabled);
         assert!(companion.feature.sub_worker.enabled);
         assert!(!companion.feature.worker.enabled);
+        let coder = archive
+            .resolve_profile("builtin:coder", root.path(), "embedded-test-coder")
+            .unwrap();
+        assert!(coder.feature.sub_worker.enabled);
+        assert!(!coder.feature.worker.enabled);
     }
 
     #[test]
@@ -4437,6 +4442,8 @@ mod tests {
             .resolve_profile("builtin:coder", root.path(), "remote-test-worker")
             .unwrap();
         assert_eq!(manifest.worker.name, "remote-test-worker");
+        assert!(manifest.feature.sub_worker.enabled);
+        assert!(!manifest.feature.worker.enabled);
     }
 
     #[test]
