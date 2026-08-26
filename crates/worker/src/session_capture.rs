@@ -143,6 +143,7 @@ pub(crate) struct SearchHit {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ReadSelector<'a> {
     Id(&'a str),
+    #[cfg(test)]
     EntryRange([u64; 2]),
 }
 
@@ -418,6 +419,7 @@ impl SessionCapture {
                 .iter()
                 .filter(|entry| entry.id.as_str() == id)
                 .collect(),
+            #[cfg(test)]
             ReadSelector::EntryRange([start, end]) => self
                 .index
                 .iter()

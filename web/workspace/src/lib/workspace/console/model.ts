@@ -3,6 +3,7 @@ import type {
   CommandEvent,
   CommandSnapshot,
   CommandStreamSlice,
+  CompactionLifecycle,
   Event as ProtocolEvent,
   InFlightBlock,
   InFlightToolCallState,
@@ -67,12 +68,26 @@ export type ConsoleDiffLine = {
 
 export type ConsoleViewMode = "overview" | "normal";
 
+export type ConsoleCompaction = {
+  id: string;
+  revision: number;
+  state: "running" | "done" | "failed" | "interrupted";
+  startedAtMs: number;
+  endedAtMs?: number;
+  summary?: string;
+  candidate?: string;
+  error?: string;
+  internalWorkerSessionId?: string;
+  activity: string[];
+};
+
 export type ConsoleLine = {
   id: string;
   kind: ConsoleLineKind;
   title: string;
   body: string;
   detail?: string;
+  compaction?: ConsoleCompaction;
   diff?: ConsoleDiffLine[];
   eventId?: string | null;
   source: "event";
@@ -114,16 +129,17 @@ export type ConsoleWorkerView = {
 export function consoleWorkerViews(
   projection: ConsoleProjection,
 ): ConsoleWorkerView[] {
-  const labels = projection.internalWorkers.map((worker) =>
-    worker.worker.name || "subworker"
+  const children = projection.internalWorkers.filter((worker) =>
+    worker.worker.kind === "sub_worker"
   );
+  const labels = children.map((worker) => worker.worker.name || "subworker");
   const labelCounts = new Map<string, number>();
   for (const label of labels) {
     labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1);
   }
   return [
     { sessionId: null, label: "main", console: projection },
-    ...projection.internalWorkers.map((worker, index) => {
+    ...children.map((worker, index) => {
       const label = labels[index] ?? "subworker";
       return {
         sessionId: worker.worker.session_id,
@@ -664,6 +680,105 @@ function projectInternalWorkerSnapshot(
   return { worker: snapshot.worker, revision: snapshot.revision, console };
 }
 
+function compactionCandidate(
+  projection: ConsoleProjection,
+  sessionId: string | undefined,
+): string | undefined {
+  if (!sessionId) return undefined;
+  const worker = projection.internalWorkers.find(
+    (candidate) => candidate.worker.session_id === sessionId,
+  );
+  const calls = worker?.console.lines
+    .map((line) => line.toolCall)
+    .filter((call): call is ToolCallView => call?.name === "write_summary") ?? [];
+  const latest = calls.at(-1);
+  const raw = latest?.arguments ?? latest?.argsStream;
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as { text?: unknown };
+    return typeof parsed.text === "string" ? parsed.text : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function compactionActivity(
+  projection: ConsoleProjection,
+  sessionId: string | undefined
+): string[] {
+  if (!sessionId) return [];
+  const worker = projection.internalWorkers.find(
+    (candidate) => candidate.worker.session_id === sessionId
+  );
+  if (!worker) return [];
+  return worker.console.lines
+    .filter((line) => line.kind === "tool" || line.kind === "status" || line.kind === "error")
+    .slice(-12)
+    .map((line) =>
+      line.toolCall?.name === "write_summary"
+        ? `write_summary — ${line.toolCall.state}`
+        : line.body || line.title
+    )
+    .filter((value, index, values) => value.length > 0 && values.indexOf(value) === index);
+}
+
+function applyCompactionLifecycle(
+  projection: ConsoleProjection,
+  lifecycle: CompactionLifecycle
+): ConsoleProjection {
+  const lineId = `compaction-${lifecycle.compaction_id}`;
+  const existing = projection.lines.find((line) => line.id === lineId)?.compaction;
+  if (existing && existing.revision >= lifecycle.revision) return projection;
+  const internalWorkerSessionId = lifecycle.internal_worker?.session_id;
+  const compaction: ConsoleCompaction = {
+    id: lifecycle.compaction_id,
+    revision: lifecycle.revision,
+    state: lifecycle.state,
+    startedAtMs: lifecycle.started_at_ms,
+    endedAtMs: lifecycle.ended_at_ms ?? undefined,
+    summary: lifecycle.summary ?? undefined,
+    candidate: compactionCandidate(projection, internalWorkerSessionId),
+    error: lifecycle.error ?? undefined,
+    internalWorkerSessionId,
+    activity: compactionActivity(projection, internalWorkerSessionId)
+  };
+  const line: ConsoleLine = {
+    id: lineId,
+    source: "event",
+    kind: compaction.state === "failed" ? "error" : "status",
+    title: "Compaction",
+    body: compaction.summary ?? compaction.error ?? "",
+    streaming: compaction.state === "running",
+    error: compaction.state === "failed",
+    compaction
+  };
+  const index = projection.lines.findIndex((candidate) => candidate.id === lineId);
+  const lines = [...projection.lines];
+  if (index >= 0) lines[index] = line;
+  else lines.push(line);
+  return { ...projection, lines };
+}
+
+function refreshCompactionActivity(
+  projection: ConsoleProjection,
+  sessionId: string
+): ConsoleProjection {
+  let changed = false;
+  const lines = projection.lines.map((line) => {
+    if (line.compaction?.internalWorkerSessionId !== sessionId) return line;
+    changed = true;
+    return {
+      ...line,
+      compaction: {
+        ...line.compaction,
+        candidate: compactionCandidate(projection, sessionId),
+        activity: compactionActivity(projection, sessionId)
+      }
+    };
+  });
+  return changed ? { ...projection, lines } : projection;
+}
+
 export function applyProtocolEvent(
   projection: ConsoleProjection,
   envelope: ConsoleEventInput,
@@ -809,6 +924,31 @@ export function applyProtocolEvent(
         projectInternalWorkerSnapshot(worker, envelope.eventId, next.cwd)
       );
       next.removedInternalWorkers = {};
+      for (const line of next.lines) {
+        const compaction = line.compaction;
+        if (!compaction) continue;
+        const sessionId = compaction.internalWorkerSessionId;
+        if (sessionId) {
+          line.compaction = {
+            ...compaction,
+            candidate: compactionCandidate(next, sessionId),
+            activity: compactionActivity(next, sessionId),
+          };
+        }
+        if (
+          compaction.state === "running" &&
+          (!sessionId || !next.internalWorkers.some((worker) =>
+            worker.worker.session_id === sessionId
+          ))
+        ) {
+          line.streaming = false;
+          line.compaction = {
+            ...line.compaction!,
+            state: "interrupted",
+            endedAtMs: envelope.observedAtMs ?? Date.now(),
+          };
+        }
+      }
       break;
     }
     case "internal_worker": {
@@ -841,7 +981,7 @@ export function applyProtocolEvent(
       };
       if (existingIndex >= 0) next.internalWorkers[existingIndex] = updated;
       else next.internalWorkers.push(updated);
-      break;
+      return refreshCompactionActivity(next, event.data.worker.session_id);
     }
     case "internal_worker_removed": {
       const existingIndex = next.internalWorkers.findIndex((worker) =>
@@ -905,21 +1045,9 @@ export function applyProtocolEvent(
       // them to the conversation surface; browser Console should not either.
       break;
     case "compact_start":
-      upsertStatusLine(next, "compact", envelope.eventId, "Compacting…", true);
-      break;
     case "compact_done":
-      upsertStatusLine(next, "compact", envelope.eventId, "Compacted.", false);
-      break;
     case "compact_failed":
-      upsertStatusLine(
-        next,
-        "compact",
-        envelope.eventId,
-        `Compact failed: ${event.data.error}`,
-        false,
-        true,
-      );
-      break;
+      return applyCompactionLifecycle(next, event.data.lifecycle);
     case "shutdown":
       next.status = "shutdown";
       break;
@@ -1880,7 +2008,22 @@ function applyExtensionEntry(
     return;
   }
   const payload = entry["payload"];
-  if (!isRecord(payload) || payload["kind"] !== "compaction_block") {
+  if (!isRecord(payload)) return;
+  if (
+    typeof payload["compaction_id"] === "string" &&
+    typeof payload["revision"] === "number" &&
+    typeof payload["state"] === "string" &&
+    typeof payload["started_at_ms"] === "number"
+  ) {
+    const updated = applyCompactionLifecycle(
+      projection,
+      payload as unknown as CompactionLifecycle,
+    );
+    projection.lines = updated.lines;
+    return;
+  }
+  // Schema v1 remains readable historical evidence.
+  if (payload["kind"] !== "compaction_block") {
     return;
   }
   const blockId = stringField(payload, "block_id") || "compact";

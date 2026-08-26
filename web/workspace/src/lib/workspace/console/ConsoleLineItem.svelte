@@ -8,6 +8,33 @@
   };
 
   let { item }: Props = $props();
+  let nowMs = $state(Date.now());
+
+  $effect(() => {
+    if (item.compaction?.state !== 'running') return;
+    nowMs = Date.now();
+    const timer = window.setInterval(() => {
+      nowMs = Date.now();
+    }, 1000);
+    return () => window.clearInterval(timer);
+  });
+
+  function compactionElapsedMs(line: ConsoleLine): number {
+    const compaction = line.compaction;
+    if (!compaction) return 0;
+    return Math.max(0, (compaction.endedAtMs ?? nowMs) - compaction.startedAtMs);
+  }
+
+  function formatElapsed(ms: number): string {
+    const seconds = Math.floor(ms / 1000);
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    return `${minutes}m ${seconds % 60}s`;
+  }
+
+  function compactionState(line: ConsoleLine): string {
+    return line.compaction?.state.replace('_', ' ') ?? '';
+  }
 
   function lineClass(line: ConsoleLine): string {
     return line.error ? 'error' : line.kind;
@@ -52,7 +79,29 @@
   class:error-line={item.error}
   data-console-line-id={item.id}
 >
-  {#if shouldRenderHeading(item)}
+  {#if item.compaction}
+    <div class="compaction-heading">
+      <span>Compaction · {compactionState(item)}</span>
+      <span>{formatElapsed(compactionElapsedMs(item))}</span>
+    </div>
+    {#if item.compaction.activity.length > 0}
+      <ul class="compaction-activity">
+        {#each item.compaction.activity as activity}
+          <li>{activity}</li>
+        {/each}
+      </ul>
+    {/if}
+    {#if item.compaction.summary}
+      <div class="compaction-summary">{item.compaction.summary}</div>
+    {:else if item.compaction.candidate}
+      <div class="compaction-candidate">
+        <span class="compaction-candidate-label">candidate</span>
+        {item.compaction.candidate}
+      </div>
+    {:else if item.compaction.error}
+      <div class="compaction-error">{item.compaction.error}</div>
+    {/if}
+  {:else if shouldRenderHeading(item)}
     <div class="message-heading">
       <span>{item.title}</span>
     </div>
@@ -63,7 +112,9 @@
       <span class={`tool-suffix ${item.toolCall?.state ?? ''}`}>{toolSummary(item).suffix}</span>
     </div>
   {/if}
-  {#if item.kind === 'tool'}
+  {#if item.compaction}
+    <!-- rendered as one lifecycle item above -->
+  {:else if item.kind === 'tool'}
     {#if bodyTextAfterToolSummary(item)}
       <p class="console-plain-text">
         {#if isBashTool(item)}
@@ -139,6 +190,43 @@
     font-size: 0.78rem;
     line-height: 1.55;
     white-space: pre-line;
+  }
+
+  .compaction-heading {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-2);
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    font-variant-numeric: tabular-nums;
+    font-weight: 750;
+  }
+
+  .compaction-activity {
+    margin: var(--space-1) 0;
+    padding-left: 1.25rem;
+    color: var(--tui-dark-gray);
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+  }
+
+  .compaction-summary,
+  .compaction-candidate,
+  .compaction-error {
+    margin-top: var(--space-1);
+    white-space: pre-wrap;
+  }
+
+  .compaction-candidate-label {
+    display: block;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+  }
+
+  .compaction-error {
+    color: var(--tui-error);
   }
 
   .activity-summary {

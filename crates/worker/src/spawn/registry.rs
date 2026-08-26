@@ -1,7 +1,8 @@
-//! Parent-owned registry of direct Internal SubWorker sessions.
+//! Parent-owned registry of direct Internal Worker sessions.
 //!
-//! `SubWorkerSpawn` inserts typed `InternalWorkerSessionHandle`s; List/Send/Stop and
-//! worker-observation use the same in-memory authority. Internal children are not persisted, restored, discovered as
+//! `SubWorkerSpawn` inserts controllable SubWorker handles, while host services such as
+//! compaction insert parent-visible service handles without joining the model-facing
+//! List/Send/Stop surface. Internal children are not persisted, restored, discovered as
 //! Runtime Workers, or addressed through sockets. Restore consumes any legacy persisted process
 //! child records only to reclaim their delegated scope and clear obsolete metadata.
 //! Parent registry drop closes all session handles and synchronously returns delegated Write deny
@@ -177,6 +178,52 @@ impl InternalSpawnedWorkerRecord {
     }
 }
 
+/// Parent-visible service Internal Worker. Unlike a SubWorker this record has no
+/// delegated scope, model-facing control name, or stop-summary authority.
+#[derive(Clone)]
+pub(crate) struct InternalServiceWorkerRecord {
+    pub service_kind: String,
+    pub display_name: String,
+    pub session: InternalWorkerSessionHandle,
+    protocol_revision: Arc<AtomicU64>,
+    protocol_emit_lock: Arc<Mutex<()>>,
+    protocol_terminal: Arc<AtomicBool>,
+    forwarding_started: Arc<AtomicBool>,
+}
+
+impl InternalServiceWorkerRecord {
+    pub(crate) fn new(
+        service_kind: impl Into<String>,
+        display_name: impl Into<String>,
+        session: InternalWorkerSessionHandle,
+    ) -> Self {
+        Self {
+            service_kind: service_kind.into(),
+            display_name: display_name.into(),
+            session,
+            protocol_revision: Arc::new(AtomicU64::new(0)),
+            protocol_emit_lock: Arc::new(Mutex::new(())),
+            protocol_terminal: Arc::new(AtomicBool::new(false)),
+            forwarding_started: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn protocol_ref(&self, parent_session_id: Option<String>) -> InternalWorkerRef {
+        InternalWorkerRef {
+            session_id: self.session.session_id_string(),
+            name: self.display_name.clone(),
+            parent_session_id,
+            kind: InternalWorkerKind::Service {
+                kind: self.service_kind.clone(),
+            },
+        }
+    }
+
+    fn protocol_revision(&self) -> u64 {
+        self.protocol_revision.load(Ordering::Acquire)
+    }
+}
+
 pub(crate) struct InternalSpawnReservation {
     registry: Arc<SpawnedWorkerRegistry>,
     worker_name: String,
@@ -214,6 +261,7 @@ impl Drop for InternalSpawnReservation {
 
 pub struct SpawnedWorkerRegistry {
     internal_records: std::sync::Mutex<Vec<InternalSpawnedWorkerRecord>>,
+    service_records: std::sync::Mutex<Vec<InternalServiceWorkerRecord>>,
     internal_names: std::sync::Mutex<HashSet<String>>,
     parent_scope: Option<SharedScope>,
     parent_protocol: Mutex<Option<(broadcast::Sender<Event>, String)>>,
@@ -226,10 +274,21 @@ pub struct SpawnedWorkerRegistryLoad {
 }
 
 impl SpawnedWorkerRegistry {
+    pub(crate) fn new_for_internal_services() -> Arc<Self> {
+        Arc::new(Self {
+            internal_records: std::sync::Mutex::new(Vec::new()),
+            service_records: std::sync::Mutex::new(Vec::new()),
+            internal_names: std::sync::Mutex::new(HashSet::new()),
+            parent_scope: None,
+            parent_protocol: Mutex::new(None),
+        })
+    }
+
     /// Empty registry used by tests and non-spawning projections.
     pub fn new(_runtime_dir: Arc<RuntimeDir>) -> Arc<Self> {
         Arc::new(Self {
             internal_records: std::sync::Mutex::new(Vec::new()),
+            service_records: std::sync::Mutex::new(Vec::new()),
             internal_names: std::sync::Mutex::new(HashSet::new()),
             parent_scope: None,
             parent_protocol: Mutex::new(None),
@@ -239,6 +298,7 @@ impl SpawnedWorkerRegistry {
     pub(crate) fn new_internal(_parent_name: String, parent_scope: SharedScope) -> Arc<Self> {
         Arc::new(Self {
             internal_records: std::sync::Mutex::new(Vec::new()),
+            service_records: std::sync::Mutex::new(Vec::new()),
             internal_names: std::sync::Mutex::new(HashSet::new()),
             parent_scope: Some(parent_scope),
             parent_protocol: Mutex::new(None),
@@ -317,6 +377,7 @@ impl SpawnedWorkerRegistry {
         Ok(SpawnedWorkerRegistryLoad {
             registry: Arc::new(Self {
                 internal_records: std::sync::Mutex::new(Vec::new()),
+                service_records: std::sync::Mutex::new(Vec::new()),
                 internal_names: std::sync::Mutex::new(HashSet::new()),
                 parent_scope,
                 parent_protocol: Mutex::new(None),
@@ -356,6 +417,144 @@ impl SpawnedWorkerRegistry {
         for record in self.internal_records.lock().unwrap().clone() {
             self.start_protocol_forwarding(record);
         }
+        for record in self.service_records.lock().unwrap().clone() {
+            self.start_service_protocol_forwarding(record);
+        }
+    }
+
+    /// Register a parent-visible service Internal Worker before its first turn.
+    pub(crate) fn attach_service(
+        &self,
+        record: InternalServiceWorkerRecord,
+    ) -> io::Result<InternalWorkerRef> {
+        let parent_session_id = self
+            .parent_protocol
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, id)| id.clone());
+        let worker_ref = record.protocol_ref(parent_session_id);
+        let session_id = record.session.session_id_string();
+        let mut records = self
+            .service_records
+            .lock()
+            .map_err(|_| io::Error::other("internal service-worker registry lock poisoned"))?;
+        if records
+            .iter()
+            .any(|candidate| candidate.session.session_id_string() == session_id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "internal service Worker is already registered",
+            ));
+        }
+        records.push(record.clone());
+        drop(records);
+        self.start_service_protocol_forwarding(record);
+        Ok(worker_ref)
+    }
+
+    /// Stop and remove one parent-owned service Worker. This is host-only and is
+    /// intentionally separate from the SubWorker control surface.
+    pub(crate) async fn stop_service(&self, session_id: &str) -> io::Result<bool> {
+        let record = self
+            .service_records
+            .lock()
+            .map_err(|_| io::Error::other("internal service-worker registry lock poisoned"))?
+            .iter()
+            .find(|record| record.session.session_id_string() == session_id)
+            .cloned();
+        let Some(record) = record else {
+            return Ok(false);
+        };
+        record
+            .session
+            .stop()
+            .await
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        self.remove_service(session_id)
+    }
+
+    /// Remove one service Worker and emit the terminal projection fence.
+    pub(crate) fn remove_service(&self, session_id: &str) -> io::Result<bool> {
+        let removed = {
+            let mut records = self
+                .service_records
+                .lock()
+                .map_err(|_| io::Error::other("internal service-worker registry lock poisoned"))?;
+            records
+                .iter()
+                .position(|record| record.session.session_id_string() == session_id)
+                .map(|index| records.remove(index))
+        };
+        if let Some(record) = removed {
+            self.publish_service_removal(&record);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn start_service_protocol_forwarding(&self, record: InternalServiceWorkerRecord) {
+        if record.session.visibility() != InternalWorkerVisibility::ParentClient
+            || record.forwarding_started.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let Some((parent_tx, parent_session_id)) = self.parent_protocol.lock().unwrap().clone()
+        else {
+            record.forwarding_started.store(false, Ordering::Release);
+            return;
+        };
+        let worker = record.protocol_ref(Some(parent_session_id));
+        let protocol_revision = record.protocol_revision.clone();
+        let protocol_emit_lock = record.protocol_emit_lock.clone();
+        let protocol_terminal = record.protocol_terminal.clone();
+        let mut child_rx = record.session.subscribe_events();
+        tokio::spawn(async move {
+            loop {
+                match child_rx.recv().await {
+                    Ok(event) => {
+                        let shutdown = matches!(event, Event::Shutdown);
+                        let _emit_guard = protocol_emit_lock
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        if protocol_terminal.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let revision = protocol_revision.fetch_add(1, Ordering::AcqRel) + 1;
+                        let _ = parent_tx.send(Event::InternalWorker {
+                            worker: worker.clone(),
+                            revision,
+                            event: Box::new(event),
+                        });
+                        if shutdown {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        let _emit_guard = protocol_emit_lock
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        if protocol_terminal.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let revision = protocol_revision.fetch_add(1, Ordering::AcqRel) + 1;
+                        let _ = parent_tx.send(Event::InternalWorker {
+                            worker: worker.clone(),
+                            revision,
+                            event: Box::new(Event::Error {
+                                code: protocol::ErrorCode::Internal,
+                                message: format!(
+                                    "internal Worker output lagged by {skipped} events; reconnect to resynchronize"
+                                ),
+                            }),
+                        });
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
     }
 
     fn start_protocol_forwarding(&self, record: InternalSpawnedWorkerRecord) {
@@ -427,28 +626,37 @@ impl SpawnedWorkerRegistry {
             .unwrap()
             .as_ref()
             .map(|(_, id)| id.clone());
-        self.internal_records
+        let mut snapshots = self
+            .internal_records
             .lock()
             .unwrap()
             .iter()
             .filter(|record| record.session.visibility() == InternalWorkerVisibility::ParentClient)
             .map(|record| {
-                let snapshot = record.session.protocol_snapshot();
-                InternalWorkerSnapshot {
-                    worker: record.protocol_ref(parent_session_id.clone()),
-                    revision: record.protocol_revision(),
-                    entries: snapshot
-                        .entries
-                        .into_iter()
-                        .filter_map(|entry| serde_json::to_value(entry).ok())
-                        .collect(),
-                    status: snapshot.status,
-                    error: snapshot.error,
-                    in_flight: snapshot.in_flight,
-                    internal_workers: snapshot.internal_workers,
-                }
+                internal_worker_snapshot(
+                    record.protocol_ref(parent_session_id.clone()),
+                    record.protocol_revision(),
+                    &record.session,
+                )
             })
-            .collect()
+            .collect::<Vec<_>>();
+        snapshots.extend(
+            self.service_records
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|record| {
+                    record.session.visibility() == InternalWorkerVisibility::ParentClient
+                })
+                .map(|record| {
+                    internal_worker_snapshot(
+                        record.protocol_ref(parent_session_id.clone()),
+                        record.protocol_revision(),
+                        &record.session,
+                    )
+                }),
+        );
+        snapshots
     }
 
     pub(crate) fn get_internal(&self, worker_name: &str) -> Option<InternalSpawnedWorkerRecord> {
@@ -566,6 +774,47 @@ impl SpawnedWorkerRegistry {
             worker: record.protocol_ref(Some(parent_session_id)),
             revision,
         });
+    }
+
+    fn publish_service_removal(&self, record: &InternalServiceWorkerRecord) {
+        if record.session.visibility() != InternalWorkerVisibility::ParentClient {
+            return;
+        }
+        let Some((parent_tx, parent_session_id)) = self.parent_protocol.lock().unwrap().clone()
+        else {
+            return;
+        };
+        let _emit_guard = record
+            .protocol_emit_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        record.protocol_terminal.store(true, Ordering::Release);
+        let revision = record.protocol_revision.fetch_add(1, Ordering::AcqRel) + 1;
+        let _ = parent_tx.send(Event::InternalWorkerRemoved {
+            worker: record.protocol_ref(Some(parent_session_id)),
+            revision,
+        });
+    }
+}
+
+fn internal_worker_snapshot(
+    worker: InternalWorkerRef,
+    revision: u64,
+    session: &InternalWorkerSessionHandle,
+) -> InternalWorkerSnapshot {
+    let snapshot = session.protocol_snapshot();
+    InternalWorkerSnapshot {
+        worker,
+        revision,
+        entries: snapshot
+            .entries
+            .into_iter()
+            .filter_map(|entry| serde_json::to_value(entry).ok())
+            .collect(),
+        status: snapshot.status,
+        error: snapshot.error,
+        in_flight: snapshot.in_flight,
+        internal_workers: snapshot.internal_workers,
     }
 }
 
@@ -811,6 +1060,63 @@ mod tests {
         let snapshots = registry.internal_worker_snapshots();
         assert_eq!(snapshots[0].revision, 3);
         assert_eq!(snapshots[0].in_flight.blocks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn service_worker_is_parent_visible_but_not_subworker_controllable() {
+        let registry = registry();
+        let (parent_tx, mut parent_rx) = broadcast::channel(16);
+        registry.attach_parent_protocol(parent_tx, "parent-session".into());
+        let (session, child_tx) =
+            test_internal_worker_session(InternalWorkerVisibility::ParentClient);
+        let session_id = session.session_id_string();
+
+        let worker_ref = registry
+            .attach_service(InternalServiceWorkerRecord::new(
+                "compaction",
+                "Compaction",
+                session,
+            ))
+            .unwrap();
+        assert!(matches!(
+            worker_ref.kind,
+            InternalWorkerKind::Service { ref kind } if kind == "compaction"
+        ));
+        assert!(registry.list_internal().is_empty());
+
+        child_tx
+            .send(Event::TextDone {
+                text: "summary candidate".into(),
+            })
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), parent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            Event::InternalWorker { worker, revision: 1, event }
+                if worker.session_id == session_id
+                    && matches!(worker.kind, InternalWorkerKind::Service { ref kind } if kind == "compaction")
+                    && matches!(*event, Event::TextDone { ref text } if text == "summary candidate")
+        ));
+        let snapshots = registry.internal_worker_snapshots();
+        assert_eq!(snapshots.len(), 1);
+        assert!(matches!(
+            snapshots[0].worker.kind,
+            InternalWorkerKind::Service { ref kind } if kind == "compaction"
+        ));
+        assert!(registry.remove_service(&session_id).unwrap());
+        let removed = tokio::time::timeout(Duration::from_secs(1), parent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            removed,
+            Event::InternalWorkerRemoved { worker, revision: 2 }
+                if worker.session_id == session_id
+        ));
+        assert!(registry.internal_worker_snapshots().is_empty());
     }
 
     #[tokio::test]

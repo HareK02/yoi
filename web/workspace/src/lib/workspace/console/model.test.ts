@@ -647,42 +647,173 @@ Deno.test("projectConsole renders alert events", () => {
   assertEquals(projection.lines[1].error, true);
 });
 
-Deno.test("projectConsole shows compact progress as a status block", () => {
+Deno.test("projectConsole upserts compaction lifecycle by stable id", () => {
+  const running = {
+    schema_version: 2,
+    compaction_id: "compaction-1",
+    revision: 1,
+    internal_worker: null,
+    state: "running",
+    started_at_ms: 1_000,
+    ended_at_ms: null,
+    summary: null,
+    error: null,
+    new_segment_id: null,
+  } as const;
   const projection = projectConsole([
     {
       eventId: "compact-1",
-      event: { event: "compact_start" } satisfies Event,
+      event: { event: "compact_start", data: { lifecycle: running } } satisfies Event,
     },
   ]);
 
   assertEquals(projection.lines.length, 1);
-  assertEquals(projection.lines[0].id, "status-compact");
-  assertEquals(projection.lines[0].kind, "status");
-  assertEquals(projection.lines[0].body, "Compacting…");
+  assertEquals(projection.lines[0].id, "compaction-compaction-1");
+  assertEquals(projection.lines[0].compaction?.state, "running");
   assertEquals(projection.lines[0].streaming, true);
 
   const completed = projectConsole([
     {
       eventId: "compact-1",
-      event: { event: "compact_start" } satisfies Event,
+      event: { event: "compact_start", data: { lifecycle: running } } satisfies Event,
     },
     {
       eventId: "compact-2",
       event: {
         event: "compact_done",
-        data: { new_segment_id: "00000000-0000-0000-0000-000000000001" },
+        data: {
+          lifecycle: {
+            ...running,
+            revision: 2,
+            state: "done",
+            ended_at_ms: 4_000,
+            summary: "accepted summary",
+            new_segment_id: "00000000-0000-0000-0000-000000000001",
+          },
+        },
       } satisfies Event,
     },
   ]);
 
   assertEquals(completed.lines.length, 1);
-  assertEquals(completed.lines[0].id, "status-compact");
-  assertEquals(completed.lines[0].body, "Compacted.");
+  assertEquals(completed.lines[0].id, "compaction-compaction-1");
+  assertEquals(completed.lines[0].compaction?.state, "done");
+  assertEquals(completed.lines[0].compaction?.summary, "accepted summary");
   assertEquals(completed.lines[0].streaming, false);
 });
 
-Deno.test("createConsoleProjector updates only compact status block", () => {
+Deno.test("compaction service activity stays nested in one lifecycle item", () => {
+  const worker = {
+    session_id: "compactor-session",
+    name: "Compaction",
+    parent_session_id: "parent-session",
+    kind: { service: { kind: "compaction" } },
+  } as const;
+  const lifecycle = {
+    schema_version: 2,
+    compaction_id: "compaction-nested",
+    revision: 2,
+    internal_worker: worker,
+    state: "running",
+    started_at_ms: 1_000,
+    ended_at_ms: null,
+    summary: null,
+    error: null,
+    new_segment_id: null,
+  } as const;
+  const projection = projectConsole([
+    {
+      eventId: "compaction-start",
+      event: { event: "compact_start", data: { lifecycle } } satisfies Event,
+    },
+    {
+      eventId: "compaction-tool",
+      event: {
+        event: "internal_worker",
+        data: {
+          worker,
+          revision: 1,
+          event: {
+            event: "tool_call_start",
+            data: { id: "call-1", name: "write_summary" },
+          },
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "compaction-tool-done",
+      event: {
+        event: "internal_worker",
+        data: {
+          worker,
+          revision: 2,
+          event: {
+            event: "tool_call_done",
+            data: {
+              id: "call-1",
+              name: "write_summary",
+              arguments: JSON.stringify({ text: "draft candidate" }),
+            },
+          },
+        },
+      } satisfies Event,
+    },
+  ]);
+
+  assertEquals(projection.lines.length, 1);
+  assertEquals(projection.lines[0].id, "compaction-compaction-nested");
+  assertEquals(projection.lines[0].compaction?.activity, ["write_summary — running"]);
+  assertEquals(projection.lines[0].compaction?.candidate, "draft candidate");
+  assert(
+    consoleWorkerViews(projection).length === 1,
+    "service is not a selectable SubWorker pane",
+  );
+});
+
+Deno.test("snapshot normalizes orphaned running compaction to interrupted", () => {
+  const projection = projectConsole([{
+    eventId: "snapshot",
+    observedAtMs: 9_000,
+    event: snapshotEvent("/repo", [{
+      kind: "extension",
+      ts: 1,
+      domain: "yoi.compaction",
+      payload: {
+        schema_version: 2,
+        compaction_id: "compaction-orphaned",
+        revision: 2,
+        internal_worker: {
+          session_id: "missing-service",
+          name: "Compaction",
+          parent_session_id: "parent",
+          kind: { service: { kind: "compaction" } },
+        },
+        state: "running",
+        started_at_ms: 1_000,
+      },
+    }]),
+  }]);
+
+  assertEquals(projection.lines.length, 1);
+  assertEquals(projection.lines[0].compaction?.state, "interrupted");
+  assertEquals(projection.lines[0].compaction?.endedAtMs, 9_000);
+  assertEquals(projection.lines[0].streaming, false);
+});
+
+Deno.test("createConsoleProjector ignores stale compaction revisions", () => {
   const projector = createConsoleProjector();
+  const base = {
+    schema_version: 2,
+    compaction_id: "compaction-identity",
+    revision: 1,
+    internal_worker: null,
+    state: "running",
+    started_at_ms: 1_000,
+    ended_at_ms: null,
+    summary: null,
+    error: null,
+    new_segment_id: null,
+  } as const;
   let projection = projector.append([
     {
       eventId: "compact-identity-1",
@@ -693,31 +824,37 @@ Deno.test("createConsoleProjector updates only compact status block", () => {
     },
     {
       eventId: "compact-identity-2",
-      event: { event: "compact_start" } satisfies Event,
+      event: { event: "compact_start", data: { lifecycle: base } } satisfies Event,
     },
   ]);
   const userLine = projection.lines[0];
-  const compactLine = projection.lines[1];
 
   projection = projector.append([
     {
       eventId: "compact-identity-3",
       event: {
         event: "compact_done",
-        data: { new_segment_id: "00000000-0000-0000-0000-000000000001" },
+        data: {
+          lifecycle: {
+            ...base,
+            revision: 2,
+            state: "done",
+            ended_at_ms: 2_000,
+            summary: "accepted",
+            new_segment_id: "00000000-0000-0000-0000-000000000001",
+          },
+        },
       } satisfies Event,
+    },
+    {
+      eventId: "compact-identity-stale",
+      event: { event: "compact_start", data: { lifecycle: base } } satisfies Event,
     },
   ]);
 
-  assert(
-    projection.lines[0] === userLine,
-    "unrelated message line should keep object identity",
-  );
-  assert(
-    projection.lines[1] !== compactLine,
-    "compact status line should update object identity",
-  );
-  assertEquals(projection.lines[1].body, "Compacted.");
+  assert(projection.lines[0] === userLine, "unrelated line retains identity");
+  assertEquals(projection.lines[1].compaction?.state, "done");
+  assertEquals(projection.lines[1].compaction?.summary, "accepted");
 });
 
 Deno.test("projectConsole keeps streaming tool call updates in the same Call block", () => {
