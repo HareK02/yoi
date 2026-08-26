@@ -533,6 +533,9 @@ model_id = "test-model"
 max_tokens = 100
 
 [memory]
+workspace_id = "test-workspace"
+settings_revision = 1
+language = "English"
 extract_threshold = 1
 
 [compaction]
@@ -695,6 +698,9 @@ model_id = "test-model"
 max_tokens = 100
 
 [memory]
+workspace_id = "test-workspace"
+settings_revision = 1
+language = "English"
 extract_threshold = 1
 
 [[scope.allow]]
