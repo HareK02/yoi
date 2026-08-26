@@ -8,11 +8,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::net::Shutdown;
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use workdir::WorkdirSessionResource;
 
@@ -1133,11 +1138,419 @@ impl Drop for RepositorySshAgent {
     }
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "channel", rename_all = "snake_case")]
+enum RepositorySshBrokerHeader {
+    Data {
+        request_id: String,
+        args: Vec<String>,
+    },
+    Stderr {
+        request_id: String,
+    },
+    Status {
+        request_id: String,
+    },
+}
+
+#[derive(Default)]
+struct PendingRepositorySshRequest {
+    created_at: Option<Instant>,
+    args: Option<Vec<String>>,
+    data: Option<UnixStream>,
+    stderr: Option<UnixStream>,
+    status: Option<UnixStream>,
+}
+
+impl std::fmt::Debug for PendingRepositorySshRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingRepositorySshRequest")
+            .field("args", &self.args)
+            .field("data_ready", &self.data.is_some())
+            .field("stderr_ready", &self.stderr.is_some())
+            .field("status_ready", &self.status.is_some())
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+struct RepositoryReadOnlySshBroker {
+    socket: PathBuf,
+    stopped: Arc<AtomicBool>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl RepositoryReadOnlySshBroker {
+    fn start(
+        root: &Path,
+        agent: Arc<RepositorySshAgent>,
+        known_hosts: PathBuf,
+    ) -> Result<Self, WorkingDirectoryDiagnostic> {
+        let socket = root.join("b.sock");
+        let listener = UnixListener::bind(&socket).map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_access_setup_failed",
+                "read-only Repository SSH broker could not be prepared",
+            )
+        })?;
+        listener.set_nonblocking(true).map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_access_setup_failed",
+                "read-only Repository SSH broker could not be prepared",
+            )
+        })?;
+        let stopped = Arc::new(AtomicBool::new(false));
+        let broker_stopped = Arc::clone(&stopped);
+        let thread = std::thread::spawn(move || {
+            let mut pending = HashMap::<String, PendingRepositorySshRequest>::new();
+            while !broker_stopped.load(Ordering::Acquire) {
+                pending.retain(|_, request| {
+                    request
+                        .created_at
+                        .is_some_and(|created_at| created_at.elapsed() < Duration::from_secs(5))
+                });
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        if let Some((request_id, request)) =
+                            receive_repository_ssh_channel(stream, &mut pending)
+                        {
+                            let request_agent = Arc::clone(&agent);
+                            let request_known_hosts = known_hosts.clone();
+                            std::thread::spawn(move || {
+                                run_brokered_read_only_ssh(
+                                    request,
+                                    &request_agent.socket,
+                                    &request_known_hosts,
+                                );
+                            });
+                            pending.remove(&request_id);
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(Self {
+            socket,
+            stopped,
+            thread: Mutex::new(Some(thread)),
+        })
+    }
+
+    fn stop(&self) {
+        if self.stopped.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _ = UnixStream::connect(&self.socket);
+        if let Ok(mut thread) = self.thread.lock()
+            && let Some(thread) = thread.take()
+        {
+            let _ = thread.join();
+        }
+        let _ = fs::remove_file(&self.socket);
+    }
+}
+
+impl Drop for RepositoryReadOnlySshBroker {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn receive_repository_ssh_channel(
+    stream: UnixStream,
+    pending: &mut HashMap<String, PendingRepositorySshRequest>,
+) -> Option<(String, PendingRepositorySshRequest)> {
+    let mut header = String::new();
+    if BufReader::new(stream.try_clone().ok()?)
+        .take(8_193)
+        .read_line(&mut header)
+        .ok()?
+        == 0
+        || header.len() > 8_192
+    {
+        return None;
+    }
+    let header: RepositorySshBrokerHeader = serde_json::from_str(header.trim_end()).ok()?;
+    let request_id = match &header {
+        RepositorySshBrokerHeader::Data { request_id, .. }
+        | RepositorySshBrokerHeader::Stderr { request_id }
+        | RepositorySshBrokerHeader::Status { request_id } => request_id.clone(),
+    };
+    if request_id.is_empty() || request_id.len() > 128 {
+        return None;
+    }
+    if !pending.contains_key(&request_id) && pending.len() >= 16 {
+        return None;
+    }
+    let request = pending.entry(request_id.clone()).or_default();
+    request.created_at.get_or_insert_with(Instant::now);
+    match header {
+        RepositorySshBrokerHeader::Data { args, .. } => {
+            request.args = Some(args);
+            request.data = Some(stream);
+        }
+        RepositorySshBrokerHeader::Stderr { .. } => request.stderr = Some(stream),
+        RepositorySshBrokerHeader::Status { .. } => request.status = Some(stream),
+    }
+    if request.args.is_some()
+        && request.data.is_some()
+        && request.stderr.is_some()
+        && request.status.is_some()
+    {
+        pending
+            .remove(&request_id)
+            .map(|request| (request_id, request))
+    } else {
+        None
+    }
+}
+
+fn run_brokered_read_only_ssh(
+    mut request: PendingRepositorySshRequest,
+    agent_socket: &Path,
+    known_hosts: &Path,
+) {
+    let args = request.args.take().unwrap_or_default();
+    let mut data = request.data.take().expect("complete broker request data");
+    let mut stderr_stream = request
+        .stderr
+        .take()
+        .expect("complete broker request stderr");
+    let mut status_stream = request
+        .status
+        .take()
+        .expect("complete broker request status");
+    let status = if !validate_read_only_ssh_args(&args) {
+        let _ = stderr_stream.write_all(b"read-only Repository SSH operation denied\n");
+        let _ = stderr_stream.shutdown(Shutdown::Write);
+        let _ = data.shutdown(Shutdown::Both);
+        126
+    } else if args.iter().any(|argument| argument == "-G") {
+        let _ = stderr_stream.shutdown(Shutdown::Write);
+        let _ = data.shutdown(Shutdown::Both);
+        0
+    } else {
+        let mut command = Command::new("ssh");
+        command
+            .args(["-F", "/dev/null"])
+            .args(["-o", "BatchMode=yes"])
+            .args(["-o", "IdentitiesOnly=no"])
+            .args(["-o", "IdentityFile=/dev/null"])
+            .args(["-o", "IdentityAgent=SSH_AUTH_SOCK"])
+            .args(["-o", "StrictHostKeyChecking=yes"])
+            .arg("-o")
+            .arg(format!(
+                "UserKnownHostsFile={}",
+                known_hosts.to_string_lossy()
+            ))
+            .args(["-o", "ClearAllForwardings=yes"])
+            .args(["-o", "PermitLocalCommand=no"])
+            .args(&args)
+            .env("SSH_AUTH_SOCK", agent_socket)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        match command.spawn() {
+            Ok(mut child) => {
+                let mut child_stdin = child.stdin.take().expect("piped ssh stdin");
+                let mut input = data.try_clone().expect("clone broker data stream");
+                let input_thread = std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut input, &mut child_stdin);
+                });
+                let mut child_stdout = child.stdout.take().expect("piped ssh stdout");
+                let output_thread = std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut child_stdout, &mut data);
+                    let _ = data.shutdown(Shutdown::Write);
+                });
+                let mut child_stderr = child.stderr.take().expect("piped ssh stderr");
+                let error_thread = std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut child_stderr, &mut stderr_stream);
+                    let _ = stderr_stream.shutdown(Shutdown::Write);
+                });
+                let status = child
+                    .wait()
+                    .ok()
+                    .and_then(|status| status.code())
+                    .unwrap_or(1);
+                let _ = input_thread.join();
+                let _ = output_thread.join();
+                let _ = error_thread.join();
+                status
+            }
+            Err(_) => 1,
+        }
+    };
+    let _ = writeln!(status_stream, "{status}");
+    let _ = status_stream.shutdown(Shutdown::Write);
+}
+
+fn validate_read_only_ssh_args(args: &[String]) -> bool {
+    let mut index = 0;
+    let mut probe = false;
+    let mut positional = Vec::new();
+    while index < args.len() {
+        match args[index].as_str() {
+            "-G" => probe = true,
+            "-4" | "-6" | "-v" | "-vv" | "-vvv" => {}
+            "-p" => {
+                index += 1;
+                if index >= args.len()
+                    || args[index].is_empty()
+                    || !args[index].bytes().all(|byte| byte.is_ascii_digit())
+                {
+                    return false;
+                }
+            }
+            "-l" => {
+                index += 1;
+                if index >= args.len() || !is_safe_ssh_destination(&args[index]) {
+                    return false;
+                }
+            }
+            "-o" => {
+                index += 1;
+                if index >= args.len() || !is_safe_git_ssh_option(&args[index]) {
+                    return false;
+                }
+            }
+            option if option.starts_with("-o") => {
+                if !is_safe_git_ssh_option(&option[2..]) {
+                    return false;
+                }
+            }
+            option if option.starts_with('-') => return false,
+            value => positional.push(value),
+        }
+        index += 1;
+    }
+    if probe {
+        positional.len() == 1 && is_safe_ssh_destination(positional[0])
+    } else {
+        positional.len() == 2
+            && is_safe_ssh_destination(positional[0])
+            && is_safe_read_only_git_command(positional[1])
+    }
+}
+
+fn is_safe_git_ssh_option(option: &str) -> bool {
+    option == "SendEnv=GIT_PROTOCOL"
+        || option
+            .strip_prefix("SetEnv=GIT_PROTOCOL=")
+            .is_some_and(|value| {
+                !value.is_empty()
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+            })
+}
+
+fn is_safe_ssh_destination(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'-' | b'_' | b'@' | b':' | b'[' | b']')
+        })
+}
+
+fn is_safe_read_only_git_command(command: &str) -> bool {
+    let Some(argument) = command
+        .strip_prefix("git-upload-pack ")
+        .or_else(|| command.strip_prefix("git-upload-archive "))
+    else {
+        return false;
+    };
+    let argument = argument
+        .strip_prefix('\'')
+        .and_then(|argument| argument.strip_suffix('\''))
+        .unwrap_or(argument);
+    !argument.is_empty()
+        && argument.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'/' | b'.' | b'-' | b'_' | b'@' | b':' | b'+' | b'~' | b' '
+                )
+        })
+}
+
+pub fn run_repository_read_only_ssh_client(arguments: &[String]) -> Result<i32, String> {
+    let (socket, ssh_args) = arguments
+        .split_first()
+        .ok_or_else(|| "read-only Repository SSH broker socket is missing".to_string())?;
+    let request_id = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let mut data = connect_repository_ssh_broker_channel(
+        socket,
+        &RepositorySshBrokerHeader::Data {
+            request_id: request_id.clone(),
+            args: ssh_args.to_vec(),
+        },
+    )?;
+    let mut stderr_stream = connect_repository_ssh_broker_channel(
+        socket,
+        &RepositorySshBrokerHeader::Stderr {
+            request_id: request_id.clone(),
+        },
+    )?;
+    let mut status_stream = connect_repository_ssh_broker_channel(
+        socket,
+        &RepositorySshBrokerHeader::Status { request_id },
+    )?;
+    let mut input = data
+        .try_clone()
+        .map_err(|_| "read-only Repository SSH broker input failed".to_string())?;
+    let input_thread = std::thread::spawn(move || {
+        let _ = std::io::copy(&mut std::io::stdin(), &mut input);
+        let _ = input.shutdown(Shutdown::Write);
+    });
+    let error_thread = std::thread::spawn(move || {
+        let _ = std::io::copy(&mut stderr_stream, &mut std::io::stderr());
+    });
+    std::io::copy(&mut data, &mut std::io::stdout())
+        .map_err(|_| "read-only Repository SSH broker output failed".to_string())?;
+    let _ = input_thread.join();
+    let _ = error_thread.join();
+    let mut status = String::new();
+    status_stream
+        .read_to_string(&mut status)
+        .map_err(|_| "read-only Repository SSH broker status failed".to_string())?;
+    status
+        .trim()
+        .parse::<i32>()
+        .map_err(|_| "read-only Repository SSH broker status was invalid".to_string())
+}
+
+fn connect_repository_ssh_broker_channel(
+    socket: &str,
+    header: &RepositorySshBrokerHeader,
+) -> Result<UnixStream, String> {
+    let mut stream = UnixStream::connect(socket)
+        .map_err(|_| "read-only Repository SSH broker is unavailable".to_string())?;
+    serde_json::to_writer(&mut stream, header)
+        .map_err(|_| "read-only Repository SSH broker request failed".to_string())?;
+    stream
+        .write_all(b"\n")
+        .map_err(|_| "read-only Repository SSH broker request failed".to_string())?;
+    Ok(stream)
+}
+
 #[derive(Debug)]
 struct RepositoryCommandAccess {
     root: PathBuf,
     ssh_command: PathBuf,
-    agent: RepositorySshAgent,
+    agent: Arc<RepositorySshAgent>,
+    read_only_broker: Option<RepositoryReadOnlySshBroker>,
 }
 
 impl RepositoryCommandAccess {
@@ -1189,27 +1602,49 @@ impl RepositoryCommandAccess {
         let known_hosts = root.join("known_hosts");
         let ssh_command = root.join("ssh-command");
         write_owner_only(&known_hosts, ssh.known_hosts_entry.expose().as_bytes())?;
-        let agent = RepositorySshAgent::start(runtime_root, operation_id, ssh)?;
-        let read_only_guard = if ssh.access == workspace_api::RepositoryAccessMode::ReadOnly {
-            "case \" $* \" in\n  *\" -G \"*|*\" git-upload-pack \"*|*\" git-upload-archive \"*) ;;\n  *) echo 'read-only Repository SSH operation denied' >&2; exit 126 ;;\nesac\n"
+        let agent = Arc::new(RepositorySshAgent::start(runtime_root, operation_id, ssh)?);
+        let read_only_broker = if ssh.access == workspace_api::RepositoryAccessMode::ReadOnly {
+            Some(RepositoryReadOnlySshBroker::start(
+                &root,
+                Arc::clone(&agent),
+                known_hosts.clone(),
+            )?)
         } else {
-            ""
+            None
         };
-        let script = format!(
-            "#!/bin/sh\n{read_only_guard}export SSH_AUTH_SOCK={}\nexec ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=no -o IdentityFile=/dev/null -o StrictHostKeyChecking=yes -o UserKnownHostsFile={} \"$@\"\n",
-            shell_quote_path(&agent.socket)?,
-            shell_quote_path(&known_hosts)?,
-        );
+        let script = if let Some(broker) = read_only_broker.as_ref() {
+            let executable = std::env::current_exe().map_err(|_| {
+                WorkingDirectoryDiagnostic::new(
+                    "working_directory_repository_access_setup_failed",
+                    "read-only Repository SSH broker client could not be resolved",
+                )
+            })?;
+            format!(
+                "#!/bin/sh\nexec {} __repository-read-only-ssh {} \"$@\"\n",
+                shell_quote_path(&executable)?,
+                shell_quote_path(&broker.socket)?,
+            )
+        } else {
+            format!(
+                "#!/bin/sh\nexport SSH_AUTH_SOCK={}\nexec ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=no -o IdentityFile=/dev/null -o StrictHostKeyChecking=yes -o UserKnownHostsFile={} \"$@\"\n",
+                shell_quote_path(&agent.socket)?,
+                shell_quote_path(&known_hosts)?,
+            )
+        };
         write_owner_only(&ssh_command, script.as_bytes())?;
         set_file_owner_executable(&ssh_command)?;
         Ok(Self {
             root,
             ssh_command,
             agent,
+            read_only_broker,
         })
     }
 
     fn stop(&self) {
+        if let Some(broker) = self.read_only_broker.as_ref() {
+            broker.stop();
+        }
         self.agent.stop();
         let _ = fs::remove_dir_all(&self.root);
     }
@@ -2127,12 +2562,51 @@ mod tests {
         assert_eq!(rebound_environment["YOI_REPOSITORY_ACCESS"], "read_only");
         assert!(!rebound_environment.contains_key("SSH_AUTH_SOCK"));
         let read_only_ssh = &rebound_environment["GIT_SSH_COMMAND"];
-        let denied = Command::new(read_only_ssh)
-            .args(["example.test", "git-receive-pack 'repo.git'"])
-            .env_remove("SSH_AUTH_SOCK")
-            .status()
-            .unwrap();
-        assert_eq!(denied.code(), Some(126));
+        let read_only_policy = fs::read_to_string(read_only_ssh).unwrap();
+        assert!(read_only_policy.contains("__repository-read-only-ssh"));
+        assert!(!read_only_policy.contains("SSH_AUTH_SOCK"));
+        assert!(!read_only_policy.contains(".repository-agents"));
+        assert!(!read_only_policy.contains("known_hosts"));
+        assert!(!validate_read_only_ssh_args(&[
+            "example.test".to_string(),
+            "git-receive-pack 'repo.git'".to_string(),
+        ]));
+        let broker_socket = fs::read_dir(runtime_root.path().join(REPOSITORY_ACCESS_DIR))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("b.sock"))
+            .find(|path| path.exists())
+            .expect("read-only broker socket");
+        assert_eq!(
+            run_repository_read_only_ssh_client(&[
+                broker_socket.to_string_lossy().to_string(),
+                "-G".to_string(),
+                "example.test".to_string(),
+            ])
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            run_repository_read_only_ssh_client(&[
+                broker_socket.to_string_lossy().to_string(),
+                "example.test".to_string(),
+                "git-receive-pack 'repo.git'".to_string(),
+            ])
+            .unwrap(),
+            126
+        );
+        assert!(!validate_read_only_ssh_args(&[
+            "-o".to_string(),
+            "ProxyCommand=sh -c exploit".to_string(),
+            "example.test".to_string(),
+            "git-upload-pack 'repo.git'".to_string(),
+        ]));
+        assert!(validate_read_only_ssh_args(&[
+            "-o".to_string(),
+            "SendEnv=GIT_PROTOCOL".to_string(),
+            "example.test".to_string(),
+            "git-upload-pack 'repo.git'".to_string(),
+        ]));
         assert_eq!(
             git_stdout(
                 rebound.root(),
@@ -2142,6 +2616,7 @@ mod tests {
             "yoi-read-only://repository-push-disabled"
         );
         drop(rebound);
+        assert!(!broker_socket.exists());
 
         let mut read_write = rotated;
         read_write.operation_id = "operation-agent-read-write".to_string();
