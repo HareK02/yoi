@@ -395,6 +395,44 @@ impl RuntimeGitCacheMaterializer {
         })
     }
 
+    fn cache_repository_access(
+        &self,
+        working_directory_id: &str,
+        ssh: &RepositorySshMaterializationAccess,
+    ) -> Result<(), WorkingDirectoryDiagnostic> {
+        validate_ssh_materialization_access(ssh)?;
+        let working_directory_id = working_directory_id.to_string();
+        let credential_revision = ssh.credential_revision;
+        let expires_at = ssh.expires_at_epoch_seconds;
+        self.repository_access
+            .lock()
+            .map_err(|_| {
+                WorkingDirectoryDiagnostic::new(
+                    "working_directory_repository_access_unavailable",
+                    "Runtime Repository access state is unavailable",
+                )
+            })?
+            .insert(working_directory_id.clone(), ssh.clone());
+        let repository_access = self.repository_access.clone();
+        std::thread::spawn(move || {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if expires_at > now {
+                std::thread::sleep(Duration::from_secs(expires_at - now));
+            }
+            if let Ok(mut access) = repository_access.lock()
+                && access
+                    .get(&working_directory_id)
+                    .is_some_and(|access| access.credential_revision == credential_revision)
+            {
+                access.remove(&working_directory_id);
+            }
+        });
+        Ok(())
+    }
+
     fn bind_repository_access(
         &self,
         working_directory_id: &str,
@@ -657,13 +695,62 @@ impl RuntimeGitCacheMaterializer {
         Ok(cache_path)
     }
 
+    fn request_with_authorized_repository_access(
+        &self,
+        working_directory_id: &str,
+        request: &WorkingDirectoryRequest,
+    ) -> Result<WorkingDirectoryRequest, WorkingDirectoryDiagnostic> {
+        let mut request = request.clone();
+        if request.repository.provider != "git"
+            || request.repository.source.kind != workspace_api::RepositorySourceKind::Ssh
+            || request
+                .materialization
+                .as_ref()
+                .and_then(|materialization| materialization.ssh.as_ref())
+                .is_some()
+        {
+            return Ok(request);
+        }
+        let access = self
+            .repository_access
+            .lock()
+            .map_err(|_| {
+                WorkingDirectoryDiagnostic::new(
+                    "working_directory_repository_access_unavailable",
+                    "Runtime Repository access state is unavailable",
+                )
+            })?
+            .get(working_directory_id)
+            .cloned()
+            .ok_or_else(|| {
+                WorkingDirectoryDiagnostic::new(
+                    "working_directory_remote_repository_access_required",
+                    "SSH Repository materialization requires pre-authorized credential and host-trust authority",
+                )
+            })?;
+        validate_ssh_materialization_access(&access)?;
+        request
+            .materialization
+            .as_mut()
+            .ok_or_else(|| {
+                WorkingDirectoryDiagnostic::new(
+                    "working_directory_repository_materialization_authority_required",
+                    "remote Repository materialization requires Backend-authored operation authority",
+                )
+            })?
+            .ssh = Some(access);
+        Ok(request)
+    }
+
     fn materialize_with_working_directory_id(
         &self,
         working_directory_id: String,
         request: &WorkingDirectoryRequest,
     ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
         validate_working_directory_id(&working_directory_id)?;
-        let repository_cache = self.ensure_repository_cache(request)?;
+        let request =
+            self.request_with_authorized_repository_access(&working_directory_id, request)?;
+        let repository_cache = self.ensure_repository_cache(&request)?;
         let selector = request.repository.selector.as_deref().unwrap_or("HEAD");
         let resolved_commit = resolve_cached_commit(&repository_cache, selector)?;
         let tree_spec = format!("{resolved_commit}^{{tree}}");
@@ -725,7 +812,7 @@ impl RuntimeGitCacheMaterializer {
                 materializer_kind: MaterializerKind::RuntimeGitCache,
                 repository_source_revision: Some(request.repository.source_revision),
                 repository_source_fingerprint: Some(request.repository.source_fingerprint.clone()),
-                repository_cache_key: Some(Self::repository_cache_key(request)),
+                repository_cache_key: Some(Self::repository_cache_key(&request)),
                 cache_generation: context
                     .map(|value| value.cache_generation)
                     .unwrap_or_default(),
@@ -741,7 +828,7 @@ impl RuntimeGitCacheMaterializer {
             },
             cleanup_target: WorkingDirectoryCleanupTarget {
                 kind: "runtime_git_cache_worktree".to_string(),
-                working_directory_id,
+                working_directory_id: working_directory_id.clone(),
                 repository_id: request.repository.id.clone(),
             },
             status: WorkingDirectoryStatusKind::Active,
@@ -756,6 +843,16 @@ impl RuntimeGitCacheMaterializer {
             session_resources: Vec::new(),
         };
         if let Err(error) = self.write_record(&binding) {
+            remove_cached_worktree(&repository_cache, &worktree_root);
+            let _ = fs::remove_dir_all(&working_directory_root);
+            return Err(error);
+        }
+        if let Some(ssh) = request
+            .materialization
+            .as_ref()
+            .and_then(|materialization| materialization.ssh.as_ref())
+            && let Err(error) = self.cache_repository_access(&working_directory_id, ssh)
+        {
             remove_cached_worktree(&repository_cache, &worktree_root);
             let _ = fs::remove_dir_all(&working_directory_root);
             return Err(error);
@@ -797,7 +894,13 @@ impl WorkingDirectoryMaterializer for RuntimeGitCacheMaterializer {
             )
         })?;
         validate_ssh_materialization_access(ssh)?;
-        let mut binding = self.read_binding(&request.working_directory_id)?;
+        let mut binding = match self.read_binding(&request.working_directory_id) {
+            Ok(binding) => binding,
+            Err(error) if error.code == "working_directory_not_found" => {
+                return self.cache_repository_access(&request.working_directory_id, ssh);
+            }
+            Err(error) => return Err(error),
+        };
         if binding
             .working_directory
             .evidence
@@ -814,36 +917,7 @@ impl WorkingDirectoryMaterializer for RuntimeGitCacheMaterializer {
         binding.working_directory.evidence.credential_revision = Some(ssh.credential_revision);
         binding.working_directory.evidence.host_trust_revision = Some(ssh.host_trust_revision);
         self.write_record(&binding)?;
-        let working_directory_id = request.working_directory_id.clone();
-        let credential_revision = ssh.credential_revision;
-        let expires_at = ssh.expires_at_epoch_seconds;
-        self.repository_access
-            .lock()
-            .map_err(|_| {
-                WorkingDirectoryDiagnostic::new(
-                    "working_directory_repository_access_unavailable",
-                    "Runtime Repository access state is unavailable",
-                )
-            })?
-            .insert(working_directory_id.clone(), ssh.clone());
-        let repository_access = self.repository_access.clone();
-        std::thread::spawn(move || {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            if expires_at > now {
-                std::thread::sleep(Duration::from_secs(expires_at - now));
-            }
-            if let Ok(mut access) = repository_access.lock()
-                && access
-                    .get(&working_directory_id)
-                    .is_some_and(|access| access.credential_revision == credential_revision)
-            {
-                access.remove(&working_directory_id);
-            }
-        });
-        Ok(())
+        self.cache_repository_access(&request.working_directory_id, ssh)
     }
 
     fn bind_working_directory(
@@ -2508,8 +2582,52 @@ mod tests {
         drop(command_access);
         assert!(!operation_socket.exists());
 
+        let initial_materialization = request.materialization.clone().unwrap();
+        let working_directory_id = "working-directory-agent".to_string();
+        materializer
+            .authorize_repository_access(&WorkingDirectoryRepositoryAccessRequest {
+                working_directory_id: working_directory_id.clone(),
+                materialization: initial_materialization.clone(),
+            })
+            .unwrap();
+        request.backend_workdir_id = Some(working_directory_id.clone());
+        request.materialization.as_mut().unwrap().ssh = None;
+        let mut authorized_ssh_request = request.clone();
+        authorized_ssh_request.repository.source = workspace_api::RepositorySource {
+            kind: workspace_api::RepositorySourceKind::Ssh,
+            uri: "ssh://git@example.test/repo.git".to_string(),
+        };
+        assert!(
+            materializer
+                .request_with_authorized_repository_access(
+                    &working_directory_id,
+                    &authorized_ssh_request,
+                )
+                .unwrap()
+                .materialization
+                .unwrap()
+                .ssh
+                .is_some()
+        );
         let created = materializer.create(&request).unwrap();
         let id = created.working_directory.id;
+        assert_eq!(id, working_directory_id);
+        let mut ssh_backed_binding = materializer.read_binding(&id).unwrap();
+        ssh_backed_binding
+            .working_directory
+            .evidence
+            .credential_revision = Some(1);
+        ssh_backed_binding
+            .working_directory
+            .evidence
+            .host_trust_revision = Some(1);
+        materializer.write_record(&ssh_backed_binding).unwrap();
+        materializer
+            .authorize_repository_access(&WorkingDirectoryRepositoryAccessRequest {
+                working_directory_id: id.clone(),
+                materialization: initial_materialization.clone(),
+            })
+            .unwrap();
         assert_eq!(materializer.list_working_directories().unwrap().len(), 1);
         assert_eq!(
             fs::read_dir(runtime_root.path().join(".repository-agents"))
@@ -2517,12 +2635,6 @@ mod tests {
                 .unwrap_or_default(),
             0
         );
-        materializer
-            .authorize_repository_access(&WorkingDirectoryRepositoryAccessRequest {
-                working_directory_id: id.clone(),
-                materialization: request.materialization.clone().unwrap(),
-            })
-            .unwrap();
         let binding = materializer.bind_working_directory(&id, None).unwrap();
         let environment = binding.command_environment();
         let socket = PathBuf::from(environment["SSH_AUTH_SOCK"].clone());
@@ -2543,7 +2655,7 @@ mod tests {
                 .code,
             "working_directory_remote_repository_access_required"
         );
-        let mut rotated = request.materialization.clone().unwrap();
+        let mut rotated = initial_materialization.clone();
         rotated.operation_id = "operation-agent-rotated".to_string();
         rotated.ssh.as_mut().unwrap().credential_revision = 2;
         rotated.ssh.as_mut().unwrap().access = workspace_api::RepositoryAccessMode::ReadOnly;
@@ -2643,7 +2755,7 @@ mod tests {
         );
         drop(rebound);
 
-        let mut expired = request.materialization.clone().unwrap();
+        let mut expired = initial_materialization;
         expired.ssh.as_mut().unwrap().expires_at_epoch_seconds = 1;
         assert_eq!(
             materializer

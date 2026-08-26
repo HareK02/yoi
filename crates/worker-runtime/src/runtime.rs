@@ -585,12 +585,13 @@ impl Runtime {
             let worker_id = request.worker_id;
             let worker_ref = WorkerRef::new(worker_id);
 
+            let durable_request = durable_create_worker_request(&request);
             let record = WorkerRecord {
                 worker_ref: worker_ref.clone(),
                 worker_id: worker_id.clone(),
                 status: WorkerStatus::Stopped,
                 workspace_id: scope.map(|scope| scope.workspace_id.clone()),
-                request: request.clone(),
+                request: durable_request,
                 run_generation: 1,
                 working_directory: None,
                 execution_handle: None,
@@ -2733,6 +2734,16 @@ fn worker_status_from_run_state(run_state: WorkerExecutionRunState) -> WorkerSta
     }
 }
 
+fn durable_create_worker_request(request: &CreateWorkerRequest) -> CreateWorkerRequest {
+    let mut durable = request.clone();
+    if let Some(working_directory) = durable.working_directory_request.as_mut()
+        && let Some(materialization) = working_directory.materialization.as_mut()
+    {
+        materialization.ssh = None;
+    }
+    durable
+}
+
 fn requested_primary_workdir_id(request: &CreateWorkerRequest) -> Option<&str> {
     request
         .working_directory
@@ -2903,7 +2914,9 @@ fn subscription_worker_state(status: WorkerStatus) -> SubscriptionWorkerState {
 mod tests {
     use super::*;
     use crate::catalog::{
-        ConfigBundleRef, ProfileSelector, WorkingDirectoryClaim, WorkspaceApiRef,
+        ConfigBundleRef, MaterializerKind, ProfileSelector, RepositoryMaterializationContext,
+        RepositorySshMaterializationAccess, SensitiveString, WorkingDirectoryClaim,
+        WorkingDirectoryRepository, WorkingDirectoryRequest, WorkspaceApiRef,
     };
     use crate::config_bundle::{
         ConfigBundle, ConfigBundleMetadata, ConfigBundleProvenance, ConfigDeclaration,
@@ -3132,6 +3145,66 @@ mod tests {
                 language: "English".to_string(),
             }),
         }
+    }
+
+    #[test]
+    fn durable_worker_request_omits_repository_credentials() {
+        let mut request = task_request("worker-secret-redaction");
+        request.working_directory_request = Some(WorkingDirectoryRequest {
+            repository: WorkingDirectoryRepository {
+                id: "repository-1".to_string(),
+                provider: "git".to_string(),
+                source: workspace_api::RepositorySource {
+                    kind: workspace_api::RepositorySourceKind::Ssh,
+                    uri: "ssh://git@example.test/repo.git".to_string(),
+                },
+                source_revision: 1,
+                source_fingerprint: "sha256:source".to_string(),
+                selector: None,
+            },
+            materializer: MaterializerKind::RuntimeGitCache,
+            backend_workdir_id: Some("working-directory-1".to_string()),
+            materialization: Some(RepositoryMaterializationContext {
+                workspace_id: "workspace-1".to_string(),
+                runtime_id: "runtime-1".to_string(),
+                operation_id: "operation-1".to_string(),
+                config_revision: 1,
+                config_projection_digest: "sha256:projection".to_string(),
+                cache_generation: 0,
+                ssh: Some(RepositorySshMaterializationAccess {
+                    credential_id: "credential-1".to_string(),
+                    credential_revision: 1,
+                    host_trust_id: "host-trust-1".to_string(),
+                    host_trust_revision: 1,
+                    access: workspace_api::RepositoryAccessMode::ReadOnly,
+                    expires_at_epoch_seconds: u64::MAX,
+                    private_key: SensitiveString::new("private-key-bytes"),
+                    known_hosts_entry: SensitiveString::new("known-hosts-entry"),
+                }),
+            }),
+        });
+
+        let durable = durable_create_worker_request(&request);
+
+        assert!(
+            request
+                .working_directory_request
+                .as_ref()
+                .and_then(|working_directory| working_directory.materialization.as_ref())
+                .and_then(|materialization| materialization.ssh.as_ref())
+                .is_some()
+        );
+        assert!(
+            durable
+                .working_directory_request
+                .as_ref()
+                .and_then(|working_directory| working_directory.materialization.as_ref())
+                .and_then(|materialization| materialization.ssh.as_ref())
+                .is_none()
+        );
+        let serialized = serde_json::to_string(&durable).unwrap();
+        assert!(!serialized.contains("private-key-bytes"));
+        assert!(!serialized.contains("known-hosts-entry"));
     }
 
     fn scoped_task_request(objective: &str, workspace_id: &str) -> CreateWorkerRequest {

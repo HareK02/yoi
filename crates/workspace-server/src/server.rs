@@ -1227,6 +1227,35 @@ pub async fn build_workspace_server_router(
         )))
 }
 
+fn take_new_workdir_repository_access(
+    request: &mut WorkerSpawnRequest,
+) -> ApiResult<Option<worker_runtime::catalog::WorkingDirectoryRepositoryAccessRequest>> {
+    let Some(working_directory) = request.resolved_working_directory_request.as_mut() else {
+        return Ok(None);
+    };
+    let Some(materialization) = working_directory.materialization.as_mut() else {
+        return Ok(None);
+    };
+    if materialization.ssh.is_none() {
+        return Ok(None);
+    }
+    let working_directory_id = working_directory
+        .backend_workdir_id
+        .clone()
+        .ok_or_else(|| {
+            Error::Config(
+                "repository access authorization requires a Backend WorkingDirectory id"
+                    .to_string(),
+            )
+        })?;
+    let access = worker_runtime::catalog::WorkingDirectoryRepositoryAccessRequest {
+        working_directory_id,
+        materialization: materialization.clone(),
+    };
+    materialization.ssh = None;
+    Ok(Some(access))
+}
+
 impl WorkspaceApi {
     pub fn with_config_schema_provider(
         mut self,
@@ -1437,6 +1466,11 @@ impl WorkspaceApi {
         self.validate_worker_spawn_repository_scope(&request)?;
         let workspace_api = self.workspace_api_ref(runtime_id);
         request.resolved_workspace_api = Some(workspace_api.clone());
+        if let Some(access) = take_new_workdir_repository_access(&mut request)? {
+            self.runtime
+                .authorize_working_directory_repository_access(runtime_id, access)
+                .map_err(RuntimeRegistryError::into_error)?;
+        }
         if let Some(working_directory) = request.resolved_working_directory.as_ref()
             && let Some(access) = repository_access_request_for_workdir(
                 self,
@@ -15387,6 +15421,56 @@ mod tests {
             api.validate_worker_spawn_repository_scope(&workdir_flow_launch)
                 .is_err()
         );
+
+        let mut repository_access_launch = workdir_flow_launch;
+        let working_directory = repository_access_launch
+            .resolved_working_directory_request
+            .as_mut()
+            .unwrap();
+        working_directory.backend_workdir_id = Some("working-directory-1".to_string());
+        working_directory.materialization =
+            Some(worker_runtime::catalog::RepositoryMaterializationContext {
+                workspace_id: api.config.workspace_id.clone(),
+                runtime_id: "runtime-1".to_string(),
+                operation_id: "operation-1".to_string(),
+                config_revision: 1,
+                config_projection_digest: "sha256:projection".to_string(),
+                cache_generation: 0,
+                ssh: Some(
+                    worker_runtime::catalog::RepositorySshMaterializationAccess {
+                        credential_id: "credential-1".to_string(),
+                        credential_revision: 1,
+                        host_trust_id: "host-trust-1".to_string(),
+                        host_trust_revision: 1,
+                        access: workspace_api::RepositoryAccessMode::ReadOnly,
+                        expires_at_epoch_seconds: u64::MAX,
+                        private_key: worker_runtime::catalog::SensitiveString::new(
+                            "private-key-bytes",
+                        ),
+                        known_hosts_entry: worker_runtime::catalog::SensitiveString::new(
+                            "known-hosts-entry",
+                        ),
+                    },
+                ),
+            });
+
+        let access = take_new_workdir_repository_access(&mut repository_access_launch)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(access.working_directory_id, "working-directory-1");
+        assert!(access.materialization.ssh.is_some());
+        assert!(
+            repository_access_launch
+                .resolved_working_directory_request
+                .as_ref()
+                .and_then(|request| request.materialization.as_ref())
+                .and_then(|materialization| materialization.ssh.as_ref())
+                .is_none()
+        );
+        let serialized = serde_json::to_string(&repository_access_launch).unwrap();
+        assert!(!serialized.contains("private-key-bytes"));
+        assert!(!serialized.contains("known-hosts-entry"));
     }
 
     #[test]
