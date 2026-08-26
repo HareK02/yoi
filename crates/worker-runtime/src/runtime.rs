@@ -1,6 +1,6 @@
 use crate::catalog::{
     ConfigBundleRef, CreateWorkerRequest, ProfileSelector, WorkerDetail, WorkerLifecycleAck,
-    WorkerStatus, WorkerSummary, WorkingDirectoryRequest,
+    WorkerStatus, WorkerSummary, WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest,
     WorkingDirectoryStatus as CatalogWorkingDirectoryStatus, WorkspaceApiRef,
 };
 use crate::config_bundle::{
@@ -363,6 +363,25 @@ impl Runtime {
         };
         backend
             .create_working_directory(&request)
+            .map_err(RuntimeError::from)
+    }
+
+    pub fn authorize_working_directory_repository_access(
+        &self,
+        request: WorkingDirectoryRepositoryAccessRequest,
+    ) -> Result<(), RuntimeError> {
+        let backend = {
+            let state = self.lock()?;
+            state.ensure_running()?;
+            state.execution_backend.clone().ok_or_else(|| {
+                RuntimeError::ExecutionBackendUnavailable {
+                    message: "working directory Repository access requires an execution backend"
+                        .to_string(),
+                }
+            })?
+        };
+        backend
+            .authorize_working_directory_repository_access(&request)
             .map_err(RuntimeError::from)
     }
 

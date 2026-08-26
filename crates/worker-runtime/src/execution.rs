@@ -1,4 +1,6 @@
-use crate::catalog::{WorkingDirectoryRequest, WorkingDirectoryStatus};
+use crate::catalog::{
+    WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest, WorkingDirectoryStatus,
+};
 use crate::config_bundle::ConfigBundle;
 use crate::error::RuntimeError;
 use crate::identity::WorkerRef;
@@ -319,6 +321,16 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         ))
     }
 
+    fn authorize_working_directory_repository_access(
+        &self,
+        _request: &WorkingDirectoryRepositoryAccessRequest,
+    ) -> Result<(), WorkingDirectoryDiagnostic> {
+        Err(WorkingDirectoryDiagnostic::rejected(
+            "working_directory_repository_access_unsupported",
+            "Worker execution backend does not support Repository access authorization",
+        ))
+    }
+
     fn list_working_directories(&self) -> Vec<WorkingDirectoryStatus> {
         Vec::new()
     }
@@ -452,6 +464,14 @@ impl WorkerExecutionBackendRef {
         request: &WorkingDirectoryRequest,
     ) -> Result<WorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
         self.backend.create_working_directory(request)
+    }
+
+    pub(crate) fn authorize_working_directory_repository_access(
+        &self,
+        request: &WorkingDirectoryRepositoryAccessRequest,
+    ) -> Result<(), WorkingDirectoryDiagnostic> {
+        self.backend
+            .authorize_working_directory_repository_access(request)
     }
 
     pub(crate) fn list_working_directories(&self) -> Vec<WorkingDirectoryStatus> {

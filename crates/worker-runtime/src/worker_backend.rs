@@ -20,7 +20,7 @@ use crate::auth::{
 };
 use crate::catalog::{
     CreateWorkerRequest, ProfileSourceArchiveHttpRef, ProfileSourceArchiveSource,
-    WorkingDirectoryRequest, WorkingDirectoryStatus,
+    WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest, WorkingDirectoryStatus,
 };
 use crate::execution::{
     WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation,
@@ -1588,6 +1588,19 @@ where
             ));
         };
         Ok(materializer.create(request)?.status())
+    }
+
+    fn authorize_working_directory_repository_access(
+        &self,
+        request: &WorkingDirectoryRepositoryAccessRequest,
+    ) -> Result<(), WorkingDirectoryDiagnostic> {
+        let materializer = self.working_directory_materializer.as_ref().ok_or_else(|| {
+            WorkingDirectoryDiagnostic::rejected(
+                "working_directory_materializer_unavailable",
+                "working directory Repository access requested, but no materializer is configured for this runtime backend",
+            )
+        })?;
+        materializer.authorize_repository_access(request)
     }
 
     fn list_working_directories(&self) -> Vec<WorkingDirectoryStatus> {

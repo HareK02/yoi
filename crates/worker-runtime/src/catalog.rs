@@ -129,6 +129,7 @@ pub struct RepositorySshMaterializationAccess {
     pub host_trust_id: String,
     pub host_trust_revision: u64,
     pub access: workspace_api::RepositoryAccessMode,
+    pub expires_at_epoch_seconds: u64,
     pub private_key: SensitiveString,
     pub known_hosts_entry: SensitiveString,
 }
@@ -144,6 +145,12 @@ pub struct RepositoryMaterializationContext {
     pub cache_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<RepositorySshMaterializationAccess>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkingDirectoryRepositoryAccessRequest {
+    pub working_directory_id: String,
+    pub materialization: RepositoryMaterializationContext,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

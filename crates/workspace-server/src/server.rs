@@ -1437,6 +1437,18 @@ impl WorkspaceApi {
         self.validate_worker_spawn_repository_scope(&request)?;
         let workspace_api = self.workspace_api_ref(runtime_id);
         request.resolved_workspace_api = Some(workspace_api.clone());
+        if let Some(working_directory) = request.resolved_working_directory.as_ref()
+            && let Some(access) = repository_access_request_for_workdir(
+                self,
+                runtime_id,
+                &working_directory.working_directory_id,
+                &format!("worker-spawn:{}", WorkerId::now_v7()),
+            )?
+        {
+            self.runtime
+                .authorize_working_directory_repository_access(runtime_id, access)
+                .map_err(RuntimeRegistryError::into_error)?;
+        }
         let attachment_reservation =
             request
                 .resolved_working_directory
@@ -1652,6 +1664,22 @@ impl WorkspaceApi {
         &self,
         worker: &RuntimeWorkerRef,
     ) -> ApiResult<WorkerRestoreResult> {
+        if let Some(link) = self
+            .store
+            .list_worker_workdir_links(&self.config.workspace_id, worker)?
+            .into_iter()
+            .find(|link| link.unlinked_at.is_none())
+            && let Some(access) = repository_access_request_for_workdir(
+                self,
+                &worker.runtime_id,
+                &link.workdir_id,
+                &format!("worker-restore:{}", WorkerId::now_v7()),
+            )?
+        {
+            self.runtime
+                .authorize_working_directory_repository_access(&worker.runtime_id, access)
+                .map_err(RuntimeRegistryError::into_error)?;
+        }
         let binding = self
             .runtime
             .replace_worker_workspace_api(worker, self.workspace_api_ref(&worker.runtime_id))
@@ -13967,6 +13995,11 @@ fn authorize_repository_materialization(
             host_trust_id: lease.host_trust_id,
             host_trust_revision: lease.host_trust_revision,
             access: binding.access,
+            expires_at_epoch_seconds: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .saturating_add(300),
             private_key: SensitiveString::new(lease.private_key.as_str()),
             known_hosts_entry: SensitiveString::new(lease.known_hosts_entry),
         })
@@ -13983,6 +14016,47 @@ fn authorize_repository_materialization(
         ssh,
     });
     Ok(())
+}
+
+fn repository_access_request_for_workdir(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+    working_directory_id: &str,
+    operation_id: &str,
+) -> ApiResult<Option<worker_runtime::catalog::WorkingDirectoryRepositoryAccessRequest>> {
+    let record = api
+        .config_store
+        .get_workdir_registry(&api.config.workspace_id, working_directory_id)?
+        .ok_or_else(|| {
+            settings_bad_request(
+                "working_directory_not_found",
+                "Working directory is not registered in this Workspace",
+            )
+        })?;
+    if record.runtime_id != runtime_id {
+        return Err(settings_bad_request(
+            "working_directory_runtime_mismatch",
+            "Working directory is owned by a different Runtime",
+        ));
+    }
+    let repository = api.require_configured_workspace_repository(&record.repository_id)?;
+    if repository.source.kind != workspace_api::RepositorySourceKind::Ssh {
+        return Ok(None);
+    }
+    let projection = active_repository_access_projection(api, &api.config.workspace_id)?;
+    let mut request = working_directory_request_from_repository(&repository, None);
+    authorize_repository_materialization(api, runtime_id, operation_id, &projection, &mut request)?;
+    Ok(Some(
+        worker_runtime::catalog::WorkingDirectoryRepositoryAccessRequest {
+            working_directory_id: working_directory_id.to_string(),
+            materialization: request.materialization.ok_or_else(|| {
+                settings_bad_request(
+                    "working_directory_remote_repository_access_required",
+                    "SSH Repository access authority is unavailable",
+                )
+            })?,
+        },
+    ))
 }
 
 fn working_directory_request_for_browser(
