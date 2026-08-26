@@ -23,7 +23,7 @@ use worker_runtime::http_server::{
     RuntimeHttpServerConfig, RuntimeHttpServerError, RuntimeHttpStoreSelection,
 };
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
-use worker_runtime::working_directory::LocalGitWorktreeMaterializer;
+use worker_runtime::working_directory::RuntimeGitCacheMaterializer;
 use worker_runtime::{Runtime, RuntimeOptions};
 
 fn main() -> ExitCode {
@@ -192,7 +192,7 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
     let backend = Arc::new(
         WorkerRuntimeExecutionBackend::new(factory)
             .map_err(ProcessError::WorkerAdapter)?
-            .with_working_directory_materializer(LocalGitWorktreeMaterializer::new(
+            .with_working_directory_materializer(RuntimeGitCacheMaterializer::new(
                 fs_paths.workdir_target.clone(),
             )),
     );

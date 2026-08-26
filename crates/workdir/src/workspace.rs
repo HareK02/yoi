@@ -30,6 +30,8 @@ impl RuntimeWorkerRef {
 #[serde(rename_all = "snake_case")]
 pub enum MaterializerKind {
     #[default]
+    RuntimeGitCache,
+    /// Legacy persisted value from the pre-cache local `git worktree` materializer.
     LocalGitWorktree,
 }
 

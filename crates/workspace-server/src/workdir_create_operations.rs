@@ -8,9 +8,16 @@ pub fn request_fingerprint(
     repository_id: &str,
     selector: Option<&str>,
     requested_runtime_id: Option<&str>,
+    repository_source_fingerprint: &str,
+    repository_source_revision: u64,
 ) -> String {
     let mut hasher = Sha256::new();
-    for value in [Some(repository_id), selector, requested_runtime_id] {
+    for value in [
+        Some(repository_id),
+        selector,
+        requested_runtime_id,
+        Some(repository_source_fingerprint),
+    ] {
         match value {
             Some(value) => {
                 hasher.update([1]);
@@ -20,6 +27,7 @@ pub fn request_fingerprint(
             None => hasher.update([0]),
         }
     }
+    hasher.update(repository_source_revision.to_be_bytes());
     let digest = hasher.finalize();
     let mut encoded = String::with_capacity(digest.len() * 2);
     for byte in digest {
@@ -201,7 +209,13 @@ mod tests {
         let record = WorkdirCreateOperationRecord {
             workspace_id: "workspace".to_string(),
             operation_id: "call-1".to_string(),
-            request_fingerprint: request_fingerprint("main", Some("develop"), None),
+            request_fingerprint: request_fingerprint(
+                "main",
+                Some("develop"),
+                None,
+                "sha256:test",
+                1,
+            ),
             repository_id: "main".to_string(),
             selector: Some("develop".to_string()),
             requested_runtime_id: None,
@@ -234,7 +248,8 @@ mod tests {
             Some(record.clone())
         );
         let mut changed_input = record.clone();
-        changed_input.request_fingerprint = request_fingerprint("main", Some("main"), None);
+        changed_input.request_fingerprint =
+            request_fingerprint("main", Some("main"), None, "sha256:test", 1);
         assert!(
             store
                 .reserve_workdir_create_operation(&changed_input)

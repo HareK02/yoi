@@ -97,6 +97,55 @@ pub use workdir::workspace::{
     WorkingDirectorySummary,
 };
 
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SensitiveString(String);
+
+impl SensitiveString {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Drop for SensitiveString {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+impl std::fmt::Debug for SensitiveString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositorySshMaterializationAccess {
+    pub credential_id: String,
+    pub credential_revision: u64,
+    pub host_trust_id: String,
+    pub host_trust_revision: u64,
+    pub access: workspace_api::RepositoryAccessMode,
+    pub private_key: SensitiveString,
+    pub known_hosts_entry: SensitiveString,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryMaterializationContext {
+    pub workspace_id: String,
+    pub runtime_id: String,
+    pub operation_id: String,
+    pub config_revision: u64,
+    pub config_projection_digest: String,
+    #[serde(default)]
+    pub cache_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<RepositorySshMaterializationAccess>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkingDirectoryRequest {
     pub repository: WorkingDirectoryRepository,
@@ -106,6 +155,9 @@ pub struct WorkingDirectoryRequest {
     /// Backend can create canonical registry rows before materialization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_workdir_id: Option<String>,
+    /// Backend-authored, operation-scoped repository access and cache identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialization: Option<RepositoryMaterializationContext>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

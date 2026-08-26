@@ -132,8 +132,10 @@ use crate::store::{
 use crate::workspace_catalog::{WorkspaceCatalogService, WorkspaceCreateRequest};
 use crate::{Error, Result};
 use worker_runtime::catalog::{
-    ConfigBundleRef, ProfileSelector, RepositorySelector as RuntimeRepositorySelector,
-    WorkingDirectoryClaim, WorkingDirectoryRepository, WorkingDirectoryRequest, WorkspaceApiRef,
+    ConfigBundleRef, ProfileSelector, RepositoryMaterializationContext,
+    RepositorySelector as RuntimeRepositorySelector, RepositorySshMaterializationAccess,
+    SensitiveString, WorkingDirectoryClaim, WorkingDirectoryRepository, WorkingDirectoryRequest,
+    WorkspaceApiRef,
 };
 use worker_runtime::config_bundle::ConfigBundle;
 use worker_runtime::http_server::{
@@ -8453,6 +8455,8 @@ async fn create_workspace_working_directory(
         &request.repository_id,
         selector.as_deref(),
         requested_runtime_id.as_deref(),
+        &working_directory_request.repository.source_fingerprint,
+        working_directory_request.repository.source_revision,
     );
     let reserved = if let Some(existing) = api
         .config_store
@@ -8596,6 +8600,24 @@ async fn create_workspace_working_directory(
         ));
     }
 
+    let repository_access_projection = active_repository_access_projection(api, workspace_id)?;
+    if let Err(error) = authorize_repository_materialization(
+        api,
+        &reserved.resolved_runtime_id,
+        &operation_id,
+        &repository_access_projection,
+        &mut working_directory_request,
+    ) {
+        api.config_store.finish_workdir_create_operation(
+            workspace_id,
+            &operation_id,
+            &request_fingerprint,
+            false,
+            Some("working_directory_remote_repository_access_required"),
+            &now_registry_timestamp(),
+        )?;
+        return Err(error);
+    }
     working_directory_request.backend_workdir_id = Some(reserved.working_directory_id.clone());
     let existing = match api.runtime.working_directory(
         &reserved.resolved_runtime_id,
@@ -10834,8 +10856,9 @@ fn working_directory_request_from_repository(
                 })
                 .or_else(|| Some(RuntimeRepositorySelector::from("HEAD"))),
         },
-        materializer: MaterializerKind::LocalGitWorktree,
+        materializer: MaterializerKind::RuntimeGitCache,
         backend_workdir_id: None,
+        materialization: None,
     }
 }
 
@@ -13917,6 +13940,51 @@ fn validate_working_directory_claim_for_browser(
     Ok(())
 }
 
+fn authorize_repository_materialization(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+    operation_id: &str,
+    projection: &RepositoryAccessProjection,
+    request: &mut WorkingDirectoryRequest,
+) -> ApiResult<()> {
+    let ssh = if request.repository.source.kind == workspace_api::RepositorySourceKind::Ssh {
+        let binding = projection
+            .bindings
+            .iter()
+            .find(|binding| binding.repository_id == request.repository.id)
+            .ok_or_else(|| {
+                settings_bad_request(
+                    "working_directory_remote_repository_access_required",
+                    "SSH Repository has no active Workspace credential and host-trust binding",
+                )
+            })?;
+        let lease = api
+            .repository_secrets
+            .lease_ssh_materialization_access(&api.config.workspace_id, binding)?;
+        Some(RepositorySshMaterializationAccess {
+            credential_id: lease.credential_id,
+            credential_revision: lease.credential_revision,
+            host_trust_id: lease.host_trust_id,
+            host_trust_revision: lease.host_trust_revision,
+            access: binding.access,
+            private_key: SensitiveString::new(lease.private_key.as_str()),
+            known_hosts_entry: SensitiveString::new(lease.known_hosts_entry),
+        })
+    } else {
+        None
+    };
+    request.materialization = Some(RepositoryMaterializationContext {
+        workspace_id: api.config.workspace_id.clone(),
+        runtime_id: runtime_id.to_string(),
+        operation_id: operation_id.to_string(),
+        config_revision: projection.config_revision,
+        config_projection_digest: projection.projection_digest.clone(),
+        cache_generation: 0,
+        ssh,
+    });
+    Ok(())
+}
+
 fn working_directory_request_for_browser(
     api: &WorkspaceApi,
     request: BrowserWorkingDirectoryCreateRequest,
@@ -13935,8 +14003,9 @@ fn working_directory_request_for_browser(
             source_fingerprint: repository.source_fingerprint.clone(),
             selector: selector.map(RuntimeRepositorySelector),
         },
-        materializer: MaterializerKind::LocalGitWorktree,
+        materializer: MaterializerKind::RuntimeGitCache,
         backend_workdir_id: None,
+        materialization: None,
     })
 }
 
@@ -16015,7 +16084,7 @@ mod tests {
                 worker_runtime::execution::WorkerExecutionContext,
             >,
         >,
-        materializer: worker_runtime::working_directory::LocalGitWorktreeMaterializer,
+        materializer: worker_runtime::working_directory::RuntimeGitCacheMaterializer,
         spawn_failure: std::sync::Mutex<Option<String>>,
         input_failure: std::sync::Mutex<Option<String>>,
         inputs: std::sync::Mutex<Vec<(worker_runtime::identity::WorkerRef, String)>>,
@@ -16035,7 +16104,7 @@ mod tests {
             );
             Self {
                 contexts: std::sync::Mutex::new(std::collections::HashMap::new()),
-                materializer: worker_runtime::working_directory::LocalGitWorktreeMaterializer::new(
+                materializer: worker_runtime::working_directory::RuntimeGitCacheMaterializer::new(
                     std::env::temp_dir().join(unique),
                 ),
                 spawn_failure: std::sync::Mutex::new(None),
@@ -21083,10 +21152,15 @@ mod tests {
         init_clean_git_workspace(dir.path());
         let api = test_api(dir.path()).await;
         let operation_id = "provider-rejection-classification";
+        let repository = api
+            .require_configured_workspace_repository(TEST_REPOSITORY_ID)
+            .unwrap();
         let request_fingerprint = crate::workdir_create_operations::request_fingerprint(
             TEST_REPOSITORY_ID,
             Some("HEAD"),
             Some(EMBEDDED_WORKER_RUNTIME_ID),
+            &repository.source_fingerprint,
+            repository.source_revision,
         );
         api.config_store
             .reserve_workdir_create_operation(&WorkdirCreateOperationRecord {

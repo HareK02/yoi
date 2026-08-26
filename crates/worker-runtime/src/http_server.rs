@@ -527,9 +527,19 @@ async fn list_working_directories(
 
 async fn create_working_directory(
     State(state): State<RuntimeHttpState>,
+    Extension(auth): Extension<RuntimeAuthContext>,
     body: Result<Json<WorkingDirectoryRequest>, JsonRejection>,
 ) -> RestResult<RuntimeHttpWorkingDirectoryResponse> {
     let Json(request) = body.map_err(RuntimeHttpRestError::json_rejection)?;
+    if let Some(materialization) = request.materialization.as_ref()
+        && materialization.workspace_id != auth.workspace_id
+    {
+        return Err(RuntimeHttpRestError::new(
+            StatusCode::FORBIDDEN,
+            "working_directory_materialization_workspace_mismatch",
+            "Repository materialization authority does not match the authenticated Workspace",
+        ));
+    }
     let working_directory = state
         .runtime
         .create_working_directory(request)
