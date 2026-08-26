@@ -4,6 +4,17 @@ use sha2::{Digest, Sha256};
 use crate::store::WorkdirCreateOperationRecord;
 use crate::{Error, Result, SqliteWorkspaceStore};
 
+pub fn selector_for_retry(
+    explicit_selector: Option<&str>,
+    persisted_selector: Option<&str>,
+    current_default_selector: Option<&str>,
+) -> Option<String> {
+    explicit_selector
+        .or(persisted_selector)
+        .or(current_default_selector)
+        .map(str::to_string)
+}
+
 pub fn request_fingerprint(
     repository_id: &str,
     selector: Option<&str>,
@@ -266,6 +277,22 @@ fn read_workdir_create_operation(
 mod tests {
     use super::*;
     use crate::store::{ControlPlaneStore, RepositoryRecord, WorkspaceRecord};
+
+    #[test]
+    fn retry_selector_keeps_persisted_default_but_honors_explicit_input() {
+        assert_eq!(
+            selector_for_retry(None, Some("develop"), Some("main")),
+            Some("develop".to_string())
+        );
+        assert_eq!(
+            selector_for_retry(Some("release"), Some("develop"), Some("main")),
+            Some("release".to_string())
+        );
+        assert_eq!(
+            selector_for_retry(None, None, Some("main")),
+            Some("main".to_string())
+        );
+    }
 
     #[test]
     fn retry_keeps_resolved_config_evidence_and_rejects_changed_input() {

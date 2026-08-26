@@ -620,8 +620,11 @@ pub struct WorkdirRegistryRecord {
     pub repository_id: String,
     pub creation_selector: Option<String>,
     pub creation_ref: Option<String>,
+    pub creation_tree: Option<String>,
     pub current_selector: Option<String>,
     pub current_ref: Option<String>,
+    pub current_tree: Option<String>,
+    pub observed_at_epoch_seconds: Option<u64>,
     pub materialization_status: String,
     pub cleanliness: String,
     pub created_at: String,
@@ -4627,16 +4630,20 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             conn.execute(
                 r#"INSERT INTO workdir_registry (
                     workspace_id, workdir_id, runtime_id, repository_id,
-                    creation_selector, creation_ref, current_selector, current_ref,
+                    creation_selector, creation_ref, creation_tree,
+                    current_selector, current_ref, current_tree, observed_at_epoch_seconds,
                     materialization_status, cleanliness, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                 ON CONFLICT(workspace_id, workdir_id) DO UPDATE SET
                     runtime_id = excluded.runtime_id,
                     repository_id = excluded.repository_id,
                     creation_selector = excluded.creation_selector,
                     creation_ref = excluded.creation_ref,
+                    creation_tree = excluded.creation_tree,
                     current_selector = excluded.current_selector,
                     current_ref = excluded.current_ref,
+                    current_tree = excluded.current_tree,
+                    observed_at_epoch_seconds = excluded.observed_at_epoch_seconds,
                     materialization_status = excluded.materialization_status,
                     cleanliness = excluded.cleanliness,
                     updated_at = excluded.updated_at"#,
@@ -4647,8 +4654,11 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     record.repository_id,
                     record.creation_selector,
                     record.creation_ref,
+                    record.creation_tree,
                     record.current_selector,
                     record.current_ref,
+                    record.current_tree,
+                    record.observed_at_epoch_seconds.map(|value| value as i64),
                     record.materialization_status,
                     record.cleanliness,
                     record.created_at,
@@ -5868,7 +5878,8 @@ fn require_expected_ticket_assignment(
 fn workdir_registry_select_sql(where_clause: &str) -> String {
     format!(
         "SELECT workspace_id, workdir_id, runtime_id, repository_id, \
-         creation_selector, creation_ref, current_selector, current_ref, \
+         creation_selector, creation_ref, creation_tree, \
+         current_selector, current_ref, current_tree, observed_at_epoch_seconds, \
          materialization_status, cleanliness, created_at, updated_at \
          FROM workdir_registry {where_clause}"
     )
@@ -5884,12 +5895,15 @@ fn read_workdir_registry_record(
         repository_id: row.get(3)?,
         creation_selector: row.get(4)?,
         creation_ref: row.get(5)?,
-        current_selector: row.get(6)?,
-        current_ref: row.get(7)?,
-        materialization_status: row.get(8)?,
-        cleanliness: row.get(9)?,
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
+        creation_tree: row.get(6)?,
+        current_selector: row.get(7)?,
+        current_ref: row.get(8)?,
+        current_tree: row.get(9)?,
+        observed_at_epoch_seconds: row.get::<_, Option<i64>>(10)?.map(|value| value as u64),
+        materialization_status: row.get(11)?,
+        cleanliness: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
     })
 }
 
@@ -6830,6 +6844,9 @@ fn create_repository_ssh_secret_authority(conn: &Connection) -> Result<()> {
 fn bind_workdir_create_repository_access_evidence(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
+        ALTER TABLE workdir_registry ADD COLUMN creation_tree TEXT;
+        ALTER TABLE workdir_registry ADD COLUMN current_tree TEXT;
+        ALTER TABLE workdir_registry ADD COLUMN observed_at_epoch_seconds INTEGER;
         ALTER TABLE workdir_create_operations ADD COLUMN source_kind TEXT;
         ALTER TABLE workdir_create_operations ADD COLUMN source_uri TEXT;
         ALTER TABLE workdir_create_operations ADD COLUMN source_revision INTEGER;
@@ -11643,6 +11660,9 @@ INSERT INTO worker_registry (
              DROP TABLE repository_ssh_host_trust_revisions;
              DROP TABLE repository_ssh_host_trusts;
              DROP TABLE workdir_create_operations;
+             ALTER TABLE workdir_registry DROP COLUMN creation_tree;
+             ALTER TABLE workdir_registry DROP COLUMN current_tree;
+             ALTER TABLE workdir_registry DROP COLUMN observed_at_epoch_seconds;
              DELETE FROM __yoi_schema_migrations WHERE version IN (45, 46, 47);",
         )
         .unwrap();
@@ -11681,6 +11701,9 @@ INSERT INTO worker_registry (
              DROP TABLE repository_ssh_credentials;
              DROP TABLE repository_ssh_host_trust_revisions;
              DROP TABLE repository_ssh_host_trusts;
+             ALTER TABLE workdir_registry DROP COLUMN creation_tree;
+             ALTER TABLE workdir_registry DROP COLUMN current_tree;
+             ALTER TABLE workdir_registry DROP COLUMN observed_at_epoch_seconds;
              ALTER TABLE workdir_create_operations DROP COLUMN source_kind;
              ALTER TABLE workdir_create_operations DROP COLUMN source_uri;
              ALTER TABLE workdir_create_operations DROP COLUMN source_revision;
@@ -11722,7 +11745,10 @@ INSERT INTO worker_registry (
         configure_sqlite(&conn).unwrap();
         apply_migrations(&conn).unwrap();
         conn.execute_batch(
-            "ALTER TABLE workdir_create_operations DROP COLUMN source_kind;
+            "ALTER TABLE workdir_registry DROP COLUMN creation_tree;
+             ALTER TABLE workdir_registry DROP COLUMN current_tree;
+             ALTER TABLE workdir_registry DROP COLUMN observed_at_epoch_seconds;
+             ALTER TABLE workdir_create_operations DROP COLUMN source_kind;
              ALTER TABLE workdir_create_operations DROP COLUMN source_uri;
              ALTER TABLE workdir_create_operations DROP COLUMN source_revision;
              ALTER TABLE workdir_create_operations DROP COLUMN source_fingerprint;
@@ -11754,6 +11780,13 @@ INSERT INTO worker_registry (
         ] {
             assert!(
                 columns.iter().any(|column| column == required),
+                "missing column {required}"
+            );
+        }
+        let workdir_columns = table_columns(&conn, "workdir_registry").unwrap();
+        for required in ["creation_tree", "current_tree", "observed_at_epoch_seconds"] {
+            assert!(
+                workdir_columns.iter().any(|column| column == required),
                 "missing column {required}"
             );
         }
@@ -12537,6 +12570,9 @@ WHERE workspace_id = 'workspace-a'
                 "updated_at",
                 "current_selector",
                 "current_ref",
+                "creation_tree",
+                "current_tree",
+                "observed_at_epoch_seconds",
             ],
         );
         assert_columns(
@@ -13028,8 +13064,11 @@ CREATE TABLE ticket_assignment_operations (
             repository_id: "repo".to_string(),
             creation_selector: Some("develop".to_string()),
             creation_ref: Some("abcdef".to_string()),
+            creation_tree: Some("tree-creation".to_string()),
             current_selector: None,
             current_ref: Some("abcdef".to_string()),
+            current_tree: Some("tree-current".to_string()),
+            observed_at_epoch_seconds: Some(1_777_777_777),
             materialization_status: "not_found".to_string(),
             cleanliness: "clean".to_string(),
             created_at: "2".to_string(),
@@ -13043,8 +13082,11 @@ CREATE TABLE ticket_assignment_operations (
             repository_id: "repo".to_string(),
             creation_selector: Some("feature".to_string()),
             creation_ref: Some("123456".to_string()),
+            creation_tree: None,
             current_selector: Some("feature".to_string()),
             current_ref: Some("123456".to_string()),
+            current_tree: None,
+            observed_at_epoch_seconds: None,
             materialization_status: "present".to_string(),
             cleanliness: "unknown".to_string(),
             created_at: "3".to_string(),

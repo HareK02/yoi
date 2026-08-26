@@ -8477,30 +8477,39 @@ async fn create_workspace_working_directory(
     if let Some(existing) = api
         .config_store
         .load_workdir_create_operation(workspace_id, &operation_id)?
-        && let (Some(kind), Some(uri), Some(revision), Some(fingerprint)) = (
-            existing.source_kind.as_deref(),
-            existing.source_uri,
-            existing.source_revision,
-            existing.source_fingerprint,
-        )
     {
-        let kind = match kind {
-            "local_path" => workspace_api::RepositorySourceKind::LocalPath,
-            "file" => workspace_api::RepositorySourceKind::File,
-            "https" => workspace_api::RepositorySourceKind::Https,
-            "http" => workspace_api::RepositorySourceKind::Http,
-            "ssh" => workspace_api::RepositorySourceKind::Ssh,
-            "invalid" => workspace_api::RepositorySourceKind::Invalid,
-            _ => {
-                return Err(settings_bad_request(
-                    "working_directory_repository_source_invalid",
-                    "persisted Workdir create Repository source kind is invalid",
-                ));
-            }
-        };
-        working_directory_request.repository.source = workspace_api::RepositorySource { kind, uri };
-        working_directory_request.repository.source_revision = revision;
-        working_directory_request.repository.source_fingerprint = fingerprint;
+        working_directory_request.repository.selector =
+            crate::workdir_create_operations::selector_for_retry(
+                request.selector.as_deref(),
+                existing.selector.as_deref(),
+                working_directory_request.repository.selector.as_deref(),
+            )
+            .map(RuntimeRepositorySelector::from);
+        if let (Some(kind), Some(uri), Some(revision), Some(fingerprint)) = (
+            existing.source_kind.as_deref(),
+            existing.source_uri.clone(),
+            existing.source_revision,
+            existing.source_fingerprint.clone(),
+        ) {
+            let kind = match kind {
+                "local_path" => workspace_api::RepositorySourceKind::LocalPath,
+                "file" => workspace_api::RepositorySourceKind::File,
+                "https" => workspace_api::RepositorySourceKind::Https,
+                "http" => workspace_api::RepositorySourceKind::Http,
+                "ssh" => workspace_api::RepositorySourceKind::Ssh,
+                "invalid" => workspace_api::RepositorySourceKind::Invalid,
+                _ => {
+                    return Err(settings_bad_request(
+                        "working_directory_repository_source_invalid",
+                        "persisted Workdir create Repository source kind is invalid",
+                    ));
+                }
+            };
+            working_directory_request.repository.source =
+                workspace_api::RepositorySource { kind, uri };
+            working_directory_request.repository.source_revision = revision;
+            working_directory_request.repository.source_fingerprint = fingerprint;
+        }
     }
     let selector = working_directory_request
         .repository
@@ -13704,8 +13713,11 @@ fn upsert_pending_backend_workdir(
             .as_ref()
             .map(|selector| selector.as_ref().to_string()),
         creation_ref: None,
+        creation_tree: None,
         current_selector: None,
         current_ref: None,
+        current_tree: None,
+        observed_at_epoch_seconds: None,
         materialization_status: "pending".to_string(),
         cleanliness: "unknown".to_string(),
         created_at: timestamp.clone(),
@@ -13853,8 +13865,11 @@ fn workdir_record_from_summary(
         repository_id: summary.repository_id.clone(),
         creation_selector: summary.creation_selector.clone(),
         creation_ref: summary.creation_ref.clone(),
+        creation_tree: summary.creation_tree.clone(),
         current_selector: summary.current_selector.clone(),
         current_ref: summary.current_ref.clone(),
+        current_tree: summary.current_tree.clone(),
+        observed_at_epoch_seconds: summary.observed_at_epoch_seconds,
         materialization_status: match summary.status {
             WorkingDirectoryStatusKind::Active => "present",
             WorkingDirectoryStatusKind::CleanupPending => "pending",
@@ -13891,6 +13906,21 @@ fn preserve_workdir_identity_for_corrupted_summary(
     if record.creation_ref.is_none() {
         record.creation_ref = existing.creation_ref.clone();
     }
+    if record.creation_tree.is_none() {
+        record.creation_tree = existing.creation_tree.clone();
+    }
+    if record.current_selector.is_none() {
+        record.current_selector = existing.current_selector.clone();
+    }
+    if record.current_ref.is_none() {
+        record.current_ref = existing.current_ref.clone();
+    }
+    if record.current_tree.is_none() {
+        record.current_tree = existing.current_tree.clone();
+    }
+    if record.observed_at_epoch_seconds.is_none() {
+        record.observed_at_epoch_seconds = existing.observed_at_epoch_seconds;
+    }
 }
 
 fn workdir_summary_from_record(record: &WorkdirRegistryRecord) -> WorkingDirectorySummary {
@@ -13907,11 +13937,14 @@ fn workdir_summary_from_record(record: &WorkdirRegistryRecord) -> WorkingDirecto
         repository_id: record.repository_id.clone(),
         creation_selector: record.creation_selector.clone(),
         creation_ref: record.creation_ref.clone(),
+        creation_tree: record.creation_tree.clone(),
         current_selector: record.current_selector.clone(),
         current_ref: record.current_ref.clone(),
-        materializer_kind: MaterializerKind::LocalGitWorktree,
+        current_tree: record.current_tree.clone(),
+        observed_at_epoch_seconds: record.observed_at_epoch_seconds,
+        materializer_kind: MaterializerKind::RuntimeGitCache,
         cleanup_target: Some(WorkingDirectoryCleanupTarget {
-            kind: "local_git_worktree".to_string(),
+            kind: "runtime_git_cache_worktree".to_string(),
             working_directory_id: record.workdir_id.clone(),
             repository_id: record.repository_id.clone(),
         }),
@@ -15109,8 +15142,11 @@ mod tests {
             repository_id: "repo".to_string(),
             creation_selector: Some("develop".to_string()),
             creation_ref: Some("abcdef".to_string()),
+            creation_tree: Some("tree-creation".to_string()),
             current_selector: None,
             current_ref: Some("fedcba".to_string()),
+            current_tree: Some("tree-current".to_string()),
+            observed_at_epoch_seconds: Some(3),
             materialization_status: "missing".to_string(),
             cleanliness: "clean".to_string(),
             created_at: "1".to_string(),
@@ -16168,8 +16204,11 @@ mod tests {
                 repository_id: "repo".to_string(),
                 creation_selector: None,
                 creation_ref: None,
+                creation_tree: None,
                 current_selector: None,
                 current_ref: None,
+                current_tree: None,
+                observed_at_epoch_seconds: None,
                 materialization_status: "present".to_string(),
                 cleanliness: "clean".to_string(),
                 created_at: "1".to_string(),
@@ -16184,8 +16223,11 @@ mod tests {
                 repository_id: "repo".to_string(),
                 creation_selector: None,
                 creation_ref: None,
+                creation_tree: None,
                 current_selector: None,
                 current_ref: None,
+                current_tree: None,
+                observed_at_epoch_seconds: None,
                 materialization_status: "present".to_string(),
                 cleanliness: "unknown".to_string(),
                 created_at: "1".to_string(),
@@ -16257,8 +16299,11 @@ mod tests {
             repository_id: "repo".to_string(),
             creation_selector: None,
             creation_ref: None,
+            creation_tree: None,
             current_selector: None,
             current_ref: None,
+            current_tree: None,
+            observed_at_epoch_seconds: None,
             materialization_status: "present".to_string(),
             cleanliness: "unknown".to_string(),
             created_at: "1".to_string(),
@@ -20586,8 +20631,11 @@ mod tests {
                 repository_id: "repo-test".to_string(),
                 creation_selector: Some("HEAD".to_string()),
                 creation_ref: None,
+                creation_tree: None,
                 current_selector: None,
                 current_ref: None,
+                current_tree: None,
+                observed_at_epoch_seconds: None,
                 materialization_status: status.to_string(),
                 cleanliness: cleanliness.to_string(),
                 created_at: now.clone(),
@@ -23967,8 +24015,11 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
                 repository_id: "main".to_string(),
                 creation_selector: None,
                 creation_ref: None,
+                creation_tree: None,
                 current_selector: Some("work/ticket".to_string()),
                 current_ref: Some("abc123".to_string()),
+                current_tree: Some("tree123".to_string()),
+                observed_at_epoch_seconds: Some(1_777_777_777),
                 materializer_kind: MaterializerKind::LocalGitWorktree,
                 cleanup_target: None,
                 status: WorkingDirectoryStatusKind::Active,

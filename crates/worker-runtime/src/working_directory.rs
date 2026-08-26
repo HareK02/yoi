@@ -69,8 +69,11 @@ impl WorkingDirectory {
             repository_id: self.repository_id.clone(),
             creation_selector: self.evidence.requested_selector.clone(),
             creation_ref: Some(self.evidence.resolved_commit.clone()),
+            creation_tree: self.evidence.resolved_tree.clone(),
             current_selector: None,
             current_ref: None,
+            current_tree: None,
+            observed_at_epoch_seconds: None,
             materializer_kind: self.materializer_kind.clone(),
             cleanup_target: Some(self.cleanup_target.clone()),
             status: self.status.clone(),
@@ -126,9 +129,16 @@ impl WorkingDirectoryBinding {
         }
         let mut summary = working_directory.status_summary();
         summary.cleanliness = if summary.status == WorkingDirectoryStatusKind::Active {
-            let (current_selector, current_ref) = binding_current_revision(self);
+            let (current_selector, current_ref, current_tree) = binding_current_revision(self);
             summary.current_selector = current_selector;
             summary.current_ref = current_ref;
+            summary.current_tree = current_tree;
+            summary.observed_at_epoch_seconds = Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            );
             Some(binding_cleanliness(self))
         } else {
             Some("unknown".to_string())
@@ -217,12 +227,14 @@ fn binding_paths_are_available(binding: &WorkingDirectoryBinding) -> bool {
     source_repository_path.is_dir()
 }
 
-fn binding_current_revision(binding: &WorkingDirectoryBinding) -> (Option<String>, Option<String>) {
+fn binding_current_revision(
+    binding: &WorkingDirectoryBinding,
+) -> (Option<String>, Option<String>, Option<String>) {
     let current_ref = git_stdout(binding.root(), ["rev-parse", "HEAD"])
         .ok()
         .filter(|value| !value.is_empty());
     if current_ref.is_none() {
-        return (None, None);
+        return (None, None, None);
     }
     let current_selector = git_stdout(
         binding.root(),
@@ -230,7 +242,10 @@ fn binding_current_revision(binding: &WorkingDirectoryBinding) -> (Option<String
     )
     .ok()
     .filter(|value| !value.is_empty());
-    (current_selector, current_ref)
+    let current_tree = git_stdout(binding.root(), ["rev-parse", "HEAD^{tree}"])
+        .ok()
+        .filter(|value| !value.is_empty());
+    (current_selector, current_ref, current_tree)
 }
 
 fn binding_cleanliness(binding: &WorkingDirectoryBinding) -> String {
@@ -303,8 +318,11 @@ impl RuntimeGitCacheMaterializer {
                 repository_id: "unknown".to_string(),
                 creation_selector: None,
                 creation_ref: None,
+                creation_tree: None,
                 current_selector: None,
                 current_ref: None,
+                current_tree: None,
+                observed_at_epoch_seconds: None,
                 materializer_kind: MaterializerKind::RuntimeGitCache,
                 cleanup_target: Some(WorkingDirectoryCleanupTarget {
                     kind: "runtime_git_cache_worktree".to_string(),
@@ -2299,6 +2317,21 @@ mod tests {
         assert_eq!(summary.creation_ref.as_deref(), Some(initial_ref.as_str()));
         assert_eq!(summary.current_selector.as_deref(), Some("observed-branch"));
         assert_ne!(summary.current_ref.as_deref(), Some(initial_ref.as_str()));
+        assert!(summary.creation_tree.is_some());
+        assert!(summary.current_tree.is_some());
+        assert_ne!(summary.current_tree, summary.creation_tree);
+        assert!(summary.observed_at_epoch_seconds.is_some());
+        assert_eq!(summary.cleanliness.as_deref(), Some("clean"));
+
+        fs::write(bound.root.join("dirty.txt"), "dirty\n").unwrap();
+        let dirty = materializer.list_working_directories().unwrap()[0]
+            .summary
+            .clone();
+        assert_eq!(dirty.creation_ref, summary.creation_ref);
+        assert_eq!(dirty.current_ref, summary.current_ref);
+        assert_eq!(dirty.current_tree, summary.current_tree);
+        assert_eq!(dirty.cleanliness.as_deref(), Some("dirty"));
+        assert!(dirty.observed_at_epoch_seconds.is_some());
     }
 
     #[test]
