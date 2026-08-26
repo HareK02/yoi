@@ -28,11 +28,9 @@ use worker_runtime::{Runtime, RuntimeOptions};
 
 fn main() -> ExitCode {
     let mut arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    if arguments.first().map(String::as_str) == Some("__repository-read-only-ssh") {
+    if arguments.first().map(String::as_str) == Some("__repository-ssh") {
         arguments.remove(0);
-        return match worker_runtime::working_directory::run_repository_read_only_ssh_client(
-            &arguments,
-        ) {
+        return match worker_runtime::working_directory::run_repository_ssh_client(&arguments) {
             Ok(status) => ExitCode::from(u8::try_from(status).unwrap_or(1)),
             Err(error) => {
                 eprintln!("{error}");

@@ -488,12 +488,9 @@ impl RuntimeGitCacheMaterializer {
                 access.stop();
             }
         });
-        if access.access == workspace_api::RepositoryAccessMode::ReadWrite {
-            binding.command_environment.insert(
-                "SSH_AUTH_SOCK".to_string(),
-                command_access.agent.socket.to_string_lossy().to_string(),
-            );
-        }
+        binding
+            .command_environment
+            .insert("SSH_AUTH_SOCK".to_string(), "/dev/null".to_string());
         binding.command_environment.insert(
             "GIT_SSH_COMMAND".to_string(),
             command_access.ssh_command.to_string_lossy().to_string(),
@@ -703,12 +700,21 @@ impl RuntimeGitCacheMaterializer {
         let mut request = request.clone();
         if request.repository.provider != "git"
             || request.repository.source.kind != workspace_api::RepositorySourceKind::Ssh
-            || request
-                .materialization
-                .as_ref()
-                .and_then(|materialization| materialization.ssh.as_ref())
-                .is_some()
         {
+            return Ok(request);
+        }
+        if let Some(access) = request
+            .materialization
+            .as_ref()
+            .and_then(|materialization| materialization.ssh.as_ref())
+        {
+            validate_ssh_materialization_access(access)?;
+            validate_repository_access_binding(
+                access,
+                &request.repository.id,
+                &request.repository.source_fingerprint,
+                Some(request.repository.source.uri.as_str()),
+            )?;
             return Ok(request);
         }
         let access = self
@@ -1266,29 +1272,30 @@ impl std::fmt::Debug for PendingRepositorySshRequest {
 }
 
 #[derive(Debug)]
-struct RepositoryReadOnlySshBroker {
+struct RepositorySshBroker {
     socket: PathBuf,
     stopped: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
-impl RepositoryReadOnlySshBroker {
+impl RepositorySshBroker {
     fn start(
         root: &Path,
         agent: Arc<RepositorySshAgent>,
         known_hosts: PathBuf,
+        policy: RepositorySshCommandPolicy,
     ) -> Result<Self, WorkingDirectoryDiagnostic> {
         let socket = root.join("b.sock");
         let listener = UnixListener::bind(&socket).map_err(|_| {
             WorkingDirectoryDiagnostic::new(
                 "working_directory_repository_access_setup_failed",
-                "read-only Repository SSH broker could not be prepared",
+                "Repository SSH broker could not be prepared",
             )
         })?;
         listener.set_nonblocking(true).map_err(|_| {
             WorkingDirectoryDiagnostic::new(
                 "working_directory_repository_access_setup_failed",
-                "read-only Repository SSH broker could not be prepared",
+                "Repository SSH broker could not be prepared",
             )
         })?;
         let stopped = Arc::new(AtomicBool::new(false));
@@ -1308,11 +1315,13 @@ impl RepositoryReadOnlySshBroker {
                         {
                             let request_agent = Arc::clone(&agent);
                             let request_known_hosts = known_hosts.clone();
+                            let request_policy = policy.clone();
                             std::thread::spawn(move || {
-                                run_brokered_read_only_ssh(
+                                run_brokered_repository_ssh(
                                     request,
                                     &request_agent.socket,
                                     &request_known_hosts,
+                                    &request_policy,
                                 );
                             });
                             pending.remove(&request_id);
@@ -1346,7 +1355,7 @@ impl RepositoryReadOnlySshBroker {
     }
 }
 
-impl Drop for RepositoryReadOnlySshBroker {
+impl Drop for RepositorySshBroker {
     fn drop(&mut self) {
         self.stop();
     }
@@ -1401,10 +1410,11 @@ fn receive_repository_ssh_channel(
     }
 }
 
-fn run_brokered_read_only_ssh(
+fn run_brokered_repository_ssh(
     mut request: PendingRepositorySshRequest,
     agent_socket: &Path,
     known_hosts: &Path,
+    policy: &RepositorySshCommandPolicy,
 ) {
     let args = request.args.take().unwrap_or_default();
     let mut data = request.data.take().expect("complete broker request data");
@@ -1416,8 +1426,8 @@ fn run_brokered_read_only_ssh(
         .status
         .take()
         .expect("complete broker request status");
-    let status = if !validate_read_only_ssh_args(&args) {
-        let _ = stderr_stream.write_all(b"read-only Repository SSH operation denied\n");
+    let status = if !validate_repository_ssh_args(&args, policy) {
+        let _ = stderr_stream.write_all(b"Repository SSH operation denied\n");
         let _ = stderr_stream.shutdown(Shutdown::Write);
         let _ = data.shutdown(Shutdown::Both);
         126
@@ -1480,28 +1490,114 @@ fn run_brokered_read_only_ssh(
     let _ = status_stream.shutdown(Shutdown::Write);
 }
 
-fn validate_read_only_ssh_args(args: &[String]) -> bool {
+#[derive(Clone, Debug)]
+struct RepositorySshCommandPolicy {
+    host: String,
+    username: Option<String>,
+    port: Option<u16>,
+    repository_path: String,
+    access: workspace_api::RepositoryAccessMode,
+}
+
+impl RepositorySshCommandPolicy {
+    fn from_access(
+        access: &RepositorySshMaterializationAccess,
+    ) -> Result<Self, WorkingDirectoryDiagnostic> {
+        let uri = url::Url::parse(&access.repository_uri).map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_access_binding_mismatch",
+                "Repository SSH access URI is invalid",
+            )
+        })?;
+        if uri.scheme() != "ssh"
+            || uri.password().is_some()
+            || uri.query().is_some()
+            || uri.fragment().is_some()
+        {
+            return Err(WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_access_binding_mismatch",
+                "Repository SSH access URI is not an authorized SSH endpoint",
+            ));
+        }
+        let host = uri
+            .host_str()
+            .filter(|host| !host.is_empty())
+            .ok_or_else(|| {
+                WorkingDirectoryDiagnostic::new(
+                    "working_directory_repository_access_binding_mismatch",
+                    "Repository SSH access host is missing",
+                )
+            })?;
+        let username = (!uri.username().is_empty()).then(|| uri.username().to_string());
+        if username
+            .as_deref()
+            .is_some_and(|username| !is_safe_ssh_destination(username))
+            || uri.path().is_empty()
+            || !is_safe_repository_path(uri.path())
+        {
+            return Err(WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_access_binding_mismatch",
+                "Repository SSH access endpoint or path is invalid",
+            ));
+        }
+        Ok(Self {
+            host: host.to_string(),
+            username,
+            port: uri.port(),
+            repository_path: uri.path().to_string(),
+            access: access.access,
+        })
+    }
+
+    fn destination_matches(&self, destination: &str, login: Option<&str>) -> bool {
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        match self.username.as_deref() {
+            Some(username) => {
+                (login.is_none() && destination == format!("{username}@{host}"))
+                    || (login == Some(username) && destination == host)
+            }
+            None => login.is_none() && destination == host,
+        }
+    }
+}
+
+fn validate_repository_ssh_args(args: &[String], policy: &RepositorySshCommandPolicy) -> bool {
     let mut index = 0;
     let mut probe = false;
+    let mut port = None;
+    let mut login = None;
     let mut positional = Vec::new();
     while index < args.len() {
         match args[index].as_str() {
             "-G" => probe = true,
             "-4" | "-6" | "-v" | "-vv" | "-vvv" => {}
             "-p" => {
-                index += 1;
-                if index >= args.len()
-                    || args[index].is_empty()
-                    || !args[index].bytes().all(|byte| byte.is_ascii_digit())
-                {
+                if port.is_some() {
                     return false;
                 }
+                index += 1;
+                let Some(value) = args.get(index).and_then(|value| value.parse::<u16>().ok())
+                else {
+                    return false;
+                };
+                port = Some(value);
             }
             "-l" => {
-                index += 1;
-                if index >= args.len() || !is_safe_ssh_destination(&args[index]) {
+                if login.is_some() {
                     return false;
                 }
+                index += 1;
+                let Some(value) = args
+                    .get(index)
+                    .filter(|value| is_safe_ssh_destination(value))
+                else {
+                    return false;
+                };
+                login = Some(value.as_str());
             }
             "-o" => {
                 index += 1;
@@ -1519,12 +1615,16 @@ fn validate_read_only_ssh_args(args: &[String]) -> bool {
         }
         index += 1;
     }
+    if port != policy.port
+        || positional.is_empty()
+        || !policy.destination_matches(positional[0], login)
+    {
+        return false;
+    }
     if probe {
-        positional.len() == 1 && is_safe_ssh_destination(positional[0])
+        positional.len() == 1
     } else {
-        positional.len() == 2
-            && is_safe_ssh_destination(positional[0])
-            && is_safe_read_only_git_command(positional[1])
+        positional.len() == 2 && repository_command_matches(positional[1], policy)
     }
 }
 
@@ -1548,31 +1648,43 @@ fn is_safe_ssh_destination(value: &str) -> bool {
         })
 }
 
-fn is_safe_read_only_git_command(command: &str) -> bool {
-    let Some(argument) = command
-        .strip_prefix("git-upload-pack ")
-        .or_else(|| command.strip_prefix("git-upload-archive "))
-    else {
-        return false;
-    };
-    let argument = argument
-        .strip_prefix('\'')
-        .and_then(|argument| argument.strip_suffix('\''))
-        .unwrap_or(argument);
-    !argument.is_empty()
-        && argument.bytes().all(|byte| {
+fn is_safe_repository_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.bytes().all(|byte| {
             byte.is_ascii_alphanumeric()
                 || matches!(
                     byte,
-                    b'/' | b'.' | b'-' | b'_' | b'@' | b':' | b'+' | b'~' | b' '
+                    b'/' | b'.' | b'-' | b'_' | b'@' | b':' | b'+' | b'~' | b' ' | b'%'
                 )
         })
 }
 
-pub fn run_repository_read_only_ssh_client(arguments: &[String]) -> Result<i32, String> {
+fn repository_command_matches(command: &str, policy: &RepositorySshCommandPolicy) -> bool {
+    let (operation, argument) = if let Some(argument) = command.strip_prefix("git-upload-pack ") {
+        ("upload-pack", argument)
+    } else if let Some(argument) = command.strip_prefix("git-upload-archive ") {
+        ("upload-archive", argument)
+    } else if let Some(argument) = command.strip_prefix("git-receive-pack ") {
+        ("receive-pack", argument)
+    } else {
+        return false;
+    };
+    if operation == "receive-pack"
+        && policy.access != workspace_api::RepositoryAccessMode::ReadWrite
+    {
+        return false;
+    }
+    let argument = argument
+        .strip_prefix('\'')
+        .and_then(|argument| argument.strip_suffix('\''))
+        .unwrap_or(argument);
+    is_safe_repository_path(argument) && argument == policy.repository_path
+}
+
+pub fn run_repository_ssh_client(arguments: &[String]) -> Result<i32, String> {
     let (socket, ssh_args) = arguments
         .split_first()
-        .ok_or_else(|| "read-only Repository SSH broker socket is missing".to_string())?;
+        .ok_or_else(|| "Repository SSH broker socket is missing".to_string())?;
     let request_id = format!(
         "{}-{}",
         std::process::id(),
@@ -1600,7 +1712,7 @@ pub fn run_repository_read_only_ssh_client(arguments: &[String]) -> Result<i32, 
     )?;
     let mut input = data
         .try_clone()
-        .map_err(|_| "read-only Repository SSH broker input failed".to_string())?;
+        .map_err(|_| "Repository SSH broker input failed".to_string())?;
     let input_thread = std::thread::spawn(move || {
         let _ = std::io::copy(&mut std::io::stdin(), &mut input);
         let _ = input.shutdown(Shutdown::Write);
@@ -1609,17 +1721,17 @@ pub fn run_repository_read_only_ssh_client(arguments: &[String]) -> Result<i32, 
         let _ = std::io::copy(&mut stderr_stream, &mut std::io::stderr());
     });
     std::io::copy(&mut data, &mut std::io::stdout())
-        .map_err(|_| "read-only Repository SSH broker output failed".to_string())?;
+        .map_err(|_| "Repository SSH broker output failed".to_string())?;
     let _ = input_thread.join();
     let _ = error_thread.join();
     let mut status = String::new();
     status_stream
         .read_to_string(&mut status)
-        .map_err(|_| "read-only Repository SSH broker status failed".to_string())?;
+        .map_err(|_| "Repository SSH broker status failed".to_string())?;
     status
         .trim()
         .parse::<i32>()
-        .map_err(|_| "read-only Repository SSH broker status was invalid".to_string())
+        .map_err(|_| "Repository SSH broker status was invalid".to_string())
 }
 
 fn connect_repository_ssh_broker_channel(
@@ -1627,12 +1739,12 @@ fn connect_repository_ssh_broker_channel(
     header: &RepositorySshBrokerHeader,
 ) -> Result<UnixStream, String> {
     let mut stream = UnixStream::connect(socket)
-        .map_err(|_| "read-only Repository SSH broker is unavailable".to_string())?;
+        .map_err(|_| "Repository SSH broker is unavailable".to_string())?;
     serde_json::to_writer(&mut stream, header)
-        .map_err(|_| "read-only Repository SSH broker request failed".to_string())?;
+        .map_err(|_| "Repository SSH broker request failed".to_string())?;
     stream
         .write_all(b"\n")
-        .map_err(|_| "read-only Repository SSH broker request failed".to_string())?;
+        .map_err(|_| "Repository SSH broker request failed".to_string())?;
     Ok(stream)
 }
 
@@ -1641,7 +1753,7 @@ struct RepositoryCommandAccess {
     root: PathBuf,
     ssh_command: PathBuf,
     agent: Arc<RepositorySshAgent>,
-    read_only_broker: Option<RepositoryReadOnlySshBroker>,
+    ssh_broker: Option<RepositorySshBroker>,
 }
 
 impl RepositoryCommandAccess {
@@ -1694,46 +1806,37 @@ impl RepositoryCommandAccess {
         let ssh_command = root.join("ssh-command");
         write_owner_only(&known_hosts, ssh.known_hosts_entry.expose().as_bytes())?;
         let agent = Arc::new(RepositorySshAgent::start(runtime_root, operation_id, ssh)?);
-        let read_only_broker = if ssh.access == workspace_api::RepositoryAccessMode::ReadOnly {
-            Some(RepositoryReadOnlySshBroker::start(
-                &root,
-                Arc::clone(&agent),
-                known_hosts.clone(),
-            )?)
-        } else {
-            None
-        };
-        let script = if let Some(broker) = read_only_broker.as_ref() {
-            let executable = std::env::current_exe().map_err(|_| {
-                WorkingDirectoryDiagnostic::new(
-                    "working_directory_repository_access_setup_failed",
-                    "read-only Repository SSH broker client could not be resolved",
-                )
-            })?;
-            format!(
-                "#!/bin/sh\nexec {} __repository-read-only-ssh {} \"$@\"\n",
-                shell_quote_path(&executable)?,
-                shell_quote_path(&broker.socket)?,
+        let policy = RepositorySshCommandPolicy::from_access(ssh)?;
+        let ssh_broker = Some(RepositorySshBroker::start(
+            &root,
+            Arc::clone(&agent),
+            known_hosts.clone(),
+            policy,
+        )?);
+        let broker = ssh_broker.as_ref().expect("Repository SSH broker");
+        let executable = std::env::current_exe().map_err(|_| {
+            WorkingDirectoryDiagnostic::new(
+                "working_directory_repository_access_setup_failed",
+                "Repository SSH broker client could not be resolved",
             )
-        } else {
-            format!(
-                "#!/bin/sh\nexport SSH_AUTH_SOCK={}\nexec ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=no -o IdentityFile=/dev/null -o StrictHostKeyChecking=yes -o UserKnownHostsFile={} \"$@\"\n",
-                shell_quote_path(&agent.socket)?,
-                shell_quote_path(&known_hosts)?,
-            )
-        };
+        })?;
+        let script = format!(
+            "#!/bin/sh\nexec {} __repository-ssh {} \"$@\"\n",
+            shell_quote_path(&executable)?,
+            shell_quote_path(&broker.socket)?,
+        );
         write_owner_only(&ssh_command, script.as_bytes())?;
         set_file_owner_executable(&ssh_command)?;
         Ok(Self {
             root,
             ssh_command,
             agent,
-            read_only_broker,
+            ssh_broker,
         })
     }
 
     fn stop(&self) {
-        if let Some(broker) = self.read_only_broker.as_ref() {
+        if let Some(broker) = self.ssh_broker.as_ref() {
             broker.stop();
         }
         self.agent.stop();
@@ -2727,17 +2830,27 @@ mod tests {
         );
         let binding = materializer.bind_working_directory(&id, None).unwrap();
         let environment = binding.command_environment();
-        let socket = PathBuf::from(environment["SSH_AUTH_SOCK"].clone());
+        assert_eq!(environment["SSH_AUTH_SOCK"], "/dev/null");
         let ssh_command = PathBuf::from(environment["GIT_SSH_COMMAND"].clone());
-        assert!(socket.exists());
         assert!(ssh_command.exists());
         let ssh_policy = fs::read_to_string(&ssh_command).unwrap();
-        assert!(ssh_policy.contains("StrictHostKeyChecking=yes"));
-        assert!(ssh_policy.contains("UserKnownHostsFile="));
+        assert!(ssh_policy.contains("__repository-ssh"));
+        assert!(!ssh_policy.contains("SSH_AUTH_SOCK"));
+        assert_eq!(
+            fs::read_dir(runtime_root.path().join(".repository-agents"))
+                .map(|entries| entries.count())
+                .unwrap_or_default(),
+            1
+        );
         assert_eq!(environment["YOI_REPOSITORY_ACCESS"], "read_write");
         drop(binding);
-        assert!(!socket.exists());
         assert!(!ssh_command.exists());
+        assert_eq!(
+            fs::read_dir(runtime_root.path().join(".repository-agents"))
+                .map(|entries| entries.count())
+                .unwrap_or_default(),
+            0
+        );
         assert_eq!(
             materializer
                 .bind_working_directory(&id, None)
@@ -2762,17 +2875,22 @@ mod tests {
         );
         let rebound_environment = rebound.command_environment();
         assert_eq!(rebound_environment["YOI_REPOSITORY_ACCESS"], "read_only");
-        assert!(!rebound_environment.contains_key("SSH_AUTH_SOCK"));
+        assert_eq!(rebound_environment["SSH_AUTH_SOCK"], "/dev/null");
         let read_only_ssh = &rebound_environment["GIT_SSH_COMMAND"];
         let read_only_policy = fs::read_to_string(read_only_ssh).unwrap();
-        assert!(read_only_policy.contains("__repository-read-only-ssh"));
+        assert!(read_only_policy.contains("__repository-ssh"));
         assert!(!read_only_policy.contains("SSH_AUTH_SOCK"));
         assert!(!read_only_policy.contains(".repository-agents"));
         assert!(!read_only_policy.contains("known_hosts"));
-        assert!(!validate_read_only_ssh_args(&[
-            "example.test".to_string(),
-            "git-receive-pack 'repo.git'".to_string(),
-        ]));
+        let read_only_command_policy =
+            RepositorySshCommandPolicy::from_access(rotated.ssh.as_ref().unwrap()).unwrap();
+        assert!(!validate_repository_ssh_args(
+            &[
+                "git@example.test".to_string(),
+                "git-receive-pack '/repo.git'".to_string(),
+            ],
+            &read_only_command_policy,
+        ));
         let broker_socket = fs::read_dir(runtime_root.path().join(REPOSITORY_ACCESS_DIR))
             .unwrap()
             .filter_map(Result::ok)
@@ -2780,35 +2898,77 @@ mod tests {
             .find(|path| path.exists())
             .expect("read-only broker socket");
         assert_eq!(
-            run_repository_read_only_ssh_client(&[
+            run_repository_ssh_client(&[
                 broker_socket.to_string_lossy().to_string(),
                 "-G".to_string(),
-                "example.test".to_string(),
+                "git@example.test".to_string(),
             ])
             .unwrap(),
             0
         );
         assert_eq!(
-            run_repository_read_only_ssh_client(&[
+            run_repository_ssh_client(&[
                 broker_socket.to_string_lossy().to_string(),
-                "example.test".to_string(),
-                "git-receive-pack 'repo.git'".to_string(),
+                "git@example.test".to_string(),
+                "git-receive-pack '/repo.git'".to_string(),
             ])
             .unwrap(),
             126
         );
-        assert!(!validate_read_only_ssh_args(&[
-            "-o".to_string(),
-            "ProxyCommand=sh -c exploit".to_string(),
-            "example.test".to_string(),
-            "git-upload-pack 'repo.git'".to_string(),
-        ]));
-        assert!(validate_read_only_ssh_args(&[
-            "-o".to_string(),
-            "SendEnv=GIT_PROTOCOL".to_string(),
-            "example.test".to_string(),
-            "git-upload-pack 'repo.git'".to_string(),
-        ]));
+        assert!(!validate_repository_ssh_args(
+            &[
+                "-o".to_string(),
+                "ProxyCommand=sh -c exploit".to_string(),
+                "git@example.test".to_string(),
+                "git-upload-pack '/repo.git'".to_string(),
+            ],
+            &read_only_command_policy,
+        ));
+        assert!(validate_repository_ssh_args(
+            &[
+                "-o".to_string(),
+                "SendEnv=GIT_PROTOCOL".to_string(),
+                "git@example.test".to_string(),
+                "git-upload-pack '/repo.git'".to_string(),
+            ],
+            &read_only_command_policy,
+        ));
+        assert!(!validate_repository_ssh_args(
+            &[
+                "git@other.test".to_string(),
+                "git-upload-pack '/repo.git'".to_string(),
+            ],
+            &read_only_command_policy,
+        ));
+        let mut port_bound_access = rotated.ssh.as_ref().unwrap().clone();
+        port_bound_access.repository_uri = "ssh://git@example.test:2222/repo.git".to_string();
+        let port_bound_policy =
+            RepositorySshCommandPolicy::from_access(&port_bound_access).unwrap();
+        assert!(validate_repository_ssh_args(
+            &[
+                "-p".to_string(),
+                "2222".to_string(),
+                "git@example.test".to_string(),
+                "git-upload-pack '/repo.git'".to_string(),
+            ],
+            &port_bound_policy,
+        ));
+        assert!(!validate_repository_ssh_args(
+            &[
+                "-p".to_string(),
+                "22".to_string(),
+                "git@example.test".to_string(),
+                "git-upload-pack '/repo.git'".to_string(),
+            ],
+            &port_bound_policy,
+        ));
+        assert!(!validate_repository_ssh_args(
+            &[
+                "git@example.test".to_string(),
+                "git-upload-pack '/other.git'".to_string(),
+            ],
+            &read_only_command_policy,
+        ));
         assert_eq!(
             git_stdout(
                 rebound.root(),
@@ -2824,6 +2984,8 @@ mod tests {
         read_write.operation_id = "operation-agent-read-write".to_string();
         read_write.ssh.as_mut().unwrap().credential_revision = 3;
         read_write.ssh.as_mut().unwrap().access = workspace_api::RepositoryAccessMode::ReadWrite;
+        let read_write_command_policy =
+            RepositorySshCommandPolicy::from_access(read_write.ssh.as_ref().unwrap()).unwrap();
         materializer
             .authorize_repository_access(&WorkingDirectoryRepositoryAccessRequest {
                 working_directory_id: id.clone(),
@@ -2835,7 +2997,21 @@ mod tests {
             rebound.command_environment()["YOI_REPOSITORY_ACCESS"],
             "read_write"
         );
-        assert!(rebound.command_environment().contains_key("SSH_AUTH_SOCK"));
+        assert_eq!(rebound.command_environment()["SSH_AUTH_SOCK"], "/dev/null");
+        assert!(validate_repository_ssh_args(
+            &[
+                "git@example.test".to_string(),
+                "git-receive-pack '/repo.git'".to_string(),
+            ],
+            &read_write_command_policy,
+        ));
+        assert!(!validate_repository_ssh_args(
+            &[
+                "git@example.test".to_string(),
+                "git-receive-pack '/other.git'".to_string(),
+            ],
+            &read_write_command_policy,
+        ));
         assert!(
             git_stdout(
                 rebound.root(),

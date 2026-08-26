@@ -575,7 +575,8 @@ async fn create_working_directory(
     }
     let working_directory = state
         .runtime
-        .create_working_directory(request)
+        .create_working_directory_from_resource(request)
+        .await
         .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkingDirectoryResponse {
         working_directory,
