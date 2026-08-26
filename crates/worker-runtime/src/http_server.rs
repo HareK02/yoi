@@ -538,7 +538,8 @@ async fn authorize_working_directory_repository_access(
     }
     state
         .runtime
-        .authorize_working_directory_repository_access(request)
+        .authorize_working_directory_repository_access_from_resource(request)
+        .await
         .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpRepositoryAccessResponse {
         authorized: true,

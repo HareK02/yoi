@@ -4500,7 +4500,7 @@ mod tests {
         let handle = bundle.profile_source_archive_handle.as_ref().unwrap();
         assert!(bundle.profile_source_archive.is_none());
         let response = broker
-            .fetch_profile_source_archive(worker_runtime::resource::BackendResourceFetchRequest {
+            .fetch_resource(worker_runtime::resource::BackendResourceFetchRequest {
                 handle: handle.clone(),
                 runtime_id: runtime_id.to_string(),
                 worker_id: None,

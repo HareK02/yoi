@@ -729,6 +729,12 @@ impl RuntimeGitCacheMaterializer {
                 )
             })?;
         validate_ssh_materialization_access(&access)?;
+        validate_repository_access_binding(
+            &access,
+            &request.repository.id,
+            &request.repository.source_fingerprint,
+            Some(request.repository.source.uri.as_str()),
+        )?;
         request
             .materialization
             .as_mut()
@@ -912,6 +918,17 @@ impl WorkingDirectoryMaterializer for RuntimeGitCacheMaterializer {
                 "Workdir is not backed by an SSH Repository",
             ));
         }
+        validate_repository_access_binding(
+            ssh,
+            &binding.working_directory.evidence.repository_id,
+            binding
+                .working_directory
+                .evidence
+                .repository_source_fingerprint
+                .as_deref()
+                .unwrap_or_default(),
+            None,
+        )?;
         binding.working_directory.evidence.operation_id =
             Some(request.materialization.operation_id.clone());
         binding.working_directory.evidence.credential_revision = Some(ssh.credential_revision);
@@ -1730,6 +1747,24 @@ impl Drop for RepositoryCommandAccess {
     }
 }
 
+fn validate_repository_access_binding(
+    access: &RepositorySshMaterializationAccess,
+    repository_id: &str,
+    repository_source_fingerprint: &str,
+    repository_uri: Option<&str>,
+) -> Result<(), WorkingDirectoryDiagnostic> {
+    if access.repository_id != repository_id
+        || access.repository_source_fingerprint != repository_source_fingerprint
+        || repository_uri.is_some_and(|repository_uri| access.repository_uri != repository_uri)
+    {
+        return Err(WorkingDirectoryDiagnostic::new(
+            "working_directory_repository_access_binding_mismatch",
+            "Repository SSH access authority does not match the requested Repository source",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_ssh_materialization_access(
     access: &RepositorySshMaterializationAccess,
 ) -> Result<(), WorkingDirectoryDiagnostic> {
@@ -2286,6 +2321,28 @@ mod tests {
     use crate::catalog::{RepositorySelector, WorkingDirectoryRepository};
     use crate::identity::{WorkerId, WorkerRef};
 
+    fn repository_resource_handle() -> crate::resource::BackendResourceHandle {
+        crate::resource::BackendResourceHandle {
+            kind: crate::resource::BackendResourceKind::RepositorySshAccess,
+            workspace_id: "workspace-1".to_string(),
+            scope_id: Some("repository-ssh-access".to_string()),
+            runtime_id: Some("runtime-1".to_string()),
+            worker_id: None,
+            resource_id: "repository-access-1".to_string(),
+            digest: "opaque:repository-access-1".to_string(),
+            operation: crate::resource::BackendResourceOperation::FetchOnce,
+            expires_at_unix_seconds: i64::MAX,
+            nonce: "repository-access-1".to_string(),
+            revision: "1".to_string(),
+            generation: None,
+            max_bytes: crate::resource::DEFAULT_REPOSITORY_SSH_ACCESS_MAX_BYTES,
+            content_type: crate::resource::REPOSITORY_SSH_ACCESS_CONTENT_TYPE.to_string(),
+            redaction: crate::resource::ResourceRedactionPolicy::RuntimeInternalOnly,
+            audit_correlation_id: "repository-access-1".to_string(),
+            profile_source_graph: None,
+        }
+    }
+
     fn git(path: &Path, args: &[&str]) {
         let status = Command::new("git")
             .arg("-C")
@@ -2523,6 +2580,10 @@ mod tests {
             host_trust_revision: 4,
             access: workspace_api::RepositoryAccessMode::ReadOnly,
             expires_at_epoch_seconds: u64::MAX,
+            repository_id: "repo-main".to_string(),
+            repository_source_fingerprint: "sha256:test".to_string(),
+            repository_uri: "ssh://git@example.test/repo.git".to_string(),
+            secret_resource: repository_resource_handle(),
             private_key: crate::catalog::SensitiveString::new("PRIVATE KEY secret bytes"),
             known_hosts_entry: crate::catalog::SensitiveString::new("host key secret bytes"),
         };
@@ -2560,6 +2621,10 @@ mod tests {
                 host_trust_revision: 1,
                 access: workspace_api::RepositoryAccessMode::ReadWrite,
                 expires_at_epoch_seconds: u64::MAX,
+                repository_id: "repo-main".to_string(),
+                repository_source_fingerprint: "sha256:test".to_string(),
+                repository_uri: "ssh://git@example.test/repo.git".to_string(),
+                secret_resource: repository_resource_handle(),
                 private_key: crate::catalog::SensitiveString::new(
                     fs::read_to_string(&key_path).unwrap(),
                 ),
@@ -2608,6 +2673,31 @@ mod tests {
                 .unwrap()
                 .ssh
                 .is_some()
+        );
+        let mut mismatched_source_request = authorized_ssh_request.clone();
+        mismatched_source_request.repository.source.uri =
+            "ssh://git@example.test/other.git".to_string();
+        assert_eq!(
+            materializer
+                .request_with_authorized_repository_access(
+                    &working_directory_id,
+                    &mismatched_source_request,
+                )
+                .unwrap_err()
+                .code,
+            "working_directory_repository_access_binding_mismatch"
+        );
+        let mut mismatched_repository_request = authorized_ssh_request.clone();
+        mismatched_repository_request.repository.id = "repo-other".to_string();
+        assert_eq!(
+            materializer
+                .request_with_authorized_repository_access(
+                    &working_directory_id,
+                    &mismatched_repository_request,
+                )
+                .unwrap_err()
+                .code,
+            "working_directory_repository_access_binding_mismatch"
         );
         let created = materializer.create(&request).unwrap();
         let id = created.working_directory.id;
@@ -2794,6 +2884,10 @@ mod tests {
                 host_trust_revision: 1,
                 access: workspace_api::RepositoryAccessMode::ReadOnly,
                 expires_at_epoch_seconds: u64::MAX,
+                repository_id: "repo-main".to_string(),
+                repository_source_fingerprint: "sha256:test".to_string(),
+                repository_uri: "ssh://git@example.test/repo.git".to_string(),
+                secret_resource: repository_resource_handle(),
                 private_key: crate::catalog::SensitiveString::new("PRIVATE KEY placeholder"),
                 known_hosts_entry: crate::catalog::SensitiveString::new(
                     "example.test ssh-ed25519 placeholder",
@@ -2884,6 +2978,10 @@ mod tests {
                 host_trust_revision: 1,
                 access: workspace_api::RepositoryAccessMode::ReadOnly,
                 expires_at_epoch_seconds: u64::MAX,
+                repository_id: "repo-main".to_string(),
+                repository_source_fingerprint: "sha256:test".to_string(),
+                repository_uri: "ssh://git@example.test/repo.git".to_string(),
+                secret_resource: repository_resource_handle(),
                 private_key: crate::catalog::SensitiveString::new("PRIVATE KEY placeholder"),
                 known_hosts_entry: crate::catalog::SensitiveString::new(
                     "other.test ssh-ed25519 placeholder",

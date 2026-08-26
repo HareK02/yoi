@@ -182,6 +182,9 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
             factory = factory.with_remote_worker_mutation_identity(identity);
         }
     }
+    let mut backend_resource_client: Option<
+        Arc<dyn worker_runtime::resource::BackendResourceClient>,
+    > = None;
     if let Some(endpoint) = config.backend_resource_endpoint.clone() {
         let identity = runtime_auth.identity.as_ref().ok_or_else(|| {
             ProcessError::Auth(
@@ -194,13 +197,15 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
                     .to_owned(),
             ));
         };
-        factory = factory.with_resource_client(Arc::new(
+        let client = Arc::new(
             worker_runtime::resource::HttpBackendResourceClient::new(
                 endpoint,
                 config.backend_resource_token.clone(),
             )
             .with_runtime_request_source(identity, trusted_server.server_id.clone()),
-        ));
+        );
+        factory = factory.with_resource_client(client.clone());
+        backend_resource_client = Some(client);
     }
     let backend = Arc::new(
         WorkerRuntimeExecutionBackend::new(factory)
@@ -210,10 +215,10 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
             )),
     );
 
-    match &config.http.store {
+    let runtime = match &config.http.store {
         RuntimeHttpStoreSelection::Memory => {
             Runtime::with_execution_backend(runtime_options_from_http(&config.http), backend)
-                .map_err(ProcessError::Runtime)
+                .map_err(ProcessError::Runtime)?
         }
         RuntimeHttpStoreSelection::Fs { root } => {
             let mut options = FsRuntimeStoreOptions::new(root.clone()).with_runtime_id(
@@ -226,12 +231,20 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
             );
             options.display_name = config.http.display_name.clone();
             Runtime::with_fs_store_and_execution_backend(options, backend)
-                .map_err(ProcessError::Runtime)
+                .map_err(ProcessError::Runtime)?
         }
-        _ => Err(ProcessError::usage(
-            "unsupported Runtime catalog store selection".to_string(),
-        )),
+        _ => {
+            return Err(ProcessError::usage(
+                "unsupported Runtime catalog store selection".to_string(),
+            ));
+        }
+    };
+    if let Some(client) = backend_resource_client {
+        runtime
+            .install_backend_resource_client(client)
+            .map_err(ProcessError::Runtime)?;
     }
+    Ok(runtime)
 }
 
 fn runtime_options_from_http(config: &RuntimeHttpServerConfig) -> RuntimeOptions {

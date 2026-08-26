@@ -11504,7 +11504,7 @@ async fn scoped_post_internal_runtime_resource_fetch(
         ));
     }
     api.resource_broker
-        .fetch_profile_source_archive(request)
+        .fetch_resource(request)
         .map(Json)
         .map_err(|error| (backend_resource_error_status(&error), Json(error)))
 }
@@ -14122,6 +14122,29 @@ fn authorize_repository_materialization_operation(
                     ));
                 }
             };
+            let expires_at_epoch_seconds = repository_access_expiry();
+            let secret_resource = api
+                .resource_broker
+                .issue_repository_ssh_access_handle(
+                    &api.config.workspace_id,
+                    &operation.resolved_runtime_id,
+                    format!("repository-ssh-access:{}", operation.operation_id),
+                    format!(
+                        "credential:{}:host-trust:{}",
+                        lease.credential_revision, lease.host_trust_revision
+                    ),
+                    i64::try_from(expires_at_epoch_seconds).unwrap_or(i64::MAX),
+                    worker_runtime::resource::RepositorySshAccessSecret {
+                        private_key: lease.private_key.as_str().to_string(),
+                        known_hosts_entry: lease.known_hosts_entry.clone(),
+                    },
+                )
+                .map_err(|_| {
+                    settings_bad_request(
+                        "working_directory_repository_access_resource_failed",
+                        "Repository SSH access resource could not be issued",
+                    )
+                })?;
             RepositoryMaterializationContext {
                 workspace_id: api.config.workspace_id.clone(),
                 runtime_id: operation.resolved_runtime_id.clone(),
@@ -14135,9 +14158,13 @@ fn authorize_repository_materialization_operation(
                     host_trust_id: lease.host_trust_id,
                     host_trust_revision: lease.host_trust_revision,
                     access,
-                    expires_at_epoch_seconds: repository_access_expiry(),
-                    private_key: SensitiveString::new(lease.private_key.as_str()),
-                    known_hosts_entry: SensitiveString::new(lease.known_hosts_entry),
+                    expires_at_epoch_seconds,
+                    repository_id: request.repository.id.clone(),
+                    repository_source_fingerprint: request.repository.source_fingerprint.clone(),
+                    repository_uri: request.repository.source.uri.clone(),
+                    secret_resource,
+                    private_key: SensitiveString::default(),
+                    known_hosts_entry: SensitiveString::default(),
                 }),
             }
         } else {
@@ -14230,15 +14257,42 @@ fn authorize_repository_materialization(
         let lease = api
             .repository_secrets
             .lease_ssh_materialization_access(&api.config.workspace_id, binding)?;
+        let expires_at_epoch_seconds = repository_access_expiry();
+        let secret_resource = api
+            .resource_broker
+            .issue_repository_ssh_access_handle(
+                &api.config.workspace_id,
+                runtime_id,
+                format!("repository-ssh-access:{operation_id}"),
+                format!(
+                    "credential:{}:host-trust:{}",
+                    lease.credential_revision, lease.host_trust_revision
+                ),
+                i64::try_from(expires_at_epoch_seconds).unwrap_or(i64::MAX),
+                worker_runtime::resource::RepositorySshAccessSecret {
+                    private_key: lease.private_key.as_str().to_string(),
+                    known_hosts_entry: lease.known_hosts_entry.clone(),
+                },
+            )
+            .map_err(|_| {
+                settings_bad_request(
+                    "working_directory_repository_access_resource_failed",
+                    "Repository SSH access resource could not be issued",
+                )
+            })?;
         Some(RepositorySshMaterializationAccess {
             credential_id: lease.credential_id,
             credential_revision: lease.credential_revision,
             host_trust_id: lease.host_trust_id,
             host_trust_revision: lease.host_trust_revision,
             access: binding.access,
-            expires_at_epoch_seconds: repository_access_expiry(),
-            private_key: SensitiveString::new(lease.private_key.as_str()),
-            known_hosts_entry: SensitiveString::new(lease.known_hosts_entry),
+            expires_at_epoch_seconds,
+            repository_id: request.repository.id.clone(),
+            repository_source_fingerprint: request.repository.source_fingerprint.clone(),
+            repository_uri: request.repository.source.uri.clone(),
+            secret_resource,
+            private_key: SensitiveString::default(),
+            known_hosts_entry: SensitiveString::default(),
         })
     } else {
         None
@@ -15423,6 +15477,20 @@ mod tests {
         );
 
         let mut repository_access_launch = workdir_flow_launch;
+        let secret_resource = api
+            .resource_broker
+            .issue_repository_ssh_access_handle(
+                &api.config.workspace_id,
+                "runtime-1",
+                "repository-access-test",
+                "1",
+                i64::MAX,
+                worker_runtime::resource::RepositorySshAccessSecret {
+                    private_key: "private-key-bytes".to_string(),
+                    known_hosts_entry: "known-hosts-entry".to_string(),
+                },
+            )
+            .unwrap();
         let working_directory = repository_access_launch
             .resolved_working_directory_request
             .as_mut()
@@ -15444,12 +15512,15 @@ mod tests {
                         host_trust_revision: 1,
                         access: workspace_api::RepositoryAccessMode::ReadOnly,
                         expires_at_epoch_seconds: u64::MAX,
-                        private_key: worker_runtime::catalog::SensitiveString::new(
-                            "private-key-bytes",
-                        ),
-                        known_hosts_entry: worker_runtime::catalog::SensitiveString::new(
-                            "known-hosts-entry",
-                        ),
+                        repository_id: working_directory.repository.id.clone(),
+                        repository_source_fingerprint: working_directory
+                            .repository
+                            .source_fingerprint
+                            .clone(),
+                        repository_uri: working_directory.repository.source.uri.clone(),
+                        secret_resource,
+                        private_key: worker_runtime::catalog::SensitiveString::default(),
+                        known_hosts_entry: worker_runtime::catalog::SensitiveString::default(),
                     },
                 ),
             });
@@ -15460,6 +15531,11 @@ mod tests {
 
         assert_eq!(access.working_directory_id, "working-directory-1");
         assert!(access.materialization.ssh.is_some());
+        let serialized_access = serde_json::to_string(&access).unwrap();
+        assert!(!serialized_access.contains("private-key-bytes"));
+        assert!(!serialized_access.contains("known-hosts-entry"));
+        assert!(!serialized_access.contains("private_key"));
+        assert!(!serialized_access.contains("known_hosts_entry"));
         assert!(
             repository_access_launch
                 .resolved_working_directory_request

@@ -116,6 +116,12 @@ impl Drop for SensitiveString {
     }
 }
 
+impl Default for SensitiveString {
+    fn default() -> Self {
+        Self(String::new())
+    }
+}
+
 impl std::fmt::Debug for SensitiveString {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("[REDACTED]")
@@ -130,7 +136,13 @@ pub struct RepositorySshMaterializationAccess {
     pub host_trust_revision: u64,
     pub access: workspace_api::RepositoryAccessMode,
     pub expires_at_epoch_seconds: u64,
+    pub repository_id: String,
+    pub repository_source_fingerprint: String,
+    pub repository_uri: String,
+    pub secret_resource: crate::resource::BackendResourceHandle,
+    #[serde(skip, default)]
     pub private_key: SensitiveString,
+    #[serde(skip, default)]
     pub known_hosts_entry: SensitiveString,
 }
 
