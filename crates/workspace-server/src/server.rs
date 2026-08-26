@@ -4275,9 +4275,9 @@ async fn scoped_queue_ticket(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRecordPath>,
     Json(_request): Json<BrowserQueueTicketRequest>,
-) -> ApiResult<Json<TicketDetail>> {
+) -> ApiResult<Json<ticket::TicketQueueOutcome>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let _ = execute_ticket_rest_operation(
+    let result = execute_ticket_rest_operation(
         &api,
         &path.workspace_id,
         HeaderMap::new(),
@@ -4287,8 +4287,10 @@ async fn scoped_queue_ticket(
         },
     )
     .await?;
-    let Json(ticket) = browser_ticket_detail(&api, &path.id)?;
-    Ok(Json(ticket))
+    ticket_rest_result(result, |result| match result {
+        TicketBackendOperationResult::QueueOutcome(outcome) => Some(outcome),
+        _ => None,
+    })
 }
 
 async fn scoped_close_ticket(
@@ -18937,13 +18939,20 @@ mod tests {
         assert_eq!(ready_detail.relations.blockers.len(), 1);
         assert_eq!(ready_detail.relations.blockers[0].reason_kind, "depends_on");
 
-        let Json(queued) = scoped_queue_ticket(
+        let Json(queue_outcome) = scoped_queue_ticket(
             State(api.clone()),
             AxumPath(path()),
             Json(BrowserQueueTicketRequest {}),
         )
         .await
         .unwrap();
+        assert_eq!(queue_outcome.requested_ticket, ticket_id);
+        assert_eq!(queue_outcome.queued_tickets.len(), 2);
+        assert!(queue_outcome.queued_tickets.contains(&related_ticket_id));
+        assert!(queue_outcome.queued_tickets.contains(&ticket_id));
+        let Json(queued) = scoped_get_ticket(State(api.clone()), AxumPath(path()))
+            .await
+            .unwrap();
         assert_eq!(queued.state, "queued");
         assert_eq!(queued.queued_by.as_deref(), Some("workspace-web"));
         assert_eq!(queued.relations.blockers.len(), 1);
