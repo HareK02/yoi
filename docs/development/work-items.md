@@ -37,9 +37,9 @@ Workers with the Ticket and operation-specific Merge Request built-in features c
 - `QueryTicket` — bounded authoritative Ticket discovery with typed state/text/event/evidence/relation/Objective/time/attention filters, stable snippets, and cursor metadata.
 - `ShowTicket` — detailed authority for one Ticket, including item revision, bounded thread/event references, relations, linked Objectives, implementation reports, and current Merge Request/review evidence.
 - `TicketComment`
-- Coder: `MergeRequestShow`, `MergeRequestOpen`
-- Reviewer: `MergeRequestShow`, `MergeRequestReview` — available only inside the attested direct-child Reviewer request; grant and subject-ref capability material are not model input.
-- Orchestrator: `MergeRequestShow`, `MergeRequestReadinessCheck`, `MergeRequestComplete`
+- Coder: `ShowMergeRequest`, `OpenMergeRequest`
+- Reviewer: `ShowMergeRequest`, `ReviewMergeRequest` — available only inside the attested direct-child Reviewer request; grant and subject-ref capability material are not model input.
+- Orchestrator: `ShowMergeRequest`, `CheckMergeRequestReadiness`, `CompleteMergeRequest`
 - `TicketClose`
 - `TicketRelationRecord`
 
@@ -244,7 +244,7 @@ Implementation normally happens in a child git worktree created by the Orchestra
 
 The assigned Coder launches the Reviewer as an actual direct-child `builtin:reviewer` SubWorker with write scope, so it can use the Workdir command tools required for inspection and validation, and a structured handoff bound to the current immutable Merge Request revision. Server authority revalidates the parent assignment, Runtime-owned child session, effective profile, one-shot review attempt, and revision; prose output is not approval.
 
-The Reviewer records the structured result with `MergeRequestReview`. Request changes requires a new immutable revision and a fresh child attempt. The Orchestrator uses `MergeRequestReadinessCheck` and then `MergeRequestComplete` for guarded integration with operation-id dedupe/CAS semantics; Flow transitions are not completion authority.
+The Reviewer records the structured result with `ReviewMergeRequest`. Request changes advances the existing Merge Request source selector with a normal non-force push and requires a fresh child attempt for that exact new source ref; do not create a replacement Merge Request, add-revision operation, or fresh integration branch. Target-only movement preserves approval for an unchanged source and requires refreshed integration evidence. The Orchestrator uses `CheckMergeRequestReadiness` and then `CompleteMergeRequest` for guarded integration with operation-id dedupe/CAS semantics; Flow transitions are not completion authority.
 
 Blockers must be fixed or explicitly escalated before merge-ready submission.
 

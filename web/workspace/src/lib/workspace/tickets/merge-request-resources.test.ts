@@ -31,6 +31,12 @@ const detailLoader = await Deno.readTextFile(
     import.meta.url,
   ),
 );
+const detailPage = await Deno.readTextFile(
+  new URL(
+    "../../../routes/w/[workspaceId]/merge-requests/[mergeRequestId]/+page.svelte",
+    import.meta.url,
+  ),
+);
 const sidebar = await Deno.readTextFile(
   new URL("../sidebar/WorkspaceSidebar.svelte", import.meta.url),
 );
@@ -62,5 +68,31 @@ Deno.test("Workspace exposes Merge Request collection and detail pages", () => {
   assert(
     sidebar.includes("MergeRequestsNavSection"),
     "MR resources are absent from navigation",
+  );
+});
+
+Deno.test("Merge Request UI separates source review freshness from target integration", () => {
+  for (const source of [detailPage, ticketPage]) {
+    assert(
+      source.includes("Fresh source review required"),
+      "missing source-review freshness diagnostic",
+    );
+    assert(
+      source.includes("Target integration"),
+      "missing target-integration status",
+    );
+    assert(
+      source.includes("Target-only movement") &&
+        source.includes("does not invalidate approval for an unchanged source"),
+      "source review and target integration semantics are conflated",
+    );
+  }
+  assert(
+    detailPage.includes("selector_from moved from"),
+    "source ref mismatch is not explained",
+  );
+  assert(
+    detailPage.includes("CompleteMergeRequest"),
+    "target integration authority is not named",
   );
 });

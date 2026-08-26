@@ -24,7 +24,7 @@ pub fn builtin_flow_source(slug: &str) -> Option<BuiltinFlowSource> {
     match slug {
         CODER_REVIEW_FLOW_SLUG => Some(BuiltinFlowSource {
             slug: CODER_REVIEW_FLOW_SLUG,
-            revision: 3,
+            revision: 4,
             path: "builtin/flows/coder-review.dcdl",
             content: CODER_REVIEW_FLOW_SOURCE,
         }),
@@ -35,7 +35,7 @@ pub fn builtin_flow_source(slug: &str) -> Option<BuiltinFlowSource> {
 pub fn builtin_flow_sources() -> &'static [BuiltinFlowSource] {
     const SOURCES: &[BuiltinFlowSource] = &[BuiltinFlowSource {
         slug: CODER_REVIEW_FLOW_SLUG,
-        revision: 3,
+        revision: 4,
         path: "builtin/flows/coder-review.dcdl",
         content: CODER_REVIEW_FLOW_SOURCE,
     }];
@@ -45,6 +45,30 @@ pub fn builtin_flow_sources() -> &'static [BuiltinFlowSource] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coder_review_flow_uses_current_selector_ref_review_contract() {
+        let source = builtin_flow_source(CODER_REVIEW_FLOW_SLUG).expect("coder review Flow");
+        for required in [
+            "OpenMergeRequest",
+            "ShowMergeRequest",
+            "ReviewMergeRequest",
+            "CompleteMergeRequest",
+            "existing Merge Request `selector_from`",
+            "Target-only movement does not invalidate",
+        ] {
+            assert!(source.content.contains(required), "missing {required}");
+        }
+        for stale in [
+            "MergeRequestOpen",
+            "MergeRequestShow",
+            "MergeRequestReview",
+            "MergeRequestComplete",
+            "new immutable revision",
+        ] {
+            assert!(!source.content.contains(stale), "stale contract {stale}");
+        }
+    }
 
     #[test]
     fn every_builtin_flow_compiles_and_matches_catalog_identity() {

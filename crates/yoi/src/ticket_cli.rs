@@ -671,7 +671,7 @@ fn state(
         StateTarget::InProgress => TicketWorkflowState::InProgress,
         StateTarget::Done => {
             return Err(TicketCliError::new(
-                "done is guarded by MergeRequestComplete with an approved immutable revision and operation_id",
+                "done is guarded by CompleteMergeRequest with an approved exact source ref and operation_id",
             ));
         }
         StateTarget::Closed => {
@@ -1366,7 +1366,7 @@ mod tests {
         let done_error = parse_ticket_args(&args(&["state", &ticket_id, "done"]))
             .and_then(|cli| run_in_workspace(cli, temp.path()))
             .unwrap_err();
-        assert!(done_error.to_string().contains("MergeRequestComplete"));
+        assert!(done_error.to_string().contains("CompleteMergeRequest"));
 
         let closed = run(
             &temp,

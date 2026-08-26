@@ -416,7 +416,7 @@ impl MergeRequestStore {
         let conflict:bool=t.query_row("SELECT EXISTS(SELECT 1 FROM merge_request_ticket_relations rel JOIN merge_requests mr ON mr.workspace_id=rel.workspace_id AND mr.merge_request_id=rel.merge_request_id WHERE rel.workspace_id=?1 AND rel.ticket_id=?2 AND mr.state='open')",params![i.auth.workspace_id,i.ticket_id],|r|r.get(0))?;
         if conflict {
             return Err(MergeRequestError::Conflict(
-                "Ticket already has an open Merge Request".into(),
+                "Ticket already has an open Merge Request; use ShowMergeRequest and advance the existing selector_from with a normal non-force push instead of opening a replacement Merge Request or adding a revision".into(),
             ));
         }
         let now = i.now.to_rfc3339();
@@ -575,12 +575,16 @@ impl MergeRequestStore {
             ));
         };
         if subject != i.current_subject_ref {
+            let reason = format!(
+                "selector_from moved from requested subject {subject} to current subject {}; fresh review of the exact current source ref is required",
+                i.current_subject_ref
+            );
             let e = ReviewCancelledEvent {
                 event_id: Uuid::now_v7().to_string(),
                 sequence: next_seq(&t, &ws, &mr)?,
                 request_event_id: req,
                 subject_ref: subject,
-                reason: "selector_from moved before submission".into(),
+                reason,
                 created_at: i.now,
             };
             insert_event(&t, &ws, &mr, "review_cancelled", &e, i.now, None)?;
@@ -667,9 +671,27 @@ impl MergeRequestStore {
         }
         match (&i.current_subject_ref, &review) {
             (None, _) => b.push("selector_from could not be resolved".into()),
-            (Some(_), None) => b.push("current source ref has no valid review".into()),
-            (_, Some(r)) if r.decision == ReviewDecision::RequestChanges => {
-                b.push("current source ref requests changes".into())
+            (Some(subject_ref), None) => {
+                let previous_review_subject = mr.thread.iter().rev().find_map(|event| match event {
+                    MergeRequestThreadEvent::ReviewRequested(value) => {
+                        Some(value.subject_ref.as_str())
+                    }
+                    MergeRequestThreadEvent::Review(value) => Some(value.subject_ref.as_str()),
+                    _ => None,
+                });
+                match previous_review_subject.filter(|previous| *previous != subject_ref) {
+                    Some(previous) => b.push(format!(
+                        "selector_from moved from reviewed/requested subject {previous} to current subject {subject_ref}; request a fresh review for this exact source ref (selector_to movement alone does not invalidate source approval)"
+                    )),
+                    None => b.push(format!(
+                        "current source ref {subject_ref} has no valid review; request a fresh review for this exact source ref"
+                    )),
+                }
+            }
+            (Some(subject_ref), Some(r)) if r.decision == ReviewDecision::RequestChanges => {
+                b.push(format!(
+                    "current source ref {subject_ref} requests changes; advance the existing selector_from with a normal non-force push, then request a fresh review for the exact new source ref"
+                ))
             }
             _ => {}
         }

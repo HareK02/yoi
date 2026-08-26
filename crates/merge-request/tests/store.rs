@@ -181,16 +181,85 @@ fn source_move_cancels_submission_and_old_approval_is_reusable_when_source_retur
         .is_err()
     );
     let mr = s.get("W", "T").unwrap();
+    let cancellation = mr.thread.iter().find_map(|event| match event {
+        MergeRequestThreadEvent::ReviewCancelled(value) => Some(value),
+        _ => None,
+    });
     assert!(
-        mr.thread
-            .iter()
-            .any(|e| matches!(e, MergeRequestThreadEvent::ReviewCancelled(_)))
+        cancellation
+            .as_ref()
+            .is_some_and(|value| value.reason.contains("selector_from moved")
+                && value.reason.contains("fresh review"))
     );
     assert_eq!(
         mr.effective_review("source-a").map(|r| &r.event_id),
         Some(&approved.event_id)
     );
 }
+#[test]
+fn same_selector_source_advancement_requires_fresh_review_and_preserves_target_only_approval() {
+    let (_d, s) = fixture();
+    open(&s);
+    let first = approve(&s, "source-1", "one");
+
+    let stale = s
+        .readiness(ReadinessCheck {
+            ticket_id: "T".into(),
+            current_subject_ref: Some("source-2".into()),
+            auth: auth(),
+        })
+        .unwrap();
+    assert!(!stale.ready);
+    assert!(stale.review.is_none());
+    assert!(stale.blockers.iter().any(|blocker| {
+        blocker.contains("selector_from moved from reviewed/requested subject source-1")
+            && blocker.contains("current subject source-2")
+            && blocker.contains("fresh review")
+    }));
+    assert_eq!(
+        s.get("W", "T")
+            .unwrap()
+            .effective_review("source-1")
+            .map(|review| &review.event_id),
+        Some(&first.event_id)
+    );
+
+    let second = approve(&s, "source-2", "two");
+    let ready = s
+        .readiness(ReadinessCheck {
+            ticket_id: "T".into(),
+            current_subject_ref: Some("source-2".into()),
+            auth: auth(),
+        })
+        .unwrap();
+    assert!(ready.ready);
+    assert_eq!(
+        ready.review.as_ref().map(|review| &review.event_id),
+        Some(&second.event_id)
+    );
+
+    // The target can move from target-1 to target-2 without changing selector_from
+    // or invalidating the exact-source approval. Completion consumes refreshed
+    // integration evidence for the current target pair.
+    let merged = s
+        .complete(CompleteMergeRequest {
+            operation_id: "target-moved".into(),
+            ticket_id: "T".into(),
+            current_subject_ref: "source-2".into(),
+            target_ref_before: "target-2".into(),
+            target_ref_after: "integrated-target-2".into(),
+            approval_event_id: second.event_id,
+            strategy: MergeStrategy::FastForward,
+            resolution: ConflictResolution::None,
+            auth: auth(),
+            now: at(5),
+        })
+        .unwrap();
+    assert_eq!(merged.approved_source_ref, "source-2");
+    assert_eq!(merged.target_ref_before, "target-2");
+    assert_eq!(merged.target_ref_after, "integrated-target-2");
+}
+
 #[test]
 fn review_revocation_invalidates_readiness() {
     let (_d, s) = fixture();

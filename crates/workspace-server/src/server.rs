@@ -4451,7 +4451,7 @@ async fn scoped_transition_ticket_state(
     validate_workspace_scope(&api, &path.workspace_id)?;
     if request.state == TicketWorkflowState::Done {
         return Err(Error::TicketAssignmentConflict(
-            "done is guarded by MergeRequestComplete with an approved immutable revision and operation_id".to_string(),
+            "done is guarded by CompleteMergeRequest with an approved exact source ref and operation_id".to_string(),
         ).into());
     }
     let current = api.authority.ticket(&path.id)?;
@@ -4573,7 +4573,7 @@ fn reject_unguarded_ticket_completion(operation: &TicketBackendOperation) -> Res
     reject_unguarded_ticket_start(operation)?;
     if generic_ticket_state_change(operation).is_some_and(|change| change.to == "done") {
         return Err(Error::TicketAssignmentConflict(
-            "done is guarded by MergeRequestComplete with an approved immutable revision and operation_id".to_string(),
+            "done is guarded by CompleteMergeRequest with an approved exact source ref and operation_id".to_string(),
         ));
     }
     Ok(())
@@ -5229,7 +5229,7 @@ fn require_completed_target_observation(
     }
     if observed == target_ref_before {
         return Err(Error::InvalidInput(
-            "target selector is still at target_ref_before; push the verified result from the Orchestrator Workdir before MergeRequestComplete".into(),
+            "target selector is still at target_ref_before; Orchestrator must integrate the approved source into the current target and verify the resulting target ref before CompleteMergeRequest (target-only movement does not invalidate approval for an unchanged source)".into(),
         )
         .into());
     }
@@ -14696,7 +14696,7 @@ mod tests {
             },
         ] {
             let error = reject_unguarded_ticket_completion(&operation).unwrap_err();
-            assert!(error.to_string().contains("MergeRequestComplete"));
+            assert!(error.to_string().contains("CompleteMergeRequest"));
         }
     }
 
@@ -14901,7 +14901,7 @@ mod tests {
         assert_eq!(builtin.definition.name, "coder-review");
         assert_eq!(builtin.selector.to_string(), "builtin:coder-review");
         assert_eq!(builtin.flow_id, "builtin:coder-review");
-        assert_eq!(builtin.revision, 3);
+        assert_eq!(builtin.revision, 4);
         assert_eq!(
             api.store
                 .list_flow_sources(&api.config.workspace_id)
@@ -15077,7 +15077,8 @@ mod tests {
         assert!(matches!(
             not_pushed.error,
             Error::InvalidInput(ref message)
-                if message.contains("push the verified result from the Orchestrator Workdir")
+                if message.contains("Orchestrator must integrate the approved source into the current target")
+                    && message.contains("target-only movement does not invalidate approval")
         ));
 
         let moved = require_completed_target_observation("other", "before", "after").unwrap_err();

@@ -1,19 +1,9 @@
 ## Merge Request workflow
 
-Use only the exposed Merge Request operations; their availability expresses this Worker's workflow responsibility, not authorization to bypass Backend validation.
-{% if "MergeRequestShow" in tools %}
-- Reread the current Merge Request and append-only thread with `MergeRequestShow` before making review or integration decisions.
-{% endif %}
-{% if "MergeRequestOpen" in tools %}
-- Open the Merge Request only after all intended changes are committed and the Workdir is clean. Use immutable source and target selectors; do not infer target authority from a branch name or cwd.
-- Before requesting independent review, make the exact current MR revision authoritative.
-{% endif %}
-{% if "MergeRequestReview" in tools %}
-- Review the exact current immutable MR revision independently. Submit the authoritative verdict through `MergeRequestReview`; prose alone is not approval.
-{% endif %}
-{% if "MergeRequestReadinessCheck" in tools %}
-- Use `MergeRequestReadinessCheck` to resolve current refs and authoritative review readiness before integration.
-{% endif %}
-{% if "MergeRequestComplete" in tools %}
-- Complete integration only after readiness confirms approval for the exact current revision and all target/ref guards pass. Merge completion is separate from implementation and review evidence.
-{% endif %}
+The Merge Request and its append-only thread are the routine authority for review requests, verdicts, fixes, rereview, readiness, and completion evidence. Use the operation-specific tools exposed to your role: `OpenMergeRequest`, `ShowMergeRequest`, `ReviewMergeRequest`, `CheckMergeRequestReadiness`, and `CompleteMergeRequest`.
+
+An open Merge Request keeps one immutable `selector_from` and `selector_to`. Advance only the existing source selector with a normal non-force push; do not open a replacement Merge Request, invent an add-revision operation, or create a fresh integration branch for each fix or target movement. Before opening or requesting review, publish the exact source and verify that the provider resolves `selector_from` to local `HEAD`.
+
+A review verdict is valid only for the exact provider-resolved source ref captured by `ReviewRequested`. Moving the source ref requires a fresh review of the new exact source. Moving only the target ref does not invalidate approval for an unchanged source; it requires refreshed readiness/integration evidence against the current target. Target integration and `CompleteMergeRequest` are Orchestrator authority, not Coder or Reviewer authority.
+
+Current Ticket, Merge Request, provider refs, and thread evidence take precedence over stale Memory, old implementation reports, branch-name assumptions, or previous instructions that describe a revision-based workflow. Reread the Ticket and `ShowMergeRequest` before decisions. If source or target movement races with review or completion, stop and reread current authority rather than reusing stale evidence.
