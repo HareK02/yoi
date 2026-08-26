@@ -257,6 +257,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create Workspace Repository SSH secret authority",
         apply: create_repository_ssh_secret_authority,
     },
+    Migration {
+        version: 47,
+        name: "bind Workdir create repository access evidence",
+        apply: bind_workdir_create_repository_access_evidence,
+    },
 ];
 
 struct Migration {
@@ -590,6 +595,16 @@ pub struct WorkdirCreateOperationRecord {
     pub resolved_runtime_id: String,
     pub config_revision: u64,
     pub config_projection_digest: String,
+    pub source_kind: Option<String>,
+    pub source_uri: Option<String>,
+    pub source_revision: Option<u64>,
+    pub source_fingerprint: Option<String>,
+    pub credential_id: Option<String>,
+    pub credential_revision: Option<u64>,
+    pub host_trust_id: Option<String>,
+    pub host_trust_revision: Option<u64>,
+    pub repository_access_mode: Option<String>,
+    pub cache_generation: u64,
     pub working_directory_id: String,
     pub state: String,
     pub failure: Option<String>,
@@ -6812,6 +6827,25 @@ fn create_repository_ssh_secret_authority(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn bind_workdir_create_repository_access_evidence(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        ALTER TABLE workdir_create_operations ADD COLUMN source_kind TEXT;
+        ALTER TABLE workdir_create_operations ADD COLUMN source_uri TEXT;
+        ALTER TABLE workdir_create_operations ADD COLUMN source_revision INTEGER;
+        ALTER TABLE workdir_create_operations ADD COLUMN source_fingerprint TEXT;
+        ALTER TABLE workdir_create_operations ADD COLUMN credential_id TEXT;
+        ALTER TABLE workdir_create_operations ADD COLUMN credential_revision INTEGER;
+        ALTER TABLE workdir_create_operations ADD COLUMN host_trust_id TEXT;
+        ALTER TABLE workdir_create_operations ADD COLUMN host_trust_revision INTEGER;
+        ALTER TABLE workdir_create_operations ADD COLUMN repository_access_mode TEXT;
+        ALTER TABLE workdir_create_operations
+            ADD COLUMN cache_generation INTEGER NOT NULL DEFAULT 0;
+        "#,
+    )?;
+    Ok(())
+}
+
 fn create_workspace_catalog_operations(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -9697,7 +9731,7 @@ mod tests {
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 46);
+        assert_eq!(current_schema_version(&conn).unwrap(), 47);
         let remote = conn
             .query_row(
                 "SELECT source_kind, source_uri, source_revision, source_fingerprint, observed_status \
@@ -9775,7 +9809,7 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
         assert_eq!(plan.current_schema_version, 36);
-        assert_eq!(plan.target_schema_version, 46);
+        assert_eq!(plan.target_schema_version, 47);
         assert!(plan.migration_required);
         assert_eq!(plan.worker_count, 1);
         assert_eq!(plan.mappings[0].legacy_worker_id, 7);
@@ -9789,7 +9823,7 @@ mod tests {
         store
             .with_conn(|conn| {
                 assert!(table_exists(conn, "worker_diagnostics_archives")?);
-                assert_eq!(current_schema_version(conn)?, 46);
+                assert_eq!(current_schema_version(conn)?, 47);
                 Ok(())
             })
             .unwrap();
@@ -9925,7 +9959,7 @@ mod tests {
                 ),
             ]
         );
-        assert_eq!(current_schema_version(&conn).unwrap(), 46);
+        assert_eq!(current_schema_version(&conn).unwrap(), 47);
         let foreign_key_error: Option<String> = conn
             .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
             .optional()
@@ -10054,7 +10088,7 @@ INSERT INTO worker_orphan_diagnostics (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 46);
+        assert_eq!(current_schema_version(&conn).unwrap(), 47);
         assert!(!table_exists(&conn, "worker_control_delegation_operations").unwrap());
         let controller_worker_id: String = conn
             .query_row(
@@ -10172,7 +10206,7 @@ INSERT INTO worker_orphan_diagnostics (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 46);
+        assert_eq!(current_schema_version(&conn).unwrap(), 47);
         assert!(table_exists(&conn, "worker_workdir_attachment_reservations").unwrap());
     }
 
@@ -10190,7 +10224,7 @@ INSERT INTO worker_orphan_diagnostics (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 46);
+        assert_eq!(current_schema_version(&conn).unwrap(), 47);
         let settings = conn
             .query_row(
                 "SELECT settings_revision, language FROM workspace_memory_settings \
@@ -10231,7 +10265,7 @@ CREATE TABLE flow_events (event_id TEXT PRIMARY KEY);
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 46);
+        assert_eq!(current_schema_version(&conn).unwrap(), 47);
         assert!(table_exists(&conn, "flow_sources").unwrap());
         assert!(table_exists(&conn, "flow_source_revisions").unwrap());
         assert!(!table_exists(&conn, "flow_instances").unwrap());
@@ -10298,7 +10332,7 @@ INSERT INTO worker_workdir_attachment_reservations (
 
         apply_migrations(&conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 46);
+        assert_eq!(current_schema_version(&conn).unwrap(), 47);
         let repositories_sql: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'repositories'",
@@ -10481,7 +10515,7 @@ INSERT INTO workdir_registry (
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 46);
+        assert_eq!(store.schema_version().await.unwrap(), 47);
         assert!(
             !store
                 .with_conn(|conn| table_exists(conn, "worker_workspace_credentials"))
@@ -10498,7 +10532,7 @@ INSERT INTO workdir_registry (
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 46);
+        assert_eq!(reopened.schema_version().await.unwrap(), 47);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -11252,7 +11286,7 @@ INSERT INTO worker_registry (
         let migrated = SqliteWorkspaceStore::open(&db_path).unwrap();
         migrated
             .with_conn(|conn| {
-                assert_eq!(current_schema_version(conn)?, 46);
+                assert_eq!(current_schema_version(conn)?, 47);
                 assert_eq!(
                     conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))?,
                     1,
@@ -11609,13 +11643,13 @@ INSERT INTO worker_registry (
              DROP TABLE repository_ssh_host_trust_revisions;
              DROP TABLE repository_ssh_host_trusts;
              DROP TABLE workdir_create_operations;
-             DELETE FROM __yoi_schema_migrations WHERE version IN (45, 46);",
+             DELETE FROM __yoi_schema_migrations WHERE version IN (45, 46, 47);",
         )
         .unwrap();
         assert_eq!(current_schema_version(&conn).unwrap(), 44);
 
         apply_migrations(&conn).unwrap();
-        assert_eq!(current_schema_version(&conn).unwrap(), 46);
+        assert_eq!(current_schema_version(&conn).unwrap(), 47);
         assert!(table_exists(&conn, "workdir_create_operations").unwrap());
         let columns = table_columns(&conn, "workdir_create_operations").unwrap();
         for required in [
@@ -11647,13 +11681,23 @@ INSERT INTO worker_registry (
              DROP TABLE repository_ssh_credentials;
              DROP TABLE repository_ssh_host_trust_revisions;
              DROP TABLE repository_ssh_host_trusts;
-             DELETE FROM __yoi_schema_migrations WHERE version = 46;",
+             ALTER TABLE workdir_create_operations DROP COLUMN source_kind;
+             ALTER TABLE workdir_create_operations DROP COLUMN source_uri;
+             ALTER TABLE workdir_create_operations DROP COLUMN source_revision;
+             ALTER TABLE workdir_create_operations DROP COLUMN source_fingerprint;
+             ALTER TABLE workdir_create_operations DROP COLUMN credential_id;
+             ALTER TABLE workdir_create_operations DROP COLUMN credential_revision;
+             ALTER TABLE workdir_create_operations DROP COLUMN host_trust_id;
+             ALTER TABLE workdir_create_operations DROP COLUMN host_trust_revision;
+             ALTER TABLE workdir_create_operations DROP COLUMN repository_access_mode;
+             ALTER TABLE workdir_create_operations DROP COLUMN cache_generation;
+             DELETE FROM __yoi_schema_migrations WHERE version IN (46, 47);",
         )
         .unwrap();
         assert_eq!(current_schema_version(&conn).unwrap(), 45);
 
         apply_migrations(&conn).unwrap();
-        assert_eq!(current_schema_version(&conn).unwrap(), 46);
+        assert_eq!(current_schema_version(&conn).unwrap(), 47);
         for table in [
             "repository_ssh_credentials",
             "repository_ssh_credential_revisions",
@@ -11673,18 +11717,61 @@ INSERT INTO worker_registry (
     }
 
     #[test]
+    fn schema_v47_binds_workdir_create_repository_access_evidence() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_sqlite(&conn).unwrap();
+        apply_migrations(&conn).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE workdir_create_operations DROP COLUMN source_kind;
+             ALTER TABLE workdir_create_operations DROP COLUMN source_uri;
+             ALTER TABLE workdir_create_operations DROP COLUMN source_revision;
+             ALTER TABLE workdir_create_operations DROP COLUMN source_fingerprint;
+             ALTER TABLE workdir_create_operations DROP COLUMN credential_id;
+             ALTER TABLE workdir_create_operations DROP COLUMN credential_revision;
+             ALTER TABLE workdir_create_operations DROP COLUMN host_trust_id;
+             ALTER TABLE workdir_create_operations DROP COLUMN host_trust_revision;
+             ALTER TABLE workdir_create_operations DROP COLUMN repository_access_mode;
+             ALTER TABLE workdir_create_operations DROP COLUMN cache_generation;
+             DELETE FROM __yoi_schema_migrations WHERE version = 47;",
+        )
+        .unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 46);
+
+        apply_migrations(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 47);
+        let columns = table_columns(&conn, "workdir_create_operations").unwrap();
+        for required in [
+            "source_kind",
+            "source_uri",
+            "source_revision",
+            "source_fingerprint",
+            "credential_id",
+            "credential_revision",
+            "host_trust_id",
+            "host_trust_revision",
+            "repository_access_mode",
+            "cache_generation",
+        ] {
+            assert!(
+                columns.iter().any(|column| column == required),
+                "missing column {required}"
+            );
+        }
+    }
+
+    #[test]
     fn server_refuses_a_database_from_a_newer_schema_generation() {
         let conn = Connection::open_in_memory().unwrap();
         configure_sqlite(&conn).unwrap();
         apply_migrations(&conn).unwrap();
         conn.execute(
-            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (47, 'future')",
+            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (48, 'future')",
             [],
         )
         .unwrap();
 
         let error = apply_migrations(&conn).unwrap_err().to_string();
-        assert!(error.contains("schema version 47 is newer"), "{error}");
+        assert!(error.contains("schema version 48 is newer"), "{error}");
         assert!(error.contains("refusing to serve"), "{error}");
     }
 
@@ -11905,7 +11992,7 @@ VALUES ('workspace-b', 'ticket-b', 'related', 'ticket-a', NULL, 'tester', '2026-
 
         apply_migrations(&mut conn).unwrap();
 
-        assert_eq!(current_schema_version(&conn).unwrap(), 46);
+        assert_eq!(current_schema_version(&conn).unwrap(), 47);
         let workspace_id: Option<String> = conn
             .query_row(
                 "SELECT workspace_id FROM trusted_runtime_records WHERE runtime_id = 'runtime-a'",
@@ -12528,7 +12615,7 @@ WHERE workspace_id = 'workspace-a'
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 46);
+        assert_eq!(store.schema_version().await.unwrap(), 47);
 
         store
             .with_conn(|conn| {
@@ -12717,7 +12804,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 46);
+        assert_eq!(store.schema_version().await.unwrap(), 47);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -12795,7 +12882,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn memory_authority_records_round_trip_and_close_staging() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 46);
+        assert_eq!(store.schema_version().await.unwrap(), 47);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -13202,7 +13289,7 @@ CREATE TABLE ticket_assignment_operations (
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 46);
+        assert_eq!(store.schema_version().await.unwrap(), 47);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),

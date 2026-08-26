@@ -865,33 +865,73 @@ impl RepositorySecretService {
                     binding.host_trust_id
                 ))
             })?;
-        let (private_key, passphrase) = self.store.with_conn(|conn| {
+        self.lease_ssh_materialization_access_revision(
+            workspace_id,
+            &binding.credential_id,
+            credential.current_revision,
+            &binding.host_trust_id,
+            host_trust.current_revision,
+        )
+    }
+
+    pub fn lease_ssh_materialization_access_revision(
+        &self,
+        workspace_id: &str,
+        credential_id: &str,
+        credential_revision: u64,
+        host_trust_id: &str,
+        host_trust_revision: u64,
+    ) -> Result<LeasedRepositorySshAccess> {
+        let (private_key, passphrase, hostname, port, host_key) = self.store.with_conn(|conn| {
             let private_key = read_sealed_secret(
                 conn,
                 workspace_id,
-                &binding.credential_id,
-                credential.current_revision,
+                credential_id,
+                credential_revision,
                 "private_key",
             )?
             .ok_or_else(|| {
                 Error::RegistryInconsistency(format!(
-                    "Repository SSH credential `{}` is missing its private-key revision",
-                    binding.credential_id
+                    "Repository SSH credential `{credential_id}` revision {credential_revision} is unavailable"
                 ))
             })?;
             let passphrase = read_sealed_secret(
                 conn,
                 workspace_id,
-                &binding.credential_id,
-                credential.current_revision,
+                credential_id,
+                credential_revision,
                 "passphrase",
             )?;
-            Ok((private_key, passphrase))
+            let (hostname, port, host_key) = conn
+                .query_row(
+                    r#"SELECT h.hostname, h.port, v.host_key
+                       FROM repository_ssh_host_trusts h
+                       JOIN repository_ssh_host_trust_revisions v
+                         ON v.workspace_id = h.workspace_id
+                        AND v.host_trust_id = h.host_trust_id
+                       WHERE h.workspace_id = ?1 AND h.host_trust_id = ?2
+                         AND v.revision = ?3"#,
+                    params![workspace_id, host_trust_id, host_trust_revision as i64],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)? as u16,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    Error::RegistryInconsistency(format!(
+                        "Repository SSH host trust `{host_trust_id}` revision {host_trust_revision} is unavailable"
+                    ))
+                })?;
+            Ok((private_key, passphrase, hostname, port, host_key))
         })?;
         let private_key = self.unseal(
             workspace_id,
-            &binding.credential_id,
-            credential.current_revision,
+            credential_id,
+            credential_revision,
             "private_key",
             private_key,
         )?;
@@ -899,8 +939,8 @@ impl RepositorySecretService {
             .map(|secret| {
                 self.unseal(
                     workspace_id,
-                    &binding.credential_id,
-                    credential.current_revision,
+                    credential_id,
+                    credential_revision,
                     "passphrase",
                     secret,
                 )
@@ -933,18 +973,18 @@ impl RepositorySecretService {
         let private_key = key
             .to_openssh(LineEnding::LF)
             .map_err(|_| Error::Store("Repository SSH private key encoding failed".to_string()))?;
-        let host = if host_trust.port == 22 {
-            host_trust.hostname.clone()
+        let host = if port == 22 {
+            hostname
         } else {
-            format!("[{}]:{}", host_trust.hostname, host_trust.port)
+            format!("[{hostname}]:{port}")
         };
         Ok(LeasedRepositorySshAccess {
-            credential_id: binding.credential_id.clone(),
-            credential_revision: credential.current_revision,
-            host_trust_id: binding.host_trust_id.clone(),
-            host_trust_revision: host_trust.current_revision,
+            credential_id: credential_id.to_string(),
+            credential_revision,
+            host_trust_id: host_trust_id.to_string(),
+            host_trust_revision,
             private_key,
-            known_hosts_entry: format!("{host} {}\n", host_trust.host_key),
+            known_hosts_entry: format!("{host} {host_key}\n"),
         })
     }
 
@@ -1888,6 +1928,18 @@ mod tests {
                 .known_hosts_entry
                 .starts_with("example.test ssh-ed25519 ")
         );
+        let exact = service
+            .lease_ssh_materialization_access_revision(
+                "workspace-a",
+                "deploy",
+                lease.credential_revision,
+                "example",
+                lease.host_trust_revision,
+            )
+            .unwrap();
+        assert_eq!(exact.credential_revision, lease.credential_revision);
+        assert_eq!(exact.host_trust_revision, lease.host_trust_revision);
+        assert_eq!(exact.known_hosts_entry, lease.known_hosts_entry);
 
         let unknown = config_state(
             r#"{

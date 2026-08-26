@@ -8474,6 +8474,34 @@ async fn create_workspace_working_directory(
         )
         .into());
     }
+    if let Some(existing) = api
+        .config_store
+        .load_workdir_create_operation(workspace_id, &operation_id)?
+        && let (Some(kind), Some(uri), Some(revision), Some(fingerprint)) = (
+            existing.source_kind.as_deref(),
+            existing.source_uri,
+            existing.source_revision,
+            existing.source_fingerprint,
+        )
+    {
+        let kind = match kind {
+            "local_path" => workspace_api::RepositorySourceKind::LocalPath,
+            "file" => workspace_api::RepositorySourceKind::File,
+            "https" => workspace_api::RepositorySourceKind::Https,
+            "http" => workspace_api::RepositorySourceKind::Http,
+            "ssh" => workspace_api::RepositorySourceKind::Ssh,
+            "invalid" => workspace_api::RepositorySourceKind::Invalid,
+            _ => {
+                return Err(settings_bad_request(
+                    "working_directory_repository_source_invalid",
+                    "persisted Workdir create Repository source kind is invalid",
+                ));
+            }
+        };
+        working_directory_request.repository.source = workspace_api::RepositorySource { kind, uri };
+        working_directory_request.repository.source_revision = revision;
+        working_directory_request.repository.source_fingerprint = fingerprint;
+    }
     let selector = working_directory_request
         .repository
         .selector
@@ -8538,6 +8566,28 @@ async fn create_workspace_working_directory(
                 resolved_runtime_id,
                 config_revision: runtime_projection.config_revision,
                 config_projection_digest: runtime_projection.projection_digest,
+                source_kind: Some(
+                    working_directory_request
+                        .repository
+                        .source
+                        .kind
+                        .as_str()
+                        .to_string(),
+                ),
+                source_uri: Some(working_directory_request.repository.source.uri.clone()),
+                source_revision: Some(working_directory_request.repository.source_revision),
+                source_fingerprint: Some(
+                    working_directory_request
+                        .repository
+                        .source_fingerprint
+                        .clone(),
+                ),
+                credential_id: None,
+                credential_revision: None,
+                host_trust_id: None,
+                host_trust_revision: None,
+                repository_access_mode: None,
+                cache_generation: 0,
                 working_directory_id: next_backend_workdir_id(&request.repository_id),
                 state: "pending".to_string(),
                 failure: None,
@@ -8628,12 +8678,10 @@ async fn create_workspace_working_directory(
         ));
     }
 
-    let repository_access_projection = active_repository_access_projection(api, workspace_id)?;
-    if let Err(error) = authorize_repository_materialization(
+    if let Err(error) = authorize_repository_materialization_operation(
         api,
-        &reserved.resolved_runtime_id,
-        &operation_id,
-        &repository_access_projection,
+        &reserved,
+        &request_fingerprint,
         &mut working_directory_request,
     ) {
         api.config_store.finish_workdir_create_operation(
@@ -13968,6 +14016,132 @@ fn validate_working_directory_claim_for_browser(
     Ok(())
 }
 
+fn authorize_repository_materialization_operation(
+    api: &WorkspaceApi,
+    operation: &WorkdirCreateOperationRecord,
+    request_fingerprint: &str,
+    request: &mut WorkingDirectoryRequest,
+) -> ApiResult<()> {
+    let context = if request.repository.source.kind == workspace_api::RepositorySourceKind::Ssh {
+        if let (
+            Some(credential_id),
+            Some(credential_revision),
+            Some(host_trust_id),
+            Some(host_trust_revision),
+            Some(access_mode),
+        ) = (
+            operation.credential_id.as_deref(),
+            operation.credential_revision,
+            operation.host_trust_id.as_deref(),
+            operation.host_trust_revision,
+            operation.repository_access_mode.as_deref(),
+        ) {
+            let lease = api
+                .repository_secrets
+                .lease_ssh_materialization_access_revision(
+                    &api.config.workspace_id,
+                    credential_id,
+                    credential_revision,
+                    host_trust_id,
+                    host_trust_revision,
+                )?;
+            let access = match access_mode {
+                "read_only" => workspace_api::RepositoryAccessMode::ReadOnly,
+                "read_write" => workspace_api::RepositoryAccessMode::ReadWrite,
+                _ => {
+                    return Err(settings_bad_request(
+                        "working_directory_repository_access_invalid",
+                        "persisted Repository access mode is invalid",
+                    ));
+                }
+            };
+            RepositoryMaterializationContext {
+                workspace_id: api.config.workspace_id.clone(),
+                runtime_id: operation.resolved_runtime_id.clone(),
+                operation_id: operation.operation_id.clone(),
+                config_revision: operation.config_revision,
+                config_projection_digest: operation.config_projection_digest.clone(),
+                cache_generation: operation.cache_generation,
+                ssh: Some(RepositorySshMaterializationAccess {
+                    credential_id: lease.credential_id,
+                    credential_revision: lease.credential_revision,
+                    host_trust_id: lease.host_trust_id,
+                    host_trust_revision: lease.host_trust_revision,
+                    access,
+                    expires_at_epoch_seconds: repository_access_expiry(),
+                    private_key: SensitiveString::new(lease.private_key.as_str()),
+                    known_hosts_entry: SensitiveString::new(lease.known_hosts_entry),
+                }),
+            }
+        } else {
+            let projection = active_repository_access_projection(api, &api.config.workspace_id)?;
+            if projection.config_revision != operation.config_revision
+                || projection.projection_digest != operation.config_projection_digest
+            {
+                return Err(settings_bad_request(
+                    "working_directory_repository_access_revision_changed",
+                    "Workspace Repository access revision changed before operation reservation was bound",
+                ));
+            }
+            authorize_repository_materialization(
+                api,
+                &operation.resolved_runtime_id,
+                &operation.operation_id,
+                &projection,
+                request,
+            )?;
+            let context = request.materialization.take().ok_or_else(|| {
+                settings_bad_request(
+                    "working_directory_remote_repository_access_required",
+                    "SSH Repository access authority is unavailable",
+                )
+            })?;
+            let ssh = context.ssh.as_ref().ok_or_else(|| {
+                settings_bad_request(
+                    "working_directory_remote_repository_access_required",
+                    "SSH Repository access authority is unavailable",
+                )
+            })?;
+            api.config_store.bind_workdir_create_repository_access(
+                &api.config.workspace_id,
+                &operation.operation_id,
+                request_fingerprint,
+                &ssh.credential_id,
+                ssh.credential_revision,
+                &ssh.host_trust_id,
+                ssh.host_trust_revision,
+                match ssh.access {
+                    workspace_api::RepositoryAccessMode::ReadOnly => "read_only",
+                    workspace_api::RepositoryAccessMode::ReadWrite => "read_write",
+                },
+                context.cache_generation,
+                &now_registry_timestamp(),
+            )?;
+            context
+        }
+    } else {
+        RepositoryMaterializationContext {
+            workspace_id: api.config.workspace_id.clone(),
+            runtime_id: operation.resolved_runtime_id.clone(),
+            operation_id: operation.operation_id.clone(),
+            config_revision: operation.config_revision,
+            config_projection_digest: operation.config_projection_digest.clone(),
+            cache_generation: operation.cache_generation,
+            ssh: None,
+        }
+    };
+    request.materialization = Some(context);
+    Ok(())
+}
+
+fn repository_access_expiry() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_add(300)
+}
+
 fn authorize_repository_materialization(
     api: &WorkspaceApi,
     runtime_id: &str,
@@ -13995,11 +14169,7 @@ fn authorize_repository_materialization(
             host_trust_id: lease.host_trust_id,
             host_trust_revision: lease.host_trust_revision,
             access: binding.access,
-            expires_at_epoch_seconds: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-                .saturating_add(300),
+            expires_at_epoch_seconds: repository_access_expiry(),
             private_key: SensitiveString::new(lease.private_key.as_str()),
             known_hosts_entry: SensitiveString::new(lease.known_hosts_entry),
         })
@@ -21247,6 +21417,16 @@ mod tests {
                 resolved_runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 config_revision: 1,
                 config_projection_digest: "sha256:test".to_string(),
+                source_kind: Some("local_path".to_string()),
+                source_uri: Some("/tmp/repo".to_string()),
+                source_revision: Some(1),
+                source_fingerprint: Some("sha256:test".to_string()),
+                credential_id: None,
+                credential_revision: None,
+                host_trust_id: None,
+                host_trust_revision: None,
+                repository_access_mode: None,
+                cache_generation: 0,
                 working_directory_id: "workdir-provider-rejection".to_string(),
                 state: "pending".to_string(),
                 failure: None,

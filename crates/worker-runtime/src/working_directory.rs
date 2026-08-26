@@ -402,12 +402,13 @@ impl RuntimeGitCacheMaterializer {
             return Ok(binding);
         };
         validate_ssh_materialization_access(&access)?;
-        let agent = Arc::new(RepositorySshAgent::start(
+        let command_access = Arc::new(RepositoryCommandAccess::prepare_ssh(
             &self.runtime_root,
-            working_directory_id,
+            &format!("attachment-{working_directory_id}"),
+            &binding.working_directory.repository_id,
             &access,
         )?);
-        let weak_agent = Arc::downgrade(&agent);
+        let weak_access = Arc::downgrade(&command_access);
         let expires_at = access.expires_at_epoch_seconds;
         std::thread::spawn(move || {
             let now = SystemTime::now()
@@ -417,13 +418,17 @@ impl RuntimeGitCacheMaterializer {
             if expires_at > now {
                 std::thread::sleep(Duration::from_secs(expires_at - now));
             }
-            if let Some(agent) = weak_agent.upgrade() {
-                agent.stop();
+            if let Some(access) = weak_access.upgrade() {
+                access.stop();
             }
         });
         binding.command_environment.insert(
             "SSH_AUTH_SOCK".to_string(),
-            agent.socket.to_string_lossy().to_string(),
+            command_access.agent.socket.to_string_lossy().to_string(),
+        );
+        binding.command_environment.insert(
+            "GIT_SSH_COMMAND".to_string(),
+            command_access.ssh_command.to_string_lossy().to_string(),
         );
         binding.command_environment.insert(
             "YOI_REPOSITORY_ACCESS".to_string(),
@@ -433,7 +438,7 @@ impl RuntimeGitCacheMaterializer {
             }
             .to_string(),
         );
-        binding.session_resources.push(agent);
+        binding.session_resources.push(command_access);
         Ok(binding)
     }
 
@@ -1122,6 +1127,7 @@ impl Drop for RepositorySshAgent {
     }
 }
 
+#[derive(Debug)]
 struct RepositoryCommandAccess {
     root: PathBuf,
     ssh_command: PathBuf,
@@ -1148,10 +1154,24 @@ impl RepositoryCommandAccess {
             .as_ref()
             .map(|materialization| materialization.operation_id.as_str())
             .unwrap_or("operation");
+        Ok(Some(Self::prepare_ssh(
+            runtime_root,
+            operation_id,
+            &request.repository.id,
+            ssh,
+        )?))
+    }
+
+    fn prepare_ssh(
+        runtime_root: &Path,
+        operation_id: &str,
+        repository_id: &str,
+        ssh: &RepositorySshMaterializationAccess,
+    ) -> Result<Self, WorkingDirectoryDiagnostic> {
         let root = runtime_root.join(REPOSITORY_ACCESS_DIR).join(format!(
             "{}-{}",
             sanitize_path_component(operation_id),
-            next_working_directory_id(&request.repository.id)
+            next_working_directory_id(repository_id)
         ));
         fs::create_dir_all(&root).map_err(|_| {
             WorkingDirectoryDiagnostic::new(
@@ -1170,17 +1190,22 @@ impl RepositoryCommandAccess {
         write_owner_only(&ssh_command, script.as_bytes())?;
         set_file_owner_executable(&ssh_command)?;
         let agent = RepositorySshAgent::start(runtime_root, operation_id, ssh)?;
-        Ok(Some(Self {
+        Ok(Self {
             root,
             ssh_command,
             agent,
-        }))
+        })
+    }
+
+    fn stop(&self) {
+        self.agent.stop();
+        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
 impl Drop for RepositoryCommandAccess {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
+        self.stop();
     }
 }
 
@@ -2006,14 +2031,18 @@ mod tests {
             })
             .unwrap();
         let binding = materializer.bind_working_directory(&id, None).unwrap();
-        let socket = PathBuf::from(binding.command_environment()["SSH_AUTH_SOCK"].clone());
+        let environment = binding.command_environment();
+        let socket = PathBuf::from(environment["SSH_AUTH_SOCK"].clone());
+        let ssh_command = PathBuf::from(environment["GIT_SSH_COMMAND"].clone());
         assert!(socket.exists());
-        assert_eq!(
-            binding.command_environment()["YOI_REPOSITORY_ACCESS"],
-            "read_write"
-        );
+        assert!(ssh_command.exists());
+        let ssh_policy = fs::read_to_string(&ssh_command).unwrap();
+        assert!(ssh_policy.contains("StrictHostKeyChecking=yes"));
+        assert!(ssh_policy.contains("UserKnownHostsFile="));
+        assert_eq!(environment["YOI_REPOSITORY_ACCESS"], "read_write");
         drop(binding);
         assert!(!socket.exists());
+        assert!(!ssh_command.exists());
         assert_eq!(
             materializer
                 .bind_working_directory(&id, None)
