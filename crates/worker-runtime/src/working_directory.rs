@@ -420,6 +420,11 @@ impl RuntimeGitCacheMaterializer {
             return Ok(binding);
         };
         validate_ssh_materialization_access(&access)?;
+        apply_worktree_access_policy(
+            binding.source_repository_path(),
+            binding.root(),
+            access.access,
+        )?;
         let command_access = Arc::new(RepositoryCommandAccess::prepare_ssh(
             &self.runtime_root,
             &format!("attachment-{working_directory_id}"),
@@ -684,35 +689,16 @@ impl RuntimeGitCacheMaterializer {
             let _ = fs::remove_dir_all(&working_directory_root);
             return Err(error);
         }
-        if request
+        if let Some(ssh) = request
             .materialization
             .as_ref()
             .and_then(|materialization| materialization.ssh.as_ref())
-            .is_some_and(|ssh| ssh.access == workspace_api::RepositoryAccessMode::ReadOnly)
+            && let Err(error) =
+                apply_worktree_access_policy(&repository_cache, &worktree_root, ssh.access)
         {
-            let mut enable_worktree_config = isolated_git_command();
-            enable_worktree_config
-                .arg("--git-dir")
-                .arg(&repository_cache)
-                .args(["config", "extensions.worktreeConfig", "true"]);
-            let mut disable_push = isolated_git_command();
-            disable_push.arg("-C").arg(&worktree_root).args([
-                "config",
-                "--worktree",
-                "remote.origin.pushurl",
-                "yoi-read-only://repository-push-disabled",
-            ]);
-            if let Err(error) = run_repository_git(
-                enable_worktree_config,
-                "working_directory_repository_policy_failed",
-            )
-            .and_then(|_| {
-                run_repository_git(disable_push, "working_directory_repository_policy_failed")
-            }) {
-                remove_cached_worktree(&repository_cache, &worktree_root);
-                let _ = fs::remove_dir_all(&working_directory_root);
-                return Err(error);
-            }
+            remove_cached_worktree(&repository_cache, &worktree_root);
+            let _ = fs::remove_dir_all(&working_directory_root);
+            return Err(error);
         }
 
         let context = request.materialization.as_ref();
@@ -1477,6 +1463,52 @@ fn fetch_repository_cache(
     run_repository_git(head, "working_directory_repository_fetch_failed")
 }
 
+fn apply_worktree_access_policy(
+    repository_cache: &Path,
+    worktree_root: &Path,
+    access: workspace_api::RepositoryAccessMode,
+) -> Result<(), WorkingDirectoryDiagnostic> {
+    let mut enable_worktree_config = isolated_git_command();
+    enable_worktree_config
+        .arg("--git-dir")
+        .arg(repository_cache)
+        .args(["config", "extensions.worktreeConfig", "true"]);
+    run_repository_git(
+        enable_worktree_config,
+        "working_directory_repository_policy_failed",
+    )?;
+    match access {
+        workspace_api::RepositoryAccessMode::ReadOnly => {
+            let mut disable_push = isolated_git_command();
+            disable_push.arg("-C").arg(worktree_root).args([
+                "config",
+                "--worktree",
+                "remote.origin.pushurl",
+                "yoi-read-only://repository-push-disabled",
+            ]);
+            run_repository_git(disable_push, "working_directory_repository_policy_failed")
+        }
+        workspace_api::RepositoryAccessMode::ReadWrite => {
+            if git_stdout(
+                worktree_root,
+                ["config", "--worktree", "--get-all", "remote.origin.pushurl"],
+            )
+            .is_err()
+            {
+                return Ok(());
+            }
+            let mut enable_push = isolated_git_command();
+            enable_push.arg("-C").arg(worktree_root).args([
+                "config",
+                "--worktree",
+                "--unset-all",
+                "remote.origin.pushurl",
+            ]);
+            run_repository_git(enable_push, "working_directory_repository_policy_failed")
+        }
+    }
+}
+
 fn validate_repository_cache_limits(
     repository_cache: &Path,
 ) -> Result<(), WorkingDirectoryDiagnostic> {
@@ -2071,10 +2103,11 @@ mod tests {
         let mut rotated = request.materialization.clone().unwrap();
         rotated.operation_id = "operation-agent-rotated".to_string();
         rotated.ssh.as_mut().unwrap().credential_revision = 2;
+        rotated.ssh.as_mut().unwrap().access = workspace_api::RepositoryAccessMode::ReadOnly;
         materializer
             .authorize_repository_access(&WorkingDirectoryRepositoryAccessRequest {
                 working_directory_id: id.clone(),
-                materialization: rotated,
+                materialization: rotated.clone(),
             })
             .unwrap();
         let rebound = materializer.bind_working_directory(&id, None).unwrap();
@@ -2082,7 +2115,44 @@ mod tests {
             rebound.working_directory.evidence.credential_revision,
             Some(2)
         );
+        assert_eq!(
+            rebound.command_environment()["YOI_REPOSITORY_ACCESS"],
+            "read_only"
+        );
+        assert_eq!(
+            git_stdout(
+                rebound.root(),
+                ["config", "--worktree", "--get", "remote.origin.pushurl"],
+            )
+            .unwrap(),
+            "yoi-read-only://repository-push-disabled"
+        );
         drop(rebound);
+
+        let mut read_write = rotated;
+        read_write.operation_id = "operation-agent-read-write".to_string();
+        read_write.ssh.as_mut().unwrap().credential_revision = 3;
+        read_write.ssh.as_mut().unwrap().access = workspace_api::RepositoryAccessMode::ReadWrite;
+        materializer
+            .authorize_repository_access(&WorkingDirectoryRepositoryAccessRequest {
+                working_directory_id: id.clone(),
+                materialization: read_write,
+            })
+            .unwrap();
+        let rebound = materializer.bind_working_directory(&id, None).unwrap();
+        assert_eq!(
+            rebound.command_environment()["YOI_REPOSITORY_ACCESS"],
+            "read_write"
+        );
+        assert!(
+            git_stdout(
+                rebound.root(),
+                ["config", "--worktree", "--get", "remote.origin.pushurl"],
+            )
+            .is_err()
+        );
+        drop(rebound);
+
         let mut expired = request.materialization.clone().unwrap();
         expired.ssh.as_mut().unwrap().expires_at_epoch_seconds = 1;
         assert_eq!(
