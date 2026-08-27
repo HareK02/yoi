@@ -70,6 +70,59 @@ pub struct EngineConfig {
     _private: (),
 }
 
+/// Project terminal tool outputs into the assistant's original ToolCall order.
+///
+/// Runtime history intentionally retains completion order so every result can
+/// be committed without waiting for slower siblings. The provider projection
+/// is deterministic within each contiguous result batch and does not rewrite
+/// the committed transcript.
+struct ProviderHistoryProjection {
+    items: Vec<Item>,
+    original_to_projected_index: Vec<usize>,
+}
+
+fn materialize_provider_history(items: &[Item]) -> ProviderHistoryProjection {
+    let mut materialized: Vec<_> = items.iter().cloned().enumerate().collect();
+    let mut call_order = HashMap::<String, usize>::new();
+    let mut next_call_order = 0usize;
+    let mut index = 0usize;
+
+    while index < materialized.len() {
+        match &materialized[index].1 {
+            Item::ToolCall { call_id, .. } => {
+                call_order.insert(call_id.clone(), next_call_order);
+                next_call_order += 1;
+                index += 1;
+            }
+            Item::ToolResult { .. } => {
+                let start = index;
+                while index < materialized.len()
+                    && matches!(materialized[index].1, Item::ToolResult { .. })
+                {
+                    index += 1;
+                }
+                materialized[start..index].sort_by_key(|(_, item)| match item {
+                    Item::ToolResult { call_id, .. } => {
+                        call_order.get(call_id).copied().unwrap_or(usize::MAX)
+                    }
+                    _ => unreachable!("tool-result run contains only ToolResult items"),
+                });
+            }
+            _ => index += 1,
+        }
+    }
+
+    let mut original_to_projected_index = vec![0; materialized.len()];
+    for (projected_index, (original_index, _)) in materialized.iter().enumerate() {
+        original_to_projected_index[*original_index] = projected_index;
+    }
+
+    ProviderHistoryProjection {
+        items: materialized.into_iter().map(|(_, item)| item).collect(),
+        original_to_projected_index,
+    }
+}
+
 /// Legacy serializable outcome used by the Worker session-log compatibility boundary.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -126,7 +179,7 @@ pub struct EngineRunOutput<C: LlmClient, A = ()> {
 
 /// Internal: tool execution result
 enum ToolExecutionResult {
-    Completed(Vec<ToolResult>),
+    Completed,
     Paused,
 }
 
@@ -892,8 +945,14 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
             request = request.system(system);
         }
 
-        // Add items directly (Request now uses Items natively)
-        request = request.items(context.iter().cloned());
+        // History keeps terminal tool outputs in completion order so each
+        // result can be committed immediately. Providers, however, expect a
+        // deterministic projection matching the assistant's ToolCall order.
+        let projection = materialize_provider_history(context);
+        let projected_cache_anchor = self
+            .cache_anchor
+            .and_then(|anchor| projection.original_to_projected_index.get(anchor).copied());
+        request = request.items(projection.items);
 
         // Add tool definitions
         for tool_def in tool_definitions {
@@ -906,7 +965,7 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
         // Attach the cache prefix anchor (may be narrower than `context`
         // if the prune projection trimmed items from the head — keep it
         // in range).
-        request.cache_anchor = self.cache_anchor.filter(|&anchor| anchor < context.len());
+        request.cache_anchor = projected_cache_anchor;
         request.cache_key = self.cache_key.clone();
 
         request
@@ -978,9 +1037,11 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
     /// executes approved tools in parallel and applies post_tool_call hooks to results.
     async fn execute_tools(
         &mut self,
+        history: &mut History<A>,
+        annotate: &mut impl FnMut(&Item) -> Result<A, String>,
         tool_calls: Vec<ToolCall>,
     ) -> Result<ToolExecutionResult, EngineError> {
-        use futures::future::join_all;
+        use futures::stream::{FuturesUnordered, StreamExt};
 
         // Map from tool call ID to (ToolCall, Meta, Tool, Context)
         // Retained because it's needed for PostToolCall hooks
@@ -1047,8 +1108,10 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
             }
         }
 
-        // Phase 2: Execute approved tools in parallel (cancellable)
-        let futures: Vec<_> = approved_calls
+        // Phase 2: Execute approved tools in parallel. FuturesUnordered yields
+        // each terminal result as soon as that call completes instead of
+        // holding fast siblings behind the slowest call in the batch.
+        let futures: FuturesUnordered<_> = approved_calls
             .into_iter()
             .map(|(tool_call, context)| {
                 let tool_server = self.tool_server.clone();
@@ -1065,84 +1128,117 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
             })
             .collect();
 
-        // Make tool execution cancellable
-        let mut results = tokio::select! {
-            results = join_all(futures) => results,
-            cancel = self.cancel_rx.recv() => {
-                if cancel.is_some() {
-                    info!("Tool execution cancelled");
+        // Synthetic results are already terminal and need no execution wait.
+        // Commit them before polling ordinary calls so they obey the same
+        // commit-before-publish boundary.
+        for result in synthetic_results {
+            self.finalize_and_commit_tool_result(history, annotate, result, &call_info_map)
+                .await?;
+        }
+
+        let mut futures = futures;
+        while !futures.is_empty() {
+            tokio::select! {
+                // If cancellation and a completed result are both ready, drain
+                // the completed result first. This preserves every terminal
+                // output observed before the cancellation boundary.
+                biased;
+                result = futures.next() => {
+                    let result = result.expect("non-empty FuturesUnordered returns a result");
+                    self.finalize_and_commit_tool_result(
+                        history,
+                        annotate,
+                        result,
+                        &call_info_map,
+                    ).await?;
                 }
-                self.timeline.abort_current_block();
-                return Err(EngineError::Cancelled);
-            }
-        };
-        results.extend(synthetic_results);
-
-        // Phase 3: Apply post_tool_call interceptor
-        for tool_result in &mut results {
-            if let Some((tool_call, meta, tool, context)) =
-                call_info_map.get(&tool_result.tool_use_id)
-            {
-                let mut info = ToolResultInfo {
-                    call: tool_call.clone(),
-                    result: tool_result.clone(),
-                    meta: meta.clone(),
-                    tool: tool.clone(),
-                    context: context.clone(),
-                };
-
-                match self.interceptor.post_tool_call(&mut info).await {
-                    PostToolAction::Continue => {}
-                    PostToolAction::Abort(reason) => {
-                        return Err(EngineError::Aborted(reason));
+                cancel = self.cancel_rx.recv() => {
+                    if cancel.is_some() {
+                        info!("Tool execution cancelled");
                     }
-                }
-                // Reflect interceptor-modified results
-                *tool_result = info.result;
-            }
-        }
-
-        // Phase 4: Cap `content` byte-size before it enters history.
-        // Runs *after* post_tool_call so interceptors (audit, logging,
-        // classification) still observe the full content, and any
-        // content they inject is also truncated — closing the last gap
-        // before the data reaches the next LLM request.
-        if let Some(limits) = self.tool_output_limits.as_ref() {
-            for tool_result in &mut results {
-                let Some(content) = tool_result.content.as_mut() else {
-                    continue;
-                };
-                let Some((tool_call, _, _, _)) = call_info_map.get(&tool_result.tool_use_id) else {
-                    continue;
-                };
-                let limit = limits.limit_for(&tool_call.name);
-                let before = content.len();
-                truncate_content(content, limit);
-                if content.len() != before {
-                    warn!(
-                        tool = %tool_call.name,
-                        before_bytes = before,
-                        after_bytes = content.len(),
-                        limit_bytes = limit,
-                        "Tool output exceeded byte limit and was truncated"
-                    );
-                    self.emit_warning(&format!(
-                        "tool `{}` output truncated from {} to {} bytes (limit {})",
-                        tool_call.name,
-                        before,
-                        content.len(),
-                        limit
-                    ));
+                    self.timeline.abort_current_block();
+                    return Err(EngineError::Cancelled);
                 }
             }
         }
 
-        // Emit per-result callbacks on the post-truncation payload.
-        for tool_result in &results {
-            self.emit_tool_result(tool_result);
+        Ok(ToolExecutionResult::Completed)
+    }
+
+    /// Apply post-execution policy, bound the model-visible payload, durably
+    /// append one terminal ToolResult, and only then publish it to observers.
+    async fn finalize_and_commit_tool_result(
+        &mut self,
+        history: &mut History<A>,
+        annotate: &mut impl FnMut(&Item) -> Result<A, String>,
+        mut tool_result: ToolResult,
+        call_info_map: &HashMap<
+            String,
+            (
+                ToolCall,
+                crate::tool::ToolMeta,
+                Arc<dyn crate::tool::Tool>,
+                ToolExecutionContext,
+            ),
+        >,
+    ) -> Result<(), EngineError> {
+        let call_info = call_info_map.get(&tool_result.tool_use_id);
+        if let Some((tool_call, meta, tool, context)) = call_info {
+            let mut info = ToolResultInfo {
+                call: tool_call.clone(),
+                result: tool_result,
+                meta: meta.clone(),
+                tool: tool.clone(),
+                context: context.clone(),
+            };
+
+            match self.interceptor.post_tool_call(&mut info).await {
+                PostToolAction::Continue => {}
+                PostToolAction::Abort(reason) => {
+                    return Err(EngineError::Aborted(reason));
+                }
+            }
+            tool_result = info.result;
         }
 
-        Ok(ToolExecutionResult::Completed(results))
+        // Cap content only after post_tool_call so interceptors still observe
+        // the full payload and any content they inject is bounded too.
+        if let (Some(limits), Some((tool_call, _, _, _)), Some(content)) = (
+            self.tool_output_limits.as_ref(),
+            call_info,
+            tool_result.content.as_mut(),
+        ) {
+            let limit = limits.limit_for(&tool_call.name);
+            let before = content.len();
+            truncate_content(content, limit);
+            if content.len() != before {
+                warn!(
+                    tool = %tool_call.name,
+                    before_bytes = before,
+                    after_bytes = content.len(),
+                    limit_bytes = limit,
+                    "Tool output exceeded byte limit and was truncated"
+                );
+                self.emit_warning(&format!(
+                    "tool `{}` output truncated from {} to {} bytes (limit {})",
+                    tool_call.name,
+                    before,
+                    content.len(),
+                    limit
+                ));
+            }
+        }
+
+        let item = Item::tool_result_item_with_attachments(
+            &tool_result.tool_use_id,
+            &tool_result.summary,
+            tool_result.content.clone(),
+            tool_result.is_error,
+            tool_result.attachments.clone(),
+        );
+        self.append_history_items(history, std::iter::once(item), annotate)?;
+        self.emit_tool_result(&tool_result);
+        Ok(())
     }
 
     /// Internal turn execution logic
@@ -1658,23 +1754,9 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
         annotate: &mut impl FnMut(&Item) -> Result<A, String>,
         tool_calls: Vec<ToolCall>,
     ) -> Result<Option<EngineResult>, EngineError> {
-        match self.execute_tools(tool_calls).await {
+        match self.execute_tools(history, annotate, tool_calls).await {
             Ok(ToolExecutionResult::Paused) => Ok(Some(EngineResult::Paused)),
-            Ok(ToolExecutionResult::Completed(results)) => {
-                // Route per-result pushes through the callback path so
-                // observers see each tool result as it lands.
-                let items = results.into_iter().map(|result| {
-                    Item::tool_result_item_with_attachments(
-                        &result.tool_use_id,
-                        &result.summary,
-                        result.content,
-                        result.is_error,
-                        result.attachments,
-                    )
-                });
-                self.append_history_items(history, items, annotate)?;
-                Ok(None)
-            }
+            Ok(ToolExecutionResult::Completed) => Ok(None),
             Err(err) => Err(err),
         }
     }
@@ -2295,6 +2377,28 @@ mod tests {
     use super::*;
     use crate::tool::{Attachment, ImageAttachment};
     use std::time::Duration;
+
+    #[test]
+    fn provider_projection_reorders_results_and_remaps_cache_anchor() {
+        let items = vec![
+            Item::tool_call_json("call_slow", "slow", serde_json::json!({})),
+            Item::tool_call_json("call_fast", "fast", serde_json::json!({})),
+            Item::tool_result_item("call_fast", "fast result", None, false),
+            Item::tool_result_item("call_slow", "slow result", None, false),
+        ];
+
+        let projection = materialize_provider_history(&items);
+        let result_order: Vec<_> = projection
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(result_order, ["call_slow", "call_fast"]);
+        assert_eq!(projection.original_to_projected_index, [0, 1, 3, 2]);
+    }
 
     #[test]
     fn tool_attachment_round_trips_through_durable_history_json() {

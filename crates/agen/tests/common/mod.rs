@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub struct MockLlmClient {
     responses: Arc<Vec<Vec<Event>>>,
     call_count: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<Request>>>,
 }
 
 impl MockLlmClient {
@@ -30,6 +31,7 @@ impl MockLlmClient {
         Self {
             responses: Arc::new(responses),
             call_count: Arc::new(AtomicUsize::new(0)),
+            requests: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -41,6 +43,10 @@ impl MockLlmClient {
     pub fn event_count(&self) -> usize {
         self.responses.iter().map(|v| v.len()).sum()
     }
+
+    pub fn requests(&self) -> Vec<Request> {
+        self.requests.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
@@ -51,8 +57,9 @@ impl LlmClient for MockLlmClient {
 
     async fn stream(
         &self,
-        _request: Request,
+        request: Request,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Event, ClientError>> + Send>>, ClientError> {
+        self.requests.lock().unwrap().push(request);
         let count = self.call_count.fetch_add(1, Ordering::SeqCst);
         if count >= self.responses.len() {
             return Err(ClientError::Api {

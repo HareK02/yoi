@@ -11,7 +11,7 @@ use agen::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use agen::tool::{
     Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput, ToolResult,
 };
-use agen::{Engine, History};
+use agen::{Engine, History, Item};
 use async_trait::async_trait;
 
 mod common;
@@ -67,6 +67,48 @@ impl Tool for SlowTool {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
         Ok(format!("Completed after {}ms", self.delay_ms).into())
+    }
+}
+
+#[derive(Clone)]
+struct FirstAttemptHangsTool {
+    calls: Arc<AtomicUsize>,
+}
+
+impl FirstAttemptHangsTool {
+    fn new() -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        let tool = self.clone();
+        Arc::new(move || {
+            let meta = ToolMeta::new("hang_once")
+                .description("Hangs on the first execution attempt")
+                .input_schema(serde_json::json!({"type": "object"}));
+            (meta, Arc::new(tool.clone()) as Arc<dyn Tool>)
+        })
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl Tool for FirstAttemptHangsTool {
+    async fn execute(
+        &self,
+        _input_json: &str,
+        _ctx: ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+        if attempt == 0 {
+            std::future::pending::<()>().await;
+        }
+        Ok("completed on retry".to_string().into())
     }
 }
 
@@ -177,6 +219,201 @@ async fn test_parallel_tool_execution() {
     );
 
     println!("Parallel execution completed in {:?}", elapsed);
+}
+
+#[tokio::test]
+async fn completed_results_commit_before_publish_without_waiting_for_siblings() {
+    let client = MockLlmClient::with_responses(vec![
+        vec![
+            Event::tool_use_start(0, "call_slow", "slow_first"),
+            Event::tool_input_delta(0, r#"{}"#),
+            Event::tool_use_stop(0),
+            Event::tool_use_start(1, "call_fast", "fast_second"),
+            Event::tool_input_delta(1, r#"{}"#),
+            Event::tool_use_stop(1),
+            Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ],
+        vec![
+            Event::text_block_start(0),
+            Event::text_delta(0, "Done"),
+            Event::text_block_stop(0, None),
+            Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ],
+    ]);
+    let client_probe = client.clone();
+    let mut engine = Engine::new(client);
+    engine.register_tool(SlowTool::new("slow_first", 100).definition());
+    engine.register_tool(SlowTool::new("fast_second", 5).definition());
+
+    let observed = Arc::new(Mutex::new(Vec::<String>::new()));
+    let published = observed.clone();
+    engine.on_tool_result(move |result| {
+        published
+            .lock()
+            .unwrap()
+            .push(format!("publish:{}", result.tool_use_id));
+    });
+
+    let committed = observed.clone();
+    let mut annotate = move |item: &Item| {
+        if let Item::ToolResult { call_id, .. } = item {
+            committed.lock().unwrap().push(format!("commit:{call_id}"));
+        }
+        Ok(())
+    };
+    let mut history = History::new();
+    let _ = engine
+        .run_with_annotation(&mut history, "run both", &mut annotate)
+        .await;
+
+    assert_eq!(
+        observed.lock().unwrap().as_slice(),
+        [
+            "commit:call_fast",
+            "publish:call_fast",
+            "commit:call_slow",
+            "publish:call_slow",
+        ]
+    );
+
+    let committed_order: Vec<_> = history
+        .iter()
+        .filter_map(|entry| match &entry.item {
+            Item::ToolResult { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(committed_order, ["call_fast", "call_slow"]);
+
+    let requests = client_probe.requests();
+    let projected_order: Vec<_> = requests[1]
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::ToolResult { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(projected_order, ["call_slow", "call_fast"]);
+}
+
+#[tokio::test]
+async fn cancellation_preserves_completed_results_and_resume_skips_them() {
+    let client = MockLlmClient::with_responses(vec![
+        vec![
+            Event::tool_use_start(0, "call_hang", "hang_once"),
+            Event::tool_input_delta(0, r#"{}"#),
+            Event::tool_use_stop(0),
+            Event::tool_use_start(1, "call_fast", "fast"),
+            Event::tool_input_delta(1, r#"{}"#),
+            Event::tool_use_stop(1),
+            Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ],
+        vec![
+            Event::text_block_start(0),
+            Event::text_delta(0, "Recovered"),
+            Event::text_block_stop(0, None),
+            Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ],
+    ]);
+    let mut engine = Engine::new(client);
+    let hanging = FirstAttemptHangsTool::new();
+    let fast = SlowTool::new("fast", 1);
+    engine.register_tool(hanging.definition());
+    engine.register_tool(fast.definition());
+
+    let cancel = engine.cancel_sender();
+    let cancel_task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        cancel.send(()).await.unwrap();
+    });
+    let mut history = History::new();
+    let output = engine.run(&mut history, "start").await;
+    let mut engine = output.engine;
+    cancel_task.await.unwrap();
+
+    let completed_before_resume = history
+        .iter()
+        .filter(|entry| {
+            matches!(
+                &entry.item,
+                Item::ToolResult { call_id, .. } if call_id == "call_fast"
+            )
+        })
+        .count();
+    assert_eq!(completed_before_resume, 1);
+    assert_eq!(fast.call_count(), 1);
+    assert_eq!(hanging.call_count(), 1);
+
+    let _ = engine.resume(&mut history).await;
+
+    assert_eq!(
+        fast.call_count(),
+        1,
+        "completed call must not be re-executed"
+    );
+    assert_eq!(
+        hanging.call_count(),
+        2,
+        "only the unresolved call is retried"
+    );
+    let completed_after_resume = history
+        .iter()
+        .filter(|entry| {
+            matches!(
+                &entry.item,
+                Item::ToolResult { call_id, .. } if call_id == "call_fast"
+            )
+        })
+        .count();
+    assert_eq!(completed_after_resume, 1);
+}
+
+#[tokio::test]
+async fn tool_result_commit_failure_prevents_publication() {
+    let client = MockLlmClient::with_responses(vec![vec![
+        Event::tool_use_start(0, "call_fast", "fast"),
+        Event::tool_input_delta(0, r#"{}"#),
+        Event::tool_use_stop(0),
+        Event::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        }),
+    ]]);
+    let mut engine = Engine::new(client);
+    engine.register_tool(SlowTool::new("fast", 1).definition());
+
+    let published = Arc::new(AtomicUsize::new(0));
+    let published_probe = published.clone();
+    engine.on_tool_result(move |_| {
+        published_probe.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let mut history = History::new();
+    let mut reject_tool_result = |item: &Item| {
+        if matches!(item, Item::ToolResult { .. }) {
+            Err("session log unavailable".to_string())
+        } else {
+            Ok(())
+        }
+    };
+    let _ = engine
+        .run_with_annotation(&mut history, "start", &mut reject_tool_result)
+        .await;
+
+    assert_eq!(published.load(Ordering::SeqCst), 0);
+    assert!(
+        history
+            .iter()
+            .all(|entry| !matches!(entry.item, Item::ToolResult { .. }))
+    );
 }
 
 #[tokio::test]
