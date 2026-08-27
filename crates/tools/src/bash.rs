@@ -1,5 +1,6 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
@@ -20,15 +21,28 @@ struct BashParams {
 
 pub(crate) struct BashTool {
     session: WorkdirSessionHandle,
+    state: Arc<Mutex<BashExecutionState>>,
+}
+
+#[derive(Default)]
+struct BashExecutionState {
+    active: HashMap<String, CommandHandle>,
+    cancellation_requested: HashSet<String>,
 }
 
 struct CommandGuard {
     session: WorkdirSessionHandle,
+    state: Arc<Mutex<BashExecutionState>>,
+    call_id: String,
     handle: Option<CommandHandle>,
 }
 
 impl Drop for CommandGuard {
     fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        state.active.remove(&self.call_id);
+        state.cancellation_requested.remove(&self.call_id);
+        drop(state);
         if let Some(handle) = self.handle.take() {
             let workdir = self.session.clone();
             tokio::spawn(async move {
@@ -52,20 +66,35 @@ impl Tool for BashTool {
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .clamp(1, MAX_TIMEOUT_SECS);
         let cmd_summary = truncate_for_summary(&params.command);
+        let call_id = ctx.call_id;
+        let mut guard = CommandGuard {
+            session: self.session.clone(),
+            state: self.state.clone(),
+            call_id: call_id.clone(),
+            handle: None,
+        };
         let handle = self
             .session
             .start_command(CommandRequest {
                 command: params.command,
                 timeout_secs,
                 output_limit: INLINE_BYTE_BUDGET,
-                tool_call_id: Some(ctx.call_id),
+                tool_call_id: Some(call_id.clone()),
             })
             .await
             .map_err(crate::ToolsError::from)?;
-        let mut guard = CommandGuard {
-            session: self.session.clone(),
-            handle: Some(handle.clone()),
+        let cancel_after_start = {
+            let mut state = self.state.lock().unwrap();
+            state.active.insert(call_id.clone(), handle.clone());
+            state.cancellation_requested.contains(&call_id)
         };
+        guard.handle = Some(handle.clone());
+        if cancel_after_start {
+            self.session
+                .cancel_command(handle.clone())
+                .await
+                .map_err(crate::ToolsError::from)?;
+        }
         let output = self
             .session
             .command_output(CommandOutputRequest {
@@ -76,9 +105,17 @@ impl Tool for BashTool {
             })
             .await
             .map_err(crate::ToolsError::from)?;
+        let cancellation_requested = {
+            let mut state = self.state.lock().unwrap();
+            state.active.remove(&call_id);
+            state.cancellation_requested.remove(&call_id)
+        };
         guard.handle = None;
 
-        let summary = if output.timed_out {
+        let timed_out = output.timed_out;
+        let summary = if cancellation_requested {
+            format!("$ {cmd_summary} (cancelled)")
+        } else if output.timed_out {
             format!("$ {cmd_summary} (timed out after {timeout_secs}s)")
         } else {
             match output.exit_code {
@@ -97,11 +134,33 @@ impl Tool for BashTool {
         } else {
             Some(output.content)
         };
-        Ok(ToolOutput {
+        let output = ToolOutput {
             summary,
             content,
             attachments: Vec::new(),
-        })
+        };
+        if cancellation_requested {
+            Err(ToolError::Cancelled(output))
+        } else if timed_out {
+            Err(ToolError::Interrupted(output))
+        } else {
+            Ok(output)
+        }
+    }
+
+    async fn cancel(&self, call_id: &str) -> Result<(), ToolError> {
+        let handle = {
+            let mut state = self.state.lock().unwrap();
+            state.cancellation_requested.insert(call_id.to_string());
+            state.active.get(call_id).cloned()
+        };
+        if let Some(handle) = handle {
+            self.session
+                .cancel_command(handle)
+                .await
+                .map_err(crate::ToolsError::from)?;
+        }
+        Ok(())
     }
 }
 
@@ -123,6 +182,7 @@ pub fn bash_tool(session: WorkdirSessionHandle, _output_dir: PathBuf) -> ToolDef
             .input_schema(serde_json::to_value(schema).expect("Bash schema serialization"));
         let tool: Arc<dyn Tool> = Arc::new(BashTool {
             session: session.clone(),
+            state: Arc::new(Mutex::new(BashExecutionState::default())),
         });
         (meta, tool)
     })

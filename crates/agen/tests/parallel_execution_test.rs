@@ -10,6 +10,7 @@ use agen::interceptor::{Interceptor, PostToolAction, PreToolAction, ToolCallInfo
 use agen::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use agen::tool::{
     Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput, ToolResult,
+    ToolResultDisposition,
 };
 use agen::{Engine, History, Item};
 use async_trait::async_trait;
@@ -109,6 +110,53 @@ impl Tool for FirstAttemptHangsTool {
             std::future::pending::<()>().await;
         }
         Ok("completed on retry".to_string().into())
+    }
+}
+
+#[derive(Clone)]
+struct CooperativeCancelTool {
+    calls: Arc<AtomicUsize>,
+    cancelled: Arc<tokio::sync::Notify>,
+}
+
+impl CooperativeCancelTool {
+    fn new() -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+            cancelled: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        let tool = self.clone();
+        Arc::new(move || {
+            let meta = ToolMeta::new("cooperative")
+                .description("Returns bounded progress after cancellation")
+                .input_schema(serde_json::json!({"type": "object"}));
+            (meta, Arc::new(tool.clone()) as Arc<dyn Tool>)
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for CooperativeCancelTool {
+    async fn execute(
+        &self,
+        _input_json: &str,
+        _ctx: ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.cancelled.notified().await;
+        Err(ToolError::Cancelled(ToolOutput {
+            summary: "cooperative command cancelled".to_string(),
+            content: Some("stdout before cancellation\nstderr before cancellation".to_string()),
+            attachments: Vec::new(),
+        }))
+    }
+
+    async fn cancel(&self, _call_id: &str) -> Result<(), ToolError> {
+        self.cancelled.notify_one();
+        Ok(())
     }
 }
 
@@ -269,6 +317,7 @@ async fn completed_results_commit_before_publish_without_waiting_for_siblings() 
     let _ = engine
         .run_with_annotation(&mut history, "run both", &mut annotate)
         .await;
+    observed.lock().unwrap().push("run-returned".to_string());
 
     assert_eq!(
         observed.lock().unwrap().as_slice(),
@@ -277,6 +326,7 @@ async fn completed_results_commit_before_publish_without_waiting_for_siblings() 
             "publish:call_fast",
             "commit:call_slow",
             "publish:call_slow",
+            "run-returned",
         ]
     );
 
@@ -308,9 +358,12 @@ async fn cancellation_preserves_completed_results_and_resume_skips_them() {
             Event::tool_use_start(0, "call_hang", "hang_once"),
             Event::tool_input_delta(0, r#"{}"#),
             Event::tool_use_stop(0),
-            Event::tool_use_start(1, "call_fast", "fast"),
+            Event::tool_use_start(1, "call_fast_a", "fast_a"),
             Event::tool_input_delta(1, r#"{}"#),
             Event::tool_use_stop(1),
+            Event::tool_use_start(2, "call_fast_b", "fast_b"),
+            Event::tool_input_delta(2, r#"{}"#),
+            Event::tool_use_stop(2),
             Event::Status(StatusEvent {
                 status: ResponseStatus::Completed,
             }),
@@ -326,9 +379,11 @@ async fn cancellation_preserves_completed_results_and_resume_skips_them() {
     ]);
     let mut engine = Engine::new(client);
     let hanging = FirstAttemptHangsTool::new();
-    let fast = SlowTool::new("fast", 1);
+    let fast_a = SlowTool::new("fast_a", 1);
+    let fast_b = SlowTool::new("fast_b", 2);
     engine.register_tool(hanging.definition());
-    engine.register_tool(fast.definition());
+    engine.register_tool(fast_a.definition());
+    engine.register_tool(fast_b.definition());
 
     let cancel = engine.cancel_sender();
     let cancel_task = tokio::spawn(async move {
@@ -345,36 +400,182 @@ async fn cancellation_preserves_completed_results_and_resume_skips_them() {
         .filter(|entry| {
             matches!(
                 &entry.item,
-                Item::ToolResult { call_id, .. } if call_id == "call_fast"
+                Item::ToolResult { call_id, .. }
+                    if call_id == "call_fast_a" || call_id == "call_fast_b"
             )
         })
         .count();
-    assert_eq!(completed_before_resume, 1);
-    assert_eq!(fast.call_count(), 1);
+    let unknown_before_resume = history
+        .iter()
+        .filter(|entry| {
+            matches!(
+                &entry.item,
+                Item::ToolResult {
+                    call_id,
+                    disposition: ToolResultDisposition::OutcomeUnknown,
+                    ..
+                } if call_id == "call_hang"
+            )
+        })
+        .count();
+    assert_eq!(completed_before_resume, 2);
+    assert_eq!(unknown_before_resume, 1);
+    assert_eq!(fast_a.call_count(), 1);
+    assert_eq!(fast_b.call_count(), 1);
     assert_eq!(hanging.call_count(), 1);
 
     let _ = engine.resume(&mut history).await;
 
     assert_eq!(
-        fast.call_count(),
+        fast_a.call_count(),
+        1,
+        "completed call must not be re-executed"
+    );
+    assert_eq!(
+        fast_b.call_count(),
         1,
         "completed call must not be re-executed"
     );
     assert_eq!(
         hanging.call_count(),
-        2,
-        "only the unresolved call is retried"
+        1,
+        "OutcomeUnknown is terminal and must not be re-executed"
     );
     let completed_after_resume = history
         .iter()
         .filter(|entry| {
             matches!(
                 &entry.item,
-                Item::ToolResult { call_id, .. } if call_id == "call_fast"
+                Item::ToolResult { call_id, .. }
+                    if call_id == "call_fast_a" || call_id == "call_fast_b"
             )
         })
         .count();
-    assert_eq!(completed_after_resume, 1);
+    assert_eq!(completed_after_resume, 2);
+    assert_eq!(
+        history
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    &entry.item,
+                    Item::ToolResult {
+                        call_id,
+                        disposition: ToolResultDisposition::OutcomeUnknown,
+                        ..
+                    } if call_id == "call_hang"
+                )
+            })
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn cooperative_cancellation_commits_bounded_terminal_output() {
+    let client = MockLlmClient::with_responses(vec![vec![
+        Event::tool_use_start(0, "call_cooperative", "cooperative"),
+        Event::tool_input_delta(0, r#"{}"#),
+        Event::tool_use_stop(0),
+        Event::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        }),
+    ]]);
+    let mut engine = Engine::new(client);
+    let tool = CooperativeCancelTool::new();
+    engine.register_tool(tool.definition());
+    let observed = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let published = observed.clone();
+    engine.on_tool_result(move |_| published.lock().unwrap().push("published"));
+    let committed = observed.clone();
+    let mut annotate = move |item: &Item| {
+        if matches!(item, Item::ToolResult { .. }) {
+            committed.lock().unwrap().push("committed");
+        }
+        Ok(())
+    };
+
+    let cancel = engine.cancel_sender();
+    let cancel_task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        cancel.send(()).await.unwrap();
+    });
+    let mut history = History::new();
+    let output = engine
+        .run_with_annotation(&mut history, "start", &mut annotate)
+        .await;
+    observed.lock().unwrap().push("run-returned");
+    cancel_task.await.unwrap();
+
+    assert_eq!(
+        observed.lock().unwrap().as_slice(),
+        ["committed", "published", "run-returned"]
+    );
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    let terminal: Vec<_> = history
+        .iter()
+        .filter_map(|entry| match &entry.item {
+            Item::ToolResult {
+                call_id,
+                disposition,
+                content,
+                ..
+            } if call_id == "call_cooperative" => Some((*disposition, content.as_deref())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(terminal.len(), 1);
+    assert_eq!(terminal[0].0, ToolResultDisposition::Cancelled);
+    assert_eq!(
+        terminal[0].1,
+        Some("stdout before cancellation\nstderr before cancellation")
+    );
+    assert!(matches!(
+        output.result,
+        agen::EngineRunExit::Interrupted(agen::StopReason::Cancelled)
+    ));
+}
+
+#[tokio::test]
+async fn cancellation_completion_race_commits_one_terminal_output() {
+    for iteration in 0..24u64 {
+        let client = MockLlmClient::with_responses(vec![
+            vec![
+                Event::tool_use_start(0, "call_racy", "racy"),
+                Event::tool_input_delta(0, r#"{}"#),
+                Event::tool_use_stop(0),
+                Event::Status(StatusEvent {
+                    status: ResponseStatus::Completed,
+                }),
+            ],
+            vec![Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            })],
+        ]);
+        let mut engine = Engine::new(client);
+        let delay = 2 + iteration % 3;
+        let tool = SlowTool::new("racy", delay);
+        engine.register_tool(tool.definition());
+        let cancel = engine.cancel_sender();
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            let _ = cancel.send(()).await;
+        });
+
+        let mut history = History::new();
+        let _ = engine.run(&mut history, "race").await;
+        cancel_task.await.unwrap();
+        let terminal_count = history
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    &entry.item,
+                    Item::ToolResult { call_id, .. } if call_id == "call_racy"
+                )
+            })
+            .count();
+        assert_eq!(terminal_count, 1, "iteration {iteration}");
+        assert_eq!(tool.call_count(), 1, "iteration {iteration}");
+    }
 }
 
 #[tokio::test]

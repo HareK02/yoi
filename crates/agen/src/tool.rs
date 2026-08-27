@@ -23,6 +23,12 @@ pub enum ToolError {
     /// Internal error
     #[error("Internal error: {0}")]
     Internal(String),
+    /// Cooperative cancellation completed with bounded terminal output.
+    #[error("Tool execution cancelled")]
+    Cancelled(ToolOutput),
+    /// Execution was interrupted with a confirmed bounded terminal output.
+    #[error("Tool execution interrupted")]
+    Interrupted(ToolOutput),
 }
 
 // =============================================================================
@@ -156,6 +162,28 @@ impl<'de> Deserialize<'de> for ImageAttachment {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum Attachment {
     Image(ImageAttachment),
+}
+
+/// Terminal disposition of one started tool call.
+///
+/// `Cancelled` means the tool confirmed cancellation. `OutcomeUnknown` means
+/// execution stopped without confirmation, so neither completion nor side
+/// effects may be inferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultDisposition {
+    #[default]
+    Success,
+    Error,
+    Interrupted,
+    Cancelled,
+    OutcomeUnknown,
+}
+
+impl ToolResultDisposition {
+    pub const fn is_success(&self) -> bool {
+        matches!(self, Self::Success)
+    }
 }
 
 /// Tool execution result.
@@ -402,6 +430,17 @@ pub trait Tool: Send + Sync {
         input_json: &str,
         ctx: ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError>;
+
+    /// Request cooperative cancellation for one started call.
+    ///
+    /// Implementations that own cancellable provider operations should signal
+    /// the exact execution identified by `call_id`, then let `execute` return
+    /// the confirmed bounded terminal output. The Engine applies a bounded
+    /// grace period and falls back to `OutcomeUnknown` when confirmation never
+    /// arrives.
+    async fn cancel(&self, _call_id: &str) -> Result<(), ToolError> {
+        Ok(())
+    }
 }
 
 // =============================================================================
@@ -429,6 +468,9 @@ pub struct ToolCall {
 pub struct ToolResult {
     /// Corresponding tool call ID
     pub tool_use_id: String,
+    /// Typed terminal state.
+    #[serde(default, skip_serializing_if = "ToolResultDisposition::is_success")]
+    pub disposition: ToolResultDisposition,
     /// Short summary (always kept in history)
     pub summary: String,
     /// Detailed output (prunable)
@@ -445,11 +487,20 @@ pub struct ToolResult {
 impl ToolResult {
     /// Create a success result from a [`ToolOutput`].
     pub fn from_output(tool_use_id: impl Into<String>, output: ToolOutput) -> Self {
+        Self::from_output_with_disposition(tool_use_id, output, ToolResultDisposition::Success)
+    }
+
+    pub fn from_output_with_disposition(
+        tool_use_id: impl Into<String>,
+        output: ToolOutput,
+        disposition: ToolResultDisposition,
+    ) -> Self {
         Self {
             tool_use_id: tool_use_id.into(),
+            disposition,
             summary: output.summary,
             content: output.content,
-            is_error: false,
+            is_error: !disposition.is_success(),
             attachments: output.attachments,
         }
     }
@@ -458,8 +509,24 @@ impl ToolResult {
     pub fn error(tool_use_id: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             tool_use_id: tool_use_id.into(),
+            disposition: ToolResultDisposition::Error,
             summary: message.into(),
             content: None,
+            is_error: true,
+            attachments: Vec::new(),
+        }
+    }
+
+    /// Close an execution whose completion and side effects cannot be confirmed.
+    pub fn outcome_unknown(tool_use_id: impl Into<String>) -> Self {
+        Self {
+            tool_use_id: tool_use_id.into(),
+            disposition: ToolResultDisposition::OutcomeUnknown,
+            summary: "Tool execution outcome unknown".to_string(),
+            content: Some(
+                "Execution was interrupted before completion could be confirmed. Completion and side effects are unknown."
+                    .to_string(),
+            ),
             is_error: true,
             attachments: Vec::new(),
         }

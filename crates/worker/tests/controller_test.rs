@@ -2169,9 +2169,13 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
     for item in items {
         match item {
             agen::Item::ToolResult {
-                call_id, summary, ..
+                call_id,
+                summary,
+                disposition,
+                ..
             } if call_id == "call_orphan" => {
-                assert_eq!(summary, "[Interrupted by user]");
+                assert_eq!(summary, "Tool execution outcome unknown");
+                assert_eq!(*disposition, agen::ToolResultDisposition::OutcomeUnknown);
                 saw_synthetic_tool_result = true;
             }
             agen::Item::Message { role, content, .. } if *role == agen::Role::System => {
@@ -2362,8 +2366,11 @@ async fn paused_cancel_abandons_resume_and_next_input_is_fresh_run() {
     assert!(
         items.iter().any(|item| matches!(
             item,
-            agen::Item::ToolResult { call_id, summary, .. }
-                if call_id == "call_cancelled" && summary == "[Interrupted by user]"
+            agen::Item::ToolResult {
+                call_id,
+                disposition: agen::ToolResultDisposition::OutcomeUnknown,
+                ..
+            } if call_id == "call_cancelled"
         )),
         "paused cancel should close orphan tool_use before future requests: {items:?}"
     );

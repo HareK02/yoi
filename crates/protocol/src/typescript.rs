@@ -8,7 +8,7 @@ use crate::{
     CompletionKind, ErrorCode, Event, Greeting, InFlightBlock, InFlightSnapshot,
     InFlightToolCallState, InternalWorkerKind, InternalWorkerRef, InternalWorkerSnapshot,
     InvokeKind, MemoryWorkerEvent, Method, Permission, RewindSummary, RewindTarget, RewindTargetId,
-    RunResult, ScopeRule, Segment, TurnResult, WorkerEvent, WorkerStatus,
+    RunResult, ScopeRule, Segment, ToolResultDisposition, TurnResult, WorkerEvent, WorkerStatus,
     subscription::{
         EventSubscriptionSelector, SubscriptionEvent, SubscriptionEventPayload, SubscriptionFrame,
         SubscriptionFramePayload, SubscriptionId, SubscriptionRejectionCode, SubscriptionRequest,
@@ -45,6 +45,7 @@ pub fn generated_protocol_types() -> String {
     push_decl::<TurnResult>(&cfg, &mut output);
     push_decl::<InvokeKind>(&cfg, &mut output);
     push_decl::<RunResult>(&cfg, &mut output);
+    push_decl::<ToolResultDisposition>(&cfg, &mut output);
     push_decl::<ErrorCode>(&cfg, &mut output);
     push_decl::<Permission>(&cfg, &mut output);
     push_decl::<InFlightToolCallState>(&cfg, &mut output);

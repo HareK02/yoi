@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::{marker::PhantomData, sync::Arc, time::Instant};
 
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+use tokio::time::{Duration, Instant as TokioInstant};
 use tracing::{debug, info, trace, warn};
 
 use crate::{
@@ -27,10 +28,13 @@ use crate::{
     timeline::{TextBlockCollector, ThinkingBlockCollector, Timeline, ToolCallCollector},
     tool::{
         ToolCall, ToolDefinition as EngineToolDefinition, ToolError, ToolExecutionContext,
-        ToolOutputLimits, ToolResult, truncate_content,
+        ToolOutputLimits, ToolResult, ToolResultDisposition, truncate_content,
     },
     tool_server::{ToolServer, ToolServerHandle},
 };
+
+const TOOL_CANCEL_SIGNAL_TIMEOUT: Duration = Duration::from_millis(100);
+const TOOL_CANCEL_GRACE_PERIOD: Duration = Duration::from_millis(500);
 
 /// Engine errors
 #[derive(Debug, thiserror::Error)]
@@ -53,6 +57,9 @@ pub enum EngineError {
     /// A durable-history observer rejected an item before it entered history.
     #[error("History append failed: {0}")]
     HistoryAppend(String),
+    /// Tool terminalization lost its execution-attempt compare-and-set fence.
+    #[error("Tool execution attempt fence failed: {0}")]
+    ToolAttemptFence(String),
 }
 
 /// Tool registration error
@@ -181,6 +188,64 @@ pub struct EngineRunOutput<C: LlmClient, A = ()> {
 enum ToolExecutionResult {
     Completed,
     Paused,
+}
+
+#[derive(Debug, Clone)]
+struct ToolExecutionAttempt {
+    attempt_id: String,
+    terminal: bool,
+}
+
+/// Per-batch compare-and-set fence for terminal ToolResult commits.
+///
+/// A completion may commit only when its attempt id still matches the active
+/// execution for that call and no prior terminal output has won the fence.
+#[derive(Debug, Default)]
+struct ToolExecutionAttemptFence {
+    attempts: HashMap<String, ToolExecutionAttempt>,
+}
+
+impl ToolExecutionAttemptFence {
+    fn register(&mut self, call_id: String, attempt_id: String) {
+        self.attempts.insert(
+            call_id,
+            ToolExecutionAttempt {
+                attempt_id,
+                terminal: false,
+            },
+        );
+    }
+
+    fn can_commit(&self, call_id: &str, attempt_id: &str) -> bool {
+        matches!(
+            self.attempts.get(call_id),
+            Some(attempt) if attempt.attempt_id == attempt_id && !attempt.terminal
+        )
+    }
+
+    fn commit_terminal(&mut self, call_id: &str, attempt_id: &str) -> bool {
+        let Some(attempt) = self.attempts.get_mut(call_id) else {
+            return false;
+        };
+        if attempt.attempt_id != attempt_id || attempt.terminal {
+            return false;
+        }
+        attempt.terminal = true;
+        true
+    }
+
+    fn is_terminal(&self, call_id: &str) -> bool {
+        self.attempts
+            .get(call_id)
+            .is_some_and(|attempt| attempt.terminal)
+    }
+
+    #[cfg(test)]
+    fn attempt_id(&self, call_id: &str) -> Option<&str> {
+        self.attempts
+            .get(call_id)
+            .map(|attempt| attempt.attempt_id.as_str())
+    }
 }
 
 const MAX_STREAM_CONTINUATIONS: u32 = 3;
@@ -1100,40 +1165,73 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
                         context.clone(),
                     ),
                 );
-                approved_calls.push((tool_call, context));
+                approved_calls.push((tool_call, context, Some(info.tool)));
             } else {
                 // Unknown tools go into approved list as-is (will error at execution)
                 let context = ToolExecutionContext::new(&tool_call.id, &batch_id, call_index);
-                approved_calls.push((tool_call, context));
+                approved_calls.push((tool_call, context, None));
             }
         }
 
         // Phase 2: Execute approved tools in parallel. FuturesUnordered yields
         // each terminal result as soon as that call completes instead of
         // holding fast siblings behind the slowest call in the batch.
+        let started_calls: Vec<_> = approved_calls
+            .iter()
+            .map(|(tool_call, context, _)| (tool_call.id.clone(), context.batch_id.clone()))
+            .collect();
+        let mut attempt_fence = ToolExecutionAttemptFence::default();
+        for (call_id, attempt_id) in &started_calls {
+            attempt_fence.register(call_id.clone(), attempt_id.clone());
+        }
         let futures: FuturesUnordered<_> = approved_calls
             .into_iter()
-            .map(|(tool_call, context)| {
-                let tool_server = self.tool_server.clone();
-                async move {
-                    let input_json = serde_json::to_string(&tool_call.input).unwrap_or_default();
-                    match tool_server
-                        .call_tool(&tool_call.name, &input_json, context)
-                        .await
-                    {
+            .map(|(tool_call, context, tool)| async move {
+                let attempt_id = context.batch_id.clone();
+                let input_json = serde_json::to_string(&tool_call.input).unwrap_or_default();
+                let result = match tool {
+                    None => ToolResult::error(
+                        &tool_call.id,
+                        format!("Tool not found: {}", tool_call.name),
+                    ),
+                    Some(tool) => match tool.execute(&input_json, context).await {
                         Ok(output) => ToolResult::from_output(&tool_call.id, output),
-                        Err(e) => ToolResult::error(&tool_call.id, e.to_string()),
-                    }
-                }
+                        Err(ToolError::Cancelled(output)) => {
+                            ToolResult::from_output_with_disposition(
+                                &tool_call.id,
+                                output,
+                                ToolResultDisposition::Cancelled,
+                            )
+                        }
+                        Err(ToolError::Interrupted(output)) => {
+                            ToolResult::from_output_with_disposition(
+                                &tool_call.id,
+                                output,
+                                ToolResultDisposition::Interrupted,
+                            )
+                        }
+                        Err(error) => ToolResult::error(&tool_call.id, error.to_string()),
+                    },
+                };
+                (attempt_id, result)
             })
             .collect();
 
         // Synthetic results are already terminal and need no execution wait.
         // Commit them before polling ordinary calls so they obey the same
         // commit-before-publish boundary.
+        let mut terminal_call_ids = HashSet::new();
         for result in synthetic_results {
-            self.finalize_and_commit_tool_result(history, annotate, result, &call_info_map)
-                .await?;
+            self.finalize_and_commit_tool_result(
+                history,
+                annotate,
+                result,
+                None,
+                &call_info_map,
+                &mut attempt_fence,
+                &mut terminal_call_ids,
+            )
+            .await?;
         }
 
         let mut futures = futures;
@@ -1144,18 +1242,94 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
                 // output observed before the cancellation boundary.
                 biased;
                 result = futures.next() => {
-                    let result = result.expect("non-empty FuturesUnordered returns a result");
+                    let (attempt_id, result) =
+                        result.expect("non-empty FuturesUnordered returns a result");
                     self.finalize_and_commit_tool_result(
                         history,
                         annotate,
                         result,
+                        Some(&attempt_id),
                         &call_info_map,
+                        &mut attempt_fence,
+                        &mut terminal_call_ids,
                     ).await?;
                 }
                 cancel = self.cancel_rx.recv() => {
                     if cancel.is_some() {
-                        info!("Tool execution cancelled");
+                        info!("Tool execution cancellation requested");
                     }
+
+                    let cancellation_requests = call_info_map
+                        .iter()
+                        .filter(|(call_id, _)| !terminal_call_ids.contains(*call_id))
+                        .map(|(call_id, (_, _, tool, _))| {
+                            let call_id = call_id.clone();
+                            let tool = tool.clone();
+                            async move { (call_id.clone(), tool.cancel(&call_id).await) }
+                        });
+                    let cancellation_requests: FuturesUnordered<_> =
+                        cancellation_requests.collect();
+                    match tokio::time::timeout(
+                        TOOL_CANCEL_SIGNAL_TIMEOUT,
+                        cancellation_requests.collect::<Vec<_>>(),
+                    )
+                    .await
+                    {
+                        Ok(results) => {
+                            for (call_id, result) in results {
+                                if let Err(error) = result {
+                                    warn!(
+                                        %call_id,
+                                        error = %error,
+                                        "Tool cooperative cancellation request failed"
+                                    );
+                                }
+                            }
+                        }
+                        Err(_) => warn!("Tool cooperative cancellation request timed out"),
+                    }
+
+                    // Keep polling the original execution futures for a bounded
+                    // grace period so cooperative providers can return their
+                    // confirmed terminal output, including bounded progress.
+                    let deadline = TokioInstant::now() + TOOL_CANCEL_GRACE_PERIOD;
+                    while !futures.is_empty() {
+                        tokio::select! {
+                            biased;
+                            result = futures.next() => {
+                                let (attempt_id, result) =
+                                    result.expect("non-empty FuturesUnordered returns a result");
+                                self.finalize_and_commit_tool_result(
+                                    history,
+                                    annotate,
+                                    result,
+                                    Some(&attempt_id),
+                                    &call_info_map,
+                                    &mut attempt_fence,
+                                    &mut terminal_call_ids,
+                                ).await?;
+                            }
+                            _ = tokio::time::sleep_until(deadline) => break,
+                        }
+                    }
+
+                    // Calls that did not confirm a terminal outcome inside the
+                    // grace period are durably closed as OutcomeUnknown before
+                    // Engine/Worker final status becomes observable.
+                    for (call_id, attempt_id) in &started_calls {
+                        if !attempt_fence.is_terminal(call_id) {
+                            self.finalize_and_commit_tool_result(
+                                history,
+                                annotate,
+                                ToolResult::outcome_unknown(call_id),
+                                Some(attempt_id),
+                                &call_info_map,
+                                &mut attempt_fence,
+                                &mut terminal_call_ids,
+                            ).await?;
+                        }
+                    }
+
                     self.timeline.abort_current_block();
                     return Err(EngineError::Cancelled);
                 }
@@ -1172,6 +1346,7 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
         history: &mut History<A>,
         annotate: &mut impl FnMut(&Item) -> Result<A, String>,
         mut tool_result: ToolResult,
+        execution_attempt_id: Option<&str>,
         call_info_map: &HashMap<
             String,
             (
@@ -1181,7 +1356,24 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
                 ToolExecutionContext,
             ),
         >,
-    ) -> Result<(), EngineError> {
+        attempt_fence: &mut ToolExecutionAttemptFence,
+        terminal_call_ids: &mut HashSet<String>,
+    ) -> Result<bool, EngineError> {
+        let call_id = tool_result.tool_use_id.as_str();
+        let may_commit = match execution_attempt_id {
+            Some(attempt_id) => attempt_fence.can_commit(call_id, attempt_id),
+            None => !terminal_call_ids.contains(call_id),
+        };
+        if !may_commit {
+            warn!(
+                call_id,
+                execution_attempt_id,
+                disposition = ?tool_result.disposition,
+                "Ignoring stale or duplicate tool result after terminal output commit"
+            );
+            return Ok(false);
+        }
+
         let call_info = call_info_map.get(&tool_result.tool_use_id);
         if let Some((tool_call, meta, tool, context)) = call_info {
             let mut info = ToolResultInfo {
@@ -1200,6 +1392,10 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
             }
             tool_result = info.result;
         }
+        if tool_result.is_error && tool_result.disposition.is_success() {
+            tool_result.disposition = ToolResultDisposition::Error;
+        }
+        tool_result.is_error = !tool_result.disposition.is_success();
 
         // Cap content only after post_tool_call so interceptors still observe
         // the full payload and any content they inject is bounded too.
@@ -1229,16 +1425,33 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
             }
         }
 
-        let item = Item::tool_result_item_with_attachments(
+        let item = Item::tool_result_item_with_disposition_and_attachments(
             &tool_result.tool_use_id,
             &tool_result.summary,
             tool_result.content.clone(),
-            tool_result.is_error,
+            tool_result.disposition,
             tool_result.attachments.clone(),
         );
         self.append_history_items(history, std::iter::once(item), annotate)?;
+        if let Some(attempt_id) = execution_attempt_id
+            && !attempt_fence.commit_terminal(&tool_result.tool_use_id, attempt_id)
+        {
+            return Err(EngineError::ToolAttemptFence(
+                "tool execution attempt fence changed during terminal commit".to_string(),
+            ));
+        }
+        terminal_call_ids.insert(tool_result.tool_use_id.clone());
+        debug!(
+            tool = call_info
+                .map(|(call, _, _, _)| call.name.as_str())
+                .unwrap_or("unknown"),
+            call_id = %tool_result.tool_use_id,
+            execution_attempt_id,
+            disposition = ?tool_result.disposition,
+            "Tool execution terminalized"
+        );
         self.emit_tool_result(&tool_result);
-        Ok(())
+        Ok(true)
     }
 
     /// Internal turn execution logic
@@ -2377,6 +2590,21 @@ mod tests {
     use super::*;
     use crate::tool::{Attachment, ImageAttachment};
     use std::time::Duration;
+
+    #[test]
+    fn tool_execution_attempt_fence_rejects_duplicate_and_stale_results() {
+        let mut fence = ToolExecutionAttemptFence::default();
+        fence.register("call".to_string(), "attempt-1".to_string());
+        assert!(fence.can_commit("call", "attempt-1"));
+        assert!(fence.commit_terminal("call", "attempt-1"));
+        assert!(!fence.commit_terminal("call", "attempt-1"));
+
+        fence.register("call".to_string(), "attempt-2".to_string());
+        assert_eq!(fence.attempt_id("call"), Some("attempt-2"));
+        assert!(!fence.can_commit("call", "attempt-1"));
+        assert!(!fence.commit_terminal("call", "attempt-1"));
+        assert!(fence.commit_terminal("call", "attempt-2"));
+    }
 
     #[test]
     fn provider_projection_reorders_results_and_remaps_cache_anchor() {

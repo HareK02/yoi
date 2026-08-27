@@ -1244,6 +1244,7 @@ impl App {
                 id,
                 summary,
                 output,
+                disposition: _,
                 is_error,
             } => {
                 self.latest_llm_wait_event = None;

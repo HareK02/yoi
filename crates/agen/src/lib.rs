@@ -28,7 +28,9 @@ pub use handler::ToolUseBlockStart;
 pub use history::{History, HistoryEntry};
 pub use interceptor::Interceptor;
 pub use message::{ContentPart, Item, Message, Role};
-pub use tool::{ToolCall, ToolExecutionContext, ToolOutputLimits, ToolResult};
+pub use tool::{
+    ToolCall, ToolExecutionContext, ToolOutputLimits, ToolResult, ToolResultDisposition,
+};
 pub use usage_record::UsageRecord;
 
 /// Implementation dependencies used by code generated from `agen` macros.

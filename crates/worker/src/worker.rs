@@ -2953,50 +2953,52 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         Ok(())
     }
 
-    /// Stage the post-interruption cleanup at the front of worker
-    /// history: close every unanswered `Item::ToolCall` with a synthetic
-    /// `Item::ToolResult` (Anthropic wire-validity), then append a
-    /// system note so the LLM understands the prior turn was cut
-    /// short. Called from `Worker::run` when the worker's
-    /// `last_run_interrupted` flag is set (i.e. the Worker just transitioned
-    /// out of Paused via a new user input).
-    fn apply_interrupt_prep(&mut self) -> Result<(), WorkerError> {
+    /// Durably close every unanswered ToolCall before the interrupted run's
+    /// final lifecycle record/status is published.
+    fn terminalize_orphan_tool_calls(&mut self) -> Result<(), WorkerError> {
         let tool_result_summary = self
             .prompts()
             .load_full()
             .interrupt_tool_result_summary()
             .map_err(WorkerError::from)?;
+        let history_items = self.history();
+        let closures = crate::interrupt_prep::orphan_tool_result_closures(
+            &history_items,
+            &tool_result_summary,
+        );
+        if closures.is_empty() {
+            return Ok(());
+        }
+
+        let subject = worker_subject(self.session.session_id());
+        for item in closures {
+            let entry = HistoryEntry::new(
+                item,
+                new_history_metadata(
+                    WorkerHistoryProvenance::ToolOutput {
+                        worker: subject.clone(),
+                    },
+                    None,
+                ),
+            );
+            self.commit_entry(LogEntry::AnnotatedToolResult {
+                ts: segment_log::now_millis(),
+                entry: to_logged_history_entry(&entry),
+            })?;
+            self.session.history_mut().push_entry(entry);
+            self.session.note_mutation();
+        }
+        Ok(())
+    }
+
+    fn apply_interrupt_prep(&mut self) -> Result<(), WorkerError> {
+        self.terminalize_orphan_tool_calls()?;
         let system_note = self
             .prompts()
             .load_full()
             .interrupt_system_note()
             .map_err(WorkerError::from)?;
 
-        let history_items = self.history();
-        let closures = crate::interrupt_prep::orphan_tool_result_closures(
-            &history_items,
-            &tool_result_summary,
-        );
-        if !closures.is_empty() {
-            let subject = worker_subject(self.session.session_id());
-            for item in closures {
-                let entry = HistoryEntry::new(
-                    item,
-                    new_history_metadata(
-                        WorkerHistoryProvenance::ToolOutput {
-                            worker: subject.clone(),
-                        },
-                        None,
-                    ),
-                );
-                self.commit_entry(LogEntry::AnnotatedToolResult {
-                    ts: segment_log::now_millis(),
-                    entry: to_logged_history_entry(&entry),
-                })?;
-                self.session.history_mut().push_entry(entry);
-                self.session.note_mutation();
-            }
-        }
         let interrupt_prompt_provenance =
             self.prompt_render_provenance("internal.interrupt_system_note");
         let interrupt_metadata = new_history_metadata(
@@ -3262,6 +3264,12 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     where
         St: Clone + 'static,
     {
+        if matches!(
+            &result,
+            EngineRunExit::Paused | EngineRunExit::Interrupted(_)
+        ) {
+            self.terminalize_orphan_tool_calls()?;
+        }
         self.persist_turn(history_before, &result).await?;
 
         if matches!(result, EngineRunExit::Yielded) {
@@ -5928,7 +5936,8 @@ fn stop_reason_error_code(reason: &StopReason) -> ErrorCode {
             EngineError::Aborted(_)
             | EngineError::Cancelled
             | EngineError::ConfigWarnings(_)
-            | EngineError::HistoryAppend(_),
+            | EngineError::HistoryAppend(_)
+            | EngineError::ToolAttemptFence(_),
         ) => ErrorCode::Internal,
     }
 }
@@ -7862,6 +7871,7 @@ mod build_summary_prompt_tests {
                     summary: "wrote a file".into(),
                     content: None,
                     attachments: Vec::new(),
+                    disposition: Default::default(),
                     is_error: false,
                 },
             },
@@ -7904,6 +7914,7 @@ mod build_summary_prompt_tests {
                     summary: "wrote a file".into(),
                     content: None,
                     attachments: Vec::new(),
+                    disposition: Default::default(),
                     is_error: false,
                 },
             },
@@ -7948,6 +7959,7 @@ mod build_summary_prompt_tests {
                         summary: "side effect".into(),
                         content: None,
                         attachments: Vec::new(),
+                        disposition: Default::default(),
                         is_error: false,
                     },
                     metadata: new_history_metadata(
@@ -8045,6 +8057,74 @@ mod build_summary_prompt_tests {
             .to_string();
 
         assert!(err.contains("session head changed"));
+    }
+
+    #[tokio::test]
+    async fn interrupted_result_terminalizes_orphan_before_run_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = minimal_manifest();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let cwd = dir.path().join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let scope = Scope::writable(&cwd).unwrap();
+        let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
+        let mut worker = Worker::new(
+            manifest,
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+            store,
+            WorkerWorkspaceContext::local_filesystem(None),
+            authority,
+            scope,
+        )
+        .await
+        .unwrap();
+
+        worker.ensure_segment_head().unwrap();
+        worker.wire_history_persistence();
+        worker.set_history_for_test(vec![Item::tool_call("call-1", "Bash", "{}")]);
+        let _ = worker
+            .handle_worker_result(
+                EngineRunExit::Interrupted(StopReason::Cancelled),
+                worker.history().len(),
+            )
+            .await
+            .unwrap();
+
+        let entries = worker
+            .store
+            .read_all(
+                worker.segment_state.session_id(),
+                worker.segment_state.segment_id(),
+            )
+            .unwrap();
+        let terminal_index = entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry,
+                    LogEntry::AnnotatedToolResult {
+                        entry: session_store::LoggedHistoryEntry {
+                            item: session_store::LoggedItem::ToolResult {
+                                disposition: agen::ToolResultDisposition::OutcomeUnknown,
+                                ..
+                            },
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+            .expect("durable OutcomeUnknown closure");
+        let final_index = entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry,
+                    LogEntry::RunCompleted { .. } | LogEntry::RunErrored { .. }
+                )
+            })
+            .expect("durable final run status");
+        assert!(terminal_index < final_index);
     }
 
     #[tokio::test]

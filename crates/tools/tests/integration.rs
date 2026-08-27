@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use agen::tool::{Tool, ToolDefinition, ToolMeta};
+use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta};
 use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
 use serde_json::json;
 use tempfile::TempDir;
@@ -399,6 +399,46 @@ async fn bash_provider_output_does_not_expose_internal_paths() {
     assert!(body.contains("bounded WorkdirSession command output"));
     assert!(!body.contains(spill.path().to_str().unwrap()));
     assert_eq!(std::fs::read_dir(spill.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn bash_cancellation_returns_bounded_progress_as_terminal_output() {
+    let (_dir, _spill, reg) = setup();
+    let bash = reg.get("Bash");
+    let executing = bash.clone();
+    let execution = tokio::spawn(async move {
+        executing
+            .execute(
+                r#"{"command":"printf 'before\\n'; printf 'err-before\\n' >&2; sleep 5; printf 'after\\n'"}"#,
+                Default::default(),
+            )
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    bash.cancel("direct").await.expect("signal cancellation");
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2), execution)
+        .await
+        .expect("cancelled Bash should terminate inside the Engine grace budget")
+        .expect("Bash task join");
+
+    let ToolError::Cancelled(output) = error.expect_err("cancelled command is non-success") else {
+        panic!("expected typed cancellation result");
+    };
+    let content = output.content.expect("bounded progress output");
+    assert!(
+        content.contains("before"),
+        "missing pre-cancel stdout: {content}"
+    );
+    assert!(
+        content.contains("err-before"),
+        "missing pre-cancel stderr: {content}"
+    );
+    assert!(
+        !content.contains("after"),
+        "post-cancel output leaked: {content}"
+    );
+    assert!(content.len() <= 16 * 1024, "output must remain bounded");
 }
 
 // Sanity: unused Path import guard

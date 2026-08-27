@@ -352,6 +352,18 @@ pub struct InternalWorkerSnapshot {
     pub internal_workers: Vec<InternalWorkerSnapshot>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultDisposition {
+    #[default]
+    Success,
+    Error,
+    Interrupted,
+    Cancelled,
+    OutcomeUnknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
@@ -501,6 +513,8 @@ pub enum Event {
         /// summary-only, or when the result was pruned.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disposition: Option<ToolResultDisposition>,
         #[serde(default)]
         is_error: bool,
     },
@@ -1839,6 +1853,7 @@ mod tests {
             id: "call_1".into(),
             summary: "Read 128 bytes".into(),
             output: Some("hello world".into()),
+            disposition: Some(ToolResultDisposition::Success),
             is_error: false,
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -1855,11 +1870,13 @@ mod tests {
                 id,
                 summary,
                 output,
+                disposition,
                 is_error,
             } => {
                 assert_eq!(id, "call_1");
                 assert_eq!(summary, "Read 128 bytes");
                 assert_eq!(output.as_deref(), Some("hello world"));
+                assert_eq!(disposition, Some(ToolResultDisposition::Success));
                 assert!(!is_error);
             }
             other => panic!("expected ToolResult, got {other:?}"),
@@ -1872,6 +1889,7 @@ mod tests {
             id: "call_2".into(),
             summary: "ok".into(),
             output: None,
+            disposition: Some(ToolResultDisposition::Success),
             is_error: false,
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -1887,6 +1905,7 @@ mod tests {
             id: "call_3".into(),
             summary: "invalid argument".into(),
             output: None,
+            disposition: Some(ToolResultDisposition::Error),
             is_error: true,
         };
         let json = serde_json::to_string(&event).unwrap();

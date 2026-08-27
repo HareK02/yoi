@@ -16,6 +16,8 @@ export type InvokeKind = "user_send" | "notify" | "worker_event" | "system_remin
 
 export type RunResult = "finished" | "paused" | "limit_reached" | "rolled_back";
 
+export type ToolResultDisposition = "success" | "error" | "interrupted" | "cancelled" | "outcome_unknown";
+
 export type ErrorCode = "already_running" | "not_running" | "not_paused" | "provider_error" | "tool_error" | "invalid_request" | "internal";
 
 export type Permission = "read" | "write";
@@ -191,7 +193,7 @@ summary: string,
  * Full tool output. Absent when the tool chose to return
  * summary-only, or when the result was pruned.
  */
-output?: string | null, is_error: boolean, } } | { "event": "usage", "data": { input_tokens: number | null, output_tokens: number | null, cache_read_input_tokens?: number | null, } } | { "event": "run_end", "data": { result: RunResult, } } | { "event": "error", "data": { code: ErrorCode, message: string, } } | { "event": "snapshot", "data": { entries: Array<unknown>, greeting: Greeting, status: WorkerStatus,
+output?: string | null, disposition?: ToolResultDisposition | null, is_error: boolean, } } | { "event": "usage", "data": { input_tokens: number | null, output_tokens: number | null, cache_read_input_tokens?: number | null, } } | { "event": "run_end", "data": { result: RunResult, } } | { "event": "error", "data": { code: ErrorCode, message: string, } } | { "event": "snapshot", "data": { entries: Array<unknown>, greeting: Greeting, status: WorkerStatus,
 /**
  * Unfinished model output that has already streamed in the current
  * run but is not yet represented by committed snapshot entries.

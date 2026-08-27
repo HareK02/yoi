@@ -763,6 +763,19 @@ pub(crate) fn wire_event_bridges_on_engine<C, St>(
             id: result.tool_use_id.clone(),
             summary: result.summary.clone(),
             output: result.content.clone(),
+            disposition: Some(match result.disposition {
+                agen::ToolResultDisposition::Success => protocol::ToolResultDisposition::Success,
+                agen::ToolResultDisposition::Error => protocol::ToolResultDisposition::Error,
+                agen::ToolResultDisposition::Interrupted => {
+                    protocol::ToolResultDisposition::Interrupted
+                }
+                agen::ToolResultDisposition::Cancelled => {
+                    protocol::ToolResultDisposition::Cancelled
+                }
+                agen::ToolResultDisposition::OutcomeUnknown => {
+                    protocol::ToolResultDisposition::OutcomeUnknown
+                }
+            }),
             is_error: result.is_error,
         });
     });
