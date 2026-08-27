@@ -778,7 +778,7 @@ impl WorkspaceHttpTicketBackend {
                 if let Some(resource_key) = object
                     .get("resource_key")
                     .and_then(Value::as_str)
-                    .filter(|key| key.starts_with("T-"))
+                    .filter(|key| is_canonical_ticket_resource_key(key))
                     .map(ToOwned::to_owned)
                     && object.contains_key("id")
                 {

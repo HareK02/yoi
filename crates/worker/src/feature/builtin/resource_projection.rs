@@ -649,7 +649,10 @@ fn human_ref(object: &Map<String, Value>, key: &str, prefix: &str) -> Result<Str
 }
 
 fn validate_human_ref(value: String, prefix: &str) -> Result<String, String> {
-    if value.starts_with(prefix) && value.len() > prefix.len() {
+    let valid = value.strip_prefix(prefix).is_some_and(|sequence| {
+        !sequence.is_empty() && sequence.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    if valid {
         Ok(value)
     } else {
         Err(format!("required {prefix} human key is unavailable"))
@@ -766,6 +769,13 @@ mod tests {
         assert!(objective_json.contains("T-543"));
         assert!(!objective_json.contains("00001OBJECTIVEINTERNAL"));
         assert!(!objective_json.contains("00001TICKETINTERNAL"));
+    }
+
+    #[test]
+    fn human_resource_projection_rejects_noncanonical_keys() {
+        for (key, prefix) in [("T-key", "T-"), ("O-", "O-"), ("W-1x", "W-")] {
+            assert!(validate_human_ref(key.to_string(), prefix).is_err());
+        }
     }
 
     #[test]
