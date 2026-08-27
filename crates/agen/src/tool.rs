@@ -490,6 +490,9 @@ impl ToolExecutionHandle {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToolExecutionPolicy {
+    /// Time a pause waits for already-started providers to reach a natural safe
+    /// boundary before escalating to explicit cooperative cancellation.
+    pub pause_safe_boundary_timeout: std::time::Duration,
     /// Maximum time allowed for a provider to accept one cooperative
     /// cancellation request.
     pub cancellation_request_timeout: std::time::Duration,
@@ -501,6 +504,7 @@ pub struct ToolExecutionPolicy {
 impl Default for ToolExecutionPolicy {
     fn default() -> Self {
         Self {
+            pause_safe_boundary_timeout: std::time::Duration::from_millis(100),
             cancellation_request_timeout: std::time::Duration::from_millis(100),
             terminal_confirmation_timeout: std::time::Duration::from_millis(500),
         }

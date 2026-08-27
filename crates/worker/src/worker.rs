@@ -2581,7 +2581,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         result: &EngineRunExit,
         snapshot: &EmptyTurnRollbackSnapshot,
     ) -> bool {
-        if !matches!(result, EngineRunExit::Interrupted(StopReason::Cancelled)) {
+        if !matches!(
+            result,
+            EngineRunExit::Paused | EngineRunExit::Interrupted(StopReason::Cancelled)
+        ) {
             return false;
         }
         if self.ai_activity_counter.load(Ordering::SeqCst) != snapshot.ai_activity_count {
@@ -5822,8 +5825,9 @@ pub fn apply_worker_manifest<C: LlmClient + 'static, A>(
     // terminal result before this bounded deadline; Agen handles only the
     // mechanical per-call terminalization.
     worker.set_tool_execution_policy(ToolExecutionPolicy {
+        pause_safe_boundary_timeout: Duration::from_millis(100),
         cancellation_request_timeout: Duration::from_millis(250),
-        terminal_confirmation_timeout: Duration::from_secs(2),
+        terminal_confirmation_timeout: Duration::from_millis(500),
     });
     worker.set_tool_output_limits(Some(ToolOutputLimits {
         default_max_bytes: wm.tool_output.default_max_bytes,

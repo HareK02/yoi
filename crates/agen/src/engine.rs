@@ -1284,6 +1284,7 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
         // commit-before-publish boundary.
         let mut terminal_call_ids = HashSet::new();
         let mut pause_requested = false;
+        let mut pause_deadline = None;
         for result in synthetic_results {
             self.finalize_and_commit_tool_result(
                 history,
@@ -1319,11 +1320,19 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
                 }
                 pause = self.pause_rx.recv(), if !pause_requested => {
                     if pause.is_some() {
-                        // Pause is a safe-boundary request: do not cancel provider
-                        // operations that already started. Drain all confirmed
-                        // terminal results, then yield control to Worker.
+                        // Pause first waits for already-started tools to reach a
+                        // natural safe boundary. If they do not, Worker policy
+                        // escalates to the same explicit cancel-and-confirm path.
                         pause_requested = true;
+                        pause_deadline = Some(
+                            TokioInstant::now()
+                                + self.tool_execution_policy.pause_safe_boundary_timeout,
+                        );
                     }
+                }
+                _ = tokio::time::sleep_until(pause_deadline.unwrap_or_else(TokioInstant::now)), if pause_deadline.is_some() => {
+                    pause_deadline = None;
+                    let _ = self.cancel_tx.try_send(());
                 }
                 cancel = self.cancel_rx.recv() => {
                     if cancel.is_some() {
@@ -1404,6 +1413,9 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
                     }
 
                     self.timeline.abort_current_block();
+                    if pause_requested {
+                        return Ok(ToolExecutionResult::Paused);
+                    }
                     return Err(EngineError::Cancelled);
                 }
             }

@@ -12,7 +12,7 @@ use agen::tool::{
     Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput, ToolResult,
     ToolResultDisposition,
 };
-use agen::{Engine, History, Item};
+use agen::{Engine, History, Item, ToolExecutionPolicy};
 use async_trait::async_trait;
 
 mod common;
@@ -610,7 +610,7 @@ async fn pause_waits_for_started_tool_terminal_without_cancelling_provider() {
         .await
         .expect("tool execution starts");
         pause.send(()).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
         release.notify_one();
     });
 
@@ -619,7 +619,7 @@ async fn pause_waits_for_started_tool_terminal_without_cancelling_provider() {
     let output = engine.run(&mut history, "pause safely").await;
     control.await.unwrap();
 
-    assert!(started_at.elapsed() >= Duration::from_millis(100));
+    assert!(started_at.elapsed() >= Duration::from_millis(50));
     assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
     assert_eq!(tool.cancellations.load(Ordering::SeqCst), 0);
     assert!(matches!(output.result, agen::EngineRunExit::Paused));
@@ -630,6 +630,53 @@ async fn pause_waits_for_started_tool_terminal_without_cancelling_provider() {
             disposition: ToolResultDisposition::Success,
             ..
         } if call_id == "call_safe_pause"
+    )));
+}
+
+#[tokio::test]
+async fn pause_escalates_to_explicit_cancel_and_confirm_after_safe_boundary_deadline() {
+    let client = MockLlmClient::with_responses(vec![vec![
+        Event::tool_use_start(0, "call_pause_cancel", "cooperative"),
+        Event::tool_input_delta(0, r#"{}"#),
+        Event::tool_use_stop(0),
+        Event::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        }),
+    ]]);
+    let mut engine = Engine::new(client);
+    engine.set_tool_execution_policy(ToolExecutionPolicy {
+        pause_safe_boundary_timeout: Duration::from_millis(20),
+        cancellation_request_timeout: Duration::from_millis(50),
+        terminal_confirmation_timeout: Duration::from_millis(100),
+    });
+    let tool = CooperativeCancelTool::new();
+    engine.register_tool(tool.definition());
+
+    let pause = engine.pause_sender();
+    let calls = Arc::clone(&tool.calls);
+    let control = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("tool execution starts");
+        pause.send(()).await.unwrap();
+    });
+
+    let mut history = History::new();
+    let output = engine.run(&mut history, "pause with escalation").await;
+    control.await.unwrap();
+
+    assert!(matches!(output.result, agen::EngineRunExit::Paused));
+    assert!(history.iter().any(|entry| matches!(
+        &entry.item,
+        Item::ToolResult {
+            call_id,
+            disposition: ToolResultDisposition::Cancelled,
+            ..
+        } if call_id == "call_pause_cancel"
     )));
 }
 
