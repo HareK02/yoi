@@ -141,8 +141,93 @@ impl WorkerPrompt {
     ];
 }
 
+/// Model-visible queued Ticket projection shared by Server and TUI backlog attention paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OrchestratorQueueAttentionTicket {
+    resource_key: String,
+    title: String,
+}
+
+impl OrchestratorQueueAttentionTicket {
+    pub fn new(
+        resource_key: impl Into<String>,
+        title: impl Into<String>,
+    ) -> Result<Self, CatalogError> {
+        let resource_key = resource_key.into();
+        if !is_ticket_resource_key(&resource_key) {
+            return Err(CatalogError::InvalidQueueAttentionResourceKey);
+        }
+        Ok(Self {
+            resource_key,
+            title: bounded_queue_attention_text(&title.into(), 240),
+        })
+    }
+}
+
+/// Shared model-visible context for every Orchestrator backlog attention renderer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OrchestratorQueueAttentionContext {
+    tickets: Vec<OrchestratorQueueAttentionTicket>,
+    separator: &'static str,
+    omitted_ticket_count: usize,
+}
+
+impl OrchestratorQueueAttentionContext {
+    pub const MAX_TICKETS: usize = 20;
+
+    pub fn new(tickets: Vec<OrchestratorQueueAttentionTicket>) -> Self {
+        let omitted_ticket_count = tickets.len().saturating_sub(Self::MAX_TICKETS);
+        Self {
+            tickets: tickets.into_iter().take(Self::MAX_TICKETS).collect(),
+            separator: "—",
+            omitted_ticket_count,
+        }
+    }
+}
+
+/// Prompt-catalog entries that must share the same backlog-attention body contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrchestratorQueueAttentionPrompt {
+    Server,
+    Tui,
+}
+
+impl OrchestratorQueueAttentionPrompt {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Server => "internal.workspace_orchestrator_queue_attention",
+            Self::Tui => "panel.orchestrator_idle_queue_notice",
+        }
+    }
+}
+
+fn is_ticket_resource_key(input: &str) -> bool {
+    input.len() <= 32
+        && input.strip_prefix("T-").is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn bounded_queue_attention_text(input: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    for (index, character) in input.chars().enumerate() {
+        if index == max_chars {
+            output.push('…');
+            break;
+        }
+        output.push(if character.is_control() {
+            ' '
+        } else {
+            character
+        });
+    }
+    output
+}
+
 #[derive(Debug, Error)]
 pub enum CatalogError {
+    #[error("queued Ticket resource key is missing or invalid")]
+    InvalidQueueAttentionResourceKey,
     #[error("failed to build builtin Prompt source tree: {0}")]
     BuiltinTree(String),
     #[error("failed to evaluate builtin Prompt source tree: {0}")]
@@ -317,6 +402,14 @@ impl PromptCatalog {
         context: &T,
     ) -> Result<String, CatalogError> {
         self.render_name(key, Value::from_serialize(context))
+    }
+
+    pub fn orchestrator_queue_attention(
+        &self,
+        prompt: OrchestratorQueueAttentionPrompt,
+        context: &OrchestratorQueueAttentionContext,
+    ) -> Result<String, CatalogError> {
+        self.render_serializable(prompt.key(), context)
     }
 
     pub fn render_name(&self, key: &str, ctx: Value) -> Result<String, CatalogError> {
@@ -651,6 +744,62 @@ mod tests {
         assert!(coder.contains("Never invent an add-revision operation"));
         assert!(orchestrator.contains("Target-only movement preserves source approval"));
         assert!(reviewer.contains("target-only movement does not invalidate approval"));
+    }
+
+    #[test]
+    fn queue_attention_prompts_share_sanitized_contract_and_true_truncation() {
+        let catalog = PromptCatalog::builtins_only().unwrap();
+        let tickets = (1..=OrchestratorQueueAttentionContext::MAX_TICKETS + 1)
+            .map(|index| {
+                OrchestratorQueueAttentionTicket::new(
+                    format!("T-{index}"),
+                    format!("Ticket {index}\nwith control\u{7}"),
+                )
+                .unwrap()
+            })
+            .collect();
+        let context = OrchestratorQueueAttentionContext::new(tickets);
+        let server = catalog
+            .orchestrator_queue_attention(OrchestratorQueueAttentionPrompt::Server, &context)
+            .unwrap();
+        let tui = catalog
+            .orchestrator_queue_attention(OrchestratorQueueAttentionPrompt::Tui, &context)
+            .unwrap();
+
+        assert_eq!(server, tui);
+        assert!(server.starts_with("Queued Tickets require attention:"));
+        assert!(server.contains("- T-1 — Ticket 1 with control "));
+        assert!(!server.contains("T-21"));
+        assert!(server.contains("were omitted from this notice: 1"));
+        assert!(server.contains("Re-query current Ticket authority"));
+        assert!(server.contains("Reread the current Ticket state before acting"));
+        for secret in [
+            "workspace_id",
+            "Workspace:",
+            "runtime_id",
+            "worker_id",
+            "bounded",
+        ] {
+            assert!(!server.contains(secret), "leaked {secret}: {server}");
+        }
+    }
+
+    #[test]
+    fn queue_attention_prompt_omits_truncation_text_for_complete_list() {
+        let catalog = PromptCatalog::builtins_only().unwrap();
+        let context = OrchestratorQueueAttentionContext::new(vec![
+            OrchestratorQueueAttentionTicket::new("T-541", "Attention contract").unwrap(),
+        ]);
+        let rendered = catalog
+            .orchestrator_queue_attention(OrchestratorQueueAttentionPrompt::Server, &context)
+            .unwrap();
+
+        assert!(rendered.contains("- T-541 — Attention contract"));
+        assert!(!rendered.contains("omitted"));
+        assert!(matches!(
+            OrchestratorQueueAttentionTicket::new("opaque-id", "must fail"),
+            Err(CatalogError::InvalidQueueAttentionResourceKey)
+        ));
     }
 
     #[test]
