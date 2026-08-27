@@ -146,6 +146,7 @@ impl WorkspaceHttpObjectiveBackend {
     async fn link_ticket(&self, input: ObjectiveLinkTicketInput) -> Result<ToolOutput, ToolError> {
         let id = validate_id(&input.id, "ObjectiveLinkTicket")?;
         let ticket_id = validate_id(&input.ticket_id, "ObjectiveLinkTicket")?;
+        let ticket_resource_key = self.ticket_resource_key(ticket_id).await?;
         let url = format!("{}/ticket-links", self.objective_url(id));
         let response = send_json::<ObjectiveLinkTicketRequest, ObjectiveDetail>(
             self.client.as_ref(),
@@ -159,7 +160,7 @@ impl WorkspaceHttpObjectiveBackend {
         .map_err(backend_error)?;
         Ok(objective_output(
             format!(
-                "Linked ticket {ticket_id} to objective {}",
+                "Linked ticket {ticket_resource_key} to objective {}",
                 &response.resource_key
             ),
             response,
@@ -172,17 +173,44 @@ impl WorkspaceHttpObjectiveBackend {
     ) -> Result<ToolOutput, ToolError> {
         let id = validate_id(&input.id, "ObjectiveUnlinkTicket")?;
         let ticket_id = validate_id(&input.ticket_id, "ObjectiveUnlinkTicket")?;
+        let ticket_resource_key = self.ticket_resource_key(ticket_id).await?;
         let url = format!("{}/ticket-links/{}", self.objective_url(id), ticket_id);
         let response = delete_json::<ObjectiveDetail>(self.client.as_ref(), &url)
             .await
             .map_err(backend_error)?;
         Ok(objective_output(
             format!(
-                "Unlinked ticket {ticket_id} from objective {}",
+                "Unlinked ticket {ticket_resource_key} from objective {}",
                 &response.resource_key
             ),
             response,
         )?)
+    }
+
+    async fn ticket_resource_key(&self, ticket_reference: &str) -> Result<String, ToolError> {
+        let workspace_id = self.client.workspace_id().unwrap_or_default();
+        let response: serde_json::Value = decode_response(
+            self.client
+                .execute(WorkspaceRequest::get(format!(
+                    "/api/w/{workspace_id}/tickets/{ticket_reference}"
+                )))
+                .map_err(WorkspaceObjectiveBackendError::from)
+                .map_err(backend_error)?,
+        )
+        .map_err(backend_error)?;
+        response
+            .get("resource_key")
+            .or_else(|| {
+                response
+                    .get("meta")
+                    .and_then(|meta| meta.get("resource_key"))
+            })
+            .and_then(serde_json::Value::as_str)
+            .filter(|key| is_canonical_resource_key(key, "T-"))
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                ToolError::ExecutionFailed("required T- human key is unavailable".to_string())
+            })
     }
 
     fn objective_url(&self, id: &str) -> String {
@@ -257,8 +285,14 @@ fn decode_response<T: for<'de> Deserialize<'de>>(
     serde_json::from_str(&response.body).map_err(Into::into)
 }
 
+fn is_canonical_resource_key(resource_key: &str, prefix: &str) -> bool {
+    resource_key.strip_prefix(prefix).is_some_and(|sequence| {
+        !sequence.is_empty() && sequence.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
 fn objective_output(summary: String, response: ObjectiveDetail) -> Result<ToolOutput, ToolError> {
-    if !response.resource_key.starts_with("O-") {
+    if !is_canonical_resource_key(&response.resource_key, "O-") {
         return Err(ToolError::ExecutionFailed(
             "required O- human key is unavailable".to_string(),
         ));
@@ -624,6 +658,11 @@ struct ObjectiveDetail {
 mod tests {
     use super::*;
     use agen::tool::ToolDefinition;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
 
     fn tool_names(definitions: Vec<ToolDefinition>) -> Vec<String> {
         let mut names = definitions
@@ -669,5 +708,84 @@ mod tests {
         assert_eq!(edit["required"][0], "id");
         let link = link_ticket_schema();
         assert_eq!(link["required"], json!(["id", "ticket_id"]));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn objective_link_summaries_resolve_internal_ticket_ids_to_human_keys() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for mutation in ["POST", "DELETE"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0_u8; 8192];
+                let len = stream.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..len]);
+                assert!(request.starts_with("GET /api/w/workspace/tickets/00001INTERNAL HTTP/1.1"));
+                let response_body = serde_json::json!({"resource_key": "T-7"}).to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                )
+                .unwrap();
+
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0_u8; 8192];
+                let len = stream.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..len]);
+                assert!(request.starts_with(&format!(
+                    "{mutation} /api/w/workspace/objectives/O-3/ticket-links"
+                )));
+                let response_body = serde_json::json!({
+                    "resource_key": "O-3",
+                    "title": "Objective",
+                    "state": "active"
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                )
+                .unwrap();
+            }
+        });
+        let backend = WorkspaceHttpObjectiveBackend::new(Arc::new(
+            crate::worker::TestWorkspaceHttpClient::new("workspace", base_url),
+        ));
+
+        let linked = backend
+            .link_ticket(ObjectiveLinkTicketInput {
+                id: "O-3".to_string(),
+                ticket_id: "00001INTERNAL".to_string(),
+            })
+            .await
+            .unwrap();
+        let unlinked = backend
+            .unlink_ticket(ObjectiveUnlinkTicketInput {
+                id: "O-3".to_string(),
+                ticket_id: "00001INTERNAL".to_string(),
+            })
+            .await
+            .unwrap();
+
+        server.join().unwrap();
+        for output in [linked, unlinked] {
+            assert!(output.summary.contains("T-7"));
+            assert!(!output.summary.contains("00001INTERNAL"));
+            assert!(!output.content.unwrap().contains("00001INTERNAL"));
+        }
+    }
+
+    #[test]
+    fn objective_output_rejects_noncanonical_human_keys() {
+        let response = ObjectiveDetail {
+            resource_key: "O-internal".to_string(),
+            title: "Objective".to_string(),
+            state: "active".to_string(),
+        };
+        assert!(objective_output("created".to_string(), response).is_err());
     }
 }

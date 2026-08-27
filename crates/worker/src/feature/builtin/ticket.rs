@@ -789,6 +789,32 @@ impl WorkspaceHttpTicketBackend {
         }
     }
 
+    fn resolve_ticket_resource_key(
+        client: Arc<dyn WorkspaceClient>,
+        base: &str,
+        reference: &TicketIdOrSlug,
+    ) -> TicketResult<String> {
+        let response: Value = Self::request(
+            client,
+            WorkspaceRequestMethod::Get,
+            format!("{base}/{}", Self::ticket_path(reference)),
+            None,
+        )?;
+        response
+            .get("resource_key")
+            .or_else(|| {
+                response
+                    .get("meta")
+                    .and_then(|meta| meta.get("resource_key"))
+            })
+            .and_then(Value::as_str)
+            .filter(|key| is_canonical_ticket_resource_key(key))
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                TicketError::Conflict("required Ticket human key is unavailable".to_string())
+            })
+    }
+
     fn request_unit(
         client: Arc<dyn WorkspaceClient>,
         method: WorkspaceRequestMethod,
@@ -958,12 +984,13 @@ impl WorkspaceHttpTicketBackend {
                 })?),
             ),
             TicketBackendOperation::AddTicketRelation { id, relation } => {
-                let source_reference = match &id {
-                    TicketIdOrSlug::Id(value)
-                    | TicketIdOrSlug::Slug(value)
-                    | TicketIdOrSlug::Query(value) => value.clone(),
-                };
-                let target_reference = relation.target.clone();
+                let source_resource_key =
+                    Self::resolve_ticket_resource_key(client.clone(), &base, &id)?;
+                let target_resource_key = Self::resolve_ticket_resource_key(
+                    client.clone(),
+                    &base,
+                    &TicketIdOrSlug::Id(relation.target.clone()),
+                )?;
                 let mut relation: TicketRelation = Self::request(
                     client,
                     WorkspaceRequestMethod::Post,
@@ -972,31 +999,29 @@ impl WorkspaceHttpTicketBackend {
                         TicketError::Conflict(format!("serialize Ticket relation: {error}"))
                     })?),
                 )?;
-                relation.ticket_id = source_reference;
-                relation.target = target_reference;
+                relation.ticket_id = source_resource_key;
+                relation.target = target_resource_key;
                 relation.author = "workspace".to_string();
                 Ok(TicketBackendOperationResult::Relation(relation))
             }
             TicketBackendOperation::RemoveTicketRelation { id, kind, target } => {
-                let source_reference = match &id {
-                    TicketIdOrSlug::Id(value)
-                    | TicketIdOrSlug::Slug(value)
-                    | TicketIdOrSlug::Query(value) => value.clone(),
-                };
+                let source_resource_key =
+                    Self::resolve_ticket_resource_key(client.clone(), &base, &id)?;
+                let target_resource_key =
+                    Self::resolve_ticket_resource_key(client.clone(), &base, &target)?;
                 let target = match target {
                     TicketIdOrSlug::Id(value)
                     | TicketIdOrSlug::Slug(value)
                     | TicketIdOrSlug::Query(value) => value,
                 };
-                let target_reference = target.clone();
                 let mut relation: TicketRelation = Self::request(
                     client,
                     WorkspaceRequestMethod::Delete,
                     format!("{base}/{}/relations", Self::ticket_path(&id)),
                     Some(serde_json::json!({ "kind": kind, "target": target })),
                 )?;
-                relation.ticket_id = source_reference;
-                relation.target = target_reference;
+                relation.ticket_id = source_resource_key;
+                relation.target = target_resource_key;
                 relation.author = "workspace".to_string();
                 Ok(TicketBackendOperationResult::Relation(relation))
             }
@@ -1826,10 +1851,101 @@ provider = "github"
     }
 
     #[test]
+    fn workspace_http_backend_records_relation_with_authoritative_human_keys() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for (expected_path, resource_key) in [
+                ("GET /api/w/workspace-a/tickets/01SOURCE HTTP/1.1", "T-1"),
+                ("GET /api/w/workspace-a/tickets/01TARGET HTTP/1.1", "T-2"),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0_u8; 8192];
+                let len = stream.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..len]);
+                assert!(request.starts_with(expected_path));
+                let body = serde_json::json!({"meta": {"resource_key": resource_key}}).to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(), body
+                )
+                .unwrap();
+            }
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 8192];
+            let len = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..len]);
+            assert!(
+                request.starts_with("POST /api/w/workspace-a/tickets/01SOURCE/relations HTTP/1.1")
+            );
+            let body = serde_json::to_string(&TicketRelation {
+                ticket_id: "01SOURCE".to_string(),
+                kind: TicketRelationKind::DependsOn,
+                target: "01TARGET".to_string(),
+                note: None,
+                author: "worker-internal".to_string(),
+                at: "2026-08-06T00:00:00Z".to_string(),
+            })
+            .unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let backend = WorkspaceHttpTicketBackend::new(Arc::new(
+            crate::worker::TestWorkspaceHttpClient::new("workspace-a", format!("http://{addr}")),
+        ));
+
+        let relation = backend
+            .add_ticket_relation(
+                TicketIdOrSlug::Id("01SOURCE".to_string()),
+                NewTicketRelation {
+                    kind: TicketRelationKind::DependsOn,
+                    target: "01TARGET".to_string(),
+                    note: None,
+                    author: None,
+                },
+            )
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(relation.ticket_id, "T-1");
+        assert_eq!(relation.target, "T-2");
+        assert_eq!(relation.author, "workspace");
+    }
+
+    #[test]
     fn workspace_http_backend_deletes_exact_ticket_relation() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
+            for (expected_path, resource_key) in [
+                ("GET /api/w/workspace-a/tickets/01SOURCE HTTP/1.1", "T-1"),
+                ("GET /api/w/workspace-a/tickets/01TARGET HTTP/1.1", "T-2"),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0_u8; 8192];
+                let len = stream.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..len]);
+                assert!(request.starts_with(expected_path));
+                let response_body = serde_json::json!({
+                    "meta": {"resource_key": resource_key}
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                )
+                .unwrap();
+            }
+
             let (mut stream, _) = listener.accept().unwrap();
             let mut buffer = [0_u8; 8192];
             let len = stream.read(&mut buffer).unwrap();
@@ -1870,8 +1986,8 @@ provider = "github"
             .unwrap();
 
         server.join().unwrap();
-        assert_eq!(removed.ticket_id, "01SOURCE");
-        assert_eq!(removed.target, "01TARGET");
+        assert_eq!(removed.ticket_id, "T-1");
+        assert_eq!(removed.target, "T-2");
     }
 
     #[test]
