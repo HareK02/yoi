@@ -806,13 +806,30 @@ async fn snapshot_includes_user_input_for_in_flight_turn() {
     let client = MockClient::sequential(vec![MockResponse::Hang(simple_text_events())]);
     let worker = make_worker(client).await;
     let handle = spawn_controller(worker).await;
+    let mut events = handle.subscribe();
 
     handle
         .send(Method::run_text("hello in-flight"))
         .await
         .unwrap();
-    wait_for_status(&handle, WorkerStatus::Running).await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if matches!(
+                events.recv().await,
+                Ok(Event::Status {
+                    status: WorkerStatus::Running,
+                })
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("running status event");
 
+    // The Running event is the in-flight visibility fence: the committed
+    // annotated input must already be available to an immediately attaching
+    // subscriber rather than racing behind this status transition.
     let stream = tokio::net::UnixStream::connect(handle.runtime_dir.socket_path())
         .await
         .unwrap();

@@ -2752,10 +2752,28 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     pub(crate) async fn run_with_input_extensions(
         &mut self,
         input: Vec<Segment>,
-        mut input_extensions: Vec<SessionExtension>,
+        input_extensions: Vec<SessionExtension>,
     ) -> Result<WorkerRunResult, WorkerError>
     where
         St: Clone + 'static,
+    {
+        self.run_with_input_extensions_and_commit_hook(input, input_extensions, || {})
+            .await
+    }
+
+    /// Run user input and invoke `on_input_committed` only after the annotated
+    /// input has crossed both the durable Store and live SegmentLogSink commit
+    /// boundaries. The Controller uses this fence before exposing `Running`, so
+    /// every in-flight snapshot for a user turn includes its committed input.
+    pub(crate) async fn run_with_input_extensions_and_commit_hook<F>(
+        &mut self,
+        input: Vec<Segment>,
+        mut input_extensions: Vec<SessionExtension>,
+        on_input_committed: F,
+    ) -> Result<WorkerRunResult, WorkerError>
+    where
+        St: Clone + 'static,
+        F: FnOnce(),
     {
         let (input, pending_flow_state, flow_projection) = self.prepare_flow_input(input)?;
         if let Some(state) = pending_flow_state.as_ref() {
@@ -2810,6 +2828,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 .expect("flow_runtime_state poisoned") = Some(state);
         }
         self.user_segments.push(input.clone());
+        on_input_committed();
 
         // Resolve `@<path>` file refs to system messages stashed for the
         // WorkerInterceptor to attach right after the user message. Resolution

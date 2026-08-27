@@ -1169,22 +1169,34 @@ async fn controller_loop<C, St>(
             // clear at run start prevents stale partial output left by an older
             // interrupted/error turn from being carried into the next snapshot.
             worker.clear_in_flight_events();
-            set_controller_status(
-                &shared_state,
-                &runtime_dir,
-                &event_tx,
-                WorkerStatus::Running,
-            )
-            .await;
             let parent_originated = run.is_parent_originated();
+            let user_input_run = matches!(&run, PendingRun::Run(_) | PendingRun::RunTracked { .. });
+            if !user_input_run {
+                set_controller_status(
+                    &shared_state,
+                    &runtime_dir,
+                    &event_tx,
+                    WorkerStatus::Running,
+                )
+                .await;
+            }
             let (mut new_status, shutdown) = match run {
                 PendingRun::Run(input) => {
+                    let (input_commit_tx, input_commit_rx) = oneshot::channel();
                     drive_turn(
-                        worker.run(input),
+                        worker.run_with_input_extensions_and_commit_hook(
+                            input,
+                            Vec::new(),
+                            move || {
+                                let _ = input_commit_tx.send(());
+                            },
+                        ),
                         &mut method_rx,
                         &event_tx,
                         &cancel_tx,
                         &shared_state,
+                        &runtime_dir,
+                        Some(input_commit_rx),
                         &notify_buffer,
                         self_parent_socket.as_ref(),
                         &spawner_name,
@@ -1194,12 +1206,21 @@ async fn controller_loop<C, St>(
                     .await
                 }
                 PendingRun::RunTracked { input, extension } => {
+                    let (input_commit_tx, input_commit_rx) = oneshot::channel();
                     drive_turn(
-                        worker.run_with_input_extensions(input, vec![extension]),
+                        worker.run_with_input_extensions_and_commit_hook(
+                            input,
+                            vec![extension],
+                            move || {
+                                let _ = input_commit_tx.send(());
+                            },
+                        ),
                         &mut method_rx,
                         &event_tx,
                         &cancel_tx,
                         &shared_state,
+                        &runtime_dir,
+                        Some(input_commit_rx),
                         &notify_buffer,
                         self_parent_socket.as_ref(),
                         &spawner_name,
@@ -1215,6 +1236,8 @@ async fn controller_loop<C, St>(
                         &event_tx,
                         &cancel_tx,
                         &shared_state,
+                        &runtime_dir,
+                        None,
                         &notify_buffer,
                         self_parent_socket.as_ref(),
                         &spawner_name,
@@ -1230,6 +1253,8 @@ async fn controller_loop<C, St>(
                         &event_tx,
                         &cancel_tx,
                         &shared_state,
+                        &runtime_dir,
+                        None,
                         &notify_buffer,
                         self_parent_socket.as_ref(),
                         &spawner_name,
@@ -1627,6 +1652,8 @@ async fn drive_turn<F>(
     event_tx: &broadcast::Sender<Event>,
     cancel_tx: &mpsc::Sender<()>,
     shared_state: &Arc<WorkerSharedState>,
+    runtime_dir: &RuntimeDir,
+    mut input_commit_rx: Option<oneshot::Receiver<()>>,
     notify_buffer: &NotifyBuffer,
     parent_socket: Option<&PathBuf>,
     self_name: &str,
@@ -1642,6 +1669,27 @@ where
 
     loop {
         tokio::select! {
+            // If input commit and provider completion become ready together, expose
+            // Running only after processing the commit fence. This makes the
+            // Running snapshot contract deterministic even for immediate clients.
+            biased;
+            committed = async {
+                input_commit_rx
+                    .as_mut()
+                    .expect("input commit receiver guarded by select condition")
+                    .await
+            }, if input_commit_rx.is_some() => {
+                input_commit_rx = None;
+                if committed.is_ok() {
+                    set_controller_status(
+                        shared_state,
+                        runtime_dir,
+                        event_tx,
+                        WorkerStatus::Running,
+                    )
+                    .await;
+                }
+            }
             result = &mut worker_future => {
                 return match result {
                     Ok(r) => {
@@ -1974,7 +2022,7 @@ mod tests {
         notify_buffer: NotifyBuffer,
         spawned_registry: Arc<SpawnedWorkerRegistry>,
         parent_socket_path: PathBuf,
-        _runtime_dir: Arc<RuntimeDir>,
+        runtime_dir: Arc<RuntimeDir>,
         _temp: TempDir,
     }
 
@@ -2017,7 +2065,7 @@ mod tests {
             notify_buffer,
             spawned_registry,
             parent_socket_path,
-            _runtime_dir: runtime_dir,
+            runtime_dir,
             _temp: temp,
         }
     }
@@ -2071,6 +2119,8 @@ mod tests {
             &env.event_tx,
             &env.cancel_tx,
             &env.shared_state,
+            &env.runtime_dir,
+            None,
             &env.notify_buffer,
             Some(&env.parent_socket_path),
             "child-worker",
@@ -2103,6 +2153,8 @@ mod tests {
             &env.event_tx,
             &env.cancel_tx,
             &env.shared_state,
+            &env.runtime_dir,
+            None,
             &env.notify_buffer,
             Some(&env.parent_socket_path),
             "child-worker",
@@ -2138,6 +2190,8 @@ mod tests {
             &env.event_tx,
             &env.cancel_tx,
             &env.shared_state,
+            &env.runtime_dir,
+            None,
             &env.notify_buffer,
             Some(&env.parent_socket_path),
             "child-worker",
@@ -2179,6 +2233,8 @@ mod tests {
             &env.event_tx,
             &env.cancel_tx,
             &env.shared_state,
+            &env.runtime_dir,
+            None,
             &env.notify_buffer,
             Some(&env.parent_socket_path),
             "child-worker",
@@ -2218,6 +2274,8 @@ mod tests {
             &env.event_tx,
             &env.cancel_tx,
             &env.shared_state,
+            &env.runtime_dir,
+            None,
             &env.notify_buffer,
             Some(&env.parent_socket_path),
             "parent",
@@ -2254,6 +2312,8 @@ mod tests {
             &env.event_tx,
             &env.cancel_tx,
             &env.shared_state,
+            &env.runtime_dir,
+            None,
             &env.notify_buffer,
             Some(&env.parent_socket_path),
             "parent",
@@ -2288,6 +2348,8 @@ mod tests {
             &env.event_tx,
             &env.cancel_tx,
             &env.shared_state,
+            &env.runtime_dir,
+            None,
             &env.notify_buffer,
             Some(&env.parent_socket_path),
             "parent",
@@ -2321,6 +2383,8 @@ mod tests {
             &env.event_tx,
             &env.cancel_tx,
             &env.shared_state,
+            &env.runtime_dir,
+            None,
             &env.notify_buffer,
             Some(&env.parent_socket_path),
             "child-worker",
