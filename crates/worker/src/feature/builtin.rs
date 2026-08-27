@@ -12,6 +12,7 @@ pub mod memory_extract;
 pub mod merge_request;
 pub mod objective;
 pub mod orchestration;
+mod resource_projection;
 pub mod session_explore;
 pub mod task;
 pub mod ticket;

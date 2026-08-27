@@ -410,7 +410,7 @@ struct TicketCreateParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketEditItemParams {
-    /// Ticket id.
+    /// Ticket reference. Prefer `T-*`; canonical internal ids remain accepted for compatibility.
     ticket: String,
     /// Optional replacement title.
     #[serde(default)]
@@ -539,7 +539,7 @@ impl QueryTicketParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ShowTicketParams {
-    /// Ticket id. Exactly one of `id` or `query` must be provided.
+    /// Ticket reference. Prefer `T-*`; canonical internal ids remain accepted for compatibility. Exactly one of `id` or `query` must be provided.
     #[serde(default)]
     id: Option<String>,
     /// Exact ticket id query. Exactly one of `id` or `query` must be provided.
@@ -558,7 +558,7 @@ struct ShowTicketParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketThreadEventParams {
-    /// Ticket id.
+    /// Ticket reference. Prefer `T-*`; canonical internal ids remain accepted for compatibility.
     ticket: String,
     /// Markdown event body.
     body: String,
@@ -566,7 +566,7 @@ struct TicketThreadEventParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketMarkReadyParams {
-    /// Ticket id.
+    /// Ticket reference. Prefer `T-*`; canonical internal ids remain accepted for compatibility.
     ticket: String,
     /// Optional reason attached to the state_changed event.
     #[serde(default)]
@@ -575,7 +575,7 @@ struct TicketMarkReadyParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketIntakeReadyParams {
-    /// Ticket id.
+    /// Ticket reference. Prefer `T-*`; canonical internal ids remain accepted for compatibility.
     ticket: String,
     /// Concise bounded intake summary appended before the ready transition.
     intake_summary: String,
@@ -586,13 +586,13 @@ struct TicketIntakeReadyParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketQueueParams {
-    /// Ticket id.
+    /// Ticket reference. Prefer `T-*`; canonical internal ids remain accepted for compatibility.
     ticket: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketWorkflowStateParams {
-    /// Ticket id.
+    /// Ticket reference. Prefer `T-*`; canonical internal ids remain accepted for compatibility.
     ticket: String,
     /// Expected current state. The backend rejects stale transitions.
     from: TicketWorkflowStateParam,
@@ -606,7 +606,7 @@ struct TicketWorkflowStateParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketCloseParams {
-    /// Ticket id.
+    /// Ticket reference. Prefer `T-*`; canonical internal ids remain accepted for compatibility.
     ticket: String,
     /// Markdown resolution written to resolution.md and thread.md.
     resolution: String,
@@ -614,7 +614,7 @@ struct TicketCloseParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketDependencyCheckParams {
-    /// Ticket id.
+    /// Ticket reference. Prefer `T-*`; canonical internal ids remain accepted for compatibility.
     ticket: String,
 }
 
@@ -646,7 +646,7 @@ struct TicketRelationRecordParams {
     ticket: String,
     /// Forward relation kind: depends_on, blocks, related, supersedes, or duplicate_of.
     kind: TicketRelationKindParam,
-    /// Target canonical Ticket id. Title/slug words are not accepted as relation authority.
+    /// Target Ticket reference. Prefer `T-*`; canonical internal ids remain accepted for compatibility.
     target: String,
     /// Optional bounded rationale/note.
     #[serde(default)]
@@ -659,7 +659,7 @@ struct TicketRelationRemoveParams {
     ticket: String,
     /// Forward relation kind to remove.
     kind: TicketRelationKindParam,
-    /// Target canonical Ticket id.
+    /// Target Ticket reference. Prefer `T-*`; canonical internal ids remain accepted for compatibility.
     target: String,
 }
 

@@ -33,6 +33,8 @@ use crate::feature::{
 use crate::worker::{WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod};
 use agen::tool::{Tool, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
 
+use super::resource_projection::{project_ticket_detail, project_ticket_query};
+
 #[derive(Clone, Copy)]
 enum WorkspaceTicketReadKind {
     Query,
@@ -153,8 +155,10 @@ struct WorkspaceQueryTicketInput {
     /// stale_after_rescope, and missing_evidence.
     #[serde(default)]
     attention: Vec<WorkspaceTicketAttentionFilter>,
+    /// Related Ticket reference. Prefer `T-*`; canonical internal ids remain accepted for compatibility.
     related_ticket_id: Option<String>,
     relation_kind: Option<WorkspaceTicketRelationFilter>,
+    /// Linked Objective reference. Prefer `O-*`; canonical internal ids remain accepted for compatibility.
     linked_objective_id: Option<String>,
     updated_after: Option<String>,
     updated_before: Option<String>,
@@ -169,6 +173,7 @@ struct WorkspaceQueryTicketInput {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 struct WorkspaceShowTicketInput {
+    /// Ticket reference. Prefer `T-*`; canonical internal ids remain accepted for compatibility.
     id: String,
     /// Most-recent thread entries to return, bounded by the Backend to 1..=50.
     event_limit: Option<usize>,
@@ -229,13 +234,27 @@ impl Tool for WorkspaceTicketReadTool {
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
         if !response.is_success() {
             return Err(ToolError::ExecutionFailed(format!(
-                "Workspace Ticket API returned HTTP {}: {}",
-                response.status, response.body
+                "Workspace Ticket API request failed with HTTP status {}",
+                response.status
             )));
         }
+        let response_value: Value = serde_json::from_str(&response.body).map_err(|error| {
+            ToolError::ExecutionFailed(format!(
+                "Workspace Ticket API returned invalid JSON: {error}"
+            ))
+        })?;
+        let content = match self.kind {
+            WorkspaceTicketReadKind::Query => serde_json::to_string(
+                &project_ticket_query(response_value).map_err(ToolError::ExecutionFailed)?,
+            ),
+            WorkspaceTicketReadKind::Show => serde_json::to_string(
+                &project_ticket_detail(response_value).map_err(ToolError::ExecutionFailed)?,
+            ),
+        }
+        .map_err(|error| ToolError::Internal(error.to_string()))?;
         Ok(ToolOutput {
             summary: self.kind.name().to_string(),
-            content: Some(response.body),
+            content: Some(content),
             attachments: Vec::new(),
         })
     }
@@ -712,12 +731,41 @@ impl WorkspaceHttpTicketBackend {
         })?;
         if !response.is_success() {
             return Err(TicketError::Conflict(format!(
-                "ticket REST API returned HTTP {}: {}",
-                response.status, response.body
+                "ticket REST API request failed with HTTP status {}",
+                response.status
             )));
         }
-        serde_json::from_str(&response.body)
+        let mut value: Value = serde_json::from_str(&response.body).map_err(|error| {
+            TicketError::Conflict(format!("decode ticket REST response: {error}"))
+        })?;
+        Self::canonicalize_ticket_references(&mut value);
+        serde_json::from_value(value)
             .map_err(|error| TicketError::Conflict(format!("decode ticket REST response: {error}")))
+    }
+
+    fn canonicalize_ticket_references(value: &mut Value) {
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    Self::canonicalize_ticket_references(value);
+                }
+            }
+            Value::Object(object) => {
+                for value in object.values_mut() {
+                    Self::canonicalize_ticket_references(value);
+                }
+                if let Some(resource_key) = object
+                    .get("resource_key")
+                    .and_then(Value::as_str)
+                    .filter(|key| key.starts_with("T-"))
+                    .map(ToOwned::to_owned)
+                    && object.contains_key("id")
+                {
+                    object.insert("id".to_string(), Value::String(resource_key));
+                }
+            }
+            _ => {}
+        }
     }
 
     fn request_unit(
@@ -739,8 +787,8 @@ impl WorkspaceHttpTicketBackend {
         })?;
         if !response.is_success() {
             return Err(TicketError::Conflict(format!(
-                "ticket REST API returned HTTP {}: {}",
-                response.status, response.body
+                "ticket REST API request failed with HTTP status {}",
+                response.status
             )));
         }
         Ok(TicketBackendOperationResult::Unit)
@@ -889,7 +937,13 @@ impl WorkspaceHttpTicketBackend {
                 })?),
             ),
             TicketBackendOperation::AddTicketRelation { id, relation } => {
-                let relation = Self::request(
+                let source_reference = match &id {
+                    TicketIdOrSlug::Id(value)
+                    | TicketIdOrSlug::Slug(value)
+                    | TicketIdOrSlug::Query(value) => value.clone(),
+                };
+                let target_reference = relation.target.clone();
+                let mut relation: TicketRelation = Self::request(
                     client,
                     WorkspaceRequestMethod::Post,
                     format!("{base}/{}/relations", Self::ticket_path(&id)),
@@ -897,20 +951,32 @@ impl WorkspaceHttpTicketBackend {
                         TicketError::Conflict(format!("serialize Ticket relation: {error}"))
                     })?),
                 )?;
+                relation.ticket_id = source_reference;
+                relation.target = target_reference;
+                relation.author = "workspace".to_string();
                 Ok(TicketBackendOperationResult::Relation(relation))
             }
             TicketBackendOperation::RemoveTicketRelation { id, kind, target } => {
+                let source_reference = match &id {
+                    TicketIdOrSlug::Id(value)
+                    | TicketIdOrSlug::Slug(value)
+                    | TicketIdOrSlug::Query(value) => value.clone(),
+                };
                 let target = match target {
                     TicketIdOrSlug::Id(value)
                     | TicketIdOrSlug::Slug(value)
                     | TicketIdOrSlug::Query(value) => value,
                 };
-                let relation = Self::request(
+                let target_reference = target.clone();
+                let mut relation: TicketRelation = Self::request(
                     client,
                     WorkspaceRequestMethod::Delete,
                     format!("{base}/{}/relations", Self::ticket_path(&id)),
                     Some(serde_json::json!({ "kind": kind, "target": target })),
                 )?;
+                relation.ticket_id = source_reference;
+                relation.target = target_reference;
+                relation.author = "workspace".to_string();
                 Ok(TicketBackendOperationResult::Relation(relation))
             }
             TicketBackendOperation::QueryTicketRelations { ticket, kind } => {
@@ -1243,6 +1309,23 @@ mod tests {
                 (meta.name == name).then_some(meta.description)
             })
             .expect("tool exists")
+    }
+
+    #[test]
+    fn workspace_ticket_backend_canonicalizes_model_facing_ticket_ids() {
+        let mut value = serde_json::json!({
+            "id": "00001INTERNAL",
+            "resource_key": "T-42",
+            "nested": {
+                "id": "00002INTERNAL",
+                "resource_key": "T-43"
+            },
+            "body": "user-authored 00003BODY stays unchanged"
+        });
+        WorkspaceHttpTicketBackend::canonicalize_ticket_references(&mut value);
+        assert_eq!(value["id"], "T-42");
+        assert_eq!(value["nested"]["id"], "T-43");
+        assert_eq!(value["body"], "user-authored 00003BODY stays unchanged");
     }
 
     #[test]
