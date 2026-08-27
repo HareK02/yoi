@@ -84,6 +84,12 @@ pub(super) struct ModelObjectiveDetail {
     event_page: ModelObjectiveEventPage,
 }
 
+impl ModelObjectiveDetail {
+    pub(super) fn objective_ref(&self) -> &str {
+        &self.objective
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ModelWorkerSummary {
     worker: String,

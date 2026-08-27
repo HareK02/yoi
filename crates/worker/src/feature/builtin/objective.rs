@@ -62,8 +62,9 @@ impl WorkspaceHttpObjectiveBackend {
         .await
         .map_err(backend_error)?;
         let response = project_objective_detail(response).map_err(ToolError::ExecutionFailed)?;
+        let objective_ref = response.objective_ref().to_string();
         Ok(ToolOutput {
-            summary: format!("Read objective {id}"),
+            summary: format!("Read objective {objective_ref}"),
             content: Some(serde_json::to_string_pretty(&response).map_err(decode_error)?),
             attachments: Vec::new(),
         })
@@ -708,6 +709,58 @@ mod tests {
         assert_eq!(edit["required"][0], "id");
         let link = link_ticket_schema();
         assert_eq!(link["required"], json!(["id", "ticket_id"]));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn objective_show_summary_uses_projected_human_key() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 8192];
+            let len = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..len]);
+            assert!(
+                request.starts_with("POST /api/w/workspace/objectives/00001INTERNAL/show HTTP/1.1")
+            );
+            let body = serde_json::json!({
+                "id": "00001INTERNAL",
+                "resource_key": "O-3",
+                "title": "Objective",
+                "body": "Body",
+                "state": "active",
+                "created_at": null,
+                "updated_at": null,
+                "linked_ticket_summaries": [],
+                "events": [],
+                "event_page": {"next_cursor": null, "has_more": false}
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let backend = WorkspaceHttpObjectiveBackend::new(Arc::new(
+            crate::worker::TestWorkspaceHttpClient::new("workspace", base_url),
+        ));
+
+        let output = backend
+            .show(ShowObjectiveInput {
+                id: "00001INTERNAL".to_string(),
+                event_limit: None,
+                event_cursor: None,
+            })
+            .await
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(output.summary, "Read objective O-3");
+        assert!(!output.summary.contains("00001INTERNAL"));
+        assert!(!output.content.unwrap().contains("00001INTERNAL"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

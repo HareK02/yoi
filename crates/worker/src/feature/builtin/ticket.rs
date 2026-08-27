@@ -876,12 +876,22 @@ impl WorkspaceHttpTicketBackend {
                 Ok(TicketBackendOperationResult::Tickets(tickets))
             }
             TicketBackendOperation::Show { id } => {
-                let ticket = Self::request(
+                let ticket: Ticket = Self::request(
                     client,
                     WorkspaceRequestMethod::Get,
                     format!("{base}/{}/record", Self::ticket_path(&id)),
                     None,
                 )?;
+                if !ticket
+                    .meta
+                    .resource_key
+                    .as_deref()
+                    .is_some_and(is_canonical_ticket_resource_key)
+                {
+                    return Err(TicketError::Conflict(
+                        "required Ticket human key is unavailable".to_string(),
+                    ));
+                }
                 Ok(TicketBackendOperationResult::Ticket(ticket))
             }
             TicketBackendOperation::Create { input } => {

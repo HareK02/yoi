@@ -1223,10 +1223,17 @@ impl Tool for TicketQueueTool {
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketQueueParams = parse_input("TicketQueue", input_json)?;
         let queued_by = default_author();
-        let outcome = self
+        let mut outcome = self
             .backend
             .queue_ready(TicketIdOrSlug::Query(params.ticket.clone()), &queued_by)
             .map_err(|error| backend_error("TicketQueue", error))?;
+        outcome.requested_ticket =
+            model_ticket_reference(&self.backend, &outcome.requested_ticket, "TicketQueue")?;
+        outcome.queued_tickets = outcome
+            .queued_tickets
+            .into_iter()
+            .map(|ticket| model_ticket_reference(&self.backend, &ticket, "TicketQueue"))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(json_output(
             format!(
                 "Queued {} ticket(s) for Orchestrator",
@@ -1264,15 +1271,17 @@ impl Tool for TicketWorkflowStateTool {
         self.backend
             .set_workflow_state(TicketIdOrSlug::Query(params.ticket.clone()), change)
             .map_err(|error| backend_error("TicketWorkflowState", error))?;
+        let ticket_ref =
+            model_ticket_reference(&self.backend, &params.ticket, "TicketWorkflowState")?;
         Ok(json_output(
             format!(
                 "Transitioned ticket {} state {} -> {}",
-                params.ticket,
+                ticket_ref,
                 from.as_str(),
                 to.as_str()
             ),
             json!({
-                "ticket": params.ticket,
+                "ticket": ticket_ref,
                 "from": from.as_str(),
                 "to": to.as_str(),
                 "state": to.as_str(),
@@ -1296,9 +1305,10 @@ impl Tool for TicketCloseTool {
                 MarkdownText::new(params.resolution),
             )
             .map_err(|error| backend_error("TicketClose", error))?;
+        let ticket_ref = model_ticket_reference(&self.backend, &params.ticket, "TicketClose")?;
         Ok(json_output(
-            format!("Closed ticket {}", params.ticket),
-            json!({ "ticket": params.ticket, "state": "closed", "ok": true }),
+            format!("Closed ticket {ticket_ref}"),
+            json!({ "ticket": ticket_ref, "state": "closed", "ok": true }),
         ))
     }
 }
@@ -1523,6 +1533,29 @@ impl Tool for TicketDependencyCheckTool {
             check,
         ))
     }
+}
+
+fn model_ticket_reference(
+    backend: &TicketToolBackend,
+    reference: &str,
+    tool_name: &str,
+) -> Result<String, ToolError> {
+    let ticket = backend
+        .show(TicketIdOrSlug::Id(reference.to_string()))
+        .map_err(|error| backend_error(tool_name, error))?;
+    match ticket.meta.resource_key {
+        Some(resource_key) if is_canonical_ticket_resource_key(&resource_key) => Ok(resource_key),
+        Some(_) => Err(ToolError::ExecutionFailed(format!(
+            "{tool_name} failed: required Ticket human key is unavailable"
+        ))),
+        None => Ok(ticket.meta.id),
+    }
+}
+
+fn is_canonical_ticket_resource_key(resource_key: &str) -> bool {
+    resource_key.strip_prefix("T-").is_some_and(|sequence| {
+        !sequence.is_empty() && sequence.bytes().all(|byte| byte.is_ascii_digit())
+    })
 }
 
 fn parse_input<T: for<'de> Deserialize<'de>>(tool: &str, input_json: &str) -> Result<T, ToolError> {
@@ -1919,6 +1952,12 @@ mod tests {
 
     fn backend(temp: &TempDir) -> LocalTicketBackend {
         LocalTicketBackend::new(temp.path().join("tickets"))
+            .with_target_authority(Arc::new(TestTargetAuthority))
+    }
+
+    fn sqlite_backend(temp: &TempDir) -> crate::SqliteTicketBackend {
+        crate::SqliteTicketBackend::open(temp.path().join("tickets.db"), "workspace")
+            .unwrap()
             .with_target_authority(Arc::new(TestTargetAuthority))
     }
 
@@ -2547,6 +2586,101 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == TicketEventKind::StateChanged)
         );
+    }
+
+    #[tokio::test]
+    async fn queue_workflow_and_close_project_internal_inputs_to_ticket_keys() {
+        let temp = TempDir::new().unwrap();
+        let inner = sqlite_backend(&temp);
+        let mut dependency_input = NewTicket::new("Dependency");
+        dependency_input.repository_id = Some("main".to_string());
+        let dependency = inner.create(dependency_input).unwrap();
+        let mut target_input = NewTicket::new("Target");
+        target_input.repository_id = Some("main".to_string());
+        let target = inner.create(target_input).unwrap();
+        inner
+            .add_ticket_relation(
+                TicketIdOrSlug::Id(target.id.clone()),
+                NewTicketRelation {
+                    kind: TicketRelationKind::DependsOn,
+                    target: dependency.id.clone(),
+                    note: None,
+                    author: None,
+                },
+            )
+            .unwrap();
+        for id in [&dependency.id, &target.id] {
+            inner
+                .mark_ready(
+                    TicketIdOrSlug::Id(id.clone()),
+                    TicketMarkReady {
+                        operation_key: format!("ready-{id}"),
+                        reason: None,
+                        author: None,
+                        intake_summary: None,
+                    },
+                )
+                .unwrap();
+        }
+        let target_key = target.resource_key.clone().unwrap();
+        let dependency_key = dependency.resource_key.clone().unwrap();
+        let backend = inner;
+        let queue = tool_by_name(TicketToolBackend::new(backend.clone()), "TicketQueue");
+        let workflow = tool_by_name(
+            TicketToolBackend::new(backend.clone()),
+            "TicketWorkflowState",
+        );
+        let close = tool_by_name(TicketToolBackend::new(backend), "TicketClose");
+
+        let queued = queue
+            .execute(
+                &json!({"ticket": target.id.clone()}).to_string(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        assert!(queued.summary.contains("2 ticket(s)"));
+        let queued_content = queued.content.unwrap();
+        assert!(queued_content.contains(&target_key));
+        assert!(queued_content.contains(&dependency_key));
+        assert!(!queued_content.contains(&target.id));
+        assert!(!queued_content.contains(&dependency.id));
+
+        for (from, to) in [("queued", "inprogress"), ("inprogress", "done")] {
+            let transitioned = workflow
+                .execute(
+                    &json!({
+                        "ticket": target.id.clone(),
+                        "from": from,
+                        "to": to,
+                        "reason": "test_transition",
+                        "body": "transitioned",
+                        "author": "tester"
+                    })
+                    .to_string(),
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+            assert!(transitioned.summary.contains(&target_key));
+            assert!(!transitioned.summary.contains(&target.id));
+            let content = transitioned.content.unwrap();
+            assert!(content.contains(&target_key));
+            assert!(!content.contains(&target.id));
+        }
+
+        let closed = close
+            .execute(
+                &json!({"ticket": target.id.clone(), "resolution": "Done"}).to_string(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        assert!(closed.summary.contains(&target_key));
+        assert!(!closed.summary.contains(&target.id));
+        let content = closed.content.unwrap();
+        assert!(content.contains(&target_key));
+        assert!(!content.contains(&target.id));
     }
 
     #[tokio::test]
