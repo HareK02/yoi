@@ -1375,6 +1375,7 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
         }
 
         let call_info = call_info_map.get(&tool_result.tool_use_id);
+        let mut abort_reason = None;
         if let Some((tool_call, meta, tool, context)) = call_info {
             let mut info = ToolResultInfo {
                 call: tool_call.clone(),
@@ -1387,7 +1388,7 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
             match self.interceptor.post_tool_call(&mut info).await {
                 PostToolAction::Continue => {}
                 PostToolAction::Abort(reason) => {
-                    return Err(EngineError::Aborted(reason));
+                    abort_reason = Some(reason);
                 }
             }
             tool_result = info.result;
@@ -1451,6 +1452,9 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
             "Tool execution terminalized"
         );
         self.emit_tool_result(&tool_result);
+        if let Some(reason) = abort_reason {
+            return Err(EngineError::Aborted(reason));
+        }
         Ok(true)
     }
 

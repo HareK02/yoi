@@ -8081,7 +8081,17 @@ mod build_summary_prompt_tests {
 
         worker.ensure_segment_head().unwrap();
         worker.wire_history_persistence();
-        worker.set_history_for_test(vec![Item::tool_call("call-1", "Bash", "{}")]);
+        worker.set_history_for_test(vec![
+            Item::tool_call("call-known", "Read", "{}"),
+            Item::tool_result_item_with_disposition_and_attachments(
+                "call-known",
+                "known result",
+                Some("confirmed output".to_string()),
+                agen::ToolResultDisposition::Success,
+                Vec::new(),
+            ),
+            Item::tool_call("call-orphan", "Bash", "{}"),
+        ]);
         let _ = worker
             .handle_worker_result(
                 EngineRunExit::Interrupted(StopReason::Cancelled),
@@ -8089,6 +8099,44 @@ mod build_summary_prompt_tests {
             )
             .await
             .unwrap();
+
+        let history = worker.history();
+        assert_eq!(
+            history
+                .iter()
+                .filter(|item| matches!(
+                    item,
+                    Item::ToolResult {
+                        call_id,
+                        disposition: agen::ToolResultDisposition::Success,
+                        ..
+                    } if call_id == "call-known"
+                ))
+                .count(),
+            1
+        );
+        assert!(!history.iter().any(|item| matches!(
+            item,
+            Item::ToolResult {
+                call_id,
+                disposition: agen::ToolResultDisposition::OutcomeUnknown,
+                ..
+            } if call_id == "call-known"
+        )));
+        assert_eq!(
+            history
+                .iter()
+                .filter(|item| matches!(
+                    item,
+                    Item::ToolResult {
+                        call_id,
+                        disposition: agen::ToolResultDisposition::OutcomeUnknown,
+                        ..
+                    } if call_id == "call-orphan"
+                ))
+                .count(),
+            1
+        );
 
         let entries = worker
             .store
@@ -8105,13 +8153,14 @@ mod build_summary_prompt_tests {
                     LogEntry::AnnotatedToolResult {
                         entry: session_store::LoggedHistoryEntry {
                             item: session_store::LoggedItem::ToolResult {
+                                call_id,
                                 disposition: agen::ToolResultDisposition::OutcomeUnknown,
                                 ..
                             },
                             ..
                         },
                         ..
-                    }
+                    } if call_id == "call-orphan"
                 )
             })
             .expect("durable OutcomeUnknown closure");

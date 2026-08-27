@@ -1021,3 +1021,76 @@ async fn test_before_tool_call_synthetic_result_committed() {
         } if call_id == "call_1" && summary == "permission denied"
     )));
 }
+
+#[tokio::test]
+async fn post_tool_abort_commits_confirmed_result_before_stopping_run() {
+    let client = MockLlmClient::new(vec![
+        Event::tool_use_start(0, "call_confirmed", "confirmed"),
+        Event::tool_input_delta(0, r#"{}"#),
+        Event::tool_use_stop(0),
+        Event::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        }),
+    ]);
+    let mut engine = Engine::new(client);
+    let tool = SlowTool::new("confirmed", 1);
+    engine.register_tool(tool.definition());
+
+    struct AbortAfterResult;
+    #[async_trait]
+    impl Interceptor for AbortAfterResult {
+        async fn post_tool_call(&self, _info: &mut ToolResultInfo) -> PostToolAction {
+            PostToolAction::Abort("policy stopped the run".to_string())
+        }
+    }
+    engine.set_interceptor(AbortAfterResult);
+
+    let observed = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let published = observed.clone();
+    engine.on_tool_result(move |_| published.lock().unwrap().push("published"));
+    let committed = observed.clone();
+    let mut annotate = move |item: &Item| {
+        if matches!(item, Item::ToolResult { .. }) {
+            committed.lock().unwrap().push("committed");
+        }
+        Ok(())
+    };
+
+    let mut history = History::new();
+    let output = engine
+        .run_with_annotation(&mut history, "run confirmed tool", &mut annotate)
+        .await;
+    observed.lock().unwrap().push("run-returned");
+
+    assert_eq!(tool.call_count(), 1);
+    assert_eq!(
+        observed.lock().unwrap().as_slice(),
+        ["committed", "published", "run-returned"]
+    );
+    assert!(matches!(
+        output.result,
+        agen::EngineRunExit::Interrupted(agen::StopReason::Unexpected(
+            agen::EngineError::Aborted(ref reason)
+        )) if reason == "policy stopped the run"
+    ));
+    let terminal: Vec<_> = history
+        .iter()
+        .filter_map(|entry| match &entry.item {
+            Item::ToolResult {
+                call_id,
+                disposition,
+                ..
+            } if call_id == "call_confirmed" => Some(*disposition),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(terminal, [ToolResultDisposition::Success]);
+    assert!(!history.iter().any(|entry| matches!(
+        &entry.item,
+        Item::ToolResult {
+            call_id,
+            disposition: ToolResultDisposition::OutcomeUnknown,
+            ..
+        } if call_id == "call_confirmed"
+    )));
+}
