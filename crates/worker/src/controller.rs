@@ -1780,7 +1780,7 @@ where
 
 fn emit_rewind_targets<C, St>(worker: &Worker<C, St>, event_tx: &broadcast::Sender<Event>)
 where
-    C: LlmClient,
+    C: LlmClient + 'static,
     St: Store,
 {
     match worker.list_rewind_targets() {
@@ -1806,7 +1806,7 @@ fn apply_rewind<C, St>(
     expected_head_entries: usize,
 ) -> bool
 where
-    C: LlmClient,
+    C: LlmClient + 'static,
     St: Store,
 {
     match worker.rewind_to(target, expected_head_entries) {
@@ -1854,7 +1854,7 @@ fn model_supports_image_attachments(model: &manifest::ModelManifest) -> bool {
 
 fn build_greeting<C, St>(worker: &Worker<C, St>) -> protocol::Greeting
 where
-    C: LlmClient,
+    C: LlmClient + 'static,
     St: Store,
 {
     let manifest = worker.manifest();

@@ -34,7 +34,7 @@ impl PermissionHook {
     }
 }
 
-impl<C: LlmClient, St: Store> Worker<C, St> {
+impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     pub(crate) fn apply_permissions_from_manifest(&mut self) {
         let Some(permissions) = self.manifest().permissions.clone() else {
             return;

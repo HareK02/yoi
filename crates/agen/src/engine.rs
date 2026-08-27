@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
 use crate::{
-    Item,
+    History, HistoryEntry, Item,
     callback::{
         ClosureMetaHandler, ClosureTextBlockHandler, ClosureThinkingBlockHandler,
         ClosureToolUseBlockHandler, TextBlockScope, ThinkingBlockScope, ToolUseBlockScope,
@@ -117,9 +117,9 @@ impl From<Result<EngineResult, EngineError>> for EngineRunExit {
 /// Result of [`Engine::run`] or [`Engine::resume`].
 ///
 /// Contains the `Locked` Engine (ready for subsequent runs) and the outcome.
-pub struct EngineRunOutput<C: LlmClient> {
+pub struct EngineRunOutput<C: LlmClient, A = ()> {
     /// The Engine, now in Locked state.
-    pub engine: Engine<C, Locked>,
+    pub engine: Engine<C, Locked, A>,
     /// Outcome of the turn.
     pub result: EngineRunExit,
 }
@@ -139,29 +139,31 @@ const MAX_STREAM_CONTINUATIONS: u32 = 3;
 ///
 /// # State Transitions (Type-state)
 ///
-/// - [`Mutable`]: Initial state. System prompt, history, and tools can be freely edited.
+/// - [`Mutable`]: Initial state. System prompt and tools can be edited; history is caller-owned.
 /// - [`Locked`]: Cache-protected state. Prefix context is immutable; only `run()` / `resume()` are available.
 ///
 /// Calling `run()` on a `Mutable` Engine consumes it and returns a
-/// `Locked` Engine together with the result. This ensures the
-/// cache prefix is fixed for optimal KV cache hit rate.
+/// `Locked` Engine together with the result. The engine borrows the caller's
+/// [`History`](crate::History) only while running, so host annotations stay with
+/// the host-owned history and are never projected to providers.
 ///
 /// ```ignore
+/// let mut history = History::new();
 /// let mut engine = Engine::new(client)
 ///     .system_prompt("You are a helpful assistant.");
 /// engine.register_tool(my_tool);
 ///
 /// // Mutable::run() consumes self → EngineRunOutput { engine: Locked, result }
-/// let out = engine.run("Hello").await;
+/// let out = engine.run(&mut history, "Hello").await?;
 /// let mut engine = out.engine;
 ///
 /// // Locked::run() borrows &mut self
-/// let _exit = engine.run("Follow-up").await;
+/// engine.run(&mut history, "Follow-up").await?;
 ///
 /// // To edit between turns, unlock back to Mutable
 /// let mut engine = engine.unlock();
-/// engine.truncate_history(5);
-/// let out = engine.run("Continue").await;
+/// history.truncate(5);
+/// let out = engine.run(&mut history, "Continue").await?;
 /// let mut engine = out.engine;
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,7 +183,7 @@ enum StreamCompletion {
     Interrupted { reason: String },
 }
 
-pub struct Engine<C: LlmClient, S: EngineState = Mutable> {
+pub struct Engine<C: LlmClient, S: EngineState = Mutable, A = ()> {
     /// LLM client
     client: C,
     /// Retry policy for opening an LLM response stream.
@@ -201,8 +203,6 @@ pub struct Engine<C: LlmClient, S: EngineState = Mutable> {
     interceptor: Box<dyn Interceptor>,
     /// System prompt
     system_prompt: Option<String>,
-    /// Item history (owned by Engine)
-    history: Vec<Item>,
     /// History length at lock time (only meaningful in Locked state)
     locked_prefix_len: usize,
     /// AgentTurn count across the lifetime of this Engine.
@@ -290,10 +290,10 @@ pub struct Engine<C: LlmClient, S: EngineState = Mutable> {
     /// stable conversation identifier when the backend benefits from one.
     cache_key: Option<String>,
     /// State marker
-    _state: PhantomData<S>,
+    _state: PhantomData<(S, A)>,
 }
 
-impl<C: LlmClient, S: EngineState> Engine<C, S> {
+impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
     fn start_logical_run(&mut self) {
         self.active_run_turn_count = Some(0);
     }
@@ -559,11 +559,15 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
 
     fn append_history_items(
         &mut self,
+        history: &mut History<A>,
         items: impl IntoIterator<Item = Item>,
+        annotate: &mut impl FnMut(&Item) -> Result<A, String>,
     ) -> Result<(), EngineError> {
         for item in items {
             self.emit_history_append(&item)?;
-            self.history.push(item);
+            history
+                .append_with(item, annotate)
+                .map_err(EngineError::HistoryAppend)?;
         }
         Ok(())
     }
@@ -670,9 +674,9 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
         &self.client
     }
 
-    /// Get a reference to the history
-    pub fn history(&self) -> &[Item] {
-        &self.history
+    /// Borrow caller-owned annotated history entries.
+    pub fn history<'h>(&self, history: &'h History<A>) -> &'h [HistoryEntry<A>] {
+        history.entries()
     }
 
     /// Get a reference to the system prompt
@@ -929,20 +933,20 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
     }
 
     /// Check for pending tool calls (for resuming from Pause)
-    fn get_pending_tool_calls(&self) -> Option<Vec<ToolCall>> {
+    fn get_pending_tool_calls(&self, history: &History<A>) -> Option<Vec<ToolCall>> {
         // Find the last ToolCall items that don't have corresponding ToolResult
         let mut pending_calls = Vec::new();
         let mut answered_call_ids = std::collections::HashSet::new();
 
         // First pass: collect all answered call IDs
-        for item in &self.history {
+        for item in history.items() {
             if let Item::ToolResult { call_id, .. } = item {
                 answered_call_ids.insert(call_id.clone());
             }
         }
 
         // Second pass: find unanswered tool calls
-        for item in &self.history {
+        for item in history.items() {
             if let Item::ToolCall {
                 call_id,
                 name,
@@ -1142,19 +1146,26 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
     }
 
     /// Internal turn execution logic
-    async fn run_turn_loop(&mut self) -> Result<EngineResult, EngineError> {
+    async fn run_turn_loop(
+        &mut self,
+        history: &mut History<A>,
+        annotate: &mut impl FnMut(&Item) -> Result<A, String>,
+    ) -> Result<EngineResult, EngineError> {
         let tool_definitions = self.build_tool_definitions();
 
         info!(
-            item_count = self.history.len(),
+            item_count = history.len(),
             tool_count = tool_definitions.len(),
             "Starting engine run"
         );
 
         // Resume pending tool calls from a previous Pause
-        if let Some(tool_calls) = self.get_pending_tool_calls() {
+        if let Some(tool_calls) = self.get_pending_tool_calls(history) {
             info!("Resuming pending tool calls");
-            if let Some(result) = self.execute_and_commit_tools(tool_calls).await? {
+            if let Some(result) = self
+                .execute_and_commit_tools(history, annotate, tool_calls)
+                .await?
+            {
                 return Ok(result);
             }
         }
@@ -1199,13 +1210,13 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                 .await
                 .map_err(EngineError::HistoryAppend)?;
             if !pending.is_empty() {
-                self.append_history_items(pending)?;
+                self.append_history_items(history, pending, annotate)?;
             }
 
             // Clone the history into a per-request context. Everything
             // below (prune projection, interceptor hooks) mutates only
-            // this clone, so the persistent `self.history` stays intact.
-            let mut request_context = self.history.clone();
+            // this clone, so the caller-owned `history` stays intact.
+            let mut request_context = history.items_cloned();
 
             // Prune projection: if both the config and the savings
             // estimator are configured, drop ToolResult.content from
@@ -1273,7 +1284,7 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                     return Err(EngineError::Aborted(reason));
                 }
                 PreRequestAction::YieldWith(items) => {
-                    self.append_history_items(items.clone())?;
+                    self.append_history_items(history, items.clone(), annotate)?;
                     request_context.extend(items);
                     info!("Yielded by interceptor after pre-request history append");
                     for cb in &self.turn_end_cbs {
@@ -1289,7 +1300,7 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                     return Ok(EngineResult::Yielded);
                 }
                 PreRequestAction::ContinueWith(items) => {
-                    self.append_history_items(items.clone())?;
+                    self.append_history_items(history, items.clone(), annotate)?;
                     request_context.extend(items);
                 }
                 PreRequestAction::Continue => {}
@@ -1348,7 +1359,7 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                 let assistant_items =
                     self.build_assistant_items(&reasoning_items, &text_blocks, &[]);
                 if !assistant_items.is_empty() {
-                    self.append_history_items(assistant_items)?;
+                    self.append_history_items(history, assistant_items, annotate)?;
                 }
                 self.emit_llm_continuation(
                     current_llm_call,
@@ -1376,15 +1387,16 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
             let tool_calls = self.tool_call_collector.take_collected();
             let assistant_items =
                 self.build_assistant_items(&reasoning_items, &text_blocks, &tool_calls);
-            self.append_history_items(assistant_items)?;
+            self.append_history_items(history, assistant_items, annotate)?;
 
             if tool_calls.is_empty() {
-                match self.interceptor.on_turn_end(&self.history).await {
+                let turn_end_context = history.items_cloned();
+                match self.interceptor.on_turn_end(&turn_end_context).await {
                     TurnEndAction::Finish => {
                         return Ok(EngineResult::Finished);
                     }
                     TurnEndAction::ContinueWithMessages(additional) => {
-                        self.append_history_items(additional)?;
+                        self.append_history_items(history, additional, annotate)?;
                         continue;
                     }
                     TurnEndAction::Pause => {
@@ -1393,7 +1405,10 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                 }
             }
 
-            if let Some(result) = self.execute_and_commit_tools(tool_calls).await? {
+            if let Some(result) = self
+                .execute_and_commit_tools(history, annotate, tool_calls)
+                .await?
+            {
                 return Ok(result);
             }
         }
@@ -1639,6 +1654,8 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
     /// `None` if the turn loop should continue.
     async fn execute_and_commit_tools(
         &mut self,
+        history: &mut History<A>,
+        annotate: &mut impl FnMut(&Item) -> Result<A, String>,
         tool_calls: Vec<ToolCall>,
     ) -> Result<Option<EngineResult>, EngineError> {
         match self.execute_tools(tool_calls).await {
@@ -1655,7 +1672,7 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                         result.attachments,
                     )
                 });
-                self.append_history_items(items)?;
+                self.append_history_items(history, items, annotate)?;
                 Ok(None)
             }
             Err(err) => Err(err),
@@ -1663,9 +1680,9 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
     }
 }
 
-impl<C: LlmClient> Engine<C, Mutable> {
-    /// Create a new Engine (in Mutable state)
-    pub fn new(client: C) -> Self {
+impl<C: LlmClient, A> Engine<C, Mutable, A> {
+    /// Create a new annotated Engine (in Mutable state).
+    pub fn new_annotated(client: C) -> Self {
         let text_block_collector = TextBlockCollector::new();
         let tool_call_collector = ToolCallCollector::new();
         let thinking_block_collector = ThinkingBlockCollector::new();
@@ -1687,7 +1704,6 @@ impl<C: LlmClient> Engine<C, Mutable> {
             tool_server: ToolServer::new().handle(),
             interceptor: Box::new(DefaultInterceptor),
             system_prompt: None,
-            history: Vec::new(),
             locked_prefix_len: 0,
             turn_count: 0,
             active_run_turn_count: None,
@@ -1847,36 +1863,38 @@ impl<C: LlmClient> Engine<C, Mutable> {
         }
     }
 
-    /// Replace history during restore/rebuild without emitting append callbacks.
+    /// Replace caller-owned history during restore/rebuild without emitting append callbacks.
     ///
     /// This is not a history-growth API. Live append paths must use
-    /// [`append_history`](Self::append_history) so `on_history_append` observers
-    /// see every inserted item.
-    pub fn set_history(&mut self, items: Vec<Item>) {
-        self.history = items;
-    }
-
-    /// Append items to history after every history-append observer accepts the
-    /// item. This is the only public Mutable-state API for growing engine
-    /// history; callers that need session-log persistence must install
-    /// [`on_history_append`](Self::on_history_append) before calling it.
-    pub fn append_history(
+    /// [`append_history_with`](Self::append_history_with) so observers and the
+    /// trusted annotation callback see every inserted item.
+    pub fn replace_history_entries(
         &mut self,
+        history: &mut History<A>,
+        entries: Vec<HistoryEntry<A>>,
+    ) -> Vec<HistoryEntry<A>> {
+        history.replace_entries(entries)
+    }
+
+    /// Append items to caller-owned history after every observer and the trusted
+    /// annotation callback accepts the item.
+    pub fn append_history_with(
+        &mut self,
+        history: &mut History<A>,
         items: impl IntoIterator<Item = Item>,
+        annotate: &mut impl FnMut(&Item) -> Result<A, String>,
     ) -> Result<(), EngineError> {
-        self.append_history_items(items)
+        self.append_history_items(history, items, annotate)
     }
 
-    /// Truncate history without emitting append callbacks.
-    ///
-    /// This is an edit operation, not a history-growth path.
-    pub fn truncate_history(&mut self, len: usize) {
-        self.history.truncate(len);
+    /// Truncate caller-owned history without emitting append callbacks.
+    pub fn truncate_history(&mut self, history: &mut History<A>, len: usize) {
+        history.truncate(len);
     }
 
-    /// Clear history
-    pub fn clear_history(&mut self) {
-        self.history.clear();
+    /// Clear caller-owned history.
+    pub fn clear_history(&mut self, history: &mut History<A>) {
+        history.clear();
     }
 
     /// Set the turn count (for session restoration)
@@ -1895,16 +1913,21 @@ impl<C: LlmClient> Engine<C, Mutable> {
         self
     }
 
-    /// Execute a turn, consuming self and transitioning to Locked.
+    /// Run the engine with one user input, appending to caller-owned history.
     ///
-    /// This is the primary entry point for first use. Equivalent to
-    /// `self.lock()` followed by `locked.run(user_input)`.
-    ///
-    /// Subsequent runs can call [`Engine::run`] directly.
-    /// To edit state between turns, call [`unlock()`](Engine::unlock) first.
-    pub async fn run(self, user_input: impl Into<String>) -> EngineRunOutput<C> {
-        let mut locked = self.lock();
-        let result = locked.run(user_input).await;
+    /// The trusted `annotate` callback is invoked after append observers and before
+    /// each new item becomes live in `history`. Providers, token counters, pruners,
+    /// and interceptors receive only the `Item` projection.
+    pub async fn run_with_annotation(
+        self,
+        history: &mut History<A>,
+        user_input: impl Into<String>,
+        annotate: &mut impl FnMut(&Item) -> Result<A, String>,
+    ) -> EngineRunOutput<C, A> {
+        let mut locked = self.lock(history);
+        let result = locked
+            .run_with_annotation(history, user_input, annotate)
+            .await;
         EngineRunOutput {
             engine: locked,
             result,
@@ -1914,9 +1937,13 @@ impl<C: LlmClient> Engine<C, Mutable> {
     /// Resume from Paused, consuming self and transitioning to Locked.
     ///
     /// Used after `unlock()` → edit → resume.
-    pub async fn resume(self) -> EngineRunOutput<C> {
-        let mut locked = self.lock();
-        let result = locked.resume().await;
+    pub async fn resume_with_annotation(
+        self,
+        history: &mut History<A>,
+        annotate: &mut impl FnMut(&Item) -> Result<A, String>,
+    ) -> EngineRunOutput<C, A> {
+        let mut locked = self.lock(history);
+        let result = locked.resume_with_annotation(history, annotate).await;
         EngineRunOutput {
             engine: locked,
             result,
@@ -1936,9 +1963,9 @@ impl<C: LlmClient> Engine<C, Mutable> {
     /// # Panics
     ///
     /// Panics if a pending tool factory produces a duplicate name.
-    pub fn lock(self) -> Engine<C, Locked> {
+    pub fn lock(self, history: &History<A>) -> Engine<C, Locked, A> {
         self.tool_server.flush_pending();
-        let locked_prefix_len = self.history.len();
+        let locked_prefix_len = history.len();
         Engine {
             client: self.client,
             retry_policy: self.retry_policy,
@@ -1949,7 +1976,6 @@ impl<C: LlmClient> Engine<C, Mutable> {
             tool_server: self.tool_server,
             interceptor: self.interceptor,
             system_prompt: self.system_prompt,
-            history: self.history,
             locked_prefix_len,
             turn_count: self.turn_count,
             active_run_turn_count: self.active_run_turn_count,
@@ -1983,19 +2009,73 @@ impl<C: LlmClient> Engine<C, Mutable> {
     }
 }
 
-impl<C: LlmClient> Engine<C, Locked> {
+fn unit_history_annotation(_: &Item) -> Result<(), String> {
+    Ok(())
+}
+
+impl<C: LlmClient> Engine<C, Mutable, ()> {
+    /// Create a new Engine (in Mutable state) using unit history annotations.
+    pub fn new(client: C) -> Self {
+        Self::new_annotated(client)
+    }
+
+    /// Append unit-annotated items to caller-owned history.
+    pub fn append_history(
+        &mut self,
+        history: &mut History<()>,
+        items: impl IntoIterator<Item = Item>,
+    ) -> Result<(), EngineError> {
+        let mut annotate = unit_history_annotation;
+        self.append_history_items(history, items, &mut annotate)
+    }
+
+    /// Replace unit-annotated history from plain items.
+    pub fn set_history(&mut self, history: &mut History<()>, items: Vec<Item>) {
+        history.replace_items(items);
+    }
+
+    /// Run using unit annotations.
+    pub async fn run(
+        self,
+        history: &mut History<()>,
+        user_input: impl Into<String>,
+    ) -> EngineRunOutput<C> {
+        let mut annotate = unit_history_annotation;
+        self.run_with_annotation(history, user_input, &mut annotate)
+            .await
+    }
+
+    /// Resume using unit annotations.
+    pub async fn resume(self, history: &mut History<()>) -> EngineRunOutput<C> {
+        let mut annotate = unit_history_annotation;
+        self.resume_with_annotation(history, &mut annotate).await
+    }
+}
+
+impl<C: LlmClient, A> Engine<C, Locked, A> {
     /// Execute a turn
     ///
     /// Adds a new user message to history and sends a request to the LLM.
     /// Automatically loops if there are tool calls.
-    pub async fn run(&mut self, user_input: impl Into<String>) -> EngineRunExit {
-        self.run_result(user_input.into()).await.into()
+    pub async fn run_with_annotation(
+        &mut self,
+        history: &mut History<A>,
+        user_input: impl Into<String>,
+        annotate: &mut impl FnMut(&Item) -> Result<A, String>,
+    ) -> EngineRunExit {
+        self.run_result_with_annotation(history, user_input.into(), annotate)
+            .await
+            .into()
     }
 
-    async fn run_result(&mut self, user_input: String) -> Result<EngineResult, EngineError> {
+    async fn run_result_with_annotation(
+        &mut self,
+        history: &mut History<A>,
+        user_input: String,
+        annotate: &mut impl FnMut(&Item) -> Result<A, String>,
+    ) -> Result<EngineResult, EngineError> {
         // Supplying new user input abandons any paused/yielded logical run.
         self.active_run_turn_count = None;
-        // Interceptor: on_prompt_submit
         let mut user_item = Item::user_message(user_input);
         let extras = match self.interceptor.on_prompt_submit(&mut user_item).await {
             PromptAction::Cancel(reason) => {
@@ -2006,27 +2086,35 @@ impl<C: LlmClient> Engine<C, Locked> {
             PromptAction::Continue => Vec::new(),
             PromptAction::ContinueWith(items) => items,
         };
-        self.append_history_items(std::iter::once(user_item))?;
+        self.append_history_items(history, std::iter::once(user_item), annotate)?;
         if !extras.is_empty() {
-            self.append_history_items(extras)?;
+            self.append_history_items(history, extras, annotate)?;
         }
         self.start_logical_run();
-        let result = self.run_turn_loop().await;
+        let result = self.run_turn_loop(history, annotate).await;
         let result = self.finalize_interruption(result).await;
         self.finish_logical_run(&result);
         result
     }
 
-    /// Resume execution (from Paused state)
-    ///
-    /// Resumes turn processing from current state without adding a new user message.
-    pub async fn resume(&mut self) -> EngineRunExit {
-        self.resume_result().await.into()
+    /// Resume execution (from Paused state).
+    pub async fn resume_with_annotation(
+        &mut self,
+        history: &mut History<A>,
+        annotate: &mut impl FnMut(&Item) -> Result<A, String>,
+    ) -> EngineRunExit {
+        self.resume_result_with_annotation(history, annotate)
+            .await
+            .into()
     }
 
-    async fn resume_result(&mut self) -> Result<EngineResult, EngineError> {
+    async fn resume_result_with_annotation(
+        &mut self,
+        history: &mut History<A>,
+        annotate: &mut impl FnMut(&Item) -> Result<A, String>,
+    ) -> Result<EngineResult, EngineError> {
         self.ensure_logical_run();
-        let result = self.run_turn_loop().await;
+        let result = self.run_turn_loop(history, annotate).await;
         let result = self.finalize_interruption(result).await;
         self.finish_logical_run(&result);
         result
@@ -2041,7 +2129,7 @@ impl<C: LlmClient> Engine<C, Locked> {
     ///
     /// Note: After this operation, subsequent requests may not hit the cache.
     /// Use only when you need to edit history.
-    pub fn unlock(self) -> Engine<C, Mutable> {
+    pub fn unlock(self) -> Engine<C, Mutable, A> {
         Engine {
             client: self.client,
             retry_policy: self.retry_policy,
@@ -2052,7 +2140,6 @@ impl<C: LlmClient> Engine<C, Locked> {
             tool_server: self.tool_server,
             interceptor: self.interceptor,
             system_prompt: self.system_prompt,
-            history: self.history,
             locked_prefix_len: 0,
             turn_count: self.turn_count,
             active_run_turn_count: self.active_run_turn_count,
@@ -2083,6 +2170,25 @@ impl<C: LlmClient> Engine<C, Locked> {
             cache_key: self.cache_key,
             _state: PhantomData,
         }
+    }
+}
+
+impl<C: LlmClient> Engine<C, Locked, ()> {
+    /// Run another turn using unit annotations.
+    pub async fn run(
+        &mut self,
+        history: &mut History<()>,
+        user_input: impl Into<String>,
+    ) -> EngineRunExit {
+        let mut annotate = unit_history_annotation;
+        self.run_with_annotation(history, user_input, &mut annotate)
+            .await
+    }
+
+    /// Resume using unit annotations.
+    pub async fn resume(&mut self, history: &mut History<()>) -> EngineRunExit {
+        let mut annotate = unit_history_annotation;
+        self.resume_with_annotation(history, &mut annotate).await
     }
 }
 

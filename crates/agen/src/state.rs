@@ -19,7 +19,7 @@ mod private {
 /// - Editing message history (add, delete, clear)
 /// - Registering tools and hooks
 ///
-/// Can transition to [`Locked`] state via `Engine::lock()`.
+/// Can transition to [`Locked`] state via `Engine::lock(&history)`.
 ///
 /// # Examples
 ///

@@ -15,7 +15,7 @@ use agen::interceptor::{
 use agen::llm_client::ClientError;
 use agen::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
-use agen::{Engine, EngineError, EngineRunExit, StopReason};
+use agen::{Engine, EngineError, EngineResult, History};
 use async_trait::async_trait;
 use common::MockLlmClient;
 
@@ -75,36 +75,37 @@ fn test_mutable_set_system_prompt() {
 fn test_mutable_history_manipulation() {
     let client = MockLlmClient::new(vec![]);
     let mut engine = Engine::new(client);
+    let mut history: History = History::new();
 
     // Initial state is empty
-    assert!(engine.history().is_empty());
+    assert!(history.is_empty());
 
     // Add to history
     engine
-        .append_history(vec![Item::user_message("Hello")])
+        .append_history(&mut history, vec![Item::user_message("Hello")])
         .unwrap();
     engine
-        .append_history(vec![Item::assistant_message("Hi there!")])
+        .append_history(&mut history, vec![Item::assistant_message("Hi there!")])
         .unwrap();
-    assert_eq!(engine.history().len(), 2);
+    assert_eq!(history.len(), 2);
 
     // Append to history via the callback-aware API.
     engine
-        .append_history(vec![Item::user_message("How are you?")])
+        .append_history(&mut history, vec![Item::user_message("How are you?")])
         .unwrap();
-    assert_eq!(engine.history().len(), 3);
+    assert_eq!(history.len(), 3);
 
     // Clear history
-    engine.clear_history();
-    assert!(engine.history().is_empty());
+    engine.clear_history(&mut history);
+    assert!(history.is_empty());
 
     // Set history
     let items = vec![
         Item::user_message("Test"),
         Item::assistant_message("Response"),
     ];
-    engine.set_history(items);
-    assert_eq!(engine.history().len(), 2);
+    engine.set_history(&mut history, items);
+    assert_eq!(history.len(), 2);
 }
 
 /// Verify that Engine can be constructed using builder pattern
@@ -112,9 +113,10 @@ fn test_mutable_history_manipulation() {
 fn test_mutable_builder_pattern() {
     let client = MockLlmClient::new(vec![]);
     let engine = Engine::new(client).system_prompt("System prompt");
+    let history: History = History::new();
 
     assert_eq!(engine.get_system_prompt(), Some("System prompt"));
-    assert!(engine.history().is_empty());
+    assert!(history.is_empty());
 }
 
 /// Verify that multiple items can be added with append_history and callbacks fire.
@@ -124,6 +126,7 @@ fn test_mutable_append_history() {
     let observed = Arc::new(Mutex::new(Vec::new()));
     let observed_for_callback = Arc::clone(&observed);
     let mut engine = Engine::new(client);
+    let mut history: History = History::new();
     engine.on_history_append(move |item| {
         if let Some(text) = item.as_text() {
             observed_for_callback.lock().unwrap().push(text.to_string());
@@ -132,18 +135,21 @@ fn test_mutable_append_history() {
     });
 
     engine
-        .append_history(vec![Item::user_message("First")])
+        .append_history(&mut history, vec![Item::user_message("First")])
         .unwrap();
 
     engine
-        .append_history(vec![
-            Item::assistant_message("Response 1"),
-            Item::user_message("Second"),
-            Item::assistant_message("Response 2"),
-        ])
+        .append_history(
+            &mut history,
+            vec![
+                Item::assistant_message("Response 1"),
+                Item::user_message("Second"),
+                Item::assistant_message("Response 2"),
+            ],
+        )
         .unwrap();
 
-    assert_eq!(engine.history().len(), 4);
+    assert_eq!(history.len(), 4);
     assert_eq!(
         observed.lock().unwrap().as_slice(),
         ["First", "Response 1", "Second", "Response 2"]
@@ -218,6 +224,7 @@ async fn history_append_failure_stops_before_tool_execution() {
     ]);
     let tool = CountingTool::new("count_tool");
     let mut engine = Engine::new(client);
+    let mut history: History = History::new();
     engine.register_tool(tool.definition());
     engine.on_history_append(|item| {
         if item.is_tool_call() {
@@ -227,8 +234,8 @@ async fn history_append_failure_stops_before_tool_execution() {
         }
     });
 
-    let mut engine = engine.lock();
-    let exit = engine.run("use the tool").await;
+    let mut engine = engine.lock(&history);
+    let error = engine.run(&mut history, "use the tool").await.unwrap_err();
 
     assert!(matches!(
         exit,
@@ -236,8 +243,8 @@ async fn history_append_failure_stops_before_tool_execution() {
             if message == "simulated ENOSPC"
     ));
     assert_eq!(tool.call_count(), 0);
-    assert_eq!(engine.history().len(), 1);
-    assert_eq!(engine.history()[0].as_text(), Some("use the tool"));
+    assert_eq!(history.len(), 1);
+    assert_eq!(history.entries()[0].item.as_text(), Some("use the tool"));
 }
 
 // =============================================================================
@@ -249,21 +256,22 @@ async fn history_append_failure_stops_before_tool_execution() {
 fn test_lock_transition() {
     let client = MockLlmClient::new(vec![]);
     let mut engine = Engine::new(client);
+    let mut history: History = History::new();
 
     engine.set_system_prompt("System");
     engine
-        .append_history(vec![Item::user_message("Hello")])
+        .append_history(&mut history, vec![Item::user_message("Hello")])
         .unwrap();
     engine
-        .append_history(vec![Item::assistant_message("Hi")])
+        .append_history(&mut history, vec![Item::assistant_message("Hi")])
         .unwrap();
 
     // Lock
-    let locked_engine = engine.lock();
+    let locked_engine = engine.lock(&history);
 
     // History and system prompt are still accessible in Locked state
     assert_eq!(locked_engine.get_system_prompt(), Some("System"));
-    assert_eq!(locked_engine.history().len(), 2);
+    assert_eq!(history.len(), 2);
     assert_eq!(locked_engine.locked_prefix_len(), 2);
 }
 
@@ -272,21 +280,22 @@ fn test_lock_transition() {
 fn test_unlock_transition() {
     let client = MockLlmClient::new(vec![]);
     let mut engine = Engine::new(client);
+    let mut history: History = History::new();
 
     engine
-        .append_history(vec![Item::user_message("Hello")])
+        .append_history(&mut history, vec![Item::user_message("Hello")])
         .unwrap();
-    let locked_engine = engine.lock();
+    let locked_engine = engine.lock(&history);
 
     // Unlock
     let mut engine = locked_engine.unlock();
 
     // History operations are available again in Mutable state
     engine
-        .append_history(vec![Item::assistant_message("Hi")])
+        .append_history(&mut history, vec![Item::assistant_message("Hi")])
         .unwrap();
-    engine.clear_history();
-    assert!(engine.history().is_empty());
+    engine.clear_history(&mut history);
+    assert!(history.is_empty());
 }
 
 // =============================================================================
@@ -307,20 +316,20 @@ async fn test_mutable_run_updates_history() -> Result<(), EngineError> {
 
     let client = MockLlmClient::new(events);
     let engine = Engine::new(client);
+    let mut history: History = History::new();
 
     // Execute (Mutable::run consumes self, returns EngineRunOutput)
-    let out = engine.run("Hi there").await;
-    let engine = out.engine;
+    let _out = engine.run(&mut history, "Hi there").await?;
 
     // History is updated
-    let history = engine.history();
+    let entries = history.entries();
     assert_eq!(history.len(), 2); // user + assistant
 
     // User message
-    assert_eq!(history[0].as_text(), Some("Hi there"));
+    assert_eq!(entries[0].item.as_text(), Some("Hi there"));
 
     // Assistant message
-    assert_eq!(history[1].as_text(), Some("Hello, I'm an assistant!"));
+    assert_eq!(entries[1].item.as_text(), Some("Hello, I'm an assistant!"));
 
     Ok(())
 }
@@ -351,35 +360,36 @@ async fn test_locked_multi_turn_history_accumulation() {
     ]);
 
     let engine = Engine::new(client).system_prompt("You are helpful.");
+    let mut history: History = History::new();
 
     // Lock (after setting system prompt)
-    let mut locked_engine = engine.lock();
+    let mut locked_engine = engine.lock(&history);
     assert_eq!(locked_engine.locked_prefix_len(), 0); // No items yet
 
     // Turn 1
-    let result1 = locked_engine.run("Hello!").await;
-    assert!(matches!(result1, EngineRunExit::Finished));
-    assert_eq!(locked_engine.history().len(), 2); // user + assistant
+    let result1 = locked_engine.run(&mut history, "Hello!").await;
+    assert!(result1.is_ok());
+    assert_eq!(history.len(), 2); // user + assistant
 
     // Turn 2
-    let result2 = locked_engine.run("Can you help me?").await;
-    assert!(matches!(result2, EngineRunExit::Finished));
-    assert_eq!(locked_engine.history().len(), 4); // 2 * (user + assistant)
+    let result2 = locked_engine.run(&mut history, "Can you help me?").await;
+    assert!(result2.is_ok());
+    assert_eq!(history.len(), 4); // 2 * (user + assistant)
 
     // Verify history contents
-    let history = locked_engine.history();
+    let entries = history.entries();
 
     // Turn 1 user message
-    assert_eq!(history[0].as_text(), Some("Hello!"));
+    assert_eq!(entries[0].item.as_text(), Some("Hello!"));
 
     // Turn 1 assistant message
-    assert_eq!(history[1].as_text(), Some("Nice to meet you!"));
+    assert_eq!(entries[1].item.as_text(), Some("Nice to meet you!"));
 
     // Turn 2 user message
-    assert_eq!(history[2].as_text(), Some("Can you help me?"));
+    assert_eq!(entries[2].item.as_text(), Some("Can you help me?"));
 
     // Turn 2 assistant message
-    assert_eq!(history[3].as_text(), Some("I can help with that."));
+    assert_eq!(entries[3].item.as_text(), Some("I can help with that."));
 }
 
 /// Verify that locked_prefix_len correctly records history length at lock time
@@ -405,26 +415,36 @@ async fn test_locked_prefix_len_tracking() {
     ]);
 
     let mut engine = Engine::new(client);
+    let mut history: History = History::new();
 
     // Add items beforehand
     engine
-        .append_history(vec![Item::user_message("Pre-existing message 1")])
+        .append_history(
+            &mut history,
+            vec![Item::user_message("Pre-existing message 1")],
+        )
         .unwrap();
     engine
-        .append_history(vec![Item::assistant_message("Pre-existing response 1")])
+        .append_history(
+            &mut history,
+            vec![Item::assistant_message("Pre-existing response 1")],
+        )
         .unwrap();
 
-    assert_eq!(engine.history().len(), 2);
+    assert_eq!(history.len(), 2);
 
     // Lock
-    let mut locked_engine = engine.lock();
+    let mut locked_engine = engine.lock(&history);
     assert_eq!(locked_engine.locked_prefix_len(), 2); // 2 items at lock time
 
     // Execute turn
-    locked_engine.run("New message").await;
+    locked_engine
+        .run(&mut history, "New message")
+        .await
+        .unwrap();
 
     // History grows but locked_prefix_len remains unchanged
-    assert_eq!(locked_engine.history().len(), 4); // 2 + 2
+    assert_eq!(history.len(), 4); // 2 + 2
     assert_eq!(locked_engine.locked_prefix_len(), 2); // Unchanged
 }
 
@@ -451,18 +471,19 @@ async fn test_turn_count_increment() -> Result<(), EngineError> {
     ]);
 
     let engine = Engine::new(client);
+    let mut history: History = History::new();
 
     assert_eq!(engine.turn_count(), 0);
     assert_eq!(engine.llm_call_count(), 0);
 
     // First run consumes Mutable, returns EngineRunOutput
-    let mut engine = engine.run("First").await.engine;
+    let mut engine = engine.run(&mut history, "First").await?.engine;
     assert_eq!(engine.turn_count(), 1);
     // Retry not yet implemented → AgentTurn:LlmCall is 1:1.
     assert_eq!(engine.llm_call_count(), 1);
 
     // Subsequent runs on Locked take &mut self
-    engine.run("Second").await;
+    engine.run(&mut history, "Second").await?;
     assert_eq!(engine.turn_count(), 2);
     assert_eq!(engine.llm_call_count(), 2);
 
@@ -482,28 +503,29 @@ async fn test_unlock_edit_relock() {
     ]]);
 
     let mut engine = Engine::new(client);
+    let mut history: History = History::new();
     engine
-        .append_history(vec![
-            Item::user_message("Hello"),
-            Item::assistant_message("Hi"),
-        ])
+        .append_history(
+            &mut history,
+            vec![Item::user_message("Hello"), Item::assistant_message("Hi")],
+        )
         .unwrap();
 
     // Lock -> Unlock
-    let locked = engine.lock();
+    let locked = engine.lock(&history);
     assert_eq!(locked.locked_prefix_len(), 2);
 
     let mut unlocked = locked.unlock();
 
     // Edit history
-    unlocked.clear_history();
+    unlocked.clear_history(&mut history);
     unlocked
-        .append_history(vec![Item::user_message("Fresh start")])
+        .append_history(&mut history, vec![Item::user_message("Fresh start")])
         .unwrap();
 
     // Re-lock
-    let relocked = unlocked.lock();
-    assert_eq!(relocked.history().len(), 1);
+    let relocked = unlocked.lock(&history);
+    assert_eq!(history.len(), 1);
     assert_eq!(relocked.locked_prefix_len(), 1);
 }
 
@@ -546,19 +568,23 @@ async fn test_lock_unlock_relock_tools_remain_effective() {
     ]);
 
     let mut engine = Engine::new(client);
+    let mut history: History = History::new();
     let tool_a = CountingTool::new("tool_a");
     engine.register_tool(tool_a.definition());
 
-    let mut locked = engine.lock();
-    locked.run("first").await;
+    let mut locked = engine.lock(&history);
+    locked.run(&mut history, "first").await.expect("first run");
     assert_eq!(tool_a.call_count(), 1, "tool_a should be called once");
 
     let mut unlocked = locked.unlock();
     let tool_b = CountingTool::new("tool_b");
     unlocked.register_tool(tool_b.definition());
 
-    let mut relocked = unlocked.lock();
-    relocked.run("second").await;
+    let mut relocked = unlocked.lock(&history);
+    relocked
+        .run(&mut history, "second")
+        .await
+        .expect("second run");
 
     assert_eq!(tool_a.call_count(), 1, "tool_a should not be called again");
     assert_eq!(tool_b.call_count(), 1, "tool_b should be called once");
@@ -573,8 +599,9 @@ async fn test_lock_unlock_relock_tools_remain_effective() {
 fn test_system_prompt_preserved_in_locked_state() {
     let client = MockLlmClient::new(vec![]);
     let engine = Engine::new(client).system_prompt("Important system prompt");
+    let history: History = History::new();
 
-    let locked = engine.lock();
+    let locked = engine.lock(&history);
     assert_eq!(locked.get_system_prompt(), Some("Important system prompt"));
 
     let unlocked = locked.unlock();
@@ -589,14 +616,15 @@ fn test_system_prompt_preserved_in_locked_state() {
 fn test_system_prompt_change_after_unlock() {
     let client = MockLlmClient::new(vec![]);
     let engine = Engine::new(client).system_prompt("Original prompt");
+    let history: History = History::new();
 
-    let locked = engine.lock();
+    let locked = engine.lock(&history);
     let mut unlocked = locked.unlock();
 
     unlocked.set_system_prompt("New prompt");
     assert_eq!(unlocked.get_system_prompt(), Some("New prompt"));
 
-    let relocked = unlocked.lock();
+    let relocked = unlocked.lock(&history);
     assert_eq!(relocked.get_system_prompt(), Some("New prompt"));
 }
 
@@ -660,17 +688,21 @@ impl Interceptor for ContinueTurnOnce {
 async fn max_turns_is_scoped_to_each_fresh_run() {
     let responses = vec![completed_text_events(), completed_text_events()];
     let mut engine = Engine::new(MockLlmClient::with_responses(responses));
+    let mut history: History = History::new();
     engine.set_max_turns(Some(1));
-    let mut engine = engine.lock();
+    let mut engine = engine.lock(&history);
 
-    assert!(matches!(engine.run("first").await, EngineRunExit::Finished));
+    assert_eq!(
+        engine.run(&mut history, "first").await.unwrap(),
+        EngineResult::Finished
+    );
     assert_eq!(engine.turn_count(), 1);
     assert_eq!(engine.active_run_turn_count(), None);
 
-    assert!(matches!(
-        engine.run("second").await,
-        EngineRunExit::Finished
-    ));
+    assert_eq!(
+        engine.run(&mut history, "second").await.unwrap(),
+        EngineResult::Finished
+    );
     assert_eq!(engine.turn_count(), 2);
     assert_eq!(engine.active_run_turn_count(), None);
 }
@@ -678,17 +710,24 @@ async fn max_turns_is_scoped_to_each_fresh_run() {
 #[tokio::test]
 async fn yielded_resume_keeps_the_same_unspent_turn_budget() {
     let mut engine = Engine::new(MockLlmClient::new(completed_text_events()));
+    let mut history: History = History::new();
     engine.set_max_turns(Some(1));
     engine.set_interceptor(YieldOnce {
         calls: AtomicUsize::new(0),
     });
-    let mut engine = engine.lock();
+    let mut engine = engine.lock(&history);
 
-    assert!(matches!(engine.run("start").await, EngineRunExit::Yielded));
+    assert_eq!(
+        engine.run(&mut history, "start").await.unwrap(),
+        EngineResult::Yielded
+    );
     assert_eq!(engine.turn_count(), 0);
     assert_eq!(engine.active_run_turn_count(), Some(0));
 
-    assert!(matches!(engine.resume().await, EngineRunExit::Finished));
+    assert_eq!(
+        engine.resume(&mut history).await.unwrap(),
+        EngineResult::Finished
+    );
     assert_eq!(engine.turn_count(), 1);
     assert_eq!(engine.active_run_turn_count(), None);
 }
@@ -705,22 +744,26 @@ async fn paused_tool_resume_does_not_reset_the_consumed_turn_budget() {
     ];
     let tool = CountingTool::new("count_tool");
     let mut engine = Engine::new(MockLlmClient::new(events));
+    let mut history: History = History::new();
     engine.set_max_turns(Some(1));
     engine.register_tool(tool.definition());
     engine.set_interceptor(PauseToolOnce {
         calls: AtomicUsize::new(0),
     });
-    let mut engine = engine.lock();
+    let mut engine = engine.lock(&history);
 
-    assert!(matches!(engine.run("call it").await, EngineRunExit::Paused));
+    assert_eq!(
+        engine.run(&mut history, "call it").await.unwrap(),
+        EngineResult::Paused
+    );
     assert_eq!(engine.turn_count(), 1);
     assert_eq!(engine.active_run_turn_count(), Some(1));
     assert_eq!(tool.call_count(), 0);
 
-    assert!(matches!(
-        engine.resume().await,
-        EngineRunExit::Interrupted(StopReason::LimitReached)
-    ));
+    assert_eq!(
+        engine.resume(&mut history).await.unwrap(),
+        EngineResult::LimitReached
+    );
     assert_eq!(engine.turn_count(), 1);
     assert_eq!(engine.active_run_turn_count(), None);
     assert_eq!(tool.call_count(), 1, "the consumed turn's tool still runs");
@@ -739,20 +782,24 @@ async fn fresh_input_abandons_a_paused_run_and_starts_a_new_budget() {
     let client = MockLlmClient::with_responses(vec![tool_events, completed_text_events()]);
     let tool = CountingTool::new("count_tool");
     let mut engine = Engine::new(client);
+    let mut history: History = History::new();
     engine.set_max_turns(Some(1));
     engine.register_tool(tool.definition());
     engine.set_interceptor(PauseToolOnce {
         calls: AtomicUsize::new(0),
     });
-    let mut engine = engine.lock();
+    let mut engine = engine.lock(&history);
 
-    assert!(matches!(engine.run("pause").await, EngineRunExit::Paused));
+    assert_eq!(
+        engine.run(&mut history, "pause").await.unwrap(),
+        EngineResult::Paused
+    );
     assert_eq!(engine.active_run_turn_count(), Some(1));
 
-    assert!(matches!(
-        engine.run("replace").await,
-        EngineRunExit::Finished
-    ));
+    assert_eq!(
+        engine.run(&mut history, "replace").await.unwrap(),
+        EngineResult::Finished
+    );
     assert_eq!(engine.turn_count(), 2);
     assert_eq!(engine.active_run_turn_count(), None);
     assert_eq!(tool.call_count(), 1, "pending-tool semantics are unchanged");
@@ -761,16 +808,17 @@ async fn fresh_input_abandons_a_paused_run_and_starts_a_new_budget() {
 #[tokio::test]
 async fn interceptor_continuation_consumes_the_logical_run_budget() {
     let mut engine = Engine::new(MockLlmClient::new(completed_text_events()));
+    let mut history: History = History::new();
     engine.set_max_turns(Some(1));
     engine.set_interceptor(ContinueTurnOnce {
         calls: AtomicUsize::new(0),
     });
-    let mut engine = engine.lock();
+    let mut engine = engine.lock(&history);
 
-    assert!(matches!(
-        engine.run("start").await,
-        EngineRunExit::Interrupted(StopReason::LimitReached)
-    ));
+    assert_eq!(
+        engine.run(&mut history, "start").await.unwrap(),
+        EngineResult::LimitReached
+    );
     assert_eq!(engine.turn_count(), 1);
     assert_eq!(engine.llm_call_count(), 1);
     assert_eq!(engine.active_run_turn_count(), None);
@@ -779,15 +827,16 @@ async fn interceptor_continuation_consumes_the_logical_run_budget() {
 #[tokio::test]
 async fn restored_active_run_budget_is_enforced_before_another_llm_call() {
     let mut engine = Engine::new(MockLlmClient::new(completed_text_events()));
+    let mut history: History = History::new();
     engine.set_max_turns(Some(1));
     engine.set_turn_count(7);
     engine.set_active_run_turn_count(Some(1));
-    let mut engine = engine.lock();
+    let mut engine = engine.lock(&history);
 
-    assert!(matches!(
-        engine.resume().await,
-        EngineRunExit::Interrupted(StopReason::LimitReached)
-    ));
+    assert_eq!(
+        engine.resume(&mut history).await.unwrap(),
+        EngineResult::LimitReached
+    );
     assert_eq!(engine.turn_count(), 7);
     assert_eq!(engine.llm_call_count(), 0);
     assert_eq!(engine.active_run_turn_count(), None);

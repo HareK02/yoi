@@ -193,6 +193,7 @@ impl Tool for ShowOverviewTool {
             .map(|entry| {
                 serde_json::json!({
                     "entry_ref": entry.id,
+                    "origin": entry.origin,
                     "entry_range": entry.entry_range,
                     "kind": entry.kind.as_str(),
                     "label": entry.label,
@@ -234,15 +235,16 @@ impl Tool for SearchEntriesTool {
             .transpose()?;
         let from = params.from.as_deref().map(parse_entry_ref).transpose()?;
         let through = params.through.as_deref().map(parse_entry_ref).transpose()?;
+        let view = self.state.view();
         if let (Some(from), Some(through)) = (&from, &through) {
-            if from.source_index() > through.source_index() {
+            if view.source_index_for_ref(from) > view.source_index_for_ref(through) {
                 return Err(ToolError::InvalidArgument(
                     "SearchEntries from must not be after through".to_string(),
                 ));
             }
         }
         let limit = bounded_limit(params.limit, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT);
-        let hits = self.state.view().search(&SearchOptions {
+        let hits = view.search(&SearchOptions {
             query: params.query,
             kind,
             tool_part,
@@ -318,6 +320,7 @@ impl Tool for ReadEntryTool {
             .map(|entry| {
                 serde_json::json!({
                     "entry_ref": entry.id,
+                    "origin": entry.origin,
                     "entry_range": entry.entry_range,
                     "kind": entry.kind.as_str(),
                     "tool_part": entry.tool_part.map(|part| format!("{part:?}").to_lowercase()),

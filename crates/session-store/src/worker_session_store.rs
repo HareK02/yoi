@@ -20,7 +20,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-const SESSION_SCHEMA_VERSION: u32 = 1;
+const SESSION_SCHEMA_VERSION: u32 = 2;
+const LEGACY_SESSION_SCHEMA_VERSION: u32 = 1;
 const SESSION_FILE: &str = "session.json";
 const SEGMENTS_DIR: &str = "segments";
 
@@ -44,15 +45,22 @@ impl WorkerSessionStore {
         fs::create_dir_all(root.join(SEGMENTS_DIR))?;
         let session_id = match fs::read(root.join(SESSION_FILE)) {
             Ok(bytes) => {
-                let manifest: SessionManifest = serde_json::from_slice(&bytes)?;
-                if manifest.schema_version != SESSION_SCHEMA_VERSION {
-                    return Err(StoreError::Corrupt {
-                        line: 0,
-                        message: format!(
-                            "unsupported Worker Session schema version {}, expected {}",
-                            manifest.schema_version, SESSION_SCHEMA_VERSION
-                        ),
-                    });
+                let mut manifest: SessionManifest = serde_json::from_slice(&bytes)?;
+                match manifest.schema_version {
+                    SESSION_SCHEMA_VERSION => {}
+                    LEGACY_SESSION_SCHEMA_VERSION => {
+                        validate_legacy_segment_logs(&root)?;
+                        manifest.schema_version = SESSION_SCHEMA_VERSION;
+                        atomic_write_json(&root.join(SESSION_FILE), &manifest)?;
+                    }
+                    version => {
+                        return Err(StoreError::Corrupt {
+                            line: 0,
+                            message: format!(
+                                "unsupported Worker Session schema version {version}, expected {SESSION_SCHEMA_VERSION}"
+                            ),
+                        });
+                    }
                 }
                 Some(manifest.session_id)
             }
@@ -278,6 +286,37 @@ impl Store for WorkerSessionStore {
     }
 }
 
+fn validate_legacy_segment_logs(root: &Path) -> Result<(), StoreError> {
+    let segments = root.join(SEGMENTS_DIR);
+    if !segments.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(&segments)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".jsonl") || name.ends_with(".trace.jsonl") {
+            continue;
+        }
+        let contents = fs::read_to_string(&path)?;
+        for (line_index, line) in contents.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            serde_json::from_str::<LogEntry>(line).map_err(|error| StoreError::Corrupt {
+                line: line_index + 1,
+                message: format!(
+                    "cannot migrate legacy Worker Session log {}: {error}",
+                    path.display()
+                ),
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreError> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
@@ -403,6 +442,54 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("cannot attach or switch"));
         assert_eq!(store.list_sessions().unwrap(), vec![session_id]);
+    }
+
+    #[test]
+    fn schema_v1_logs_are_validated_and_promoted_to_v2() {
+        let root = tempfile::tempdir().unwrap();
+        let session_id = new_session_id();
+        let segment_id = new_segment_id();
+        WorkerSessionStore::new(root.path())
+            .unwrap()
+            .create_segment(session_id, segment_id, &[])
+            .unwrap();
+        let manifest_path = root.path().join(SESSION_FILE);
+        let mut manifest: SessionManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.schema_version = LEGACY_SESSION_SCHEMA_VERSION;
+        atomic_write_json(&manifest_path, &manifest).unwrap();
+
+        let reopened = WorkerSessionStore::new(root.path()).unwrap();
+        assert_eq!(reopened.session_id().unwrap(), Some(session_id));
+        let migrated: SessionManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(migrated.schema_version, SESSION_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn schema_v1_migration_rejects_corrupt_log_before_manifest_update() {
+        let root = tempfile::tempdir().unwrap();
+        let session_id = new_session_id();
+        let manifest = SessionManifest {
+            schema_version: LEGACY_SESSION_SCHEMA_VERSION,
+            session_id,
+        };
+        atomic_write_json(&root.path().join(SESSION_FILE), &manifest).unwrap();
+        fs::create_dir_all(root.path().join(SEGMENTS_DIR)).unwrap();
+        fs::write(
+            root.path().join(SEGMENTS_DIR).join("broken.jsonl"),
+            "{not-json}\n",
+        )
+        .unwrap();
+
+        let error = match WorkerSessionStore::new(root.path()) {
+            Ok(_) => panic!("corrupt legacy Session log must reject migration"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StoreError::Corrupt { .. }));
+        let persisted: SessionManifest =
+            serde_json::from_slice(&fs::read(root.path().join(SESSION_FILE)).unwrap()).unwrap();
+        assert_eq!(persisted.schema_version, LEGACY_SESSION_SCHEMA_VERSION);
     }
 
     #[test]

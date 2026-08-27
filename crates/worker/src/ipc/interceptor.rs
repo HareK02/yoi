@@ -8,6 +8,7 @@
 //! decisions (continue / skip / abort / pause).
 
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -33,7 +34,9 @@ use crate::hook::{
 };
 use crate::ipc::notify_buffer::{NotifyBuffer, build_system_item_with_provenance};
 use crate::prompt::catalog::PromptCatalog;
+use crate::session_history::SessionHistoryMetadata;
 use crate::worker::SystemItemCommitter;
+use agen::HistoryEntry;
 use agen::token_counter::total_tokens;
 
 /// Maximum number of bytes copied into `TurnEndInfo::final_text_preview`.
@@ -73,6 +76,7 @@ pub(crate) struct WorkerInterceptor {
     /// worker. `None` in tests / `Worker::new` paths where no writer is
     /// attached.
     log_writer: Option<Arc<dyn SystemItemCommitter>>,
+    pending_committed_history: Arc<Mutex<VecDeque<HistoryEntry<SessionHistoryMetadata>>>>,
     /// Next turn index assigned by `on_prompt_submit`.
     next_turn_index: AtomicUsize,
     /// Tool calls observed in the current turn (reset on each new prompt).
@@ -80,6 +84,7 @@ pub(crate) struct WorkerInterceptor {
 }
 
 impl WorkerInterceptor {
+    #[cfg(test)]
     pub(crate) fn new(
         registry: Arc<HookRegistry>,
         compact_state: Option<Arc<CompactState>>,
@@ -88,6 +93,28 @@ impl WorkerInterceptor {
         pending_attachments: Arc<Mutex<Vec<SystemItem>>>,
         prompts: Arc<ArcSwap<PromptCatalog>>,
         log_writer: Option<Arc<dyn SystemItemCommitter>>,
+    ) -> Self {
+        Self::new_with_history_queue(
+            registry,
+            compact_state,
+            usage_history,
+            pending_notifies,
+            pending_attachments,
+            prompts,
+            log_writer,
+            Arc::new(Mutex::new(VecDeque::new())),
+        )
+    }
+
+    pub(crate) fn new_with_history_queue(
+        registry: Arc<HookRegistry>,
+        compact_state: Option<Arc<CompactState>>,
+        usage_history: Option<Arc<Mutex<Vec<UsageRecord>>>>,
+        pending_notifies: NotifyBuffer,
+        pending_attachments: Arc<Mutex<Vec<SystemItem>>>,
+        prompts: Arc<ArcSwap<PromptCatalog>>,
+        log_writer: Option<Arc<dyn SystemItemCommitter>>,
+        pending_committed_history: Arc<Mutex<VecDeque<HistoryEntry<SessionHistoryMetadata>>>>,
     ) -> Self {
         Self {
             registry,
@@ -99,6 +126,7 @@ impl WorkerInterceptor {
             prompts,
             prompt_workspace_id: None,
             log_writer,
+            pending_committed_history,
             next_turn_index: AtomicUsize::new(0),
             tool_calls_this_turn: AtomicUsize::new(0),
         }
@@ -125,7 +153,11 @@ impl WorkerInterceptor {
             return Ok(());
         };
         for item in items {
-            writer.commit_system_item(item.clone())?;
+            let entry = writer.commit_system_item(item.clone())?;
+            self.pending_committed_history
+                .lock()
+                .expect("pending committed history poisoned")
+                .push_back(entry);
         }
         Ok(())
     }
@@ -507,7 +539,12 @@ mod tests {
             &self,
             entry: session_store::LogEntry,
         ) -> Result<(), session_store::StoreError> {
-            if let session_store::LogEntry::SystemItem { item, .. } = entry {
+            let item = match entry {
+                session_store::LogEntry::SystemItem { item, .. } => Some(item),
+                session_store::LogEntry::AnnotatedSystemItem { entry, .. } => Some(entry.item),
+                _ => None,
+            };
+            if let Some(item) = item {
                 self.committed
                     .lock()
                     .expect("committed system-item list poisoned")

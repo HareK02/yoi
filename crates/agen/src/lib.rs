@@ -2,6 +2,7 @@
 
 mod engine;
 mod handler;
+mod history;
 mod message;
 
 pub(crate) mod callback;
@@ -24,6 +25,7 @@ pub use engine::{
     LlmRetryNotice, StopReason, ToolRegistryError,
 };
 pub use handler::ToolUseBlockStart;
+pub use history::{History, HistoryEntry};
 pub use interceptor::Interceptor;
 pub use message::{ContentPart, Item, Message, Role};
 pub use tool::{ToolCall, ToolExecutionContext, ToolOutputLimits, ToolResult};

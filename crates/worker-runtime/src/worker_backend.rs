@@ -38,9 +38,7 @@ use crate::working_directory::{
 };
 use async_trait::async_trait;
 use protocol::{Event, Method, Segment, WorkerStatus};
-use session_store::{
-    CombinedStore, LogEntry, WorkerAggregateStore, WorkerSessionStore, collect_state,
-};
+use session_store::{CombinedStore, LogEntry, WorkerAggregateStore, WorkerSessionStore};
 #[cfg(test)]
 use session_store::{FsStore, FsWorkerStore};
 use tokio::runtime::Runtime;
@@ -68,8 +66,10 @@ const RUNTIME_TASK_TIMEOUT: Duration = Duration::from_secs(10);
 const USER_INPUT_COMMIT_TIMEOUT: Duration = Duration::from_secs(9);
 
 fn user_input_has_submission(entry: &LogEntry, submission_id: &str) -> bool {
-    let LogEntry::UserInput { extensions, .. } = entry else {
-        return false;
+    let extensions = match entry {
+        LogEntry::UserInput { extensions, .. }
+        | LogEntry::AnnotatedUserInput { extensions, .. } => extensions,
+        _ => return false,
     };
     extensions.iter().any(|extension| {
         extension.domain == WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN
@@ -212,11 +212,11 @@ impl WorkerObservationProvider for RuntimeGrantedWorkerObservationProvider {
             return Err(WorkerObservationError::NotFound);
         }
         let entries = sink.subscribe_with_snapshot().0;
-        let state = collect_state(&entries);
-        Ok(WorkerSessionCapture {
-            segment_id: format!("runtime:{runtime_id}:worker:{worker_id}"),
-            items: state.history,
-        })
+        WorkerSessionCapture::from_log_entries(
+            format!("runtime:{runtime_id}:worker:{worker_id}"),
+            &entries,
+        )
+        .map_err(WorkerObservationError::Unavailable)
     }
 }
 
@@ -2507,7 +2507,9 @@ mod tests {
             let scope = Scope::writable(&scope_root).map_err(|err| err.to_string())?;
             let worker = Worker::new(
                 manifest,
-                Engine::new(self.client.clone()),
+                Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(
+                    self.client.clone(),
+                ),
                 store,
                 workspace_context,
                 filesystem_authority,
@@ -3243,14 +3245,17 @@ mod tests {
             matches!(
                 entry,
                 LogEntry::UserInput { segments, .. }
+                | LogEntry::AnnotatedUserInput { segments, .. }
                     if segments == &vec![Segment::text("start the ticket")]
             )
         }));
         let submission_id = entries
             .iter()
             .find_map(|entry| {
-                let LogEntry::UserInput { extensions, .. } = entry else {
-                    return None;
+                let extensions = match entry {
+                    LogEntry::UserInput { extensions, .. }
+                    | LogEntry::AnnotatedUserInput { extensions, .. } => extensions,
+                    _ => return None,
                 };
                 extensions
                     .iter()

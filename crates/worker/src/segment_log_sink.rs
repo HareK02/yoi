@@ -121,8 +121,11 @@ impl SegmentLogSink {
         matches!(
             entry,
             LogEntry::SegmentStart { .. }
+                | LogEntry::AnnotatedSegmentStart { .. }
                 | LogEntry::UserInput { .. }
+                | LogEntry::AnnotatedUserInput { .. }
                 | LogEntry::SystemItem { .. }
+                | LogEntry::AnnotatedSystemItem { .. }
                 | LogEntry::Invoke { .. }
         )
     }

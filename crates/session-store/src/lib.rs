@@ -32,6 +32,7 @@
 
 pub mod event_trace;
 pub mod fs_store;
+pub mod history;
 pub mod logged_item;
 pub mod segment;
 pub mod segment_log;
@@ -44,6 +45,11 @@ pub use agen::UsageRecord;
 pub use agen::llm_client::types::{ContentPart, Item, Role};
 pub use event_trace::{TraceEntry, TracePayload};
 pub use fs_store::FsStore;
+pub use history::{
+    LoggedHistoryDerivation, LoggedHistoryEntry, LoggedSessionHistoryEntryId,
+    LoggedSessionHistoryMetadata, LoggedSessionHistoryOrigin, LoggedSystemHistoryEntry,
+    LoggedWorkerSubject, legacy_logged_history, legacy_segment_history,
+};
 pub use logged_item::{LoggedContentPart, LoggedItem, LoggedRole, from_logged, to_logged};
 pub use segment::{
     SegmentStartState, append_entry, append_system_item, classify_history_item,
