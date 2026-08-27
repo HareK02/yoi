@@ -1,3 +1,4 @@
+use fs_operation::FsPath;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -7,6 +8,10 @@ pub struct CommandHandle(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandRequest {
     pub command: String,
+    /// Optional logical working directory relative to the calling session's cwd.
+    /// Providers must resolve and validate it before starting the process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<FsPath>,
     pub timeout_secs: u64,
     pub output_limit: usize,
     /// Optional caller-owned correlation id. Bash supplies its tool-call id so

@@ -230,6 +230,7 @@ async fn shutdown_closes_bound_workdir_session() {
     let command = session
         .start_command(CommandRequest {
             command: "sleep 30".to_owned(),
+            cwd: None,
             timeout_secs: 60,
             output_limit: 1024,
             tool_call_id: None,
@@ -271,6 +272,7 @@ async fn controller_projects_workdir_command_events_and_snapshot_state() {
     let command = session
         .start_command(CommandRequest {
             command: "printf ready; sleep 0.3; printf done".to_owned(),
+            cwd: None,
             timeout_secs: 5,
             output_limit: 1024,
             tool_call_id: Some("tool-command-1".into()),
@@ -378,6 +380,7 @@ async fn controller_refreshes_command_snapshot_after_high_output_provider_lag() 
         .start_command(CommandRequest {
             command: "dd if=/dev/zero bs=8192 count=300 2>/dev/null | tr '\\0' x; sleep 5"
                 .to_owned(),
+            cwd: None,
             timeout_secs: 10,
             output_limit: 1024,
             tool_call_id: Some("tool-high-output".into()),
@@ -452,6 +455,7 @@ async fn controller_startup_failure_closes_bound_workdir_session() {
         session
             .start_command(CommandRequest {
                 command: "printf unreachable".to_owned(),
+                cwd: None,
                 timeout_secs: 5,
                 output_limit: 1024,
                 tool_call_id: None,

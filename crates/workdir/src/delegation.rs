@@ -251,14 +251,43 @@ impl DelegatingWorkdirSession {
         self.ensure_path(path, WorkdirDelegationPermission::Write)
     }
 
-    fn ensure_command(&self, starting: bool) -> Result<(), WorkdirError> {
-        self.ensure_capability(WorkdirSessionCapability::Command, "command execution")?;
-        if starting && self.has_active_write_lease() {
-            return Err(WorkdirError::Denied(
-                "command execution is denied while a child holds a write delegation".into(),
-            ));
+    fn resolve_command_cwd(&self, cwd: Option<&FsPath>) -> Result<FsPath, WorkdirError> {
+        match cwd {
+            Some(cwd) => self.resolve_path(cwd),
+            None => Ok(self.cwd.clone()),
         }
-        Ok(())
+    }
+
+    fn ensure_command_start(&self, cwd: &FsPath) -> Result<(), WorkdirError> {
+        self.ensure_capability(WorkdirSessionCapability::Command, "command execution")?;
+        if let Some(scope) = &self.scope
+            && !scope.iter().any(|rule| {
+                rule.permission == WorkdirDelegationPermission::Write
+                    && rule_allows_path(rule, cwd, WorkdirDelegationPermission::Write)
+            })
+        {
+            return Err(WorkdirError::Denied(format!(
+                "command cwd `{cwd}` is outside the delegated write scope"
+            )));
+        }
+
+        let mut leases = self
+            .child_write_leases
+            .lock()
+            .expect("workdir delegation lease mutex poisoned");
+        leases.retain(|_, lease| lease.validity.upgrade().is_some_and(|v| v.is_active()));
+        if leases.values().any(|lease| {
+            lease.rules.iter().any(|rule| {
+                rule.permission == WorkdirDelegationPermission::Write
+                    && command_cwd_overlaps_rule(cwd, rule)
+            })
+        }) {
+            Err(WorkdirError::Denied(format!(
+                "command cwd `{cwd}` overlaps a child write delegation"
+            )))
+        } else {
+            Ok(())
+        }
     }
 
     fn ensure_parent_write_available(&self, path: &FsPath) -> Result<(), WorkdirError> {
@@ -279,20 +308,6 @@ impl DelegatingWorkdirSession {
         } else {
             Ok(())
         }
-    }
-
-    fn has_active_write_lease(&self) -> bool {
-        let mut leases = self
-            .child_write_leases
-            .lock()
-            .expect("workdir delegation lease mutex poisoned");
-        leases.retain(|_, lease| lease.validity.upgrade().is_some_and(|v| v.is_active()));
-        leases.values().any(|lease| {
-            lease
-                .rules
-                .iter()
-                .any(|rule| rule.permission == WorkdirDelegationPermission::Write)
-        })
     }
 
     fn validate_delegation_rules(
@@ -502,13 +517,20 @@ impl WorkdirSession for DelegatingWorkdirSession {
         self.source.grep(request).await
     }
 
-    async fn start_command(&self, request: CommandRequest) -> Result<CommandHandle, WorkdirError> {
-        self.ensure_command(true)?;
+    async fn start_command(
+        &self,
+        mut request: CommandRequest,
+    ) -> Result<CommandHandle, WorkdirError> {
+        let cwd = self.resolve_command_cwd(request.cwd.as_ref())?;
+        self.ensure_command_start(&cwd)?;
+        if !self.source.transports_delegation_context() {
+            request.cwd = Some(cwd);
+        }
         self.source.start_command(request).await
     }
 
     async fn command_status(&self, handle: CommandHandle) -> Result<CommandStatus, WorkdirError> {
-        self.ensure_command(false)?;
+        self.ensure_capability(WorkdirSessionCapability::Command, "command execution")?;
         self.source.command_status(handle).await
     }
 
@@ -516,12 +538,12 @@ impl WorkdirSession for DelegatingWorkdirSession {
         &self,
         request: CommandOutputRequest,
     ) -> Result<CommandOutput, WorkdirError> {
-        self.ensure_command(false)?;
+        self.ensure_capability(WorkdirSessionCapability::Command, "command execution")?;
         self.source.command_output(request).await
     }
 
     async fn cancel_command(&self, handle: CommandHandle) -> Result<(), WorkdirError> {
-        self.ensure_command(false)?;
+        self.ensure_capability(WorkdirSessionCapability::Command, "command execution")?;
         self.source.cancel_command(handle).await
     }
 
@@ -649,6 +671,11 @@ impl WorkdirSession for ReadOnlyWorkdirSession {
     }
 }
 
+fn command_cwd_overlaps_rule(cwd: &FsPath, rule: &WorkdirDelegationRule) -> bool {
+    rule_allows_path(rule, cwd, WorkdirDelegationPermission::Write)
+        || Path::new(rule.target.as_str()).starts_with(Path::new(cwd.as_str()))
+}
+
 fn rule_allows_path(
     rule: &WorkdirDelegationRule,
     path: &FsPath,
@@ -763,6 +790,7 @@ mod tests {
         let handle = parent
             .start_command(CommandRequest {
                 command: "printf ready; sleep 0.2; printf done".into(),
+                cwd: None,
                 timeout_secs: 5,
                 output_limit: 1024,
                 tool_call_id: Some("tool-delegated".into()),
@@ -917,6 +945,18 @@ mod tests {
                 .await,
             Err(WorkdirError::Denied(_))
         ));
+        assert!(matches!(
+            parent
+                .start_command(CommandRequest {
+                    command: "printf escaped".into(),
+                    cwd: Some(fs_path("granted/outside")),
+                    timeout_secs: 5,
+                    output_limit: 1024,
+                    tool_call_id: Some("symlink-cwd".into()),
+                })
+                .await,
+            Err(WorkdirError::Denied(message)) if message.contains("traverses a symlink")
+        ));
         parent
             .write(write("secret/parent", "still-authoritative"))
             .await
@@ -924,7 +964,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_lease_blocks_parent_region_until_release() {
+    async fn write_lease_blocks_only_overlapping_parent_command_cwds_until_release() {
         let root = TempDir::new().unwrap();
         fs::create_dir_all(root.path().join("leased")).unwrap();
         fs::create_dir_all(root.path().join("other")).unwrap();
@@ -941,7 +981,8 @@ mod tests {
         let command = child
             .scoped_session
             .start_command(CommandRequest {
-                command: "printf child-command".into(),
+                command: "pwd; printf child-command".into(),
+                cwd: None,
                 timeout_secs: 5,
                 output_limit: 1024,
                 tool_call_id: Some("delegated-child-command".into()),
@@ -958,17 +999,65 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(command_output.content, "child-command");
         assert!(
-            parent
-                .start_command(CommandRequest {
-                    command: "printf parent-command".into(),
-                    timeout_secs: 5,
-                    output_limit: 1024,
-                    tool_call_id: Some("blocked-parent-command".into()),
-                })
-                .await
-                .is_err()
+            command_output.content.ends_with("leased\nchild-command"),
+            "child command must run from its delegated cwd: {}",
+            command_output.content
+        );
+        let denied = parent
+            .start_command(CommandRequest {
+                command: "printf parent-command".into(),
+                cwd: None,
+                timeout_secs: 5,
+                output_limit: 1024,
+                tool_call_id: Some("blocked-parent-command".into()),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            denied,
+            WorkdirError::Denied(message)
+                if message.contains("command cwd `.` overlaps a child write delegation")
+        ));
+        let denied = parent
+            .start_command(CommandRequest {
+                command: "printf still-denied".into(),
+                cwd: Some(fs_path("leased")),
+                timeout_secs: 5,
+                output_limit: 1024,
+                tool_call_id: Some("overlapping-parent-command".into()),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            denied,
+            WorkdirError::Denied(message)
+                if message.contains("command cwd `leased` overlaps a child write delegation")
+        ));
+
+        let unrelated = parent
+            .start_command(CommandRequest {
+                command: "pwd; printf parent-command".into(),
+                cwd: Some(fs_path("other")),
+                timeout_secs: 5,
+                output_limit: 1024,
+                tool_call_id: Some("unrelated-parent-command".into()),
+            })
+            .await
+            .unwrap();
+        let unrelated_output = parent
+            .command_output(CommandOutputRequest {
+                handle: unrelated,
+                cursor: 0,
+                limit: 1024,
+                wait: true,
+            })
+            .await
+            .unwrap();
+        assert!(
+            unrelated_output.content.ends_with("other\nparent-command"),
+            "parent command must run from its explicit disjoint cwd: {}",
+            unrelated_output.content
         );
 
         assert!(matches!(
@@ -982,6 +1071,26 @@ mod tests {
             .await
             .unwrap();
         child.release();
+        let resumed = parent
+            .start_command(CommandRequest {
+                command: "printf resumed".into(),
+                cwd: None,
+                timeout_secs: 5,
+                output_limit: 1024,
+                tool_call_id: Some("resumed-parent-command".into()),
+            })
+            .await
+            .unwrap();
+        let resumed_output = parent
+            .command_output(CommandOutputRequest {
+                handle: resumed,
+                cursor: 0,
+                limit: 1024,
+                wait: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(resumed_output.content, "resumed");
         parent
             .write(write("leased/parent", "parent"))
             .await
@@ -1031,6 +1140,153 @@ mod tests {
             nested.scoped_session.read(read("a")).await,
             Err(WorkdirError::SessionClosed)
         ));
+    }
+
+    #[tokio::test]
+    async fn nested_write_delegation_uses_each_session_cwd_without_widening_scope() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("top/nested")).unwrap();
+        fs::create_dir_all(root.path().join("top/peer")).unwrap();
+        fs::create_dir_all(root.path().join("other")).unwrap();
+        let root_session = session(root.path());
+        let child = root_session
+            .delegate(request("top", WorkdirDelegationPermission::Write))
+            .await
+            .unwrap();
+        let nested = child
+            .scoped_session
+            .delegate(WorkdirDelegationRequest {
+                rules: vec![WorkdirDelegationRule {
+                    target: fs_path("top/nested"),
+                    permission: WorkdirDelegationPermission::Write,
+                    recursive: true,
+                }],
+                cwd: fs_path("top/nested"),
+            })
+            .await
+            .unwrap();
+
+        let nested_handle = nested
+            .scoped_session
+            .start_command(CommandRequest {
+                command: "pwd; printf nested".into(),
+                cwd: None,
+                timeout_secs: 5,
+                output_limit: 1024,
+                tool_call_id: Some("nested-command".into()),
+            })
+            .await
+            .unwrap();
+        let nested_output = nested
+            .scoped_session
+            .command_output(CommandOutputRequest {
+                handle: nested_handle,
+                cursor: 0,
+                limit: 1024,
+                wait: true,
+            })
+            .await
+            .unwrap();
+        assert!(nested_output.content.ends_with("top/nested\nnested"));
+
+        let denied = child
+            .scoped_session
+            .start_command(CommandRequest {
+                command: "printf blocked".into(),
+                cwd: None,
+                timeout_secs: 5,
+                output_limit: 1024,
+                tool_call_id: Some("nested-overlap".into()),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            denied,
+            WorkdirError::Denied(message)
+                if message.contains("command cwd `top` overlaps a child write delegation")
+        ));
+
+        let peer_handle = child
+            .scoped_session
+            .start_command(CommandRequest {
+                command: "pwd; printf peer".into(),
+                cwd: Some(fs_path("peer")),
+                timeout_secs: 5,
+                output_limit: 1024,
+                tool_call_id: Some("nested-peer".into()),
+            })
+            .await
+            .unwrap();
+        let peer_output = child
+            .scoped_session
+            .command_output(CommandOutputRequest {
+                handle: peer_handle,
+                cursor: 0,
+                limit: 1024,
+                wait: true,
+            })
+            .await
+            .unwrap();
+        assert!(peer_output.content.ends_with("top/peer\npeer"));
+
+        let outside_handle = root_session
+            .start_command(CommandRequest {
+                command: "pwd; printf outside".into(),
+                cwd: Some(fs_path("other")),
+                timeout_secs: 5,
+                output_limit: 1024,
+                tool_call_id: Some("root-outside".into()),
+            })
+            .await
+            .unwrap();
+        let outside_output = root_session
+            .command_output(CommandOutputRequest {
+                handle: outside_handle,
+                cursor: 0,
+                limit: 1024,
+                wait: true,
+            })
+            .await
+            .unwrap();
+        assert!(outside_output.content.ends_with("other\noutside"));
+
+        nested.release();
+        child.release();
+    }
+
+    #[tokio::test]
+    async fn reapplied_delegation_chain_preserves_command_cwd() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("delegated")).unwrap();
+        let parent = session(root.path());
+        let applied = apply_delegation_chain(
+            parent,
+            [request("delegated", WorkdirDelegationPermission::Write)],
+        )
+        .await
+        .unwrap();
+        let scoped = &applied.scoped_session;
+
+        let handle = scoped
+            .start_command(CommandRequest {
+                command: "pwd; printf reapplied".into(),
+                cwd: None,
+                timeout_secs: 5,
+                output_limit: 1024,
+                tool_call_id: Some("reapplied-command".into()),
+            })
+            .await
+            .unwrap();
+        let output = scoped
+            .command_output(CommandOutputRequest {
+                handle,
+                cursor: 0,
+                limit: 1024,
+                wait: true,
+            })
+            .await
+            .unwrap();
+        assert!(output.content.ends_with("delegated\nreapplied"));
     }
 
     #[tokio::test]

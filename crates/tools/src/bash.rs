@@ -5,7 +5,9 @@ use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use workdir::{CommandHandle, CommandOutputRequest, CommandRequest, WorkdirSessionHandle};
+use workdir::{
+    CommandHandle, CommandOutputRequest, CommandRequest, WorkdirPath, WorkdirSessionHandle,
+};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_TIMEOUT_SECS: u64 = 600;
@@ -14,6 +16,10 @@ const INLINE_BYTE_BUDGET: usize = 12 * 1024;
 #[derive(Debug, Deserialize, JsonSchema)]
 struct BashParams {
     command: String,
+    /// Optional logical working directory relative to the bound session cwd.
+    /// Supplying it lets delegation guards prove the command is disjoint from child write scopes.
+    #[serde(default)]
+    cwd: Option<String>,
     #[serde(default)]
     timeout: Option<u64>,
 }
@@ -51,11 +57,18 @@ impl Tool for BashTool {
             .timeout
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .clamp(1, MAX_TIMEOUT_SECS);
+        let cwd = params
+            .cwd
+            .as_deref()
+            .map(WorkdirPath::new)
+            .transpose()
+            .map_err(crate::ToolsError::from)?;
         let cmd_summary = truncate_for_summary(&params.command);
         let handle = self
             .session
             .start_command(CommandRequest {
                 command: params.command,
+                cwd,
                 timeout_secs,
                 output_limit: INLINE_BYTE_BUDGET,
                 tool_call_id: Some(ctx.call_id),
