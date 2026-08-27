@@ -2969,7 +2969,7 @@ fn dashboard_empty_enter_on_non_openable_row_reports_open_diagnostic() {
 }
 
 #[test]
-fn idle_orchestrator_gets_bounded_attention_for_new_queued_work() {
+fn idle_orchestrator_gets_sanitized_attention_for_new_queued_work() {
     let mut app = ticket_enabled_app(vec![live_info("test-orchestrator", WorkerStatus::Idle)]);
     app.panel.rows = vec![panel_test_ticket_row(
         "00001QUEUE",
@@ -2989,11 +2989,87 @@ fn idle_orchestrator_gets_bounded_attention_for_new_queued_work() {
         request
             .notice
             .message
-            .starts_with("Workspace Dashboard observed")
+            .starts_with("Queued Tickets require attention:")
     );
-    assert!(request.notice.message.contains("00001QUEUE"));
-    assert!(request.notice.message.contains("new_queued"));
-    assert!(request.notice.message.contains("queued -> inprogress"));
+    assert!(request.notice.message.contains("- T-1 — Queued work"));
+    assert!(
+        request
+            .notice
+            .message
+            .contains("Reread the current Ticket state before acting")
+    );
+    assert!(
+        !request
+            .notice
+            .message
+            .contains(&app.panel.header.workspace_label)
+    );
+    for hidden in [
+        "00001QUEUE",
+        "Workspace:",
+        "workspace_id",
+        "new_queued",
+        "bounded",
+        "queued -> inprogress",
+    ] {
+        assert!(!request.notice.message.contains(hidden), "leaked {hidden}");
+    }
+}
+
+#[test]
+fn queued_attention_missing_resource_key_fails_closed_with_panel_notice() {
+    let mut app = ticket_enabled_app(vec![live_info("test-orchestrator", WorkerStatus::Idle)]);
+    let mut row = panel_test_ticket_row(
+        "00001QUEUE",
+        "Queued work",
+        ActionPriority::Background,
+        NextUserAction::Wait,
+        "queued",
+    );
+    row.ticket.as_mut().unwrap().resource_key = None;
+    app.panel.rows = vec![row];
+    app.refresh_orchestrator_work_set();
+
+    assert!(app.prepare_orchestrator_queue_attention_notice().is_none());
+    assert_eq!(
+        app.notice.as_deref(),
+        Some(
+            "Orchestrator queued-work attention not delivered: queued Ticket is missing its required resource key"
+        )
+    );
+}
+
+#[test]
+fn queued_attention_truncates_only_when_tickets_are_omitted() {
+    let mut app = ticket_enabled_app(vec![live_info("test-orchestrator", WorkerStatus::Idle)]);
+    app.panel.rows = (1..=worker::OrchestratorQueueAttentionContext::MAX_TICKETS + 1)
+        .map(|index| {
+            let mut row = panel_test_ticket_row(
+                &format!("opaque-{index}"),
+                &format!("Queued work {index}"),
+                ActionPriority::Background,
+                NextUserAction::Wait,
+                "queued",
+            );
+            row.ticket.as_mut().unwrap().resource_key = Some(format!("T-{index}"));
+            row
+        })
+        .collect();
+    app.refresh_orchestrator_work_set();
+
+    let request = app
+        .prepare_orchestrator_queue_attention_notice()
+        .expect("bounded queued-work attention");
+
+    assert!(request.notice.message.contains("- T-20 — Queued work 20"));
+    assert!(!request.notice.message.contains("T-21"));
+    assert!(
+        request
+            .notice
+            .message
+            .contains("were omitted from this notice: 1")
+    );
+    assert!(!request.notice.message.contains("opaque-"));
 }
 
 #[test]
@@ -3083,7 +3159,9 @@ fn planned_queued_prompts_when_active_work_clears() {
         .prepare_orchestrator_queue_attention_notice()
         .expect("planned queued work should prompt after active work clears");
 
-    assert!(request.notice.message.contains("planned_queued"));
+    assert!(request.notice.message.contains("- T-1 — Queued work"));
+    assert!(!request.notice.message.contains("planned_queued"));
+    assert!(!request.notice.message.contains("00001QUEUE"));
     assert!(
         !request
             .notice
@@ -3138,8 +3216,9 @@ fn rediscovered_queued_work_is_actionable_when_session_work_set_is_empty() {
         .prepare_orchestrator_queue_attention_notice()
         .expect("queued ticket state should be rediscovered safely");
 
-    assert!(request.notice.message.contains("new_queued"));
-    assert!(request.notice.message.contains("00001QUEUE"));
+    assert!(request.notice.message.contains("- T-1 — Queued work"));
+    assert!(!request.notice.message.contains("new_queued"));
+    assert!(!request.notice.message.contains("00001QUEUE"));
 }
 
 #[test]

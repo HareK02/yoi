@@ -327,8 +327,6 @@ fn repository_local_path(source: &workspace_api::RepositorySource) -> Option<Pat
     }
 }
 
-const ORCHESTRATOR_ATTENTION_TICKET_LIMIT: usize = 20;
-const ORCHESTRATOR_ATTENTION_PROMPT_NAME: &str = "internal.workspace_orchestrator_queue_attention";
 static EMBEDDED_RUNTIME_REQUEST_IDENTITY: std::sync::LazyLock<
     worker_runtime::auth::RuntimeIdentityMaterial,
 > = std::sync::LazyLock::new(|| {
@@ -7241,25 +7239,21 @@ fn dispatch_orchestrator_queue_attention(api: &WorkspaceApi) {
         return;
     }
 
-    let shown = queued
-        .iter()
-        .take(ORCHESTRATOR_ATTENTION_TICKET_LIMIT)
-        .map(|ticket| {
-            format!(
-                "- {} — {}",
-                bounded_orchestrator_attention_text(&ticket.id, 80),
-                bounded_orchestrator_attention_text(&ticket.title, 240)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let omitted = queued
-        .len()
-        .saturating_sub(ORCHESTRATOR_ATTENTION_TICKET_LIMIT);
-    let omitted_line = if omitted == 0 {
-        String::new()
-    } else {
-        format!("Additional queued Tickets omitted from this notice: {omitted}\n")
+    let attention_context = match orchestrator_queue_attention_context(
+        &api.config.workspace_id,
+        &api.config.workspace_id,
+        &queued,
+    ) {
+        Ok(context) => context,
+        Err(error) => {
+            tracing::warn!(
+                workspace_id = %api.config.workspace_id,
+                candidate_count = queued.len(),
+                diagnostic = error,
+                "orchestrator backlog attention projection rejected"
+            );
+            return;
+        }
     };
     let Ok(Some(config_state)) = api
         .config_store
@@ -7276,16 +7270,19 @@ fn dispatch_orchestrator_queue_attention(api: &WorkspaceApi) {
     let Ok(catalog) = worker::PromptCatalog::from_projection(projection.catalog().clone()) else {
         return;
     };
-    let content = match catalog.render_serializable(
-        ORCHESTRATOR_ATTENTION_PROMPT_NAME,
-        &BTreeMap::from([
-            ("omitted_line", omitted_line.as_str()),
-            ("workspace_id", api.config.workspace_id.as_str()),
-            ("ticket_lines", shown.as_str()),
-        ]),
+    let content = match catalog.orchestrator_queue_attention(
+        worker::OrchestratorQueueAttentionPrompt::Server,
+        &attention_context,
     ) {
         Ok(content) => content,
-        Err(_) => return,
+        Err(error) => {
+            tracing::warn!(
+                workspace_id = %api.config.workspace_id,
+                diagnostic = %error,
+                "orchestrator backlog attention rendering failed"
+            );
+            return;
+        }
     };
     let accepted = api
         .runtime
@@ -7305,20 +7302,26 @@ fn dispatch_orchestrator_queue_attention(api: &WorkspaceApi) {
     }
 }
 
-fn bounded_orchestrator_attention_text(input: &str, max_chars: usize) -> String {
-    let mut output = String::new();
-    for (index, character) in input.chars().enumerate() {
-        if index == max_chars {
-            output.push('…');
-            break;
-        }
-        output.push(if character.is_control() {
-            ' '
-        } else {
-            character
-        });
+fn orchestrator_queue_attention_context(
+    expected_workspace_id: &str,
+    candidate_workspace_id: &str,
+    tickets: &[ticket::TicketSummary],
+) -> std::result::Result<worker::OrchestratorQueueAttentionContext, &'static str> {
+    if candidate_workspace_id != expected_workspace_id {
+        return Err("foreign_workspace_ticket_projection");
     }
-    output
+    let tickets = tickets
+        .iter()
+        .map(|ticket| {
+            let resource_key = ticket
+                .resource_key
+                .clone()
+                .ok_or("missing_ticket_resource_key")?;
+            worker::OrchestratorQueueAttentionTicket::new(resource_key, ticket.title.clone())
+                .map_err(|_| "invalid_ticket_resource_key")
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(worker::OrchestratorQueueAttentionContext::new(tickets))
 }
 
 fn require_online_workspace_orchestrator_source(
@@ -19585,7 +19588,8 @@ mod tests {
     #[tokio::test]
     async fn orchestrator_running_to_idle_recovers_queued_ticket_without_notification_memory() {
         let dir = tempfile::tempdir().unwrap();
-        let api = test_api(dir.path()).await;
+        init_clean_git_workspace(dir.path());
+        let (api, execution) = test_api_with_recording_backend(dir.path()).await;
         let backend = browser_ticket_backend(&api).unwrap();
         let mut input = ticket::NewTicket::new("Recover queued work");
         input.workflow_state = Some(TicketWorkflowState::Queued);
@@ -19604,6 +19608,8 @@ mod tests {
         .await
         .unwrap();
         assert!(started.online);
+        let startup_inputs = execution.take_inputs();
+        assert_eq!(startup_inputs.len(), 1);
         assert_eq!(
             api.orchestrator_attention_fingerprint
                 .lock()
@@ -19638,6 +19644,76 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some(ticket_ref.id.as_str())
+        );
+        let notifications = execution.take_inputs();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].0.worker_id.to_string(), worker_id);
+        let content = &notifications[0].1;
+        assert!(content.starts_with("Queued Tickets require attention:"));
+        assert!(
+            content.contains(&format!(
+                "- {} — Recover queued work",
+                ticket_ref.resource_key.as_deref().unwrap()
+            )),
+            "unexpected notification body: {content:?}"
+        );
+        assert!(content.contains("Reread the current Ticket state before acting"));
+        assert!(!content.contains(ticket_ref.id.as_str()));
+        assert!(!content.contains(TEST_WORKSPACE_ID));
+        assert!(!content.contains("bounded"));
+        assert!(!content.contains("omitted"));
+
+        let candidates = backend
+            .list(ticket::TicketListQuery::states([
+                ticket::TicketListState::Queued,
+            ]))
+            .unwrap();
+        let mut truncated_candidates = (1..=worker::OrchestratorQueueAttentionContext::MAX_TICKETS
+            + 1)
+            .map(|index| {
+                let mut candidate = candidates[0].clone();
+                candidate.id = format!("opaque-{index}");
+                candidate.resource_key = Some(format!("T-{index}"));
+                candidate.title = format!("Queued {index}");
+                candidate
+            })
+            .collect::<Vec<_>>();
+        let truncated = orchestrator_queue_attention_context(
+            TEST_WORKSPACE_ID,
+            TEST_WORKSPACE_ID,
+            &truncated_candidates,
+        )
+        .unwrap();
+        let rendered = worker::PromptCatalog::builtins_only()
+            .unwrap()
+            .orchestrator_queue_attention(
+                worker::OrchestratorQueueAttentionPrompt::Server,
+                &truncated,
+            )
+            .unwrap();
+        assert!(rendered.contains("- T-20 — Queued 20"));
+        assert!(!rendered.contains("T-21"));
+        assert!(rendered.contains("were omitted from this notice: 1"));
+        assert!(!rendered.contains("opaque-"));
+
+        truncated_candidates[0].resource_key = None;
+        assert_eq!(
+            orchestrator_queue_attention_context(
+                TEST_WORKSPACE_ID,
+                TEST_WORKSPACE_ID,
+                &truncated_candidates
+            )
+            .unwrap_err(),
+            "missing_ticket_resource_key"
+        );
+        assert_eq!(
+            orchestrator_queue_attention_context(
+                TEST_WORKSPACE_ID,
+                "foreign-workspace",
+                &truncated_candidates
+            )
+            .unwrap_err(),
+            "foreign_workspace_ticket_projection"
         );
     }
 
