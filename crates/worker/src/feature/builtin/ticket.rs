@@ -286,7 +286,20 @@ pub const TICKET_SERVICE_ID: &str = "ticket.authority";
 const TICKET_SERVICE_VERSION: &str = "1";
 
 pub trait TicketService: Send + Sync {
-    fn workflow_state(&self, ticket_id: &str) -> Result<TicketWorkflowState, TicketError>;
+    fn ticket_handoff(&self, ticket_ref: &str) -> Result<TicketHandoff, TicketError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketHandoff {
+    pub id: String,
+    pub resource_key: String,
+    pub workflow_state: TicketWorkflowState,
+}
+
+fn is_canonical_ticket_resource_key(resource_key: &str) -> bool {
+    resource_key.strip_prefix("T-").is_some_and(|sequence| {
+        !sequence.is_empty() && sequence.bytes().all(|byte| byte.is_ascii_digit())
+    })
 }
 
 struct BackendTicketService {
@@ -294,10 +307,18 @@ struct BackendTicketService {
 }
 
 impl TicketService for BackendTicketService {
-    fn workflow_state(&self, ticket_id: &str) -> Result<TicketWorkflowState, TicketError> {
-        self.backend
-            .show(ticket_id.into())
-            .map(|ticket| ticket.meta.workflow_state)
+    fn ticket_handoff(&self, ticket_ref: &str) -> Result<TicketHandoff, TicketError> {
+        let ticket = self.backend.show(ticket_ref.into())?;
+        let resource_key = ticket
+            .meta
+            .resource_key
+            .filter(|key| is_canonical_ticket_resource_key(key))
+            .ok_or_else(|| TicketError::Conflict("ticket resource key is unavailable".into()))?;
+        Ok(TicketHandoff {
+            id: ticket.meta.id,
+            resource_key,
+            workflow_state: ticket.meta.workflow_state,
+        })
     }
 }
 
@@ -1851,6 +1872,14 @@ provider = "github"
         server.join().unwrap();
         assert_eq!(removed.ticket_id, "01SOURCE");
         assert_eq!(removed.target, "01TARGET");
+    }
+
+    #[test]
+    fn ticket_handoff_accepts_only_canonical_ticket_resource_keys() {
+        assert!(is_canonical_ticket_resource_key("T-482"));
+        for invalid in ["", "00001KZVNXFNK", "T-", "T-key", "O-482"] {
+            assert!(!is_canonical_ticket_resource_key(invalid));
+        }
     }
 
     #[test]

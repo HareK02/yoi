@@ -89,18 +89,19 @@ impl Tool for SpawnTicketCoderTool {
         let input: SpawnTicketCoderInput = serde_json::from_str(input_json).map_err(|error| {
             ToolError::InvalidArgument(format!("invalid {TOOL_NAME} input: {error}"))
         })?;
-        let ticket_id = authority_id(input.ticket_id, "ticket_id")?;
-        let workflow_state = self
+        let ticket_ref = authority_id(input.ticket_id, "ticket_id")?;
+        let ticket = self
             .ticket_service
-            .workflow_state(&ticket_id)
+            .ticket_handoff(&ticket_ref)
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
         if !matches!(
-            workflow_state,
+            ticket.workflow_state,
             ticket::TicketWorkflowState::Queued | ticket::TicketWorkflowState::InProgress
         ) {
             return Err(ToolError::ExecutionFailed(format!(
-                "Ticket {ticket_id} must be queued or inprogress before spawning its Coder; current state is {}",
-                workflow_state.as_str()
+                "Ticket {} must be queued or inprogress before spawning its Coder; current state is {}",
+                ticket.resource_key,
+                ticket.workflow_state.as_str()
             )));
         }
         let call_id = non_empty(ctx.call_id, "tool call_id")?;
@@ -115,14 +116,14 @@ impl Tool for SpawnTicketCoderTool {
                 )?,
                 relative_cwd,
                 profile: CODER_PROFILE.to_string(),
-                ticket_id: Some(ticket_id.clone()),
-                operation_id: Some(format!("spawn-ticket-coder:{ticket_id}:{call_id}")),
-                display_name: format!("Coder · {ticket_id}"),
+                ticket_id: Some(ticket.id.clone()),
+                operation_id: Some(format!("spawn-ticket-coder:{}:{call_id}", ticket.id)),
+                display_name: format!("Coder · {}", ticket.resource_key),
                 initial_submit: vec![
                     Segment::Flow {
                         selector: CODER_FLOW.to_string(),
                     },
-                    Segment::text(format!("Implement Ticket {ticket_id}.")),
+                    Segment::text(format!("Implement Ticket {}.", ticket.resource_key)),
                 ],
             })
             .await
@@ -134,7 +135,7 @@ impl Tool for SpawnTicketCoderTool {
             )));
         }
         Ok(ToolOutput {
-            summary: format!("Spawned Coder for Ticket {ticket_id}"),
+            summary: format!("Spawned Coder for Ticket {}", ticket.resource_key),
             content: Some(response.body),
             attachments: Vec::new(),
         })
@@ -201,21 +202,31 @@ mod tests {
     use crate::worker::{WorkspaceClientError, WorkspaceResponse};
 
     use super::*;
+    use crate::feature::builtin::ticket::TicketHandoff;
 
     #[derive(Default)]
     struct RecordingTicketService;
 
     impl TicketService for RecordingTicketService {
-        fn workflow_state(&self, _ticket_id: &str) -> Result<TicketWorkflowState, TicketError> {
-            Ok(TicketWorkflowState::Queued)
+        fn ticket_handoff(&self, ticket_ref: &str) -> Result<TicketHandoff, TicketError> {
+            assert_eq!(ticket_ref, "T-482");
+            Ok(TicketHandoff {
+                id: "00001KZXN51C7".to_string(),
+                resource_key: "T-482".to_string(),
+                workflow_state: TicketWorkflowState::Queued,
+            })
         }
     }
 
     struct FixedTicketService(TicketWorkflowState);
 
     impl TicketService for FixedTicketService {
-        fn workflow_state(&self, _ticket_id: &str) -> Result<TicketWorkflowState, TicketError> {
-            Ok(self.0)
+        fn ticket_handoff(&self, _ticket_ref: &str) -> Result<TicketHandoff, TicketError> {
+            Ok(TicketHandoff {
+                id: "00001KZXN51C7".to_string(),
+                resource_key: "T-482".to_string(),
+                workflow_state: self.0,
+            })
         }
     }
 
@@ -247,7 +258,7 @@ mod tests {
         };
         tool.execute(
             &serde_json::json!({
-                "ticket_id": "00001KZXN51C7",
+                "ticket_id": "T-482",
                 "runtime_id": "runtime-1",
                 "working_directory_id": "workdir-1"
             })
@@ -265,16 +276,20 @@ mod tests {
             request.operation_id.as_deref(),
             Some("spawn-ticket-coder:00001KZXN51C7:call-7")
         );
-        assert_eq!(request.display_name, "Coder · 00001KZXN51C7");
+        assert_eq!(request.display_name, "Coder · T-482");
         assert_eq!(
             request.initial_submit,
             vec![
                 Segment::Flow {
                     selector: CODER_FLOW.to_string()
                 },
-                Segment::text("Implement Ticket 00001KZXN51C7.")
+                Segment::text("Implement Ticket T-482.")
             ]
         );
+        assert!(!request.display_name.contains("00001KZXN51C7"));
+        assert!(request.initial_submit.iter().all(|segment| {
+            !Segment::flatten_to_text(std::slice::from_ref(segment)).contains("00001KZXN51C7")
+        }));
     }
 
     #[tokio::test]
