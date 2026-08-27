@@ -1354,7 +1354,7 @@ async fn controller_loop<C, St>(
                         });
                     }
                 },
-                WorkerStatus::Idle => {
+                WorkerStatus::Idle | WorkerStatus::Stopped => {
                     let _ = event_tx.send(Event::Error {
                         code: ErrorCode::NotRunning,
                         message: "Worker is not running".into(),
@@ -1395,7 +1395,7 @@ async fn controller_loop<C, St>(
                             .into(),
                     });
                 }
-                WorkerStatus::Running => {
+                WorkerStatus::Running | WorkerStatus::Stopped => {
                     let _ = event_tx.send(Event::Error {
                         code: ErrorCode::AlreadyRunning,
                         message:
@@ -1409,7 +1409,7 @@ async fn controller_loop<C, St>(
                 WorkerStatus::Idle | WorkerStatus::Paused => {
                     emit_rewind_targets(&worker, &event_tx)
                 }
-                WorkerStatus::Running => {
+                WorkerStatus::Running | WorkerStatus::Stopped => {
                     let _ = event_tx.send(Event::Error {
                         code: ErrorCode::AlreadyRunning,
                         message: "Worker is already executing a turn; rewind can only run while idle or paused"
@@ -1438,7 +1438,7 @@ async fn controller_loop<C, St>(
                             .into(),
                     });
                 }
-                WorkerStatus::Running => {
+                WorkerStatus::Running | WorkerStatus::Stopped => {
                     let _ = event_tx.send(Event::Error {
                         code: ErrorCode::AlreadyRunning,
                         message: "Worker is already executing a turn; rewind can only run while idle or paused"
@@ -1650,6 +1650,26 @@ where
                             WorkerRunResult::Paused => (WorkerStatus::Paused, RunResult::Paused),
                             WorkerRunResult::LimitReached => (WorkerStatus::Idle, RunResult::LimitReached),
                             WorkerRunResult::RolledBack => (WorkerStatus::Idle, RunResult::RolledBack),
+                            WorkerRunResult::Interrupted { .. } if pause_requested => {
+                                let _ = event_tx.send(Event::RunEnd { result: RunResult::Paused });
+                                return (WorkerStatus::Paused, shutdown_requested);
+                            }
+                            WorkerRunResult::Interrupted { code, message } => {
+                                let _ = event_tx.send(Event::Error {
+                                    code,
+                                    message: message.clone(),
+                                });
+                                if parent_originated {
+                                    crate::ipc::event::fire_and_forget(
+                                        parent_socket.cloned(),
+                                        protocol::WorkerEvent::Errored {
+                                            worker_name: self_name.to_string(),
+                                            message,
+                                        },
+                                    );
+                                }
+                                return (WorkerStatus::Idle, shutdown_requested);
+                            }
                         };
                         let _ = event_tx.send(Event::RunEnd { result: run_result });
                         if parent_originated && matches!(run_result, RunResult::Finished) {

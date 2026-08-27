@@ -65,7 +65,7 @@ async fn anthropic_thinking_round_trips_signature_into_history() {
     ]);
     let client = MockLlmClient::new(events);
     let engine = Engine::new(client);
-    let out = engine.run("question?").await.expect("run ok");
+    let out = engine.run("question?").await;
     let engine = out.engine;
 
     let history = engine.history();
@@ -109,7 +109,7 @@ async fn openai_reasoning_round_trips_encrypted_and_summary() {
     ]);
     let client = MockLlmClient::new(events);
     let engine = Engine::new(client);
-    let out = engine.run("q").await.expect("run ok");
+    let out = engine.run("q").await;
     let engine = out.engine;
 
     let history = engine.history();
@@ -155,7 +155,7 @@ async fn reasoning_precedes_text_in_assistant_burst() {
     }));
     let client = MockLlmClient::new(events);
     let engine = Engine::new(client);
-    let out = engine.run("q").await.expect("run ok");
+    let out = engine.run("q").await;
     let engine = out.engine;
 
     let history = engine.history();
@@ -214,7 +214,7 @@ async fn injected_reasoning_survives_into_outgoing_request() {
         Item::assistant_message("prior answer"),
     ]);
 
-    let _ = engine.run("follow up").await.expect("run ok");
+    let _ = engine.run("follow up").await;
 
     let req = captured
         .lock()

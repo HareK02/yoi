@@ -70,22 +70,48 @@ pub struct EngineConfig {
     _private: (),
 }
 
-/// Engine execution result (status)
+/// Legacy serializable outcome used by the Worker session-log compatibility boundary.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EngineResult {
-    /// Completed (waiting for user input)
     Finished,
-    /// Paused (can be resumed)
     Paused,
-    /// Turn limit reached (max_turns exceeded)
     LimitReached,
-    /// Yielded to caller for external processing (e.g. context compaction).
-    ///
-    /// Distinct from `Paused`: internal machinery, not user-facing. The
-    /// caller is expected to perform some side work and then call `resume()`
-    /// to continue the turn loop.
     Yielded,
+}
+
+/// The public termination boundary for one logical engine run.
+#[derive(Debug)]
+pub enum EngineRunExit {
+    Finished,
+    Paused,
+    Yielded,
+    Interrupted(StopReason),
+}
+
+/// A typed reason why an engine run could not finish normally.
+#[derive(Debug)]
+pub enum StopReason {
+    LimitReached,
+    ContextWindowExceeded,
+    Cancelled,
+    Unexpected(EngineError),
+}
+
+impl From<Result<EngineResult, EngineError>> for EngineRunExit {
+    fn from(result: Result<EngineResult, EngineError>) -> Self {
+        match result {
+            Ok(EngineResult::Finished) => Self::Finished,
+            Ok(EngineResult::Paused) => Self::Paused,
+            Ok(EngineResult::Yielded) => Self::Yielded,
+            Ok(EngineResult::LimitReached) => Self::Interrupted(StopReason::LimitReached),
+            Err(EngineError::Client(ClientError::ContextWindowExceeded)) => {
+                Self::Interrupted(StopReason::ContextWindowExceeded)
+            }
+            Err(EngineError::Cancelled) => Self::Interrupted(StopReason::Cancelled),
+            Err(error) => Self::Interrupted(StopReason::Unexpected(error)),
+        }
+    }
 }
 
 /// Result of [`Engine::run`] or [`Engine::resume`].
@@ -95,7 +121,7 @@ pub struct EngineRunOutput<C: LlmClient> {
     /// The Engine, now in Locked state.
     pub engine: Engine<C, Locked>,
     /// Outcome of the turn.
-    pub result: EngineResult,
+    pub result: EngineRunExit,
 }
 
 /// Internal: tool execution result
@@ -126,16 +152,16 @@ const MAX_STREAM_CONTINUATIONS: u32 = 3;
 /// engine.register_tool(my_tool);
 ///
 /// // Mutable::run() consumes self → EngineRunOutput { engine: Locked, result }
-/// let out = engine.run("Hello").await?;
+/// let out = engine.run("Hello").await;
 /// let mut engine = out.engine;
 ///
 /// // Locked::run() borrows &mut self
-/// engine.run("Follow-up").await?;
+/// let _exit = engine.run("Follow-up").await;
 ///
 /// // To edit between turns, unlock back to Mutable
 /// let mut engine = engine.unlock();
 /// engine.truncate_history(5);
-/// let out = engine.run("Continue").await?;
+/// let out = engine.run("Continue").await;
 /// let mut engine = out.engine;
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,8 +263,6 @@ pub struct Engine<C: LlmClient, S: EngineState = Mutable> {
     history_append_cbs: Vec<Box<dyn Fn(&Item) -> Result<(), String> + Send + Sync>>,
     /// Request configuration (max_tokens, temperature, etc.)
     request_config: RequestConfig,
-    /// Whether the previous run was interrupted
-    last_run_interrupted: bool,
     /// Cancel notification channel (for interrupting execution)
     cancel_tx: mpsc::Sender<()>,
     cancel_rx: mpsc::Receiver<()>,
@@ -270,10 +294,6 @@ pub struct Engine<C: LlmClient, S: EngineState = Mutable> {
 }
 
 impl<C: LlmClient, S: EngineState> Engine<C, S> {
-    fn reset_interruption_state(&mut self) {
-        self.last_run_interrupted = false;
-    }
-
     fn start_logical_run(&mut self) {
         self.active_run_turn_count = Some(0);
     }
@@ -805,11 +825,6 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
         self.try_cancelled()
     }
 
-    /// Whether the previous run was interrupted
-    pub fn last_run_interrupted(&self) -> bool {
-        self.last_run_interrupted
-    }
-
     /// Generate list of ToolDefinitions for LLM from registered tools
     fn build_tool_definitions(&self) -> Vec<ToolDefinition> {
         self.tool_server.tool_definitions_sorted()
@@ -902,7 +917,6 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
         match result {
             Ok(value) => Ok(value),
             Err(err) => {
-                self.last_run_interrupted = true;
                 let reason = match &err {
                     EngineError::Aborted(reason) => reason.clone(),
                     EngineError::Cancelled => "Cancelled".to_string(),
@@ -1000,11 +1014,9 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                         continue;
                     }
                     PreToolAction::Abort(reason) => {
-                        self.last_run_interrupted = true;
                         return Err(EngineError::Aborted(reason));
                     }
                     PreToolAction::Pause => {
-                        self.last_run_interrupted = true;
                         return Ok(ToolExecutionResult::Paused);
                     }
                 }
@@ -1057,7 +1069,6 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                     info!("Tool execution cancelled");
                 }
                 self.timeline.abort_current_block();
-                self.last_run_interrupted = true;
                 return Err(EngineError::Cancelled);
             }
         };
@@ -1079,7 +1090,6 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                 match self.interceptor.post_tool_call(&mut info).await {
                     PostToolAction::Continue => {}
                     PostToolAction::Abort(reason) => {
-                        self.last_run_interrupted = true;
                         return Err(EngineError::Aborted(reason));
                     }
                 }
@@ -1133,7 +1143,6 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
 
     /// Internal turn execution logic
     async fn run_turn_loop(&mut self) -> Result<EngineResult, EngineError> {
-        self.reset_interruption_state();
         let tool_definitions = self.build_tool_definitions();
 
         info!(
@@ -1156,7 +1165,6 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
             if self.try_cancelled() {
                 info!("Execution cancelled");
                 self.timeline.abort_current_block();
-                self.last_run_interrupted = true;
                 return Err(EngineError::Cancelled);
             }
 
@@ -1169,7 +1177,6 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                     max_turns = max,
                     "Logical run turn limit reached"
                 );
-                self.last_run_interrupted = false;
                 return Ok(EngineResult::LimitReached);
             }
 
@@ -1263,7 +1270,6 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                     for cb in &self.turn_end_cbs {
                         cb(current_turn);
                     }
-                    self.last_run_interrupted = true;
                     return Err(EngineError::Aborted(reason));
                 }
                 PreRequestAction::YieldWith(items) => {
@@ -1273,7 +1279,6 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                     for cb in &self.turn_end_cbs {
                         cb(current_turn);
                     }
-                    self.last_run_interrupted = true;
                     return Ok(EngineResult::Yielded);
                 }
                 PreRequestAction::Yield => {
@@ -1281,7 +1286,6 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                     for cb in &self.turn_end_cbs {
                         cb(current_turn);
                     }
-                    self.last_run_interrupted = true;
                     return Ok(EngineResult::Yielded);
                 }
                 PreRequestAction::ContinueWith(items) => {
@@ -1326,7 +1330,6 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
             if let StreamCompletion::Interrupted { reason } = stream_outcome {
                 stream_continuations += 1;
                 if stream_continuations > MAX_STREAM_CONTINUATIONS {
-                    self.last_run_interrupted = true;
                     return Err(EngineError::Client(ClientError::Api {
                         status: None,
                         code: None,
@@ -1378,7 +1381,6 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
             if tool_calls.is_empty() {
                 match self.interceptor.on_turn_end(&self.history).await {
                     TurnEndAction::Finish => {
-                        self.last_run_interrupted = false;
                         return Ok(EngineResult::Finished);
                     }
                     TurnEndAction::ContinueWithMessages(additional) => {
@@ -1386,7 +1388,6 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                         continue;
                     }
                     TurnEndAction::Pause => {
-                        self.last_run_interrupted = true;
                         return Ok(EngineResult::Paused);
                     }
                 }
@@ -1436,7 +1437,6 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                         }),
                     );
                     self.timeline.abort_current_block();
-                    self.last_run_interrupted = true;
                     return Err(EngineError::Cancelled);
                 }
             };
@@ -1468,7 +1468,6 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                                 }),
                             );
                             self.timeline.abort_current_block();
-                            self.last_run_interrupted = true;
                             return Err(EngineError::Cancelled);
                         }
                     };
@@ -1510,7 +1509,6 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
 
             let next_failed_attempt = failed_attempt + 1;
             if next_failed_attempt >= policy.max_attempts || !is_retryable(&err) {
-                self.last_run_interrupted = true;
                 return Err(EngineError::Client(err));
             }
 
@@ -1519,7 +1517,6 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                 .unwrap_or_else(|| policy.backoff(failed_attempt));
             let elapsed = started.elapsed();
             if elapsed + wait > policy.total_timeout {
-                self.last_run_interrupted = true;
                 return Err(EngineError::Client(err));
             }
 
@@ -1548,7 +1545,6 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                         info!("Cancelled during LLM retry backoff");
                     }
                     self.timeline.abort_current_block();
-                    self.last_run_interrupted = true;
                     return Err(EngineError::Cancelled);
                 }
             }
@@ -1591,7 +1587,6 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                             let event = match result {
                                 Ok(event) => event,
                                 Err(err) => {
-                                    self.last_run_interrupted = true;
                                     // 部分情報でも発火しておく（料金会計用）
                                     self.timeline.flush_usage();
                                     return Ok(StreamCompletion::Interrupted {
@@ -1612,7 +1607,6 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                             if let Event::Error(err) = &event {
                                 self.timeline.abort_current_block();
                                 self.timeline.flush_usage();
-                                self.last_run_interrupted = true;
                                 return Err(EngineError::Client(ClientError::Api {
                                     status: None,
                                     code: err.code.clone(),
@@ -1630,7 +1624,6 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                     }
                     self.timeline.abort_current_block();
                     self.timeline.flush_usage();
-                    self.last_run_interrupted = true;
                     return Err(EngineError::Cancelled);
                 }
             }
@@ -1649,10 +1642,7 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
         tool_calls: Vec<ToolCall>,
     ) -> Result<Option<EngineResult>, EngineError> {
         match self.execute_tools(tool_calls).await {
-            Ok(ToolExecutionResult::Paused) => {
-                self.last_run_interrupted = true;
-                Ok(Some(EngineResult::Paused))
-            }
+            Ok(ToolExecutionResult::Paused) => Ok(Some(EngineResult::Paused)),
             Ok(ToolExecutionResult::Completed(results)) => {
                 // Route per-result pushes through the callback path so
                 // observers see each tool result as it lands.
@@ -1668,10 +1658,7 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
                 self.append_history_items(items)?;
                 Ok(None)
             }
-            Err(err) => {
-                self.last_run_interrupted = true;
-                Err(err)
-            }
+            Err(err) => Err(err),
         }
     }
 }
@@ -1719,7 +1706,6 @@ impl<C: LlmClient> Engine<C, Mutable> {
             tool_result_cbs: Vec::new(),
             history_append_cbs: Vec::new(),
             request_config: RequestConfig::default(),
-            last_run_interrupted: false,
             cancel_tx,
             cancel_rx,
             tool_output_limits: None,
@@ -1903,14 +1889,6 @@ impl<C: LlmClient> Engine<C, Mutable> {
         self.max_turns = max_turns;
     }
 
-    /// Set the last_run_interrupted flag (for session restoration)
-    pub fn set_last_run_interrupted(&mut self, interrupted: bool) {
-        self.last_run_interrupted = interrupted;
-        if !interrupted {
-            self.active_run_turn_count = None;
-        }
-    }
-
     /// Apply configuration (reserved for future extensions)
     #[allow(dead_code)]
     pub fn config(self, _config: EngineConfig) -> Self {
@@ -1924,28 +1902,25 @@ impl<C: LlmClient> Engine<C, Mutable> {
     ///
     /// Subsequent runs can call [`Engine::run`] directly.
     /// To edit state between turns, call [`unlock()`](Engine::unlock) first.
-    pub async fn run(
-        self,
-        user_input: impl Into<String>,
-    ) -> Result<EngineRunOutput<C>, EngineError> {
+    pub async fn run(self, user_input: impl Into<String>) -> EngineRunOutput<C> {
         let mut locked = self.lock();
-        let result = locked.run(user_input).await?;
-        Ok(EngineRunOutput {
+        let result = locked.run(user_input).await;
+        EngineRunOutput {
             engine: locked,
             result,
-        })
+        }
     }
 
     /// Resume from Paused, consuming self and transitioning to Locked.
     ///
     /// Used after `unlock()` → edit → resume.
-    pub async fn resume(self) -> Result<EngineRunOutput<C>, EngineError> {
+    pub async fn resume(self) -> EngineRunOutput<C> {
         let mut locked = self.lock();
-        let result = locked.resume().await?;
-        Ok(EngineRunOutput {
+        let result = locked.resume().await;
+        EngineRunOutput {
             engine: locked,
             result,
-        })
+        }
     }
 
     /// Lock and transition to Locked state
@@ -1993,7 +1968,6 @@ impl<C: LlmClient> Engine<C, Mutable> {
             tool_result_cbs: self.tool_result_cbs,
             history_append_cbs: self.history_append_cbs,
             request_config: self.request_config,
-            last_run_interrupted: self.last_run_interrupted,
 
             cancel_tx: self.cancel_tx,
             cancel_rx: self.cancel_rx,
@@ -2014,18 +1988,17 @@ impl<C: LlmClient> Engine<C, Locked> {
     ///
     /// Adds a new user message to history and sends a request to the LLM.
     /// Automatically loops if there are tool calls.
-    pub async fn run(
-        &mut self,
-        user_input: impl Into<String>,
-    ) -> Result<EngineResult, EngineError> {
+    pub async fn run(&mut self, user_input: impl Into<String>) -> EngineRunExit {
+        self.run_result(user_input.into()).await.into()
+    }
+
+    async fn run_result(&mut self, user_input: String) -> Result<EngineResult, EngineError> {
         // Supplying new user input abandons any paused/yielded logical run.
         self.active_run_turn_count = None;
-        self.reset_interruption_state();
         // Interceptor: on_prompt_submit
         let mut user_item = Item::user_message(user_input);
         let extras = match self.interceptor.on_prompt_submit(&mut user_item).await {
             PromptAction::Cancel(reason) => {
-                self.last_run_interrupted = true;
                 return self
                     .finalize_interruption(Err(EngineError::Aborted(reason)))
                     .await;
@@ -2047,8 +2020,11 @@ impl<C: LlmClient> Engine<C, Locked> {
     /// Resume execution (from Paused state)
     ///
     /// Resumes turn processing from current state without adding a new user message.
-    pub async fn resume(&mut self) -> Result<EngineResult, EngineError> {
-        self.reset_interruption_state();
+    pub async fn resume(&mut self) -> EngineRunExit {
+        self.resume_result().await.into()
+    }
+
+    async fn resume_result(&mut self) -> Result<EngineResult, EngineError> {
         self.ensure_logical_run();
         let result = self.run_turn_loop().await;
         let result = self.finalize_interruption(result).await;
@@ -2095,7 +2071,6 @@ impl<C: LlmClient> Engine<C, Locked> {
             tool_result_cbs: self.tool_result_cbs,
             history_append_cbs: self.history_append_cbs,
             request_config: self.request_config,
-            last_run_interrupted: self.last_run_interrupted,
 
             cancel_tx: self.cancel_tx,
             cancel_rx: self.cancel_rx,

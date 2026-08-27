@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use agen::timeline::event::UsageEvent;
-use agen::{Engine, llm_client::LlmClient};
+use agen::{Engine, EngineError, llm_client::LlmClient};
 use manifest::{Scope, WorkerManifest};
 use protocol::{Event, InFlightSnapshot, WorkerStatus};
 use session_store::{LogEntry, SegmentId, SessionId, Store, StoreError, TraceEntry};
@@ -199,10 +199,26 @@ where
     on_cancel_sender(worker.engine_mut().cancel_sender());
 
     match worker.run_text(&input).await {
-        Ok(lifecycle) => Ok(InternalWorkerResult {
+        Ok(lifecycle @ WorkerRunResult::Finished)
+        | Ok(lifecycle @ WorkerRunResult::Paused)
+        | Ok(lifecycle @ WorkerRunResult::RolledBack) => Ok(InternalWorkerResult {
             usage: last_usage.lock().ok().and_then(|slot| slot.clone()),
             identity,
             lifecycle,
+            history_entries: store.entries_count(session_id, segment_id),
+        }),
+        Ok(WorkerRunResult::LimitReached) => Err(InternalWorkerError {
+            source: WorkerError::Engine(EngineError::Aborted(
+                "internal Worker reached its turn limit".to_string(),
+            )),
+            usage: last_usage.lock().ok().and_then(|slot| slot.clone()),
+            identity,
+            history_entries: store.entries_count(session_id, segment_id),
+        }),
+        Ok(WorkerRunResult::Interrupted { message, .. }) => Err(InternalWorkerError {
+            source: WorkerError::Engine(EngineError::Aborted(message)),
+            usage: last_usage.lock().ok().and_then(|slot| slot.clone()),
+            identity,
             history_entries: store.entries_count(session_id, segment_id),
         }),
         Err(source) => Err(InternalWorkerError {
@@ -232,6 +248,7 @@ impl Default for InternalWorkerVisibility {
 pub(crate) enum InternalWorkerSessionStatus {
     Idle,
     Running,
+    Paused,
     Stopping,
     Stopped,
     Failed,
@@ -242,9 +259,10 @@ impl InternalWorkerSessionStatus {
         match self {
             Self::Idle => 0,
             Self::Running => 1,
-            Self::Stopping => 2,
-            Self::Stopped => 3,
-            Self::Failed => 4,
+            Self::Paused => 2,
+            Self::Stopping => 3,
+            Self::Stopped => 4,
+            Self::Failed => 5,
         }
     }
 
@@ -252,10 +270,32 @@ impl InternalWorkerSessionStatus {
         match value {
             0 => Self::Idle,
             1 => Self::Running,
-            2 => Self::Stopping,
-            3 => Self::Stopped,
+            2 => Self::Paused,
+            3 => Self::Stopping,
+            4 => Self::Stopped,
             _ => Self::Failed,
         }
+    }
+}
+
+fn classify_internal_turn_result(
+    result: Result<WorkerRunResult, WorkerError>,
+) -> (InternalWorkerSessionStatus, Option<String>) {
+    match result {
+        Ok(WorkerRunResult::Finished) => (InternalWorkerSessionStatus::Idle, None),
+        Ok(WorkerRunResult::Paused) => (InternalWorkerSessionStatus::Paused, None),
+        Ok(WorkerRunResult::LimitReached) => (
+            InternalWorkerSessionStatus::Stopped,
+            Some("internal Worker reached its turn limit".to_string()),
+        ),
+        Ok(WorkerRunResult::Interrupted { message, .. }) => {
+            (InternalWorkerSessionStatus::Stopped, Some(message))
+        }
+        Ok(WorkerRunResult::RolledBack) => (
+            InternalWorkerSessionStatus::Stopped,
+            Some("internal Worker run was cancelled before AI output".to_string()),
+        ),
+        Err(error) => (InternalWorkerSessionStatus::Failed, Some(error.to_string())),
     }
 }
 
@@ -353,10 +393,11 @@ impl InternalWorkerSessionHandle {
             entries,
             status: match self.status() {
                 InternalWorkerSessionStatus::Running => WorkerStatus::Running,
+                InternalWorkerSessionStatus::Paused => WorkerStatus::Paused,
                 InternalWorkerSessionStatus::Idle => WorkerStatus::Idle,
                 InternalWorkerSessionStatus::Stopping
                 | InternalWorkerSessionStatus::Stopped
-                | InternalWorkerSessionStatus::Failed => WorkerStatus::Paused,
+                | InternalWorkerSessionStatus::Failed => WorkerStatus::Stopped,
             },
             error: self.last_error.lock().unwrap().clone(),
             in_flight,
@@ -388,6 +429,7 @@ impl InternalWorkerSessionHandle {
             .map_err(
                 |current| match InternalWorkerSessionStatus::decode(current) {
                     InternalWorkerSessionStatus::Running
+                    | InternalWorkerSessionStatus::Paused
                     | InternalWorkerSessionStatus::Stopping => InternalWorkerSessionError::Busy,
                     InternalWorkerSessionStatus::Stopped | InternalWorkerSessionStatus::Failed => {
                         InternalWorkerSessionError::Stopped
@@ -733,13 +775,7 @@ pub(crate) async fn prepare_internal_worker_session(
                     loop {
                         tokio::select! {
                             result = &mut run => {
-                                let (turn_status, error) = match result {
-                                    Ok(_) => (InternalWorkerSessionStatus::Idle, None),
-                                    Err(error) => (
-                                        InternalWorkerSessionStatus::Failed,
-                                        Some(error.to_string()),
-                                    ),
-                                };
+                                let (turn_status, error) = classify_internal_turn_result(result);
                                 actor_in_flight.clear();
                                 status.store(turn_status.encode(), std::sync::atomic::Ordering::Release);
                                 if let Some(message) = error {
@@ -748,11 +784,20 @@ pub(crate) async fn prepare_internal_worker_session(
                                         code: protocol::ErrorCode::Internal,
                                         message,
                                     });
-                                } else {
-                                    let _ = event_tx.send(Event::Status {
-                                        status: WorkerStatus::Idle,
-                                    });
                                 }
+                                let protocol_status = match turn_status {
+                                    InternalWorkerSessionStatus::Idle => WorkerStatus::Idle,
+                                    InternalWorkerSessionStatus::Paused => WorkerStatus::Paused,
+                                    InternalWorkerSessionStatus::Stopped
+                                    | InternalWorkerSessionStatus::Failed => WorkerStatus::Stopped,
+                                    InternalWorkerSessionStatus::Running
+                                    | InternalWorkerSessionStatus::Stopping => {
+                                        unreachable!("run completion cannot remain active")
+                                    }
+                                };
+                                let _ = event_tx.send(Event::Status {
+                                    status: protocol_status,
+                                });
                                 if let Some(callback) = &on_turn_end {
                                     callback(turn_status);
                                 }
@@ -766,7 +811,7 @@ pub(crate) async fn prepare_internal_worker_session(
                                         let _ = (&mut run).await;
                                         actor_in_flight.clear();
                                         status.store(InternalWorkerSessionStatus::Stopped.encode(), std::sync::atomic::Ordering::Release);
-                                        let _ = event_tx.send(Event::Status { status: WorkerStatus::Paused });
+                                        let _ = event_tx.send(Event::Status { status: WorkerStatus::Stopped });
                                         let _ = event_tx.send(Event::Shutdown);
                                         state_changed.notify_waiters();
                                         let _ = done.send(());
@@ -792,7 +837,7 @@ pub(crate) async fn prepare_internal_worker_session(
                         std::sync::atomic::Ordering::Release,
                     );
                     let _ = event_tx.send(Event::Status {
-                        status: WorkerStatus::Paused,
+                        status: WorkerStatus::Stopped,
                     });
                     let _ = event_tx.send(Event::Shutdown);
                     state_changed.notify_waiters();
@@ -1103,6 +1148,26 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct FailingClient;
+
+    #[async_trait]
+    impl LlmClient for FailingClient {
+        fn clone_boxed(&self) -> Box<dyn LlmClient> {
+            Box::new(self.clone())
+        }
+
+        async fn stream(
+            &self,
+            _request: Request,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmEvent, ClientError>> + Send>>, ClientError>
+        {
+            Err(ClientError::Config(
+                "intentional internal failure".to_string(),
+            ))
+        }
+    }
+
+    #[derive(Clone)]
     struct CancelBeforeAiClient {
         calls: Arc<AtomicUsize>,
         cancel_sender: Arc<Mutex<Option<tokio::sync::mpsc::Sender<()>>>>,
@@ -1213,6 +1278,77 @@ permission = "write"
         assert!(matches!(result.lifecycle, WorkerRunResult::Finished));
         assert!(result.history_entries >= 4);
         assert_eq!(result.identity.kind, "test");
+    }
+
+    #[test]
+    fn internal_turn_result_mapping_is_exhaustive() {
+        let cases = [
+            (
+                WorkerRunResult::Finished,
+                InternalWorkerSessionStatus::Idle,
+                false,
+            ),
+            (
+                WorkerRunResult::Paused,
+                InternalWorkerSessionStatus::Paused,
+                false,
+            ),
+            (
+                WorkerRunResult::LimitReached,
+                InternalWorkerSessionStatus::Stopped,
+                true,
+            ),
+            (
+                WorkerRunResult::Interrupted {
+                    code: protocol::ErrorCode::Internal,
+                    message: "cancelled".to_string(),
+                },
+                InternalWorkerSessionStatus::Stopped,
+                true,
+            ),
+            (
+                WorkerRunResult::RolledBack,
+                InternalWorkerSessionStatus::Stopped,
+                true,
+            ),
+        ];
+
+        for (result, expected_status, expects_error) in cases {
+            let (status, error) = classify_internal_turn_result(Ok(result));
+            assert_eq!(status, expected_status);
+            assert_eq!(error.is_some(), expects_error);
+        }
+
+        let (status, error) = classify_internal_turn_result(Err(WorkerError::Engine(
+            EngineError::Aborted("fatal".to_string()),
+        )));
+        assert_eq!(status, InternalWorkerSessionStatus::Failed);
+        assert!(error.is_some_and(|message| message.contains("fatal")));
+    }
+
+    #[tokio::test]
+    async fn fatal_internal_run_transitions_to_stopped_protocol_status() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut internal_spec = spec(calls, &[]);
+        internal_spec.client = Box::new(FailingClient);
+
+        let handle = spawn_internal_worker_session(internal_spec)
+            .await
+            .expect("spawn failing Internal Worker session");
+        assert_eq!(
+            handle.wait_until_idle().await,
+            InternalWorkerSessionStatus::Stopped
+        );
+        assert_eq!(handle.status(), InternalWorkerSessionStatus::Stopped);
+        assert_eq!(handle.protocol_snapshot().status, WorkerStatus::Stopped);
+        assert!(
+            handle
+                .last_error
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|message| message.contains("intentional internal failure"))
+        );
     }
 
     #[tokio::test]

@@ -12,11 +12,44 @@ use agen::Item;
 use agen::interceptor::{
     Interceptor, PreRequestAction, PreToolAction, ToolCallInfo, TurnEndAction,
 };
+use agen::llm_client::ClientError;
 use agen::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
-use agen::{Engine, EngineError, EngineResult};
+use agen::{Engine, EngineError, EngineRunExit, StopReason};
 use async_trait::async_trait;
 use common::MockLlmClient;
+
+#[test]
+fn engine_source_has_no_worker_owned_interruption_marker() {
+    let source = include_str!("../src/engine.rs");
+    assert!(!source.contains("last_run_interrupted"));
+    assert!(!source.contains("set_last_run_interrupted"));
+}
+
+#[test]
+fn run_exit_classifies_known_and_unexpected_stops_without_message_parsing() {
+    assert!(matches!(
+        EngineRunExit::from(Err(EngineError::Cancelled)),
+        EngineRunExit::Interrupted(StopReason::Cancelled)
+    ));
+    assert!(matches!(
+        EngineRunExit::from(Err(EngineError::Client(ClientError::ContextWindowExceeded))),
+        EngineRunExit::Interrupted(StopReason::ContextWindowExceeded)
+    ));
+
+    let message_only = EngineError::Client(ClientError::Api {
+        status: Some(400),
+        code: None,
+        message: "context_length_exceeded".to_string(),
+        retry_after: None,
+    });
+    assert!(matches!(
+        EngineRunExit::from(Err(message_only)),
+        EngineRunExit::Interrupted(StopReason::Unexpected(EngineError::Client(
+            ClientError::Api { .. }
+        )))
+    ));
+}
 
 // =============================================================================
 // Mutable State Tests
@@ -195,11 +228,13 @@ async fn history_append_failure_stops_before_tool_execution() {
     });
 
     let mut engine = engine.lock();
-    let error = engine.run("use the tool").await.unwrap_err();
+    let exit = engine.run("use the tool").await;
 
-    assert!(
-        matches!(error, EngineError::HistoryAppend(ref message) if message == "simulated ENOSPC")
-    );
+    assert!(matches!(
+        exit,
+        EngineRunExit::Interrupted(StopReason::Unexpected(EngineError::HistoryAppend(ref message)))
+            if message == "simulated ENOSPC"
+    ));
     assert_eq!(tool.call_count(), 0);
     assert_eq!(engine.history().len(), 1);
     assert_eq!(engine.history()[0].as_text(), Some("use the tool"));
@@ -274,7 +309,7 @@ async fn test_mutable_run_updates_history() -> Result<(), EngineError> {
     let engine = Engine::new(client);
 
     // Execute (Mutable::run consumes self, returns EngineRunOutput)
-    let out = engine.run("Hi there").await?;
+    let out = engine.run("Hi there").await;
     let engine = out.engine;
 
     // History is updated
@@ -323,12 +358,12 @@ async fn test_locked_multi_turn_history_accumulation() {
 
     // Turn 1
     let result1 = locked_engine.run("Hello!").await;
-    assert!(result1.is_ok());
+    assert!(matches!(result1, EngineRunExit::Finished));
     assert_eq!(locked_engine.history().len(), 2); // user + assistant
 
     // Turn 2
     let result2 = locked_engine.run("Can you help me?").await;
-    assert!(result2.is_ok());
+    assert!(matches!(result2, EngineRunExit::Finished));
     assert_eq!(locked_engine.history().len(), 4); // 2 * (user + assistant)
 
     // Verify history contents
@@ -386,7 +421,7 @@ async fn test_locked_prefix_len_tracking() {
     assert_eq!(locked_engine.locked_prefix_len(), 2); // 2 items at lock time
 
     // Execute turn
-    locked_engine.run("New message").await.unwrap();
+    locked_engine.run("New message").await;
 
     // History grows but locked_prefix_len remains unchanged
     assert_eq!(locked_engine.history().len(), 4); // 2 + 2
@@ -421,13 +456,13 @@ async fn test_turn_count_increment() -> Result<(), EngineError> {
     assert_eq!(engine.llm_call_count(), 0);
 
     // First run consumes Mutable, returns EngineRunOutput
-    let mut engine = engine.run("First").await?.engine;
+    let mut engine = engine.run("First").await.engine;
     assert_eq!(engine.turn_count(), 1);
     // Retry not yet implemented → AgentTurn:LlmCall is 1:1.
     assert_eq!(engine.llm_call_count(), 1);
 
     // Subsequent runs on Locked take &mut self
-    engine.run("Second").await?;
+    engine.run("Second").await;
     assert_eq!(engine.turn_count(), 2);
     assert_eq!(engine.llm_call_count(), 2);
 
@@ -515,7 +550,7 @@ async fn test_lock_unlock_relock_tools_remain_effective() {
     engine.register_tool(tool_a.definition());
 
     let mut locked = engine.lock();
-    locked.run("first").await.expect("first run");
+    locked.run("first").await;
     assert_eq!(tool_a.call_count(), 1, "tool_a should be called once");
 
     let mut unlocked = locked.unlock();
@@ -523,7 +558,7 @@ async fn test_lock_unlock_relock_tools_remain_effective() {
     unlocked.register_tool(tool_b.definition());
 
     let mut relocked = unlocked.lock();
-    relocked.run("second").await.expect("second run");
+    relocked.run("second").await;
 
     assert_eq!(tool_a.call_count(), 1, "tool_a should not be called again");
     assert_eq!(tool_b.call_count(), 1, "tool_b should be called once");
@@ -628,11 +663,14 @@ async fn max_turns_is_scoped_to_each_fresh_run() {
     engine.set_max_turns(Some(1));
     let mut engine = engine.lock();
 
-    assert_eq!(engine.run("first").await.unwrap(), EngineResult::Finished);
+    assert!(matches!(engine.run("first").await, EngineRunExit::Finished));
     assert_eq!(engine.turn_count(), 1);
     assert_eq!(engine.active_run_turn_count(), None);
 
-    assert_eq!(engine.run("second").await.unwrap(), EngineResult::Finished);
+    assert!(matches!(
+        engine.run("second").await,
+        EngineRunExit::Finished
+    ));
     assert_eq!(engine.turn_count(), 2);
     assert_eq!(engine.active_run_turn_count(), None);
 }
@@ -646,11 +684,11 @@ async fn yielded_resume_keeps_the_same_unspent_turn_budget() {
     });
     let mut engine = engine.lock();
 
-    assert_eq!(engine.run("start").await.unwrap(), EngineResult::Yielded);
+    assert!(matches!(engine.run("start").await, EngineRunExit::Yielded));
     assert_eq!(engine.turn_count(), 0);
     assert_eq!(engine.active_run_turn_count(), Some(0));
 
-    assert_eq!(engine.resume().await.unwrap(), EngineResult::Finished);
+    assert!(matches!(engine.resume().await, EngineRunExit::Finished));
     assert_eq!(engine.turn_count(), 1);
     assert_eq!(engine.active_run_turn_count(), None);
 }
@@ -674,12 +712,15 @@ async fn paused_tool_resume_does_not_reset_the_consumed_turn_budget() {
     });
     let mut engine = engine.lock();
 
-    assert_eq!(engine.run("call it").await.unwrap(), EngineResult::Paused);
+    assert!(matches!(engine.run("call it").await, EngineRunExit::Paused));
     assert_eq!(engine.turn_count(), 1);
     assert_eq!(engine.active_run_turn_count(), Some(1));
     assert_eq!(tool.call_count(), 0);
 
-    assert_eq!(engine.resume().await.unwrap(), EngineResult::LimitReached);
+    assert!(matches!(
+        engine.resume().await,
+        EngineRunExit::Interrupted(StopReason::LimitReached)
+    ));
     assert_eq!(engine.turn_count(), 1);
     assert_eq!(engine.active_run_turn_count(), None);
     assert_eq!(tool.call_count(), 1, "the consumed turn's tool still runs");
@@ -705,10 +746,13 @@ async fn fresh_input_abandons_a_paused_run_and_starts_a_new_budget() {
     });
     let mut engine = engine.lock();
 
-    assert_eq!(engine.run("pause").await.unwrap(), EngineResult::Paused);
+    assert!(matches!(engine.run("pause").await, EngineRunExit::Paused));
     assert_eq!(engine.active_run_turn_count(), Some(1));
 
-    assert_eq!(engine.run("replace").await.unwrap(), EngineResult::Finished);
+    assert!(matches!(
+        engine.run("replace").await,
+        EngineRunExit::Finished
+    ));
     assert_eq!(engine.turn_count(), 2);
     assert_eq!(engine.active_run_turn_count(), None);
     assert_eq!(tool.call_count(), 1, "pending-tool semantics are unchanged");
@@ -723,10 +767,10 @@ async fn interceptor_continuation_consumes_the_logical_run_budget() {
     });
     let mut engine = engine.lock();
 
-    assert_eq!(
-        engine.run("start").await.unwrap(),
-        EngineResult::LimitReached
-    );
+    assert!(matches!(
+        engine.run("start").await,
+        EngineRunExit::Interrupted(StopReason::LimitReached)
+    ));
     assert_eq!(engine.turn_count(), 1);
     assert_eq!(engine.llm_call_count(), 1);
     assert_eq!(engine.active_run_turn_count(), None);
@@ -737,11 +781,13 @@ async fn restored_active_run_budget_is_enforced_before_another_llm_call() {
     let mut engine = Engine::new(MockLlmClient::new(completed_text_events()));
     engine.set_max_turns(Some(1));
     engine.set_turn_count(7);
-    engine.set_last_run_interrupted(true);
     engine.set_active_run_turn_count(Some(1));
     let mut engine = engine.lock();
 
-    assert_eq!(engine.resume().await.unwrap(), EngineResult::LimitReached);
+    assert!(matches!(
+        engine.resume().await,
+        EngineRunExit::Interrupted(StopReason::LimitReached)
+    ));
     assert_eq!(engine.turn_count(), 7);
     assert_eq!(engine.llm_call_count(), 0);
     assert_eq!(engine.active_run_turn_count(), None);

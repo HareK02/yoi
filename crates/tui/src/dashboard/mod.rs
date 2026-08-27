@@ -5200,6 +5200,7 @@ fn row_status_label(entry: &WorkerListEntry) -> (&'static str, Style) {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
+            Some(WorkerStatus::Stopped) => ("live stopped", Style::default().fg(Color::DarkGray)),
             None => ("live", Style::default().fg(Color::DarkGray)),
         };
     }

@@ -138,7 +138,10 @@ async fn test_engine_simple_text_response() {
     // Send a simple message (Mutable::run consumes self, returns tuple)
     let result = engine.run("Hello").await;
 
-    assert!(result.is_ok(), "Engine should complete successfully");
+    assert!(
+        matches!(result.result, agen::EngineRunExit::Finished),
+        "Engine should complete successfully"
+    );
 }
 
 /// Verify that Engine can correctly process responses containing tool calls
@@ -199,7 +202,10 @@ async fn test_engine_with_programmatic_events() {
     // Mutable::run consumes self, returns tuple
     let result = engine.run("Greet me").await;
 
-    assert!(result.is_ok(), "Engine should complete successfully");
+    assert!(
+        matches!(result.result, agen::EngineRunExit::Finished),
+        "Engine should complete successfully"
+    );
 }
 
 /// Verify that ToolCallCollector correctly collects ToolCall from ToolUse block events

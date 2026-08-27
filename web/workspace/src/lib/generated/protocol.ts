@@ -8,7 +8,7 @@ export type AlertSource = "worker" | "engine" | "compactor" | "agents_md";
 
 export type CompletionKind = "file";
 
-export type WorkerStatus = "idle" | "running" | "paused";
+export type WorkerStatus = "idle" | "running" | "paused" | "stopped";
 
 export type TurnResult = "finished" | "paused";
 

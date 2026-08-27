@@ -4,7 +4,7 @@
 
 use agen::llm_client::scheme::{Scheme, anthropic::AnthropicScheme};
 use agen::llm_client::transport::{HttpTransport, ResolvedAuth};
-use agen::{Engine, EngineResult};
+use agen::{Engine, EngineRunExit, StopReason};
 use std::time::Duration;
 
 #[tokio::main]
@@ -45,16 +45,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("📡 Sending request to LLM...");
 
-    match engine.run("Tell me a very long story about a brave knight. Make it as detailed as possible with many paragraphs.").await {
-        Ok(out) => match out.result {
-            EngineResult::Finished => println!("✅ Task completed normally"),
-            EngineResult::Paused => println!("⏸️  Task paused"),
-            EngineResult::LimitReached => println!("🔒 Turn limit reached"),
-            EngineResult::Yielded => println!("↩️  Task yielded"),
-        },
-        Err(e) => {
-            println!("❌ Task error: {}", e);
+    let output = engine.run("Tell me a very long story about a brave knight. Make it as detailed as possible with many paragraphs.").await;
+    match output.result {
+        EngineRunExit::Finished => println!("✅ Task completed normally"),
+        EngineRunExit::Paused => println!("⏸️  Task paused"),
+        EngineRunExit::Yielded => println!("↩️  Task yielded"),
+        EngineRunExit::Interrupted(StopReason::LimitReached) => {
+            println!("🔒 Turn limit reached")
         }
+        EngineRunExit::Interrupted(reason) => println!("❌ Task interrupted: {reason:?}"),
     }
 
     println!("\n✨ Demo complete!");

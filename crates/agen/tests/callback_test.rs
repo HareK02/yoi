@@ -66,7 +66,10 @@ async fn test_callback_llm_retry_event() {
     });
 
     let result = engine.run("retry once").await;
-    assert!(result.is_ok(), "engine should succeed after one retry");
+    assert!(
+        matches!(result.result, agen::EngineRunExit::Finished),
+        "engine should succeed after one retry"
+    );
 
     let notices = notices.lock().unwrap();
     assert_eq!(notices.len(), 1);
@@ -108,9 +111,12 @@ async fn test_callback_text_block_events() {
         });
     });
 
-    // Mutable::run consumes self, returns (Locked, EngineResult)
+    // Mutable::run consumes self, returns (Locked, EngineRunExit)
     let result = engine.run("Greet me").await;
-    assert!(result.is_ok(), "Engine should complete");
+    assert!(
+        matches!(result.result, agen::EngineRunExit::Finished),
+        "Engine should complete"
+    );
 
     let deltas = text_deltas.lock().unwrap();
     assert_eq!(deltas.len(), 2);
@@ -154,7 +160,7 @@ async fn test_callback_tool_call_complete() {
         });
     });
 
-    // Mutable::run consumes self, returns (Locked, EngineResult)
+    // Mutable::run consumes self, returns (Locked, EngineRunExit)
     let _ = engine.run("Weather please").await;
 
     let starts = tool_starts.lock().unwrap();
@@ -197,9 +203,9 @@ async fn test_callback_turn_events() {
         ends.lock().unwrap().push(turn);
     });
 
-    // Mutable::run consumes self, returns (Locked, EngineResult)
+    // Mutable::run consumes self, returns (Locked, EngineRunExit)
     let result = engine.run("Do something").await;
-    assert!(result.is_ok());
+    assert!(matches!(result.result, agen::EngineRunExit::Finished));
 
     let starts = turn_starts.lock().unwrap();
     let ends = turn_ends.lock().unwrap();
@@ -382,7 +388,7 @@ async fn test_callback_usage_events() {
         usages.lock().unwrap().push(event.clone());
     });
 
-    // Mutable::run consumes self, returns (Locked, EngineResult)
+    // Mutable::run consumes self, returns (Locked, EngineRunExit)
     let _ = engine.run("Hello").await;
 
     let usages = usage_events.lock().unwrap();

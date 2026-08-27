@@ -2742,6 +2742,7 @@ impl RuntimeState {
                 protocol::WorkerStatus::Running => Some(WorkerStatus::Running),
                 protocol::WorkerStatus::Idle => Some(WorkerStatus::Idle),
                 protocol::WorkerStatus::Paused => Some(WorkerStatus::Paused),
+                protocol::WorkerStatus::Stopped => Some(WorkerStatus::Stopped),
             },
             protocol::Event::RunEnd { result } => match result {
                 protocol::RunResult::Finished | protocol::RunResult::RolledBack => {
@@ -3104,7 +3105,7 @@ mod tests {
             &mut activity,
             &internal_worker_status_event(
                 internal_worker_ref("child-b", None),
-                protocol::WorkerStatus::Idle,
+                protocol::WorkerStatus::Stopped,
             ),
         ));
     }

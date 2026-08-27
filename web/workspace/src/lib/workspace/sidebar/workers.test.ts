@@ -2,6 +2,7 @@ import {
   canOpenWorkerConsole,
   canShowWorkerInSidebar,
   compareWorkersForSidebar,
+  sidebarWorkerActivity,
 } from "./workers.ts";
 import type { Worker } from "./types.ts";
 
@@ -76,4 +77,22 @@ Deno.test("sidebar workers sort running then idle then stopped", () => {
   ];
   workers.sort(compareWorkersForSidebar);
   assertEquals(workers.map((candidate) => candidate.worker_id).join(","), "2,1,4,3");
+});
+
+Deno.test("fatal child stop clears the sidebar SubWorker spinner activity", () => {
+  const parent = { state: "idle", has_running_internal_workers: true };
+  assertEquals(sidebarWorkerActivity(parent), "subworker-running");
+
+  parent.has_running_internal_workers = false;
+  assertEquals(sidebarWorkerActivity(parent), "idle");
+});
+
+Deno.test("stopped parents do not fall back to the idle indicator", () => {
+  assertEquals(
+    sidebarWorkerActivity({
+      state: "stopped",
+      has_running_internal_workers: false,
+    }),
+    "none",
+  );
 });
