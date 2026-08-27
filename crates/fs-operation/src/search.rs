@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::FsAccessPolicy;
@@ -57,20 +59,11 @@ impl GrepReport {
                 }
             }
             GrepOutputMode::Content => {
-                for line in &self.lines {
-                    let separator = if line.is_match { ':' } else { '-' };
-                    let path = logical_display(root, &line.path);
-                    if self.show_line_numbers
-                        && let Some(number) = line.line_number
-                    {
-                        output.push_str(&format!(
-                            "{path}{separator}{number}{separator}{}\n",
-                            line.text
-                        ));
-                    } else {
-                        output.push_str(&format!("{path}{separator}{}\n", line.text));
-                    }
-                }
+                output.push_str(&render_content_lines(
+                    root,
+                    &self.lines,
+                    self.show_line_numbers,
+                ));
             }
         }
         GrepResult {
@@ -80,6 +73,48 @@ impl GrepReport {
             truncated: self.truncated,
         }
     }
+}
+
+fn render_content_lines(root: &Path, lines: &[ContentLine], show_line_numbers: bool) -> String {
+    let mut grouped = BTreeMap::<&Path, Vec<&ContentLine>>::new();
+    for line in lines {
+        grouped.entry(&line.path).or_default().push(line);
+    }
+
+    let mut output = String::new();
+    for (file_index, (path, file_lines)) in grouped.into_iter().enumerate() {
+        if file_index > 0 {
+            output.push('\n');
+        }
+        let _ = writeln!(output, "{}", logical_display(root, path));
+
+        let number_width = file_lines
+            .iter()
+            .filter_map(|line| line.line_number)
+            .map(|number| number.to_string().len())
+            .max()
+            .unwrap_or(1);
+        let mut previous_line_end = None;
+        for line in file_lines {
+            if let (Some(previous_end), Some(number)) = (previous_line_end, line.line_number)
+                && number > previous_end
+            {
+                let _ = writeln!(output, "   …");
+            }
+
+            let marker = if line.is_match { '>' } else { ' ' };
+            if show_line_numbers && let Some(number) = line.line_number {
+                let _ = writeln!(output, " {marker} {number:>number_width$} │ {}", line.text);
+            } else {
+                let _ = writeln!(output, " {marker} │ {}", line.text);
+            }
+            previous_line_end = line
+                .line_number
+                .map(|number| number + line.text.split('\n').count() as u64);
+        }
+    }
+
+    output
 }
 
 fn logical_display(root: &Path, path: &Path) -> String {
