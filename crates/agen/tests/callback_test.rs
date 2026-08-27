@@ -8,11 +8,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use agen::Engine;
 use agen::llm_client::event::{Event, ResponseStatus, StatusEvent as ClientStatusEvent};
 use agen::llm_client::retry::RetryPolicy;
 use agen::llm_client::{ClientError, LlmClient, Request, ResponseStream};
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
-use agen::{Engine, History};
 use async_trait::async_trait;
 use common::MockLlmClient;
 
@@ -58,7 +58,7 @@ async fn test_callback_llm_retry_event() {
         max_attempts: 2,
         total_timeout: Duration::from_secs(1),
     });
-    let mut history: History = History::new();
+    let mut history = agen::History::new();
 
     let notices = Arc::new(Mutex::new(Vec::new()));
     let sink = notices.clone();
@@ -67,7 +67,10 @@ async fn test_callback_llm_retry_event() {
     });
 
     let result = engine.run(&mut history, "retry once").await;
-    assert!(result.is_ok(), "engine should succeed after one retry");
+    assert!(
+        matches!(result.result, agen::EngineRunExit::Finished),
+        "engine should succeed after one retry"
+    );
 
     let notices = notices.lock().unwrap();
     assert_eq!(notices.len(), 1);
@@ -92,7 +95,7 @@ async fn test_callback_text_block_events() {
 
     let client = MockLlmClient::new(events);
     let mut engine = Engine::new(client);
-    let mut history: History = History::new();
+    let mut history = agen::History::new();
 
     let text_deltas = Arc::new(Mutex::new(Vec::new()));
     let text_completes = Arc::new(Mutex::new(Vec::new()));
@@ -110,9 +113,12 @@ async fn test_callback_text_block_events() {
         });
     });
 
-    // Mutable::run consumes self, returns (Locked, EngineResult)
+    // Mutable::run consumes self, returns (Locked, EngineRunExit)
     let result = engine.run(&mut history, "Greet me").await;
-    assert!(result.is_ok(), "Engine should complete");
+    assert!(
+        matches!(result.result, agen::EngineRunExit::Finished),
+        "Engine should complete"
+    );
 
     let deltas = text_deltas.lock().unwrap();
     assert_eq!(deltas.len(), 2);
@@ -139,7 +145,7 @@ async fn test_callback_tool_call_complete() {
 
     let client = MockLlmClient::new(events);
     let mut engine = Engine::new(client);
-    let mut history: History = History::new();
+    let mut history = agen::History::new();
 
     let tool_starts = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
     let tool_completes = Arc::new(Mutex::new(Vec::new()));
@@ -157,7 +163,7 @@ async fn test_callback_tool_call_complete() {
         });
     });
 
-    // Mutable::run consumes self, returns (Locked, EngineResult)
+    // Mutable::run consumes self, returns (Locked, EngineRunExit)
     let _ = engine.run(&mut history, "Weather please").await;
 
     let starts = tool_starts.lock().unwrap();
@@ -186,7 +192,7 @@ async fn test_callback_turn_events() {
 
     let client = MockLlmClient::new(events);
     let mut engine = Engine::new(client);
-    let mut history: History = History::new();
+    let mut history = agen::History::new();
 
     let turn_starts = Arc::new(Mutex::new(Vec::new()));
     let turn_ends = Arc::new(Mutex::new(Vec::new()));
@@ -201,9 +207,9 @@ async fn test_callback_turn_events() {
         ends.lock().unwrap().push(turn);
     });
 
-    // Mutable::run consumes self, returns (Locked, EngineResult)
+    // Mutable::run consumes self, returns (Locked, EngineRunExit)
     let result = engine.run(&mut history, "Do something").await;
-    assert!(result.is_ok());
+    assert!(matches!(result.result, agen::EngineRunExit::Finished));
 
     let starts = turn_starts.lock().unwrap();
     let ends = turn_ends.lock().unwrap();
@@ -258,7 +264,7 @@ async fn test_callback_tool_result_events() {
 
     let client = MockLlmClient::new(events);
     let mut engine = Engine::new(client);
-    let mut history: History = History::new();
+    let mut history = agen::History::new();
 
     engine.register_tool(fixed_tool(
         "fixed",
@@ -335,7 +341,7 @@ async fn test_callback_tool_result_error_path() {
 
     let client = MockLlmClient::new(events);
     let mut engine = Engine::new(client);
-    let mut history: History = History::new();
+    let mut history = agen::History::new();
 
     engine.register_tool(erroring_tool("erroring", "boom"));
 
@@ -380,7 +386,7 @@ async fn test_callback_usage_events() {
 
     let client = MockLlmClient::new(events);
     let mut engine = Engine::new(client);
-    let mut history: History = History::new();
+    let mut history = agen::History::new();
 
     let usage_events = Arc::new(Mutex::new(Vec::new()));
 
@@ -389,7 +395,7 @@ async fn test_callback_usage_events() {
         usages.lock().unwrap().push(event.clone());
     });
 
-    // Mutable::run consumes self, returns (Locked, EngineResult)
+    // Mutable::run consumes self, returns (Locked, EngineRunExit)
     let _ = engine.run(&mut history, "Hello").await;
 
     let usages = usage_events.lock().unwrap();

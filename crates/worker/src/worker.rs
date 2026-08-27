@@ -2941,10 +2941,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// short. Called from `Worker::run` when the worker's
     /// `last_run_interrupted` flag is set (i.e. the Worker just transitioned
     /// out of Paused via a new user input).
-    fn apply_interrupt_prep(&mut self) -> Result<(), WorkerError>
-    where
-        St: Clone + 'static,
-    {
+    fn apply_interrupt_prep(&mut self) -> Result<(), WorkerError> {
         let tool_result_summary = self
             .prompts()
             .load_full()
@@ -2962,17 +2959,24 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             &tool_result_summary,
         );
         if !closures.is_empty() {
-            let mut annotate = history_annotator(
-                self.log_writer_handle(),
-                Vec::new(),
-                self.pending_committed_history.clone(),
-            );
-            let (engine, session) = (
-                self.engine.as_mut().expect("worker present"),
-                &mut self.session,
-            );
-            engine.append_history_with(session.history_mut(), closures, &mut annotate)?;
-            session.note_mutation();
+            let subject = worker_subject(self.session.session_id());
+            for item in closures {
+                let entry = HistoryEntry::new(
+                    item,
+                    new_history_metadata(
+                        WorkerHistoryProvenance::ToolOutput {
+                            worker: subject.clone(),
+                        },
+                        None,
+                    ),
+                );
+                self.commit_entry(LogEntry::AnnotatedToolResult {
+                    ts: segment_log::now_millis(),
+                    entry: to_logged_history_entry(&entry),
+                })?;
+                self.session.history_mut().push_entry(entry);
+                self.session.note_mutation();
+            }
         }
         let interrupt_prompt_provenance =
             self.prompt_render_provenance("internal.interrupt_system_note");
@@ -2992,21 +2996,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         })?;
         let interrupt_entry =
             HistoryEntry::new(agen::Item::system_message(system_note), interrupt_metadata);
-        let mut annotate = history_annotator(
-            self.log_writer_handle(),
-            vec![interrupt_entry.clone()],
-            self.pending_committed_history.clone(),
-        );
-        let (engine, session) = (
-            self.engine.as_mut().expect("worker present"),
-            &mut self.session,
-        );
-        engine.append_history_with(
-            session.history_mut(),
-            std::iter::once(interrupt_entry.item),
-            &mut annotate,
-        )?;
-        session.note_mutation();
+        self.session.history_mut().push_entry(interrupt_entry);
+        self.session.note_mutation();
         Ok(())
     }
 

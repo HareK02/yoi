@@ -39,7 +39,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use agen::{
-    Engine, History,
+    Engine, EngineRunExit, StopReason,
     interceptor::{Interceptor, PostToolAction, ToolResultInfo},
     llm_client::{
         LlmClient,
@@ -451,6 +451,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create Engine
     let mut engine = Engine::new(client);
+    let mut history = agen::History::new();
 
     let tool_call_names = Arc::new(Mutex::new(HashMap::new()));
 
@@ -474,16 +475,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     engine.set_interceptor(ToolResultPrinterPolicy::new(tool_call_names));
 
-    let mut history = History::new();
-
     // One-shot mode
     if let Some(prompt) = args.prompt {
-        match engine.run(&mut history, &prompt).await {
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("\n❌ Error: {}", e);
-                std::process::exit(1);
-            }
+        let output = engine.run(&mut history, &prompt).await;
+        if let EngineRunExit::Interrupted(StopReason::Unexpected(error)) = output.result {
+            eprintln!("\n❌ Error: {error}");
         }
 
         return Ok(());
@@ -502,13 +498,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let mut locked = match engine.run(&mut history, first_input).await {
-        Ok(out) => out.engine,
-        Err(e) => {
-            eprintln!("\n❌ Error: {}", e);
-            return Ok(());
-        }
-    };
+    let output = engine.run(&mut history, first_input).await;
+    let mut locked = output.engine;
 
     loop {
         print!("\n👤 You: ");
@@ -527,11 +518,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        match locked.run(&mut history, input).await {
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("\n❌ Error: {}", e);
-            }
+        if let EngineRunExit::Interrupted(StopReason::Unexpected(error)) =
+            locked.run(&mut history, input).await
+        {
+            eprintln!("\n❌ Error: {error}");
         }
     }
 

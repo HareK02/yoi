@@ -570,10 +570,7 @@ async fn test_before_tool_call_synthetic_result_committed() {
 
     engine.set_interceptor(SyntheticPolicy);
 
-    let _result = engine
-        .run(&mut history, "Test synthetic result")
-        .await
-        .unwrap();
+    let _result = engine.run(&mut history, "Test synthetic result").await;
 
     assert_eq!(blocked_clone.call_count(), 0, "Blocked tool should not run");
     assert!(history.items().any(|item| matches!(

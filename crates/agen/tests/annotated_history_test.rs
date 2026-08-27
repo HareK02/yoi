@@ -38,10 +38,9 @@ async fn run_preserves_item_annotations_without_projecting_them() {
 
     let output = engine
         .run_with_annotation(&mut history, "hello", &mut annotate)
-        .await
-        .unwrap();
+        .await;
 
-    assert!(matches!(output.result, agen::EngineResult::Finished));
+    assert!(matches!(output.result, agen::EngineRunExit::Finished));
     assert_eq!(history.len(), 2);
     assert_eq!(history.entries()[0].annotation, "1:user");
     assert_eq!(history.entries()[1].annotation, "2:assistant");

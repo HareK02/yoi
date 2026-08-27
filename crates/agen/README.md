@@ -32,10 +32,10 @@ async fn conversation<C: LlmClient>(client: C) -> Result<(), EngineError> {
     let output = Engine::new(client)
         .system_prompt("You are a concise assistant.")
         .run(&mut history, "Explain typed state in one sentence.")
-        .await?;
+        .await;
 
     let mut engine = output.engine;
-    let _result = engine.run(&mut history, "Give a Rust example.").await?;
+    let _result = engine.run(&mut history, "Give a Rust example.").await;
     Ok(())
 }
 ```

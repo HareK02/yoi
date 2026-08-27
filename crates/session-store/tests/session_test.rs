@@ -135,7 +135,7 @@ async fn run_and_persist(
     session_id: session_store::SessionId,
     segment_id: session_store::SegmentId,
     input: &str,
-) -> (TestWorker, agen::EngineResult) {
+) -> (TestWorker, agen::EngineRunExit) {
     // Mirror Worker's run-entry contract: log the user input as segments
     // before the worker pushes its flattened user_message; save_delta
     // skips the resulting user_message item to avoid double-write.
