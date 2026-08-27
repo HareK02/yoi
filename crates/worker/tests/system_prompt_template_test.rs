@@ -130,7 +130,8 @@ async fn make_worker_with_body(
         EffectivePromptCatalog::new(templates, 1, "test-schema", "test-toolchain").unwrap();
     let loader = PromptCatalogSource::builtins_only().with_effective_catalog(projection);
 
-    let worker = Engine::new(client);
+    let worker =
+        Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(client);
     let mut worker = Worker::new(
         manifest,
         worker,

@@ -13,12 +13,12 @@
 
 mod common;
 
-use agen::Engine;
 use agen::Item;
 use agen::llm_client::event::{
     BlockMetadata, BlockStart, BlockStop, BlockType, Event, ReasoningBlockData, ResponseStatus,
     StatusEvent,
 };
+use agen::{Engine, History};
 use common::MockLlmClient;
 
 fn reasoning_block(text: impl Into<String>, data: ReasoningBlockData) -> Vec<Event> {
@@ -65,15 +65,15 @@ async fn anthropic_thinking_round_trips_signature_into_history() {
     ]);
     let client = MockLlmClient::new(events);
     let engine = Engine::new(client);
-    let out = engine.run("question?").await.expect("run ok");
-    let engine = out.engine;
+    let mut history: History = History::new();
+    let _out = engine.run(&mut history, "question?").await.expect("run ok");
 
-    let history = engine.history();
+    let entries = history.entries();
     // user / reasoning / assistant_message
     assert_eq!(history.len(), 3, "history: {history:?}");
 
-    assert!(matches!(history[0], Item::Message { .. }));
-    match &history[1] {
+    assert!(matches!(entries[0].item, Item::Message { .. }));
+    match &entries[1].item {
         Item::Reasoning {
             text, signature, ..
         } => {
@@ -82,7 +82,7 @@ async fn anthropic_thinking_round_trips_signature_into_history() {
         }
         other => panic!("expected Reasoning, got {other:?}"),
     }
-    assert_eq!(history[2].as_text(), Some("Here's the answer"));
+    assert_eq!(entries[2].item.as_text(), Some("Here's the answer"));
 }
 
 /// OpenAI Responses 風: encrypted_content + summary を持った reasoning が
@@ -109,11 +109,11 @@ async fn openai_reasoning_round_trips_encrypted_and_summary() {
     ]);
     let client = MockLlmClient::new(events);
     let engine = Engine::new(client);
-    let out = engine.run("q").await.expect("run ok");
-    let engine = out.engine;
+    let mut history: History = History::new();
+    let _out = engine.run(&mut history, "q").await.expect("run ok");
 
-    let history = engine.history();
-    match &history[1] {
+    let entries = history.entries();
+    match &entries[1].item {
         Item::Reasoning {
             text,
             summary,
@@ -155,13 +155,13 @@ async fn reasoning_precedes_text_in_assistant_burst() {
     }));
     let client = MockLlmClient::new(events);
     let engine = Engine::new(client);
-    let out = engine.run("q").await.expect("run ok");
-    let engine = out.engine;
+    let mut history: History = History::new();
+    let _out = engine.run(&mut history, "q").await.expect("run ok");
 
-    let history = engine.history();
+    let entries = history.entries();
     // user / reasoning(先頭) / assistant_message
-    assert!(matches!(history[1], Item::Reasoning { .. }));
-    assert_eq!(history[2].as_text(), Some("intermediate"));
+    assert!(matches!(entries[1].item, Item::Reasoning { .. }));
+    assert_eq!(entries[2].item.as_text(), Some("intermediate"));
 }
 
 /// resume シナリオ: history.json 由来の Item::Reasoning(signature) を Engine に
@@ -207,14 +207,18 @@ async fn injected_reasoning_survives_into_outgoing_request() {
     };
 
     let mut engine = Engine::new(client);
+    let mut history: History = History::new();
     // resume: 既存 history を流し込む
-    engine.set_history(vec![
-        Item::user_message("prior question"),
-        Item::reasoning("prior thinking").with_signature("SIG-PRIOR"),
-        Item::assistant_message("prior answer"),
-    ]);
+    engine.set_history(
+        &mut history,
+        vec![
+            Item::user_message("prior question"),
+            Item::reasoning("prior thinking").with_signature("SIG-PRIOR"),
+            Item::assistant_message("prior answer"),
+        ],
+    );
 
-    let _ = engine.run("follow up").await.expect("run ok");
+    let _ = engine.run(&mut history, "follow up").await.expect("run ok");
 
     let req = captured
         .lock()

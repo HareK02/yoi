@@ -22,7 +22,7 @@ use crate::compact::token_counter::{
     EstimateSource, savings_for_prune_impl, token_estimates_for_prune_impl,
 };
 
-impl<C: LlmClient, St: Store> Worker<C, St> {
+impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// Enable prune projection on the underlying Engine.
     ///
     /// Registers the config and token/savings-estimator closures on the Engine.

@@ -6,12 +6,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agen::Engine;
 use agen::interceptor::{Interceptor, PostToolAction, PreToolAction, ToolCallInfo, ToolResultInfo};
 use agen::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use agen::tool::{
     Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput, ToolResult,
 };
+use agen::{Engine, History};
 use async_trait::async_trait;
 
 mod common;
@@ -145,6 +145,7 @@ async fn test_parallel_tool_execution() {
         ],
     ]);
     let mut engine = Engine::new(client);
+    let mut history: History = History::new();
     let tool1 = SlowTool::new("slow_tool_1", 100);
     let tool2 = SlowTool::new("slow_tool_2", 100);
     let tool3 = SlowTool::new("slow_tool_3", 100);
@@ -159,7 +160,7 @@ async fn test_parallel_tool_execution() {
 
     let start = Instant::now();
     // Mutable::run consumes self, returns (Locked, EngineResult)
-    let _result = engine.run("Run all tools").await;
+    let _result = engine.run(&mut history, "Run all tools").await;
     let elapsed = start.elapsed();
 
     // Verify all tools were called
@@ -205,13 +206,14 @@ async fn test_tool_execution_context_order_and_batch_id() {
         ],
     ]);
     let mut engine = Engine::new(client);
+    let mut history: History = History::new();
     let contexts = Arc::new(Mutex::new(Vec::new()));
 
     engine.register_tool(ContextRecordingTool::new("record_a", contexts.clone()).definition());
     engine.register_tool(ContextRecordingTool::new("record_b", contexts.clone()).definition());
     engine.register_tool(ContextRecordingTool::new("record_c", contexts.clone()).definition());
 
-    let _ = engine.run("record contexts").await;
+    let _ = engine.run(&mut history, "record contexts").await;
 
     let mut contexts = contexts.lock().unwrap().clone();
     contexts.sort_by_key(|ctx| ctx.call_index);
@@ -256,11 +258,12 @@ async fn test_tool_execution_context_batch_id_changes_between_batches() {
         ],
     ]);
     let mut engine = Engine::new(client);
+    let mut history: History = History::new();
     let contexts = Arc::new(Mutex::new(Vec::new()));
 
     engine.register_tool(ContextRecordingTool::new("record", contexts.clone()).definition());
 
-    let _ = engine.run("record batches").await;
+    let _ = engine.run(&mut history, "record batches").await;
 
     let contexts = contexts.lock().unwrap().clone();
     assert_eq!(contexts.len(), 2);
@@ -298,6 +301,7 @@ async fn test_tool_execution_context_for_skipped_and_synthetic_paths() {
         ],
     ]);
     let mut engine = Engine::new(client);
+    let mut history: History = History::new();
     let executed_contexts = Arc::new(Mutex::new(Vec::new()));
     let pre_contexts = Arc::new(Mutex::new(Vec::new()));
     let post_contexts = Arc::new(Mutex::new(Vec::new()));
@@ -344,7 +348,9 @@ async fn test_tool_execution_context_for_skipped_and_synthetic_paths() {
         post_contexts: post_contexts.clone(),
     });
 
-    let _ = engine.run("record skipped and synthetic contexts").await;
+    let _ = engine
+        .run(&mut history, "record skipped and synthetic contexts")
+        .await;
 
     let mut pre_contexts = pre_contexts.lock().unwrap().clone();
     pre_contexts.sort_by_key(|ctx| ctx.call_index);
@@ -389,6 +395,7 @@ async fn test_before_tool_call_skip() {
 
     let client = MockLlmClient::new(events);
     let mut engine = Engine::new(client);
+    let mut history: History = History::new();
 
     let allowed_tool = SlowTool::new("allowed_tool", 10);
     let blocked_tool = SlowTool::new("blocked_tool", 10);
@@ -416,7 +423,7 @@ async fn test_before_tool_call_skip() {
     engine.set_interceptor(BlockingPolicy);
 
     // Mutable::run consumes self, returns (Locked, EngineResult)
-    let _result = engine.run("Test hook").await;
+    let _result = engine.run(&mut history, "Test hook").await;
 
     // allowed_tool is called, but blocked_tool is not
     assert_eq!(
@@ -457,6 +464,7 @@ async fn test_post_tool_call_modification() {
     ]);
 
     let mut engine = Engine::new(client);
+    let mut history: History = History::new();
 
     #[derive(Clone)]
     struct SimpleTool;
@@ -503,7 +511,7 @@ async fn test_post_tool_call_modification() {
     });
 
     // Mutable::run consumes self, returns (Locked, EngineResult)
-    let result = engine.run("Test modification").await;
+    let result = engine.run(&mut history, "Test modification").await;
 
     assert!(result.is_ok(), "Engine should complete");
 
@@ -540,6 +548,7 @@ async fn test_before_tool_call_synthetic_result_committed() {
         ],
     ]);
     let mut engine = Engine::new(client);
+    let mut history: History = History::new();
     let blocked_tool = SlowTool::new("blocked_tool", 10);
     let blocked_clone = blocked_tool.clone();
     engine.register_tool(blocked_tool.definition());
@@ -558,10 +567,13 @@ async fn test_before_tool_call_synthetic_result_committed() {
 
     engine.set_interceptor(SyntheticPolicy);
 
-    let result = engine.run("Test synthetic result").await.unwrap();
+    let _result = engine
+        .run(&mut history, "Test synthetic result")
+        .await
+        .unwrap();
 
     assert_eq!(blocked_clone.call_count(), 0, "Blocked tool should not run");
-    assert!(result.engine.history().iter().any(|item| matches!(
+    assert!(history.items().any(|item| matches!(
         item,
         agen::Item::ToolResult {
             call_id,

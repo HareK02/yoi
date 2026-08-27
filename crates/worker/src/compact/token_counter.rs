@@ -242,13 +242,13 @@ pub(crate) fn savings_for_prune_impl(
 
 // ── Worker に生やす公開 API ───────────────────────────────────────────────
 
-impl<C: LlmClient, St: Store> Worker<C, St> {
+impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// 現在の history 全体の推定トークン数。
     ///
     /// 最後の measurement と、その後に追加された未測定分の byte/4 外挿。
     pub fn total_tokens(&self) -> TokenEstimate {
         let usage = self.usage_history();
-        agen::token_counter::total_tokens(self.history(), &usage)
+        agen::token_counter::total_tokens(&self.history(), &usage)
     }
 
     /// 任意の history index 時点でのプロンプト全長推定。
@@ -259,7 +259,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// pointer 以降に増えたプロンプト長を測るのに使う。
     pub fn total_tokens_at(&self, history_len: usize) -> TokenEstimate {
         let usage = self.usage_history();
-        agen::token_counter::total_tokens_at(self.history(), &usage, history_len)
+        agen::token_counter::total_tokens_at(&self.history(), &usage, history_len)
     }
 
     /// 末尾から `retained` トークン以上を残すための分割位置。
@@ -267,7 +267,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// `history[..cut.index]` が要約／破棄される側、`history[cut.index..]` が残る側。
     pub fn split_for_retained(&self, retained: u64) -> SplitPoint {
         let usage = self.usage_history();
-        split_for_retained_impl(self.history(), &usage, retained)
+        split_for_retained_impl(&self.history(), &usage, retained)
     }
 }
 

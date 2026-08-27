@@ -21,20 +21,21 @@ agen = { version = "0.2.1", features = ["codex"] }
 
 ## Quick start
 
-Supply an implementation of [`LlmClient`](https://docs.rs/agen/latest/agen/llm_client/trait.LlmClient.html), then run a turn. The first call consumes the mutable engine and returns a cache-locked engine for later turns.
+Supply an implementation of [`LlmClient`](https://docs.rs/agen/latest/agen/llm_client/trait.LlmClient.html), keep conversation history in your application, then run a turn. The first call consumes the mutable engine and returns a cache-locked engine for later turns.
 
 ```no_run
-use agen::{Engine, EngineError};
+use agen::{Engine, EngineError, History};
 use agen::llm_client::LlmClient;
 
 async fn conversation<C: LlmClient>(client: C) -> Result<(), EngineError> {
+    let mut history = History::new();
     let output = Engine::new(client)
         .system_prompt("You are a concise assistant.")
-        .run("Explain typed state in one sentence.")
+        .run(&mut history, "Explain typed state in one sentence.")
         .await?;
 
     let mut engine = output.engine;
-    let _result = engine.run("Give a Rust example.").await?;
+    let _result = engine.run(&mut history, "Give a Rust example.").await?;
     Ok(())
 }
 ```

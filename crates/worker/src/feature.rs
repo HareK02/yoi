@@ -1795,9 +1795,9 @@ impl FeatureRegistryBuilder {
     }
 
     /// Install modules into the existing Engine tool path and hook builder.
-    pub(crate) fn install_into_engine<C: LlmClient>(
+    pub(crate) fn install_into_engine<C: LlmClient, A>(
         self,
-        worker: &mut Engine<C, Mutable>,
+        worker: &mut Engine<C, Mutable, A>,
         hook_builder: &mut HookRegistryBuilder,
     ) -> FeatureRegistryInstallReport {
         let mut pending_tools = Vec::new();

@@ -70,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 5. Extract the assistant's reply from history
-    let history = worker.engine().history();
+    let history = worker.history();
     if let Some(text) = history
         .iter()
         .rev()

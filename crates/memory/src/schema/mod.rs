@@ -10,7 +10,10 @@ mod decision;
 mod request;
 mod summary;
 
-pub use common::{EvidenceKind, Frontmatter, SourceEvidenceRef, SourceRef, split_frontmatter};
+pub use common::{
+    EvidenceKind, EvidenceOrigin, EvidenceOriginKind, Frontmatter, SourceEvidenceRef, SourceRef,
+    split_frontmatter,
+};
 pub use decision::{DecisionFrontmatter, DecisionStatus};
 pub use request::RequestFrontmatter;
 pub use summary::SummaryFrontmatter;

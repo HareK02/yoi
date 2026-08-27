@@ -1249,7 +1249,7 @@ extract_threshold = 4000
         )
         .await
         .unwrap();
-        assert!(first_capture.items.iter().any(|item| {
+        assert!(first_capture.entries.iter().map(|entry| &entry.item).any(|item| {
             matches!(item, Item::Message { role: Role::Assistant, content, .. } if content.iter().any(|part| matches!(part, ContentPart::Text { text } if text.contains("reviewed"))))
         }));
 
@@ -1271,7 +1271,7 @@ extract_threshold = 4000
         )
         .await
         .unwrap();
-        assert!(latest_capture.items.len() > first_capture.items.len());
+        assert!(latest_capture.entries.len() > first_capture.entries.len());
 
         fail_requests.store(true, Ordering::SeqCst);
         send.execute(

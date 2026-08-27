@@ -4,7 +4,7 @@
 
 use agen::llm_client::scheme::{Scheme, anthropic::AnthropicScheme};
 use agen::llm_client::transport::{HttpTransport, ResolvedAuth};
-use agen::{Engine, EngineResult};
+use agen::{Engine, EngineResult, History};
 use std::time::Duration;
 
 #[tokio::main]
@@ -29,6 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let base_url = scheme.default_base_url().to_string();
     let client = HttpTransport::new(scheme, model, base_url, ResolvedAuth::ApiKey(api_key), cap);
     let engine = Engine::new(client);
+    let mut history = History::new();
 
     println!("🚀 Starting Engine...");
     println!("💡 Will cancel after 2 seconds\n");
@@ -45,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("📡 Sending request to LLM...");
 
-    match engine.run("Tell me a very long story about a brave knight. Make it as detailed as possible with many paragraphs.").await {
+    match engine.run(&mut history, "Tell me a very long story about a brave knight. Make it as detailed as possible with many paragraphs.").await {
         Ok(out) => match out.result {
             EngineResult::Finished => println!("✅ Task completed normally"),
             EngineResult::Paused => println!("⏸️  Task paused"),

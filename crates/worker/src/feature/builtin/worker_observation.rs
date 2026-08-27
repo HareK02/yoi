@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
+#[cfg(test)]
 use agen::Item;
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use session_store::collect_state;
+use session_store::{LogEntry, collect_state};
 
 use super::manage_worker::{WORKER_CONTROL_SERVICE_ID, WorkerControlService};
 use crate::feature::{
@@ -60,7 +61,27 @@ pub struct WorkerObservationSubject {
 #[derive(Debug, Clone)]
 pub struct WorkerSessionCapture {
     pub segment_id: String,
-    pub items: Vec<Item>,
+    pub entries: Vec<agen::HistoryEntry<crate::SessionHistoryMetadata>>,
+}
+
+impl WorkerSessionCapture {
+    pub fn from_log_entries(
+        segment_id: impl Into<String>,
+        log_entries: &[LogEntry],
+    ) -> Result<Self, String> {
+        let segment_id = segment_id.into();
+        let state = collect_state(log_entries);
+        let parsed_segment_id = segment_id.parse().unwrap_or_default();
+        let entries = crate::session_history::restore_history_entries(
+            state.session_id.unwrap_or_default(),
+            parsed_segment_id,
+            log_entries,
+        )?;
+        Ok(Self {
+            segment_id,
+            entries,
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -161,9 +182,17 @@ impl WorkerObservationProvider for WorkspaceClientWorkerObservationProvider {
             })
             .collect::<Result<Vec<session_store::LogEntry>, _>>()?;
         let state = collect_state(&entries);
+        let segment_id = response.segment_id;
+        let parsed_segment_id = segment_id.parse().unwrap_or_default();
+        let typed_entries = crate::session_history::restore_history_entries(
+            state.session_id.unwrap_or_default(),
+            parsed_segment_id,
+            &entries,
+        )
+        .map_err(WorkerObservationError::Unavailable)?;
         Ok(WorkerSessionCapture {
-            segment_id: response.segment_id,
-            items: state.history,
+            segment_id,
+            entries: typed_entries,
         })
     }
 }
@@ -392,9 +421,15 @@ impl WorkerObservationProvider for SpawnedSubWorkerObservationProvider {
             .ok_or(WorkerObservationError::NotFound)?;
         let entries = record.session.entries();
         let state = collect_state(&entries);
+        let typed_entries = crate::session_history::restore_history_entries(
+            state.session_id.unwrap_or_default(),
+            Default::default(),
+            &entries,
+        )
+        .map_err(WorkerObservationError::Unavailable)?;
         Ok(WorkerSessionCapture {
             segment_id: format!("subworker:{name}"),
-            items: state.history,
+            entries: typed_entries,
         })
     }
 }
@@ -508,6 +543,7 @@ impl Tool for ViewSessionOverviewTool {
             .map(|entry| {
                 serde_json::json!({
                     "entry_ref": entry.id,
+                    "origin": entry.origin,
                     "entry_range": entry.entry_range,
                     "kind": entry.kind.as_str(),
                     "label": entry.label,
@@ -547,7 +583,7 @@ impl Tool for SearchSessionEntriesTool {
         let from = params.from.as_deref().map(parse_entry_ref).transpose()?;
         let through = params.through.as_deref().map(parse_entry_ref).transpose()?;
         if let (Some(from), Some(through)) = (&from, &through) {
-            if from.source_index() > through.source_index() {
+            if view.source_index_for_ref(from) > view.source_index_for_ref(through) {
                 return Err(ToolError::InvalidArgument(
                     "SearchSessionEntries from must not be after through".to_string(),
                 ));
@@ -573,6 +609,7 @@ impl Tool for SearchSessionEntriesTool {
             .map(|entry| {
                 serde_json::json!({
                     "entry_ref": entry.id,
+                    "origin": entry.origin,
                     "entry_range": entry.entry_range,
                     "kind": entry.kind.as_str(),
                     "tool_part": entry.tool_part.map(|part| format!("{part:?}").to_lowercase()),
@@ -628,6 +665,7 @@ impl Tool for ReadSessionEntryTool {
             .map(|entry| {
                 serde_json::json!({
                     "entry_ref": entry.id,
+                    "origin": entry.origin,
                     "entry_range": entry.entry_range,
                     "kind": entry.kind.as_str(),
                     "tool_part": entry.tool_part.map(|part| format!("{part:?}").to_lowercase()),
@@ -661,7 +699,10 @@ async fn latest_view(
         .capture_worker_session(subject)
         .await
         .map_err(tool_error)?;
-    Ok(SessionCapture::new(capture.segment_id, capture.items))
+    Ok(SessionCapture::from_history_entries(
+        capture.segment_id,
+        capture.entries,
+    ))
 }
 
 fn parse_input<T: serde::de::DeserializeOwned>(
@@ -751,9 +792,23 @@ mod tests {
             if subject != &granted_subject() {
                 return Err(WorkerObservationError::NotFound);
             }
+            let entries = self
+                .captures
+                .lock()
+                .unwrap()
+                .clone()
+                .into_iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    let mut metadata = crate::SessionHistoryMetadata::legacy_unknown();
+                    metadata.entry_id =
+                        session_store::LoggedSessionHistoryEntryId(format!("fake-{index:08}"));
+                    agen::HistoryEntry::new(item, metadata)
+                })
+                .collect();
             Ok(WorkerSessionCapture {
                 segment_id: "segment".to_string(),
-                items: self.captures.lock().unwrap().clone(),
+                entries,
             })
         }
     }
@@ -796,7 +851,7 @@ mod tests {
         let read = read_definition(provider.clone())().1;
         let hidden = read
             .execute(
-                r#"{"subject":{"kind":"runtime_worker","runtime_id":"runtime-1","worker_id":"unauthorized"},"entry_ref":"E00000000"}"#,
+                r#"{"subject":{"kind":"runtime_worker","runtime_id":"runtime-1","worker_id":"unauthorized"},"entry_ref":"Efake-00000000"}"#,
                 agen::tool::ToolExecutionContext::direct(),
             )
             .await
@@ -810,7 +865,7 @@ mod tests {
             .push(message("a1", Role::Assistant, "second"));
         let output = read
             .execute(
-                r#"{"subject":{"kind":"runtime_worker","runtime_id":"runtime-1","worker_id":"granted"},"entry_ref":"E00000000"}"#,
+                r#"{"subject":{"kind":"runtime_worker","runtime_id":"runtime-1","worker_id":"granted"},"entry_ref":"Efake-00000000"}"#,
                 agen::tool::ToolExecutionContext::direct(),
             )
             .await
@@ -819,7 +874,7 @@ mod tests {
 
         let output = read
             .execute(
-                r#"{"subject":{"kind":"runtime_worker","runtime_id":"runtime-1","worker_id":"granted"},"entry_ref":"E00000001"}"#,
+                r#"{"subject":{"kind":"runtime_worker","runtime_id":"runtime-1","worker_id":"granted"},"entry_ref":"Efake-00000001"}"#,
                 agen::tool::ToolExecutionContext::direct(),
             )
             .await

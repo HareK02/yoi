@@ -163,7 +163,8 @@ async fn make_worker_with_manifest(
     let scope = worker::Scope::writable(&pwd).unwrap();
     std::mem::forget(pwd_tmp);
 
-    let worker = Engine::new(client);
+    let worker =
+        Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(client);
     let mut worker = Worker::new(
         manifest,
         worker,
@@ -204,28 +205,34 @@ fn system_texts_in_sink_session_start(
 ) -> Vec<String> {
     let (entries, _rx) = worker.sink().subscribe_with_snapshot();
     for entry in entries.into_iter().rev() {
-        if let session_store::LogEntry::SegmentStart { history, .. } = entry {
-            return history
+        let history = match entry {
+            session_store::LogEntry::AnnotatedSegmentStart { history, .. } => history
                 .into_iter()
-                .filter_map(|logged| {
-                    let item: Item = logged.into();
-                    match item {
-                        Item::Message {
-                            role: agen::Role::System,
-                            content,
-                            ..
-                        } => Some(
-                            content
-                                .iter()
-                                .map(|p| p.as_text().to_owned())
-                                .collect::<Vec<_>>()
-                                .join(""),
-                        ),
-                        _ => None,
-                    }
-                })
-                .collect();
-        }
+                .map(|entry| entry.item)
+                .collect::<Vec<_>>(),
+            session_store::LogEntry::SegmentStart { history, .. } => history,
+            _ => continue,
+        };
+        return history
+            .into_iter()
+            .filter_map(|logged| {
+                let item: Item = logged.into();
+                match item {
+                    Item::Message {
+                        role: agen::Role::System,
+                        content,
+                        ..
+                    } => Some(
+                        content
+                            .iter()
+                            .map(|p| p.as_text().to_owned())
+                            .collect::<Vec<_>>()
+                            .join(""),
+                    ),
+                    _ => None,
+                }
+            })
+            .collect();
     }
     Vec::new()
 }
@@ -337,7 +344,12 @@ permission = "write"
     // New segment records forked_from pointing at the source.
     let new_entries = store.read_all(session_id, new_segment_id).unwrap();
     match &new_entries[0] {
-        LogEntry::SegmentStart {
+        LogEntry::AnnotatedSegmentStart {
+            session_id: seg_session,
+            forked_from: Some(origin),
+            ..
+        }
+        | LogEntry::SegmentStart {
             session_id: seg_session,
             forked_from: Some(origin),
             ..

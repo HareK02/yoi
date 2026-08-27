@@ -12,6 +12,7 @@ pub mod prompt;
 pub mod runtime;
 pub mod segment_log_sink;
 mod session_capture;
+mod session_history;
 pub mod shared_state;
 mod shutdown_after_idle;
 pub mod skill;
@@ -41,6 +42,10 @@ pub use prompt::system::{SystemPromptContext, SystemPromptError, SystemPromptTem
 pub use protocol::{ErrorCode, Event, Method, TurnResult, WorkerStatus};
 pub use runtime::dir::RuntimeDir;
 pub use segment_log_sink::SegmentLogSink;
+pub use session_history::{
+    SessionHistoryDerivation, SessionHistoryEntryId, SessionHistoryMetadata,
+    WorkerHistoryProvenance, WorkerSubjectSnapshot,
+};
 pub use shared_state::WorkerSharedState;
 pub use worker::{
     LocalWorkingDirectory, WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN, Worker, WorkerError,

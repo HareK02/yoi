@@ -55,7 +55,17 @@ pub(crate) struct InternalWorkerSpec {
     pub input: String,
     pub cache_key: Option<String>,
     pub max_turns: Option<u32>,
-    pub engine_configurator: Option<Box<dyn FnOnce(&mut Engine<Box<dyn LlmClient>>) + Send>>,
+    pub engine_configurator: Option<
+        Box<
+            dyn FnOnce(
+                    &mut Engine<
+                        Box<dyn LlmClient>,
+                        agen::state::Mutable,
+                        crate::SessionHistoryMetadata,
+                    >,
+                ) + Send,
+        >,
+    >,
     pub features: FeatureRegistryBuilder,
     pub required_tools: &'static [&'static str],
     pub authority: InternalWorkerAuthority,
@@ -124,7 +134,9 @@ where
 
     let last_usage = Arc::new(Mutex::new(None::<UsageEvent>));
     let usage_slot = last_usage.clone();
-    let mut engine = Engine::new(client).system_prompt(system_prompt);
+    let mut engine =
+        Engine::<_, agen::state::Mutable, crate::SessionHistoryMetadata>::new_annotated(client)
+            .system_prompt(system_prompt);
     engine.on_usage(move |usage| {
         if let Ok(mut slot) = usage_slot.lock() {
             *slot = Some(usage.clone());
@@ -494,7 +506,9 @@ pub(crate) async fn spawn_internal_worker_session(
 
     let last_usage = Arc::new(Mutex::new(None::<UsageEvent>));
     let usage_slot = last_usage.clone();
-    let mut engine = Engine::new(client).system_prompt(system_prompt);
+    let mut engine =
+        Engine::<_, agen::state::Mutable, crate::SessionHistoryMetadata>::new_annotated(client)
+            .system_prompt(system_prompt);
     engine.on_usage(move |usage| {
         if let Ok(mut slot) = usage_slot.lock() {
             *slot = Some(usage.clone());
@@ -591,7 +605,9 @@ pub(crate) fn prepare_internal_worker_from_spec(
         manifest.compaction = None;
         manifest.memory = None;
 
-        let mut engine = Engine::new(client).system_prompt(system_prompt);
+        let mut engine =
+            Engine::<_, agen::state::Mutable, crate::SessionHistoryMetadata>::new_annotated(client)
+                .system_prompt(system_prompt);
         engine.set_cache_key(cache_key);
         engine.set_max_turns(max_turns);
         if let Some(configure) = engine_configurator {
