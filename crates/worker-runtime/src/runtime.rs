@@ -1,6 +1,6 @@
 use crate::catalog::{
     ConfigBundleRef, CreateWorkerRequest, ProfileSelector, WorkerDetail, WorkerLifecycleAck,
-    WorkerStatus, WorkerSummary, WorkingDirectoryRequest,
+    WorkerStatus, WorkerSummary, WorkingDirectoryRepositoryAccessRequest, WorkingDirectoryRequest,
     WorkingDirectoryStatus as CatalogWorkingDirectoryStatus, WorkspaceApiRef,
 };
 use crate::config_bundle::{
@@ -26,6 +26,10 @@ use crate::management::{
 };
 #[cfg(feature = "ws-server")]
 use crate::observation::{WorkerObservationCursor, WorkerObservationEvent};
+use crate::resource::{
+    BackendResourceClient, BackendResourceError, BackendResourceFetchRequest, BackendResourceKind,
+    REPOSITORY_SSH_ACCESS_CONTENT_TYPE, RepositorySshAccessSecret,
+};
 #[cfg(feature = "fs-store")]
 use crate::retention::{
     FsWorkerRetentionProvider, WorkerRetentionExecutionRequest, WorkerRetentionExecutionResult,
@@ -170,6 +174,14 @@ impl Runtime {
         let runtime = Self::with_options(options);
         runtime.install_execution_backend(backend)?;
         Ok(runtime)
+    }
+
+    pub fn install_backend_resource_client(
+        &self,
+        client: Arc<dyn BackendResourceClient>,
+    ) -> Result<(), RuntimeError> {
+        self.lock()?.backend_resource_client = Some(BackendResourceClientRef(client));
+        Ok(())
     }
 
     /// Create or restore a filesystem-backed Runtime.
@@ -364,6 +376,103 @@ impl Runtime {
         backend
             .create_working_directory(&request)
             .map_err(RuntimeError::from)
+    }
+
+    pub async fn create_working_directory_from_resource(
+        &self,
+        mut request: WorkingDirectoryRequest,
+    ) -> Result<CatalogWorkingDirectoryStatus, RuntimeError> {
+        if let Some(ssh) = request
+            .materialization
+            .as_mut()
+            .and_then(|materialization| materialization.ssh.as_mut())
+        {
+            self.resolve_repository_access_resource(ssh).await?;
+        }
+        self.create_working_directory(request)
+    }
+
+    pub fn authorize_working_directory_repository_access(
+        &self,
+        request: WorkingDirectoryRepositoryAccessRequest,
+    ) -> Result<(), RuntimeError> {
+        let backend = {
+            let state = self.lock()?;
+            state.ensure_running()?;
+            state.execution_backend.clone().ok_or_else(|| {
+                RuntimeError::ExecutionBackendUnavailable {
+                    message: "working directory Repository access requires an execution backend"
+                        .to_string(),
+                }
+            })?
+        };
+        backend
+            .authorize_working_directory_repository_access(&request)
+            .map_err(RuntimeError::from)
+    }
+
+    async fn resolve_repository_access_resource(
+        &self,
+        ssh: &mut crate::catalog::RepositorySshMaterializationAccess,
+    ) -> Result<(), RuntimeError> {
+        if !ssh.private_key.expose().is_empty() && !ssh.known_hosts_entry.expose().is_empty() {
+            return Ok(());
+        }
+        let (client, runtime_id) = {
+            let state = self.lock()?;
+            let client = state.backend_resource_client.clone().ok_or_else(|| {
+                RuntimeError::InvalidRequest(
+                    "Backend Repository access resource client is unavailable".to_string(),
+                )
+            })?;
+            let runtime_id = state.runtime_identity.clone().ok_or_else(|| {
+                RuntimeError::InvalidRequest("Runtime identity is unavailable".to_string())
+            })?;
+            (client, runtime_id)
+        };
+        let mut response = client
+            .0
+            .fetch_resource(BackendResourceFetchRequest {
+                handle: ssh.secret_resource.clone(),
+                runtime_id,
+                worker_id: None,
+                audit_correlation_id: ssh.secret_resource.audit_correlation_id.clone(),
+            })
+            .await
+            .map_err(repository_resource_error)?;
+        if response.kind != BackendResourceKind::RepositorySshAccess
+            || response.content_type != REPOSITORY_SSH_ACCESS_CONTENT_TYPE
+            || response.resource_id != ssh.secret_resource.resource_id
+            || response.digest != ssh.secret_resource.digest
+            || response.bytes.len() as u64 > ssh.secret_resource.max_bytes
+        {
+            return Err(RuntimeError::InvalidRequest(
+                "Backend Repository SSH access resource response was invalid".to_string(),
+            ));
+        }
+        let secret = serde_json::from_slice::<RepositorySshAccessSecret>(&response.bytes);
+        response.bytes.fill(0);
+        let mut secret = secret.map_err(|_| {
+            RuntimeError::InvalidRequest(
+                "Backend Repository SSH access resource payload was invalid".to_string(),
+            )
+        })?;
+        ssh.private_key =
+            crate::catalog::SensitiveString::new(std::mem::take(&mut secret.private_key));
+        ssh.known_hosts_entry =
+            crate::catalog::SensitiveString::new(std::mem::take(&mut secret.known_hosts_entry));
+        Ok(())
+    }
+
+    pub async fn authorize_working_directory_repository_access_from_resource(
+        &self,
+        mut request: WorkingDirectoryRepositoryAccessRequest,
+    ) -> Result<(), RuntimeError> {
+        let ssh = request.materialization.ssh.as_mut().ok_or_else(|| {
+            RuntimeError::InvalidRequest("Repository SSH access metadata is missing".to_string())
+        })?;
+        self.resolve_repository_access_resource(ssh).await?;
+        self.authorize_working_directory_repository_access(request)
     }
 
     /// List Runtime-owned working directories through the attached execution backend.
@@ -566,12 +675,13 @@ impl Runtime {
             let worker_id = request.worker_id;
             let worker_ref = WorkerRef::new(worker_id);
 
+            let durable_request = durable_create_worker_request(&request);
             let record = WorkerRecord {
                 worker_ref: worker_ref.clone(),
                 worker_id: worker_id.clone(),
                 status: WorkerStatus::Stopped,
                 workspace_id: scope.map(|scope| scope.workspace_id.clone()),
-                request: request.clone(),
+                request: durable_request,
                 run_generation: 1,
                 working_directory: None,
                 execution_handle: None,
@@ -1842,6 +1952,15 @@ struct SubscriptionSink {
     lagged: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
+struct BackendResourceClientRef(Arc<dyn BackendResourceClient>);
+
+impl std::fmt::Debug for BackendResourceClientRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BackendResourceClientRef(..)")
+    }
+}
+
 #[derive(Debug)]
 struct RuntimeState {
     display_name: Option<String>,
@@ -1853,6 +1972,7 @@ struct RuntimeState {
     persistence: RuntimePersistence,
     status: RuntimeStatus,
     execution_backend: Option<WorkerExecutionBackendRef>,
+    backend_resource_client: Option<BackendResourceClientRef>,
     #[cfg(feature = "fs-store")]
     next_diagnostic_id: u64,
     workers: BTreeMap<WorkerId, WorkerRecord>,
@@ -1880,6 +2000,7 @@ impl RuntimeState {
             persistence: RuntimePersistence::Memory,
             status: RuntimeStatus::Running,
             execution_backend: None,
+            backend_resource_client: None,
             #[cfg(feature = "fs-store")]
             next_diagnostic_id: 1,
             workers: BTreeMap::new(),
@@ -1908,6 +2029,7 @@ impl RuntimeState {
             persistence: RuntimePersistence::Fs(store),
             status: RuntimeStatus::Running,
             execution_backend: None,
+            backend_resource_client: None,
             #[cfg(feature = "fs-store")]
             next_diagnostic_id: 1,
             workers: BTreeMap::new(),
@@ -1959,6 +2081,7 @@ impl RuntimeState {
             persistence: RuntimePersistence::Fs(store),
             status: persisted.status,
             execution_backend: None,
+            backend_resource_client: None,
             next_diagnostic_id,
             workers,
             config_bundles: BTreeMap::new(),
@@ -2714,6 +2837,33 @@ fn worker_status_from_run_state(run_state: WorkerExecutionRunState) -> WorkerSta
     }
 }
 
+fn repository_resource_error(error: BackendResourceError) -> RuntimeError {
+    let category = match error {
+        BackendResourceError::Expired => "expired",
+        BackendResourceError::Unauthorized { .. } => "unauthorized",
+        BackendResourceError::UnsupportedKind => "unsupported_kind",
+        BackendResourceError::MissingResource => "missing_resource",
+        BackendResourceError::Oversized { .. } => "oversized",
+        BackendResourceError::DigestMismatch { .. } => "digest_mismatch",
+        BackendResourceError::ContentTypeMismatch { .. } => "content_type_mismatch",
+        BackendResourceError::InvalidResponse { .. } => "invalid_response",
+        BackendResourceError::Transport { .. } => "transport",
+    };
+    RuntimeError::InvalidRequest(format!(
+        "Backend Repository SSH access resource fetch failed: {category}"
+    ))
+}
+
+fn durable_create_worker_request(request: &CreateWorkerRequest) -> CreateWorkerRequest {
+    let mut durable = request.clone();
+    if let Some(working_directory) = durable.working_directory_request.as_mut()
+        && let Some(materialization) = working_directory.materialization.as_mut()
+    {
+        materialization.ssh = None;
+    }
+    durable
+}
+
 fn requested_primary_workdir_id(request: &CreateWorkerRequest) -> Option<&str> {
     request
         .working_directory
@@ -2884,7 +3034,9 @@ fn subscription_worker_state(status: WorkerStatus) -> SubscriptionWorkerState {
 mod tests {
     use super::*;
     use crate::catalog::{
-        ConfigBundleRef, ProfileSelector, WorkingDirectoryClaim, WorkspaceApiRef,
+        ConfigBundleRef, MaterializerKind, ProfileSelector, RepositoryMaterializationContext,
+        RepositorySshMaterializationAccess, SensitiveString, WorkingDirectoryClaim,
+        WorkingDirectoryRepository, WorkingDirectoryRequest, WorkspaceApiRef,
     };
     use crate::config_bundle::{
         ConfigBundle, ConfigBundleMetadata, ConfigBundleProvenance, ConfigDeclaration,
@@ -2894,6 +3046,8 @@ mod tests {
         WorkerExecutionBackend, WorkerExecutionContext, WorkerExecutionHandle,
         WorkerExecutionRestoreRequest, WorkerExecutionRunState,
     };
+    use crate::working_directory::WorkingDirectoryDiagnostic;
+    use async_trait::async_trait;
     use std::collections::BTreeMap;
     #[cfg(feature = "fs-store")]
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3115,6 +3269,243 @@ mod tests {
         }
     }
 
+    #[test]
+    fn durable_worker_request_omits_repository_credentials() {
+        let mut request = task_request("worker-secret-redaction");
+        request.working_directory_request = Some(WorkingDirectoryRequest {
+            repository: WorkingDirectoryRepository {
+                id: "repository-1".to_string(),
+                provider: "git".to_string(),
+                source: workspace_api::RepositorySource {
+                    kind: workspace_api::RepositorySourceKind::Ssh,
+                    uri: "ssh://git@example.test/repo.git".to_string(),
+                },
+                source_revision: 1,
+                source_fingerprint: "sha256:source".to_string(),
+                selector: None,
+            },
+            materializer: MaterializerKind::RuntimeGitCache,
+            backend_workdir_id: Some("working-directory-1".to_string()),
+            materialization: Some(RepositoryMaterializationContext {
+                workspace_id: "workspace-1".to_string(),
+                runtime_id: "runtime-1".to_string(),
+                operation_id: "operation-1".to_string(),
+                config_revision: 1,
+                config_projection_digest: "sha256:projection".to_string(),
+                cache_generation: 0,
+                ssh: Some(RepositorySshMaterializationAccess {
+                    credential_id: "credential-1".to_string(),
+                    credential_revision: 1,
+                    host_trust_id: "host-trust-1".to_string(),
+                    host_trust_revision: 1,
+                    access: workspace_api::RepositoryAccessMode::ReadOnly,
+                    expires_at_epoch_seconds: u64::MAX,
+                    repository_id: "repository-1".to_string(),
+                    repository_source_fingerprint: "sha256:source".to_string(),
+                    repository_uri: "ssh://git@example.test/repo.git".to_string(),
+                    secret_resource: repository_resource_handle(),
+                    private_key: SensitiveString::new("private-key-bytes"),
+                    known_hosts_entry: SensitiveString::new("known-hosts-entry"),
+                }),
+            }),
+        });
+
+        let durable = durable_create_worker_request(&request);
+
+        assert!(
+            request
+                .working_directory_request
+                .as_ref()
+                .and_then(|working_directory| working_directory.materialization.as_ref())
+                .and_then(|materialization| materialization.ssh.as_ref())
+                .is_some()
+        );
+        assert!(
+            durable
+                .working_directory_request
+                .as_ref()
+                .and_then(|working_directory| working_directory.materialization.as_ref())
+                .and_then(|materialization| materialization.ssh.as_ref())
+                .is_none()
+        );
+        let serialized = serde_json::to_string(&durable).unwrap();
+        assert!(!serialized.contains("private-key-bytes"));
+        assert!(!serialized.contains("known-hosts-entry"));
+    }
+
+    fn repository_resource_handle() -> crate::resource::BackendResourceHandle {
+        crate::resource::BackendResourceHandle {
+            kind: crate::resource::BackendResourceKind::RepositorySshAccess,
+            workspace_id: "workspace-1".to_string(),
+            scope_id: Some("repository-ssh-access".to_string()),
+            runtime_id: Some("runtime-1".to_string()),
+            worker_id: None,
+            resource_id: "repository-access-1".to_string(),
+            digest: "opaque:repository-access-1".to_string(),
+            operation: crate::resource::BackendResourceOperation::FetchOnce,
+            expires_at_unix_seconds: i64::MAX,
+            nonce: "repository-access-1".to_string(),
+            revision: "1".to_string(),
+            generation: None,
+            max_bytes: crate::resource::DEFAULT_REPOSITORY_SSH_ACCESS_MAX_BYTES,
+            content_type: crate::resource::REPOSITORY_SSH_ACCESS_CONTENT_TYPE.to_string(),
+            redaction: crate::resource::ResourceRedactionPolicy::RuntimeInternalOnly,
+            audit_correlation_id: "repository-access-1".to_string(),
+            profile_source_graph: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_access_resource_is_fetched_before_provider_authorization() {
+        let (runtime, backend) = runtime_and_backend();
+        backend
+            .repository_access_available
+            .store(true, Ordering::SeqCst);
+        runtime.bind_runtime_identity("runtime-1").unwrap();
+        let handle = repository_resource_handle();
+        runtime
+            .install_backend_resource_client(Arc::new(TestRepositoryResourceClient {
+                response: Mutex::new(Some(crate::resource::BackendResourceFetchResponse {
+                    kind: crate::resource::BackendResourceKind::RepositorySshAccess,
+                    resource_id: handle.resource_id.clone(),
+                    digest: handle.digest.clone(),
+                    content_type: crate::resource::REPOSITORY_SSH_ACCESS_CONTENT_TYPE.to_string(),
+                    bytes: serde_json::to_vec(&RepositorySshAccessSecret {
+                        private_key: "private-key-bytes".to_string(),
+                        known_hosts_entry: "known-hosts-entry".to_string(),
+                    })
+                    .unwrap(),
+                    audit_correlation_id: handle.audit_correlation_id.clone(),
+                })),
+            }))
+            .unwrap();
+        let request = WorkingDirectoryRepositoryAccessRequest {
+            working_directory_id: "working-directory-1".to_string(),
+            materialization: RepositoryMaterializationContext {
+                workspace_id: "workspace-1".to_string(),
+                runtime_id: "runtime-1".to_string(),
+                operation_id: "operation-1".to_string(),
+                config_revision: 1,
+                config_projection_digest: "sha256:projection".to_string(),
+                cache_generation: 0,
+                ssh: Some(RepositorySshMaterializationAccess {
+                    credential_id: "credential-1".to_string(),
+                    credential_revision: 1,
+                    host_trust_id: "host-trust-1".to_string(),
+                    host_trust_revision: 1,
+                    access: workspace_api::RepositoryAccessMode::ReadOnly,
+                    expires_at_epoch_seconds: u64::MAX,
+                    repository_id: "repository-1".to_string(),
+                    repository_source_fingerprint: "sha256:source".to_string(),
+                    repository_uri: "ssh://git@example.test/repo.git".to_string(),
+                    secret_resource: handle,
+                    private_key: SensitiveString::default(),
+                    known_hosts_entry: SensitiveString::default(),
+                }),
+            },
+        };
+
+        let replay = request.clone();
+        runtime
+            .authorize_working_directory_repository_access_from_resource(request)
+            .await
+            .unwrap();
+        assert!(
+            runtime
+                .authorize_working_directory_repository_access_from_resource(replay)
+                .await
+                .is_err()
+        );
+
+        let accesses = backend.repository_accesses.lock().unwrap();
+        assert_eq!(accesses.len(), 1);
+        let access = accesses[0].materialization.ssh.as_ref().unwrap();
+        assert_eq!(access.private_key.expose(), "private-key-bytes");
+        assert_eq!(access.known_hosts_entry.expose(), "known-hosts-entry");
+    }
+
+    #[tokio::test]
+    async fn working_directory_create_fetches_repository_access_before_provider_call() {
+        let (runtime, backend) = runtime_and_backend();
+        backend
+            .repository_access_available
+            .store(true, Ordering::SeqCst);
+        runtime.bind_runtime_identity("runtime-1").unwrap();
+        let handle = repository_resource_handle();
+        runtime
+            .install_backend_resource_client(Arc::new(TestRepositoryResourceClient {
+                response: Mutex::new(Some(crate::resource::BackendResourceFetchResponse {
+                    kind: crate::resource::BackendResourceKind::RepositorySshAccess,
+                    resource_id: handle.resource_id.clone(),
+                    digest: handle.digest.clone(),
+                    content_type: crate::resource::REPOSITORY_SSH_ACCESS_CONTENT_TYPE.to_string(),
+                    bytes: serde_json::to_vec(&RepositorySshAccessSecret {
+                        private_key: "create-private-key-bytes".to_string(),
+                        known_hosts_entry: "create-known-hosts-entry".to_string(),
+                    })
+                    .unwrap(),
+                    audit_correlation_id: handle.audit_correlation_id.clone(),
+                })),
+            }))
+            .unwrap();
+        let request = WorkingDirectoryRequest {
+            repository: WorkingDirectoryRepository {
+                id: "repository-1".to_string(),
+                provider: "git".to_string(),
+                source: workspace_api::RepositorySource {
+                    kind: workspace_api::RepositorySourceKind::Ssh,
+                    uri: "ssh://git@example.test/repo.git".to_string(),
+                },
+                source_revision: 1,
+                source_fingerprint: "sha256:source".to_string(),
+                selector: None,
+            },
+            materializer: MaterializerKind::RuntimeGitCache,
+            backend_workdir_id: Some("working-directory-1".to_string()),
+            materialization: Some(RepositoryMaterializationContext {
+                workspace_id: "workspace-1".to_string(),
+                runtime_id: "runtime-1".to_string(),
+                operation_id: "operation-create".to_string(),
+                config_revision: 1,
+                config_projection_digest: "sha256:projection".to_string(),
+                cache_generation: 0,
+                ssh: Some(RepositorySshMaterializationAccess {
+                    credential_id: "credential-1".to_string(),
+                    credential_revision: 1,
+                    host_trust_id: "host-trust-1".to_string(),
+                    host_trust_revision: 1,
+                    access: workspace_api::RepositoryAccessMode::ReadOnly,
+                    expires_at_epoch_seconds: u64::MAX,
+                    repository_id: "repository-1".to_string(),
+                    repository_source_fingerprint: "sha256:source".to_string(),
+                    repository_uri: "ssh://git@example.test/repo.git".to_string(),
+                    secret_resource: handle,
+                    private_key: SensitiveString::default(),
+                    known_hosts_entry: SensitiveString::default(),
+                }),
+            }),
+        };
+
+        assert!(
+            runtime
+                .create_working_directory_from_resource(request)
+                .await
+                .is_err()
+        );
+
+        let requests = backend.working_directory_requests.lock().unwrap();
+        let access = requests[0]
+            .materialization
+            .as_ref()
+            .and_then(|materialization| materialization.ssh.as_ref())
+            .unwrap();
+        assert_eq!(access.private_key.expose(), "create-private-key-bytes");
+        assert_eq!(
+            access.known_hosts_entry.expose(),
+            "create-known-hosts-entry"
+        );
+    }
+
     fn scoped_task_request(objective: &str, workspace_id: &str) -> CreateWorkerRequest {
         let mut request = task_request(objective);
         request.workspace_api = Some(WorkspaceApiRef {
@@ -3196,6 +3587,9 @@ mod tests {
         config_bundles: Mutex<Vec<Option<ConfigBundle>>>,
         contexts: Mutex<BTreeMap<WorkerId, WorkerExecutionContext>>,
         dispatched_inputs: Mutex<Vec<WorkerInput>>,
+        repository_accesses: Mutex<Vec<WorkingDirectoryRepositoryAccessRequest>>,
+        repository_access_available: AtomicBool,
+        working_directory_requests: Mutex<Vec<WorkingDirectoryRequest>>,
         preserve_commit_ack_submission_id: AtomicBool,
         #[cfg(feature = "ws-server")]
         snapshots: Mutex<BTreeMap<WorkerId, protocol::Event>>,
@@ -3234,6 +3628,38 @@ mod tests {
     impl WorkerExecutionBackend for TestExecutionBackend {
         fn backend_id(&self) -> &str {
             "test-execution-backend"
+        }
+
+        fn create_working_directory(
+            &self,
+            request: &WorkingDirectoryRequest,
+        ) -> Result<CatalogWorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
+            self.working_directory_requests
+                .lock()
+                .unwrap()
+                .push(request.clone());
+            Err(WorkingDirectoryDiagnostic::rejected(
+                "working_directory_unsupported",
+                "Worker execution backend does not support working directory materialization",
+            ))
+        }
+
+        fn authorize_working_directory_repository_access(
+            &self,
+            request: &WorkingDirectoryRepositoryAccessRequest,
+        ) -> Result<(), WorkingDirectoryDiagnostic> {
+            self.repository_accesses
+                .lock()
+                .unwrap()
+                .push(request.clone());
+            if self.repository_access_available.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(WorkingDirectoryDiagnostic::rejected(
+                    "working_directory_repository_access_unsupported",
+                    "Worker execution backend does not support Repository access authorization",
+                ))
+            }
         }
 
         fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
@@ -3340,6 +3766,24 @@ mod tests {
                 .unwrap()
                 .get(&handle.worker_ref().worker_id)
                 .cloned()
+        }
+    }
+
+    struct TestRepositoryResourceClient {
+        response: Mutex<Option<crate::resource::BackendResourceFetchResponse>>,
+    }
+
+    #[async_trait]
+    impl BackendResourceClient for TestRepositoryResourceClient {
+        async fn fetch_resource(
+            &self,
+            _request: BackendResourceFetchRequest,
+        ) -> Result<crate::resource::BackendResourceFetchResponse, BackendResourceError> {
+            self.response
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or(BackendResourceError::MissingResource)
         }
     }
 

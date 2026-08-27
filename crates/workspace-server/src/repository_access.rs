@@ -11,7 +11,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use ssh_key::{Algorithm, HashAlg, PrivateKey, PublicKey};
+use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey, PublicKey};
 use workspace_api::{
     CreateRepositorySshCredentialRequest, DeleteRepositorySshCredentialRequest,
     DeleteRepositorySshHostTrustRequest, PutRepositorySshHostTrustRequest, RepositoryAccessMode,
@@ -59,7 +59,6 @@ impl WorkspaceConfigSchemaProvider for RepositoryAccessConfigSchemaProvider {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct VirtualWorkspaceConfig {
     #[serde(default)]
     repository_access: BTreeMap<String, VirtualRepositoryAccess>,
@@ -217,6 +216,16 @@ fn project_repository_access_evaluation(
         projection_digest: projection_digest.to_string(),
         bindings,
     })
+}
+
+#[derive(Clone)]
+pub struct LeasedRepositorySshAccess {
+    pub credential_id: String,
+    pub credential_revision: u64,
+    pub host_trust_id: String,
+    pub host_trust_revision: u64,
+    pub private_key: zeroize::Zeroizing<String>,
+    pub known_hosts_entry: String,
 }
 
 #[derive(Clone)]
@@ -829,6 +838,184 @@ impl RepositorySecretService {
         })
     }
 
+    pub fn lease_ssh_materialization_access(
+        &self,
+        workspace_id: &str,
+        binding: &RepositorySshAccessBinding,
+    ) -> Result<LeasedRepositorySshAccess> {
+        let credential = self
+            .get_credential(workspace_id, &binding.credential_id, &[])?
+            .ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "unknown Repository SSH credential `{}`",
+                    binding.credential_id
+                ))
+            })?;
+        if credential.status != "active" {
+            return Err(Error::InvalidInput(format!(
+                "Repository SSH credential `{}` is not active",
+                binding.credential_id
+            )));
+        }
+        let host_trust = self
+            .get_host_trust(workspace_id, &binding.host_trust_id, &[])?
+            .ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "unknown Repository SSH host trust `{}`",
+                    binding.host_trust_id
+                ))
+            })?;
+        self.lease_ssh_materialization_access_revision(
+            workspace_id,
+            &binding.credential_id,
+            credential.current_revision,
+            &binding.host_trust_id,
+            host_trust.current_revision,
+        )
+    }
+
+    pub fn lease_ssh_materialization_access_revision(
+        &self,
+        workspace_id: &str,
+        credential_id: &str,
+        credential_revision: u64,
+        host_trust_id: &str,
+        host_trust_revision: u64,
+    ) -> Result<LeasedRepositorySshAccess> {
+        let (private_key, passphrase, hostname, port, host_key) = self.store.with_conn(|conn| {
+            let private_key = read_sealed_secret(
+                conn,
+                workspace_id,
+                credential_id,
+                credential_revision,
+                "private_key",
+            )?
+            .ok_or_else(|| {
+                Error::RegistryInconsistency(format!(
+                    "Repository SSH credential `{credential_id}` revision {credential_revision} is unavailable"
+                ))
+            })?;
+            let passphrase = read_sealed_secret(
+                conn,
+                workspace_id,
+                credential_id,
+                credential_revision,
+                "passphrase",
+            )?;
+            let (hostname, port, host_key) = conn
+                .query_row(
+                    r#"SELECT h.hostname, h.port, v.host_key
+                       FROM repository_ssh_host_trusts h
+                       JOIN repository_ssh_host_trust_revisions v
+                         ON v.workspace_id = h.workspace_id
+                        AND v.host_trust_id = h.host_trust_id
+                       WHERE h.workspace_id = ?1 AND h.host_trust_id = ?2
+                         AND v.revision = ?3"#,
+                    params![workspace_id, host_trust_id, host_trust_revision as i64],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)? as u16,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    Error::RegistryInconsistency(format!(
+                        "Repository SSH host trust `{host_trust_id}` revision {host_trust_revision} is unavailable"
+                    ))
+                })?;
+            Ok((private_key, passphrase, hostname, port, host_key))
+        })?;
+        let private_key = self.unseal(
+            workspace_id,
+            credential_id,
+            credential_revision,
+            "private_key",
+            private_key,
+        )?;
+        let passphrase = passphrase
+            .map(|secret| {
+                self.unseal(
+                    workspace_id,
+                    credential_id,
+                    credential_revision,
+                    "passphrase",
+                    secret,
+                )
+            })
+            .transpose()?;
+        let private_key =
+            zeroize::Zeroizing::new(String::from_utf8(private_key).map_err(|_| {
+                Error::Store("Repository SSH private key plaintext is invalid".to_string())
+            })?);
+        let passphrase = passphrase
+            .map(|value| {
+                String::from_utf8(value)
+                    .map(zeroize::Zeroizing::new)
+                    .map_err(|_| {
+                        Error::Store("Repository SSH passphrase plaintext is invalid".to_string())
+                    })
+            })
+            .transpose()?;
+        let key = PrivateKey::from_openssh(private_key.as_str()).map_err(|_| {
+            Error::Store("Repository SSH private key plaintext is invalid".to_string())
+        })?;
+        let key = if key.is_encrypted() {
+            key.decrypt(passphrase.as_deref().ok_or_else(|| {
+                Error::Store("Repository SSH passphrase revision is unavailable".to_string())
+            })?)
+            .map_err(|_| Error::Store("Repository SSH private key decryption failed".to_string()))?
+        } else {
+            key
+        };
+        let private_key = key
+            .to_openssh(LineEnding::LF)
+            .map_err(|_| Error::Store("Repository SSH private key encoding failed".to_string()))?;
+        let host = if port == 22 {
+            hostname
+        } else {
+            format!("[{hostname}]:{port}")
+        };
+        Ok(LeasedRepositorySshAccess {
+            credential_id: credential_id.to_string(),
+            credential_revision,
+            host_trust_id: host_trust_id.to_string(),
+            host_trust_revision,
+            private_key,
+            known_hosts_entry: format!("{host} {host_key}\n"),
+        })
+    }
+
+    fn unseal(
+        &self,
+        workspace_id: &str,
+        credential_id: &str,
+        revision: u64,
+        purpose: &str,
+        secret: SealedSecret,
+    ) -> Result<Vec<u8>> {
+        let master_key = self.master_key.as_ref().ok_or_else(|| {
+            Error::Store("Repository secret encryption authority is unavailable".to_string())
+        })?;
+        let unbound = UnboundKey::new(&AES_256_GCM, master_key.as_slice())
+            .map_err(|_| Error::Store("Repository secret encryption key is invalid".to_string()))?;
+        let key = LessSafeKey::new(unbound);
+        let mut plaintext = secret.ciphertext;
+        let aad = secret_aad(workspace_id, credential_id, revision, purpose);
+        let plaintext_len = key
+            .open_in_place(
+                Nonce::assume_unique_for_key(secret.nonce),
+                Aad::from(aad.as_bytes()),
+                &mut plaintext,
+            )
+            .map_err(|_| Error::Store("Repository secret decryption failed".to_string()))?
+            .len();
+        plaintext.truncate(plaintext_len);
+        Ok(plaintext)
+    }
+
     fn seal(
         &self,
         workspace_id: &str,
@@ -966,6 +1153,45 @@ fn insert_secret(
         ],
     )?;
     Ok(())
+}
+
+fn read_sealed_secret(
+    conn: &rusqlite::Connection,
+    workspace_id: &str,
+    credential_id: &str,
+    revision: u64,
+    purpose: &str,
+) -> Result<Option<SealedSecret>> {
+    let row = conn
+        .query_row(
+            r#"SELECT encryption_algorithm, nonce, ciphertext
+               FROM server_secret_versions
+               WHERE workspace_id = ?1 AND secret_id = ?2
+                 AND revision = ?3 AND purpose = ?4"#,
+            params![workspace_id, credential_id, revision, purpose],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((algorithm, nonce, ciphertext)) = row else {
+        return Ok(None);
+    };
+    if algorithm != "aes-256-gcm-v1" || nonce.len() != NONCE_BYTES {
+        return Err(Error::RegistryInconsistency(
+            "Repository secret envelope is invalid".to_string(),
+        ));
+    }
+    let mut nonce_bytes = [0u8; NONCE_BYTES];
+    nonce_bytes.copy_from_slice(&nonce);
+    Ok(Some(SealedSecret {
+        nonce: nonce_bytes,
+        ciphertext,
+    }))
 }
 
 fn replay_credential_operation(
@@ -1691,6 +1917,29 @@ mod tests {
             projection.bindings[0].access,
             RepositoryAccessMode::ReadOnly
         );
+        let lease = service
+            .lease_ssh_materialization_access("workspace-a", &projection.bindings[0])
+            .unwrap();
+        assert_eq!(lease.credential_revision, 1);
+        assert_eq!(lease.host_trust_revision, 1);
+        assert!(lease.private_key.contains("BEGIN OPENSSH PRIVATE KEY"));
+        assert!(
+            lease
+                .known_hosts_entry
+                .starts_with("example.test ssh-ed25519 ")
+        );
+        let exact = service
+            .lease_ssh_materialization_access_revision(
+                "workspace-a",
+                "deploy",
+                lease.credential_revision,
+                "example",
+                lease.host_trust_revision,
+            )
+            .unwrap();
+        assert_eq!(exact.credential_revision, lease.credential_revision);
+        assert_eq!(exact.host_trust_revision, lease.host_trust_revision);
+        assert_eq!(exact.known_hosts_entry, lease.known_hosts_entry);
 
         let unknown = config_state(
             r#"{

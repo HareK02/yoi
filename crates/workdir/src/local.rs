@@ -8,7 +8,8 @@
 //! `LocalWorkdirSession` is cheap to clone (`Arc` inside). Tool-specific session
 //! state, such as read-before-edit tracking, remains owned by the tool layer.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt::Debug;
 #[cfg(test)]
 use std::io::Write as _;
 use std::io::{Read as _, Seek as _, SeekFrom};
@@ -228,6 +229,8 @@ struct LocalWorkdirSessionInner {
     next_command_id: AtomicU64,
     commands: Mutex<HashMap<String, LocalCommand>>,
     command_telemetry: CommandTelemetry,
+    command_environment: BTreeMap<String, String>,
+    resources: StdMutex<Vec<Arc<dyn WorkdirSessionResource>>>,
 }
 
 impl Drop for LocalWorkdirSessionInner {
@@ -241,6 +244,9 @@ impl Drop for LocalWorkdirSessionInner {
         }
     }
 }
+
+pub trait WorkdirSessionResource: Debug + Send + Sync {}
+impl<T> WorkdirSessionResource for T where T: Debug + Send + Sync {}
 
 /// Scope-aware filesystem handle. Clone-cheap (`Arc` inside).
 ///
@@ -319,6 +325,26 @@ impl LocalWorkdirSession {
         scope: SharedScope,
         capabilities: WorkdirSessionCapabilities,
     ) -> Self {
+        Self::materialized_bound_with_environment(
+            workdir,
+            root,
+            cwd,
+            scope,
+            capabilities,
+            BTreeMap::new(),
+            Vec::new(),
+        )
+    }
+
+    pub fn materialized_bound_with_environment(
+        workdir: Workdir,
+        root: PathBuf,
+        cwd: PathBuf,
+        scope: SharedScope,
+        capabilities: WorkdirSessionCapabilities,
+        command_environment: BTreeMap<String, String>,
+        resources: Vec<Arc<dyn WorkdirSessionResource>>,
+    ) -> Self {
         Self {
             inner: Arc::new(LocalWorkdirSessionInner {
                 workdir,
@@ -331,6 +357,8 @@ impl LocalWorkdirSession {
                 next_command_id: AtomicU64::new(1),
                 commands: Mutex::new(HashMap::new()),
                 command_telemetry: CommandTelemetry::new(),
+                command_environment,
+                resources: StdMutex::new(resources),
             }),
         }
     }
@@ -669,9 +697,18 @@ impl WorkdirSession for LocalWorkdirSession {
         let (completion_tx, completion) = watch::channel(false);
         let command_id = handle.0.clone();
         let telemetry = self.inner.command_telemetry.clone();
+        let command_environment = self.inner.command_environment.clone();
         let (cancel, cancel_rx) = watch::channel(false);
         let task = tokio::spawn(async move {
-            let output = run_command(cwd, request, command_id, telemetry, cancel_rx).await;
+            let output = run_command(
+                cwd,
+                request,
+                command_id,
+                telemetry,
+                command_environment,
+                cancel_rx,
+            )
+            .await;
             let _ = completion_tx.send(true);
             output
         });
@@ -840,6 +877,9 @@ impl WorkdirSession for LocalWorkdirSession {
                 LocalCommand::Completed(_) => {}
             }
         }
+        if let Ok(mut resources) = self.inner.resources.lock() {
+            resources.clear();
+        }
         Ok(())
     }
 }
@@ -909,6 +949,7 @@ async fn run_command(
     request: CommandRequest,
     command_id: String,
     telemetry: CommandTelemetry,
+    command_environment: BTreeMap<String, String>,
     mut cancel: watch::Receiver<bool>,
 ) -> Result<CommandOutput, WorkdirError> {
     let stdout = tempfile::NamedTempFile::new().map_err(|error| WorkdirError::io(&cwd, error))?;
@@ -925,6 +966,7 @@ async fn run_command(
         .arg("-c")
         .arg(&request.command)
         .current_dir(&cwd)
+        .envs(command_environment)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
@@ -2317,6 +2359,31 @@ mod tests {
             }
         }
         assert_eq!(terminal, Some((handle.0, CommandStatus::TimedOut, None)));
+    }
+
+    #[tokio::test]
+    async fn closing_session_releases_runtime_resources() {
+        #[derive(Debug)]
+        struct Resource(Arc<AtomicBool>);
+        impl Drop for Resource {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let released = Arc::new(AtomicBool::new(false));
+        let session = LocalWorkdirSession::materialized_bound_with_environment(
+            Workdir::new("resource-session"),
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+            SharedScope::new(Scope::writable(dir.path()).unwrap()),
+            WorkdirSessionCapabilities::ALL,
+            BTreeMap::from([("SSH_AUTH_SOCK".to_string(), "test-socket".to_string())]),
+            vec![Arc::new(Resource(released.clone()))],
+        );
+        WorkdirSession::close(&session).await.unwrap();
+        assert!(released.load(Ordering::Acquire));
     }
 
     #[tokio::test]

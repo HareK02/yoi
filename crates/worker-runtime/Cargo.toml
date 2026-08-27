@@ -43,6 +43,7 @@ tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
 toml.workspace = true
 url.workspace = true
 uuid = { workspace = true, features = ["v7"] }
+zeroize.workspace = true
 tower = { workspace = true, features = ["util"], optional = true }
 worker.workspace = true
 workspace-api = { path = "../workspace-api" }
