@@ -63,7 +63,7 @@ pub(super) struct ModelObjectiveQueryResponse {
 struct ModelObjectiveQueryItem {
     objective: String,
     title: String,
-    summary: String,
+    summary: Option<String>,
     state: String,
     created_at: Option<String>,
     updated_at: Option<String>,
@@ -331,7 +331,7 @@ fn project_objective_query_item(value: &Value) -> Result<ModelObjectiveQueryItem
     Ok(ModelObjectiveQueryItem {
         objective: human_ref(item, "resource_key", "O-")?,
         title: string_field(item, "title")?,
-        summary: string_field(item, "snippet")?,
+        summary: optional_string(item, "snippet")?,
         state: string_field(item, "state")?,
         created_at: optional_string(item, "created_at")?,
         updated_at: optional_string(item, "updated_at")?,
@@ -757,7 +757,7 @@ mod tests {
                 "created_at": null,
                 "updated_at": null,
                 "matched_fields": [],
-                "snippet": "Objective summary",
+                "snippet": null,
                 "linked_ticket_count": 1,
                 "linked_tickets": ["00001TICKETINTERNAL"],
                 "linked_ticket_keys": ["T-543"]
@@ -767,6 +767,7 @@ mod tests {
         let objective_json = serde_json::to_string(&objective).expect("serialize Objective query");
         assert!(objective_json.contains("O-6"));
         assert!(objective_json.contains("T-543"));
+        assert!(objective_json.contains("\"summary\":null"));
         assert!(!objective_json.contains("00001OBJECTIVEINTERNAL"));
         assert!(!objective_json.contains("00001TICKETINTERNAL"));
     }
