@@ -15271,7 +15271,6 @@ mod tests {
         let provider_handle = source
             .start_command(workdir::CommandRequest {
                 command: "printf ready; sleep 30".to_string(),
-                cwd: None,
                 timeout_secs: 60,
                 output_limit: 4096,
                 tool_call_id: Some("tool-call-command-session".to_string()),

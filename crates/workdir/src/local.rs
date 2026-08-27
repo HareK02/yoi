@@ -548,40 +548,6 @@ impl LocalWorkdirSession {
             self.inner.root.join(path.as_str())
         }
     }
-
-    fn resolve_command_cwd(&self, cwd: Option<&WorkdirPath>) -> Result<PathBuf, WorkdirError> {
-        let Some(cwd) = cwd else {
-            return Ok(self.inner.cwd.clone());
-        };
-        let host_cwd = self.resolve(cwd);
-        let canonical_root = self
-            .inner
-            .root
-            .canonicalize()
-            .map_err(|error| WorkdirError::io(&self.inner.root, error))?;
-        let expected = if cwd.is_root() {
-            canonical_root
-        } else {
-            canonical_root.join(cwd.as_str())
-        };
-        let resolved = host_cwd
-            .canonicalize()
-            .map_err(|error| WorkdirError::io(&host_cwd, error))?;
-        if resolved != expected {
-            return Err(WorkdirError::Denied(format!(
-                "command cwd `{cwd}` traverses a symlink"
-            )));
-        }
-        let scope = self.inner.scope.snapshot();
-        if !scope.is_readable(&resolved)
-            || !std::fs::metadata(&resolved).is_ok_and(|metadata| metadata.is_dir())
-        {
-            return Err(WorkdirError::Denied(format!(
-                "command cwd `{cwd}` is not a readable Workdir directory"
-            )));
-        }
-        Ok(resolved)
-    }
 }
 
 #[async_trait]
@@ -727,7 +693,7 @@ impl WorkdirSession for LocalWorkdirSession {
         self.ensure_open()?;
         let id = self.inner.next_command_id.fetch_add(1, Ordering::Relaxed);
         let handle = CommandHandle(format!("command-{id}"));
-        let cwd = self.resolve_command_cwd(request.cwd.as_ref())?;
+        let cwd = self.inner.cwd.clone();
         let (completion_tx, completion) = watch::channel(false);
         let command_id = handle.0.clone();
         let telemetry = self.inner.command_telemetry.clone();
@@ -1472,7 +1438,6 @@ mod tests {
             &session,
             CommandRequest {
                 command: "sleep 30".to_owned(),
-                cwd: None,
                 timeout_secs: 60,
                 output_limit: 1024,
                 tool_call_id: None,
@@ -1999,7 +1964,6 @@ mod tests {
             &workdir,
             CommandRequest {
                 command: "pwd && printf provider-command".into(),
-                cwd: None,
                 timeout_secs: 5,
                 output_limit: 4096,
                 tool_call_id: None,
@@ -2035,7 +1999,6 @@ mod tests {
             &workdir,
             CommandRequest {
                 command: "printf 'aéz'".into(),
-                cwd: None,
                 timeout_secs: 5,
                 output_limit: 1024,
                 tool_call_id: None,
@@ -2259,7 +2222,6 @@ mod tests {
             &workdir,
             CommandRequest {
                 command: "printf ready; printf warning >&2; sleep 0.2; printf done".into(),
-                cwd: None,
                 timeout_secs: 5,
                 output_limit: 1024,
                 tool_call_id: Some("tool-7".into()),
@@ -2363,7 +2325,6 @@ mod tests {
             &workdir,
             CommandRequest {
                 command: "sleep 30".into(),
-                cwd: None,
                 timeout_secs: 1,
                 output_limit: 1024,
                 tool_call_id: None,
@@ -2433,7 +2394,6 @@ mod tests {
             &workdir,
             CommandRequest {
                 command: "sleep 30".into(),
-                cwd: None,
                 timeout_secs: 60,
                 output_limit: 1024,
                 tool_call_id: None,

@@ -391,18 +391,6 @@ async fn bash_inherits_workdir_cwd() {
 }
 
 #[tokio::test]
-async fn bash_uses_explicit_logical_cwd() {
-    let (dir, _spill, reg) = setup();
-    std::fs::create_dir_all(dir.path().join("nested")).unwrap();
-    let bash = reg.get("Bash");
-    let out = call(&bash, json!({ "command": "pwd", "cwd": "nested" })).await;
-    let body = out.content.unwrap();
-    let actual = std::fs::canonicalize(body.trim()).unwrap();
-    let expected = std::fs::canonicalize(dir.path().join("nested")).unwrap();
-    assert_eq!(actual, expected);
-}
-
-#[tokio::test]
 async fn bash_provider_output_does_not_expose_internal_paths() {
     let (_dir, spill, reg) = setup();
     let bash = reg.get("Bash");
