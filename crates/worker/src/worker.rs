@@ -10,7 +10,9 @@ use agen::llm_client::RequestConfig;
 use agen::llm_client::client::LlmClient;
 use agen::llm_client::types::Role;
 use agen::state::Mutable;
-use agen::{Engine, EngineError, EngineResult, ToolOutputLimits, UsageRecord};
+use agen::{
+    Engine, EngineError, EngineResult, EngineRunExit, StopReason, ToolOutputLimits, UsageRecord,
+};
 use arc_swap::ArcSwap;
 use session_store::{
     LogEntry, PromptRenderProvenance, SegmentId, SessionExtension, SessionId, Store, StoreError,
@@ -905,6 +907,9 @@ pub struct Worker<C: LlmClient, St: Store> {
     manifest: WorkerManifest,
     /// Always `Some` outside of `run()`/`resume()`.
     engine: Option<Engine<C, Mutable>>,
+    /// Worker-owned recovery marker. Agen exposes only the typed run exit and
+    /// never persists or restores Worker lifecycle state.
+    last_run_interrupted: bool,
     store: St,
     /// Optional write-through hook for name-keyed Worker metadata. Production
     /// constructors install this from the same FsStore that owns the session
@@ -1107,6 +1112,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
         Self {
             manifest: self.manifest.clone(),
             engine: Some(worker),
+            last_run_interrupted: false,
             store: self.store.clone(),
             worker_metadata_writer: None,
             segment_state: self.segment_state.clone(),
@@ -1308,6 +1314,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         let mut worker = Self {
             manifest,
             engine: Some(worker),
+            last_run_interrupted: false,
             store,
             worker_metadata_writer: None,
             segment_state: SegmentState::new(session_id, segment_id, 0),
@@ -1787,8 +1794,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         self.engine_mut().set_history(history);
         self.engine_mut().set_request_config(state.config);
         self.engine_mut().set_turn_count(state.turn_count);
-        self.engine_mut()
-            .set_last_run_interrupted(state.last_run_interrupted);
+        self.last_run_interrupted = state.last_run_interrupted;
         self.engine_mut()
             .set_active_run_turn_count(state.active_run_turn_count);
         self.user_segments = state.user_segments;
@@ -2363,7 +2369,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             pending_attachments,
             usage_history_len,
             ai_activity_count: self.ai_activity_counter.load(Ordering::SeqCst),
-            last_run_interrupted: self.engine().last_run_interrupted(),
+            last_run_interrupted: self.last_run_interrupted,
             active_run_turn_count: self.engine().active_run_turn_count(),
             flow_runtime_state: self
                 .flow_runtime_state
@@ -2375,10 +2381,10 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
 
     fn should_rollback_empty_turn(
         &self,
-        result: &Result<EngineResult, EngineError>,
+        result: &EngineRunExit,
         snapshot: &EmptyTurnRollbackSnapshot,
     ) -> bool {
-        if !matches!(result, Err(EngineError::Cancelled)) {
+        if !matches!(result, EngineRunExit::Interrupted(StopReason::Cancelled)) {
             return false;
         }
         if self.ai_activity_counter.load(Ordering::SeqCst) != snapshot.ai_activity_count {
@@ -2394,8 +2400,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         snapshot: EmptyTurnRollbackSnapshot,
     ) -> Result<(), StoreError> {
         self.engine_mut().truncate_history(snapshot.history_len);
-        self.engine_mut()
-            .set_last_run_interrupted(snapshot.last_run_interrupted);
+        self.last_run_interrupted = snapshot.last_run_interrupted;
         self.engine_mut()
             .set_active_run_turn_count(snapshot.active_run_turn_count);
         *self
@@ -2678,9 +2683,10 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// must happen before `prepare_for_run`: proactive compaction checkpoints
     /// only resumable runs, never the run this invocation is abandoning.
     fn prepare_interrupted_history_for_fresh_run(&mut self) -> Result<(), WorkerError> {
-        if self.engine().last_run_interrupted() {
+        if self.last_run_interrupted {
             self.apply_interrupt_prep()?;
-            self.engine_mut().set_last_run_interrupted(false);
+            self.last_run_interrupted = false;
+            self.engine_mut().set_active_run_turn_count(None);
         }
         Ok(())
     }
@@ -2733,12 +2739,12 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// The explicit `PausedTurnAbandoned` marker preserves durable lifecycle
     /// semantics without claiming another `run` / `resume` completed.
     pub fn cancel_paused_turn(&mut self) -> Result<(), WorkerError> {
-        if !self.engine().last_run_interrupted() {
+        if !self.last_run_interrupted {
             return Ok(());
         }
 
         self.apply_interrupt_prep()?;
-        self.engine_mut().set_last_run_interrupted(false);
+        self.last_run_interrupted = false;
         self.commit_entry(LogEntry::PausedTurnAbandoned {
             ts: segment_log::now_millis(),
         })?;
@@ -2927,23 +2933,41 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// `Yielded`), so restore remains consistent.
     async fn handle_worker_result(
         &mut self,
-        result: Result<EngineResult, EngineError>,
+        result: EngineRunExit,
         history_before: usize,
     ) -> Result<WorkerRunResult, WorkerError> {
         self.persist_turn(history_before, &result).await?;
 
-        if matches!(result, Ok(EngineResult::Yielded)) {
+        if matches!(result, EngineRunExit::Yielded) {
+            self.last_run_interrupted = true;
             return self.do_compact_and_resume().await;
         }
 
-        if result.is_ok() {
+        if !matches!(result, EngineRunExit::Interrupted(_)) {
             if let Some(ref state) = self.compact_state {
                 state.set_just_compacted(false);
             }
         }
-        result
-            .map(WorkerRunResult::from)
-            .map_err(WorkerError::Engine)
+
+        match result {
+            EngineRunExit::Finished => {
+                self.last_run_interrupted = false;
+                Ok(WorkerRunResult::Finished)
+            }
+            EngineRunExit::Paused => {
+                self.last_run_interrupted = true;
+                Ok(WorkerRunResult::Paused)
+            }
+            EngineRunExit::Interrupted(StopReason::LimitReached) => {
+                self.last_run_interrupted = false;
+                Ok(WorkerRunResult::LimitReached)
+            }
+            EngineRunExit::Interrupted(reason) => {
+                self.last_run_interrupted = true;
+                Ok(WorkerRunResult::Interrupted(stop_reason_message(&reason)))
+            }
+            EngineRunExit::Yielded => unreachable!("yielded handled above"),
+        }
     }
 
     fn persist_compaction_lifecycle(
@@ -3153,7 +3177,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     async fn persist_turn(
         &mut self,
         history_before: usize,
-        result: &Result<EngineResult, EngineError>,
+        result: &EngineRunExit,
     ) -> Result<(), StoreError> {
         // Per-item commits for AssistantItem / ToolResult / SystemItem
         // entries are expected to have landed synchronously: the
@@ -3251,22 +3275,43 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 .push(record);
         }
 
-        let interrupted = self.engine.as_ref().unwrap().last_run_interrupted();
+        let interrupted = matches!(
+            result,
+            EngineRunExit::Paused
+                | EngineRunExit::Yielded
+                | EngineRunExit::Interrupted(StopReason::Cancelled)
+                | EngineRunExit::Interrupted(StopReason::ContextWindowExceeded)
+                | EngineRunExit::Interrupted(StopReason::Unexpected(_))
+        );
         let active_run_turn_count = self.engine.as_ref().unwrap().active_run_turn_count();
         match result {
-            Ok(r) => {
+            EngineRunExit::Finished | EngineRunExit::Paused | EngineRunExit::Yielded => {
+                let result = match result {
+                    EngineRunExit::Finished => EngineResult::Finished,
+                    EngineRunExit::Paused => EngineResult::Paused,
+                    EngineRunExit::Yielded => EngineResult::Yielded,
+                    EngineRunExit::Interrupted(_) => unreachable!(),
+                };
                 self.commit_entry(LogEntry::RunCompleted {
                     ts: segment_log::now_millis(),
                     interrupted,
-                    result: r.clone(),
+                    result,
                     active_run_turn_count,
                 })?;
             }
-            Err(e) => {
+            EngineRunExit::Interrupted(StopReason::LimitReached) => {
+                self.commit_entry(LogEntry::RunCompleted {
+                    ts: segment_log::now_millis(),
+                    interrupted: false,
+                    result: EngineResult::LimitReached,
+                    active_run_turn_count,
+                })?;
+            }
+            EngineRunExit::Interrupted(reason) => {
                 self.commit_entry(LogEntry::RunErrored {
                     ts: segment_log::now_millis(),
                     interrupted,
-                    message: e.to_string(),
+                    message: stop_reason_message(reason),
                 })?;
             }
         }
@@ -4467,6 +4512,9 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
 fn extract_internal_worker_lifecycle_error(lifecycle: &WorkerRunResult) -> Option<WorkerError> {
     match lifecycle {
         WorkerRunResult::RolledBack => Some(WorkerError::Engine(EngineError::Cancelled)),
+        WorkerRunResult::Interrupted(message) => {
+            Some(WorkerError::Engine(EngineError::Aborted(message.clone())))
+        }
         WorkerRunResult::Finished | WorkerRunResult::Paused | WorkerRunResult::LimitReached => None,
     }
 }
@@ -4729,6 +4777,7 @@ where
         let mut worker = Self {
             manifest,
             engine: Some(worker),
+            last_run_interrupted: false,
             store,
             worker_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, 0),
@@ -4807,6 +4856,7 @@ where
         let mut worker = Self {
             manifest,
             engine: Some(engine),
+            last_run_interrupted: false,
             store,
             worker_metadata_writer: None,
             segment_state: SegmentState::new(session_id, segment_id, 0),
@@ -4920,6 +4970,7 @@ where
         let mut worker = Self {
             manifest,
             engine: Some(worker),
+            last_run_interrupted: false,
             store,
             worker_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, 0),
@@ -5219,7 +5270,6 @@ where
         worker.set_history(restored_history);
         worker.set_request_config(state.config.clone());
         worker.set_turn_count(state.turn_count);
-        worker.set_last_run_interrupted(state.last_run_interrupted);
         worker.set_active_run_turn_count(state.active_run_turn_count);
         if anchored_on_summary {
             worker.set_cache_anchor(Some(0));
@@ -5234,6 +5284,7 @@ where
         let mut worker = Self {
             manifest,
             engine: Some(worker),
+            last_run_interrupted: state.last_run_interrupted,
             store,
             worker_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, state.entries_count),
@@ -5470,8 +5521,17 @@ fn restore_manifest_from_worker_metadata_snapshot(
     }
 }
 
+fn stop_reason_message(reason: &StopReason) -> String {
+    match reason {
+        StopReason::LimitReached => "engine turn limit reached".to_string(),
+        StopReason::ContextWindowExceeded => "model context window reached".to_string(),
+        StopReason::Cancelled => "engine run cancelled".to_string(),
+        StopReason::Unexpected(error) => format!("unexpected engine failure: {error}"),
+    }
+}
+
 /// Result of a Worker run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerRunResult {
     /// The LLM finished its turn normally.
     Finished,
@@ -5479,6 +5539,8 @@ pub enum WorkerRunResult {
     Paused,
     /// The worker reached its configured max_turns limit.
     LimitReached,
+    /// The run was interrupted by a known or unexpected terminal cause.
+    Interrupted(String),
     /// The submit-time user turn was rolled back because no AI output was materialized.
     RolledBack,
 }
@@ -7014,12 +7076,12 @@ mod build_summary_prompt_tests {
         .await
         .unwrap();
         worker.ensure_segment_head().unwrap();
-        worker.engine_mut().set_last_run_interrupted(true);
+        worker.last_run_interrupted = true;
         worker.engine_mut().set_active_run_turn_count(Some(3));
 
         worker.prepare_interrupted_history_for_fresh_run().unwrap();
 
-        assert!(!worker.engine().last_run_interrupted());
+        assert!(!worker.last_run_interrupted);
         assert_eq!(worker.engine().active_run_turn_count(), None);
         let checkpoint = active_run_checkpoint_entry(
             worker.engine().active_run_turn_count(),
@@ -7058,7 +7120,7 @@ mod build_summary_prompt_tests {
         .unwrap();
         worker.ensure_segment_head().unwrap();
         worker.engine_mut().set_turn_count(7);
-        worker.engine_mut().set_last_run_interrupted(true);
+        worker.last_run_interrupted = true;
         worker.engine_mut().set_active_run_turn_count(Some(3));
 
         let session_id = worker.session_id();
@@ -7519,7 +7581,7 @@ mod build_summary_prompt_tests {
             })
             .unwrap();
         worker.engine_mut().set_history(vec![dangling_call]);
-        worker.engine_mut().set_last_run_interrupted(true);
+        worker.last_run_interrupted = true;
 
         worker
             .run_for_notification(protocol::InvokeKind::Notify)

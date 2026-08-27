@@ -923,6 +923,7 @@ pub enum WorkerStatus {
     Idle,
     Running,
     Paused,
+    Stopped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

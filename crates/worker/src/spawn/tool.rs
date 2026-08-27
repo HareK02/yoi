@@ -499,7 +499,10 @@ impl Tool for SubWorkerSpawnTool {
             InternalWorkerVisibility::ParentClient,
             Some(child_registry.clone()),
             Some(Arc::new(move |status| {
-                if status == InternalWorkerSessionStatus::Failed {
+                if matches!(
+                    status,
+                    InternalWorkerSessionStatus::Failed | InternalWorkerSessionStatus::Stopped
+                ) {
                     if let Some(registry) = registry.upgrade() {
                         if let Err(error) = registry.reclaim_internal_scope(&child_name) {
                             tracing::warn!(
@@ -1282,16 +1285,16 @@ extract_threshold = 4000
         .unwrap();
         assert_eq!(
             record.session.wait_until_idle().await,
-            InternalWorkerSessionStatus::Failed
+            InternalWorkerSessionStatus::Stopped
         );
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert!(
             spawner_scope.snapshot().is_writable(&workspace_root),
-            "Failed terminal child must release its delegated Workdir session"
+            "Stopped terminal child must release its delegated Workdir session"
         );
         assert!(
             !record.workdir_delegation.is_active(),
-            "failed child must revoke cloned scoped sessions"
+            "stopped child must revoke cloned scoped sessions"
         );
         assert!(registry.get_internal("reviewer-child").is_some());
 

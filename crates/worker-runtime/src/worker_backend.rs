@@ -1546,7 +1546,9 @@ fn accepted_notify_run_state(status: WorkerStatus, auto_run: bool) -> WorkerExec
     match status {
         WorkerStatus::Running => WorkerExecutionRunState::Busy,
         WorkerStatus::Idle if auto_run => WorkerExecutionRunState::Busy,
-        WorkerStatus::Idle | WorkerStatus::Paused => WorkerExecutionRunState::Idle,
+        WorkerStatus::Idle | WorkerStatus::Paused | WorkerStatus::Stopped => {
+            WorkerExecutionRunState::Idle
+        }
     }
 }
 

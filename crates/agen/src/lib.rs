@@ -20,8 +20,8 @@ pub mod usage_record;
 pub use agen_macros::{description, tool, tool_registry};
 pub use callback::{TextBlockScope, ThinkingBlockScope, ToolUseBlockScope};
 pub use engine::{
-    Engine, EngineConfig, EngineError, EngineResult, EngineRunOutput, LlmRetryNotice,
-    ToolRegistryError,
+    Engine, EngineConfig, EngineError, EngineResult, EngineRunExit, EngineRunOutput,
+    LlmRetryNotice, StopReason, ToolRegistryError,
 };
 pub use handler::ToolUseBlockStart;
 pub use interceptor::Interceptor;

@@ -158,7 +158,7 @@ async fn test_parallel_tool_execution() {
     engine.register_tool(tool3.definition());
 
     let start = Instant::now();
-    // Mutable::run consumes self, returns (Locked, EngineResult)
+    // Mutable::run consumes self, returns (Locked, EngineRunExit)
     let _result = engine.run("Run all tools").await;
     let elapsed = start.elapsed();
 
@@ -415,7 +415,7 @@ async fn test_before_tool_call_skip() {
 
     engine.set_interceptor(BlockingPolicy);
 
-    // Mutable::run consumes self, returns (Locked, EngineResult)
+    // Mutable::run consumes self, returns (Locked, EngineRunExit)
     let _result = engine.run("Test hook").await;
 
     // allowed_tool is called, but blocked_tool is not
@@ -502,10 +502,13 @@ async fn test_post_tool_call_modification() {
         modified_content: modified_content.clone(),
     });
 
-    // Mutable::run consumes self, returns (Locked, EngineResult)
+    // Mutable::run consumes self, returns (Locked, EngineRunExit)
     let result = engine.run("Test modification").await;
 
-    assert!(result.is_ok(), "Engine should complete");
+    assert!(
+        matches!(result.result, agen::EngineRunExit::Finished),
+        "Engine should complete"
+    );
 
     // Verify hook was called and content was modified
     let content = modified_content.lock().unwrap().clone();
@@ -558,7 +561,7 @@ async fn test_before_tool_call_synthetic_result_committed() {
 
     engine.set_interceptor(SyntheticPolicy);
 
-    let result = engine.run("Test synthetic result").await.unwrap();
+    let result = engine.run("Test synthetic result").await;
 
     assert_eq!(blocked_clone.call_count(), 0, "Blocked tool should not run");
     assert!(result.engine.history().iter().any(|item| matches!(
