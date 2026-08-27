@@ -3264,10 +3264,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     where
         St: Clone + 'static,
     {
-        if matches!(
-            &result,
-            EngineRunExit::Paused | EngineRunExit::Interrupted(_)
-        ) {
+        if matches!(&result, EngineRunExit::Interrupted(_)) {
             self.terminalize_orphan_tool_calls()?;
         }
         self.persist_turn(history_before, &result).await?;
@@ -7452,6 +7449,118 @@ mod build_summary_prompt_tests {
     }
 
     #[derive(Clone)]
+    struct PauseResumeClient {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PauseResumeClient {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl agen::llm_client::LlmClient for PauseResumeClient {
+        async fn stream(
+            &self,
+            _request: agen::llm_client::Request,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<agen::llm_client::Event, agen::llm_client::ClientError>,
+                        > + Send,
+                >,
+            >,
+            agen::llm_client::ClientError,
+        > {
+            use agen::llm_client::{Event, ResponseStatus, StatusEvent};
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let events = if call == 0 {
+                vec![
+                    Event::tool_use_start(0, "call_pending", "pending_once"),
+                    Event::tool_input_delta(0, r#"{}"#),
+                    Event::tool_use_stop(0),
+                    Event::Status(StatusEvent {
+                        status: ResponseStatus::Completed,
+                    }),
+                ]
+            } else {
+                vec![
+                    Event::text_block_start(0),
+                    Event::text_delta(0, "done"),
+                    Event::text_block_stop(0, None),
+                    Event::Status(StatusEvent {
+                        status: ResponseStatus::Completed,
+                    }),
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+        }
+
+        fn clone_boxed(&self) -> Box<dyn agen::llm_client::LlmClient> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[derive(Clone)]
+    struct CountingPendingTool {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl agen::tool::Tool for CountingPendingTool {
+        async fn execute(
+            &self,
+            _input_json: &str,
+            _ctx: agen::ToolExecutionContext,
+        ) -> Result<agen::tool::ToolOutput, agen::tool::ToolError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("executed once".to_string().into())
+        }
+    }
+
+    fn counting_pending_tool(
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> agen::tool::ToolDefinition {
+        Arc::new(move || {
+            let meta = agen::tool::ToolMeta::new("pending_once")
+                .description("Counts resumable pending execution")
+                .input_schema(serde_json::json!({"type": "object"}));
+            (
+                meta,
+                Arc::new(CountingPendingTool {
+                    calls: calls.clone(),
+                }) as Arc<dyn agen::tool::Tool>,
+            )
+        })
+    }
+
+    #[derive(Clone)]
+    struct PauseOnceHook {
+        should_pause: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::hook::Hook<crate::hook::PreToolCall> for PauseOnceHook {
+        async fn call(
+            &self,
+            _input: &crate::hook::ToolCallSummary,
+        ) -> crate::hook::HookPreToolAction {
+            if self
+                .should_pause
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                crate::hook::HookPreToolAction::Pause
+            } else {
+                crate::hook::HookPreToolAction::Continue
+            }
+        }
+    }
+
+    #[derive(Clone)]
     struct NoopClient;
 
     #[async_trait]
@@ -8057,6 +8166,60 @@ mod build_summary_prompt_tests {
             .to_string();
 
         assert!(err.contains("session head changed"));
+    }
+
+    #[tokio::test]
+    async fn hook_paused_pending_tool_resumes_and_executes_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut engine =
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(PauseResumeClient::new());
+        engine.register_tool(counting_pending_tool(calls.clone()));
+        let mut worker = Worker::new(
+            minimal_manifest(),
+            engine,
+            store,
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        let should_pause = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        worker.add_pre_tool_call_hook(PauseOnceHook { should_pause });
+
+        assert_eq!(
+            worker.run_text("start").await.unwrap(),
+            WorkerRunResult::Paused
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(worker.history().iter().any(|item| matches!(
+            item,
+            Item::ToolCall { call_id, .. } if call_id == "call_pending"
+        )));
+        assert!(!worker.history().iter().any(|item| matches!(
+            item,
+            Item::ToolResult { call_id, .. } if call_id == "call_pending"
+        )));
+
+        assert_eq!(worker.resume().await.unwrap(), WorkerRunResult::Finished);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            worker
+                .history()
+                .iter()
+                .filter(|item| matches!(
+                    item,
+                    Item::ToolResult {
+                        call_id,
+                        disposition: agen::ToolResultDisposition::Success,
+                        ..
+                    } if call_id == "call_pending"
+                ))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
