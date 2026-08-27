@@ -251,14 +251,8 @@ impl DelegatingWorkdirSession {
         self.ensure_path(path, WorkdirDelegationPermission::Write)
     }
 
-    fn ensure_command(&self, starting: bool) -> Result<(), WorkdirError> {
-        self.ensure_capability(WorkdirSessionCapability::Command, "command execution")?;
-        if starting && self.has_active_write_lease() {
-            return Err(WorkdirError::Denied(
-                "command execution is denied while a child holds a write delegation".into(),
-            ));
-        }
-        Ok(())
+    fn ensure_command(&self) -> Result<(), WorkdirError> {
+        self.ensure_capability(WorkdirSessionCapability::Command, "command execution")
     }
 
     fn ensure_parent_write_available(&self, path: &FsPath) -> Result<(), WorkdirError> {
@@ -279,20 +273,6 @@ impl DelegatingWorkdirSession {
         } else {
             Ok(())
         }
-    }
-
-    fn has_active_write_lease(&self) -> bool {
-        let mut leases = self
-            .child_write_leases
-            .lock()
-            .expect("workdir delegation lease mutex poisoned");
-        leases.retain(|_, lease| lease.validity.upgrade().is_some_and(|v| v.is_active()));
-        leases.values().any(|lease| {
-            lease
-                .rules
-                .iter()
-                .any(|rule| rule.permission == WorkdirDelegationPermission::Write)
-        })
     }
 
     fn validate_delegation_rules(
@@ -503,12 +483,12 @@ impl WorkdirSession for DelegatingWorkdirSession {
     }
 
     async fn start_command(&self, request: CommandRequest) -> Result<CommandHandle, WorkdirError> {
-        self.ensure_command(true)?;
+        self.ensure_command()?;
         self.source.start_command(request).await
     }
 
     async fn command_status(&self, handle: CommandHandle) -> Result<CommandStatus, WorkdirError> {
-        self.ensure_command(false)?;
+        self.ensure_command()?;
         self.source.command_status(handle).await
     }
 
@@ -516,12 +496,12 @@ impl WorkdirSession for DelegatingWorkdirSession {
         &self,
         request: CommandOutputRequest,
     ) -> Result<CommandOutput, WorkdirError> {
-        self.ensure_command(false)?;
+        self.ensure_command()?;
         self.source.command_output(request).await
     }
 
     async fn cancel_command(&self, handle: CommandHandle) -> Result<(), WorkdirError> {
-        self.ensure_command(false)?;
+        self.ensure_command()?;
         self.source.cancel_command(handle).await
     }
 
@@ -753,6 +733,31 @@ mod tests {
         }
     }
 
+    async fn run_command(
+        session: &WorkdirSessionHandle,
+        command: impl Into<String>,
+        tool_call_id: impl Into<String>,
+    ) -> CommandOutput {
+        let handle = session
+            .start_command(CommandRequest {
+                command: command.into(),
+                timeout_secs: 5,
+                output_limit: 1024,
+                tool_call_id: Some(tool_call_id.into()),
+            })
+            .await
+            .unwrap();
+        session
+            .command_output(CommandOutputRequest {
+                handle,
+                cursor: 0,
+                limit: 1024,
+                wait: true,
+            })
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn delegation_capable_session_forwards_command_telemetry() {
         let root = TempDir::new().unwrap();
@@ -846,6 +851,18 @@ mod tests {
         );
         assert!(child.scoped_session.subscribe_command_events().is_none());
         assert!(child.scoped_session.command_snapshot().is_empty());
+        assert!(matches!(
+            child
+                .scoped_session
+                .start_command(CommandRequest {
+                    command: "printf denied".into(),
+                    timeout_secs: 5,
+                    output_limit: 1024,
+                    tool_call_id: Some("read-only-command".into()),
+                })
+                .await,
+            Err(WorkdirError::Denied(_))
+        ));
     }
 
     #[cfg(unix)]
@@ -924,7 +941,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_lease_blocks_parent_region_until_release() {
+    async fn write_lease_keeps_typed_parent_writes_exclusive_without_blocking_commands() {
         let root = TempDir::new().unwrap();
         fs::create_dir_all(root.path().join("leased")).unwrap();
         fs::create_dir_all(root.path().join("other")).unwrap();
@@ -938,37 +955,24 @@ mod tests {
                 .capabilities
                 .supports(WorkdirSessionCapability::Command)
         );
-        let command = child
-            .scoped_session
-            .start_command(CommandRequest {
-                command: "printf child-command".into(),
-                timeout_secs: 5,
-                output_limit: 1024,
-                tool_call_id: Some("delegated-child-command".into()),
-            })
-            .await
-            .unwrap();
-        let command_output = child
-            .scoped_session
-            .command_output(CommandOutputRequest {
-                handle: command,
-                cursor: 0,
-                limit: 1024,
-                wait: true,
-            })
-            .await
-            .unwrap();
-        assert_eq!(command_output.content, "child-command");
-        assert!(
-            parent
-                .start_command(CommandRequest {
-                    command: "printf parent-command".into(),
-                    timeout_secs: 5,
-                    output_limit: 1024,
-                    tool_call_id: Some("blocked-parent-command".into()),
-                })
-                .await
-                .is_err()
+        let child_output = run_command(
+            &child.scoped_session,
+            "printf child-command",
+            "delegated-child-command",
+        )
+        .await;
+        assert_eq!(child_output.content, "child-command");
+        let parent_output = run_command(
+            &parent,
+            "printf parent-write > leased/from-command; printf parent-command",
+            "parent-command-during-child-write",
+        )
+        .await;
+        assert_eq!(parent_output.status, CommandStatus::Completed);
+        assert_eq!(parent_output.content, "parent-command");
+        assert_eq!(
+            fs::read_to_string(root.path().join("leased/from-command")).unwrap(),
+            "parent-write"
         );
 
         assert!(matches!(
@@ -982,6 +986,18 @@ mod tests {
             .await
             .unwrap();
         child.release();
+        assert!(matches!(
+            child
+                .scoped_session
+                .start_command(CommandRequest {
+                    command: "printf revoked".into(),
+                    timeout_secs: 5,
+                    output_limit: 1024,
+                    tool_call_id: Some("revoked-child-command".into()),
+                })
+                .await,
+            Err(WorkdirError::SessionClosed)
+        ));
         parent
             .write(write("leased/parent", "parent"))
             .await
@@ -1034,6 +1050,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nested_write_leases_do_not_block_command_capable_ancestors() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("docs/sub")).unwrap();
+        let root_session = session(root.path());
+        let child = root_session
+            .delegate(request("docs", WorkdirDelegationPermission::Write))
+            .await
+            .unwrap();
+        let nested = child
+            .scoped_session
+            .delegate(request("docs/sub", WorkdirDelegationPermission::Write))
+            .await
+            .unwrap();
+
+        for (session, label) in [
+            (&root_session, "root"),
+            (&child.scoped_session, "child"),
+            (&nested.scoped_session, "nested"),
+        ] {
+            let output = run_command(
+                session,
+                format!("printf {label}"),
+                format!("{label}-command-during-nested-write"),
+            )
+            .await;
+            assert_eq!(output.status, CommandStatus::Completed);
+            assert_eq!(output.content, label);
+        }
+
+        assert!(matches!(
+            root_session.write(write("docs/root", "blocked")).await,
+            Err(WorkdirError::Denied(_))
+        ));
+        assert!(matches!(
+            child
+                .scoped_session
+                .write(write("sub/child", "blocked"))
+                .await,
+            Err(WorkdirError::Denied(_))
+        ));
+        nested
+            .scoped_session
+            .write(write("nested", "allowed"))
+            .await
+            .unwrap();
+
+        nested.release();
+        child.release();
+    }
+
+    #[tokio::test]
+    async fn reapplied_write_delegation_chain_forwards_command_lifecycle() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("delegated")).unwrap();
+        let applied = apply_delegation_chain(
+            session(root.path()),
+            [request("delegated", WorkdirDelegationPermission::Write)],
+        )
+        .await
+        .unwrap();
+
+        let output = run_command(
+            &applied.scoped_session,
+            "printf reapplied",
+            "reapplied-command",
+        )
+        .await;
+        assert_eq!(output.status, CommandStatus::Completed);
+        assert_eq!(output.content, "reapplied");
+    }
+
+    #[tokio::test]
     async fn applied_chain_cannot_replace_outer_provider_attenuation() {
         let root = TempDir::new().unwrap();
         fs::create_dir_all(root.path().join("outer")).unwrap();
@@ -1077,6 +1165,17 @@ mod tests {
             .unwrap();
 
         parent.close().await.unwrap();
+        assert!(matches!(
+            parent
+                .start_command(CommandRequest {
+                    command: "printf closed".into(),
+                    timeout_secs: 5,
+                    output_limit: 1024,
+                    tool_call_id: Some("closed-parent-command".into()),
+                })
+                .await,
+            Err(WorkdirError::SessionClosed)
+        ));
         assert!(matches!(
             child.scoped_session.read(read("a")).await,
             Err(WorkdirError::SessionClosed)

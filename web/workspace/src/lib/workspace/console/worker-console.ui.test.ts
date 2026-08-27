@@ -251,7 +251,8 @@ Deno.test("workspace Tickets surface provides Kanban and lifecycle controls", as
     ticketDetailLoad.includes("/repositories") &&
       ticketDetailPage.includes('mutate("state", "/state"') &&
       ticketDetailPage.includes("async function queueTicket") &&
-      ticketDetailPage.includes("`${ticketPath}/queue`") &&
+      ticketDetailPage.includes("const path = ticketPath") &&
+      ticketDetailPage.includes("`${path}/queue`") &&
       !ticketDetailPage.includes("/merge-request/merge") &&
       ticketDetailPage.includes("mergeRequest.selector_from") &&
       ticketDetailPage.includes("mergeRequest.review_status") &&

@@ -36,7 +36,7 @@
   const initialData = untrack(() => data);
   const loadedTicket = initialData.ticket.data;
   if (!loadedTicket) throw new Error(initialData.ticket.error ?? "ticket load failed");
-  const loadedRepositories = initialData.repositories.data;
+  const loadedRepositories = $derived(data.repositories.data);
 
   type QueueOutcome = {
     requested_ticket: string;
@@ -62,6 +62,8 @@
   let manualRuntimeId = $state("");
   let manualWorkerId = $state("");
   let cancellationReason = $state("");
+  let routeTicketSnapshot = `${initialData.ticketId}:${loadedTicket.item_revision}`;
+  let routeGeneration = 0;
   const coderAssignment = $derived(
     ticket.assignments.find((assignment) => assignment.role === "coder") ?? null,
   );
@@ -95,12 +97,42 @@
 
   function applyTicket(updatedTicket: TicketDetail): void {
     ticket = updatedTicket;
-    editTitle = ticket.title;
-    editBody = ticket.body;
-    repositoryId = ticket.repository_id ?? "";
-    refSelector = ticket.ref_selector ?? "";
-    nextState = ticket.state;
+    editTitle = updatedTicket.title;
+    editBody = updatedTicket.body;
+    repositoryId = updatedTicket.repository_id ?? "";
+    refSelector = updatedTicket.ref_selector ?? "";
+    nextState = updatedTicket.state;
   }
+
+  function resetTicketView(updatedTicket: TicketDetail): void {
+    applyTicket(updatedTicket);
+    editing = false;
+    transitionReason = "";
+    threadRole = "comment";
+    threadBody = "";
+    resolution = "";
+    busy = null;
+    errorMessage = null;
+    queueMessage = null;
+    readyOperationKey = null;
+    manualRuntimeId = "";
+    manualWorkerId = "";
+    cancellationReason = "";
+  }
+
+  $effect(() => {
+    const incomingTicketId = data.ticketId;
+    const incomingTicket = data.ticket.data;
+    if (!incomingTicket) return;
+    const incomingSnapshot = `${incomingTicketId}:${incomingTicket.item_revision}`;
+
+    untrack(() => {
+      if (incomingSnapshot === routeTicketSnapshot) return;
+      routeTicketSnapshot = incomingSnapshot;
+      routeGeneration += 1;
+      resetTicketView(incomingTicket);
+    });
+  });
 
   async function mutate(
     action: string,
@@ -109,40 +141,51 @@
     method = "POST",
   ): Promise<boolean> {
     if (busy) return false;
+    const generation = routeGeneration;
+    const path = `${ticketPath}${suffix}`;
     busy = action;
     errorMessage = null;
     try {
-      const path = `${ticketPath}${suffix}`;
       const response = await workspaceApiJsonWithBody<TicketDetail>(path, {
         method,
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
+      if (generation !== routeGeneration) return false;
       applyTicket(response);
       return true;
     } catch (error) {
-      errorMessage = error instanceof Error ? error.message : String(error);
+      if (generation === routeGeneration) {
+        errorMessage = error instanceof Error ? error.message : String(error);
+      }
       return false;
     } finally {
-      busy = null;
+      if (generation === routeGeneration) busy = null;
     }
   }
 
   async function queueTicket(): Promise<void> {
     if (busy) return;
+    const generation = routeGeneration;
+    const path = ticketPath;
     busy = "queue";
     errorMessage = null;
     queueMessage = null;
     try {
       const outcome = await workspaceApiJsonWithBody<QueueOutcome>(
-        `${ticketPath}/queue`,
+        `${path}/queue`,
         { method: "POST", body: JSON.stringify({}) },
       );
+      if (generation !== routeGeneration) return;
+      const updatedTicket = await workspaceApiJson<TicketDetail>(path);
+      if (generation !== routeGeneration) return;
       queueMessage = `Queued ${outcome.queued_tickets.length} Ticket(s): ${outcome.queued_tickets.join(", ")}`;
-      applyTicket(await workspaceApiJson<TicketDetail>(ticketPath));
+      applyTicket(updatedTicket);
     } catch (error) {
-      errorMessage = error instanceof Error ? error.message : String(error);
+      if (generation === routeGeneration) {
+        errorMessage = error instanceof Error ? error.message : String(error);
+      }
     } finally {
-      busy = null;
+      if (generation === routeGeneration) busy = null;
     }
   }
 
@@ -152,11 +195,13 @@
     principal: Record<string, string>,
   ): Promise<void> {
     if (busy) return;
+    const generation = routeGeneration;
+    const path = ticketPath;
     busy = action;
     errorMessage = null;
     try {
       await workspaceApiJsonWithBody(
-        `${ticketPath}/assignments/${role}`,
+        `${path}/assignments/${role}`,
         {
           method: "PUT",
           body: JSON.stringify({
@@ -166,11 +211,16 @@
           }),
         },
       );
-      applyTicket(await workspaceApiJson<TicketDetail>(ticketPath));
+      if (generation !== routeGeneration) return;
+      const updatedTicket = await workspaceApiJson<TicketDetail>(path);
+      if (generation !== routeGeneration) return;
+      applyTicket(updatedTicket);
     } catch (error) {
-      errorMessage = error instanceof Error ? error.message : String(error);
+      if (generation === routeGeneration) {
+        errorMessage = error instanceof Error ? error.message : String(error);
+      }
     } finally {
-      busy = null;
+      if (generation === routeGeneration) busy = null;
     }
   }
 

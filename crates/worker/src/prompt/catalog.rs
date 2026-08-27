@@ -102,7 +102,6 @@ pub enum WorkerPrompt {
     AgentsMdSection,
     ResidentMemorySummarySection,
     WorkerOrchestrationGuidanceSection,
-    TicketEventCompanionNotice,
     SubWorkerSpawnToolDescription,
 }
 
@@ -122,7 +121,6 @@ impl WorkerPrompt {
             Self::WorkerOrchestrationGuidanceSection => {
                 "internal.worker_orchestration_guidance_section"
             }
-            Self::TicketEventCompanionNotice => "worker.ticket_event_companion_notice",
             Self::SubWorkerSpawnToolDescription => "internal.sub_worker_spawn_tool_description",
         }
     }
@@ -139,7 +137,6 @@ impl WorkerPrompt {
         WorkerPrompt::AgentsMdSection,
         WorkerPrompt::ResidentMemorySummarySection,
         WorkerPrompt::WorkerOrchestrationGuidanceSection,
-        WorkerPrompt::TicketEventCompanionNotice,
         WorkerPrompt::SubWorkerSpawnToolDescription,
     ];
 }
@@ -593,6 +590,12 @@ mod tests {
     fn builtin_dcdl_catalog_loads() {
         let catalog = PromptCatalog::builtins_only().unwrap();
         assert!(!catalog.projection.templates.is_empty());
+        assert!(
+            !catalog
+                .projection
+                .templates
+                .contains_key("worker.ticket_event_companion_notice")
+        );
     }
 
     #[test]
