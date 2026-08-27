@@ -5,7 +5,7 @@
     workspaceWorkersStore,
     type SidebarWorker,
   } from './worker-subscription';
-  import { canShowWorkerInSidebar } from './workers';
+  import { canShowWorkerInSidebar, sidebarWorkerActivity } from './workers';
 
   const COLLAPSED_WORKER_COUNT = 6;
 
@@ -69,6 +69,7 @@
     <ul class="nav-list" aria-label="Workers">
       {#each visibleWorkers as worker (`${worker.runtime_id}:${worker.worker_id}`)}
         {@const href = workerConsoleHref(worker, workspaceId)}
+        {@const activity = sidebarWorkerActivity(worker)}
         <li>
           <a
             href={href}
@@ -77,11 +78,11 @@
             aria-current={currentPath === href ? 'page' : undefined}
           >
             <span class="worker-status-indicator">
-              {#if worker.state === 'running'}
+              {#if activity === 'worker-running'}
                 <span class="worker-status-spinner"><Spinner label="Running" /></span>
-              {:else if worker.has_running_internal_workers}
+              {:else if activity === 'subworker-running'}
                 <span class="worker-status-spinner is-subworker"><Spinner label="SubWorker running" /></span>
-              {:else if worker.state === 'idle'}
+              {:else if activity === 'idle'}
                 <span class="worker-status-dot" aria-label="Idle"></span>
               {/if}
             </span>

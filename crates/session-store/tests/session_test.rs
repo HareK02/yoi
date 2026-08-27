@@ -102,7 +102,7 @@ async fn run_and_persist(
     session_id: session_store::SessionId,
     segment_id: session_store::SegmentId,
     input: &str,
-) -> (Engine<MockLlmClient>, agen::EngineResult) {
+) -> (Engine<MockLlmClient>, agen::EngineRunExit) {
     // Mirror Worker's run-entry contract: log the user input as segments
     // before the worker pushes its flattened user_message; save_delta
     // skips the resulting user_message item to avoid double-write.
@@ -125,31 +125,49 @@ async fn run_and_persist(
     session_store::save_turn_end(store, session_id, segment_id, worker.turn_count()).unwrap();
 
     match &result {
-        Ok(r) => {
+        agen::EngineRunExit::Finished
+        | agen::EngineRunExit::Paused
+        | agen::EngineRunExit::Yielded => {
+            let (legacy_result, interrupted) = match &result {
+                agen::EngineRunExit::Finished => (agen::EngineResult::Finished, false),
+                agen::EngineRunExit::Paused => (agen::EngineResult::Paused, true),
+                agen::EngineRunExit::Yielded => (agen::EngineResult::Yielded, true),
+                agen::EngineRunExit::Interrupted(_) => unreachable!(),
+            };
             session_store::save_run_completed(
                 store,
                 session_id,
                 segment_id,
-                r.clone(),
-                worker.last_run_interrupted(),
+                legacy_result,
+                interrupted,
                 worker.active_run_turn_count(),
             )
             .unwrap();
         }
-        Err(e) => {
+        agen::EngineRunExit::Interrupted(agen::StopReason::LimitReached) => {
+            session_store::save_run_completed(
+                store,
+                session_id,
+                segment_id,
+                agen::EngineResult::LimitReached,
+                false,
+                worker.active_run_turn_count(),
+            )
+            .unwrap();
+        }
+        agen::EngineRunExit::Interrupted(reason) => {
             session_store::save_run_errored(
                 store,
                 session_id,
                 segment_id,
-                e.to_string(),
-                worker.last_run_interrupted(),
+                format!("{reason:?}"),
+                true,
             )
             .unwrap();
         }
     }
 
-    let r = result.unwrap();
-    (worker, r)
+    (worker, result)
 }
 
 // =============================================================================
@@ -292,7 +310,7 @@ async fn session_resume_after_pause() {
     .unwrap();
 
     let (_worker, result) = run_and_persist(worker, &store, sid, segid, "Weather?").await;
-    assert!(matches!(result, agen::EngineResult::Paused));
+    assert!(matches!(result, agen::EngineRunExit::Paused));
 
     // Check RunCompleted is Paused
     let entries = store.read_all(sid, segid).unwrap();

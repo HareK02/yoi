@@ -77,8 +77,8 @@ use crate::skill::{SkillActivationResponse, SkillClientError};
 #[cfg(test)]
 use async_trait::async_trait;
 use protocol::{
-    AlertLevel, AlertSource, CompactionLifecycle, CompactionLifecycleState, Event, RewindSummary,
-    RewindTarget, RewindTargetId, Segment,
+    AlertLevel, AlertSource, CompactionLifecycle, CompactionLifecycleState, ErrorCode, Event,
+    RewindSummary, RewindTarget, RewindTargetId, Segment,
 };
 use tokio::net::UnixStream;
 use tokio::sync::broadcast;
@@ -2964,7 +2964,10 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             }
             EngineRunExit::Interrupted(reason) => {
                 self.last_run_interrupted = true;
-                Ok(WorkerRunResult::Interrupted(stop_reason_message(&reason)))
+                Ok(WorkerRunResult::Interrupted {
+                    code: stop_reason_error_code(&reason),
+                    message: stop_reason_message(&reason),
+                })
             }
             EngineRunExit::Yielded => unreachable!("yielded handled above"),
         }
@@ -4512,7 +4515,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
 fn extract_internal_worker_lifecycle_error(lifecycle: &WorkerRunResult) -> Option<WorkerError> {
     match lifecycle {
         WorkerRunResult::RolledBack => Some(WorkerError::Engine(EngineError::Cancelled)),
-        WorkerRunResult::Interrupted(message) => {
+        WorkerRunResult::Interrupted { message, .. } => {
             Some(WorkerError::Engine(EngineError::Aborted(message.clone())))
         }
         WorkerRunResult::Finished | WorkerRunResult::Paused | WorkerRunResult::LimitReached => None,
@@ -5521,6 +5524,23 @@ fn restore_manifest_from_worker_metadata_snapshot(
     }
 }
 
+fn stop_reason_error_code(reason: &StopReason) -> ErrorCode {
+    match reason {
+        StopReason::ContextWindowExceeded | StopReason::Unexpected(EngineError::Client(_)) => {
+            ErrorCode::ProviderError
+        }
+        StopReason::Unexpected(EngineError::Tool(_)) => ErrorCode::ToolError,
+        StopReason::LimitReached
+        | StopReason::Cancelled
+        | StopReason::Unexpected(
+            EngineError::Aborted(_)
+            | EngineError::Cancelled
+            | EngineError::ConfigWarnings(_)
+            | EngineError::HistoryAppend(_),
+        ) => ErrorCode::Internal,
+    }
+}
+
 fn stop_reason_message(reason: &StopReason) -> String {
     match reason {
         StopReason::LimitReached => "engine turn limit reached".to_string(),
@@ -5540,7 +5560,7 @@ pub enum WorkerRunResult {
     /// The worker reached its configured max_turns limit.
     LimitReached,
     /// The run was interrupted by a known or unexpected terminal cause.
-    Interrupted(String),
+    Interrupted { code: ErrorCode, message: String },
     /// The submit-time user turn was rolled back because no AI output was materialized.
     RolledBack,
 }

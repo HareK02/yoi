@@ -1650,13 +1650,13 @@ where
                             WorkerRunResult::Paused => (WorkerStatus::Paused, RunResult::Paused),
                             WorkerRunResult::LimitReached => (WorkerStatus::Idle, RunResult::LimitReached),
                             WorkerRunResult::RolledBack => (WorkerStatus::Idle, RunResult::RolledBack),
-                            WorkerRunResult::Interrupted(_message) if pause_requested => {
+                            WorkerRunResult::Interrupted { .. } if pause_requested => {
                                 let _ = event_tx.send(Event::RunEnd { result: RunResult::Paused });
                                 return (WorkerStatus::Paused, shutdown_requested);
                             }
-                            WorkerRunResult::Interrupted(message) => {
+                            WorkerRunResult::Interrupted { code, message } => {
                                 let _ = event_tx.send(Event::Error {
-                                    code: ErrorCode::Internal,
+                                    code,
                                     message: message.clone(),
                                 });
                                 if parent_originated {
