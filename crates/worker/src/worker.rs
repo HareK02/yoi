@@ -1940,13 +1940,15 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             )));
         }
 
-        let Some(LogEntry::UserInput { segments, .. }) = entries.get(target.user_input_entry_index)
-        else {
-            return Err(RewindError::Invalid(
-                "rewind target is no longer a user message".into(),
-            ));
+        let input = match entries.get(target.user_input_entry_index) {
+            Some(LogEntry::UserInput { segments, .. })
+            | Some(LogEntry::AnnotatedUserInput { segments, .. }) => segments.clone(),
+            _ => {
+                return Err(RewindError::Invalid(
+                    "rewind target is no longer a user message".into(),
+                ));
+            }
         };
-        let input = segments.clone();
         let truncate_entries = rewind_truncate_entries(&entries, target.user_input_entry_index);
         let retained = entries[..truncate_entries].to_vec();
         let tool_side_effect_warning = suffix_has_tool_side_effects(&entries[truncate_entries..]);
@@ -6225,27 +6227,30 @@ fn build_rewind_targets(segment_id: uuid::Uuid, entries: &[LogEntry]) -> Vec<Rew
     let mut turn_index = 0usize;
     let mut targets = Vec::new();
     for (entry_index, entry) in entries.iter().enumerate() {
-        if let LogEntry::UserInput { segments, ts, .. } = entry {
-            turn_index += 1;
-            let truncate_entries = rewind_truncate_entries(entries, entry_index);
-            let tool_warning = suffix_has_tool_side_effects(&entries[truncate_entries..]);
-            targets.push(RewindTarget {
-                id: RewindTargetId {
-                    segment_id,
-                    user_input_entry_index: entry_index,
-                },
-                expected_head_entries: head_entries,
-                truncate_entries,
-                turn_index,
-                timestamp_ms: Some(*ts),
-                preview: preview_segments(segments),
-                eligible: true,
-                disabled_reason: None,
-                warning: tool_warning.then(|| {
-                    "history suffix will be discarded; tool side effects are not undone".into()
-                }),
-            });
-        }
+        let (segments, ts) = match entry {
+            LogEntry::UserInput { segments, ts, .. }
+            | LogEntry::AnnotatedUserInput { segments, ts, .. } => (segments, ts),
+            _ => continue,
+        };
+        turn_index += 1;
+        let truncate_entries = rewind_truncate_entries(entries, entry_index);
+        let tool_warning = suffix_has_tool_side_effects(&entries[truncate_entries..]);
+        targets.push(RewindTarget {
+            id: RewindTargetId {
+                segment_id,
+                user_input_entry_index: entry_index,
+            },
+            expected_head_entries: head_entries,
+            truncate_entries,
+            turn_index,
+            timestamp_ms: Some(*ts),
+            preview: preview_segments(segments),
+            eligible: true,
+            disabled_reason: None,
+            warning: tool_warning.then(|| {
+                "history suffix will be discarded; tool side effects are not undone".into()
+            }),
+        });
     }
     targets.reverse();
     targets
@@ -6266,8 +6271,9 @@ fn rewind_truncate_entries(entries: &[LogEntry], user_input_entry_index: usize) 
 
 fn suffix_has_tool_side_effects(entries: &[LogEntry]) -> bool {
     entries.iter().any(|entry| match entry {
-        LogEntry::ToolResult { .. } => true,
+        LogEntry::ToolResult { .. } | LogEntry::AnnotatedToolResult { .. } => true,
         LogEntry::AssistantItem { item, .. } => logged_item_is_tool_call(item),
+        LogEntry::AnnotatedAssistantItem { entry, .. } => logged_item_is_tool_call(&entry.item),
         _ => false,
     })
 }
@@ -7757,6 +7763,56 @@ mod build_summary_prompt_tests {
             .unwrap();
     }
 
+    fn append_annotated_user_turn(
+        worker: &Worker<NoopClient, session_store::FsStore>,
+        ts: u64,
+        text: &str,
+    ) -> Vec<SessionHistoryMetadata> {
+        let user = history_entry(
+            Item::user_message(text),
+            WorkerHistoryProvenance::HumanInput {
+                account_id: "account-1".into(),
+            },
+        );
+        let assistant = history_entry(
+            Item::assistant_message(format!("answer: {text}")),
+            WorkerHistoryProvenance::ModelOutput {
+                worker: worker_subject(worker.session.session_id()),
+            },
+        );
+        append_test_entry(
+            worker,
+            LogEntry::Invoke {
+                ts,
+                trigger: protocol::InvokeKind::UserSend,
+            },
+        );
+        append_test_entry(
+            worker,
+            LogEntry::AnnotatedUserInput {
+                ts: ts + 1,
+                segments: vec![Segment::text(text)],
+                extensions: Vec::new(),
+                history: vec![to_logged_history_entry(&user)],
+            },
+        );
+        append_test_entry(
+            worker,
+            LogEntry::AnnotatedAssistantItem {
+                ts: ts + 2,
+                entry: to_logged_history_entry(&assistant),
+            },
+        );
+        append_test_entry(
+            worker,
+            LogEntry::TurnEnd {
+                ts: ts + 3,
+                turn_count: 1,
+            },
+        );
+        vec![user.annotation, assistant.annotation]
+    }
+
     fn append_user_turn(worker: &Worker<NoopClient, session_store::FsStore>, ts: u64, text: &str) {
         append_test_entry(
             worker,
@@ -7865,6 +7921,105 @@ mod build_summary_prompt_tests {
         );
         assert_eq!(worker.history().len(), 1);
         assert_eq!(worker.history()[0].as_text().unwrap(), "first message");
+    }
+
+    #[tokio::test]
+    async fn annotated_history_rewind_commits_authoritative_prefix() {
+        let (_dir, mut worker) = rewind_test_worker().await;
+        let expected_metadata = append_annotated_user_turn(&worker, 10, "first message");
+        append_annotated_user_turn(&worker, 20, "second message");
+        append_test_entry(
+            &worker,
+            LogEntry::AnnotatedToolResult {
+                ts: 30,
+                entry: session_store::LoggedHistoryEntry {
+                    item: session_store::LoggedItem::ToolResult {
+                        call_id: "call-v2".into(),
+                        summary: "side effect".into(),
+                        content: None,
+                        attachments: Vec::new(),
+                        is_error: false,
+                    },
+                    metadata: new_history_metadata(
+                        WorkerHistoryProvenance::ToolOutput {
+                            worker: worker_subject(worker.session.session_id()),
+                        },
+                        None,
+                    ),
+                },
+            },
+        );
+
+        let (head_entries, targets) = worker.list_rewind_targets().unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].preview, "second message");
+        assert!(targets[0].truncate_entries > 0);
+        assert!(targets[0].warning.is_some());
+
+        let applied = worker
+            .rewind_to(targets[0].id.clone(), head_entries)
+            .unwrap();
+        assert_eq!(applied.summary.truncated_to_entries, 5);
+        assert!(matches!(
+            applied.entries.first(),
+            Some(LogEntry::AnnotatedSegmentStart { .. })
+        ));
+        let retained_metadata = worker
+            .session_history()
+            .entries()
+            .iter()
+            .map(|entry| entry.annotation.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(retained_metadata, expected_metadata);
+
+        let source_location = worker.segment_state.location();
+        let persisted_prefix = worker
+            .store
+            .read_all(source_location.session_id, source_location.segment_id)
+            .unwrap();
+        let restored_prefix = restore_history_entries(
+            source_location.session_id,
+            source_location.segment_id,
+            &persisted_prefix,
+        )
+        .unwrap();
+        assert_eq!(
+            restored_prefix
+                .iter()
+                .map(|entry| entry.annotation.clone())
+                .collect::<Vec<_>>(),
+            expected_metadata
+        );
+
+        // Simulate a stale concurrent writer so the next head check forks.
+        append_test_entry(
+            &worker,
+            LogEntry::Extension {
+                ts: 31,
+                domain: "test.concurrent-writer".into(),
+                payload: serde_json::json!({"value": true}),
+            },
+        );
+        worker.ensure_segment_head().unwrap();
+        let fork_location = worker.segment_state.location();
+        assert_ne!(fork_location.segment_id, source_location.segment_id);
+        let fork_entries = worker
+            .store
+            .read_all(fork_location.session_id, fork_location.segment_id)
+            .unwrap();
+        let fork_history = restore_history_entries(
+            fork_location.session_id,
+            fork_location.segment_id,
+            &fork_entries,
+        )
+        .unwrap();
+        assert_eq!(
+            fork_history
+                .iter()
+                .map(|entry| entry.annotation.clone())
+                .collect::<Vec<_>>(),
+            expected_metadata
+        );
     }
 
     #[tokio::test]
