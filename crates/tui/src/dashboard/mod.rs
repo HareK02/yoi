@@ -581,6 +581,7 @@ pub(crate) enum IntakeRegistryUpdate {
 pub(crate) struct ReadyTicketPlanningReturnRequest {
     workspace_root: PathBuf,
     ticket_id: String,
+    ticket_key: String,
     user_instruction: String,
     followup: ReadyTicketPlanningReturnFollowup,
 }
@@ -2042,11 +2043,18 @@ impl DashboardApp {
             return None;
         };
         let ticket_id = ticket.id.clone();
+        let ticket_key = match required_ticket_handoff_key(ticket.resource_key.as_deref()) {
+            Ok(ticket_key) => ticket_key.to_string(),
+            Err(error) => {
+                self.notice = Some(error);
+                return None;
+            }
+        };
         let mut context =
             TicketRoleLaunchContext::new(current_workspace_root(), TicketRole::Intake);
         context.ticket = Some(TicketRef::id(ticket_id.clone()));
         context.user_instruction = Some(format!(
-            "Continue Intake for existing Ticket {ticket_id}. Do not create a duplicate Ticket unless the user explicitly requests one. Read ShowTicket body/thread/artifacts before making routing or requirements decisions."
+            "Continue Intake for existing Ticket {ticket_key}. Do not create a duplicate Ticket unless the user explicitly requests one. Read ShowTicket body/thread/artifacts before making routing or requirements decisions."
         ));
         let store = match PanelRegistryStore::default_for_workspace(&context.workspace_root) {
             Ok(store) => store,
@@ -2059,7 +2067,7 @@ impl DashboardApp {
             Ok(Some(claim)) => {
                 let status = local_claim_status_for_pod(&claim.worker_name, &self.list);
                 self.notice = Some(existing_ticket_claim_notice(
-                    &ticket_id,
+                    &ticket_key,
                     &claim.worker_name,
                     status,
                 ));
@@ -2087,7 +2095,7 @@ impl DashboardApp {
         self.sending = true;
         self.notice = Some(format!(
             "Launching Ticket Intake for {} as {}…",
-            ticket_id, planned.worker_name
+            ticket_key, planned.worker_name
         ));
         Some(IntakeLaunchRequest {
             context,
@@ -2158,10 +2166,17 @@ impl DashboardApp {
             return None;
         };
         let ticket_id = ticket.id.clone();
+        let ticket_key = match required_ticket_handoff_key(ticket.resource_key.as_deref()) {
+            Ok(ticket_key) => ticket_key.to_string(),
+            Err(error) => {
+                self.notice = Some(error);
+                return None;
+            }
+        };
         if ticket.workflow_state != TicketWorkflowState::Ready {
             self.notice = Some(format!(
                 "Ticket {} is {}; expected ready before returning to planning.",
-                ticket_id,
+                ticket_key,
                 ticket.workflow_state.as_str()
             ));
             return None;
@@ -2213,7 +2228,7 @@ impl DashboardApp {
                     TicketRoleLaunchContext::new(workspace_root.clone(), TicketRole::Intake);
                 context.ticket = Some(TicketRef::id(ticket_id.clone()));
                 context.user_instruction = Some(build_ready_ticket_refinement_launch_instruction(
-                    &ticket_id,
+                    &ticket_key,
                     &user_instruction,
                 ));
                 let peer_registration = self.prepare_intake_peer_registration(&mut context);
@@ -2237,11 +2252,12 @@ impl DashboardApp {
         self.sending = true;
         self.notice = Some(format!(
             "Returning ready Ticket {} to planning for refinement…",
-            ticket_id
+            ticket_key
         ));
         Some(ReadyTicketPlanningReturnRequest {
             workspace_root,
             ticket_id,
+            ticket_key,
             user_instruction,
             followup,
         })
@@ -3918,21 +3934,35 @@ fn bounded_refinement_instruction(input: &str) -> String {
         .to_string()
 }
 
-fn build_ready_ticket_refinement_thread_body(ticket_id: &str, instruction: &str) -> String {
+fn required_ticket_handoff_key(resource_key: Option<&str>) -> Result<&str, String> {
+    let resource_key = resource_key.ok_or_else(|| {
+        "Ticket handoff is unavailable because the canonical T-* resource key is missing. Refresh the panel and retry."
+            .to_string()
+    })?;
+    let sequence = resource_key.strip_prefix("T-").filter(|sequence| {
+        !sequence.is_empty() && sequence.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    sequence.map(|_| resource_key).ok_or_else(|| {
+        "Ticket handoff is unavailable because the canonical T-* resource key is invalid. Refresh the panel and retry."
+            .to_string()
+    })
+}
+
+fn build_ready_ticket_refinement_thread_body(ticket_key: &str, instruction: &str) -> String {
     format!(
-        "Panel returned ready Ticket {ticket_id} to planning for requirements sync. This is not Queue routing and must not start implementation.\n\n## User refinement instruction\n\n{instruction}\n"
+        "Panel returned ready Ticket {ticket_key} to planning for requirements sync. This is not Queue routing and must not start implementation.\n\n## User refinement instruction\n\n{instruction}\n"
     )
 }
 
-fn build_ready_ticket_refinement_launch_instruction(ticket_id: &str, instruction: &str) -> String {
+fn build_ready_ticket_refinement_launch_instruction(ticket_key: &str, instruction: &str) -> String {
     format!(
-        "Continue Ticket Intake / requirements sync for existing Ticket {ticket_id}. The Panel has returned the Ticket from ready to planning; do not queue the Ticket, do not route implementation, and do not create a duplicate unless the user explicitly asks for one. Read ShowTicket body/thread/artifacts before making requirements or readiness decisions.\n\nUser refinement instruction:\n\n{instruction}"
+        "Continue Ticket Intake / requirements sync for existing Ticket {ticket_key}. The Panel has returned the Ticket from ready to planning; do not queue the Ticket, do not route implementation, and do not create a duplicate unless the user explicitly asks for one. Read ShowTicket body/thread/artifacts before making requirements or readiness decisions.\n\nUser refinement instruction:\n\n{instruction}"
     )
 }
 
-fn build_ready_ticket_refinement_notify(ticket_id: &str, instruction: &str) -> String {
+fn build_ready_ticket_refinement_notify(ticket_key: &str, instruction: &str) -> String {
     format!(
-        "Ticket {ticket_id} was returned from ready to planning from the Panel for requirements sync. Continue Intake/refinement only; do not Queue or route implementation. Read the Ticket thread for the recorded state change and user instruction.\n\nUser refinement instruction:\n\n{instruction}"
+        "Ticket {ticket_key} was returned from ready to planning from the Panel for requirements sync. Continue Intake/refinement only; do not Queue or route implementation. Read the Ticket thread for the recorded state change and user instruction.\n\nUser refinement instruction:\n\n{instruction}"
     )
 }
 
@@ -3961,10 +3991,12 @@ async fn dispatch_ready_ticket_planning_return(
     let ticket = backend
         .show(id.clone())
         .map_err(|error| TicketActionError::Ticket(error.to_string()))?;
+    let ticket_key =
+        required_ticket_handoff_key(Some(&request.ticket_key)).map_err(TicketActionError::Stale)?;
     if ticket.meta.workflow_state != TicketWorkflowState::Ready {
         return Err(TicketActionError::Stale(format!(
             "Ticket {} is {}; expected ready before returning it to planning. Refresh the panel and retry if appropriate.",
-            ticket.meta.id,
+            ticket_key,
             ticket.meta.workflow_state.as_str()
         )));
     }
@@ -3973,7 +4005,7 @@ async fn dispatch_ready_ticket_planning_return(
         TicketWorkflowState::Planning.as_str(),
         "panel_return_to_planning",
         MarkdownText::from(build_ready_ticket_refinement_thread_body(
-            &ticket.meta.id,
+            ticket_key,
             &request.user_instruction,
         )),
     );
@@ -3987,7 +4019,7 @@ async fn dispatch_ready_ticket_planning_return(
             ReadyTicketPlanningReturnOutcome {
                 notice: format!(
                     "Ticket {} returned to planning for refinement; launching Ticket Intake…",
-                    ticket.meta.id
+                    ticket_key
                 ),
                 followup: ReadyTicketPlanningReturnAfterMutation::LaunchIntake(request),
             }
@@ -3997,19 +4029,19 @@ async fn dispatch_ready_ticket_planning_return(
             socket_path,
         } => {
             let message =
-                build_ready_ticket_refinement_notify(&ticket.meta.id, &request.user_instruction);
+                build_ready_ticket_refinement_notify(ticket_key, &request.user_instruction);
             match send_notify_only(&socket_path, message, true).await {
                 Ok(()) => ReadyTicketPlanningReturnOutcome {
                     notice: format!(
                         "Ticket {} returned to planning for refinement; notified live Intake Worker {}.",
-                        ticket.meta.id, worker_name
+                        ticket_key, worker_name
                     ),
                     followup: ReadyTicketPlanningReturnAfterMutation::None,
                 },
                 Err(error) => ReadyTicketPlanningReturnOutcome {
                     notice: bounded_panel_diagnostic(format!(
                         "Ticket {} returned to planning and instruction was recorded, but notifying Intake Worker {} failed: {}",
-                        ticket.meta.id, worker_name, error
+                        ticket_key, worker_name, error
                     )),
                     followup: ReadyTicketPlanningReturnAfterMutation::None,
                 },
@@ -4020,7 +4052,7 @@ async fn dispatch_ready_ticket_planning_return(
             ReadyTicketPlanningReturnOutcome {
                 notice: format!(
                     "Ticket {} returned to planning for refinement; opening/restoring claimed Intake Worker {}…",
-                    ticket.meta.id, worker_name
+                    ticket_key, worker_name
                 ),
                 followup: ReadyTicketPlanningReturnAfterMutation::OpenClaim(request),
             }
@@ -4029,7 +4061,7 @@ async fn dispatch_ready_ticket_planning_return(
             ReadyTicketPlanningReturnOutcome {
                 notice: bounded_panel_diagnostic(format!(
                     "Ticket {} returned to planning and instruction was recorded, but Intake launch was not attempted because existing Intake claim {} is stale; inspect or clear the local claim before launching another Intake Worker.",
-                    ticket.meta.id, worker_name
+                    ticket_key, worker_name
                 )),
                 followup: ReadyTicketPlanningReturnAfterMutation::None,
             }

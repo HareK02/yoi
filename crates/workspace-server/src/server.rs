@@ -6414,9 +6414,15 @@ fn worker_ticket_source_context(
     }
 }
 
-fn ticket_notification_content(ticket_id: &str, current_state: &str) -> String {
+fn canonical_ticket_resource_key(resource_key: &str) -> Option<&str> {
+    let sequence = resource_key.strip_prefix("T-")?;
+    (!sequence.is_empty() && sequence.bytes().all(|byte| byte.is_ascii_digit()))
+        .then_some(resource_key)
+}
+
+fn ticket_notification_content(resource_key: &str, current_state: &str) -> String {
     format!(
-        "Ticket notification: ticket_id={ticket_id} current_state={current_state}. Reread the Ticket before acting."
+        "Ticket {resource_key} changed to {current_state}. Reread the current Ticket before acting."
     )
 }
 
@@ -6498,6 +6504,16 @@ fn notify_ticket_recipients(
     current_state: &str,
     source: Option<RuntimeWorkerRef>,
 ) {
+    let Ok(Some(resource_key)) =
+        api.store
+            .resource_key(workspace_id, WorkspaceResourceKind::Ticket, ticket_id)
+    else {
+        return;
+    };
+    let Some(resource_key) = canonical_ticket_resource_key(&resource_key) else {
+        return;
+    };
+
     let mut recipients = Vec::new();
     if let Some(assignment) = api
         .store
@@ -6518,7 +6534,7 @@ fn notify_ticket_recipients(
     recipients.sort();
     recipients.dedup();
 
-    let content = ticket_notification_content(ticket_id, current_state);
+    let content = ticket_notification_content(resource_key, current_state);
     for recipient in recipients {
         if source.as_ref().is_some_and(|source| source == &recipient) {
             continue;
@@ -18216,15 +18232,25 @@ mod tests {
     }
 
     #[test]
-    fn ticket_notification_projection_exposes_only_ticket_and_current_state() {
+    fn ticket_notification_requires_canonical_ticket_resource_key() {
+        assert_eq!(canonical_ticket_resource_key("T-429"), Some("T-429"));
+        for invalid in ["", "00001KZ9SR97B", "T-", "T-key", "O-429"] {
+            assert_eq!(canonical_ticket_resource_key(invalid), None);
+        }
+    }
+
+    #[test]
+    fn ticket_notification_projection_exposes_only_resource_key_and_current_state() {
+        const INTERNAL_ID: &str = "00001KZ9SR97B";
         for current_state in ["queued", "inprogress"] {
-            let content = ticket_notification_content("00001KZ9SR97B", current_state);
+            let content = ticket_notification_content("T-429", current_state);
             assert_eq!(
                 content,
                 format!(
-                    "Ticket notification: ticket_id=00001KZ9SR97B current_state={current_state}. Reread the Ticket before acting."
+                    "Ticket T-429 changed to {current_state}. Reread the current Ticket before acting."
                 )
             );
+            assert!(!content.contains(INTERNAL_ID));
             for forbidden in [
                 "workspace_id",
                 "event_sequence",
@@ -18402,9 +18428,13 @@ mod tests {
         assert_eq!(inputs.len(), expected_states.len());
         for ((recipient, content), current_state) in inputs.iter().zip(expected_states) {
             assert_eq!(recipient.worker_id.to_string(), orchestrator.worker_id);
+            assert!(!content.contains(&ticket.id));
             assert_eq!(
                 content,
-                &ticket_notification_content(&ticket.id, current_state)
+                &ticket_notification_content(
+                    ticket.resource_key.as_deref().unwrap(),
+                    current_state,
+                )
             );
         }
     }
@@ -19520,7 +19550,7 @@ mod tests {
         assert_eq!(
             notifications[0].1,
             ticket_notification_content(
-                ticket_ref.id.as_str(),
+                ticket_ref.resource_key.as_deref().unwrap(),
                 TicketWorkflowState::Queued.as_str()
             )
         );
