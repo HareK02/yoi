@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
-use std::{marker::PhantomData, sync::Arc, time::Instant};
+use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc, time::Instant};
 
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use tokio::time::{Duration, Instant as TokioInstant};
+use tokio::time::Instant as TokioInstant;
 use tracing::{debug, info, trace, warn};
 
 use crate::{
@@ -28,13 +28,11 @@ use crate::{
     timeline::{TextBlockCollector, ThinkingBlockCollector, Timeline, ToolCallCollector},
     tool::{
         ToolCall, ToolDefinition as EngineToolDefinition, ToolError, ToolExecutionContext,
-        ToolOutputLimits, ToolResult, ToolResultDisposition, truncate_content,
+        ToolExecutionHandle, ToolExecutionPolicy, ToolExecutionTerminal, ToolOutputLimits,
+        ToolResult, ToolResultDisposition, truncate_content,
     },
     tool_server::{ToolServer, ToolServerHandle},
 };
-
-const TOOL_CANCEL_SIGNAL_TIMEOUT: Duration = Duration::from_millis(100);
-const TOOL_CANCEL_GRACE_PERIOD: Duration = Duration::from_millis(500);
 
 /// Engine errors
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +49,9 @@ pub enum EngineError {
     /// Cancelled by CancellationToken
     #[error("Cancelled")]
     Cancelled,
+    /// Paused by the caller at the next safe boundary.
+    #[error("Paused")]
+    PauseRequested,
     /// Config warnings (unsupported options)
     #[error("Config warnings: {}", .0.iter().map(|w| w.to_string()).collect::<Vec<_>>().join(", "))]
     ConfigWarnings(Vec<ConfigWarning>),
@@ -169,6 +170,7 @@ impl From<Result<EngineResult, EngineError>> for EngineRunExit {
                 Self::Interrupted(StopReason::ContextWindowExceeded)
             }
             Err(EngineError::Cancelled) => Self::Interrupted(StopReason::Cancelled),
+            Err(EngineError::PauseRequested) => Self::Paused,
             Err(error) => Self::Interrupted(StopReason::Unexpected(error)),
         }
     }
@@ -346,6 +348,8 @@ pub struct Engine<C: LlmClient, S: EngineState = Mutable, A = ()> {
     tool_execution_batch_count: usize,
     /// Maximum number of AgentTurns (None = unlimited)
     max_turns: Option<u32>,
+    /// Caller-selected policy for interrupting started provider operations.
+    tool_execution_policy: ToolExecutionPolicy,
     /// AgentTurn-start callbacks (1:1 with LlmCall today)
     turn_start_cbs: Vec<Box<dyn Fn(usize) + Send + Sync>>,
     /// AgentTurn-end callbacks (1:1 with LlmCall today)
@@ -384,6 +388,10 @@ pub struct Engine<C: LlmClient, S: EngineState = Mutable, A = ()> {
     /// Cancel notification channel (for interrupting execution)
     cancel_tx: mpsc::Sender<()>,
     cancel_rx: mpsc::Receiver<()>,
+    /// Pause notification channel. Unlike cancellation, this waits for already
+    /// started tools to reach provider-confirmed terminal results.
+    pause_tx: mpsc::Sender<()>,
+    pause_rx: mpsc::Receiver<()>,
     /// Byte-size caps applied to tool `content` before it reaches history.
     /// `None` disables truncation (tests and minimal setups).
     tool_output_limits: Option<ToolOutputLimits>,
@@ -421,7 +429,10 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
     }
 
     fn finish_logical_run(&mut self, result: &Result<EngineResult, EngineError>) {
-        if !matches!(result, Ok(EngineResult::Paused) | Ok(EngineResult::Yielded)) {
+        if !matches!(
+            result,
+            Ok(EngineResult::Paused | EngineResult::Yielded) | Err(EngineError::PauseRequested)
+        ) {
             self.active_run_turn_count = None;
         }
     }
@@ -430,14 +441,19 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
         while self.cancel_rx.try_recv().is_ok() {}
     }
 
-    /// Discard pending cancellation notifications while the engine is idle.
+    fn drain_pause_queue(&mut self) {
+        while self.pause_rx.try_recv().is_ok() {}
+    }
+
+    /// Discard pending interruption notifications while the engine is idle.
     ///
-    /// Cancellation is a running-turn control signal. Callers that own a higher
-    /// level run state can use this before starting a new turn so an old idle
-    /// signal does not poison the next request, while cancellation queued after
-    /// the run has been accepted remains observable by the turn loop.
+    /// Cancellation and pause are running-turn control signals. Callers that own
+    /// a higher level run state can use this before starting a new turn so an old
+    /// idle signal does not poison the next request, while interruption queued
+    /// after the run has been accepted remains observable by the turn loop.
     pub fn clear_pending_cancel(&mut self) {
         self.drain_cancel_queue();
+        self.drain_pause_queue();
     }
 
     fn try_cancelled(&mut self) -> bool {
@@ -446,6 +462,14 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
             Ok(()) => true,
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => true,
+        }
+    }
+
+    fn try_paused(&mut self) -> bool {
+        use tokio::sync::mpsc::error::TryRecvError;
+        match self.pause_rx.try_recv() {
+            Ok(()) => true,
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => false,
         }
     }
 
@@ -912,6 +936,22 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
         self.cancel_tx.clone()
     }
 
+    /// Get the safe-boundary pause notification sender.
+    pub fn pause_sender(&self) -> mpsc::Sender<()> {
+        self.pause_tx.clone()
+    }
+
+    /// Select the deadline policy applied to already-started provider operations.
+    /// Worker/controller layers own this lifecycle policy; Agen owns only the
+    /// mechanical terminalization of each call.
+    pub fn set_tool_execution_policy(&mut self, policy: ToolExecutionPolicy) {
+        self.tool_execution_policy = policy;
+    }
+
+    pub fn tool_execution_policy(&self) -> ToolExecutionPolicy {
+        self.tool_execution_policy
+    }
+
     /// Set request configuration at once
     pub fn set_request_config(&mut self, config: RequestConfig) {
         self.request_config = config;
@@ -1108,6 +1148,12 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
     ) -> Result<ToolExecutionResult, EngineError> {
         use futures::stream::{FuturesUnordered, StreamExt};
 
+        // A pause observed before provider ownership starts leaves every call
+        // NotStarted and therefore eligible for an explicit later retry.
+        if self.try_paused() {
+            return Ok(ToolExecutionResult::Paused);
+        }
+
         // Map from tool call ID to (ToolCall, Meta, Tool, Context)
         // Retained because it's needed for PostToolCall hooks
         let mut call_info_map = HashMap::new();
@@ -1184,43 +1230,60 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
         for (call_id, attempt_id) in &started_calls {
             attempt_fence.register(call_id.clone(), attempt_id.clone());
         }
-        let futures: FuturesUnordered<_> = approved_calls
-            .into_iter()
-            .map(|(tool_call, context, tool)| async move {
-                let attempt_id = context.batch_id.clone();
-                let input_json = serde_json::to_string(&tool_call.input).unwrap_or_default();
-                let result = match tool {
-                    None => ToolResult::error(
-                        &tool_call.id,
-                        format!("Tool not found: {}", tool_call.name),
-                    ),
-                    Some(tool) => match tool.execute(&input_json, context).await {
-                        Ok(output) => ToolResult::from_output(&tool_call.id, output),
-                        Err(ToolError::Cancelled(output)) => {
-                            ToolResult::from_output_with_disposition(
-                                &tool_call.id,
+        let futures: FuturesUnordered<Pin<Box<dyn Future<Output = (String, ToolResult)> + Send>>> =
+            FuturesUnordered::new();
+        let mut execution_handles = HashMap::new();
+        for (tool_call, context, tool) in approved_calls {
+            let attempt_id = context.batch_id.clone();
+            let input_json = serde_json::to_string(&tool_call.input).unwrap_or_default();
+            let call_id = tool_call.id.clone();
+            let future: Pin<Box<dyn Future<Output = (String, ToolResult)> + Send>> = match tool {
+                None => {
+                    let result =
+                        ToolResult::error(&call_id, format!("Tool not found: {}", tool_call.name));
+                    Box::pin(async move { (attempt_id, result) })
+                }
+                Some(tool) => {
+                    let (handle, terminal) = ToolExecutionHandle::start(tool, input_json, context);
+                    execution_handles.insert(call_id.clone(), handle);
+                    Box::pin(async move {
+                        let result = match terminal.await {
+                            ToolExecutionTerminal::Confirmed(Ok(output)) => {
+                                ToolResult::from_output(&call_id, output)
+                            }
+                            ToolExecutionTerminal::Confirmed(Err(ToolError::Cancelled(output))) => {
+                                ToolResult::from_output_with_disposition(
+                                    &call_id,
+                                    output,
+                                    ToolResultDisposition::Cancelled,
+                                )
+                            }
+                            ToolExecutionTerminal::Confirmed(Err(ToolError::Interrupted(
                                 output,
-                                ToolResultDisposition::Cancelled,
-                            )
-                        }
-                        Err(ToolError::Interrupted(output)) => {
-                            ToolResult::from_output_with_disposition(
-                                &tool_call.id,
+                            ))) => ToolResult::from_output_with_disposition(
+                                &call_id,
                                 output,
                                 ToolResultDisposition::Interrupted,
-                            )
-                        }
-                        Err(error) => ToolResult::error(&tool_call.id, error.to_string()),
-                    },
-                };
-                (attempt_id, result)
-            })
-            .collect();
+                            ),
+                            ToolExecutionTerminal::Confirmed(Err(error)) => {
+                                ToolResult::error(&call_id, error.to_string())
+                            }
+                            ToolExecutionTerminal::OutcomeUnknown => {
+                                ToolResult::outcome_unknown(&call_id)
+                            }
+                        };
+                        (attempt_id, result)
+                    })
+                }
+            };
+            futures.push(future);
+        }
 
         // Synthetic results are already terminal and need no execution wait.
         // Commit them before polling ordinary calls so they obey the same
         // commit-before-publish boundary.
         let mut terminal_call_ids = HashSet::new();
+        let mut pause_requested = false;
         for result in synthetic_results {
             self.finalize_and_commit_tool_result(
                 history,
@@ -1254,45 +1317,52 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
                         &mut terminal_call_ids,
                     ).await?;
                 }
+                pause = self.pause_rx.recv(), if !pause_requested => {
+                    if pause.is_some() {
+                        // Pause is a safe-boundary request: do not cancel provider
+                        // operations that already started. Drain all confirmed
+                        // terminal results, then yield control to Worker.
+                        pause_requested = true;
+                    }
+                }
                 cancel = self.cancel_rx.recv() => {
                     if cancel.is_some() {
                         info!("Tool execution cancellation requested");
                     }
 
-                    let cancellation_requests = call_info_map
+                    let cancellation_request_deadline = TokioInstant::now()
+                        + self.tool_execution_policy.cancellation_request_timeout;
+                    let cancellation_requests = execution_handles
                         .iter()
                         .filter(|(call_id, _)| !terminal_call_ids.contains(*call_id))
-                        .map(|(call_id, (_, _, tool, _))| {
+                        .map(|(call_id, handle)| {
                             let call_id = call_id.clone();
-                            let tool = tool.clone();
-                            async move { (call_id.clone(), tool.cancel(&call_id).await) }
+                            let handle = handle.clone();
+                            async move {
+                                (
+                                    call_id,
+                                    handle.cancel_before(cancellation_request_deadline).await,
+                                )
+                            }
                         });
                     let cancellation_requests: FuturesUnordered<_> =
                         cancellation_requests.collect();
-                    match tokio::time::timeout(
-                        TOOL_CANCEL_SIGNAL_TIMEOUT,
-                        cancellation_requests.collect::<Vec<_>>(),
-                    )
-                    .await
-                    {
-                        Ok(results) => {
-                            for (call_id, result) in results {
-                                if let Err(error) = result {
-                                    warn!(
-                                        %call_id,
-                                        error = %error,
-                                        "Tool cooperative cancellation request failed"
-                                    );
-                                }
-                            }
+                    for (call_id, result) in cancellation_requests.collect::<Vec<_>>().await {
+                        if let Err(error) = result {
+                            warn!(
+                                %call_id,
+                                error = %error,
+                                "Tool cooperative cancellation request failed"
+                            );
                         }
-                        Err(_) => warn!("Tool cooperative cancellation request timed out"),
                     }
 
-                    // Keep polling the original execution futures for a bounded
-                    // grace period so cooperative providers can return their
-                    // confirmed terminal output, including bounded progress.
-                    let deadline = TokioInstant::now() + TOOL_CANCEL_GRACE_PERIOD;
+                    // Keep polling the original execution handles to their
+                    // provider-confirmed terminal result until the caller-selected
+                    // deadline. The execution remains owned even if this polling
+                    // future is later dropped.
+                    let deadline = TokioInstant::now()
+                        + self.tool_execution_policy.terminal_confirmation_timeout;
                     while !futures.is_empty() {
                         tokio::select! {
                             biased;
@@ -1318,6 +1388,9 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
                     // Engine/Worker final status becomes observable.
                     for (call_id, attempt_id) in &started_calls {
                         if !attempt_fence.is_terminal(call_id) {
+                            if let Some(handle) = execution_handles.get(call_id) {
+                                handle.force_close();
+                            }
                             self.finalize_and_commit_tool_result(
                                 history,
                                 annotate,
@@ -1336,7 +1409,11 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
             }
         }
 
-        Ok(ToolExecutionResult::Completed)
+        Ok(if pause_requested {
+            ToolExecutionResult::Paused
+        } else {
+            ToolExecutionResult::Completed
+        })
     }
 
     /// Apply post-execution policy, bound the model-visible payload, durably
@@ -1751,6 +1828,13 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
             let stream_started = Instant::now();
             let stream_result = tokio::select! {
                 stream_result = self.client.stream(request.clone()) => stream_result,
+                pause = self.pause_rx.recv() => {
+                    if pause.is_some() {
+                        info!("Paused before stream started");
+                    }
+                    self.timeline.abort_current_block();
+                    return Err(EngineError::PauseRequested);
+                }
                 cancel = self.cancel_rx.recv() => {
                     if cancel.is_some() {
                         info!("Cancelled before stream started");
@@ -1782,6 +1866,13 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
                     );
                     let first_event_result = tokio::select! {
                         first_event = wait_for_first_stream_event(stream, DEFAULT_FIRST_STREAM_EVENT_TIMEOUT) => first_event,
+                        pause = self.pause_rx.recv() => {
+                            if pause.is_some() {
+                                info!("Paused before first stream event");
+                            }
+                            self.timeline.abort_current_block();
+                            return Err(EngineError::PauseRequested);
+                        }
                         cancel = self.cancel_rx.recv() => {
                             if cancel.is_some() {
                                 info!("Cancelled before first stream event");
@@ -1868,6 +1959,13 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
 
             tokio::select! {
                 _ = tokio::time::sleep(wait) => {}
+                pause = self.pause_rx.recv() => {
+                    if pause.is_some() {
+                        info!("Paused during LLM retry backoff");
+                    }
+                    self.timeline.abort_current_block();
+                    return Err(EngineError::PauseRequested);
+                }
                 cancel = self.cancel_rx.recv() => {
                     if cancel.is_some() {
                         info!("Cancelled during LLM retry backoff");
@@ -1946,6 +2044,13 @@ impl<C: LlmClient, S: EngineState, A> Engine<C, S, A> {
                         None => break,
                     }
                 }
+                pause = self.pause_rx.recv() => {
+                    if pause.is_some() {
+                        info!("Paused during response stream");
+                    }
+                    self.timeline.abort_current_block();
+                    return Err(EngineError::PauseRequested);
+                }
                 cancel = self.cancel_rx.recv() => {
                     if cancel.is_some() {
                         info!("Stream cancelled");
@@ -1987,6 +2092,7 @@ impl<C: LlmClient, A> Engine<C, Mutable, A> {
         let thinking_block_collector = ThinkingBlockCollector::new();
         let mut timeline = Timeline::new();
         let (cancel_tx, cancel_rx) = mpsc::channel(1);
+        let (pause_tx, pause_rx) = mpsc::channel(1);
 
         // Register collectors with Timeline
         timeline.on_text_block(text_block_collector.clone());
@@ -2009,6 +2115,7 @@ impl<C: LlmClient, A> Engine<C, Mutable, A> {
             llm_call_count: 0,
             tool_execution_batch_count: 0,
             max_turns: None,
+            tool_execution_policy: ToolExecutionPolicy::default(),
             turn_start_cbs: Vec::new(),
             turn_end_cbs: Vec::new(),
             llm_call_start_cbs: Vec::new(),
@@ -2023,6 +2130,8 @@ impl<C: LlmClient, A> Engine<C, Mutable, A> {
             request_config: RequestConfig::default(),
             cancel_tx,
             cancel_rx,
+            pause_tx,
+            pause_rx,
             tool_output_limits: None,
             prune_config: None,
             token_estimator: None,
@@ -2281,6 +2390,7 @@ impl<C: LlmClient, A> Engine<C, Mutable, A> {
             llm_call_count: self.llm_call_count,
             tool_execution_batch_count: self.tool_execution_batch_count,
             max_turns: self.max_turns,
+            tool_execution_policy: self.tool_execution_policy,
             turn_start_cbs: self.turn_start_cbs,
             turn_end_cbs: self.turn_end_cbs,
             llm_call_start_cbs: self.llm_call_start_cbs,
@@ -2296,6 +2406,8 @@ impl<C: LlmClient, A> Engine<C, Mutable, A> {
 
             cancel_tx: self.cancel_tx,
             cancel_rx: self.cancel_rx,
+            pause_tx: self.pause_tx,
+            pause_rx: self.pause_rx,
             tool_output_limits: self.tool_output_limits,
             prune_config: self.prune_config,
             token_estimator: self.token_estimator,
@@ -2390,7 +2502,10 @@ impl<C: LlmClient, A> Engine<C, Locked, A> {
             self.append_history_items(history, extras, annotate)?;
         }
         self.start_logical_run();
-        let result = self.run_turn_loop(history, annotate).await;
+        let result = match self.run_turn_loop(history, annotate).await {
+            Err(EngineError::PauseRequested) => Ok(EngineResult::Paused),
+            other => other,
+        };
         let result = self.finalize_interruption(result).await;
         self.finish_logical_run(&result);
         result
@@ -2413,7 +2528,10 @@ impl<C: LlmClient, A> Engine<C, Locked, A> {
         annotate: &mut impl FnMut(&Item) -> Result<A, String>,
     ) -> Result<EngineResult, EngineError> {
         self.ensure_logical_run();
-        let result = self.run_turn_loop(history, annotate).await;
+        let result = match self.run_turn_loop(history, annotate).await {
+            Err(EngineError::PauseRequested) => Ok(EngineResult::Paused),
+            other => other,
+        };
         let result = self.finalize_interruption(result).await;
         self.finish_logical_run(&result);
         result
@@ -2445,6 +2563,7 @@ impl<C: LlmClient, A> Engine<C, Locked, A> {
             llm_call_count: self.llm_call_count,
             tool_execution_batch_count: self.tool_execution_batch_count,
             max_turns: self.max_turns,
+            tool_execution_policy: self.tool_execution_policy,
             turn_start_cbs: self.turn_start_cbs,
             turn_end_cbs: self.turn_end_cbs,
             llm_call_start_cbs: self.llm_call_start_cbs,
@@ -2460,6 +2579,8 @@ impl<C: LlmClient, A> Engine<C, Locked, A> {
 
             cancel_tx: self.cancel_tx,
             cancel_rx: self.cancel_rx,
+            pause_tx: self.pause_tx,
+            pause_rx: self.pause_rx,
             tool_output_limits: self.tool_output_limits,
             prune_config: self.prune_config,
             token_estimator: self.token_estimator,

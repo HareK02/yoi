@@ -3,7 +3,14 @@
 //! Traits for defining tools callable by LLM.
 //! Usually auto-implemented using the `#[tool]` macro.
 
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -350,6 +357,12 @@ impl ToolExecutionContext {
         }
     }
 
+    /// Identifies one live execution attempt without making the batch id a durable
+    /// replay or idempotency authority.
+    pub fn execution_id(&self) -> String {
+        format!("{}:{}", self.batch_id, self.call_id)
+    }
+
     /// Context for direct, non-engine calls in unit tests and low-level callers.
     pub fn direct() -> Self {
         Self::new("direct", "direct", 0)
@@ -359,6 +372,138 @@ impl ToolExecutionContext {
 impl Default for ToolExecutionContext {
     fn default() -> Self {
         Self::direct()
+    }
+}
+
+/// The provider-confirmed terminal result of one started tool execution.
+///
+/// `OutcomeUnknown` is reserved for an execution task that had to be force-closed
+/// or failed before the provider could confirm its terminal result.
+#[derive(Debug)]
+pub enum ToolExecutionTerminal {
+    Confirmed(Result<ToolOutput, ToolError>),
+    OutcomeUnknown,
+}
+
+/// The completion future paired with a [`ToolExecutionHandle`]. Dropping this
+/// future does not drop the provider execution: the spawned execution remains
+/// owned by its handle until it completes or is explicitly force-closed.
+pub struct ToolExecutionTerminalFuture {
+    task: tokio::task::JoinHandle<Result<ToolOutput, ToolError>>,
+}
+
+impl Future for ToolExecutionTerminalFuture {
+    type Output = ToolExecutionTerminal;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.task).poll(cx) {
+            Poll::Ready(Ok(result)) => Poll::Ready(ToolExecutionTerminal::Confirmed(result)),
+            Poll::Ready(Err(_)) => Poll::Ready(ToolExecutionTerminal::OutcomeUnknown),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Live ownership and control for one started tool execution.
+///
+/// Execution, cancellation, and terminal confirmation remain provider-owned:
+/// this handle starts `Tool::execute`, delegates cooperative cancellation to
+/// `Tool::cancel_execution`, and treats execution-future completion as the
+/// provider's terminal confirmation. Agen may force-close only after its caller's
+/// deadline expires, at which point the outcome is necessarily unknown.
+#[derive(Clone)]
+pub struct ToolExecutionHandle {
+    inner: Arc<ToolExecutionHandleInner>,
+}
+
+struct ToolExecutionHandleInner {
+    tool: Arc<dyn Tool>,
+    context: ToolExecutionContext,
+    abort: tokio::task::AbortHandle,
+}
+
+impl Drop for ToolExecutionHandleInner {
+    fn drop(&mut self) {
+        // Losing the final live owner is an explicit forced close, never a
+        // best-effort detached provider future.
+        self.abort.abort();
+    }
+}
+
+impl fmt::Debug for ToolExecutionHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ToolExecutionHandle")
+            .field("call_id", &self.inner.context.call_id)
+            .field("batch_id", &self.inner.context.batch_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ToolExecutionHandle {
+    pub fn start(
+        tool: Arc<dyn Tool>,
+        input_json: String,
+        context: ToolExecutionContext,
+    ) -> (Self, ToolExecutionTerminalFuture) {
+        let execution_tool = Arc::clone(&tool);
+        let execution_context = context.clone();
+        let task =
+            tokio::spawn(
+                async move { execution_tool.execute(&input_json, execution_context).await },
+            );
+        let abort = task.abort_handle();
+        (
+            Self {
+                inner: Arc::new(ToolExecutionHandleInner {
+                    tool,
+                    context,
+                    abort,
+                }),
+            },
+            ToolExecutionTerminalFuture { task },
+        )
+    }
+
+    pub fn context(&self) -> &ToolExecutionContext {
+        &self.inner.context
+    }
+
+    pub async fn cancel_before(&self, deadline: tokio::time::Instant) -> Result<(), ToolError> {
+        match tokio::time::timeout_at(
+            deadline,
+            self.inner.tool.cancel_execution(&self.inner.context),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(ToolError::Internal(format!(
+                "tool cancellation request exceeded its deadline for call {}",
+                self.inner.context.call_id
+            ))),
+        }
+    }
+
+    pub fn force_close(&self) {
+        self.inner.abort.abort();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolExecutionPolicy {
+    /// Maximum time allowed for a provider to accept one cooperative
+    /// cancellation request.
+    pub cancellation_request_timeout: std::time::Duration,
+    /// Maximum time allowed for all providers to confirm terminal results after
+    /// cancellation has been requested.
+    pub terminal_confirmation_timeout: std::time::Duration,
+}
+
+impl Default for ToolExecutionPolicy {
+    fn default() -> Self {
+        Self {
+            cancellation_request_timeout: std::time::Duration::from_millis(100),
+            terminal_confirmation_timeout: std::time::Duration::from_millis(500),
+        }
     }
 }
 
@@ -434,12 +579,21 @@ pub trait Tool: Send + Sync {
     /// Request cooperative cancellation for one started call.
     ///
     /// Implementations that own cancellable provider operations should signal
-    /// the exact execution identified by `call_id`, then let `execute` return
-    /// the confirmed bounded terminal output. The Engine applies a bounded
-    /// grace period and falls back to `OutcomeUnknown` when confirmation never
-    /// arrives.
+    /// every live execution identified by `call_id`, then let `execute` return
+    /// the confirmed bounded terminal output. Direct callers may use this
+    /// compatibility surface; Agen uses [`Tool::cancel_execution`] so providers
+    /// can bind cancellation to one exact live attempt.
     async fn cancel(&self, _call_id: &str) -> Result<(), ToolError> {
         Ok(())
+    }
+
+    /// Request cooperative cancellation for one exact started execution.
+    ///
+    /// The default preserves existing tools by delegating to `cancel(call_id)`.
+    /// Providers with their own execution registry should override this method
+    /// and key cancellation by [`ToolExecutionContext::execution_id`].
+    async fn cancel_execution(&self, ctx: &ToolExecutionContext) -> Result<(), ToolError> {
+        self.cancel(&ctx.call_id).await
     }
 }
 

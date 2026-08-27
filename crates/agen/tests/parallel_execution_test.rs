@@ -161,6 +161,55 @@ impl Tool for CooperativeCancelTool {
 }
 
 #[derive(Clone)]
+struct SafePauseTool {
+    calls: Arc<AtomicUsize>,
+    cancellations: Arc<AtomicUsize>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl SafePauseTool {
+    fn new() -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+            cancellations: Arc::new(AtomicUsize::new(0)),
+            release: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        let tool = self.clone();
+        Arc::new(move || {
+            let meta = ToolMeta::new("safe_pause")
+                .description("Waits for a safe-boundary release")
+                .input_schema(serde_json::json!({"type": "object"}));
+            (meta, Arc::new(tool.clone()) as Arc<dyn Tool>)
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for SafePauseTool {
+    async fn execute(
+        &self,
+        _input_json: &str,
+        _ctx: ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.release.notified().await;
+        Ok(ToolOutput {
+            summary: "safe-boundary complete".to_string(),
+            content: Some("safe-boundary complete".to_string()),
+            attachments: Vec::new(),
+        })
+    }
+
+    async fn cancel(&self, _call_id: &str) -> Result<(), ToolError> {
+        self.cancellations.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
 struct ContextRecordingTool {
     name: String,
     contexts: Arc<Mutex<Vec<ToolExecutionContext>>>,
@@ -533,6 +582,55 @@ async fn cooperative_cancellation_commits_bounded_terminal_output() {
         output.result,
         agen::EngineRunExit::Interrupted(agen::StopReason::Cancelled)
     ));
+}
+
+#[tokio::test]
+async fn pause_waits_for_started_tool_terminal_without_cancelling_provider() {
+    let client = MockLlmClient::with_responses(vec![vec![
+        Event::tool_use_start(0, "call_safe_pause", "safe_pause"),
+        Event::tool_input_delta(0, r#"{}"#),
+        Event::tool_use_stop(0),
+        Event::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        }),
+    ]]);
+    let mut engine = Engine::new(client);
+    let tool = SafePauseTool::new();
+    engine.register_tool(tool.definition());
+
+    let pause = engine.pause_sender();
+    let calls = Arc::clone(&tool.calls);
+    let release = Arc::clone(&tool.release);
+    let control = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("tool execution starts");
+        pause.send(()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        release.notify_one();
+    });
+
+    let started_at = std::time::Instant::now();
+    let mut history = History::new();
+    let output = engine.run(&mut history, "pause safely").await;
+    control.await.unwrap();
+
+    assert!(started_at.elapsed() >= Duration::from_millis(100));
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(tool.cancellations.load(Ordering::SeqCst), 0);
+    assert!(matches!(output.result, agen::EngineRunExit::Paused));
+    assert!(history.iter().any(|entry| matches!(
+        &entry.item,
+        Item::ToolResult {
+            call_id,
+            disposition: ToolResultDisposition::Success,
+            ..
+        } if call_id == "call_safe_pause"
+    )));
 }
 
 #[tokio::test]

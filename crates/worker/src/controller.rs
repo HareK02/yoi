@@ -485,6 +485,7 @@ impl WorkerController {
         // into the controller task so the in-flight turn can be reached
         // via these handles while worker itself is borrowed by drive_turn.
         let cancel_tx = worker.engine_mut().cancel_sender();
+        let pause_tx = worker.engine_mut().pause_sender();
         let notify_buffer = worker.notify_buffer_handle();
 
         tokio::spawn(controller_loop(
@@ -494,6 +495,7 @@ impl WorkerController {
             shared_state,
             runtime_dir,
             cancel_tx,
+            pause_tx,
             notify_buffer,
             self_parent_socket,
             spawner_name,
@@ -1136,6 +1138,7 @@ async fn controller_loop<C, St>(
     shared_state: Arc<WorkerSharedState>,
     runtime_dir: Arc<RuntimeDir>,
     cancel_tx: mpsc::Sender<()>,
+    pause_tx: mpsc::Sender<()>,
     notify_buffer: NotifyBuffer,
     self_parent_socket: Option<PathBuf>,
     spawner_name: String,
@@ -1207,6 +1210,7 @@ async fn controller_loop<C, St>(
                         &mut method_rx,
                         &event_tx,
                         &cancel_tx,
+                        &pause_tx,
                         &shared_state,
                         &runtime_dir,
                         Some(input_commit_rx),
@@ -1231,6 +1235,7 @@ async fn controller_loop<C, St>(
                         &mut method_rx,
                         &event_tx,
                         &cancel_tx,
+                        &pause_tx,
                         &shared_state,
                         &runtime_dir,
                         Some(input_commit_rx),
@@ -1248,6 +1253,7 @@ async fn controller_loop<C, St>(
                         &mut method_rx,
                         &event_tx,
                         &cancel_tx,
+                        &pause_tx,
                         &shared_state,
                         &runtime_dir,
                         None,
@@ -1265,6 +1271,7 @@ async fn controller_loop<C, St>(
                         &mut method_rx,
                         &event_tx,
                         &cancel_tx,
+                        &pause_tx,
                         &shared_state,
                         &runtime_dir,
                         None,
@@ -1664,6 +1671,7 @@ async fn drive_turn<F>(
     method_rx: &mut mpsc::Receiver<Method>,
     event_tx: &broadcast::Sender<Event>,
     cancel_tx: &mpsc::Sender<()>,
+    pause_tx: &mpsc::Sender<()>,
     shared_state: &Arc<WorkerSharedState>,
     runtime_dir: &RuntimeDir,
     mut input_commit_rx: Option<oneshot::Receiver<()>>,
@@ -1707,6 +1715,9 @@ where
                 return match result {
                     Ok(r) => {
                         let (status, run_result) = match r {
+                            WorkerRunResult::Finished if pause_requested => {
+                                (WorkerStatus::Paused, RunResult::Paused)
+                            }
                             WorkerRunResult::Finished => (WorkerStatus::Idle, RunResult::Finished),
                             WorkerRunResult::Paused => (WorkerStatus::Paused, RunResult::Paused),
                             WorkerRunResult::LimitReached => (WorkerStatus::Idle, RunResult::LimitReached),
@@ -1779,7 +1790,7 @@ where
                     }
                     Some(Method::Pause) => {
                         pause_requested = true;
-                        let _ = cancel_tx.try_send(());
+                        let _ = pause_tx.try_send(());
                     }
                     Some(Method::Shutdown) => {
                         shutdown_requested = true;
@@ -2031,6 +2042,8 @@ mod tests {
         event_tx: broadcast::Sender<Event>,
         cancel_tx: mpsc::Sender<()>,
         _cancel_rx: mpsc::Receiver<()>,
+        pause_tx: mpsc::Sender<()>,
+        _pause_rx: mpsc::Receiver<()>,
         shared_state: Arc<WorkerSharedState>,
         notify_buffer: NotifyBuffer,
         spawned_registry: Arc<SpawnedWorkerRegistry>,
@@ -2049,6 +2062,7 @@ mod tests {
         let (method_tx, method_rx) = mpsc::channel::<Method>(16);
         let (event_tx, _) = broadcast::channel::<Event>(16);
         let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
+        let (pause_tx, pause_rx) = mpsc::channel::<()>(1);
         let shared_state = Arc::new(WorkerSharedState::new(
             "child-worker".to_string(),
             session_store::new_segment_id(),
@@ -2074,6 +2088,8 @@ mod tests {
             event_tx,
             cancel_tx,
             _cancel_rx: cancel_rx,
+            pause_tx,
+            _pause_rx: pause_rx,
             shared_state,
             notify_buffer,
             spawned_registry,
@@ -2131,6 +2147,7 @@ mod tests {
             &mut env.method_rx,
             &env.event_tx,
             &env.cancel_tx,
+            &env.pause_tx,
             &env.shared_state,
             &env.runtime_dir,
             None,
@@ -2155,6 +2172,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pause_waits_for_run_boundary_and_uses_safe_pause_channel() {
+        let mut env = make_env().await;
+        let method_tx = env._method_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            method_tx.send(Method::Pause).await.expect("send pause");
+        });
+
+        let worker_future = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok::<_, WorkerError>(WorkerRunResult::Finished)
+        };
+        let started_at = std::time::Instant::now();
+        let (status, shutdown) = drive_turn(
+            worker_future,
+            &mut env.method_rx,
+            &env.event_tx,
+            &env.cancel_tx,
+            &env.pause_tx,
+            &env.shared_state,
+            &env.runtime_dir,
+            None,
+            &env.notify_buffer,
+            None,
+            "child-worker",
+            &env.spawned_registry,
+            true,
+        )
+        .await;
+
+        assert_eq!(status, WorkerStatus::Paused);
+        assert!(!shutdown);
+        assert!(started_at.elapsed() >= Duration::from_millis(100));
+        assert!(env._pause_rx.try_recv().is_ok());
+        assert!(env._cancel_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn non_parent_originated_finished_stays_silent() {
         let mut env = make_env().await;
         let listener = UnixListener::bind(&env.parent_socket_path).expect("bind listener");
@@ -2165,6 +2220,7 @@ mod tests {
             &mut env.method_rx,
             &env.event_tx,
             &env.cancel_tx,
+            &env.pause_tx,
             &env.shared_state,
             &env.runtime_dir,
             None,
@@ -2202,6 +2258,7 @@ mod tests {
             &mut env.method_rx,
             &env.event_tx,
             &env.cancel_tx,
+            &env.pause_tx,
             &env.shared_state,
             &env.runtime_dir,
             None,
@@ -2245,6 +2302,7 @@ mod tests {
             &mut env.method_rx,
             &env.event_tx,
             &env.cancel_tx,
+            &env.pause_tx,
             &env.shared_state,
             &env.runtime_dir,
             None,
@@ -2286,6 +2344,7 @@ mod tests {
             &mut env.method_rx,
             &env.event_tx,
             &env.cancel_tx,
+            &env.pause_tx,
             &env.shared_state,
             &env.runtime_dir,
             None,
@@ -2324,6 +2383,7 @@ mod tests {
             &mut env.method_rx,
             &env.event_tx,
             &env.cancel_tx,
+            &env.pause_tx,
             &env.shared_state,
             &env.runtime_dir,
             None,
@@ -2360,6 +2420,7 @@ mod tests {
             &mut env.method_rx,
             &env.event_tx,
             &env.cancel_tx,
+            &env.pause_tx,
             &env.shared_state,
             &env.runtime_dir,
             None,
@@ -2395,6 +2456,7 @@ mod tests {
             &mut env.method_rx,
             &env.event_tx,
             &env.cancel_tx,
+            &env.pause_tx,
             &env.shared_state,
             &env.runtime_dir,
             None,

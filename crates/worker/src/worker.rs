@@ -11,7 +11,7 @@ use agen::llm_client::types::Role;
 use agen::state::Mutable;
 use agen::{
     Engine, EngineError, EngineResult, EngineRunExit, History, HistoryEntry, Item, StopReason,
-    ToolOutputLimits, UsageRecord,
+    ToolExecutionPolicy, ToolOutputLimits, UsageRecord,
 };
 use arc_swap::ArcSwap;
 use session_store::{
@@ -5817,6 +5817,14 @@ pub fn apply_worker_manifest<C: LlmClient + 'static, A>(
 ) {
     worker.set_request_config(request_config_from_engine_manifest(wm));
     worker.set_max_turns(wm.max_turns.map(|n| n.get()));
+    // Worker owns the lifecycle strategy for already-started tool operations.
+    // The provider must first accept cooperative cancellation, then confirm a
+    // terminal result before this bounded deadline; Agen handles only the
+    // mechanical per-call terminalization.
+    worker.set_tool_execution_policy(ToolExecutionPolicy {
+        cancellation_request_timeout: Duration::from_millis(250),
+        terminal_confirmation_timeout: Duration::from_secs(2),
+    });
     worker.set_tool_output_limits(Some(ToolOutputLimits {
         default_max_bytes: wm.tool_output.default_max_bytes,
         per_tool: wm.tool_output.per_tool.clone(),
@@ -5932,6 +5940,7 @@ fn stop_reason_error_code(reason: &StopReason) -> ErrorCode {
         | StopReason::Unexpected(
             EngineError::Aborted(_)
             | EngineError::Cancelled
+            | EngineError::PauseRequested
             | EngineError::ConfigWarnings(_)
             | EngineError::HistoryAppend(_)
             | EngineError::ToolAttemptFence(_),
