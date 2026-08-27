@@ -390,6 +390,7 @@ fn planning_return_request(
     ReadyTicketPlanningReturnRequest {
         workspace_root: temp.path().to_path_buf(),
         ticket_id,
+        ticket_key: "T-482".to_string(),
         user_instruction: instruction.to_string(),
         followup: ReadyTicketPlanningReturnFollowup::BlockedByStaleClaim {
             worker_name: "stale-intake".to_string(),
@@ -494,6 +495,7 @@ fn ready_ticket_intake_enter_prepares_planning_return_not_queue_or_generic_launc
     };
 
     assert_eq!(request.ticket_id, "20260608-000123-ready");
+    assert_eq!(request.ticket_key, "T-1");
     assert_eq!(request.user_instruction, "clarify expected behavior");
     assert!(matches!(
         request.followup,
@@ -515,6 +517,7 @@ async fn planning_return_with_launch_followup_changes_state_before_launch_follow
     let request = ReadyTicketPlanningReturnRequest {
         workspace_root: temp.path().to_path_buf(),
         ticket_id: ticket_id.clone(),
+        ticket_key: "T-482".to_string(),
         user_instruction: "launch intake after state change".to_string(),
         followup: ReadyTicketPlanningReturnFollowup::LaunchIntake(IntakeLaunchRequest {
             context: TicketRoleLaunchContext::new(temp.path().to_path_buf(), TicketRole::Intake),
@@ -3502,6 +3505,27 @@ fn ticket_action_error_records_f2_diagnostic_details() {
         DashboardAction::None
     ));
     assert!(!app.panel_diagnostic_open);
+}
+
+#[test]
+fn ready_ticket_refinement_projection_uses_only_canonical_resource_key() {
+    const INTERNAL_ID: &str = "00001KZVNXFNK";
+    let thread = build_ready_ticket_refinement_thread_body("T-482", "Clarify rollback.");
+    let launch = build_ready_ticket_refinement_launch_instruction("T-482", "Clarify rollback.");
+    let notify = build_ready_ticket_refinement_notify("T-482", "Clarify rollback.");
+
+    for projection in [&thread, &launch, &notify] {
+        assert!(projection.contains("T-482"));
+        assert!(!projection.contains(INTERNAL_ID));
+    }
+}
+
+#[test]
+fn ticket_handoff_fails_closed_without_canonical_resource_key() {
+    assert_eq!(required_ticket_handoff_key(Some("T-482")), Ok("T-482"));
+    for invalid in [None, Some(""), Some("00001KZVNXFNK"), Some("T-key")] {
+        assert!(required_ticket_handoff_key(invalid).is_err());
+    }
 }
 
 fn plain_line(line: &Line<'_>) -> String {

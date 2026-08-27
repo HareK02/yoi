@@ -30,7 +30,6 @@ internalAgentsMdSection = import "./internal/agents_md_section.md";
 internalResidentMemorySummarySection = import "./internal/resident_memory_summary_section.md";
 internalSubWorkerSpawnToolDescription = import "./internal/sub_worker_spawn_tool_description.md";
 panelOrchestratorIdleQueueNotice = import "./panel/orchestrator_idle_queue_notice.md";
-workerTicketEventCompanionNotice = import "./worker/ticket_event_companion_notice.md";
 in
 {
     default_prompt = defaultDocument.content;
@@ -68,8 +67,5 @@ in
     };
     panel = {
         orchestrator_idle_queue_notice = panelOrchestratorIdleQueueNotice.content;
-    };
-    worker = {
-        ticket_event_companion_notice = workerTicketEventCompanionNotice.content;
     };
 }
