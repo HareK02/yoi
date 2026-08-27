@@ -313,26 +313,25 @@ Deno.test("projectConsole groups tool call lifecycle into one Call block", () =>
     !toolLines[0].streaming,
     "completed tool call should not remain streaming",
   );
-  assert(
-    toolLines[0].body.includes("$ pwd"),
-    "Bash command should be summarized",
-  );
+  assertEquals(toolLines[0].toolCallLabel, "Bash($ pwd)");
+  assertEquals(toolLines[0].toolStatus, "done");
   assert(
     toolLines[0].body.includes("/repo"),
     "tool result should be folded into the Call block",
   );
   assert(
     toolLines[0].body.includes("line9"),
-    "Bash result preview should include the ninth output line",
+    "Bash preview should include the ninth output line",
   );
   assert(
     !toolLines[0].body.includes("line10") &&
-      !toolLines[0].body.includes("line12"),
-    "Bash result preview should be capped at ten display lines",
+      toolLines[0].body.includes("… +3 more lines"),
+    "Bash preview should retain its line cap",
   );
   assert(
-    toolLines[0].body.includes("… +3 more lines"),
-    "Bash result preview should show omitted output count",
+    toolLines[0].expandedBody?.includes("line12") === true &&
+      !toolLines[0].expandedBody?.includes("more lines"),
+    "Bash detail should show every returned output line",
   );
   assert(
     toolLines[0].detail?.includes("id: call-1"),
@@ -421,7 +420,8 @@ Deno.test("projectConsole streams distinct Bash stdout and stderr through termin
   ]);
 
   const [line] = projection.lines.filter((line) => line.kind === "tool");
-  assert(line.body.includes("Bash — failed (exit 7)"), line.body);
+  assertEquals(line.toolCallLabel, "Bash($ long-command)");
+  assertEquals(line.toolStatus, "failed (exit 7)");
   assert(!line.body.includes("elapsed"), line.body);
   assert(!line.body.includes("stdout:"), line.body);
   assert(line.body.includes("ready\n"), line.body);
@@ -463,7 +463,8 @@ Deno.test("snapshot restores bounded in-flight Bash command output", () => {
 
   const projection = projectConsole([{ eventId: "snapshot-command", event: snapshot }]);
   const [line] = projection.lines.filter((line) => line.kind === "tool");
-  assert(line.body.includes("Bash — running…"), line.body);
+  assertEquals(line.toolCallLabel, "Bash($ slow)");
+  assertEquals(line.toolStatus, "running…");
   assert(!line.body.includes("elapsed"), line.body);
   assert(!line.body.includes("stdout:"), line.body);
   assert(line.body.includes("[… earlier stdout omitted]\ntail\n"), line.body);
@@ -474,7 +475,7 @@ Deno.test("snapshot restores bounded in-flight Bash command output", () => {
   assertEquals(line.streaming, true);
 });
 
-Deno.test("projectConsole caps default tool request and result previews", () => {
+Deno.test("projectConsole caps default preview but keeps complete detail body", () => {
   const projection = projectConsole([
     {
       eventId: "70",
@@ -508,19 +509,100 @@ Deno.test("projectConsole caps default tool request and result previews", () => 
 
   const [line] = projection.lines.filter((line) => line.kind === "tool");
   assertEquals(line.title, "Call · CustomTool");
-  assertEquals(line.body.split("\n").length, 7);
-  assert(line.body.includes("CustomTool — done"), "tool state should be shown");
+  assertEquals(line.toolCallLabel, 'CustomTool("first":"one","second":"two","third":"three","fourth":"four")');
+  assertEquals(line.toolStatus, "done");
+  assertEquals(line.body.split("\n").length, 3);
   assert(
-    line.body.includes('"first": "one"'),
-    "request preview should be shown",
+    line.body.includes("out1") && line.body.includes("… +3 more lines"),
+    "normal display should retain the capped response preview",
   );
-  assert(line.body.includes("out1"), "result preview should be shown");
-  assert(!line.body.includes("third"), "request preview should be capped");
-  assert(!line.body.includes("out3"), "result preview should be capped");
-  assert(line.body.includes("… +"), "overflow marker should be shown");
+  assert(!line.body.includes("first"), "request arguments should stay in the Call signature and detail");
+  assert(
+    line.detail?.includes("arguments:\nfirst: one") === true &&
+      line.detail?.includes("fourth: four") === true,
+    "detail metadata should render complete request arguments as YAML",
+  );
+  assert(
+    line.expandedBody?.includes("out5") === true &&
+      !line.expandedBody?.includes("more lines"),
+    "detail body should contain the complete result",
+  );
 });
 
-Deno.test("projectConsole shows Grep query and caps result preview to five entries", () => {
+Deno.test("projectConsole renders JSON tool responses as YAML", () => {
+  const projection = projectConsole([
+    {
+      eventId: "json-call",
+      event: {
+        event: "tool_call_done",
+        data: {
+          id: "json-tool",
+          name: "CustomTool",
+          arguments: "{}",
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "json-result",
+      event: {
+        event: "tool_result",
+        data: {
+          id: "json-tool",
+          summary: "json completed",
+          output: JSON.stringify({
+            status: "ok",
+            items: [{ id: 1 }, { id: 2 }],
+          }),
+          is_error: false,
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "invalid-json-call",
+      event: {
+        event: "tool_call_done",
+        data: {
+          id: "invalid-json-tool",
+          name: "CustomTool",
+          arguments: "{}",
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "invalid-json-result",
+      event: {
+        event: "tool_result",
+        data: {
+          id: "invalid-json-tool",
+          summary: "invalid json",
+          output: '{"status": broken}',
+          is_error: false,
+        },
+      } satisfies Event,
+    },
+  ]);
+
+  const toolLines = projection.lines.filter((line) => line.kind === "tool");
+  const jsonLine = toolLines.find((line) => line.id.includes("json-tool"));
+  const invalidLine = toolLines.find((line) => line.id.includes("invalid-json-tool"));
+  assert(jsonLine, "JSON tool line should be projected");
+  assert(invalidLine, "invalid JSON tool line should be projected");
+  assert(
+    jsonLine.expandedBody?.includes("status: ok") === true &&
+      jsonLine.expandedBody?.includes("  - id: 2") === true,
+    "detail body should serialize parsed JSON as YAML",
+  );
+  assert(
+    jsonLine.body.includes("more lines"),
+    "normal preview should cap the pretty-printed JSON",
+  );
+  assert(
+    invalidLine.expandedBody?.includes('{"status": broken}') === true,
+    "invalid JSON-looking output should remain unchanged",
+  );
+});
+
+Deno.test("projectConsole caps Grep preview but keeps complete detail body", () => {
   const projection = projectConsole([
     {
       eventId: "72",
@@ -549,17 +631,19 @@ Deno.test("projectConsole shows Grep query and caps result preview to five entri
 
   const [line] = projection.lines.filter((line) => line.kind === "tool");
   assertEquals(line.title, "Call · Grep");
-  assert(
-    line.body.includes("Grep — 6 matches"),
-    "Grep summary should be shown",
-  );
-  assert(line.body.includes("query: needle"), "Grep query should be shown");
+  assertEquals(line.toolCallLabel, "Grep(needle)");
+  assertEquals(line.toolStatus, "done");
   assert(line.body.includes("hit1"), "first result should be shown");
   assert(line.body.includes("hit5"), "fifth result should be shown");
-  assert(!line.body.includes("hit6"), "sixth result should be capped");
+  assert(!line.body.includes("hit6"), "normal preview should retain its result cap");
   assert(
     line.body.includes("… +1 more results"),
-    "overflow marker should be shown",
+    "preview should show the omitted result count",
+  );
+  assert(
+    line.expandedBody?.includes("hit6") === true &&
+      !line.expandedBody?.includes("more results"),
+    "detail body should show every Grep result",
   );
 });
 
@@ -594,17 +678,15 @@ Deno.test("projectConsole keeps Grep error detail in the body", () => {
 
   const [line] = projection.lines.filter((line) => line.kind === "tool");
   assertEquals(line.title, "Call · Grep");
-  assert(
-    line.body.includes("Grep — Failed"),
-    "error suffix should stay short",
-  );
+  assertEquals(line.toolCallLabel, "Grep(needle)");
+  assertEquals(line.toolStatus, "error");
   assert(
     line.body.includes(message),
     "error detail should remain visible in the body",
   );
   assert(
-    !line.body.includes(`Grep — ${message}`),
-    "error detail should not be repeated in the suffix",
+    !line.toolCallLabel?.includes(message),
+    "error detail should not be repeated in the Call signature",
   );
 });
 
@@ -879,9 +961,10 @@ Deno.test("projectConsole keeps streaming tool call updates in the same Call blo
   assertEquals(toolLines.length, 1);
   assertEquals(toolLines[0].title, "Call · Read");
   assert(toolLines[0].streaming, "streaming tool call should remain streaming");
+  assertEquals(toolLines[0].toolCallLabel, "Read(1 file)");
+  assertEquals(toolLines[0].toolStatus, "reading…");
   assert(
-    toolLines[0].body.includes("/tmp/a.md") &&
-      toolLines[0].body.includes("Read — reading"),
+    toolLines[0].body.includes("/tmp/a.md"),
     "Read call should render aggregate progress and path without content",
   );
 });
@@ -1018,10 +1101,8 @@ Deno.test("projectConsole aggregates Read calls without showing file content", (
   const toolLines = projection.lines.filter((line) => line.kind === "tool");
   assertEquals(toolLines.length, 1);
   assertEquals(toolLines[0].title, "Call · Read");
-  assert(
-    toolLines[0].body.includes("Read — 2 files read"),
-    "aggregate count should be shown",
-  );
+  assertEquals(toolLines[0].toolCallLabel, "Read(2 files)");
+  assertEquals(toolLines[0].toolStatus, "done");
   assert(
     toolLines[0].body.includes("/tmp/a.md"),
     "first path should be listed",
@@ -1073,7 +1154,9 @@ Deno.test("projectConsole renders Edit calls with structured diff lines", () => 
 
   const [line] = projection.lines.filter((line) => line.kind === "tool");
   assertEquals(line.title, "Call · Edit");
-  assert(line.body.includes("diff: -1 +2"), "diff summary should be shown");
+  assertEquals(line.toolCallLabel, "Edit(/tmp/a.md)");
+  assertEquals(line.toolStatus, "done");
+  assertEquals(line.body, "ok");
   assertEquals(line.diff?.map((row) => row.kind), [
     "context",
     "remove",
@@ -1242,13 +1325,13 @@ Deno.test("projectConsole renders snapshot entries and in-flight output", () => 
   assertEquals(projection.status, "running");
   assertEquals(
     projection.lines.map((line) =>
-      `${line.kind}:${line.body}:${line.streaming}`
+      `${line.kind}:${line.toolCallLabel ? `${line.toolCallLabel}\n${line.body}` : line.body}:${line.streaming}`
     ),
     [
       "user:seed user:false",
       "user:new user:false",
       "assistant:assistant reply:false",
-      "tool:Read — 1 file read\n  /tmp/a.md:false",
+      "tool:Read(1 file)\n  /tmp/a.md:false",
       "status:Compacting…:true",
       "in_flight:partial:true",
     ],
@@ -1476,25 +1559,26 @@ Deno.test("projectConsole relativizes known tool path displays from snapshot cwd
     },
   ]);
 
-  const bodies = projection.lines.filter((line) => line.kind === "tool").map((
-    line,
-  ) => line.body);
-  assertEquals(bodies[0], "Read — 1 file read\n  src/main.rs");
+  const toolLines = projection.lines.filter((line) => line.kind === "tool");
+  const bodies = toolLines.map((line) => line.body);
+  assertEquals(toolLines[0].toolCallLabel, "Read(1 file)");
+  assertEquals(bodies[0], "  src/main.rs");
   assert(
     projection.lines[0].detail?.includes("from src/main.rs"),
     "Read summary detail path should be relative",
   );
   assert(
-    bodies.some((body) =>
-      body.includes("Write — out.txt") && body.includes("Wrote out.txt")
+    toolLines.some((line) =>
+      line.toolCallLabel === "Write(out.txt)" && line.body.includes("Wrote out.txt")
     ),
-    "Write header and known result path should be relative",
+    "Write signature and known result path should be relative",
   );
   assert(
-    bodies.some((body) =>
-      body.includes("Edit — src/main.rs") && body.includes("Edited src/main.rs")
+    toolLines.some((line) =>
+      line.toolCallLabel === "Edit(src/main.rs)" &&
+      line.body.includes("Edited src/main.rs")
     ),
-    "Edit header and known result path should be relative",
+    "Edit signature and known result path should be relative",
   );
   assert(
     bodies.some((body) =>

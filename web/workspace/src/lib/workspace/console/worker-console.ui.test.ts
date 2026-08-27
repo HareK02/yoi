@@ -402,7 +402,7 @@ Deno.test("Worker Console renders markdown only for message rows", async () => {
       consoleLine.includes("item.kind === 'tool'") &&
       consoleLine.includes("{#if isBashTool(item)}") &&
       consoleLine.includes(
-        "<AnsiText text={bodyTextAfterToolSummary(item)} />",
+        "<AnsiText text={toolBodyText(item)} />",
       ) &&
       consoleLine.includes(
         ".console-line.tool-bash .console-plain-text",
@@ -416,6 +416,30 @@ Deno.test("Worker Console renders markdown only for message rows", async () => {
       consoleLine.includes("<RichMarkdown text={item.body || '—'} />") &&
       !consoleLine.includes("{@html"),
     "Console should keep markdown rendering to message bodies, safely project Bash ANSI, and render other tool text literally",
+  );
+});
+
+Deno.test("Worker Console expands uncapped tool body from the hover detail action", async () => {
+  const consoleLine = await Deno.readTextFile(
+    new URL("./ConsoleLineItem.svelte", import.meta.url),
+  );
+
+  assert(
+    consoleLine.includes(
+      "return detailOpen ? (line.expandedBody ?? line.body) : line.body",
+    ) &&
+      consoleLine.includes("line.toolCallLabel ?? line.toolCall?.name") &&
+      consoleLine.includes('class={`tool-status') &&
+      consoleLine.includes('class="tool-detail-button"') &&
+      consoleLine.includes("aria-expanded={detailOpen}") &&
+      consoleLine.includes("detailOpen = !detailOpen") &&
+      consoleLine.includes("item.detail && detailOpen") &&
+      consoleLine.includes('role="region"') &&
+      consoleLine.includes(".console-line:hover .tool-detail-button") &&
+      consoleLine.includes(".tool-detail-button:focus-visible") &&
+      consoleLine.includes("@media (hover: none)") &&
+      !consoleLine.includes('<details class="message-detail">'),
+    "Normal tool display should keep its preview while detail reveals the uncapped body and existing metadata",
   );
 });
 
