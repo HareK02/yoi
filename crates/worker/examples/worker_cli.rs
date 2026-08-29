@@ -66,11 +66,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         WorkerRunResult::Finished => println!("(finished)"),
         WorkerRunResult::Paused => println!("(paused)"),
         WorkerRunResult::LimitReached => println!("(turn limit reached)"),
+        WorkerRunResult::Interrupted { message, .. } => println!("(interrupted: {message})"),
         WorkerRunResult::RolledBack => println!("(empty turn rolled back)"),
     }
 
     // 5. Extract the assistant's reply from history
-    let history = worker.engine().history();
+    let history = worker.history();
     if let Some(text) = history
         .iter()
         .rev()

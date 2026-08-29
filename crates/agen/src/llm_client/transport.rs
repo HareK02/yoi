@@ -431,13 +431,7 @@ fn api_error_code(error: &ClientError) -> Option<&str> {
 }
 
 fn is_context_length_exceeded(error: &ClientError) -> bool {
-    match error {
-        ClientError::Api { code, message, .. } => {
-            code.as_deref() == Some("context_length_exceeded")
-                || message.contains("context_length_exceeded")
-        }
-        _ => false,
-    }
+    matches!(error, ClientError::ContextWindowExceeded)
 }
 
 async fn response_with_timeout(
@@ -487,6 +481,9 @@ async fn classify_error_response(resp: reqwest::Response) -> ClientError {
             .and_then(|v| v.as_str())
             .unwrap_or(&text)
             .to_string();
+        if code.as_deref() == Some("context_length_exceeded") {
+            return ClientError::ContextWindowExceeded;
+        }
         ClientError::Api {
             status: Some(status),
             code,

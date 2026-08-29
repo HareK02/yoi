@@ -8,6 +8,7 @@
   };
 
   let { item }: Props = $props();
+  let detailOpen = $state(false);
   let nowMs = $state(Date.now());
 
   $effect(() => {
@@ -55,22 +56,20 @@
       line.kind !== 'activity' && line.kind !== 'task_reminder' && line.kind !== 'run_stats';
   }
 
-  function toolSummary(line: ConsoleLine): { label: string; suffix: string; rest: string } {
-    const [firstLine = '', ...rest] = line.body.split('\n');
-    const [label, suffix = ''] = firstLine.split(' — ', 2);
-    return {
-      label,
-      suffix,
-      rest: rest.join('\n')
-    };
+  function toolLabel(line: ConsoleLine): string {
+    return line.toolCallLabel ?? line.toolCall?.name ?? line.title;
+  }
+
+  function toolStatus(line: ConsoleLine): string {
+    return line.toolStatus ?? line.toolCall?.state ?? '';
   }
 
   function shouldRenderMarkdown(line: ConsoleLine): boolean {
     return line.kind === 'user' || line.kind === 'assistant' || line.kind === 'system';
   }
 
-  function bodyTextAfterToolSummary(line: ConsoleLine): string {
-    return toolSummary(line).rest;
+  function toolBodyText(line: ConsoleLine): string {
+    return detailOpen ? (line.expandedBody ?? line.body) : line.body;
   }
 </script>
 
@@ -107,20 +106,27 @@
     </div>
   {:else if item.kind === 'tool'}
     <div class="tool-summary">
-      <span class="tool-label">{toolSummary(item).label}</span>
-      <span class="tool-separator"> — </span>
-      <span class={`tool-suffix ${item.toolCall?.state ?? ''}`}>{toolSummary(item).suffix}</span>
+      <span class="tool-label">{toolLabel(item)}</span>
+      <span class={`tool-status ${item.toolCall?.state ?? ''}`}>{toolStatus(item)}</span>
+      {#if item.detail}
+        <button
+          type="button"
+          class="tool-detail-button"
+          aria-expanded={detailOpen}
+          onclick={() => (detailOpen = !detailOpen)}
+        >detail</button>
+      {/if}
     </div>
   {/if}
   {#if item.compaction}
     <!-- rendered as one lifecycle item above -->
   {:else if item.kind === 'tool'}
-    {#if bodyTextAfterToolSummary(item)}
+    {#if toolBodyText(item)}
       <p class="console-plain-text">
         {#if isBashTool(item)}
-          <AnsiText text={bodyTextAfterToolSummary(item)} />
+          <AnsiText text={toolBodyText(item)} />
         {:else}
-          {bodyTextAfterToolSummary(item)}
+          {toolBodyText(item)}
         {/if}
       </p>
     {/if}
@@ -147,11 +153,10 @@
       {/each}
     </div>
   {/if}
-  {#if item.detail}
-    <details class="message-detail">
-      <summary>detail</summary>
+  {#if item.detail && detailOpen}
+    <div class="message-detail" role="region" aria-label={`${toolLabel(item)} detail`}>
       <p>{item.detail}</p>
-    </details>
+    </div>
   {/if}
 </li>
 
@@ -306,46 +311,44 @@
   .tool-summary {
     display: flex;
     align-items: baseline;
-    gap: 0;
+    gap: 0.5rem;
     color: var(--text-muted);
     font-size: 0.88rem;
     font-weight: 750;
   }
 
   .tool-label {
-    flex: 0 0 auto;
-    color: var(--tui-cyan);
-    white-space: nowrap;
-  }
-
-  .tool-separator {
-    flex: 0 0 auto;
-    white-space: nowrap;
-  }
-
-  .tool-suffix {
     flex: 1 1 auto;
     min-width: 0;
-    overflow-wrap: anywhere;
+    overflow: hidden;
+    color: var(--tui-cyan);
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
-  .tool-separator,
-  .tool-suffix {
+  .tool-status {
+    flex: 0 0 auto;
     color: var(--tui-dark-gray);
+    font-size: 0.72rem;
+    white-space: nowrap;
   }
 
-  .tool-state-error .tool-suffix {
+  .tool-state-error .tool-status {
     color: var(--tui-red);
   }
 
-  .tool-state-running .tool-suffix,
-  .tool-state-streaming_args .tool-suffix,
-  .tool-state-pending .tool-suffix {
+  .tool-state-running .tool-status,
+  .tool-state-streaming_args .tool-status,
+  .tool-state-pending .tool-status {
     color: var(--tui-yellow);
   }
 
-  .tool-state-done .tool-suffix {
+  .tool-state-done .tool-status {
     color: var(--tui-dark-gray);
+  }
+
+  .console-line.error-line .tool-status {
+    color: var(--tui-red);
   }
 
   .message-heading {
@@ -412,13 +415,47 @@
     color: var(--code);
   }
 
+  .tool-detail-button {
+    margin-inline-start: auto;
+    border: 1px solid var(--line);
+    border-radius: 0.35rem;
+    padding: 0.08rem 0.35rem;
+    background: var(--bg-raised);
+    color: var(--text-muted);
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.68rem;
+    font-weight: 750;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 120ms ease;
+  }
+
+  .console-line:hover .tool-detail-button,
+  .tool-detail-button:focus-visible,
+  .tool-detail-button[aria-expanded='true'] {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
   .message-detail {
+    margin-top: 0.35rem;
+    border-left: 2px solid var(--line);
+    padding-left: 0.6rem;
     color: var(--text-muted);
     font-size: 0.84rem;
   }
 
-  .message-detail summary {
-    cursor: pointer;
-    font-weight: 800;
+  .message-detail p {
+    margin: 0;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+  }
+
+  @media (hover: none) {
+    .tool-detail-button {
+      opacity: 1;
+      pointer-events: auto;
+    }
   }
 </style>

@@ -18,6 +18,9 @@ pub enum ClientError {
         message: String,
         retry_after: Option<Duration>,
     },
+    /// The provider rejected the request because it exceeded the model context window.
+    /// Classified only from a structured provider error code, never message text.
+    ContextWindowExceeded,
     /// A request lifecycle phase exceeded its hard timeout.
     Timeout {
         phase: &'static str,
@@ -48,6 +51,7 @@ impl fmt::Display for ClientError {
                 }
                 write!(f, ": {}", message)
             }
+            ClientError::ContextWindowExceeded => write!(f, "Model context window reached"),
             ClientError::Timeout { phase, timeout } => {
                 write!(f, "{phase} timed out after {}s", timeout.as_secs())
             }
@@ -112,7 +116,10 @@ pub fn is_retryable(error: &ClientError) -> bool {
         ClientError::Api { status: None, .. } => false,
         ClientError::Timeout { .. } => true,
         ClientError::Http(e) => e.is_connect() || e.is_timeout(),
-        ClientError::Json(_) | ClientError::Sse(_) | ClientError::Config(_) => false,
+        ClientError::ContextWindowExceeded
+        | ClientError::Json(_)
+        | ClientError::Sse(_)
+        | ClientError::Config(_) => false,
     }
 }
 

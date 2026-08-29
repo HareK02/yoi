@@ -485,6 +485,7 @@ impl WorkerController {
         // into the controller task so the in-flight turn can be reached
         // via these handles while worker itself is borrowed by drive_turn.
         let cancel_tx = worker.engine_mut().cancel_sender();
+        let pause_tx = worker.engine_mut().pause_sender();
         let notify_buffer = worker.notify_buffer_handle();
 
         tokio::spawn(controller_loop(
@@ -494,6 +495,7 @@ impl WorkerController {
             shared_state,
             runtime_dir,
             cancel_tx,
+            pause_tx,
             notify_buffer,
             self_parent_socket,
             spawner_name,
@@ -763,6 +765,19 @@ pub(crate) fn wire_event_bridges_on_engine<C, St>(
             id: result.tool_use_id.clone(),
             summary: result.summary.clone(),
             output: result.content.clone(),
+            disposition: Some(match result.disposition {
+                agen::ToolResultDisposition::Success => protocol::ToolResultDisposition::Success,
+                agen::ToolResultDisposition::Error => protocol::ToolResultDisposition::Error,
+                agen::ToolResultDisposition::Interrupted => {
+                    protocol::ToolResultDisposition::Interrupted
+                }
+                agen::ToolResultDisposition::Cancelled => {
+                    protocol::ToolResultDisposition::Cancelled
+                }
+                agen::ToolResultDisposition::OutcomeUnknown => {
+                    protocol::ToolResultDisposition::OutcomeUnknown
+                }
+            }),
             is_error: result.is_error,
         });
     });
@@ -1115,6 +1130,7 @@ async fn controller_loop<C, St>(
     shared_state: Arc<WorkerSharedState>,
     runtime_dir: Arc<RuntimeDir>,
     cancel_tx: mpsc::Sender<()>,
+    pause_tx: mpsc::Sender<()>,
     notify_buffer: NotifyBuffer,
     self_parent_socket: Option<PathBuf>,
     spawner_name: String,
@@ -1161,22 +1177,35 @@ async fn controller_loop<C, St>(
             // clear at run start prevents stale partial output left by an older
             // interrupted/error turn from being carried into the next snapshot.
             worker.clear_in_flight_events();
-            set_controller_status(
-                &shared_state,
-                &runtime_dir,
-                &event_tx,
-                WorkerStatus::Running,
-            )
-            .await;
             let parent_originated = run.is_parent_originated();
+            let user_input_run = matches!(&run, PendingRun::Run(_) | PendingRun::RunTracked { .. });
+            if !user_input_run {
+                set_controller_status(
+                    &shared_state,
+                    &runtime_dir,
+                    &event_tx,
+                    WorkerStatus::Running,
+                )
+                .await;
+            }
             let (mut new_status, shutdown) = match run {
                 PendingRun::Run(input) => {
+                    let (input_commit_tx, input_commit_rx) = oneshot::channel();
                     drive_turn(
-                        worker.run(input),
+                        worker.run_with_input_extensions_and_commit_hook(
+                            input,
+                            Vec::new(),
+                            move || {
+                                let _ = input_commit_tx.send(());
+                            },
+                        ),
                         &mut method_rx,
                         &event_tx,
                         &cancel_tx,
+                        &pause_tx,
                         &shared_state,
+                        &runtime_dir,
+                        Some(input_commit_rx),
                         &notify_buffer,
                         self_parent_socket.as_ref(),
                         &spawner_name,
@@ -1186,12 +1215,22 @@ async fn controller_loop<C, St>(
                     .await
                 }
                 PendingRun::RunTracked { input, extension } => {
+                    let (input_commit_tx, input_commit_rx) = oneshot::channel();
                     drive_turn(
-                        worker.run_with_input_extensions(input, vec![extension]),
+                        worker.run_with_input_extensions_and_commit_hook(
+                            input,
+                            vec![extension],
+                            move || {
+                                let _ = input_commit_tx.send(());
+                            },
+                        ),
                         &mut method_rx,
                         &event_tx,
                         &cancel_tx,
+                        &pause_tx,
                         &shared_state,
+                        &runtime_dir,
+                        Some(input_commit_rx),
                         &notify_buffer,
                         self_parent_socket.as_ref(),
                         &spawner_name,
@@ -1206,7 +1245,10 @@ async fn controller_loop<C, St>(
                         &mut method_rx,
                         &event_tx,
                         &cancel_tx,
+                        &pause_tx,
                         &shared_state,
+                        &runtime_dir,
+                        None,
                         &notify_buffer,
                         self_parent_socket.as_ref(),
                         &spawner_name,
@@ -1221,7 +1263,10 @@ async fn controller_loop<C, St>(
                         &mut method_rx,
                         &event_tx,
                         &cancel_tx,
+                        &pause_tx,
                         &shared_state,
+                        &runtime_dir,
+                        None,
                         &notify_buffer,
                         self_parent_socket.as_ref(),
                         &spawner_name,
@@ -1346,7 +1391,7 @@ async fn controller_loop<C, St>(
                         });
                     }
                 },
-                WorkerStatus::Idle => {
+                WorkerStatus::Idle | WorkerStatus::Stopped => {
                     let _ = event_tx.send(Event::Error {
                         code: ErrorCode::NotRunning,
                         message: "Worker is not running".into(),
@@ -1387,7 +1432,7 @@ async fn controller_loop<C, St>(
                             .into(),
                     });
                 }
-                WorkerStatus::Running => {
+                WorkerStatus::Running | WorkerStatus::Stopped => {
                     let _ = event_tx.send(Event::Error {
                         code: ErrorCode::AlreadyRunning,
                         message:
@@ -1401,7 +1446,7 @@ async fn controller_loop<C, St>(
                 WorkerStatus::Idle | WorkerStatus::Paused => {
                     emit_rewind_targets(&worker, &event_tx)
                 }
-                WorkerStatus::Running => {
+                WorkerStatus::Running | WorkerStatus::Stopped => {
                     let _ = event_tx.send(Event::Error {
                         code: ErrorCode::AlreadyRunning,
                         message: "Worker is already executing a turn; rewind can only run while idle or paused"
@@ -1430,7 +1475,7 @@ async fn controller_loop<C, St>(
                             .into(),
                     });
                 }
-                WorkerStatus::Running => {
+                WorkerStatus::Running | WorkerStatus::Stopped => {
                     let _ = event_tx.send(Event::Error {
                         code: ErrorCode::AlreadyRunning,
                         message: "Worker is already executing a turn; rewind can only run while idle or paused"
@@ -1618,7 +1663,10 @@ async fn drive_turn<F>(
     method_rx: &mut mpsc::Receiver<Method>,
     event_tx: &broadcast::Sender<Event>,
     cancel_tx: &mpsc::Sender<()>,
+    pause_tx: &mpsc::Sender<()>,
     shared_state: &Arc<WorkerSharedState>,
+    runtime_dir: &RuntimeDir,
+    mut input_commit_rx: Option<oneshot::Receiver<()>>,
     notify_buffer: &NotifyBuffer,
     parent_socket: Option<&PathBuf>,
     self_name: &str,
@@ -1634,14 +1682,58 @@ where
 
     loop {
         tokio::select! {
+            // If input commit and provider completion become ready together, expose
+            // Running only after processing the commit fence. This makes the
+            // Running snapshot contract deterministic even for immediate clients.
+            biased;
+            committed = async {
+                input_commit_rx
+                    .as_mut()
+                    .expect("input commit receiver guarded by select condition")
+                    .await
+            }, if input_commit_rx.is_some() => {
+                input_commit_rx = None;
+                if committed.is_ok() {
+                    set_controller_status(
+                        shared_state,
+                        runtime_dir,
+                        event_tx,
+                        WorkerStatus::Running,
+                    )
+                    .await;
+                }
+            }
             result = &mut worker_future => {
                 return match result {
                     Ok(r) => {
                         let (status, run_result) = match r {
+                            WorkerRunResult::Finished if pause_requested => {
+                                (WorkerStatus::Paused, RunResult::Paused)
+                            }
                             WorkerRunResult::Finished => (WorkerStatus::Idle, RunResult::Finished),
                             WorkerRunResult::Paused => (WorkerStatus::Paused, RunResult::Paused),
                             WorkerRunResult::LimitReached => (WorkerStatus::Idle, RunResult::LimitReached),
                             WorkerRunResult::RolledBack => (WorkerStatus::Idle, RunResult::RolledBack),
+                            WorkerRunResult::Interrupted { .. } if pause_requested => {
+                                let _ = event_tx.send(Event::RunEnd { result: RunResult::Paused });
+                                return (WorkerStatus::Paused, shutdown_requested);
+                            }
+                            WorkerRunResult::Interrupted { code, message } => {
+                                let _ = event_tx.send(Event::Error {
+                                    code,
+                                    message: message.clone(),
+                                });
+                                if parent_originated {
+                                    crate::ipc::event::fire_and_forget(
+                                        parent_socket.cloned(),
+                                        protocol::WorkerEvent::Errored {
+                                            worker_name: self_name.to_string(),
+                                            message,
+                                        },
+                                    );
+                                }
+                                return (WorkerStatus::Idle, shutdown_requested);
+                            }
                         };
                         let _ = event_tx.send(Event::RunEnd { result: run_result });
                         if parent_originated && matches!(run_result, RunResult::Finished) {
@@ -1690,7 +1782,7 @@ where
                     }
                     Some(Method::Pause) => {
                         pause_requested = true;
-                        let _ = cancel_tx.try_send(());
+                        let _ = pause_tx.try_send(());
                     }
                     Some(Method::Shutdown) => {
                         shutdown_requested = true;
@@ -1752,7 +1844,7 @@ where
 
 fn emit_rewind_targets<C, St>(worker: &Worker<C, St>, event_tx: &broadcast::Sender<Event>)
 where
-    C: LlmClient,
+    C: LlmClient + 'static,
     St: Store,
 {
     match worker.list_rewind_targets() {
@@ -1778,7 +1870,7 @@ fn apply_rewind<C, St>(
     expected_head_entries: usize,
 ) -> bool
 where
-    C: LlmClient,
+    C: LlmClient + 'static,
     St: Store,
 {
     match worker.rewind_to(target, expected_head_entries) {
@@ -1826,7 +1918,7 @@ fn model_supports_image_attachments(model: &manifest::ModelManifest) -> bool {
 
 fn build_greeting<C, St>(worker: &Worker<C, St>) -> protocol::Greeting
 where
-    C: LlmClient,
+    C: LlmClient + 'static,
     St: Store,
 {
     let manifest = worker.manifest();
@@ -1942,11 +2034,13 @@ mod tests {
         event_tx: broadcast::Sender<Event>,
         cancel_tx: mpsc::Sender<()>,
         _cancel_rx: mpsc::Receiver<()>,
+        pause_tx: mpsc::Sender<()>,
+        _pause_rx: mpsc::Receiver<()>,
         shared_state: Arc<WorkerSharedState>,
         notify_buffer: NotifyBuffer,
         spawned_registry: Arc<SpawnedWorkerRegistry>,
         parent_socket_path: PathBuf,
-        _runtime_dir: Arc<RuntimeDir>,
+        runtime_dir: Arc<RuntimeDir>,
         _temp: TempDir,
     }
 
@@ -1960,6 +2054,7 @@ mod tests {
         let (method_tx, method_rx) = mpsc::channel::<Method>(16);
         let (event_tx, _) = broadcast::channel::<Event>(16);
         let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
+        let (pause_tx, pause_rx) = mpsc::channel::<()>(1);
         let shared_state = Arc::new(WorkerSharedState::new(
             "child-worker".to_string(),
             session_store::new_segment_id(),
@@ -1985,11 +2080,13 @@ mod tests {
             event_tx,
             cancel_tx,
             _cancel_rx: cancel_rx,
+            pause_tx,
+            _pause_rx: pause_rx,
             shared_state,
             notify_buffer,
             spawned_registry,
             parent_socket_path,
-            _runtime_dir: runtime_dir,
+            runtime_dir,
             _temp: temp,
         }
     }
@@ -2042,7 +2139,10 @@ mod tests {
             &mut env.method_rx,
             &env.event_tx,
             &env.cancel_tx,
+            &env.pause_tx,
             &env.shared_state,
+            &env.runtime_dir,
+            None,
             &env.notify_buffer,
             Some(&env.parent_socket_path),
             "child-worker",
@@ -2064,6 +2164,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pause_waits_for_run_boundary_and_uses_safe_pause_channel() {
+        let mut env = make_env().await;
+        let method_tx = env._method_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            method_tx.send(Method::Pause).await.expect("send pause");
+        });
+
+        let worker_future = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok::<_, WorkerError>(WorkerRunResult::Finished)
+        };
+        let started_at = std::time::Instant::now();
+        let (status, shutdown) = drive_turn(
+            worker_future,
+            &mut env.method_rx,
+            &env.event_tx,
+            &env.cancel_tx,
+            &env.pause_tx,
+            &env.shared_state,
+            &env.runtime_dir,
+            None,
+            &env.notify_buffer,
+            None,
+            "child-worker",
+            &env.spawned_registry,
+            true,
+        )
+        .await;
+
+        assert_eq!(status, WorkerStatus::Paused);
+        assert!(!shutdown);
+        assert!(started_at.elapsed() >= Duration::from_millis(100));
+        assert!(env._pause_rx.try_recv().is_ok());
+        assert!(env._cancel_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn non_parent_originated_finished_stays_silent() {
         let mut env = make_env().await;
         let listener = UnixListener::bind(&env.parent_socket_path).expect("bind listener");
@@ -2074,7 +2212,10 @@ mod tests {
             &mut env.method_rx,
             &env.event_tx,
             &env.cancel_tx,
+            &env.pause_tx,
             &env.shared_state,
+            &env.runtime_dir,
+            None,
             &env.notify_buffer,
             Some(&env.parent_socket_path),
             "child-worker",
@@ -2109,7 +2250,10 @@ mod tests {
             &mut env.method_rx,
             &env.event_tx,
             &env.cancel_tx,
+            &env.pause_tx,
             &env.shared_state,
+            &env.runtime_dir,
+            None,
             &env.notify_buffer,
             Some(&env.parent_socket_path),
             "child-worker",
@@ -2150,7 +2294,10 @@ mod tests {
             &mut env.method_rx,
             &env.event_tx,
             &env.cancel_tx,
+            &env.pause_tx,
             &env.shared_state,
+            &env.runtime_dir,
+            None,
             &env.notify_buffer,
             Some(&env.parent_socket_path),
             "child-worker",
@@ -2189,7 +2336,10 @@ mod tests {
             &mut env.method_rx,
             &env.event_tx,
             &env.cancel_tx,
+            &env.pause_tx,
             &env.shared_state,
+            &env.runtime_dir,
+            None,
             &env.notify_buffer,
             Some(&env.parent_socket_path),
             "parent",
@@ -2225,7 +2375,10 @@ mod tests {
             &mut env.method_rx,
             &env.event_tx,
             &env.cancel_tx,
+            &env.pause_tx,
             &env.shared_state,
+            &env.runtime_dir,
+            None,
             &env.notify_buffer,
             Some(&env.parent_socket_path),
             "parent",
@@ -2259,7 +2412,10 @@ mod tests {
             &mut env.method_rx,
             &env.event_tx,
             &env.cancel_tx,
+            &env.pause_tx,
             &env.shared_state,
+            &env.runtime_dir,
+            None,
             &env.notify_buffer,
             Some(&env.parent_socket_path),
             "parent",
@@ -2292,7 +2448,10 @@ mod tests {
             &mut env.method_rx,
             &env.event_tx,
             &env.cancel_tx,
+            &env.pause_tx,
             &env.shared_state,
+            &env.runtime_dir,
+            None,
             &env.notify_buffer,
             Some(&env.parent_socket_path),
             "child-worker",

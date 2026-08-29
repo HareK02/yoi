@@ -1,5 +1,6 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
@@ -20,21 +21,65 @@ struct BashParams {
 
 pub(crate) struct BashTool {
     session: WorkdirSessionHandle,
+    state: Arc<Mutex<BashExecutionState>>,
+}
+
+#[derive(Clone)]
+struct ActiveCommand {
+    call_id: String,
+    execution_nonce: u64,
+    handle: CommandHandle,
+}
+
+#[derive(Default)]
+struct BashExecutionState {
+    active: HashMap<String, ActiveCommand>,
+    cancellation_requested: HashSet<String>,
+    legacy_cancellation_requested: HashSet<String>,
+    next_execution_nonce: u64,
 }
 
 struct CommandGuard {
     session: WorkdirSessionHandle,
+    state: Arc<Mutex<BashExecutionState>>,
+    execution_id: String,
+    execution_nonce: u64,
     handle: Option<CommandHandle>,
 }
 
 impl Drop for CommandGuard {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            let workdir = self.session.clone();
-            tokio::spawn(async move {
-                let _ = workdir.cancel_command(handle).await;
-            });
-        }
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let workdir = self.session.clone();
+        let state = Arc::clone(&self.state);
+        let execution_id = self.execution_id.clone();
+        let execution_nonce = self.execution_nonce;
+        // A dropped provider future is not terminal confirmation. Keep the live
+        // execution registered until cleanup has both requested cancellation and
+        // observed terminal command output, so cancellation/session teardown
+        // cannot race with an apparently empty registry.
+        tokio::spawn(async move {
+            let _ = workdir.cancel_command(handle.clone()).await;
+            let _ = workdir
+                .command_output(CommandOutputRequest {
+                    handle,
+                    cursor: 0,
+                    limit: INLINE_BYTE_BUDGET,
+                    wait: true,
+                })
+                .await;
+            let mut state = state.lock().unwrap();
+            if state
+                .active
+                .get(&execution_id)
+                .is_some_and(|active| active.execution_nonce == execution_nonce)
+            {
+                state.active.remove(&execution_id);
+                state.cancellation_requested.remove(&execution_id);
+            }
+        });
     }
 }
 
@@ -52,20 +97,50 @@ impl Tool for BashTool {
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .clamp(1, MAX_TIMEOUT_SECS);
         let cmd_summary = truncate_for_summary(&params.command);
+        let execution_id = ctx.execution_id();
+        let call_id = ctx.call_id;
+        let execution_nonce = {
+            let mut state = self.state.lock().unwrap();
+            state.next_execution_nonce = state.next_execution_nonce.wrapping_add(1);
+            state.next_execution_nonce
+        };
+        let mut guard = CommandGuard {
+            session: self.session.clone(),
+            state: self.state.clone(),
+            execution_id: execution_id.clone(),
+            execution_nonce,
+            handle: None,
+        };
         let handle = self
             .session
             .start_command(CommandRequest {
                 command: params.command,
                 timeout_secs,
                 output_limit: INLINE_BYTE_BUDGET,
-                tool_call_id: Some(ctx.call_id),
+                tool_call_id: Some(call_id.clone()),
             })
             .await
             .map_err(crate::ToolsError::from)?;
-        let mut guard = CommandGuard {
-            session: self.session.clone(),
-            handle: Some(handle.clone()),
+        let cancel_after_start = {
+            let mut state = self.state.lock().unwrap();
+            state.active.insert(
+                execution_id.clone(),
+                ActiveCommand {
+                    call_id: call_id.clone(),
+                    execution_nonce,
+                    handle: handle.clone(),
+                },
+            );
+            state.cancellation_requested.contains(&execution_id)
+                || state.legacy_cancellation_requested.contains(&call_id)
         };
+        guard.handle = Some(handle.clone());
+        if cancel_after_start {
+            self.session
+                .cancel_command(handle.clone())
+                .await
+                .map_err(crate::ToolsError::from)?;
+        }
         let output = self
             .session
             .command_output(CommandOutputRequest {
@@ -76,9 +151,27 @@ impl Tool for BashTool {
             })
             .await
             .map_err(crate::ToolsError::from)?;
+        let cancellation_requested = {
+            let mut state = self.state.lock().unwrap();
+            let owns_registration = state
+                .active
+                .get(&execution_id)
+                .is_some_and(|active| active.execution_nonce == execution_nonce);
+            let exact = if owns_registration {
+                state.active.remove(&execution_id);
+                state.cancellation_requested.remove(&execution_id)
+            } else {
+                false
+            };
+            let legacy = state.legacy_cancellation_requested.remove(&call_id);
+            exact || legacy
+        };
         guard.handle = None;
 
-        let summary = if output.timed_out {
+        let timed_out = output.timed_out;
+        let summary = if cancellation_requested {
+            format!("$ {cmd_summary} (cancelled)")
+        } else if output.timed_out {
             format!("$ {cmd_summary} (timed out after {timeout_secs}s)")
         } else {
             match output.exit_code {
@@ -97,11 +190,62 @@ impl Tool for BashTool {
         } else {
             Some(output.content)
         };
-        Ok(ToolOutput {
+        let output = ToolOutput {
             summary,
             content,
             attachments: Vec::new(),
-        })
+        };
+        if cancellation_requested {
+            Err(ToolError::Cancelled(output))
+        } else if timed_out {
+            Err(ToolError::Interrupted(output))
+        } else {
+            Ok(output)
+        }
+    }
+
+    async fn cancel(&self, call_id: &str) -> Result<(), ToolError> {
+        let handles = {
+            let mut state = self.state.lock().unwrap();
+            state
+                .legacy_cancellation_requested
+                .insert(call_id.to_string());
+            state
+                .active
+                .values()
+                .filter(|active| active.call_id == call_id)
+                .map(|active| active.handle.clone())
+                .collect::<Vec<_>>()
+        };
+        for handle in handles {
+            self.session
+                .cancel_command(handle)
+                .await
+                .map_err(crate::ToolsError::from)?;
+        }
+        Ok(())
+    }
+
+    async fn cancel_execution(
+        &self,
+        ctx: &agen::tool::ToolExecutionContext,
+    ) -> Result<(), ToolError> {
+        let execution_id = ctx.execution_id();
+        let handle = {
+            let mut state = self.state.lock().unwrap();
+            state.cancellation_requested.insert(execution_id.clone());
+            state
+                .active
+                .get(&execution_id)
+                .map(|active| active.handle.clone())
+        };
+        if let Some(handle) = handle {
+            self.session
+                .cancel_command(handle)
+                .await
+                .map_err(crate::ToolsError::from)?;
+        }
+        Ok(())
     }
 }
 
@@ -123,6 +267,7 @@ pub fn bash_tool(session: WorkdirSessionHandle, _output_dir: PathBuf) -> ToolDef
             .input_schema(serde_json::to_value(schema).expect("Bash schema serialization"));
         let tool: Arc<dyn Tool> = Arc::new(BashTool {
             session: session.clone(),
+            state: Arc::new(Mutex::new(BashExecutionState::default())),
         });
         (meta, tool)
     })

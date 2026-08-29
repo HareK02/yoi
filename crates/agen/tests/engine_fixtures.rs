@@ -134,11 +134,15 @@ async fn test_engine_simple_text_response() {
 
     let client = MockLlmClient::from_fixture(&fixture_path).unwrap();
     let engine = Engine::new(client);
+    let mut history = agen::History::new();
 
     // Send a simple message (Mutable::run consumes self, returns tuple)
-    let result = engine.run("Hello").await;
+    let result = engine.run(&mut history, "Hello").await;
 
-    assert!(result.is_ok(), "Engine should complete successfully");
+    assert!(
+        matches!(result.result, agen::EngineRunExit::Finished),
+        "Engine should complete successfully"
+    );
 }
 
 /// Verify that Engine can correctly process responses containing tool calls
@@ -156,6 +160,7 @@ async fn test_engine_tool_call() {
 
     let client = MockLlmClient::from_fixture(&fixture_path).unwrap();
     let mut engine = Engine::new(client);
+    let mut history = agen::History::new();
 
     // Register tool
     let weather_tool = MockWeatherTool::new();
@@ -163,7 +168,9 @@ async fn test_engine_tool_call() {
     engine.register_tool(weather_tool.definition());
 
     // Send message (Mutable::run consumes self, returns tuple)
-    let _result = engine.run("What's the weather in Tokyo?").await;
+    let _result = engine
+        .run(&mut history, "What's the weather in Tokyo?")
+        .await;
 
     // Verify tool was called
     // Note: max_turns=1 so no request is sent after tool result
@@ -195,11 +202,15 @@ async fn test_engine_with_programmatic_events() {
 
     let client = MockLlmClient::new(events);
     let engine = Engine::new(client);
+    let mut history = agen::History::new();
 
     // Mutable::run consumes self, returns tuple
-    let result = engine.run("Greet me").await;
+    let result = engine.run(&mut history, "Greet me").await;
 
-    assert!(result.is_ok(), "Engine should complete successfully");
+    assert!(
+        matches!(result.result, agen::EngineRunExit::Finished),
+        "Engine should complete successfully"
+    );
 }
 
 /// Verify that ToolCallCollector correctly collects ToolCall from ToolUse block events

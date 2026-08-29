@@ -1,4 +1,4 @@
-use agen::Engine;
+use agen::{Engine, History};
 use agen::llm_client::capability::{
     CacheStrategy, ModelCapability, StructuredOutput, ToolCallingSupport,
 };
@@ -22,7 +22,8 @@ fn main() {
         cap,
     );
     let engine = Engine::new(client);
-    let mut locked = engine.lock();
+    let history = History::new();
+    let mut locked = engine.lock(&history);
     let def: agen::tool::ToolDefinition = Arc::new(|| panic!("unused"));
     let _ = locked.register_tool(def);
 }

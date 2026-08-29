@@ -14,13 +14,18 @@ declare const Deno: {
   test(name: string, fn: () => void | Promise<void>): void;
 };
 
-function worker(runtimeId: string, workerId: string, revision: number): SubscriptionWorker {
+function worker(
+  runtimeId: string,
+  workerId: string,
+  revision: number,
+  hasRunningInternalWorkers = false,
+): SubscriptionWorker {
   return {
     worker_id: workerId,
     runtime_id: runtimeId,
     subject_revision: revision,
     state: 'idle',
-    has_running_internal_workers: false,
+    has_running_internal_workers: hasRunningInternalWorkers,
     workspace_id: 'workspace-test',
     display_name: null,
     profile: null,
@@ -87,4 +92,29 @@ Deno.test('workspace Worker reducer ignores stale events and removes composite s
   });
   assertEquals(projection.workers.size, 0);
   assertEquals(projection.revisions.get('runtime-a:1'), 4);
+});
+
+Deno.test('fatal child stop replaces the running-child sidebar projection', () => {
+  const projection = createWorkspaceWorkersProjection();
+  projection.workers.set('runtime-a:1', worker('runtime-a', '1', 1, true));
+  projection.revisions.set('runtime-a:1', 1);
+
+  applyWorkspaceWorkersFrame(projection, {
+    protocol_version: 1,
+    frame: 'event',
+    message: {
+      event: 'event',
+      data: {
+        subscription_id: 'subscription-1',
+        subject_revision: 2,
+        payload: {
+          event: 'worker_upserted',
+          data: { worker: worker('runtime-a', '1', 2, false) },
+        },
+      },
+    },
+  });
+
+  assertEquals(projection.workers.get('runtime-a:1')?.has_running_internal_workers, false);
+  assertEquals(projection.revisions.get('runtime-a:1'), 2);
 });

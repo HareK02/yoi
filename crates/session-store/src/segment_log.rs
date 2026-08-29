@@ -14,6 +14,7 @@ use agen::{EngineResult, UsageRecord};
 use protocol::{InvokeKind, Segment};
 use serde::{Deserialize, Serialize};
 
+use crate::history::{LoggedHistoryEntry, LoggedSystemHistoryEntry};
 use crate::logged_item::LoggedItem;
 use crate::system_item::SystemItem;
 
@@ -70,6 +71,20 @@ pub enum LogEntry {
         compacted_from: Option<SegmentOrigin>,
     },
 
+    /// Schema-v2 segment seed. Retained entries keep their stable logical
+    /// identity and origin across fork/compaction/restore.
+    AnnotatedSegmentStart {
+        ts: u64,
+        session_id: crate::SessionId,
+        system_prompt: Option<String>,
+        config: RequestConfig,
+        history: Vec<LoggedHistoryEntry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        forked_from: Option<SegmentOrigin>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compacted_from: Option<SegmentOrigin>,
+    },
+
     /// IDLE → active marker. Records the start of a new self-driving
     /// cycle (Invoke range). The range extends implicitly until the
     /// next `Invoke` entry; this entry carries the trigger only — the
@@ -105,13 +120,36 @@ pub enum LogEntry {
         extensions: Vec<SessionExtension>,
     },
 
+    /// Schema-v2 user submission with its exact model-visible entries. Typed
+    /// Flow instructions and caller-attributed input remain separate entries.
+    AnnotatedUserInput {
+        ts: u64,
+        segments: Vec<Segment>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        extensions: Vec<SessionExtension>,
+        history: Vec<LoggedHistoryEntry>,
+    },
+
+    /// Schema-v2 model output and metadata committed as one journal record.
+    AnnotatedAssistantItem { ts: u64, entry: LoggedHistoryEntry },
+
     /// One assistant-side item appended to history — assistant message,
     /// reasoning, or tool call. Singular: one entry per history item so
     /// the wire-side `Event::*` lane and on-disk LogEntry stay 1:1.
     AssistantItem { ts: u64, item: LoggedItem },
 
+    /// Schema-v2 tool output and metadata committed as one journal record.
+    AnnotatedToolResult { ts: u64, entry: LoggedHistoryEntry },
+
     /// One tool-execution result appended to history.
     ToolResult { ts: u64, item: LoggedItem },
+
+    /// Schema-v2 typed system event and model-visible metadata committed
+    /// together.
+    AnnotatedSystemItem {
+        ts: u64,
+        entry: LoggedSystemHistoryEntry,
+    },
 
     /// One typed agent-injected system item: notification, child-Worker
     /// lifecycle event, `@<path>` / `/<slug>` resolution payload. Each
@@ -278,6 +316,22 @@ pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
                 state.config = config.clone();
                 state.history = history.iter().cloned().map(Item::from).collect();
             }
+            LogEntry::AnnotatedSegmentStart {
+                session_id,
+                system_prompt,
+                config,
+                history,
+                ..
+            } => {
+                state.session_id = Some(*session_id);
+                state.system_prompt = system_prompt.clone();
+                state.config = config.clone();
+                state.history = history
+                    .iter()
+                    .cloned()
+                    .map(|entry| Item::from(entry.item))
+                    .collect();
+            }
             LogEntry::Invoke { .. } => {
                 // A terminal run record below clears or refines this. If the
                 // log ends first, restore must treat the turn as interrupted.
@@ -297,6 +351,29 @@ pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
                         .iter()
                         .map(|extension| (extension.domain.clone(), extension.payload.clone())),
                 );
+            }
+            LogEntry::AnnotatedUserInput {
+                segments,
+                extensions,
+                history,
+                ..
+            } => {
+                state
+                    .history
+                    .extend(history.iter().cloned().map(|entry| Item::from(entry.item)));
+                state.user_segments.push(segments.clone());
+                state.extensions.extend(
+                    extensions
+                        .iter()
+                        .map(|extension| (extension.domain.clone(), extension.payload.clone())),
+                );
+            }
+            LogEntry::AnnotatedAssistantItem { entry, .. }
+            | LogEntry::AnnotatedToolResult { entry, .. } => {
+                state.history.push(Item::from(entry.item.clone()));
+            }
+            LogEntry::AnnotatedSystemItem { entry, .. } => {
+                state.history.push(entry.item.to_history_item());
             }
             LogEntry::AssistantItem { item, .. } => {
                 state.history.push(Item::from(item.clone()));

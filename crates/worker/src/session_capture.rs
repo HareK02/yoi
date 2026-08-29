@@ -6,7 +6,8 @@
 
 use std::sync::Arc;
 
-use agen::{Item, Role};
+use crate::session_history::{SessionHistoryMetadata, WorkerHistoryProvenance};
+use agen::{HistoryEntry, Item, Role};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_SEARCH_LIMIT: usize = 20;
@@ -21,14 +22,21 @@ const OVERVIEW_ANCHOR_STRIDE: usize = 8;
 pub(crate) struct SessionEntryRef(String);
 
 impl SessionEntryRef {
-    pub(crate) fn new(source_index: usize) -> Self {
-        Self(format!("E{source_index:08}"))
+    pub(crate) fn from_history_entry_id(entry_id: &crate::SessionHistoryEntryId) -> Self {
+        Self(format!("E{}", entry_id.0))
     }
 
     pub(crate) fn parse(value: &str) -> Option<Self> {
-        let reference = Self(value.to_string());
-        reference.source_index()?;
-        Some(reference)
+        let suffix = value.strip_prefix('E')?;
+        if suffix.is_empty()
+            || suffix.len() > 64
+            || !suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return None;
+        }
+        Some(Self(value.to_string()))
     }
 
     pub(crate) fn as_str(&self) -> &str {
@@ -97,6 +105,7 @@ impl ToolPart {
 #[derive(Debug, Clone)]
 pub(crate) struct OverviewItem {
     pub id: SessionEntryRef,
+    pub origin: WorkerHistoryProvenance,
     pub entry_range: [u64; 2],
     pub kind: ReferenceKind,
     pub label: String,
@@ -107,6 +116,7 @@ pub(crate) struct OverviewItem {
 #[derive(Debug, Clone)]
 pub(crate) struct ReferenceEntry {
     pub id: SessionEntryRef,
+    pub origin: WorkerHistoryProvenance,
     pub entry_range: [u64; 2],
     pub kind: ReferenceKind,
     pub tool_part: Option<ToolPart>,
@@ -132,6 +142,7 @@ pub(crate) struct SearchOptions {
 #[derive(Debug, Clone)]
 pub(crate) struct SearchHit {
     pub id: SessionEntryRef,
+    pub origin: WorkerHistoryProvenance,
     pub kind: ReferenceKind,
     pub tool_part: Option<ToolPart>,
     pub tool_name: Option<String>,
@@ -177,6 +188,7 @@ impl Default for ReadOptions {
 #[derive(Debug, Clone)]
 pub(crate) struct ReadEntry {
     pub id: SessionEntryRef,
+    pub origin: WorkerHistoryProvenance,
     pub kind: ReferenceKind,
     pub tool_part: Option<ToolPart>,
     pub tool_name: Option<String>,
@@ -195,6 +207,7 @@ pub(crate) struct ReadResult {
 pub(crate) struct SessionEntryEvidence {
     pub segment_id: String,
     pub entry_ref: SessionEntryRef,
+    pub origin: WorkerHistoryProvenance,
     pub entry_range: [u64; 2],
     pub kind: ReferenceKind,
     pub tool_part: Option<ToolPart>,
@@ -206,26 +219,42 @@ pub(crate) struct SessionEntryEvidence {
 #[derive(Debug, Clone)]
 pub(crate) struct SessionCapture {
     segment_id: String,
-    items: Arc<Vec<Item>>,
+    entries: Arc<Vec<HistoryEntry<SessionHistoryMetadata>>>,
     overview: Vec<OverviewItem>,
     index: Vec<ReferenceEntry>,
 }
 
 impl SessionCapture {
     pub(crate) fn new(segment_id: impl Into<String>, items: Vec<Item>) -> Self {
+        let entries = items
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let mut metadata = SessionHistoryMetadata::legacy_unknown();
+                metadata.entry_id =
+                    session_store::LoggedSessionHistoryEntryId(format!("{index:08}"));
+                HistoryEntry::new(item, metadata)
+            })
+            .collect();
+        Self::from_history_entries(segment_id, entries)
+    }
+
+    pub(crate) fn from_history_entries(
+        segment_id: impl Into<String>,
+        entries: Vec<HistoryEntry<SessionHistoryMetadata>>,
+    ) -> Self {
         let segment_id = segment_id.into();
-        let items = Arc::new(items);
+        let entries = Arc::new(entries);
         let mut overview = Vec::new();
         let mut index = Vec::new();
 
-        for (idx, item) in items.iter().enumerate() {
+        for (idx, entry) in entries.iter().enumerate() {
+            let item = &entry.item;
             let entry_range = [idx as u64, idx as u64];
             match item {
                 Item::Message { role, content, .. } => {
-                    let kind = match role {
-                        Role::User => ReferenceKind::User,
-                        Role::Assistant => ReferenceKind::Assistant,
-                        Role::System => continue,
+                    let Some(kind) = message_reference_kind(&entry.annotation.origin, role) else {
+                        continue;
                     };
                     let text = content
                         .iter()
@@ -234,9 +263,10 @@ impl SessionCapture {
                         .join("");
                     let label = format!("{} message", kind.as_str());
                     let summary = truncate_chars(&text, 240);
-                    let id = SessionEntryRef::new(idx);
+                    let id = SessionEntryRef::from_history_entry_id(&entry.annotation.entry_id);
                     index.push(ReferenceEntry {
                         id: id.clone(),
+                        origin: entry.annotation.origin.clone(),
                         entry_range,
                         kind,
                         tool_part: None,
@@ -248,6 +278,7 @@ impl SessionCapture {
                     if matches!(kind, ReferenceKind::User | ReferenceKind::Assistant) {
                         overview.push(OverviewItem {
                             id: id.clone(),
+                            origin: entry.annotation.origin.clone(),
                             entry_range,
                             kind,
                             label,
@@ -261,7 +292,8 @@ impl SessionCapture {
                 } => {
                     let text = format!("{name}\n{arguments}");
                     index.push(ReferenceEntry {
-                        id: SessionEntryRef::new(idx),
+                        id: SessionEntryRef::from_history_entry_id(&entry.annotation.entry_id),
+                        origin: entry.annotation.origin.clone(),
                         entry_range,
                         kind: ReferenceKind::Tool,
                         tool_part: Some(ToolPart::Input),
@@ -287,7 +319,8 @@ impl SessionCapture {
                         content.as_deref().unwrap_or_default(),
                     );
                     index.push(ReferenceEntry {
-                        id: SessionEntryRef::new(idx),
+                        id: SessionEntryRef::from_history_entry_id(&entry.annotation.entry_id),
+                        origin: entry.annotation.origin.clone(),
                         entry_range,
                         kind: ReferenceKind::Tool,
                         tool_part: Some(ToolPart::Output),
@@ -327,7 +360,7 @@ impl SessionCapture {
 
         Self {
             segment_id,
-            items,
+            entries,
             overview,
             index,
         }
@@ -335,6 +368,14 @@ impl SessionCapture {
 
     pub(crate) fn overview(&self) -> &[OverviewItem] {
         &self.overview
+    }
+
+    pub(crate) fn source_index_for_ref(&self, reference: &SessionEntryRef) -> Option<u64> {
+        self.index
+            .iter()
+            .find(|entry| entry.id == *reference)
+            .map(|entry| entry.entry_range[0])
+            .or_else(|| reference.source_index())
     }
 
     pub(crate) fn search(&self, options: &SearchOptions) -> Vec<SearchHit> {
@@ -347,12 +388,12 @@ impl SessionCapture {
         let min_entry_index = options
             .from
             .as_ref()
-            .and_then(SessionEntryRef::source_index)
+            .and_then(|reference| self.source_index_for_ref(reference))
             .unwrap_or_else(|| options.min_entry_index.unwrap_or(0));
         let max_entry_index = options
             .through
             .as_ref()
-            .and_then(SessionEntryRef::source_index)
+            .and_then(|reference| self.source_index_for_ref(reference))
             .unwrap_or(u64::MAX);
         let mut skipped = 0usize;
         let mut hits = Vec::new();
@@ -391,6 +432,7 @@ impl SessionCapture {
             }
             hits.push(SearchHit {
                 id: entry.id.clone(),
+                origin: entry.origin.clone(),
                 kind: entry.kind,
                 tool_part: entry.tool_part,
                 tool_name: entry.tool_name.clone(),
@@ -442,13 +484,18 @@ impl SessionCapture {
                     }
                 }
             }
-            let Some(item) = self.items.get(entry.entry_range[0] as usize) else {
+            let Some(item) = self
+                .entries
+                .get(entry.entry_range[0] as usize)
+                .map(|entry| &entry.item)
+            else {
                 continue;
             };
             let text = render_item(item, entry, options.detail, max_bytes.saturating_sub(bytes));
             bytes = bytes.saturating_add(text.len());
             entries.push(ReadEntry {
                 id: entry.id.clone(),
+                origin: entry.origin.clone(),
                 kind: entry.kind,
                 tool_part: entry.tool_part,
                 tool_name: entry.tool_name.clone(),
@@ -485,6 +532,7 @@ impl SessionCapture {
         Some(SessionEntryEvidence {
             segment_id: self.segment_id.clone(),
             entry_ref: entry.id.clone(),
+            origin: entry.origin.clone(),
             entry_range: entry.entry_range,
             kind: entry.kind,
             tool_part: entry.tool_part,
@@ -492,6 +540,28 @@ impl SessionCapture {
             summary: entry.summary.clone(),
             excerpt,
         })
+    }
+}
+
+fn message_reference_kind(
+    origin: &WorkerHistoryProvenance,
+    provider_role: &Role,
+) -> Option<ReferenceKind> {
+    match origin {
+        WorkerHistoryProvenance::HumanInput { .. }
+        | WorkerHistoryProvenance::WorkerInput { .. } => Some(ReferenceKind::User),
+        WorkerHistoryProvenance::ModelOutput { .. } => Some(ReferenceKind::Assistant),
+        WorkerHistoryProvenance::ToolOutput { .. } => Some(ReferenceKind::Tool),
+        WorkerHistoryProvenance::LegacyUnknown => match provider_role {
+            Role::User => Some(ReferenceKind::User),
+            Role::Assistant => Some(ReferenceKind::Assistant),
+            Role::System => None,
+        },
+        // Flow/backend/system content remains out of the observation surface
+        // even when represented with a provider user/system role.
+        WorkerHistoryProvenance::FlowInstruction { .. }
+        | WorkerHistoryProvenance::BackendInstruction { .. }
+        | WorkerHistoryProvenance::DerivedSummary => None,
     }
 }
 
@@ -562,6 +632,60 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flow_user_role_is_excluded_while_explicit_human_origin_remains_evidence() {
+        let entries = vec![
+            crate::session_history::history_entry(
+                Item::user_message("trusted flow instruction"),
+                WorkerHistoryProvenance::FlowInstruction {
+                    selector: "builtin:coder-review".into(),
+                    definition_id: "coder-review".into(),
+                    definition_revision: 3,
+                    instance_id: "instance".into(),
+                    state_id: "implement".into(),
+                },
+            ),
+            crate::session_history::history_entry(
+                Item::user_message("remember my preference"),
+                WorkerHistoryProvenance::HumanInput {
+                    account_id: "account-1".into(),
+                },
+            ),
+        ];
+        let capture = SessionCapture::from_history_entries("segment", entries);
+        let overview = capture.overview();
+        assert_eq!(overview.len(), 1);
+        assert!(matches!(
+            overview[0].origin,
+            WorkerHistoryProvenance::HumanInput { .. }
+        ));
+        let evidence = capture.evidence_for(overview[0].id.as_str()).unwrap();
+        assert!(evidence.excerpt.ends_with("remember my preference"));
+        assert!(matches!(
+            evidence.origin,
+            WorkerHistoryProvenance::HumanInput { .. }
+        ));
+    }
+
+    #[test]
+    fn stable_logical_ref_survives_retention_and_restore_projection() {
+        let retained = crate::session_history::history_entry(
+            Item::assistant_message("retained"),
+            WorkerHistoryProvenance::ModelOutput {
+                worker: crate::session_history::worker_subject(Default::default()),
+            },
+        );
+        let expected_ref = SessionEntryRef::from_history_entry_id(&retained.annotation.entry_id);
+        let before = SessionCapture::from_history_entries("old", vec![retained.clone()]);
+        let after = SessionCapture::from_history_entries("new", vec![retained]);
+        assert_eq!(before.overview()[0].id, expected_ref);
+        assert_eq!(after.overview()[0].id, expected_ref);
+        assert_eq!(
+            after.evidence_for(expected_ref.as_str()).unwrap().entry_ref,
+            expected_ref
+        );
+    }
 
     #[test]
     fn overview_contains_user_and_assistant_only() {

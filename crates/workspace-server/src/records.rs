@@ -1,11 +1,8 @@
-use project_record::validate_record_id;
 use serde::{Deserialize, Serialize};
 pub use workspace_api::{
     ObjectiveDetail, ObjectiveEventDetail, ObjectiveLinkedTicketSummary, ObjectiveResourceSummary,
     ObjectiveSummary, QueryPage,
 };
-
-use crate::{Error, Result};
 
 const SUMMARY_BODY_LIMIT: usize = 240;
 
@@ -387,12 +384,16 @@ pub struct TicketQueryItem {
     pub snippet: Option<String>,
     pub matching_event: Option<TicketEvidenceEvent>,
     pub linked_objective_ids: Vec<String>,
+    #[ts(skip)]
+    pub linked_objective_keys: Vec<String>,
     pub relation_count: usize,
     pub blocker_count: usize,
     pub unresolved_blocker_count: usize,
     pub unresolved_review_count: usize,
     pub evidence: TicketEvidenceSummary,
     pub merge_request: Option<TicketMergeRequestSummary>,
+    #[ts(skip)]
+    pub current_coder: Option<TicketAssignmentSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -435,6 +436,7 @@ pub struct ObjectiveQueryItem {
     pub snippet: Option<String>,
     pub linked_ticket_count: usize,
     pub linked_tickets: Vec<String>,
+    pub linked_ticket_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -519,10 +521,6 @@ mod typescript_tests {
             .collect::<String>()
             .replace(";}", "}")
     }
-}
-
-pub(crate) fn validate_project_id(id: &str) -> Result<()> {
-    validate_record_id(id).map_err(|_| Error::InvalidRecordId(id.to_string()))
 }
 
 pub(crate) fn summarize_body(body: &str) -> String {

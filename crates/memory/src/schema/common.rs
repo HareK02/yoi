@@ -67,6 +67,40 @@ impl EvidenceKind {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceOriginKind {
+    HumanInput,
+    WorkerInput,
+    FlowInstruction,
+    BackendInstruction,
+    ModelOutput,
+    ToolOutput,
+    DerivedSummary,
+    LegacyUnknown,
+}
+
+/// Bounded origin snapshot attached to extraction evidence. This is audit
+/// metadata only and cannot authorize Workspace operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct EvidenceOrigin {
+    pub kind: EvidenceOriginKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_selector: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_definition_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_definition_revision: Option<u64>,
+}
+
 /// Host-resolved source/evidence metadata for an individual staging claim.
 ///
 /// This deliberately stores only bounded anchor metadata: stable ids, entry
@@ -86,6 +120,9 @@ pub struct SourceEvidenceRef {
     /// Host-assigned evidence id within the referenced evidence set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_id: Option<String>,
+    /// Trusted typed origin snapshot for this logical evidence entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<EvidenceOrigin>,
     /// Extensible evidence kind tag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_kind: Option<EvidenceKind>,

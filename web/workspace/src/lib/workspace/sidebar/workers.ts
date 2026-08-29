@@ -1,5 +1,24 @@
 import type { Worker } from './types';
 
+export type SidebarWorkerActivity =
+  | 'worker-running'
+  | 'subworker-running'
+  | 'idle'
+  | 'none';
+
+type WorkerActivitySource = Pick<Worker, 'state'> & {
+  has_running_internal_workers: boolean;
+};
+
+export function sidebarWorkerActivity(
+  worker: WorkerActivitySource,
+): SidebarWorkerActivity {
+  if (worker.state === 'running') return 'worker-running';
+  if (worker.has_running_internal_workers) return 'subworker-running';
+  if (worker.state === 'idle') return 'idle';
+  return 'none';
+}
+
 export function canShowWorkerInSidebar(worker: Worker): boolean {
   return worker.implementation.kind !== 'backend_worker_registry';
 }

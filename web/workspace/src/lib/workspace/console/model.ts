@@ -11,6 +11,7 @@ import type {
   InternalWorkerSnapshot,
   Segment,
 } from "$lib/generated/protocol";
+import { stringify as stringifyYaml } from "yaml";
 import { workspaceRoute } from "$lib/workspace/api/http";
 import {
   applyRunActivityEvent,
@@ -86,6 +87,9 @@ export type ConsoleLine = {
   kind: ConsoleLineKind;
   title: string;
   body: string;
+  expandedBody?: string;
+  toolCallLabel?: string;
+  toolStatus?: string;
   detail?: string;
   compaction?: ConsoleCompaction;
   diff?: ConsoleDiffLine[];
@@ -1376,7 +1380,10 @@ function refreshedToolLine(item: ConsoleLine): ConsoleLine {
     title: item.title.startsWith("Call · Tool result")
       ? item.title
       : `Call · ${toolCall.name}`,
-    body: renderToolCall(toolCall),
+    body: renderToolResponse(toolCall),
+    expandedBody: renderToolResponse(toolCall, true),
+    toolCallLabel: toolCallSignature(toolCall),
+    toolStatus: toolCallStatus(toolCall),
     detail: toolCallDetail(toolCall),
     diff: toolCall.name === "Edit" ? editDiff(toolCall) : undefined,
     streaming: !["done", "error"].includes(toolCall.state) && !commandTerminal,
@@ -1384,7 +1391,7 @@ function refreshedToolLine(item: ConsoleLine): ConsoleLine {
   };
 }
 
-function renderToolCall(toolCall: ToolCallView): string {
+function renderToolResponse(toolCall: ToolCallView, expanded = false): string {
   switch (toolCall.name) {
     case "Read":
       return renderReadTool(toolCall);
@@ -1395,12 +1402,52 @@ function renderToolCall(toolCall: ToolCallView): string {
     case "Glob":
       return renderSearchTool(toolCall);
     case "Grep":
-      return renderGrepTool(toolCall);
+      return renderGrepTool(toolCall, expanded);
     case "Bash":
-      return renderBashTool(toolCall);
+      return renderBashTool(toolCall, expanded);
     default:
-      return renderDefaultTool(toolCall);
+      return renderDefaultTool(toolCall, expanded);
   }
+}
+
+function toolCallSignature(toolCall: ToolCallView): string {
+  const args = parsedArgs(toolCall);
+  switch (toolCall.name) {
+    case "Read":
+      return `Read(${readPath(toolCall)})`;
+    case "Write":
+    case "Edit": {
+      const path = displayPath(stringField(args, "file_path") ?? "?", toolCall.cwd);
+      return `${toolCall.name}(${path})`;
+    }
+    case "Glob":
+      return `Glob(${stringField(args, "pattern") ?? genericCallArguments(toolCall)})`;
+    case "Grep":
+      return `Grep(${stringField(args, "pattern") ?? genericCallArguments(toolCall)})`;
+    case "Bash": {
+      const command = stringField(args, "command");
+      return `Bash(${command ? `$ ${singleLine(command)}` : genericCallArguments(toolCall)})`;
+    }
+    default:
+      return `${toolCall.name}(${genericCallArguments(toolCall)})`;
+  }
+}
+
+function genericCallArguments(toolCall: ToolCallView): string {
+  const raw = toolCall.arguments ?? toolCall.argsStream;
+  if (!raw.trim()) return "";
+  const parsed = parseJson(raw);
+  if (parsed === undefined) return singleLine(raw);
+  const serialized = JSON.stringify(parsed) ?? "null";
+  return isRecord(parsed) ? serialized.slice(1, -1) : serialized;
+}
+
+function singleLine(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function toolCallStatus(toolCall: ToolCallView): string {
+  return toolCall.name === "Bash" ? commandStateSuffix(toolCall) : stateSuffix(toolCall.state);
 }
 
 function aggregateReadToolLines(lines: ConsoleLine[]): ConsoleLine[] {
@@ -1434,9 +1481,6 @@ function readAggregateLine(group: ConsoleLine[]): ConsoleLine {
   const paths = calls.map(readPath);
   const visiblePaths = inProgress ? paths.slice(-3) : paths;
   const body = compactLines([
-    inProgress
-      ? `Read — reading (${count} file${plural(count)}…)`
-      : `Read — ${count} file${plural(count)} read`,
     visiblePaths.map((path) => `  ${path}`).join("\n"),
     inProgress && paths.length > visiblePaths.length
       ? `  … (${paths.length - visiblePaths.length} earlier)`
@@ -1447,6 +1491,8 @@ function readAggregateLine(group: ConsoleLine[]): ConsoleLine {
     kind: "tool",
     title: "Call · Read",
     body,
+    toolCallLabel: `Read(${count} file${plural(count)})`,
+    toolStatus: hasError ? "failed" : inProgress ? "reading…" : "done",
     detail: calls.map(readDetail).join("\n\n"),
     eventId: group.at(-1)?.eventId,
     source: "event",
@@ -1483,32 +1529,16 @@ function readDetail(toolCall: ToolCallView): string {
   ]);
 }
 
-function renderReadTool(toolCall: ToolCallView): string {
-  return `Read — ${readPath(toolCall)} (${stateSuffix(toolCall.state)})`;
+function renderReadTool(_toolCall: ToolCallView): string {
+  return "";
 }
 
 function renderWriteTool(toolCall: ToolCallView): string {
-  const args = parsedArgs(toolCall);
-  const path = displayPath(stringField(args, "file_path") ?? "?", toolCall.cwd);
-  const content = stringField(args, "content");
-  return compactLines([
-    `Write — ${path} (${stateSuffix(toolCall.state)})`,
-    cappedSection(content, 5),
-    knownToolResultText(toolCall),
-  ]);
+  return knownToolResultText(toolCall) ?? "";
 }
 
 function renderEditTool(toolCall: ToolCallView): string {
-  const args = parsedArgs(toolCall);
-  const path = displayPath(stringField(args, "file_path") ?? "?", toolCall.cwd);
-  const diff = editDiff(toolCall) ?? [];
-  const removes = diff.filter((line) => line.kind === "remove").length;
-  const adds = diff.filter((line) => line.kind === "add").length;
-  return compactLines([
-    `Edit — ${path} (${stateSuffix(toolCall.state)})`,
-    diff.length > 0 ? `diff: -${removes} +${adds}` : undefined,
-    knownToolResultText(toolCall),
-  ]);
+  return knownToolResultText(toolCall) ?? "";
 }
 
 function editDiff(toolCall: ToolCallView): ConsoleDiffLine[] | undefined {
@@ -1591,52 +1621,20 @@ function lcsTable(oldLines: string[], newLines: string[]): number[][] {
 }
 
 function renderSearchTool(toolCall: ToolCallView): string {
-  const summary = toolCall.summary?.trim();
-  return compactLines([
-    `${toolCall.name} — ${toolHeaderSuffix(toolCall, summary)}`,
-    knownToolResultText(toolCall),
-  ]);
+  return knownToolResultText(toolCall) ?? "";
 }
 
-function renderGrepTool(toolCall: ToolCallView): string {
-  const summary = toolCall.summary?.trim();
-  return compactLines([
-    `Grep — ${toolHeaderSuffix(toolCall, summary)}`,
-    grepQueryText(toolCall),
-    cappedResultSection(knownToolResultText(toolCall), 5),
-  ]);
+function renderGrepTool(toolCall: ToolCallView, expanded: boolean): string {
+  const result = knownToolResultText(toolCall);
+  return expanded ? result ?? "" : cappedResultSection(result, 5) ?? "";
 }
 
-function toolHeaderSuffix(
-  toolCall: ToolCallView,
-  summary?: string,
-): string {
-  if (toolCall.state === "error") {
-    return "Failed";
+function renderBashTool(toolCall: ToolCallView, expanded: boolean): string {
+  if (["done", "error"].includes(toolCall.state)) {
+    const result = resultText(toolCall);
+    return expanded ? result ?? "" : cappedDisplaySection(result, 10) ?? "";
   }
-  return summary ? firstLine(summary) : stateSuffix(toolCall.state);
-}
-
-function grepQueryText(toolCall: ToolCallView): string | undefined {
-  const args = parsedArgs(toolCall);
-  const pattern = stringField(args, "pattern");
-  if (pattern) {
-    return `query: ${pattern}`;
-  }
-  const renderedArgs = argsText(toolCall);
-  return renderedArgs ? `query:\n${renderedArgs}` : undefined;
-}
-
-function renderBashTool(toolCall: ToolCallView): string {
-  const args = parsedArgs(toolCall);
-  const command = stringField(args, "command");
-  return compactLines([
-    `Bash — ${commandStateSuffix(toolCall)}`,
-    command ? `$ ${command}` : argsText(toolCall),
-    ["done", "error"].includes(toolCall.state)
-      ? cappedDisplaySection(resultText(toolCall), 10)
-      : renderLiveCommandOutput(toolCall.command),
-  ]);
+  return renderLiveCommandOutput(toolCall.command) ?? "";
 }
 
 function commandStateSuffix(toolCall: ToolCallView): string {
@@ -1690,12 +1688,9 @@ function renderLiveCommandOutput(command?: CommandSnapshot): string | undefined 
   ]);
 }
 
-function renderDefaultTool(toolCall: ToolCallView): string {
-  return compactLines([
-    `${toolCall.name} — ${stateSuffix(toolCall.state)}`,
-    cappedDisplaySection(argsText(toolCall), 3),
-    cappedDisplaySection(resultText(toolCall), 3),
-  ]);
+function renderDefaultTool(toolCall: ToolCallView, expanded: boolean): string {
+  const result = resultText(toolCall);
+  return expanded ? result ?? "" : cappedDisplaySection(result, 3) ?? "";
 }
 
 function toolCallDetail(toolCall: ToolCallView): string {
@@ -1713,10 +1708,30 @@ function toolCallDetail(toolCall: ToolCallView): string {
 }
 
 function resultText(toolCall: ToolCallView): string | undefined {
-  if (toolCall.output) {
-    return toolCall.output;
+  const text = toolCall.output || toolCall.summary;
+  return text ? formatJsonResponseAsYaml(text) : undefined;
+}
+
+function formatJsonResponseAsYaml(text: string): string {
+  const trimmed = text.trim();
+  if (
+    !(
+      (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+      (trimmed.startsWith("[") && trimmed.endsWith("]"))
+    )
+  ) {
+    return text;
   }
-  return toolCall.summary;
+
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    if (parsed === null || typeof parsed !== "object") {
+      return text;
+    }
+    return stringifyYaml(parsed).trimEnd();
+  } catch {
+    return text;
+  }
 }
 
 function knownToolResultText(toolCall: ToolCallView): string | undefined {
@@ -1803,7 +1818,7 @@ function argsText(toolCall: ToolCallView): string {
     return "";
   }
   const parsed = parseJson(raw);
-  return parsed === undefined ? raw : jsonPreview(parsed);
+  return parsed === undefined ? raw : stringifyYaml(parsed).trimEnd();
 }
 
 function parsedArgs(
@@ -1828,21 +1843,6 @@ function arrayField(value: Record<string, unknown>, key: string): unknown[] {
 
 function compactLines(lines: Array<string | undefined | null | false>): string {
   return lines.filter((line): line is string => Boolean(line)).join("\n");
-}
-
-function cappedSection(
-  value: string | undefined,
-  cap: number,
-): string | undefined {
-  if (!value) {
-    return undefined;
-  }
-  const lines = value.split(/\r?\n/);
-  const shown = lines.slice(0, cap);
-  if (lines.length > cap) {
-    shown.push(`… +${lines.length - cap} more lines`);
-  }
-  return shown.join("\n");
 }
 
 function cappedDisplaySection(

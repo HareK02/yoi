@@ -1016,7 +1016,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
                 app.clear_queued_inputs();
                 Some(Method::Cancel)
             }
-            WorkerStatus::Idle => Some(Method::Shutdown),
+            WorkerStatus::Idle | WorkerStatus::Stopped => Some(Method::Shutdown),
         }),
         KeyCode::Char('d') if ctrl => {
             app.quit = true;

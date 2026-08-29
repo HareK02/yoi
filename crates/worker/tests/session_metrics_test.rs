@@ -188,7 +188,8 @@ async fn make_worker(
     let pwd = pwd_tmp.path().to_path_buf();
     let scope = worker::Scope::writable(&pwd).unwrap();
 
-    let mut worker = Engine::new(client);
+    let mut worker =
+        Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(client);
     worker.register_tool(big_content_tool_definition(tool_name));
 
     let worker = Worker::new(
@@ -460,7 +461,8 @@ async fn metric_write_failure_emits_warn_alert_and_does_not_abort_run() {
     // protected token budget covers the only user message). That is enough to drive
     // the failure path: at least one metric attempts to write.
     let client = MockClient::new(vec![text_response_with_cache("hi", 0, 0)]);
-    let worker = Engine::new(client);
+    let worker =
+        Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(client);
     let mut worker = Worker::new(
         manifest,
         worker,
@@ -536,7 +538,8 @@ permission = "write"
     let pwd_tmp = tempfile::tempdir().unwrap();
     let pwd = pwd_tmp.path().to_path_buf();
     let scope = worker::Scope::writable(&pwd).unwrap();
-    let worker = Engine::new(client);
+    let worker =
+        Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(client);
     let mut worker = Worker::new(
         manifest,
         worker,

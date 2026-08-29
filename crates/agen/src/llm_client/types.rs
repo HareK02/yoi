@@ -9,7 +9,7 @@
 
 use std::{fmt, sync::Arc};
 
-use crate::tool::Attachment;
+use crate::tool::{Attachment, ToolResultDisposition};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
@@ -121,6 +121,9 @@ pub enum Item {
         /// Detailed output (removed by pruning when old enough)
         #[serde(default, skip_serializing_if = "Option::is_none")]
         content: Option<String>,
+        /// Typed terminal state used for replay and recovery.
+        #[serde(default, skip_serializing_if = "ToolResultDisposition::is_success")]
+        disposition: ToolResultDisposition,
         /// Whether the tool result represents an execution error.
         #[serde(default, skip_serializing_if = "is_false")]
         is_error: bool,
@@ -261,7 +264,17 @@ impl Item {
         content: Option<String>,
         is_error: bool,
     ) -> Self {
-        Self::tool_result_item_with_attachments(call_id, summary, content, is_error, Vec::new())
+        Self::tool_result_item_with_disposition_and_attachments(
+            call_id,
+            summary,
+            content,
+            if is_error {
+                ToolResultDisposition::Error
+            } else {
+                ToolResultDisposition::Success
+            },
+            Vec::new(),
+        )
     }
 
     /// Create a tool result item with durable, prunable structured attachments.
@@ -272,11 +285,33 @@ impl Item {
         is_error: bool,
         attachments: Vec<Attachment>,
     ) -> Self {
+        Self::tool_result_item_with_disposition_and_attachments(
+            call_id,
+            summary,
+            content,
+            if is_error {
+                ToolResultDisposition::Error
+            } else {
+                ToolResultDisposition::Success
+            },
+            attachments,
+        )
+    }
+
+    pub fn tool_result_item_with_disposition_and_attachments(
+        call_id: impl Into<String>,
+        summary: impl Into<String>,
+        content: Option<String>,
+        disposition: ToolResultDisposition,
+        attachments: Vec<Attachment>,
+    ) -> Self {
+        let is_error = !disposition.is_success();
         Self::ToolResult {
             id: None,
             call_id: call_id.into(),
             summary: summary.into(),
             content,
+            disposition,
             is_error,
             attachments,
         }

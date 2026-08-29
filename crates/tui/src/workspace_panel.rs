@@ -1530,6 +1530,7 @@ fn worker_status_label(entry: &WorkerListEntry) -> &'static str {
             Some(WorkerStatus::Idle) => "live idle",
             Some(WorkerStatus::Running) => "live running",
             Some(WorkerStatus::Paused) => "live paused",
+            Some(WorkerStatus::Stopped) => "live stopped",
             None => "live",
         };
     }

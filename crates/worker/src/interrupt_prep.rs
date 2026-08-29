@@ -13,7 +13,7 @@
 
 #[cfg(test)]
 use crate::prompt::catalog::PromptCatalog;
-use agen::Item;
+use agen::{Item, ToolResultDisposition};
 
 /// Build synthetic `Item::ToolResult` items for every unanswered
 /// `Item::ToolCall` in `history`, preserving order.
@@ -28,7 +28,16 @@ pub(crate) fn orphan_tool_result_closures(history: &[Item], summary: &str) -> Ve
     for item in history {
         if let Item::ToolCall { call_id, .. } = item {
             if !answered.contains(call_id.as_str()) {
-                out.push(Item::tool_result(call_id.clone(), summary));
+                out.push(Item::tool_result_item_with_disposition_and_attachments(
+                    call_id.clone(),
+                    summary,
+                    Some(
+                        "Execution ended before completion could be confirmed. Completion and side effects are unknown."
+                            .to_string(),
+                    ),
+                    ToolResultDisposition::OutcomeUnknown,
+                    Vec::new(),
+                ));
             }
         }
     }
@@ -77,10 +86,12 @@ mod tests {
             Item::ToolResult {
                 call_id,
                 summary: got,
+                disposition,
                 ..
             } => {
                 assert_eq!(call_id, "c1");
                 assert_eq!(got, &summary);
+                assert_eq!(*disposition, ToolResultDisposition::OutcomeUnknown);
             }
             other => panic!("expected ToolResult, got {other:?}"),
         }

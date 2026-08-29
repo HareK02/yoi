@@ -5,16 +5,18 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agen::Item;
 use agen::llm_client::RequestConfig;
 use agen::llm_client::client::LlmClient;
 use agen::llm_client::types::Role;
 use agen::state::Mutable;
-use agen::{Engine, EngineError, EngineResult, ToolOutputLimits, UsageRecord};
+use agen::{
+    Engine, EngineError, EngineResult, EngineRunExit, History, HistoryEntry, Item, StopReason,
+    ToolExecutionPolicy, ToolOutputLimits, UsageRecord,
+};
 use arc_swap::ArcSwap;
 use session_store::{
     LogEntry, PromptRenderProvenance, SegmentId, SessionExtension, SessionId, Store, StoreError,
-    SystemItem, segment_log, to_logged,
+    SystemItem, segment_log,
 };
 use session_store::{
     WorkerActiveSegmentRef, WorkerMetadata, WorkerMetadataStore, WorkerReclaimedChild,
@@ -23,6 +25,11 @@ use session_store::{
 use tracing::{info, warn};
 
 use crate::segment_log_sink::SegmentLogSink;
+use crate::session_history::{
+    SessionHistoryDerivation, SessionHistoryMetadata, WorkerHistoryProvenance, history_entry,
+    metadata as new_history_metadata, restore_history_entries, to_logged_history_entry,
+    worker_subject,
+};
 
 use manifest::{
     DelegationScope, Permission, ResolveError, Scope, ScopeConfig, ScopeError, ScopeRule,
@@ -75,8 +82,8 @@ use crate::skill::{SkillActivationResponse, SkillClientError};
 #[cfg(test)]
 use async_trait::async_trait;
 use protocol::{
-    AlertLevel, AlertSource, CompactionLifecycle, CompactionLifecycleState, Event, RewindSummary,
-    RewindTarget, RewindTargetId, Segment,
+    AlertLevel, AlertSource, CompactionLifecycle, CompactionLifecycleState, ErrorCode, Event,
+    RewindSummary, RewindTarget, RewindTargetId, Segment,
 };
 use tokio::net::UnixStream;
 use tokio::sync::broadcast;
@@ -803,6 +810,70 @@ fn is_ai_materialized_item(item: &Item) -> bool {
     }
 }
 
+fn history_annotator<St>(
+    annotation_writer: LogWriterHandle<St>,
+    pending_input: Vec<HistoryEntry<SessionHistoryMetadata>>,
+    pending_committed_history: Arc<
+        Mutex<std::collections::VecDeque<HistoryEntry<SessionHistoryMetadata>>>,
+    >,
+) -> impl FnMut(&Item) -> Result<SessionHistoryMetadata, String>
+where
+    St: Store + Clone,
+{
+    let mut pending_input = std::collections::VecDeque::from(pending_input);
+    move |item: &Item| {
+        if let Some(entry) = pending_input.pop_front() {
+            return Ok(entry.annotation);
+        }
+        if let Some(entry) = {
+            let mut pending = pending_committed_history
+                .lock()
+                .expect("pending committed history poisoned");
+            pending
+                .front()
+                .filter(|entry| entry.item == *item)
+                .cloned()
+                .map(|entry| {
+                    pending.pop_front();
+                    entry
+                })
+        } {
+            return Ok(entry.annotation);
+        }
+
+        let subject = worker_subject(annotation_writer.state.location().session_id);
+        let origin = if item.is_tool_result() {
+            WorkerHistoryProvenance::ToolOutput { worker: subject }
+        } else if item.is_assistant_message() || item.is_tool_call() || item.is_reasoning() {
+            WorkerHistoryProvenance::ModelOutput { worker: subject }
+        } else {
+            // Unknown user/system append paths fail closed. Trusted system
+            // producers must precommit through `SystemItemCommitter`.
+            WorkerHistoryProvenance::LegacyUnknown
+        };
+        let metadata = new_history_metadata(origin, None);
+        let entry = session_store::LoggedHistoryEntry {
+            item: item.clone().into(),
+            metadata: metadata.clone(),
+        };
+        let log_entry = if item.is_tool_result() {
+            LogEntry::AnnotatedToolResult {
+                ts: segment_log::now_millis(),
+                entry,
+            }
+        } else {
+            LogEntry::AnnotatedAssistantItem {
+                ts: segment_log::now_millis(),
+                entry,
+            }
+        };
+        annotation_writer
+            .append_entry(log_entry)
+            .map_err(|error| error.to_string())?;
+        Ok(metadata)
+    }
+}
+
 /// Cheap-cloneable bundle of (store + shared session pointer + sink)
 /// handed to the worker callback and the interceptor so they can
 /// commit `LogEntry` values directly without going through an mpsc
@@ -828,8 +899,12 @@ where
         self.store.append(loc.session_id, loc.segment_id, &entry)?;
         self.state.increment_entries();
         if let Some(in_flight) = &self.in_flight {
-            if let LogEntry::AssistantItem { item, .. } = &entry {
-                let item_for_clear = item.clone();
+            let committed_item = match &entry {
+                LogEntry::AssistantItem { item, .. } => Some(item.clone()),
+                LogEntry::AnnotatedAssistantItem { entry, .. } => Some(entry.item.clone()),
+                _ => None,
+            };
+            if let Some(item_for_clear) = committed_item {
                 in_flight.clear_for_committed_item_then(&item_for_clear, || {
                     self.sink.publish(entry);
                 });
@@ -856,11 +931,23 @@ where
 pub trait SystemItemCommitter: Send + Sync {
     fn commit_log_entry(&self, entry: LogEntry) -> Result<(), StoreError>;
 
-    fn commit_system_item(&self, item: SystemItem) -> Result<(), StoreError> {
-        self.commit_log_entry(LogEntry::SystemItem {
+    fn commit_system_item(
+        &self,
+        item: SystemItem,
+    ) -> Result<HistoryEntry<SessionHistoryMetadata>, StoreError> {
+        let metadata = new_history_metadata(
+            WorkerHistoryProvenance::BackendInstruction { operation_id: None },
+            None,
+        );
+        let history_item = item.to_history_item();
+        self.commit_log_entry(LogEntry::AnnotatedSystemItem {
             ts: segment_log::now_millis(),
-            item,
-        })
+            entry: session_store::LoggedSystemHistoryEntry {
+                item,
+                metadata: metadata.clone(),
+            },
+        })?;
+        Ok(HistoryEntry::new(history_item, metadata))
     }
 }
 
@@ -897,6 +984,64 @@ where
 
 pub const WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN: &str = "worker.input-submission.v1";
 
+#[derive(Clone)]
+struct PreparedFlowProjection {
+    selector: String,
+    instructions: String,
+    definition_id: String,
+    definition_revision: u64,
+    instance_id: String,
+    state_id: String,
+}
+
+/// Sole live owner of committed model-visible Worker history.
+///
+/// `Engine` borrows this history only while executing a run. The revision is
+/// advanced together with every live rewrite so projections can fence stale
+/// observations without maintaining a second transcript.
+#[derive(Clone)]
+pub struct WorkerSession {
+    session_id: SessionId,
+    revision: u64,
+    history: History<SessionHistoryMetadata>,
+}
+
+impl WorkerSession {
+    fn new(session_id: SessionId, entries: Vec<HistoryEntry<SessionHistoryMetadata>>) -> Self {
+        let revision = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+        Self {
+            session_id,
+            revision,
+            history: History::from_entries(entries),
+        }
+    }
+
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn history(&self) -> &History<SessionHistoryMetadata> {
+        &self.history
+    }
+
+    fn history_mut(&mut self) -> &mut History<SessionHistoryMetadata> {
+        &mut self.history
+    }
+
+    fn note_mutation(&mut self) {
+        self.revision = self.revision.saturating_add(1);
+    }
+
+    fn replace_history(&mut self, entries: Vec<HistoryEntry<SessionHistoryMetadata>>) {
+        self.history.replace_entries(entries);
+        self.note_mutation();
+    }
+}
+
 /// An independent agent execution unit.
 ///
 /// Holds a [`Engine`] directly and persists session state via
@@ -904,7 +1049,11 @@ pub const WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN: &str = "worker.input-submiss
 pub struct Worker<C: LlmClient, St: Store> {
     manifest: WorkerManifest,
     /// Always `Some` outside of `run()`/`resume()`.
-    engine: Option<Engine<C, Mutable>>,
+    engine: Option<Engine<C, Mutable, SessionHistoryMetadata>>,
+    /// Sole live authority for committed model-visible history.
+    session: WorkerSession,
+    /// Worker-owned interruption recovery marker.
+    last_run_interrupted: bool,
     store: St,
     /// Optional write-through hook for name-keyed Worker metadata. Production
     /// constructors install this from the same FsStore that owns the session
@@ -1003,6 +1152,10 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// drains it and returns `ContinueWith` so the items land in
     /// history right after the user message that referenced them.
     pending_attachments: Arc<Mutex<Vec<SystemItem>>>,
+    /// Ephemeral handoff for system items that were durably committed by the
+    /// interceptor before Agen applies them to live typed history.
+    pending_committed_history:
+        Arc<Mutex<std::collections::VecDeque<HistoryEntry<SessionHistoryMetadata>>>>,
     /// Scope allocation in the machine-wide lock file. `Some` for
     /// Workers built via `from_manifest` / `from_manifest_spawned` /
     /// `restore_from_manifest` (production paths); `None` for the
@@ -1102,11 +1255,14 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
         // model is configured. system_prompt / request_config / cache_key
         // are unused on this path, so we deliberately skip copying them.
         let source_worker = self.engine.as_ref().expect("worker present");
-        let mut worker = Engine::new(source_worker.client().clone());
-        worker.set_history(source_worker.history().to_vec());
+        let worker = Engine::<C, Mutable, SessionHistoryMetadata>::new_annotated(
+            source_worker.client().clone(),
+        );
         Self {
             manifest: self.manifest.clone(),
             engine: Some(worker),
+            session: self.session.clone(),
+            last_run_interrupted: false,
             store: self.store.clone(),
             worker_metadata_writer: None,
             segment_state: self.segment_state.clone(),
@@ -1135,6 +1291,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
             ai_activity_counter: self.ai_activity_counter.clone(),
             pending_notifies: NotifyBuffer::new(),
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
+            pending_committed_history: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             scope_allocation: None,
             callback_socket: None,
             runtime_ticket_role: None,
@@ -1153,7 +1310,9 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
             log_writer: None,
         }
     }
+}
 
+impl<C: LlmClient + 'static, St: Store + Clone + 'static> Worker<C, St> {
     /// Build a `LogWriterHandle` carrying everything the worker
     /// callback / interceptor needs to commit `LogEntry` values
     /// directly: store handle, the shared session pointer, and the
@@ -1199,25 +1358,9 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
     /// interrupted-turn prep) before they reach the worker's history, so this
     /// callback would otherwise double-write them.
     pub fn wire_history_persistence(&mut self) {
-        let writer = self.log_writer_handle();
-        self.engine_mut().on_history_append(move |item| {
-            if item.is_user_message() {
-                return Ok(());
-            }
-            if matches!(
-                item,
-                Item::Message {
-                    role: agen::Role::System,
-                    ..
-                }
-            ) {
-                return Ok(());
-            }
-            let entry = session_store::classify_history_item(item, segment_log::now_millis());
-            writer
-                .append_entry(entry)
-                .map_err(|error| error.to_string())
-        });
+        // History records are committed by the annotation callback before Agen
+        // applies the corresponding entry. A second observer callback would
+        // create an unannotated duplicate and is intentionally not installed.
         if self.manifest.session.record_event_trace {
             let writer = self.log_writer_handle();
             self.engine_mut()
@@ -1253,7 +1396,9 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
         }
         self.history_persistence_wired = true;
     }
+}
 
+impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> {
     pub fn spawn_post_run_memory_jobs(&mut self) {
         // Drop a finished prior handle so we can spawn a fresh task.
         // If the prior task is still running, coalesce by skipping —
@@ -1275,7 +1420,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
     }
 }
 
-impl<C: LlmClient, St: Store> Worker<C, St> {
+impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// Create a new Worker from a pre-built Engine and store.
     ///
     /// Callers must pass path-free workspace context separately from explicit
@@ -1289,7 +1434,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// should parse it themselves and call [`set_system_prompt_template`].
     pub async fn new(
         manifest: WorkerManifest,
-        worker: Engine<C>,
+        worker: Engine<C, Mutable, SessionHistoryMetadata>,
         store: St,
         workspace_context: WorkerWorkspaceContext,
         filesystem_authority: WorkerFilesystemAuthority,
@@ -1308,6 +1453,8 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         let mut worker = Self {
             manifest,
             engine: Some(worker),
+            session: WorkerSession::new(session_id, Vec::new()),
+            last_run_interrupted: false,
             store,
             worker_metadata_writer: None,
             segment_state: SegmentState::new(session_id, segment_id, 0),
@@ -1336,6 +1483,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
+            pending_committed_history: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             scope_allocation: None,
             callback_socket: None,
             runtime_ticket_role: None,
@@ -1545,22 +1693,46 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// This deliberately does not scan `.yoi/skills` locally: when a Workspace
     /// HTTP client is available, catalog/detail/activation authority belongs to
     /// the Workspace backend API.
-    pub fn activate_skill(&mut self, name: &str) -> Result<SkillActivationResponse, WorkerError> {
+    pub fn activate_skill(&mut self, name: &str) -> Result<SkillActivationResponse, WorkerError>
+    where
+        St: Clone + 'static,
+    {
         let activation = self.workspace_client().activate_skill(name)?;
         self.ensure_segment_head()?;
         let body = format!(
             "Agent Skill `{}` activated from {}.\n\n{}",
             activation.name, activation.provenance.id, activation.body
         );
-        self.commit_entry(LogEntry::SystemItem {
+        let skill_metadata = new_history_metadata(
+            WorkerHistoryProvenance::BackendInstruction { operation_id: None },
+            None,
+        );
+        self.commit_entry(LogEntry::AnnotatedSystemItem {
             ts: segment_log::now_millis(),
-            item: SystemItem::SkillActivation {
-                name: activation.name.clone(),
-                body: body.clone(),
+            entry: session_store::LoggedSystemHistoryEntry {
+                item: SystemItem::SkillActivation {
+                    name: activation.name.clone(),
+                    body: body.clone(),
+                },
+                metadata: skill_metadata.clone(),
             },
         })?;
-        self.engine_mut()
-            .append_history(std::iter::once(agen::Item::system_message(body)))?;
+        let history_entry = HistoryEntry::new(agen::Item::system_message(body), skill_metadata);
+        let mut annotate = history_annotator(
+            self.log_writer_handle(),
+            vec![history_entry.clone()],
+            self.pending_committed_history.clone(),
+        );
+        let (engine, session) = (
+            self.engine.as_mut().expect("worker present"),
+            &mut self.session,
+        );
+        engine.append_history_with(
+            session.history_mut(),
+            std::iter::once(history_entry.item),
+            &mut annotate,
+        )?;
+        session.note_mutation();
         Ok(activation)
     }
 
@@ -1623,7 +1795,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     }
 
     /// Direct access to the underlying Engine.
-    pub fn engine(&self) -> &Engine<C, Mutable> {
+    pub fn engine(&self) -> &Engine<C, Mutable, SessionHistoryMetadata> {
         self.engine.as_ref().expect("worker taken during run")
     }
 
@@ -1631,8 +1803,17 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     ///
     /// Use this to register tools, hooks, or subscribers before calling
     /// [`run`](Self::run).
-    pub fn engine_mut(&mut self) -> &mut Engine<C, Mutable> {
+    pub fn engine_mut(&mut self) -> &mut Engine<C, Mutable, SessionHistoryMetadata> {
         self.engine.as_mut().expect("worker taken during run")
+    }
+
+    #[cfg(test)]
+    fn set_history_for_test(&mut self, items: Vec<Item>) {
+        let entries = items
+            .into_iter()
+            .map(|item| HistoryEntry::new(item, SessionHistoryMetadata::legacy_unknown()))
+            .collect();
+        self.session.replace_history(entries);
     }
 
     /// Install enabled feature modules into the Worker host surfaces.
@@ -1759,13 +1940,15 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             )));
         }
 
-        let Some(LogEntry::UserInput { segments, .. }) = entries.get(target.user_input_entry_index)
-        else {
-            return Err(RewindError::Invalid(
-                "rewind target is no longer a user message".into(),
-            ));
+        let input = match entries.get(target.user_input_entry_index) {
+            Some(LogEntry::UserInput { segments, .. })
+            | Some(LogEntry::AnnotatedUserInput { segments, .. }) => segments.clone(),
+            _ => {
+                return Err(RewindError::Invalid(
+                    "rewind target is no longer a user message".into(),
+                ));
+            }
         };
-        let input = segments.clone();
         let truncate_entries = rewind_truncate_entries(&entries, target.user_input_entry_index);
         let retained = entries[..truncate_entries].to_vec();
         let tool_side_effect_warning = suffix_has_tool_side_effects(&entries[truncate_entries..]);
@@ -1782,13 +1965,17 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         self.segment_state.set_entries_written(truncate_entries);
         self.sink.truncate_silent(truncate_entries);
 
-        self.task_feature.restore_from_history(&state.history);
-        let history = state.history;
-        self.engine_mut().set_history(history);
+        let history_entries = restore_history_entries(loc.session_id, loc.segment_id, &retained)
+            .map_err(|error| RewindError::Invalid(error.into()))?;
+        let projected_history = history_entries
+            .iter()
+            .map(|entry| entry.item.clone())
+            .collect::<Vec<_>>();
+        self.task_feature.restore_from_history(&projected_history);
+        self.session.replace_history(history_entries);
         self.engine_mut().set_request_config(state.config);
         self.engine_mut().set_turn_count(state.turn_count);
-        self.engine_mut()
-            .set_last_run_interrupted(state.last_run_interrupted);
+        self.last_run_interrupted = state.last_run_interrupted;
         self.engine_mut()
             .set_active_run_turn_count(state.active_run_turn_count);
         self.user_segments = state.user_segments;
@@ -1857,9 +2044,18 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         self.write_worker_metadata_pending()
     }
 
-    /// Current history items held by the underlying Engine.
-    pub fn history(&self) -> &[Item] {
-        self.engine().history()
+    /// Provider-visible projection of the current typed Worker session history.
+    /// The authoritative item+provenance entries remain owned by `WorkerSession`.
+    pub fn history(&self) -> Vec<Item> {
+        self.session.history().items_cloned()
+    }
+
+    pub fn session_history(&self) -> &History<SessionHistoryMetadata> {
+        self.session.history()
+    }
+
+    pub fn worker_session(&self) -> &WorkerSession {
+        &self.session
     }
 
     /// Snapshot of the cumulative LLM Usage measurement timeline.
@@ -2163,7 +2359,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
 
             let usage_history_handle = compact_state.as_ref().map(|_| self.usage_history.clone());
 
-            let interceptor = WorkerInterceptor::new(
+            let interceptor = WorkerInterceptor::new_with_history_queue(
                 registry,
                 compact_state,
                 usage_history_handle,
@@ -2171,6 +2367,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 self.pending_attachments.clone(),
                 self.prompts.clone(),
                 self.log_writer.clone(),
+                self.pending_committed_history.clone(),
             )
             .with_usage_tracker(self.usage_tracker.clone())
             .with_prompt_workspace_id(
@@ -2293,7 +2490,10 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// Equivalent to `run(vec![Segment::text(s)])`. The dumb-client
     /// counterpart of [`protocol::Method::run_text`]; primarily for
     /// tests and tools that have only a string in hand.
-    pub async fn run_text(&mut self, s: impl Into<String>) -> Result<WorkerRunResult, WorkerError> {
+    pub async fn run_text(&mut self, s: impl Into<String>) -> Result<WorkerRunResult, WorkerError>
+    where
+        St: Clone + 'static,
+    {
         self.run(vec![Segment::text(s)]).await
     }
 
@@ -2331,7 +2531,10 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// Wires up worker hooks, ensures the session is materialized on the
     /// store, and runs pre-run compact (joining any in-flight memory task
     /// first so extract sees a stable history range).
-    async fn prepare_for_run(&mut self) -> Result<(), WorkerError> {
+    async fn prepare_for_run(&mut self) -> Result<(), WorkerError>
+    where
+        St: Clone + 'static,
+    {
         self.refresh_prompt_projection_for_future_operations()?;
         self.ensure_interceptor_installed();
         self.ensure_system_prompt_materialized().await?;
@@ -2356,14 +2559,14 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             .expect("usage_history poisoned")
             .len();
         EmptyTurnRollbackSnapshot {
-            history_len: self.engine().history().len(),
+            history_len: self.session.history().len(),
             user_segments_len: self.user_segments.len(),
             entries_written: self.segment_state.entries_written(),
             sink_len: self.sink.len(),
             pending_attachments,
             usage_history_len,
             ai_activity_count: self.ai_activity_counter.load(Ordering::SeqCst),
-            last_run_interrupted: self.engine().last_run_interrupted(),
+            last_run_interrupted: self.last_run_interrupted,
             active_run_turn_count: self.engine().active_run_turn_count(),
             flow_runtime_state: self
                 .flow_runtime_state
@@ -2375,17 +2578,21 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
 
     fn should_rollback_empty_turn(
         &self,
-        result: &Result<EngineResult, EngineError>,
+        result: &EngineRunExit,
         snapshot: &EmptyTurnRollbackSnapshot,
     ) -> bool {
-        if !matches!(result, Err(EngineError::Cancelled)) {
+        if !matches!(
+            result,
+            EngineRunExit::Paused | EngineRunExit::Interrupted(StopReason::Cancelled)
+        ) {
             return false;
         }
         if self.ai_activity_counter.load(Ordering::SeqCst) != snapshot.ai_activity_count {
             return false;
         }
-        !self.engine().history()[snapshot.history_len..]
+        !self.session.history().entries()[snapshot.history_len..]
             .iter()
+            .map(|entry| &entry.item)
             .any(is_ai_materialized_item)
     }
 
@@ -2393,9 +2600,9 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         &mut self,
         snapshot: EmptyTurnRollbackSnapshot,
     ) -> Result<(), StoreError> {
-        self.engine_mut().truncate_history(snapshot.history_len);
-        self.engine_mut()
-            .set_last_run_interrupted(snapshot.last_run_interrupted);
+        self.session.history_mut().truncate(snapshot.history_len);
+        self.session.note_mutation();
+        self.last_run_interrupted = snapshot.last_run_interrupted;
         self.engine_mut()
             .set_active_run_turn_count(snapshot.active_run_turn_count);
         *self
@@ -2425,7 +2632,14 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     fn prepare_flow_input(
         &self,
         input: Vec<Segment>,
-    ) -> Result<(Vec<Segment>, Option<flow::FlowRuntimeState>), WorkerError> {
+    ) -> Result<
+        (
+            Vec<Segment>,
+            Option<flow::FlowRuntimeState>,
+            Option<PreparedFlowProjection>,
+        ),
+        WorkerError,
+    > {
         let flow_segments = input
             .iter()
             .filter_map(|segment| match segment {
@@ -2434,7 +2648,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             })
             .collect::<Vec<_>>();
         if flow_segments.is_empty() {
-            return Ok((input, None));
+            return Ok((input, None, None));
         }
         if flow_segments.len() != 1 {
             return Err(WorkerError::FlowInput(
@@ -2509,16 +2723,15 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         let (state, initial_instructions) =
             flow::FlowRuntimeState::start(&source, uuid::Uuid::now_v7().to_string())
                 .map_err(|error| WorkerError::FlowInput(error.to_string()))?;
-        let input = input
-            .into_iter()
-            .map(|segment| match segment {
-                Segment::Flow { .. } => Segment::Text {
-                    content: initial_instructions.clone(),
-                },
-                other => other,
-            })
-            .collect();
-        Ok((input, Some(state)))
+        let projection = PreparedFlowProjection {
+            selector: selector.to_string(),
+            instructions: initial_instructions,
+            definition_id: state.instance.definition_id.clone(),
+            definition_revision: state.instance.definition_revision,
+            instance_id: state.instance.instance_id.clone(),
+            state_id: state.instance.current_state.to_string(),
+        };
+        Ok((input, Some(state), Some(projection)))
     }
 
     /// Send user input and run until the LLM turn completes.
@@ -2532,16 +2745,40 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// If the between-turns compaction threshold is exceeded mid-run,
     /// the Engine is aborted, history is compacted, and execution resumes
     /// automatically.
-    pub async fn run(&mut self, input: Vec<Segment>) -> Result<WorkerRunResult, WorkerError> {
+    pub async fn run(&mut self, input: Vec<Segment>) -> Result<WorkerRunResult, WorkerError>
+    where
+        St: Clone + 'static,
+    {
         self.run_with_input_extensions(input, Vec::new()).await
     }
 
     pub(crate) async fn run_with_input_extensions(
         &mut self,
         input: Vec<Segment>,
+        input_extensions: Vec<SessionExtension>,
+    ) -> Result<WorkerRunResult, WorkerError>
+    where
+        St: Clone + 'static,
+    {
+        self.run_with_input_extensions_and_commit_hook(input, input_extensions, || {})
+            .await
+    }
+
+    /// Run user input and invoke `on_input_committed` only after the annotated
+    /// input has crossed both the durable Store and live SegmentLogSink commit
+    /// boundaries. The Controller uses this fence before exposing `Running`, so
+    /// every in-flight snapshot for a user turn includes its committed input.
+    pub(crate) async fn run_with_input_extensions_and_commit_hook<F>(
+        &mut self,
+        input: Vec<Segment>,
         mut input_extensions: Vec<SessionExtension>,
-    ) -> Result<WorkerRunResult, WorkerError> {
-        let (input, pending_flow_state) = self.prepare_flow_input(input)?;
+        on_input_committed: F,
+    ) -> Result<WorkerRunResult, WorkerError>
+    where
+        St: Clone + 'static,
+        F: FnOnce(),
+    {
+        let (input, pending_flow_state, flow_projection) = self.prepare_flow_input(input)?;
         if let Some(state) = pending_flow_state.as_ref() {
             let payload = serde_json::to_value(state).map_err(|error| {
                 WorkerError::FlowInput(format!("serialize Flow runtime state: {error}"))
@@ -2574,13 +2811,18 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             trigger: protocol::InvokeKind::UserSend,
         })?;
 
-        // Persist the user input as typed segments before the worker
-        // pushes its flattened copy into history. save_delta deliberately
-        // skips the resulting `is_user_message()` item to avoid double-write.
-        self.commit_entry(LogEntry::UserInput {
+        let projected_input = self.projected_input_history(&input, flow_projection.as_ref());
+
+        // Persist original typed segments together with the exact ordered
+        // model-visible item+origin projection before any entry becomes live.
+        self.commit_entry(LogEntry::AnnotatedUserInput {
             ts: segment_log::now_millis(),
             segments: input.clone(),
             extensions: input_extensions,
+            history: projected_input
+                .iter()
+                .map(to_logged_history_entry)
+                .collect(),
         })?;
         if let Some(state) = pending_flow_state {
             *self
@@ -2589,12 +2831,12 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 .expect("flow_runtime_state poisoned") = Some(state);
         }
         self.user_segments.push(input.clone());
+        on_input_committed();
 
         // Resolve `@<path>` file refs to system messages stashed for the
         // WorkerInterceptor to attach right after the user message. Resolution
         // failures are non-fatal alerts.
         let attachments = self.resolve_file_refs(&input).await;
-        let flattened = self.flatten_segments(&input);
         if !attachments.is_empty() {
             *self
                 .pending_attachments
@@ -2602,13 +2844,41 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 .expect("pending_attachments poisoned") = attachments;
         }
 
-        let history_before = self.engine.as_ref().unwrap().history().len();
+        let history_before = self.session.history().len();
+        let pending_input = projected_input;
+        let input_entry = pending_input
+            .last()
+            .cloned()
+            .expect("projected Worker input is never empty");
+        let prefix_items = pending_input
+            .iter()
+            .take(pending_input.len().saturating_sub(1))
+            .map(|entry| entry.item.clone())
+            .collect::<Vec<_>>();
+        let input_string = input_entry.item.as_text().unwrap_or_default();
+        let mut annotate = history_annotator(
+            self.log_writer_handle(),
+            pending_input,
+            self.pending_committed_history.clone(),
+        );
 
-        // lock → run → unlock
+        if !prefix_items.is_empty() {
+            let (engine, session) = (
+                self.engine.as_mut().expect("worker present"),
+                &mut self.session,
+            );
+            engine
+                .append_history_with(session.history_mut(), prefix_items, &mut annotate)
+                .map_err(|error| WorkerError::InvalidState(error.to_string()))?;
+        }
+
         let worker = self.engine.take().expect("worker taken during run");
-        let mut locked = worker.lock();
-        let result = locked.run(flattened).await;
+        let mut locked = worker.lock(self.session.history());
+        let result = locked
+            .run_with_annotation(self.session.history_mut(), input_string, &mut annotate)
+            .await;
         self.engine = Some(locked.unlock());
+        self.session.note_mutation();
 
         if self.should_rollback_empty_turn(&result, &rollback_snapshot) {
             self.rollback_empty_turn(rollback_snapshot)?;
@@ -2678,50 +2948,80 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// must happen before `prepare_for_run`: proactive compaction checkpoints
     /// only resumable runs, never the run this invocation is abandoning.
     fn prepare_interrupted_history_for_fresh_run(&mut self) -> Result<(), WorkerError> {
-        if self.engine().last_run_interrupted() {
+        if self.last_run_interrupted {
             self.apply_interrupt_prep()?;
-            self.engine_mut().set_last_run_interrupted(false);
+            self.last_run_interrupted = false;
+            self.engine_mut().set_active_run_turn_count(None);
         }
         Ok(())
     }
 
-    /// Stage the post-interruption cleanup at the front of worker
-    /// history: close every unanswered `Item::ToolCall` with a synthetic
-    /// `Item::ToolResult` (Anthropic wire-validity), then append a
-    /// system note so the LLM understands the prior turn was cut
-    /// short. Called from `Worker::run` when the worker's
-    /// `last_run_interrupted` flag is set (i.e. the Worker just transitioned
-    /// out of Paused via a new user input).
-    fn apply_interrupt_prep(&mut self) -> Result<(), WorkerError> {
+    /// Durably close every unanswered ToolCall before the interrupted run's
+    /// final lifecycle record/status is published.
+    fn terminalize_orphan_tool_calls(&mut self) -> Result<(), WorkerError> {
         let tool_result_summary = self
             .prompts()
             .load_full()
             .interrupt_tool_result_summary()
             .map_err(WorkerError::from)?;
+        let history_items = self.history();
+        let closures = crate::interrupt_prep::orphan_tool_result_closures(
+            &history_items,
+            &tool_result_summary,
+        );
+        if closures.is_empty() {
+            return Ok(());
+        }
+
+        let subject = worker_subject(self.session.session_id());
+        for item in closures {
+            let entry = HistoryEntry::new(
+                item,
+                new_history_metadata(
+                    WorkerHistoryProvenance::ToolOutput {
+                        worker: subject.clone(),
+                    },
+                    None,
+                ),
+            );
+            self.commit_entry(LogEntry::AnnotatedToolResult {
+                ts: segment_log::now_millis(),
+                entry: to_logged_history_entry(&entry),
+            })?;
+            self.session.history_mut().push_entry(entry);
+            self.session.note_mutation();
+        }
+        Ok(())
+    }
+
+    fn apply_interrupt_prep(&mut self) -> Result<(), WorkerError> {
+        self.terminalize_orphan_tool_calls()?;
         let system_note = self
             .prompts()
             .load_full()
             .interrupt_system_note()
             .map_err(WorkerError::from)?;
 
-        let closures = crate::interrupt_prep::orphan_tool_result_closures(
-            self.engine().history(),
-            &tool_result_summary,
-        );
-        if !closures.is_empty() {
-            self.engine_mut().append_history(closures)?;
-        }
         let interrupt_prompt_provenance =
             self.prompt_render_provenance("internal.interrupt_system_note");
-        self.commit_entry(LogEntry::SystemItem {
+        let interrupt_metadata = new_history_metadata(
+            WorkerHistoryProvenance::BackendInstruction { operation_id: None },
+            None,
+        );
+        self.commit_entry(LogEntry::AnnotatedSystemItem {
             ts: segment_log::now_millis(),
-            item: SystemItem::Interrupt {
-                body: system_note.clone(),
-                prompt_provenance: Some(interrupt_prompt_provenance),
+            entry: session_store::LoggedSystemHistoryEntry {
+                item: SystemItem::Interrupt {
+                    body: system_note.clone(),
+                    prompt_provenance: Some(interrupt_prompt_provenance),
+                },
+                metadata: interrupt_metadata.clone(),
             },
         })?;
-        self.engine_mut()
-            .append_history(std::iter::once(agen::Item::system_message(system_note)))?;
+        let interrupt_entry =
+            HistoryEntry::new(agen::Item::system_message(system_note), interrupt_metadata);
+        self.session.history_mut().push_entry(interrupt_entry);
+        self.session.note_mutation();
         Ok(())
     }
 
@@ -2733,49 +3033,52 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// The explicit `PausedTurnAbandoned` marker preserves durable lifecycle
     /// semantics without claiming another `run` / `resume` completed.
     pub fn cancel_paused_turn(&mut self) -> Result<(), WorkerError> {
-        if !self.engine().last_run_interrupted() {
+        if !self.last_run_interrupted {
             return Ok(());
         }
 
         self.apply_interrupt_prep()?;
-        self.engine_mut().set_last_run_interrupted(false);
+        self.last_run_interrupted = false;
         self.commit_entry(LogEntry::PausedTurnAbandoned {
             ts: segment_log::now_millis(),
         })?;
         Ok(())
     }
 
-    /// Flatten a typed segment list into the single string the Engine
-    /// receives as the user message, and emit user-facing alerts for
-    /// segments that fall through to placeholder (unknown variants from a newer client).
-    /// `FileRef` is handled separately by `resolve_file_refs`. The text
-    /// reconstruction itself comes from `Segment::flatten_to_text`,
-    /// shared with replay paths that should not re-alert.
-    fn flatten_segments(&self, segments: &[Segment]) -> String {
-        for seg in segments {
-            match seg {
-                Segment::Text { .. } | Segment::Paste { .. } | Segment::FileRef { .. } => {}
-                Segment::Flow { selector } => {
-                    self.alert(
-                        AlertLevel::Error,
-                        AlertSource::Worker,
-                        format!(
-                            "received unresolved Flow invocation {selector:?}; Runtime must resolve Flow segments through Workspace authority before Worker input"
-                        ),
-                    );
-                }
-                Segment::Unknown => {
-                    self.alert(
-                        AlertLevel::Warn,
-                        AlertSource::Worker,
-                        "received unknown segment kind from a newer client; \
-                         passed to LLM as placeholder"
-                            .into(),
-                    );
-                }
-            }
+    fn projected_input_history(
+        &self,
+        input: &[Segment],
+        flow_projection: Option<&PreparedFlowProjection>,
+    ) -> Vec<HistoryEntry<SessionHistoryMetadata>> {
+        if let Some(flow) = flow_projection {
+            return input
+                .iter()
+                .map(|segment| match segment {
+                    Segment::Flow { .. } => history_entry(
+                        Item::user_message(flow.instructions.clone()),
+                        WorkerHistoryProvenance::FlowInstruction {
+                            selector: flow.selector.clone(),
+                            definition_id: flow.definition_id.clone(),
+                            definition_revision: flow.definition_revision,
+                            instance_id: flow.instance_id.clone(),
+                            state_id: flow.state_id.clone(),
+                        },
+                    ),
+                    other => history_entry(
+                        Item::user_message(Segment::flatten_to_text(std::slice::from_ref(other))),
+                        // Current public submit transport does not carry a
+                        // trusted account/Worker subject envelope. Fail closed
+                        // instead of promoting role=user to HumanInput.
+                        WorkerHistoryProvenance::LegacyUnknown,
+                    ),
+                })
+                .collect();
         }
-        Segment::flatten_to_text(segments)
+
+        vec![history_entry(
+            Item::user_message(Segment::flatten_to_text(input)),
+            WorkerHistoryProvenance::LegacyUnknown,
+        )]
     }
 
     /// Run a turn triggered by `Method::Notify` while the Worker is idle.
@@ -2789,7 +3092,10 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     pub async fn run_for_notification(
         &mut self,
         kind: protocol::InvokeKind,
-    ) -> Result<WorkerRunResult, WorkerError> {
+    ) -> Result<WorkerRunResult, WorkerError>
+    where
+        St: Clone + 'static,
+    {
         debug_assert!(
             matches!(
                 kind,
@@ -2811,27 +3117,43 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             trigger: kind,
         })?;
 
-        let history_before = self.engine.as_ref().unwrap().history().len();
-
+        let history_before = self.session.history().len();
+        let mut annotate = history_annotator(
+            self.log_writer_handle(),
+            Vec::new(),
+            self.pending_committed_history.clone(),
+        );
         let worker = self.engine.take().expect("worker taken during run");
-        let mut locked = worker.lock();
-        let result = locked.resume().await;
+        let mut locked = worker.lock(self.session.history());
+        let result = locked
+            .resume_with_annotation(self.session.history_mut(), &mut annotate)
+            .await;
         self.engine = Some(locked.unlock());
+        self.session.note_mutation();
 
         self.handle_worker_result(result, history_before).await
     }
 
     /// Resume from a paused state.
-    pub async fn resume(&mut self) -> Result<WorkerRunResult, WorkerError> {
+    pub async fn resume(&mut self) -> Result<WorkerRunResult, WorkerError>
+    where
+        St: Clone + 'static,
+    {
         self.prepare_for_run().await?;
 
-        let history_before = self.engine.as_ref().unwrap().history().len();
-
-        // lock → resume → unlock
+        let history_before = self.session.history().len();
+        let mut annotate = history_annotator(
+            self.log_writer_handle(),
+            Vec::new(),
+            self.pending_committed_history.clone(),
+        );
         let worker = self.engine.take().expect("worker taken during run");
-        let mut locked = worker.lock();
-        let result = locked.resume().await;
+        let mut locked = worker.lock(self.session.history());
+        let result = locked
+            .resume_with_annotation(self.session.history_mut(), &mut annotate)
+            .await;
         self.engine = Some(locked.unlock());
+        self.session.note_mutation();
 
         self.handle_worker_result(result, history_before).await
     }
@@ -2850,12 +3172,18 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         let loc = self.segment_state.location();
         let entries_written = self.segment_state.entries_written();
         if entries_written == 0 {
-            let initial = LogEntry::SegmentStart {
+            let initial = LogEntry::AnnotatedSegmentStart {
                 ts: segment_log::now_millis(),
                 session_id: loc.session_id,
                 system_prompt: w.get_system_prompt().map(String::from),
                 config: w.request_config().clone(),
-                history: to_logged(w.history()),
+                history: self
+                    .session
+                    .history()
+                    .entries()
+                    .iter()
+                    .map(to_logged_history_entry)
+                    .collect(),
                 forked_from: None,
                 compacted_from: None,
             };
@@ -2880,12 +3208,18 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         // and is broadcast through the sink so existing subscribers reset
         // their view.
         let fork_segment_id = session_store::new_segment_id();
-        let entry = LogEntry::SegmentStart {
+        let entry = LogEntry::AnnotatedSegmentStart {
             ts: segment_log::now_millis(),
             session_id: loc.session_id,
             system_prompt: w.get_system_prompt().map(String::from),
             config: w.request_config().clone(),
-            history: to_logged(w.history()),
+            history: self
+                .session
+                .history()
+                .entries()
+                .iter()
+                .map(to_logged_history_entry)
+                .collect(),
             forked_from: Some(session_store::SegmentOrigin {
                 segment_id: loc.segment_id,
                 at_turn_index: w.turn_count(),
@@ -2927,23 +3261,50 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// `Yielded`), so restore remains consistent.
     async fn handle_worker_result(
         &mut self,
-        result: Result<EngineResult, EngineError>,
+        result: EngineRunExit,
         history_before: usize,
-    ) -> Result<WorkerRunResult, WorkerError> {
+    ) -> Result<WorkerRunResult, WorkerError>
+    where
+        St: Clone + 'static,
+    {
+        if matches!(&result, EngineRunExit::Interrupted(_)) {
+            self.terminalize_orphan_tool_calls()?;
+        }
         self.persist_turn(history_before, &result).await?;
 
-        if matches!(result, Ok(EngineResult::Yielded)) {
+        if matches!(result, EngineRunExit::Yielded) {
+            self.last_run_interrupted = true;
             return self.do_compact_and_resume().await;
         }
 
-        if result.is_ok() {
+        if !matches!(result, EngineRunExit::Interrupted(_)) {
             if let Some(ref state) = self.compact_state {
                 state.set_just_compacted(false);
             }
         }
-        result
-            .map(WorkerRunResult::from)
-            .map_err(WorkerError::Engine)
+
+        match result {
+            EngineRunExit::Finished => {
+                self.last_run_interrupted = false;
+                Ok(WorkerRunResult::Finished)
+            }
+            EngineRunExit::Paused => {
+                self.last_run_interrupted = true;
+                Ok(WorkerRunResult::Paused)
+            }
+            EngineRunExit::Interrupted(StopReason::LimitReached) => {
+                self.last_run_interrupted = false;
+                Ok(WorkerRunResult::LimitReached)
+            }
+            EngineRunExit::Interrupted(reason) => {
+                self.last_run_interrupted = true;
+                Ok(WorkerRunResult::Interrupted {
+                    code: stop_reason_error_code(&reason),
+                    message: stop_reason_message(&reason),
+                })
+            }
+            EngineRunExit::Yielded => unreachable!("yielded handled above"),
+        }
     }
 
     fn persist_compaction_lifecycle(
@@ -2997,7 +3358,10 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         &mut self,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<WorkerRunResult, WorkerError>> + Send + '_>,
-    > {
+    >
+    where
+        St: Clone + 'static,
+    {
         Box::pin(async move {
             // Thrash detection: if we just compacted and hit the threshold again,
             // something is wrong.
@@ -3153,7 +3517,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     async fn persist_turn(
         &mut self,
         history_before: usize,
-        result: &Result<EngineResult, EngineError>,
+        result: &EngineRunExit,
     ) -> Result<(), StoreError> {
         // Per-item commits for AssistantItem / ToolResult / SystemItem
         // entries are expected to have landed synchronously: the
@@ -3169,9 +3533,9 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         // slice from `history_before` inline so the test's
         // `restore`-style assertions still see entries on disk.
         if !self.history_persistence_wired {
-            let new_items: Vec<Item> = self.engine.as_ref().unwrap().history()[history_before..]
+            let new_items: Vec<Item> = self.session.history().entries()[history_before..]
                 .iter()
-                .cloned()
+                .map(|entry| entry.item.clone())
                 .collect();
             let ts = segment_log::now_millis();
             for item in &new_items {
@@ -3251,22 +3615,43 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 .push(record);
         }
 
-        let interrupted = self.engine.as_ref().unwrap().last_run_interrupted();
+        let interrupted = matches!(
+            result,
+            EngineRunExit::Paused
+                | EngineRunExit::Yielded
+                | EngineRunExit::Interrupted(StopReason::Cancelled)
+                | EngineRunExit::Interrupted(StopReason::ContextWindowExceeded)
+                | EngineRunExit::Interrupted(StopReason::Unexpected(_))
+        );
         let active_run_turn_count = self.engine.as_ref().unwrap().active_run_turn_count();
         match result {
-            Ok(r) => {
+            EngineRunExit::Finished | EngineRunExit::Paused | EngineRunExit::Yielded => {
+                let result = match result {
+                    EngineRunExit::Finished => EngineResult::Finished,
+                    EngineRunExit::Paused => EngineResult::Paused,
+                    EngineRunExit::Yielded => EngineResult::Yielded,
+                    EngineRunExit::Interrupted(_) => unreachable!(),
+                };
                 self.commit_entry(LogEntry::RunCompleted {
                     ts: segment_log::now_millis(),
                     interrupted,
-                    result: r.clone(),
+                    result,
                     active_run_turn_count,
                 })?;
             }
-            Err(e) => {
+            EngineRunExit::Interrupted(StopReason::LimitReached) => {
+                self.commit_entry(LogEntry::RunCompleted {
+                    ts: segment_log::now_millis(),
+                    interrupted: false,
+                    result: EngineResult::LimitReached,
+                    active_run_turn_count,
+                })?;
+            }
+            EngineRunExit::Interrupted(reason) => {
                 self.commit_entry(LogEntry::RunErrored {
                     ts: segment_log::now_millis(),
                     interrupted,
-                    message: e.to_string(),
+                    message: stop_reason_message(reason),
                 })?;
             }
         }
@@ -3355,11 +3740,18 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         // within `retained_tokens`. Item-granular, turn boundaries ignored.
         let cut = self.split_for_retained(retained_tokens);
 
-        let worker = self.engine.as_ref().expect("worker taken during run");
-        let history = worker.history();
-        let retain_from = cut.index.min(history.len());
-        let retained_items = history[retain_from..].to_vec();
-        let items_to_summarise = history[..retain_from].to_vec();
+        let history_entries = self.session.history().entries();
+        let retain_from = cut.index.min(history_entries.len());
+        let retained_history_entries = history_entries[retain_from..].to_vec();
+        let retained_items = retained_history_entries
+            .iter()
+            .map(|entry| entry.item.clone())
+            .collect::<Vec<_>>();
+        let entries_to_summarise = history_entries[..retain_from].to_vec();
+        let items_to_summarise = entries_to_summarise
+            .iter()
+            .map(|entry| entry.item.clone())
+            .collect::<Vec<_>>();
         // Compaction-related knobs. Fall through to manifest defaults when
         // `[compaction]` is omitted entirely.
         let (
@@ -3487,9 +3879,9 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             .with_module(
                 crate::feature::builtin::session_explore::SessionExploreFeature::new(
                     crate::feature::builtin::session_explore::SessionExploreState::new(
-                        crate::session_capture::SessionCapture::new(
+                        crate::session_capture::SessionCapture::from_history_entries(
                             self.segment_id().to_string(),
-                            items_to_summarise.clone(),
+                            entries_to_summarise.clone(),
                         ),
                     ),
                 ),
@@ -3766,6 +4158,36 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 max: result_context_max_tokens,
             });
         }
+        let original_entries = self.session.history().entries();
+        let derived_sources = original_entries
+            .iter()
+            .map(|entry| entry.annotation.entry_id.clone())
+            .collect::<Vec<_>>();
+        let mut original_cursor = 0usize;
+        let compacted_history_entries = new_history
+            .iter()
+            .cloned()
+            .map(|item| {
+                if let Some((offset, original)) = original_entries[original_cursor..]
+                    .iter()
+                    .enumerate()
+                    .find(|(_, original)| original.item == item)
+                {
+                    original_cursor += offset + 1;
+                    HistoryEntry::new(item, original.annotation.clone())
+                } else {
+                    HistoryEntry::new(
+                        item,
+                        new_history_metadata(
+                            WorkerHistoryProvenance::DerivedSummary,
+                            Some(SessionHistoryDerivation {
+                                sources: derived_sources.clone(),
+                            }),
+                        ),
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
 
         // Build the SegmentStart entry for the new compacted segment.
         // Inherits the source Segment's session_id so the compacted
@@ -3777,12 +4199,15 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         let old_loc = self.segment_state.location();
         let source_turn_count = self.engine.as_ref().unwrap().turn_count();
         let w = self.engine.as_ref().unwrap();
-        let entry = LogEntry::SegmentStart {
+        let entry = LogEntry::AnnotatedSegmentStart {
             ts: segment_log::now_millis(),
             session_id: old_loc.session_id,
             system_prompt: w.get_system_prompt().map(String::from),
             config: w.request_config().clone(),
-            history: to_logged(&new_history),
+            history: compacted_history_entries
+                .iter()
+                .map(to_logged_history_entry)
+                .collect(),
             forked_from: None,
             compacted_from: Some(session_store::SegmentOrigin {
                 segment_id: old_loc.segment_id,
@@ -3846,7 +4271,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             self.user_segments.drain(..drop_n);
         }
 
-        self.engine.as_mut().unwrap().set_history(new_history);
+        self.session.replace_history(compacted_history_entries);
         // Compaction-introduced system messages are part of the new
         // SegmentStart's history (broadcast above) — clients derive
         // their blocks from `SegmentStart.history`. No per-item
@@ -4086,12 +4511,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             return Ok(ExtractDecision::Skipped);
         }
 
-        let current_history_len = self
-            .engine
-            .as_ref()
-            .expect("engine present")
-            .history()
-            .len();
+        let current_history_len = self.session.history().len();
         if current_history_len <= processed_history_len {
             audit
                 .emit(
@@ -4184,9 +4604,8 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             )
             .await;
 
-        let items_to_extract = self.engine.as_ref().expect("worker present").history()
-            [processed_history_len..current_history_len]
-            .to_vec();
+        let entries_to_extract =
+            self.session.history().entries()[processed_history_len..current_history_len].to_vec();
 
         let extract_worker_max_turns = memory_cfg
             .extract_worker_max_turns
@@ -4236,9 +4655,9 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             segment_id: source_segment_id.to_string(),
             range: [start_entry as u64, end_entry as u64],
         };
-        let session_view = crate::session_capture::SessionCapture::new(
+        let session_view = crate::session_capture::SessionCapture::from_history_entries(
             source_segment_id.to_string(),
-            items_to_extract,
+            entries_to_extract,
         );
         let session_explore_state = SessionExploreState::new(session_view.clone());
         let memory_extract_state = MemoryExtractState::new(
@@ -4467,6 +4886,9 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
 fn extract_internal_worker_lifecycle_error(lifecycle: &WorkerRunResult) -> Option<WorkerError> {
     match lifecycle {
         WorkerRunResult::RolledBack => Some(WorkerError::Engine(EngineError::Cancelled)),
+        WorkerRunResult::Interrupted { message, .. } => {
+            Some(WorkerError::Engine(EngineError::Aborted(message.clone())))
+        }
         WorkerRunResult::Finished | WorkerRunResult::Paused | WorkerRunResult::LimitReached => None,
     }
 }
@@ -4719,7 +5141,10 @@ where
             segment_id,
         )?;
 
-        let mut worker = Engine::new(common.client);
+        let mut worker =
+            Engine::<Box<dyn LlmClient>, Mutable, SessionHistoryMetadata>::new_annotated(
+                common.client,
+            );
         apply_worker_manifest(&mut worker, &manifest.engine);
         worker.set_cache_key(Some(segment_id.to_string()));
         let worker_metadata_writer = Some(worker_metadata_writer_for_store(&store));
@@ -4729,6 +5154,8 @@ where
         let mut worker = Self {
             manifest,
             engine: Some(worker),
+            session: WorkerSession::new(session_id, Vec::new()),
+            last_run_interrupted: false,
             store,
             worker_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, 0),
@@ -4757,6 +5184,7 @@ where
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
+            pending_committed_history: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             scope_allocation: Some(scope_allocation),
             callback_socket: None,
             runtime_ticket_role: None,
@@ -4799,7 +5227,10 @@ where
         }
         let session_id = session_store::new_session_id();
         let segment_id = session_store::new_segment_id();
-        let mut engine = Engine::new(common.client);
+        let mut engine =
+            Engine::<Box<dyn LlmClient>, Mutable, SessionHistoryMetadata>::new_annotated(
+                common.client,
+            );
         apply_worker_manifest(&mut engine, &manifest.engine);
         engine.set_cache_key(Some(segment_id.to_string()));
         let scope = SharedScope::new(common.scope);
@@ -4807,6 +5238,8 @@ where
         let mut worker = Self {
             manifest,
             engine: Some(engine),
+            session: WorkerSession::new(session_id, Vec::new()),
+            last_run_interrupted: false,
             store,
             worker_metadata_writer: None,
             segment_state: SegmentState::new(session_id, segment_id, 0),
@@ -4835,6 +5268,7 @@ where
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
+            pending_committed_history: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             scope_allocation: None,
             callback_socket: None,
             runtime_ticket_role: None,
@@ -4910,7 +5344,10 @@ where
             segment_id,
         )?;
 
-        let mut worker = Engine::new(common.client);
+        let mut worker =
+            Engine::<Box<dyn LlmClient>, Mutable, SessionHistoryMetadata>::new_annotated(
+                common.client,
+            );
         apply_worker_manifest(&mut worker, &manifest.engine);
         worker.set_cache_key(Some(segment_id.to_string()));
         let worker_metadata_writer = Some(worker_metadata_writer_for_store(&store));
@@ -4920,6 +5357,8 @@ where
         let mut worker = Self {
             manifest,
             engine: Some(worker),
+            session: WorkerSession::new(session_id, Vec::new()),
+            last_run_interrupted: false,
             store,
             worker_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, 0),
@@ -4948,6 +5387,7 @@ where
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
+            pending_committed_history: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             scope_allocation: Some(scope_allocation),
             callback_socket: Some(callback_socket),
             runtime_ticket_role: None,
@@ -5198,7 +5638,10 @@ where
 
         // Build the worker and apply the manifest defaults first, then
         // overwrite the pieces the session log is authoritative for.
-        let mut worker = Engine::new(common.client);
+        let mut worker =
+            Engine::<Box<dyn LlmClient>, Mutable, SessionHistoryMetadata>::new_annotated(
+                common.client,
+            );
         apply_worker_manifest(&mut worker, &manifest.engine);
         worker.set_cache_key(Some(segment_id.to_string()));
         if let Some(ref prompt) = state.system_prompt {
@@ -5208,18 +5651,23 @@ where
         // (the Worker's one and only write path that prepends a summary at
         // history[0]). Restoring the anchor lets Anthropic re-use a
         // stable cache prefix for long-lived restored sessions.
+        let restored_history_entries =
+            restore_history_entries(session_id, segment_id, &raw_entries).map_err(|error| {
+                WorkerError::InvalidState(format!("restore typed Worker session history: {error}"))
+            })?;
+        let restored_history = restored_history_entries
+            .iter()
+            .map(|entry| entry.item.clone())
+            .collect::<Vec<_>>();
         let anchored_on_summary = matches!(
-            state.history.first(),
+            restored_history.first(),
             Some(Item::Message {
                 role: agen::Role::System,
                 ..
             })
         );
-        let restored_history = state.history.clone();
-        worker.set_history(restored_history);
         worker.set_request_config(state.config.clone());
         worker.set_turn_count(state.turn_count);
-        worker.set_last_run_interrupted(state.last_run_interrupted);
         worker.set_active_run_turn_count(state.active_run_turn_count);
         if anchored_on_summary {
             worker.set_cache_anchor(Some(0));
@@ -5234,6 +5682,8 @@ where
         let mut worker = Self {
             manifest,
             engine: Some(worker),
+            session: WorkerSession::new(session_id, restored_history_entries),
+            last_run_interrupted: state.last_run_interrupted,
             store,
             worker_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, state.entries_count),
@@ -5266,6 +5716,7 @@ where
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
+            pending_committed_history: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             scope_allocation: Some(scope_allocation),
             callback_socket: None,
             runtime_ticket_role: None,
@@ -5363,9 +5814,21 @@ where
 /// Note: `system_prompt` is intentionally not applied here. It is a
 /// minijinja template that is parsed by `Worker::from_manifest` and
 /// rendered once at first turn in `ensure_system_prompt_materialized`.
-pub fn apply_worker_manifest<C: LlmClient>(worker: &mut Engine<C>, wm: &manifest::EngineManifest) {
+pub fn apply_worker_manifest<C: LlmClient + 'static, A>(
+    worker: &mut Engine<C, Mutable, A>,
+    wm: &manifest::EngineManifest,
+) {
     worker.set_request_config(request_config_from_engine_manifest(wm));
     worker.set_max_turns(wm.max_turns.map(|n| n.get()));
+    // Worker owns the lifecycle strategy for already-started tool operations.
+    // The provider must first accept cooperative cancellation, then confirm a
+    // terminal result before this bounded deadline; Agen handles only the
+    // mechanical per-call terminalization.
+    worker.set_tool_execution_policy(ToolExecutionPolicy {
+        pause_safe_boundary_timeout: Duration::from_millis(100),
+        cancellation_request_timeout: Duration::from_millis(250),
+        terminal_confirmation_timeout: Duration::from_millis(500),
+    });
     worker.set_tool_output_limits(Some(ToolOutputLimits {
         default_max_bytes: wm.tool_output.default_max_bytes,
         per_tool: wm.tool_output.per_tool.clone(),
@@ -5470,8 +5933,36 @@ fn restore_manifest_from_worker_metadata_snapshot(
     }
 }
 
+fn stop_reason_error_code(reason: &StopReason) -> ErrorCode {
+    match reason {
+        StopReason::ContextWindowExceeded | StopReason::Unexpected(EngineError::Client(_)) => {
+            ErrorCode::ProviderError
+        }
+        StopReason::Unexpected(EngineError::Tool(_)) => ErrorCode::ToolError,
+        StopReason::LimitReached
+        | StopReason::Cancelled
+        | StopReason::Unexpected(
+            EngineError::Aborted(_)
+            | EngineError::Cancelled
+            | EngineError::PauseRequested
+            | EngineError::ConfigWarnings(_)
+            | EngineError::HistoryAppend(_)
+            | EngineError::ToolAttemptFence(_),
+        ) => ErrorCode::Internal,
+    }
+}
+
+fn stop_reason_message(reason: &StopReason) -> String {
+    match reason {
+        StopReason::LimitReached => "engine turn limit reached".to_string(),
+        StopReason::ContextWindowExceeded => "model context window reached".to_string(),
+        StopReason::Cancelled => "engine run cancelled".to_string(),
+        StopReason::Unexpected(error) => format!("unexpected engine failure: {error}"),
+    }
+}
+
 /// Result of a Worker run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerRunResult {
     /// The LLM finished its turn normally.
     Finished,
@@ -5479,6 +5970,8 @@ pub enum WorkerRunResult {
     Paused,
     /// The worker reached its configured max_turns limit.
     LimitReached,
+    /// The run was interrupted by a known or unexpected terminal cause.
+    Interrupted { code: ErrorCode, message: String },
     /// The submit-time user turn was rolled back because no AI output was materialized.
     RolledBack,
 }
@@ -5763,27 +6256,30 @@ fn build_rewind_targets(segment_id: uuid::Uuid, entries: &[LogEntry]) -> Vec<Rew
     let mut turn_index = 0usize;
     let mut targets = Vec::new();
     for (entry_index, entry) in entries.iter().enumerate() {
-        if let LogEntry::UserInput { segments, ts, .. } = entry {
-            turn_index += 1;
-            let truncate_entries = rewind_truncate_entries(entries, entry_index);
-            let tool_warning = suffix_has_tool_side_effects(&entries[truncate_entries..]);
-            targets.push(RewindTarget {
-                id: RewindTargetId {
-                    segment_id,
-                    user_input_entry_index: entry_index,
-                },
-                expected_head_entries: head_entries,
-                truncate_entries,
-                turn_index,
-                timestamp_ms: Some(*ts),
-                preview: preview_segments(segments),
-                eligible: true,
-                disabled_reason: None,
-                warning: tool_warning.then(|| {
-                    "history suffix will be discarded; tool side effects are not undone".into()
-                }),
-            });
-        }
+        let (segments, ts) = match entry {
+            LogEntry::UserInput { segments, ts, .. }
+            | LogEntry::AnnotatedUserInput { segments, ts, .. } => (segments, ts),
+            _ => continue,
+        };
+        turn_index += 1;
+        let truncate_entries = rewind_truncate_entries(entries, entry_index);
+        let tool_warning = suffix_has_tool_side_effects(&entries[truncate_entries..]);
+        targets.push(RewindTarget {
+            id: RewindTargetId {
+                segment_id,
+                user_input_entry_index: entry_index,
+            },
+            expected_head_entries: head_entries,
+            truncate_entries,
+            turn_index,
+            timestamp_ms: Some(*ts),
+            preview: preview_segments(segments),
+            eligible: true,
+            disabled_reason: None,
+            warning: tool_warning.then(|| {
+                "history suffix will be discarded; tool side effects are not undone".into()
+            }),
+        });
     }
     targets.reverse();
     targets
@@ -5804,8 +6300,9 @@ fn rewind_truncate_entries(entries: &[LogEntry], user_input_entry_index: usize) 
 
 fn suffix_has_tool_side_effects(entries: &[LogEntry]) -> bool {
     entries.iter().any(|entry| match entry {
-        LogEntry::ToolResult { .. } => true,
+        LogEntry::ToolResult { .. } | LogEntry::AnnotatedToolResult { .. } => true,
         LogEntry::AssistantItem { item, .. } => logged_item_is_tool_call(item),
+        LogEntry::AnnotatedAssistantItem { entry, .. } => logged_item_is_tool_call(&entry.item),
         _ => false,
     })
 }
@@ -6965,6 +7462,118 @@ mod build_summary_prompt_tests {
     }
 
     #[derive(Clone)]
+    struct PauseResumeClient {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PauseResumeClient {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl agen::llm_client::LlmClient for PauseResumeClient {
+        async fn stream(
+            &self,
+            _request: agen::llm_client::Request,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<agen::llm_client::Event, agen::llm_client::ClientError>,
+                        > + Send,
+                >,
+            >,
+            agen::llm_client::ClientError,
+        > {
+            use agen::llm_client::{Event, ResponseStatus, StatusEvent};
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let events = if call == 0 {
+                vec![
+                    Event::tool_use_start(0, "call_pending", "pending_once"),
+                    Event::tool_input_delta(0, r#"{}"#),
+                    Event::tool_use_stop(0),
+                    Event::Status(StatusEvent {
+                        status: ResponseStatus::Completed,
+                    }),
+                ]
+            } else {
+                vec![
+                    Event::text_block_start(0),
+                    Event::text_delta(0, "done"),
+                    Event::text_block_stop(0, None),
+                    Event::Status(StatusEvent {
+                        status: ResponseStatus::Completed,
+                    }),
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+        }
+
+        fn clone_boxed(&self) -> Box<dyn agen::llm_client::LlmClient> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[derive(Clone)]
+    struct CountingPendingTool {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl agen::tool::Tool for CountingPendingTool {
+        async fn execute(
+            &self,
+            _input_json: &str,
+            _ctx: agen::ToolExecutionContext,
+        ) -> Result<agen::tool::ToolOutput, agen::tool::ToolError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("executed once".to_string().into())
+        }
+    }
+
+    fn counting_pending_tool(
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> agen::tool::ToolDefinition {
+        Arc::new(move || {
+            let meta = agen::tool::ToolMeta::new("pending_once")
+                .description("Counts resumable pending execution")
+                .input_schema(serde_json::json!({"type": "object"}));
+            (
+                meta,
+                Arc::new(CountingPendingTool {
+                    calls: calls.clone(),
+                }) as Arc<dyn agen::tool::Tool>,
+            )
+        })
+    }
+
+    #[derive(Clone)]
+    struct PauseOnceHook {
+        should_pause: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::hook::Hook<crate::hook::PreToolCall> for PauseOnceHook {
+        async fn call(
+            &self,
+            _input: &crate::hook::ToolCallSummary,
+        ) -> crate::hook::HookPreToolAction {
+            if self
+                .should_pause
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                crate::hook::HookPreToolAction::Pause
+            } else {
+                crate::hook::HookPreToolAction::Continue
+            }
+        }
+    }
+
+    #[derive(Clone)]
     struct NoopClient;
 
     #[async_trait]
@@ -7005,7 +7614,7 @@ mod build_summary_prompt_tests {
         let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
         let mut worker = Worker::new(
             minimal_manifest(),
-            Engine::new(NoopClient),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
             store,
             WorkerWorkspaceContext::no_workspace(),
             WorkerFilesystemAuthority::None,
@@ -7014,12 +7623,12 @@ mod build_summary_prompt_tests {
         .await
         .unwrap();
         worker.ensure_segment_head().unwrap();
-        worker.engine_mut().set_last_run_interrupted(true);
+        worker.last_run_interrupted = true;
         worker.engine_mut().set_active_run_turn_count(Some(3));
 
         worker.prepare_interrupted_history_for_fresh_run().unwrap();
 
-        assert!(!worker.engine().last_run_interrupted());
+        assert!(!worker.last_run_interrupted);
         assert_eq!(worker.engine().active_run_turn_count(), None);
         let checkpoint = active_run_checkpoint_entry(
             worker.engine().active_run_turn_count(),
@@ -7048,7 +7657,7 @@ mod build_summary_prompt_tests {
         let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
         let mut worker = Worker::new(
             minimal_manifest(),
-            Engine::new(NoopClient),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
             store,
             WorkerWorkspaceContext::no_workspace(),
             WorkerFilesystemAuthority::None,
@@ -7058,7 +7667,7 @@ mod build_summary_prompt_tests {
         .unwrap();
         worker.ensure_segment_head().unwrap();
         worker.engine_mut().set_turn_count(7);
-        worker.engine_mut().set_last_run_interrupted(true);
+        worker.last_run_interrupted = true;
         worker.engine_mut().set_active_run_turn_count(Some(3));
 
         let session_id = worker.session_id();
@@ -7087,7 +7696,7 @@ mod build_summary_prompt_tests {
         assert!(matches!(
             fork_entries.as_slice(),
             [
-                LogEntry::SegmentStart { .. },
+                LogEntry::AnnotatedSegmentStart { .. },
                 LogEntry::ActiveRunCheckpoint {
                     active_turn_count: 3,
                     total_turn_count: 7,
@@ -7108,7 +7717,7 @@ mod build_summary_prompt_tests {
         let workspace_client = Arc::new(RecordingAuditWorkspaceClient::default());
         let mut worker = Worker::new(
             minimal_manifest(),
-            Engine::new(NoopClient),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
             store,
             WorkerWorkspaceContext::with_client(
                 Some(WorkspaceId::new("workspace-test").unwrap()),
@@ -7142,7 +7751,7 @@ mod build_summary_prompt_tests {
         let workspace_client = Arc::new(FlowSourceWorkspaceClient::default());
         let mut worker = Worker::new(
             minimal_manifest(),
-            Engine::new(NoopClient),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
             store.clone(),
             WorkerWorkspaceContext::with_client(
                 Some(WorkspaceId::new("workspace-test").unwrap()),
@@ -7177,7 +7786,7 @@ mod build_summary_prompt_tests {
         }]);
         assert!(matches!(invalid, Err(WorkerError::FlowInput(_))));
 
-        let (segments, state) = worker
+        let (segments, state, projection) = worker
             .prepare_flow_input(vec![
                 Segment::Flow {
                     selector: "builtin:coder-review".to_string(),
@@ -7190,11 +7799,13 @@ mod build_summary_prompt_tests {
             FLOW_RUNTIME_EXTENSION_DOMAIN,
             serde_json::to_value(&state).unwrap(),
         );
+        let projected = worker.projected_input_history(&segments, projection.as_ref());
         worker
-            .commit_entry(LogEntry::UserInput {
+            .commit_entry(LogEntry::AnnotatedUserInput {
                 ts: segment_log::now_millis(),
                 segments: segments.clone(),
                 extensions: vec![extension],
+                history: projected.iter().map(to_logged_history_entry).collect(),
             })
             .unwrap();
         *worker
@@ -7202,11 +7813,19 @@ mod build_summary_prompt_tests {
             .lock()
             .expect("flow runtime state lock") = Some(state.clone());
 
-        assert_eq!(
-            segments[0],
-            Segment::text("Implement the Ticket and request review.")
-        );
+        assert!(matches!(
+            &segments[0],
+            Segment::Flow { selector } if selector == "builtin:coder-review"
+        ));
         assert_eq!(segments[1], Segment::text("Implement Ticket 00001"));
+        assert_eq!(
+            projected[0].item.as_text().as_deref(),
+            Some("Implement the Ticket and request review.")
+        );
+        assert!(matches!(
+            projected[0].annotation.origin,
+            WorkerHistoryProvenance::FlowInstruction { .. }
+        ));
         assert_eq!(state.instance.definition_revision, 3);
         assert_eq!(state.instance.current_state.as_str(), "implement");
         assert_eq!(workspace_client.requests.lock().unwrap().len(), 1);
@@ -7232,7 +7851,7 @@ mod build_summary_prompt_tests {
 
         let mut detached = Worker::new(
             minimal_manifest(),
-            Engine::new(NoopClient),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
             session_store::FsStore::new(dir.path().join("detached-sessions")).unwrap(),
             WorkerWorkspaceContext::unavailable(
                 Some(WorkspaceId::new("workspace-test").unwrap()),
@@ -7265,7 +7884,7 @@ mod build_summary_prompt_tests {
         let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
         let mut worker = Worker::new(
             manifest,
-            Engine::new(NoopClient),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
             store,
             WorkerWorkspaceContext::local_filesystem(None),
             authority,
@@ -7283,6 +7902,56 @@ mod build_summary_prompt_tests {
             .store
             .append(loc.session_id, loc.segment_id, &entry)
             .unwrap();
+    }
+
+    fn append_annotated_user_turn(
+        worker: &Worker<NoopClient, session_store::FsStore>,
+        ts: u64,
+        text: &str,
+    ) -> Vec<SessionHistoryMetadata> {
+        let user = history_entry(
+            Item::user_message(text),
+            WorkerHistoryProvenance::HumanInput {
+                account_id: "account-1".into(),
+            },
+        );
+        let assistant = history_entry(
+            Item::assistant_message(format!("answer: {text}")),
+            WorkerHistoryProvenance::ModelOutput {
+                worker: worker_subject(worker.session.session_id()),
+            },
+        );
+        append_test_entry(
+            worker,
+            LogEntry::Invoke {
+                ts,
+                trigger: protocol::InvokeKind::UserSend,
+            },
+        );
+        append_test_entry(
+            worker,
+            LogEntry::AnnotatedUserInput {
+                ts: ts + 1,
+                segments: vec![Segment::text(text)],
+                extensions: Vec::new(),
+                history: vec![to_logged_history_entry(&user)],
+            },
+        );
+        append_test_entry(
+            worker,
+            LogEntry::AnnotatedAssistantItem {
+                ts: ts + 2,
+                entry: to_logged_history_entry(&assistant),
+            },
+        );
+        append_test_entry(
+            worker,
+            LogEntry::TurnEnd {
+                ts: ts + 3,
+                turn_count: 1,
+            },
+        );
+        vec![user.annotation, assistant.annotation]
     }
 
     fn append_user_turn(worker: &Worker<NoopClient, session_store::FsStore>, ts: u64, text: &str) {
@@ -7324,6 +7993,7 @@ mod build_summary_prompt_tests {
                     summary: "wrote a file".into(),
                     content: None,
                     attachments: Vec::new(),
+                    disposition: Default::default(),
                     is_error: false,
                 },
             },
@@ -7366,6 +8036,7 @@ mod build_summary_prompt_tests {
                     summary: "wrote a file".into(),
                     content: None,
                     attachments: Vec::new(),
+                    disposition: Default::default(),
                     is_error: false,
                 },
             },
@@ -7391,10 +8062,107 @@ mod build_summary_prompt_tests {
                 .len(),
             expected_truncate_entries
         );
-        assert_eq!(worker.engine().history().len(), 1);
+        assert_eq!(worker.history().len(), 1);
+        assert_eq!(worker.history()[0].as_text().unwrap(), "first message");
+    }
+
+    #[tokio::test]
+    async fn annotated_history_rewind_commits_authoritative_prefix() {
+        let (_dir, mut worker) = rewind_test_worker().await;
+        let expected_metadata = append_annotated_user_turn(&worker, 10, "first message");
+        append_annotated_user_turn(&worker, 20, "second message");
+        append_test_entry(
+            &worker,
+            LogEntry::AnnotatedToolResult {
+                ts: 30,
+                entry: session_store::LoggedHistoryEntry {
+                    item: session_store::LoggedItem::ToolResult {
+                        call_id: "call-v2".into(),
+                        summary: "side effect".into(),
+                        content: None,
+                        attachments: Vec::new(),
+                        disposition: Default::default(),
+                        is_error: false,
+                    },
+                    metadata: new_history_metadata(
+                        WorkerHistoryProvenance::ToolOutput {
+                            worker: worker_subject(worker.session.session_id()),
+                        },
+                        None,
+                    ),
+                },
+            },
+        );
+
+        let (head_entries, targets) = worker.list_rewind_targets().unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].preview, "second message");
+        assert!(targets[0].truncate_entries > 0);
+        assert!(targets[0].warning.is_some());
+
+        let applied = worker
+            .rewind_to(targets[0].id.clone(), head_entries)
+            .unwrap();
+        assert_eq!(applied.summary.truncated_to_entries, 5);
+        assert!(matches!(
+            applied.entries.first(),
+            Some(LogEntry::AnnotatedSegmentStart { .. })
+        ));
+        let retained_metadata = worker
+            .session_history()
+            .entries()
+            .iter()
+            .map(|entry| entry.annotation.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(retained_metadata, expected_metadata);
+
+        let source_location = worker.segment_state.location();
+        let persisted_prefix = worker
+            .store
+            .read_all(source_location.session_id, source_location.segment_id)
+            .unwrap();
+        let restored_prefix = restore_history_entries(
+            source_location.session_id,
+            source_location.segment_id,
+            &persisted_prefix,
+        )
+        .unwrap();
         assert_eq!(
-            worker.engine().history()[0].as_text().unwrap(),
-            "first message"
+            restored_prefix
+                .iter()
+                .map(|entry| entry.annotation.clone())
+                .collect::<Vec<_>>(),
+            expected_metadata
+        );
+
+        // Simulate a stale concurrent writer so the next head check forks.
+        append_test_entry(
+            &worker,
+            LogEntry::Extension {
+                ts: 31,
+                domain: "test.concurrent-writer".into(),
+                payload: serde_json::json!({"value": true}),
+            },
+        );
+        worker.ensure_segment_head().unwrap();
+        let fork_location = worker.segment_state.location();
+        assert_ne!(fork_location.segment_id, source_location.segment_id);
+        let fork_entries = worker
+            .store
+            .read_all(fork_location.session_id, fork_location.segment_id)
+            .unwrap();
+        let fork_history = restore_history_entries(
+            fork_location.session_id,
+            fork_location.segment_id,
+            &fork_entries,
+        )
+        .unwrap();
+        assert_eq!(
+            fork_history
+                .iter()
+                .map(|entry| entry.annotation.clone())
+                .collect::<Vec<_>>(),
+            expected_metadata
         );
     }
 
@@ -7414,7 +8182,61 @@ mod build_summary_prompt_tests {
     }
 
     #[tokio::test]
-    async fn apply_interrupt_prep_appends_via_callback_and_logs_independent_entries() {
+    async fn hook_paused_pending_tool_resumes_and_executes_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut engine =
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(PauseResumeClient::new());
+        engine.register_tool(counting_pending_tool(calls.clone()));
+        let mut worker = Worker::new(
+            minimal_manifest(),
+            engine,
+            store,
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        let should_pause = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        worker.add_pre_tool_call_hook(PauseOnceHook { should_pause });
+
+        assert_eq!(
+            worker.run_text("start").await.unwrap(),
+            WorkerRunResult::Paused
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(worker.history().iter().any(|item| matches!(
+            item,
+            Item::ToolCall { call_id, .. } if call_id == "call_pending"
+        )));
+        assert!(!worker.history().iter().any(|item| matches!(
+            item,
+            Item::ToolResult { call_id, .. } if call_id == "call_pending"
+        )));
+
+        assert_eq!(worker.resume().await.unwrap(), WorkerRunResult::Finished);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            worker
+                .history()
+                .iter()
+                .filter(|item| matches!(
+                    item,
+                    Item::ToolResult {
+                        call_id,
+                        disposition: agen::ToolResultDisposition::Success,
+                        ..
+                    } if call_id == "call_pending"
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_result_terminalizes_orphan_before_run_completed() {
         let dir = tempfile::tempdir().unwrap();
         let manifest = minimal_manifest();
         let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
@@ -7424,7 +8246,7 @@ mod build_summary_prompt_tests {
         let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
         let mut worker = Worker::new(
             manifest,
-            Engine::new(NoopClient),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
             store,
             WorkerWorkspaceContext::local_filesystem(None),
             authority,
@@ -7435,13 +8257,128 @@ mod build_summary_prompt_tests {
 
         worker.ensure_segment_head().unwrap();
         worker.wire_history_persistence();
-        worker
-            .engine_mut()
-            .set_history(vec![Item::tool_call("call-1", "Read", "{}")]);
+        worker.set_history_for_test(vec![
+            Item::tool_call("call-known", "Read", "{}"),
+            Item::tool_result_item_with_disposition_and_attachments(
+                "call-known",
+                "known result",
+                Some("confirmed output".to_string()),
+                agen::ToolResultDisposition::Success,
+                Vec::new(),
+            ),
+            Item::tool_call("call-orphan", "Bash", "{}"),
+        ]);
+        let _ = worker
+            .handle_worker_result(
+                EngineRunExit::Interrupted(StopReason::Cancelled),
+                worker.history().len(),
+            )
+            .await
+            .unwrap();
+
+        let history = worker.history();
+        assert_eq!(
+            history
+                .iter()
+                .filter(|item| matches!(
+                    item,
+                    Item::ToolResult {
+                        call_id,
+                        disposition: agen::ToolResultDisposition::Success,
+                        ..
+                    } if call_id == "call-known"
+                ))
+                .count(),
+            1
+        );
+        assert!(!history.iter().any(|item| matches!(
+            item,
+            Item::ToolResult {
+                call_id,
+                disposition: agen::ToolResultDisposition::OutcomeUnknown,
+                ..
+            } if call_id == "call-known"
+        )));
+        assert_eq!(
+            history
+                .iter()
+                .filter(|item| matches!(
+                    item,
+                    Item::ToolResult {
+                        call_id,
+                        disposition: agen::ToolResultDisposition::OutcomeUnknown,
+                        ..
+                    } if call_id == "call-orphan"
+                ))
+                .count(),
+            1
+        );
+
+        let entries = worker
+            .store
+            .read_all(
+                worker.segment_state.session_id(),
+                worker.segment_state.segment_id(),
+            )
+            .unwrap();
+        let terminal_index = entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry,
+                    LogEntry::AnnotatedToolResult {
+                        entry: session_store::LoggedHistoryEntry {
+                            item: session_store::LoggedItem::ToolResult {
+                                call_id,
+                                disposition: agen::ToolResultDisposition::OutcomeUnknown,
+                                ..
+                            },
+                            ..
+                        },
+                        ..
+                    } if call_id == "call-orphan"
+                )
+            })
+            .expect("durable OutcomeUnknown closure");
+        let final_index = entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry,
+                    LogEntry::RunCompleted { .. } | LogEntry::RunErrored { .. }
+                )
+            })
+            .expect("durable final run status");
+        assert!(terminal_index < final_index);
+    }
+
+    #[tokio::test]
+    async fn apply_interrupt_prep_appends_via_callback_and_logs_independent_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = minimal_manifest();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let cwd = dir.path().join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let scope = Scope::writable(&cwd).unwrap();
+        let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
+        let mut worker = Worker::new(
+            manifest,
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+            store,
+            WorkerWorkspaceContext::local_filesystem(None),
+            authority,
+            scope,
+        )
+        .await
+        .unwrap();
+
+        worker.ensure_segment_head().unwrap();
+        worker.wire_history_persistence();
+        worker.set_history_for_test(vec![Item::tool_call("call-1", "Read", "{}")]);
 
         worker.apply_interrupt_prep().unwrap();
 
-        let history = worker.engine().history();
+        let history = worker.history();
         assert_eq!(history.len(), 3);
         assert!(matches!(history[1], Item::ToolResult { ref call_id, .. } if call_id == "call-1"));
         assert!(matches!(
@@ -7465,8 +8402,11 @@ mod build_summary_prompt_tests {
             .filter(|entry| {
                 matches!(
                     entry,
-                    LogEntry::ToolResult {
-                        item: session_store::LoggedItem::ToolResult { call_id, .. },
+                    LogEntry::AnnotatedToolResult {
+                        entry: session_store::LoggedHistoryEntry {
+                            item: session_store::LoggedItem::ToolResult { call_id, .. },
+                            ..
+                        },
                         ..
                     } if call_id == "call-1"
                 )
@@ -7477,8 +8417,11 @@ mod build_summary_prompt_tests {
             .filter(|entry| {
                 matches!(
                     entry,
-                    LogEntry::SystemItem {
-                        item: SystemItem::Interrupt { body, .. },
+                    LogEntry::AnnotatedSystemItem {
+                        entry: session_store::LoggedSystemHistoryEntry {
+                            item: SystemItem::Interrupt { body, .. },
+                            ..
+                        },
                         ..
                     } if body == &interrupt_note
                 )
@@ -7500,7 +8443,7 @@ mod build_summary_prompt_tests {
         let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
         let mut worker = Worker::new(
             manifest,
-            Engine::new(NoopClient),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
             store,
             WorkerWorkspaceContext::local_filesystem(None),
             authority,
@@ -7518,15 +8461,15 @@ mod build_summary_prompt_tests {
                 item: dangling_call.clone().into(),
             })
             .unwrap();
-        worker.engine_mut().set_history(vec![dangling_call]);
-        worker.engine_mut().set_last_run_interrupted(true);
+        worker.set_history_for_test(vec![dangling_call]);
+        worker.last_run_interrupted = true;
 
         worker
             .run_for_notification(protocol::InvokeKind::Notify)
             .await
             .unwrap();
 
-        let history = worker.engine().history();
+        let history = worker.history();
         assert!(matches!(
             history.get(1),
             Some(Item::ToolResult { call_id, .. }) if call_id == "call-1"
@@ -7576,7 +8519,7 @@ mod build_summary_prompt_tests {
         manifest.memory = Some(memory);
         let mut worker = Worker::new(
             manifest,
-            Engine::new(NoopClient),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
             store,
             WorkerWorkspaceContext::no_workspace(),
             WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone()),
@@ -7636,7 +8579,7 @@ mod build_summary_prompt_tests {
         };
         let mut worker = Worker::new(
             manifest,
-            Engine::new(NoopClient),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
             store,
             workspace_context,
             authority,
@@ -7829,7 +8772,7 @@ mod build_summary_prompt_tests {
             .unwrap()
             .block_on(Worker::new(
                 manifest,
-                Engine::new(NoopClient),
+                Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
                 store,
                 WorkerWorkspaceContext::with_client(
                     Some(WorkspaceId::new("ws-skill").unwrap()),
@@ -7867,8 +8810,11 @@ mod build_summary_prompt_tests {
         assert!(entries.iter().any(|entry| {
             matches!(
                 entry,
-                LogEntry::SystemItem {
-                    item: SystemItem::SkillActivation { name, body },
+                LogEntry::AnnotatedSystemItem {
+                    entry: session_store::LoggedSystemHistoryEntry {
+                        item: SystemItem::SkillActivation { name, body },
+                        ..
+                    },
                     ..
                 } if name == "triage-errors"
                     && body.contains("# Triage Errors")
@@ -7899,7 +8845,7 @@ mod build_summary_prompt_tests {
         let memory_config = manifest.memory.clone().unwrap();
         let mut worker = Worker::new(
             manifest,
-            Engine::new(client),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(client),
             store,
             WorkerWorkspaceContext::with_client(
                 Some(WorkspaceId::new("workspace-test").unwrap()),
@@ -7915,7 +8861,7 @@ mod build_summary_prompt_tests {
         let evidence = Item::user_message(
             "The cancellation regression must leave this evidence available for retry.",
         );
-        worker.engine_mut().set_history(vec![evidence.clone()]);
+        worker.set_history_for_test(vec![evidence.clone()]);
         worker
             .commit_entry(LogEntry::UserInput {
                 ts: segment_log::now_millis(),
@@ -7974,7 +8920,7 @@ mod build_summary_prompt_tests {
                 .expect("extract pointer lock")
                 .is_none()
         );
-        assert_eq!(worker.engine().history(), &[evidence]);
+        assert_eq!(worker.history(), &[evidence]);
 
         let entries_after = worker
             .store

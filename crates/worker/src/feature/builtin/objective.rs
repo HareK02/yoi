@@ -14,6 +14,8 @@ use serde_json::json;
 
 use crate::worker::{WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod};
 
+use super::resource_projection::{project_objective_detail, project_objective_query};
+
 #[derive(Clone, Debug)]
 pub struct WorkspaceHttpObjectiveBackend {
     client: Arc<dyn WorkspaceClient>,
@@ -37,6 +39,7 @@ impl WorkspaceHttpObjectiveBackend {
         )
         .await
         .map_err(backend_error)?;
+        let response = project_objective_query(response).map_err(ToolError::ExecutionFailed)?;
         Ok(ToolOutput {
             summary: "Queried Objectives".to_string(),
             content: Some(serde_json::to_string_pretty(&response).map_err(decode_error)?),
@@ -58,8 +61,10 @@ impl WorkspaceHttpObjectiveBackend {
         )
         .await
         .map_err(backend_error)?;
+        let response = project_objective_detail(response).map_err(ToolError::ExecutionFailed)?;
+        let objective_ref = response.objective_ref().to_string();
         Ok(ToolOutput {
-            summary: format!("Read objective {id}"),
+            summary: format!("Read objective {objective_ref}"),
             content: Some(serde_json::to_string_pretty(&response).map_err(decode_error)?),
             attachments: Vec::new(),
         })
@@ -84,7 +89,7 @@ impl WorkspaceHttpObjectiveBackend {
         .await
         .map_err(backend_error)?;
         Ok(objective_output(
-            format!("Created objective {}", response.id),
+            format!("Created objective {}", &response.resource_key),
             response,
         )?)
     }
@@ -112,7 +117,7 @@ impl WorkspaceHttpObjectiveBackend {
         .await
         .map_err(backend_error)?;
         Ok(objective_output(
-            format!("Edited objective {}", response.id),
+            format!("Edited objective {}", &response.resource_key),
             response,
         )?)
     }
@@ -134,7 +139,7 @@ impl WorkspaceHttpObjectiveBackend {
         .await
         .map_err(backend_error)?;
         Ok(objective_output(
-            format!("Updated objective {} state", response.id),
+            format!("Updated objective {} state", &response.resource_key),
             response,
         )?)
     }
@@ -142,6 +147,7 @@ impl WorkspaceHttpObjectiveBackend {
     async fn link_ticket(&self, input: ObjectiveLinkTicketInput) -> Result<ToolOutput, ToolError> {
         let id = validate_id(&input.id, "ObjectiveLinkTicket")?;
         let ticket_id = validate_id(&input.ticket_id, "ObjectiveLinkTicket")?;
+        let ticket_resource_key = self.ticket_resource_key(ticket_id).await?;
         let url = format!("{}/ticket-links", self.objective_url(id));
         let response = send_json::<ObjectiveLinkTicketRequest, ObjectiveDetail>(
             self.client.as_ref(),
@@ -154,7 +160,10 @@ impl WorkspaceHttpObjectiveBackend {
         .await
         .map_err(backend_error)?;
         Ok(objective_output(
-            format!("Linked ticket {ticket_id} to objective {}", response.id),
+            format!(
+                "Linked ticket {ticket_resource_key} to objective {}",
+                &response.resource_key
+            ),
             response,
         )?)
     }
@@ -165,14 +174,44 @@ impl WorkspaceHttpObjectiveBackend {
     ) -> Result<ToolOutput, ToolError> {
         let id = validate_id(&input.id, "ObjectiveUnlinkTicket")?;
         let ticket_id = validate_id(&input.ticket_id, "ObjectiveUnlinkTicket")?;
+        let ticket_resource_key = self.ticket_resource_key(ticket_id).await?;
         let url = format!("{}/ticket-links/{}", self.objective_url(id), ticket_id);
         let response = delete_json::<ObjectiveDetail>(self.client.as_ref(), &url)
             .await
             .map_err(backend_error)?;
         Ok(objective_output(
-            format!("Unlinked ticket {ticket_id} from objective {}", response.id),
+            format!(
+                "Unlinked ticket {ticket_resource_key} from objective {}",
+                &response.resource_key
+            ),
             response,
         )?)
+    }
+
+    async fn ticket_resource_key(&self, ticket_reference: &str) -> Result<String, ToolError> {
+        let workspace_id = self.client.workspace_id().unwrap_or_default();
+        let response: serde_json::Value = decode_response(
+            self.client
+                .execute(WorkspaceRequest::get(format!(
+                    "/api/w/{workspace_id}/tickets/{ticket_reference}"
+                )))
+                .map_err(WorkspaceObjectiveBackendError::from)
+                .map_err(backend_error)?,
+        )
+        .map_err(backend_error)?;
+        response
+            .get("resource_key")
+            .or_else(|| {
+                response
+                    .get("meta")
+                    .and_then(|meta| meta.get("resource_key"))
+            })
+            .and_then(serde_json::Value::as_str)
+            .filter(|key| is_canonical_resource_key(key, "T-"))
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                ToolError::ExecutionFailed("required T- human key is unavailable".to_string())
+            })
     }
 
     fn objective_url(&self, id: &str) -> String {
@@ -185,7 +224,7 @@ impl WorkspaceHttpObjectiveBackend {
 pub enum WorkspaceObjectiveBackendError {
     #[error("workspace objective backend request failed: {0}")]
     Request(#[from] crate::worker::WorkspaceClientError),
-    #[error("workspace objective backend returned HTTP {status}: {body}")]
+    #[error("workspace objective backend returned HTTP {status}")]
     Http {
         status: reqwest::StatusCode,
         body: String,
@@ -247,10 +286,26 @@ fn decode_response<T: for<'de> Deserialize<'de>>(
     serde_json::from_str(&response.body).map_err(Into::into)
 }
 
+fn is_canonical_resource_key(resource_key: &str, prefix: &str) -> bool {
+    resource_key.strip_prefix(prefix).is_some_and(|sequence| {
+        !sequence.is_empty() && sequence.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
 fn objective_output(summary: String, response: ObjectiveDetail) -> Result<ToolOutput, ToolError> {
+    if !is_canonical_resource_key(&response.resource_key, "O-") {
+        return Err(ToolError::ExecutionFailed(
+            "required O- human key is unavailable".to_string(),
+        ));
+    }
+    let projected = serde_json::json!({
+        "objective": &response.resource_key,
+        "title": response.title,
+        "state": response.state,
+    });
     Ok(ToolOutput {
         summary,
-        content: Some(serde_json::to_string_pretty(&response).map_err(decode_error)?),
+        content: Some(serde_json::to_string_pretty(&projected).map_err(decode_error)?),
 
         attachments: Vec::new(),
     })
@@ -260,7 +315,7 @@ fn validate_id<'a>(id: &'a str, tool_name: &str) -> Result<&'a str, ToolError> {
     let id = id.trim();
     if id.is_empty() || id.contains('/') {
         return Err(ToolError::InvalidArgument(format!(
-            "{tool_name} requires non-empty canonical id without '/'"
+            "{tool_name} requires a non-empty Objective reference without '/'"
         )));
     }
     Ok(id)
@@ -411,9 +466,9 @@ const EDIT_DESCRIPTION: &str =
 const SET_STATE_DESCRIPTION: &str =
     "Set an Objective state through Backend Workspace API authority.";
 const LINK_TICKET_DESCRIPTION: &str =
-    "Link a Ticket id to an Objective through Backend Workspace API authority.";
+    "Link a Ticket reference to an Objective through Backend Workspace API authority.";
 const UNLINK_TICKET_DESCRIPTION: &str =
-    "Unlink a Ticket id from an Objective through Backend Workspace API authority.";
+    "Unlink a Ticket reference from an Objective through Backend Workspace API authority.";
 
 fn list_schema() -> serde_json::Value {
     json!({
@@ -422,7 +477,7 @@ fn list_schema() -> serde_json::Value {
         "properties":{
             "query":{"type":["string","null"]},
             "states":{"type":"array","items":{"type":"string"},"default":[]},
-            "linked_ticket_id":{"type":["string","null"]},
+            "linked_ticket_id":{"type":["string","null"],"description":"Linked Ticket reference. Prefer T-*; canonical internal ids remain accepted for compatibility."},
             "updated_after":{"type":["string","null"]},
             "updated_before":{"type":["string","null"]},
             "sort":{"type":["string","null"],"enum":["relevance","updated_desc","created_desc","title",null]},
@@ -438,7 +493,7 @@ fn show_schema() -> serde_json::Value {
         "additionalProperties": false,
         "required":["id"],
         "properties":{
-            "id":{"type":"string"},
+            "id":{"type":"string","description":"Objective reference. Prefer O-*; canonical internal ids remain accepted for compatibility."},
             "event_limit":{"type":["integer","null"],"minimum":1,"maximum":50},
             "event_cursor":{"type":["string","null"]}
         }
@@ -454,7 +509,7 @@ fn create_schema() -> serde_json::Value {
             "title":{"type":"string","minLength":1},
             "body_md":{"type":"string"},
             "state":{"type":"string","default":"active"},
-            "linked_tickets":{"type":"array","items":{"type":"string"}}
+            "linked_tickets":{"type":"array","items":{"type":"string"},"description":"Linked Ticket references. Prefer T-*; canonical internal ids remain accepted for compatibility."}
         }
     })
 }
@@ -465,7 +520,7 @@ fn edit_schema() -> serde_json::Value {
         "additionalProperties": false,
         "required":["id"],
         "properties":{
-            "id":{"type":"string"},
+            "id":{"type":"string","description":"Objective reference. Prefer O-*; canonical internal ids remain accepted for compatibility."},
             "title":{"type":["string","null"]},
             "old_string":{"type":["string","null"]},
             "new_string":{"type":["string","null"]},
@@ -480,7 +535,7 @@ fn set_state_schema() -> serde_json::Value {
         "additionalProperties": false,
         "required":["id","state"],
         "properties":{
-            "id":{"type":"string"},
+            "id":{"type":"string","description":"Objective reference. Prefer O-*; canonical internal ids remain accepted for compatibility."},
             "state":{"type":"string","minLength":1}
         }
     })
@@ -500,8 +555,8 @@ fn id_ticket_schema(required: &[&str]) -> serde_json::Value {
         "additionalProperties": false,
         "required": required,
         "properties":{
-            "id":{"type":"string"},
-            "ticket_id":{"type":"string"}
+            "id":{"type":"string","description":"Objective reference. Prefer O-*; canonical internal ids remain accepted for compatibility."},
+            "ticket_id":{"type":"string","description":"Ticket reference. Prefer T-*; canonical internal ids remain accepted for compatibility."}
         }
     })
 }
@@ -595,21 +650,20 @@ fn default_state() -> String {
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct ObjectiveDetail {
-    id: String,
+    resource_key: String,
     title: String,
     state: String,
-    created_at: Option<String>,
-    updated_at: Option<String>,
-    linked_tickets: Vec<String>,
-    body: String,
-    body_truncated: bool,
-    record_source: String,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use agen::tool::ToolDefinition;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
 
     fn tool_names(definitions: Vec<ToolDefinition>) -> Vec<String> {
         let mut names = definitions
@@ -655,5 +709,136 @@ mod tests {
         assert_eq!(edit["required"][0], "id");
         let link = link_ticket_schema();
         assert_eq!(link["required"], json!(["id", "ticket_id"]));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn objective_show_summary_uses_projected_human_key() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 8192];
+            let len = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..len]);
+            assert!(
+                request.starts_with("POST /api/w/workspace/objectives/00001INTERNAL/show HTTP/1.1")
+            );
+            let body = serde_json::json!({
+                "id": "00001INTERNAL",
+                "resource_key": "O-3",
+                "title": "Objective",
+                "body": "Body",
+                "state": "active",
+                "created_at": null,
+                "updated_at": null,
+                "linked_ticket_summaries": [],
+                "events": [],
+                "event_page": {"next_cursor": null, "has_more": false}
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let backend = WorkspaceHttpObjectiveBackend::new(Arc::new(
+            crate::worker::TestWorkspaceHttpClient::new("workspace", base_url),
+        ));
+
+        let output = backend
+            .show(ShowObjectiveInput {
+                id: "00001INTERNAL".to_string(),
+                event_limit: None,
+                event_cursor: None,
+            })
+            .await
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(output.summary, "Read objective O-3");
+        assert!(!output.summary.contains("00001INTERNAL"));
+        assert!(!output.content.unwrap().contains("00001INTERNAL"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn objective_link_summaries_resolve_internal_ticket_ids_to_human_keys() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for mutation in ["POST", "DELETE"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0_u8; 8192];
+                let len = stream.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..len]);
+                assert!(request.starts_with("GET /api/w/workspace/tickets/00001INTERNAL HTTP/1.1"));
+                let response_body = serde_json::json!({"resource_key": "T-7"}).to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                )
+                .unwrap();
+
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0_u8; 8192];
+                let len = stream.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..len]);
+                assert!(request.starts_with(&format!(
+                    "{mutation} /api/w/workspace/objectives/O-3/ticket-links"
+                )));
+                let response_body = serde_json::json!({
+                    "resource_key": "O-3",
+                    "title": "Objective",
+                    "state": "active"
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                )
+                .unwrap();
+            }
+        });
+        let backend = WorkspaceHttpObjectiveBackend::new(Arc::new(
+            crate::worker::TestWorkspaceHttpClient::new("workspace", base_url),
+        ));
+
+        let linked = backend
+            .link_ticket(ObjectiveLinkTicketInput {
+                id: "O-3".to_string(),
+                ticket_id: "00001INTERNAL".to_string(),
+            })
+            .await
+            .unwrap();
+        let unlinked = backend
+            .unlink_ticket(ObjectiveUnlinkTicketInput {
+                id: "O-3".to_string(),
+                ticket_id: "00001INTERNAL".to_string(),
+            })
+            .await
+            .unwrap();
+
+        server.join().unwrap();
+        for output in [linked, unlinked] {
+            assert!(output.summary.contains("T-7"));
+            assert!(!output.summary.contains("00001INTERNAL"));
+            assert!(!output.content.unwrap().contains("00001INTERNAL"));
+        }
+    }
+
+    #[test]
+    fn objective_output_rejects_noncanonical_human_keys() {
+        let response = ObjectiveDetail {
+            resource_key: "O-internal".to_string(),
+            title: "Objective".to_string(),
+            state: "active".to_string(),
+        };
+        assert!(objective_output("created".to_string(), response).is_err());
     }
 }

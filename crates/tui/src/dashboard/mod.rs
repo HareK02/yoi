@@ -29,7 +29,6 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
-use serde::Serialize;
 use session_store::FsStore;
 use session_store::FsWorkerStore;
 use ticket::config::{GitBranchName, TicketConfig, TicketOrchestrationConfig};
@@ -70,10 +69,6 @@ use render::{PanelListRow, row_hit_boxes};
 
 const MAX_ENTRIES: usize = 50;
 const CLOSED_VISIBLE_ROWS: usize = 3;
-const ORCHESTRATOR_IDLE_QUEUE_NOTICE_PROMPT: &str = "panel.orchestrator_idle_queue_notice";
-const ORCHESTRATOR_QUEUE_ATTENTION_MAX_TICKETS: usize = 6;
-const ORCHESTRATOR_QUEUE_ATTENTION_MAX_TEXT_CHARS: usize = 120;
-const ORCHESTRATOR_QUEUE_ATTENTION_MAX_MESSAGE_CHARS: usize = 2_400;
 const SOCKET_OP_TIMEOUT: Duration = Duration::from_secs(3);
 const DASHBOARD_POLL_INTERVAL: Duration = Duration::from_millis(1_500);
 const TERMINAL_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -911,6 +906,7 @@ struct OrchestratorActiveWorkItem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OrchestratorQueuedWorkItem {
     id: String,
+    resource_key: Option<String>,
     title: String,
     classification: OrchestratorQueuedClassification,
     waiting_reason: Option<String>,
@@ -973,22 +969,6 @@ impl OrchestratorQueueAttentionNoticeResult {
             error: Some(error.into()),
         }
     }
-}
-
-#[derive(Debug, Serialize)]
-struct OrchestratorQueueTemplateContext {
-    workspace: String,
-    actionable_tickets: Vec<OrchestratorQueueTemplateTicket>,
-    waiting_tickets: Vec<OrchestratorQueueTemplateTicket>,
-    omitted_ticket_count: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct OrchestratorQueueTemplateTicket {
-    id: String,
-    title: String,
-    classification: &'static str,
-    waiting_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1326,7 +1306,16 @@ impl DashboardApp {
         if self.orchestrator_work_set.is_empty() {
             self.refresh_orchestrator_work_set();
         }
-        let notice = orchestrator_queue_attention_notice(&self.panel, &self.orchestrator_work_set)?;
+        let notice = match orchestrator_queue_attention_notice(&self.orchestrator_work_set) {
+            Ok(Some(notice)) => notice,
+            Ok(None) => return None,
+            Err(error) => {
+                self.notice = Some(format!(
+                    "Orchestrator queued-work attention not delivered: {error}"
+                ));
+                return None;
+            }
+        };
         if self
             .orchestrator_queue_attention
             .as_ref()
@@ -3661,6 +3650,7 @@ fn derive_orchestrator_work_set(
                 };
             Some(OrchestratorQueuedWorkItem {
                 id: ticket.id.clone(),
+                resource_key: ticket.resource_key.clone(),
                 title: ticket.title.clone(),
                 classification,
                 waiting_reason,
@@ -3744,72 +3734,46 @@ fn orchestrator_work_set_fingerprint(
 }
 
 fn orchestrator_queue_attention_notice(
-    panel: &WorkspacePanelViewModel,
     work_set: &OrchestratorWorkSet,
-) -> Option<OrchestratorQueueAttentionNotice> {
+) -> Result<Option<OrchestratorQueueAttentionNotice>, &'static str> {
     if work_set.has_active_inprogress() {
-        return None;
+        return Ok(None);
     }
     let actionable = work_set.actionable_queued();
     if actionable.is_empty() {
-        return None;
+        return Ok(None);
     }
     let waiting = work_set
         .queued
         .iter()
-        .filter(|item| item.waiting_reason.is_some())
-        .collect::<Vec<_>>();
-    let ticket_count = actionable.len() + waiting.len();
-    let actionable_tickets = actionable
-        .iter()
-        .take(ORCHESTRATOR_QUEUE_ATTENTION_MAX_TICKETS)
-        .map(|item| orchestrator_queue_template_ticket(item))
-        .collect::<Vec<_>>();
-    let remaining_capacity =
-        ORCHESTRATOR_QUEUE_ATTENTION_MAX_TICKETS.saturating_sub(actionable_tickets.len());
-    let waiting_tickets = waiting
-        .iter()
-        .take(remaining_capacity)
-        .map(|item| orchestrator_queue_template_ticket(item))
-        .collect::<Vec<_>>();
-    let rendered =
-        render_orchestrator_queue_attention_template(&OrchestratorQueueTemplateContext {
-            workspace: bounded_progress_text(
-                &panel.header.workspace_label,
-                ORCHESTRATOR_QUEUE_ATTENTION_MAX_TEXT_CHARS,
-            ),
-            actionable_tickets,
-            waiting_tickets,
-            omitted_ticket_count: ticket_count
-                .saturating_sub(ORCHESTRATOR_QUEUE_ATTENTION_MAX_TICKETS),
+        .filter(|item| item.waiting_reason.is_some());
+    let tickets = actionable
+        .into_iter()
+        .chain(waiting)
+        .map(|item| {
+            let resource_key = item
+                .resource_key
+                .clone()
+                .ok_or("queued Ticket is missing its required resource key")?;
+            worker::OrchestratorQueueAttentionTicket::new(resource_key, item.title.clone())
+                .map_err(|_| "queued Ticket has an invalid resource key")
         })
-        .ok()?;
-    let message = bounded_progress_text(&rendered, ORCHESTRATOR_QUEUE_ATTENTION_MAX_MESSAGE_CHARS);
+        .collect::<Result<Vec<_>, _>>()?;
+    let context = worker::OrchestratorQueueAttentionContext::new(tickets);
+    let message = render_orchestrator_queue_attention_template(&context)
+        .map_err(|_| "queued-work attention prompt rendering failed")?;
     let fingerprint = format!("idle-queue:{}", work_set.fingerprint);
-    Some(OrchestratorQueueAttentionNotice {
+    Ok(Some(OrchestratorQueueAttentionNotice {
         message,
         fingerprint,
-    })
-}
-
-fn orchestrator_queue_template_ticket(
-    item: &&OrchestratorQueuedWorkItem,
-) -> OrchestratorQueueTemplateTicket {
-    OrchestratorQueueTemplateTicket {
-        id: bounded_progress_text(&item.id, ORCHESTRATOR_QUEUE_ATTENTION_MAX_TEXT_CHARS),
-        title: bounded_progress_text(&item.title, ORCHESTRATOR_QUEUE_ATTENTION_MAX_TEXT_CHARS),
-        classification: item.classification.as_str(),
-        waiting_reason: item.waiting_reason.as_ref().map(|reason| {
-            bounded_progress_text(reason, ORCHESTRATOR_QUEUE_ATTENTION_MAX_TEXT_CHARS)
-        }),
-    }
+    }))
 }
 
 fn render_orchestrator_queue_attention_template(
-    context: &OrchestratorQueueTemplateContext,
+    context: &worker::OrchestratorQueueAttentionContext,
 ) -> Result<String, worker::CatalogError> {
     worker::PromptCatalog::builtins_only()?
-        .render_serializable(ORCHESTRATOR_IDLE_QUEUE_NOTICE_PROMPT, context)
+        .orchestrator_queue_attention(worker::OrchestratorQueueAttentionPrompt::Tui, context)
 }
 
 fn orchestrator_work_set_detail(
@@ -5236,6 +5200,7 @@ fn row_status_label(entry: &WorkerListEntry) -> (&'static str, Style) {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
+            Some(WorkerStatus::Stopped) => ("live stopped", Style::default().fg(Color::DarkGray)),
             None => ("live", Style::default().fg(Color::DarkGray)),
         };
     }

@@ -9,7 +9,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::schema::{EvidenceKind, SourceEvidenceRef, SourceRef};
+use crate::schema::{EvidenceKind, EvidenceOrigin, SourceEvidenceRef, SourceRef};
 
 /// Current flat staging schema version.
 pub const STAGING_SCHEMA_VERSION: u32 = 2;
@@ -79,6 +79,8 @@ pub struct StagingEvidence {
     pub kind: EvidenceKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry_range: Option<[u64; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<EvidenceOrigin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub excerpt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -159,6 +161,7 @@ mod tests {
             id: "E001".into(),
             kind: EvidenceKind::new(EvidenceKind::MESSAGE),
             entry_range: Some([10, 12]),
+            origin: None,
             excerpt: Some("extract candidate taxonomy".into()),
             summary: Some("User and assistant discussed staging kinds".into()),
         };

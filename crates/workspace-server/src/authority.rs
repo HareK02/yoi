@@ -22,7 +22,7 @@ use crate::records::{
     TicketEvidenceEvent, TicketEvidenceSummary, TicketListPageRequest, TicketMergeRequestSummary,
     TicketQueryItem, TicketQueryRequest, TicketQueryResponse, TicketRelationView,
     TicketRoleAssignmentSummary, TicketShowRequest, TicketSummary, TicketSummaryPage,
-    summarize_body, truncate_body, validate_project_id,
+    summarize_body, truncate_body,
 };
 use crate::store::{
     ControlPlaneStore, MemoryDocumentRecord, MemoryStagingRecord, MemoryStagingResolutionRecord,
@@ -633,7 +633,15 @@ impl SqliteWorkspaceAuthority {
             predicates.push(format!("o.updated_at<{value}"));
         }
         if let Some(value) = &query.linked_ticket_id {
-            let value = bind(SqlValue::Text(value.clone()));
+            let resolved = self
+                .store
+                .resolve_resource_reference(
+                    &self.workspace_id,
+                    WorkspaceResourceKind::Ticket,
+                    value,
+                )?
+                .ok_or_else(|| invalid_objective_error("linked Ticket was not found"))?;
+            let value = bind(SqlValue::Text(resolved));
             predicates.push(format!("EXISTS (SELECT 1 FROM objective_ticket_links link WHERE link.workspace_id=o.workspace_id AND link.objective_id=o.objective_id AND link.ticket_id={value})"));
         }
         let relevance_rank = if let Some(text) =
@@ -1237,6 +1245,10 @@ impl ObjectiveAuthority for SqliteWorkspaceAuthority {
                 .into_iter()
                 .map(|link| link.ticket_id)
                 .collect::<Vec<_>>();
+            let linked_ticket_keys = linked_tickets
+                .iter()
+                .map(|ticket_id| self.resource_key(WorkspaceResourceKind::Ticket, ticket_id))
+                .collect::<Result<Vec<_>>>()?;
             let body_md = record.body_md.clone();
             let objective = ObjectiveSummary {
                 resource_key: self
@@ -1253,6 +1265,7 @@ impl ObjectiveAuthority for SqliteWorkspaceAuthority {
             items.push(objective_query_item(
                 objective,
                 linked_tickets,
+                linked_ticket_keys,
                 query.query.as_deref(),
                 &body_md,
             ));
@@ -1339,9 +1352,19 @@ impl ObjectiveAuthority for SqliteWorkspaceAuthority {
     fn create_objective(&self, input: ObjectiveCreateInput) -> Result<ObjectiveDetail> {
         validate_objective_title(&input.title)?;
         validate_objective_state(&input.state)?;
-        for ticket_id in &input.linked_tickets {
-            validate_project_id(ticket_id)?;
-        }
+        let linked_tickets = input
+            .linked_tickets
+            .iter()
+            .map(|ticket_reference| {
+                self.store
+                    .resolve_resource_reference(
+                        &self.workspace_id,
+                        WorkspaceResourceKind::Ticket,
+                        ticket_reference,
+                    )?
+                    .ok_or_else(|| invalid_objective_error("linked Ticket was not found"))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let now = now_rfc3339();
         let objective_id = allocate_record_id(
             unix_epoch_millis_now().map_err(|err| {
@@ -1367,8 +1390,7 @@ impl ObjectiveAuthority for SqliteWorkspaceAuthority {
             updated_at: now.clone(),
         };
         self.store.upsert_objective(&record)?;
-        let links = input
-            .linked_tickets
+        let links = linked_tickets
             .into_iter()
             .map(|ticket_id| ObjectiveTicketLinkRecord {
                 workspace_id: self.workspace_id.clone(),
@@ -2283,12 +2305,18 @@ fn ticket_query_item(
             .iter()
             .map(|objective| objective.id.clone())
             .collect(),
+        linked_objective_keys: detail
+            .linked_objectives
+            .iter()
+            .map(|objective| objective.resource_key.clone())
+            .collect(),
         relation_count: detail.relations.outgoing.len() + detail.relations.incoming.len(),
         blocker_count: detail.relations.blockers.len(),
         unresolved_blocker_count: detail.relations.blockers.len(),
         unresolved_review_count: usize::from(detail.evidence.unresolved_request_changes),
         evidence: detail.evidence.clone(),
         merge_request: detail.merge_request.clone(),
+        current_coder: detail.current_coder.clone(),
     }
 }
 
@@ -2399,6 +2427,7 @@ fn ticket_item_after_cursor(
 fn objective_query_item(
     objective: ObjectiveSummary,
     linked_tickets: Vec<String>,
+    linked_ticket_keys: Vec<String>,
     text: Option<&str>,
     body_md: &str,
 ) -> ObjectiveQueryItem {
@@ -2426,6 +2455,7 @@ fn objective_query_item(
         snippet,
         linked_ticket_count: linked_tickets.len(),
         linked_tickets,
+        linked_ticket_keys,
     }
 }
 
@@ -3308,16 +3338,21 @@ VALUES ('workspace-test', 'ticket', 4);
         assert!(!objective.revision.is_empty());
         assert_eq!(objective.linked_ticket_summaries[0].id, "00000000001J2");
         assert_eq!(objective.linked_ticket_summaries[0].state, "ready");
+        let linked_ticket_key = objective.linked_ticket_summaries[0].resource_key.clone();
         let objective_query = authority
             .query_objectives(ObjectiveQueryRequest {
                 query: Some("Control plane".to_string()),
-                linked_ticket_id: Some("00000000001J2".to_string()),
+                linked_ticket_id: Some(linked_ticket_key.clone()),
                 limit: Some(1),
                 ..ObjectiveQueryRequest::default()
             })
             .unwrap();
         assert_eq!(objective_query.items.len(), 1);
         assert_eq!(objective_query.items[0].linked_ticket_count, 1);
+        assert_eq!(
+            objective_query.items[0].linked_ticket_keys,
+            vec![linked_ticket_key]
+        );
         assert_eq!(objective_query.page.limit, 1);
         let body_query = authority
             .query_objectives(ObjectiveQueryRequest {
@@ -3410,7 +3445,7 @@ VALUES ('workspace-test', 'ticket', 3);
                 title: "Create Objective".to_string(),
                 body_md: "Alpha body".to_string(),
                 state: "active".to_string(),
-                linked_tickets: vec!["00000000001J2".to_string()],
+                linked_tickets: vec!["T-1".to_string()],
             })
             .unwrap();
         assert_eq!(created.title, "Create Objective");
@@ -3436,14 +3471,14 @@ VALUES ('workspace-test', 'ticket', 3);
         assert_eq!(state.state, "paused");
         assert_eq!(
             authority
-                .link_objective_ticket(&created.id, "00000000001J3")
+                .link_objective_ticket(&created.id, "T-2")
                 .unwrap()
                 .linked_tickets,
             vec!["00000000001J2", "00000000001J3"]
         );
         assert_eq!(
             authority
-                .unlink_objective_ticket(&created.id, "00000000001J2")
+                .unlink_objective_ticket(&created.id, "T-1")
                 .unwrap()
                 .linked_tickets,
             vec!["00000000001J3"]

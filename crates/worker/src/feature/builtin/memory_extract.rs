@@ -6,7 +6,9 @@ use memory::backend::{
     MemoryBackendOperation, MemoryBackendOperationResult, MemoryStageCandidateOperation,
 };
 use memory::extract::{CandidateKind, ExtractedCandidate, StagingEvidence};
-use memory::schema::{EvidenceKind, SourceEvidenceRef, SourceRef};
+use memory::schema::{
+    EvidenceKind, EvidenceOrigin, EvidenceOriginKind, SourceEvidenceRef, SourceRef,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -174,17 +176,29 @@ impl Tool for StageMemoryCandidateTool {
                 "StageMemoryCandidate requires at least one entry_ref".to_string(),
             ));
         }
-        let mut evidence = Vec::with_capacity(params.entry_refs.len());
-        let mut source_refs = Vec::with_capacity(params.entry_refs.len());
+        let mut entries = Vec::with_capacity(params.entry_refs.len());
         for entry_ref in &params.entry_refs {
-            let projection = self.state.view.evidence_for(entry_ref).ok_or_else(|| {
+            entries.push(self.state.view.evidence_for(entry_ref).ok_or_else(|| {
                 ToolError::InvalidArgument(format!(
                     "unknown SessionEntryRef {entry_ref:?} for this extraction capture"
                 ))
-            })?;
-            evidence.push(staging_evidence(&projection));
-            source_refs.push(source_evidence_ref(&projection));
+            })?);
         }
+        if matches!(params.kind, CandidateKind::Preference)
+            && entries.iter().any(|entry| {
+                !matches!(
+                    entry.origin,
+                    crate::WorkerHistoryProvenance::HumanInput { .. }
+                )
+            })
+        {
+            return Err(ToolError::InvalidArgument(
+                "preference candidates require exclusively HumanInput evidence; model, Worker, Flow, backend, derived, and legacy-unknown origins are not preference authority"
+                    .to_string(),
+            ));
+        }
+        let evidence = entries.iter().map(staging_evidence).collect();
+        let source_refs = entries.iter().map(source_evidence_ref).collect();
         let candidate = ExtractedCandidate {
             kind: params.kind,
             claim: params.claim,
@@ -310,11 +324,65 @@ fn evidence_kind(entry: &SessionEntryEvidence) -> EvidenceKind {
     }
 }
 
+fn evidence_origin(origin: &crate::WorkerHistoryProvenance) -> EvidenceOrigin {
+    use crate::WorkerHistoryProvenance as Origin;
+    let mut evidence = EvidenceOrigin {
+        kind: EvidenceOriginKind::LegacyUnknown,
+        account_id: None,
+        workspace_id: None,
+        runtime_id: None,
+        worker_id: None,
+        flow_selector: None,
+        flow_definition_id: None,
+        flow_definition_revision: None,
+    };
+    match origin {
+        Origin::HumanInput { account_id } => {
+            evidence.kind = EvidenceOriginKind::HumanInput;
+            evidence.account_id = Some(account_id.clone());
+        }
+        Origin::WorkerInput { actor } => {
+            evidence.kind = EvidenceOriginKind::WorkerInput;
+            evidence.workspace_id = actor.workspace_id.clone();
+            evidence.runtime_id = actor.runtime_id.clone();
+            evidence.worker_id = Some(actor.worker_id.clone());
+        }
+        Origin::FlowInstruction {
+            selector,
+            definition_id,
+            definition_revision,
+            ..
+        } => {
+            evidence.kind = EvidenceOriginKind::FlowInstruction;
+            evidence.flow_selector = Some(selector.clone());
+            evidence.flow_definition_id = Some(definition_id.clone());
+            evidence.flow_definition_revision = Some(*definition_revision);
+        }
+        Origin::BackendInstruction { .. } => evidence.kind = EvidenceOriginKind::BackendInstruction,
+        Origin::ModelOutput { worker } => {
+            evidence.kind = EvidenceOriginKind::ModelOutput;
+            evidence.workspace_id = worker.workspace_id.clone();
+            evidence.runtime_id = worker.runtime_id.clone();
+            evidence.worker_id = Some(worker.worker_id.clone());
+        }
+        Origin::ToolOutput { worker } => {
+            evidence.kind = EvidenceOriginKind::ToolOutput;
+            evidence.workspace_id = worker.workspace_id.clone();
+            evidence.runtime_id = worker.runtime_id.clone();
+            evidence.worker_id = Some(worker.worker_id.clone());
+        }
+        Origin::DerivedSummary => evidence.kind = EvidenceOriginKind::DerivedSummary,
+        Origin::LegacyUnknown => evidence.kind = EvidenceOriginKind::LegacyUnknown,
+    }
+    evidence
+}
+
 fn staging_evidence(entry: &SessionEntryEvidence) -> StagingEvidence {
     StagingEvidence {
         id: entry.entry_ref.to_string(),
         kind: evidence_kind(entry),
         entry_range: Some(entry.entry_range),
+        origin: Some(evidence_origin(&entry.origin)),
         excerpt: Some(entry.excerpt.clone()),
         summary: Some(entry.summary.clone()),
     }
@@ -325,6 +393,7 @@ fn source_evidence_ref(entry: &SessionEntryEvidence) -> SourceEvidenceRef {
         segment_id: Some(entry.segment_id.clone()),
         entry_range: Some(entry.entry_range),
         evidence_id: Some(entry.entry_ref.to_string()),
+        origin: Some(evidence_origin(&entry.origin)),
         evidence_kind: Some(evidence_kind(entry)),
         label: Some(entry.label.clone()),
         summary: Some(entry.summary.clone()),
@@ -433,6 +502,15 @@ mod tests {
     }
 
     #[test]
+    fn human_origin_projects_account_authority_into_evidence() {
+        let origin = evidence_origin(&crate::WorkerHistoryProvenance::HumanInput {
+            account_id: "account-1".into(),
+        });
+        assert_eq!(origin.kind, EvidenceOriginKind::HumanInput);
+        assert_eq!(origin.account_id.as_deref(), Some("account-1"));
+    }
+
+    #[test]
     fn backend_input_failures_remain_invalid_argument_tool_errors() {
         let backend = map_memory_stage_error(WorkspaceMemoryBackendError::Backend(
             "invalid candidate".to_string(),
@@ -443,6 +521,19 @@ mod tests {
             body: "invalid candidate".to_string(),
         });
         assert!(matches!(http, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn preference_rejects_legacy_unknown_before_backend_mutation() {
+        let tool = StageMemoryCandidateTool { state: state() };
+        let error = tool
+            .execute(
+                r#"{"kind":"preference","claim":"claim","why_useful":"useful","entry_refs":["E00000000"]}"#,
+                agen::tool::ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("exclusively HumanInput evidence"));
     }
 
     #[tokio::test]

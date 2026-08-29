@@ -7,7 +7,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use agen::tool::{Tool, ToolDefinition, ToolMeta};
+use agen::tool::{
+    Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolExecutionHandle,
+    ToolExecutionTerminal, ToolMeta,
+};
 use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
 use serde_json::json;
 use tempfile::TempDir;
@@ -399,6 +402,85 @@ async fn bash_provider_output_does_not_expose_internal_paths() {
     assert!(body.contains("bounded WorkdirSession command output"));
     assert!(!body.contains(spill.path().to_str().unwrap()));
     assert_eq!(std::fs::read_dir(spill.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn bash_cancellation_returns_bounded_progress_as_terminal_output() {
+    let (dir, _spill, reg) = setup();
+    let marker = dir.path().join("must-not-run-after-cancel");
+    let command = format!(
+        "printf 'before\\n'; printf 'err-before\\n' >&2; sleep 1; touch {}; printf 'after\\n'",
+        marker.display()
+    );
+    let input = serde_json::to_string(&json!({ "command": command })).unwrap();
+    let context = ToolExecutionContext::new("call-heavy", "attempt-heavy", 0);
+    let bash = reg.get("Bash");
+    let executing = bash.clone();
+    let execution_context = context.clone();
+    let execution = tokio::spawn(async move { executing.execute(&input, execution_context).await });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    bash.cancel_execution(&context)
+        .await
+        .expect("signal exact execution cancellation");
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2), execution)
+        .await
+        .expect("cancelled Bash should terminate inside the Engine grace budget")
+        .expect("Bash task join");
+
+    let ToolError::Cancelled(output) = error.expect_err("cancelled command is non-success") else {
+        panic!("expected typed cancellation result");
+    };
+    let content = output.content.expect("bounded progress output");
+    assert!(
+        content.contains("before"),
+        "missing pre-cancel stdout: {content}"
+    );
+    assert!(
+        content.contains("err-before"),
+        "missing pre-cancel stderr: {content}"
+    );
+    assert!(
+        !content.contains("after"),
+        "post-cancel output leaked: {content}"
+    );
+    assert!(content.len() <= 16 * 1024, "output must remain bounded");
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    assert!(
+        !marker.exists(),
+        "the cancelled command continued executing after terminal confirmation"
+    );
+}
+
+#[tokio::test]
+async fn bash_force_close_cleanup_stops_command_and_keeps_session_reusable() {
+    let (dir, _spill, reg) = setup();
+    let marker = dir.path().join("must-not-survive-force-close");
+    let command = format!("sleep 1; touch {}", marker.display());
+    let input = serde_json::to_string(&json!({ "command": command })).unwrap();
+    let bash = reg.get("Bash");
+    let context = ToolExecutionContext::new("call-force", "attempt-force", 0);
+    let (handle, terminal) = ToolExecutionHandle::start(bash.clone(), input, context);
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    handle.force_close();
+    assert!(matches!(
+        terminal.await,
+        ToolExecutionTerminal::OutcomeUnknown
+    ));
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    assert!(
+        !marker.exists(),
+        "CommandGuard cleanup allowed a force-closed command to continue"
+    );
+
+    let output = bash
+        .execute(r#"{"command":"printf 'reused'"}"#, Default::default())
+        .await
+        .expect("workdir session remains reusable after cleanup");
+    assert_eq!(output.content.as_deref(), Some("reused"));
 }
 
 // Sanity: unused Path import guard

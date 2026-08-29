@@ -14,7 +14,7 @@
 
 use agen::{
     llm_client::types::{ContentPart, Item, Role},
-    tool::{Attachment, ImageAttachment},
+    tool::{Attachment, ImageAttachment, ToolResultDisposition},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
@@ -61,6 +61,8 @@ pub enum LoggedItem {
         content: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<LoggedAttachment>,
+        #[serde(default, skip_serializing_if = "ToolResultDisposition::is_success")]
+        disposition: ToolResultDisposition,
         #[serde(default, skip_serializing_if = "is_false")]
         is_error: bool,
     },
@@ -128,6 +130,7 @@ impl From<&Item> for LoggedItem {
                 summary,
                 content,
                 attachments,
+                disposition,
                 is_error,
                 ..
             } => Self::ToolResult {
@@ -135,6 +138,7 @@ impl From<&Item> for LoggedItem {
                 summary: summary.clone(),
                 content: content.clone(),
                 attachments: attachments.iter().map(LoggedAttachment::from).collect(),
+                disposition: *disposition,
                 is_error: *is_error,
             },
             Item::Reasoning {
@@ -184,15 +188,24 @@ impl From<LoggedItem> for Item {
                 summary,
                 content,
                 attachments,
+                disposition,
                 is_error,
-            } => Item::ToolResult {
-                id: None,
-                call_id,
-                summary,
-                content,
-                is_error,
-                attachments: attachments.into_iter().map(Attachment::from).collect(),
-            },
+            } => {
+                let disposition = if is_error && disposition.is_success() {
+                    ToolResultDisposition::Error
+                } else {
+                    disposition
+                };
+                Item::ToolResult {
+                    id: None,
+                    call_id,
+                    summary,
+                    content,
+                    disposition,
+                    is_error,
+                    attachments: attachments.into_iter().map(Attachment::from).collect(),
+                }
+            }
             LoggedItem::Reasoning {
                 text,
                 summary,
@@ -426,6 +439,42 @@ mod tests {
         assert_eq!(value["is_error"], true);
         match Item::from(logged) {
             Item::ToolResult { is_error, .. } => assert!(is_error),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn outcome_unknown_tool_result_round_trips_as_terminal() {
+        let original = Item::tool_result_item_with_disposition_and_attachments(
+            "call_unknown",
+            "outcome unknown",
+            Some("bounded progress".to_string()),
+            ToolResultDisposition::OutcomeUnknown,
+            Vec::new(),
+        );
+        let logged: LoggedItem = (&original).into();
+        let json = serde_json::to_string(&logged).unwrap();
+        assert!(json.contains(r#""disposition":"outcome_unknown""#));
+        match Item::from(serde_json::from_str::<LoggedItem>(&json).unwrap()) {
+            Item::ToolResult {
+                disposition,
+                is_error,
+                ..
+            } => {
+                assert_eq!(disposition, ToolResultDisposition::OutcomeUnknown);
+                assert!(is_error);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_error_tool_result_infers_error_disposition() {
+        let legacy = r#"{"kind":"tool_result","call_id":"call_old","summary":"failed","content":null,"is_error":true}"#;
+        match Item::from(serde_json::from_str::<LoggedItem>(legacy).unwrap()) {
+            Item::ToolResult { disposition, .. } => {
+                assert_eq!(disposition, ToolResultDisposition::Error)
+            }
             other => panic!("unexpected variant: {other:?}"),
         }
     }

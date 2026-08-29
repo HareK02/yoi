@@ -2,6 +2,7 @@
 
 mod engine;
 mod handler;
+mod history;
 mod message;
 
 pub(crate) mod callback;
@@ -20,13 +21,18 @@ pub mod usage_record;
 pub use agen_macros::{description, tool, tool_registry};
 pub use callback::{TextBlockScope, ThinkingBlockScope, ToolUseBlockScope};
 pub use engine::{
-    Engine, EngineConfig, EngineError, EngineResult, EngineRunOutput, LlmRetryNotice,
-    ToolRegistryError,
+    Engine, EngineConfig, EngineError, EngineResult, EngineRunExit, EngineRunOutput,
+    LlmRetryNotice, StopReason, ToolRegistryError,
 };
 pub use handler::ToolUseBlockStart;
+pub use history::{History, HistoryEntry};
 pub use interceptor::Interceptor;
 pub use message::{ContentPart, Item, Message, Role};
-pub use tool::{ToolCall, ToolExecutionContext, ToolOutputLimits, ToolResult};
+pub use tool::{
+    ToolCall, ToolExecutionContext, ToolExecutionHandle, ToolExecutionPolicy,
+    ToolExecutionTerminal, ToolExecutionTerminalFuture, ToolOutputLimits, ToolResult,
+    ToolResultDisposition,
+};
 pub use usage_record::UsageRecord;
 
 /// Implementation dependencies used by code generated from `agen` macros.
