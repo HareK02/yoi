@@ -1,6 +1,9 @@
 use std::fmt;
 
-use crate::{BackendRuntimeListTarget, BackendRuntimeTarget, WorkerRuntimeCommand};
+use crate::{
+    BackendApiClient, BackendApiClientError, BackendOrigin, BackendRuntimeListTarget,
+    BackendRuntimeTarget, WorkerRuntimeCommand,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetKind {
@@ -62,10 +65,18 @@ pub struct BackendTarget {
 
 impl BackendTarget {
     pub fn new(base_url: impl Into<String>, workspace_id: Option<impl Into<String>>) -> Self {
+        let base_url = base_url.into();
+        let base_url = BackendOrigin::parse(&base_url)
+            .map(|origin| origin.to_string())
+            .unwrap_or(base_url);
         Self {
-            base_url: base_url.into(),
+            base_url,
             workspace_id: workspace_id.map(Into::into),
         }
+    }
+
+    pub fn authenticated_client(&self) -> Result<BackendApiClient, BackendApiClientError> {
+        BackendApiClient::from_stored_token(&self.base_url)
     }
 }
 

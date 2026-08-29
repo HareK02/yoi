@@ -1,3 +1,5 @@
+use crate::{BackendApiClient, BackendApiClientError};
+use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use workspace_api::{RepositoryObservedStatus, RepositorySource};
@@ -70,7 +72,7 @@ impl BackendWorkspaceCatalogTarget {
 #[derive(Debug)]
 pub enum BackendWorkspaceClientError {
     InvalidTarget(String),
-    RequestFailed { status: u16, message: String },
+    Api(BackendApiClientError),
     Http(reqwest::Error),
 }
 
@@ -78,15 +80,19 @@ impl fmt::Display for BackendWorkspaceClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidTarget(message) => f.write_str(message),
-            Self::RequestFailed { status, message } => {
-                write!(f, "Backend request failed with HTTP {status}: {message}")
-            }
+            Self::Api(error) => write!(f, "{error}"),
             Self::Http(error) => write!(f, "{error}"),
         }
     }
 }
 
 impl std::error::Error for BackendWorkspaceClientError {}
+
+impl From<BackendApiClientError> for BackendWorkspaceClientError {
+    fn from(error: BackendApiClientError) -> Self {
+        Self::Api(error)
+    }
+}
 
 impl From<reqwest::Error> for BackendWorkspaceClientError {
     fn from(error: reqwest::Error) -> Self {
@@ -97,13 +103,21 @@ impl From<reqwest::Error> for BackendWorkspaceClientError {
 pub async fn list_backend_workspaces(
     target: &BackendWorkspaceCatalogTarget,
 ) -> Result<Vec<BackendWorkspace>, BackendWorkspaceClientError> {
-    validate_target(target)?;
-    let url = format!(
-        "{}/api/workspaces?limit={DEFAULT_WORKSPACE_LIMIT}",
-        target.base_url.trim_end_matches('/')
-    );
-    let response = reqwest::Client::new().get(url).send().await?;
-    let response = require_success(response).await?;
+    let client = BackendApiClient::from_stored_token(&target.base_url)?;
+    list_backend_workspaces_with_client(&client).await
+}
+
+async fn list_backend_workspaces_with_client(
+    client: &BackendApiClient,
+) -> Result<Vec<BackendWorkspace>, BackendWorkspaceClientError> {
+    let response = client
+        .request(
+            Method::GET,
+            &format!("/api/workspaces?limit={DEFAULT_WORKSPACE_LIMIT}"),
+        )?
+        .send()
+        .await?;
+    client.check_status(response.status())?;
     Ok(response.json::<Vec<BackendWorkspace>>().await?)
 }
 
@@ -111,42 +125,50 @@ pub async fn create_backend_workspace(
     target: &BackendWorkspaceCatalogTarget,
     request: &CreateBackendWorkspaceRequest,
 ) -> Result<CreateBackendWorkspaceResponse, BackendWorkspaceClientError> {
-    validate_target(target)?;
-    let url = format!("{}/api/workspaces", target.base_url.trim_end_matches('/'));
-    let response = reqwest::Client::new()
-        .post(url)
+    let client = BackendApiClient::from_stored_token(&target.base_url)?;
+    let response = client
+        .request(Method::POST, "/api/workspaces")?
         .json(request)
         .send()
         .await?;
-    let response = require_success(response).await?;
+    client.check_status(response.status())?;
     Ok(response.json::<CreateBackendWorkspaceResponse>().await?)
-}
-
-async fn require_success(
-    response: reqwest::Response,
-) -> Result<reqwest::Response, BackendWorkspaceClientError> {
-    if response.status().is_success() {
-        return Ok(response);
-    }
-    let status = response.status().as_u16();
-    let message = response.text().await.unwrap_or_default();
-    Err(BackendWorkspaceClientError::RequestFailed { status, message })
-}
-
-fn validate_target(
-    target: &BackendWorkspaceCatalogTarget,
-) -> Result<(), BackendWorkspaceClientError> {
-    if !(target.base_url.starts_with("http://") || target.base_url.starts_with("https://")) {
-        return Err(BackendWorkspaceClientError::InvalidTarget(
-            "Backend API base URL must start with http:// or https://".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[tokio::test]
+    async fn workspace_catalog_request_uses_shared_bearer_client() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = vec![0; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+            assert!(request.starts_with("get /api/workspaces?limit=200 "));
+            assert!(request.contains("authorization: bearer catalog-secret\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
+                )
+                .unwrap();
+        });
+        let client =
+            BackendApiClient::from_access_token_for_test(&base_url, "catalog-secret").unwrap();
+        assert!(
+            list_backend_workspaces_with_client(&client)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        handle.join().unwrap();
+    }
 
     #[test]
     fn create_request_keeps_operation_key_for_exact_retry() {
