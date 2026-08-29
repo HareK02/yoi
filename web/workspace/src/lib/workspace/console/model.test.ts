@@ -238,6 +238,108 @@ Deno.test("segment rotation retains a live error beside the real SegmentStart hi
   );
 });
 
+Deno.test("reload snapshot projects provenance-annotated history entries", () => {
+  const metadata = {
+    entry_id: "history-entry-1",
+    origin: {
+      kind: "model_output",
+      worker: {
+        workspace_id: "workspace-secret",
+        runtime_id: "runtime-secret",
+        worker_id: "worker-secret",
+      },
+    },
+  };
+  const annotated = (item: unknown) => ({ item, metadata });
+  const projection = projectConsole([{
+    eventId: "annotated-reload",
+    event: snapshotEvent("/repo", [
+      {
+        kind: "annotated_segment_start",
+        ts: 1,
+        session_id: "session-1",
+        system_prompt: null,
+        config: {},
+        history: [annotated({
+          kind: "message",
+          role: "assistant",
+          content: [{ kind: "text", text: "older committed reply" }],
+        })],
+      },
+      {
+        kind: "annotated_user_input",
+        ts: 2,
+        segments: [{ kind: "text", content: "latest user message" }],
+        history: [annotated({
+          kind: "message",
+          role: "user",
+          content: [{ kind: "text", text: "latest user message" }],
+        })],
+      },
+      {
+        kind: "annotated_assistant_item",
+        ts: 3,
+        entry: annotated({
+          kind: "message",
+          role: "assistant",
+          content: [{ kind: "text", text: "latest committed reply" }],
+        }),
+      },
+      {
+        kind: "annotated_assistant_item",
+        ts: 4,
+        entry: annotated({
+          kind: "tool_call",
+          call_id: "annotated-call",
+          name: "Read",
+          arguments: '{"file_path":"/repo/a.md"}',
+        }),
+      },
+      {
+        kind: "annotated_tool_result",
+        ts: 5,
+        entry: annotated({
+          kind: "tool_result",
+          call_id: "annotated-call",
+          summary: "Read 1 line from /repo/a.md",
+          content: "1→content",
+          is_error: false,
+        }),
+      },
+      {
+        kind: "annotated_system_item",
+        ts: 6,
+        entry: annotated({
+          kind: "notification",
+          message: "Worker completed",
+        }),
+      },
+    ]),
+  }]);
+
+  assertEquals(
+    projection.lines.map((line) =>
+      `${line.kind}:${line.toolCallLabel ?? line.body}`
+    ),
+    [
+      "assistant:older committed reply",
+      "user:latest user message",
+      "assistant:latest committed reply",
+      "tool:Read(1 file)",
+      "system:Worker completed",
+    ],
+  );
+  const visible = JSON.stringify(projection.lines);
+  assert(
+    !visible.includes("workspace-secret"),
+    "history metadata must not enter Console rows",
+  );
+  assert(
+    !visible.includes("runtime-secret"),
+    "history origin must remain non-visible metadata",
+  );
+});
+
 Deno.test("workerConsoleHref encodes runtime and worker target authority", () => {
   assert(
     workerConsoleHref({

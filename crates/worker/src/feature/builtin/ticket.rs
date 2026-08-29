@@ -306,19 +306,32 @@ struct BackendTicketService {
     backend: TicketToolBackend,
 }
 
+struct WorkspaceTicketService {
+    backend: WorkspaceHttpTicketBackend,
+}
+
+fn ticket_handoff_from_record(ticket: Ticket) -> Result<TicketHandoff, TicketError> {
+    let resource_key = ticket
+        .meta
+        .resource_key
+        .filter(|key| is_canonical_ticket_resource_key(key))
+        .ok_or_else(|| TicketError::Conflict("ticket resource key is unavailable".into()))?;
+    Ok(TicketHandoff {
+        id: ticket.meta.id,
+        resource_key,
+        workflow_state: ticket.meta.workflow_state,
+    })
+}
+
 impl TicketService for BackendTicketService {
     fn ticket_handoff(&self, ticket_ref: &str) -> Result<TicketHandoff, TicketError> {
-        let ticket = self.backend.show(ticket_ref.into())?;
-        let resource_key = ticket
-            .meta
-            .resource_key
-            .filter(|key| is_canonical_ticket_resource_key(key))
-            .ok_or_else(|| TicketError::Conflict("ticket resource key is unavailable".into()))?;
-        Ok(TicketHandoff {
-            id: ticket.meta.id,
-            resource_key,
-            workflow_state: ticket.meta.workflow_state,
-        })
+        ticket_handoff_from_record(self.backend.show(ticket_ref.into())?)
+    }
+}
+
+impl TicketService for WorkspaceTicketService {
+    fn ticket_handoff(&self, ticket_ref: &str) -> Result<TicketHandoff, TicketError> {
+        ticket_handoff_from_record(self.backend.show_unprojected(ticket_ref)?)
     }
 }
 
@@ -640,9 +653,14 @@ impl FeatureModule for TicketFeature {
         let Some(backend) = self.tool_backend(context) else {
             return Ok(());
         };
-        let ticket_service: Arc<dyn TicketService> = Arc::new(BackendTicketService {
-            backend: backend.clone(),
-        });
+        let ticket_service: Arc<dyn TicketService> = match &self.backend {
+            TicketFeatureBackend::WorkspaceClient(client) => Arc::new(WorkspaceTicketService {
+                backend: WorkspaceHttpTicketBackend::new(client.clone()),
+            }),
+            TicketFeatureBackend::Local { .. } => Arc::new(BackendTicketService {
+                backend: backend.clone(),
+            }),
+        };
         context.services().provide(
             ServiceDeclaration::new(
                 ServiceId::builtin(TICKET_SERVICE_ID),
@@ -714,6 +732,26 @@ impl WorkspaceHttpTicketBackend {
         Self::invoke_client(client, workspace_id, operation)
     }
 
+    fn show_unprojected(&self, ticket_ref: &str) -> TicketResult<Ticket> {
+        let client = self.client.clone();
+        let workspace_id = self.client.workspace_id().unwrap_or_default().to_string();
+        let ticket_path = Self::ticket_path(&TicketIdOrSlug::from(ticket_ref));
+        let request = move || {
+            Self::request_unprojected(
+                client,
+                WorkspaceRequestMethod::Get,
+                format!("/api/w/{workspace_id}/tickets/{ticket_path}/record"),
+                None,
+            )
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return std::thread::spawn(request).join().map_err(|_| {
+                TicketError::Conflict("ticket REST request thread panicked".to_string())
+            })?;
+        }
+        request()
+    }
+
     fn ticket_path(id: &TicketIdOrSlug) -> String {
         let value = match id {
             TicketIdOrSlug::Id(value)
@@ -738,6 +776,29 @@ impl WorkspaceHttpTicketBackend {
         endpoint: String,
         body: Option<serde_json::Value>,
     ) -> TicketResult<T> {
+        let mut value = Self::request_value(client, method, endpoint, body)?;
+        Self::canonicalize_ticket_references(&mut value);
+        serde_json::from_value(value)
+            .map_err(|error| TicketError::Conflict(format!("decode ticket REST response: {error}")))
+    }
+
+    fn request_unprojected<T: serde::de::DeserializeOwned>(
+        client: Arc<dyn WorkspaceClient>,
+        method: WorkspaceRequestMethod,
+        endpoint: String,
+        body: Option<serde_json::Value>,
+    ) -> TicketResult<T> {
+        let value = Self::request_value(client, method, endpoint, body)?;
+        serde_json::from_value(value)
+            .map_err(|error| TicketError::Conflict(format!("decode ticket REST response: {error}")))
+    }
+
+    fn request_value(
+        client: Arc<dyn WorkspaceClient>,
+        method: WorkspaceRequestMethod,
+        endpoint: String,
+        body: Option<serde_json::Value>,
+    ) -> TicketResult<Value> {
         let request = match body {
             Some(body) => WorkspaceRequest::json(method, endpoint, body.to_string()),
             None if method == WorkspaceRequestMethod::Get => WorkspaceRequest::get(endpoint),
@@ -756,11 +817,7 @@ impl WorkspaceHttpTicketBackend {
                 response.status
             )));
         }
-        let mut value: Value = serde_json::from_str(&response.body).map_err(|error| {
-            TicketError::Conflict(format!("decode ticket REST response: {error}"))
-        })?;
-        Self::canonicalize_ticket_references(&mut value);
-        serde_json::from_value(value)
+        serde_json::from_str(&response.body)
             .map_err(|error| TicketError::Conflict(format!("decode ticket REST response: {error}")))
     }
 
@@ -810,9 +867,7 @@ impl WorkspaceHttpTicketBackend {
             .and_then(Value::as_str)
             .filter(|key| is_canonical_ticket_resource_key(key))
             .map(ToOwned::to_owned)
-            .ok_or_else(|| {
-                TicketError::Conflict("required Ticket human key is unavailable".to_string())
-            })
+            .ok_or_else(|| TicketError::Conflict("required Ticket key is unavailable".to_string()))
     }
 
     fn request_unit(
@@ -889,7 +944,7 @@ impl WorkspaceHttpTicketBackend {
                     .is_some_and(is_canonical_ticket_resource_key)
                 {
                     return Err(TicketError::Conflict(
-                        "required Ticket human key is unavailable".to_string(),
+                        "required Ticket key is unavailable".to_string(),
                     ));
                 }
                 Ok(TicketBackendOperationResult::Ticket(ticket))
@@ -1861,7 +1916,7 @@ provider = "github"
     }
 
     #[test]
-    fn workspace_http_backend_records_relation_with_authoritative_human_keys() {
+    fn workspace_http_backend_records_relation_with_authoritative_keys() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -1998,6 +2053,46 @@ provider = "github"
         server.join().unwrap();
         assert_eq!(removed.ticket_id, "T-1");
         assert_eq!(removed.target, "T-2");
+    }
+
+    #[test]
+    fn workspace_ticket_service_preserves_internal_identity_for_handoff() {
+        let temp = TempDir::new().unwrap();
+        let local = LocalTicketBackend::new(temp.path().join("tickets"));
+        let created = local.create(NewTicket::new("Ticket handoff")).unwrap();
+        let mut ticket = local.show(TicketIdOrSlug::Id(created.id.clone())).unwrap();
+        ticket.meta.resource_key = Some("T-548".to_string());
+        ticket.meta.workflow_state = TicketWorkflowState::Queued;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let response_body = serde_json::to_string(&ticket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 8192];
+            let len = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..len]);
+            assert!(request.starts_with("GET /api/w/workspace-a/tickets/T-548/record HTTP/1.1"));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            )
+            .unwrap();
+        });
+
+        let service = WorkspaceTicketService {
+            backend: WorkspaceHttpTicketBackend::new(Arc::new(
+                crate::worker::TestWorkspaceHttpClient::new("workspace-a", base_url),
+            )),
+        };
+        let handoff = service.ticket_handoff("T-548").unwrap();
+
+        server.join().unwrap();
+        assert_eq!(handoff.id, created.id);
+        assert_eq!(handoff.resource_key, "T-548");
+        assert_eq!(handoff.workflow_state, TicketWorkflowState::Queued);
     }
 
     #[test]

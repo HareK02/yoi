@@ -2072,6 +2072,52 @@ function compactMessageForState(
   }
 }
 
+function applyLoggedUserInput(
+  projection: ConsoleProjection,
+  eventId: string,
+  entry: Record<string, unknown>,
+): void {
+  let body = segmentsToText(arrayField(entry, "segments") as Segment[]);
+  if (!body && stringField(entry, "kind") === "annotated_user_input") {
+    body = loggedUserText(arrayField(entry, "history"));
+  }
+  projection.lines.push(line(eventId, "user", "User", body));
+}
+
+function loggedUserText(history: unknown[]): string {
+  for (const historyEntry of history) {
+    if (!isRecord(historyEntry) || !isRecord(historyEntry["item"])) continue;
+    const item = historyEntry["item"];
+    if (
+      stringField(item, "kind") !== "message" ||
+      stringField(item, "role") !== "user"
+    ) {
+      continue;
+    }
+    return loggedContentText(arrayField(item, "content"));
+  }
+  return "";
+}
+
+function applyLoggedHistoryEntry(
+  projection: ConsoleProjection,
+  eventId: string,
+  historyEntry: unknown,
+): void {
+  if (!isRecord(historyEntry)) return;
+  applyLoggedItem(projection, eventId, historyEntry["item"]);
+}
+
+function applyLoggedSystemEntry(
+  projection: ConsoleProjection,
+  eventId: string,
+  historyEntry: unknown,
+): void {
+  if (!isRecord(historyEntry)) return;
+  projection.lines.push(systemItemLine(eventId, historyEntry["item"]));
+  applyTaskSystemItem(projection, historyEntry["item"]);
+}
+
 function applyLoggedItem(
   projection: ConsoleProjection,
   eventId: string,

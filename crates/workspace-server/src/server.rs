@@ -5458,6 +5458,36 @@ fn resolve_workspace_ticket_reference(
         .ok_or_else(|| Error::Ticket(ticket::TicketError::NotFound(reference.to_string())).into())
 }
 
+fn resolve_workspace_ticket_identity(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    reference: &str,
+) -> ApiResult<String> {
+    let ticket_id = resolve_workspace_ticket_reference(api, workspace_id, reference)?;
+    let ticket = browser_ticket_backend(api)?
+        .show(ticket_id.clone().into())
+        .map_err(Error::from)?;
+    if ticket.meta.id != ticket_id {
+        return Err(Error::InvalidInput(
+            "resolved Ticket identity does not match Ticket authority".to_string(),
+        )
+        .into());
+    }
+    Ok(ticket_id)
+}
+
+fn resolve_workspace_worker_ticket_assignment(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    assignment: &mut Option<CreateWorkspaceWorkerTicketAssignmentRequest>,
+) -> ApiResult<()> {
+    if let Some(assignment) = assignment {
+        assignment.ticket_id =
+            resolve_workspace_ticket_identity(api, workspace_id, &assignment.ticket_id)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct MergeRequestListHttpQuery {
     state: Option<String>,
@@ -8217,6 +8247,11 @@ async fn spawn_known_worker(
 ) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
+    resolve_workspace_worker_ticket_assignment(
+        &api,
+        &path.workspace_id,
+        &mut request.ticket_assignment,
+    )?;
     let relation = if request.ticket_assignment.is_some() {
         "assigned"
     } else {
@@ -20220,6 +20255,25 @@ mod tests {
                 .unwrap(),
             ticket_id
         );
+        assert_eq!(
+            resolve_workspace_ticket_identity(&api, TEST_WORKSPACE_ID, &ticket_resource_key)
+                .unwrap(),
+            ticket_id
+        );
+        assert_eq!(
+            resolve_workspace_ticket_identity(&api, TEST_WORKSPACE_ID, &ticket_id).unwrap(),
+            ticket_id
+        );
+        let mut assignment = Some(CreateWorkspaceWorkerTicketAssignmentRequest {
+            ticket_id: ticket_resource_key.clone(),
+            operation_id: "ticket-key-assignment".to_string(),
+        });
+        resolve_workspace_worker_ticket_assignment(&api, TEST_WORKSPACE_ID, &mut assignment)
+            .unwrap();
+        assert_eq!(assignment.unwrap().ticket_id, ticket_id);
+        let missing =
+            resolve_workspace_ticket_identity(&api, TEST_WORKSPACE_ID, "T-999999").unwrap_err();
+        assert_eq!(missing.into_response().status(), StatusCode::NOT_FOUND);
         let path = || ScopedRecordPath {
             workspace_id: TEST_WORKSPACE_ID.to_string(),
             id: ticket_id.clone(),

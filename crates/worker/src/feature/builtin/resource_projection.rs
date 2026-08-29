@@ -228,7 +228,7 @@ pub(super) fn project_ticket_query(value: Value) -> Result<ModelTicketQueryRespo
 fn project_ticket_query_item(value: &Value) -> Result<ModelTicketQueryItem, String> {
     let item = object(value, "Ticket query item")?;
     Ok(ModelTicketQueryItem {
-        ticket: human_ref(item, "resource_key", "T-")?,
+        ticket: resource_ref(item, "resource_key", "T-")?,
         title: string_field(item, "title")?,
         state: string_field(item, "state")?,
         readiness: optional_string(item, "readiness")?,
@@ -245,7 +245,7 @@ fn project_ticket_query_item(value: &Value) -> Result<ModelTicketQueryItem, Stri
             .transpose()?,
         linked_objectives: string_array(item, "linked_objective_keys")?
             .into_iter()
-            .map(|key| validate_human_ref(key, "O-"))
+            .map(|key| validate_resource_ref(key, "O-"))
             .collect::<Result<Vec<_>, _>>()?,
         relation_count: usize_field(item, "relation_count")?,
         blocker_count: usize_field(item, "blocker_count")?,
@@ -273,7 +273,7 @@ pub(super) fn project_ticket_detail(value: Value) -> Result<ModelTicketDetail, S
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(ModelTicketDetail {
-        ticket: human_ref(root, "resource_key", "T-")?,
+        ticket: resource_ref(root, "resource_key", "T-")?,
         title: string_field(root, "title")?,
         body: string_field(root, "body")?,
         state: string_field(root, "state")?,
@@ -332,10 +332,10 @@ fn project_objective_query_item(value: &Value) -> Result<ModelObjectiveQueryItem
     let item = object(value, "Objective query item")?;
     let linked_tickets = string_array(item, "linked_ticket_keys")?
         .into_iter()
-        .map(|key| validate_human_ref(key, "T-"))
+        .map(|key| validate_resource_ref(key, "T-"))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ModelObjectiveQueryItem {
-        objective: human_ref(item, "resource_key", "O-")?,
+        objective: resource_ref(item, "resource_key", "O-")?,
         title: string_field(item, "title")?,
         summary: optional_string(item, "snippet")?,
         state: string_field(item, "state")?,
@@ -349,7 +349,7 @@ fn project_objective_query_item(value: &Value) -> Result<ModelObjectiveQueryItem
 pub(super) fn project_objective_detail(value: Value) -> Result<ModelObjectiveDetail, String> {
     let root = object(&value, "Objective detail response")?;
     Ok(ModelObjectiveDetail {
-        objective: human_ref(root, "resource_key", "O-")?,
+        objective: resource_ref(root, "resource_key", "O-")?,
         title: string_field(root, "title")?,
         body: string_field(root, "body")?,
         state: string_field(root, "state")?,
@@ -373,7 +373,7 @@ pub(super) fn project_objective_detail(value: Value) -> Result<ModelObjectiveDet
 fn project_worker(value: &Value) -> Result<ModelWorkerSummary, String> {
     let worker = object(value, "Worker summary")?;
     Ok(ModelWorkerSummary {
-        worker: human_ref(worker, "worker_resource_key", "W-")?,
+        worker: resource_ref(worker, "worker_resource_key", "W-")?,
     })
 }
 
@@ -439,7 +439,7 @@ fn project_relation(
         None => optional_string(relation, "at")?,
     };
     Ok(ModelRelation {
-        ticket: human_ref(relation, ticket_key, "T-")?,
+        ticket: resource_ref(relation, ticket_key, "T-")?,
         kind,
         note,
         created_at,
@@ -449,7 +449,7 @@ fn project_relation(
 fn project_blocker(value: &Value) -> Result<ModelBlocker, String> {
     let blocker = object(value, "Ticket blocker")?;
     Ok(ModelBlocker {
-        ticket: human_ref(blocker, "blocking_resource_key", "T-")?,
+        ticket: resource_ref(blocker, "blocking_resource_key", "T-")?,
         kind: string_field(blocker, "relation_kind")?,
         state: optional_string(blocker, "blocking_state")?,
         resolved: bool_field(blocker, "resolved")?,
@@ -466,7 +466,7 @@ fn project_notice(value: &Value) -> Result<ModelNotice, String> {
 fn project_objective_summary(value: &Value) -> Result<ModelObjectiveSummary, String> {
     let summary = object(value, "Objective summary")?;
     Ok(ModelObjectiveSummary {
-        objective: human_ref(summary, "resource_key", "O-")?,
+        objective: resource_ref(summary, "resource_key", "O-")?,
         title: string_field(summary, "title")?,
         state: string_field(summary, "state")?,
     })
@@ -475,7 +475,7 @@ fn project_objective_summary(value: &Value) -> Result<ModelObjectiveSummary, Str
 fn project_ticket_summary(value: &Value) -> Result<ModelTicketSummary, String> {
     let summary = object(value, "Ticket summary")?;
     Ok(ModelTicketSummary {
-        ticket: human_ref(summary, "resource_key", "T-")?,
+        ticket: resource_ref(summary, "resource_key", "T-")?,
         title: string_field(summary, "title")?,
         state: string_field(summary, "state")?,
     })
@@ -491,9 +491,7 @@ fn project_assignment(
     let principal = match kind.as_str() {
         "worker" => current_coder
             .map(|coder| coder.worker.clone())
-            .ok_or_else(|| {
-                "Worker assignment is missing a Workspace human key projection".to_string()
-            })?,
+            .ok_or_else(|| "Worker assignment is missing a Workspace key projection".to_string())?,
         "workspace_agent" => format!("workspace-agent:{}", string_field(principal, "agent_key")?),
         "user" => "user".to_string(),
         other => format!("source:{other}"),
@@ -645,23 +643,23 @@ fn string_array(object: &Map<String, Value>, key: &str) -> Result<Vec<String>, S
         .collect()
 }
 
-fn human_ref(object: &Map<String, Value>, key: &str, prefix: &str) -> Result<String, String> {
+fn resource_ref(object: &Map<String, Value>, key: &str, prefix: &str) -> Result<String, String> {
     let value = object
         .get(key)
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
-        .ok_or_else(|| format!("required {prefix} human key is unavailable"))?;
-    validate_human_ref(value, prefix)
+        .ok_or_else(|| format!("required {prefix} key is unavailable"))?;
+    validate_resource_ref(value, prefix)
 }
 
-fn validate_human_ref(value: String, prefix: &str) -> Result<String, String> {
+fn validate_resource_ref(value: String, prefix: &str) -> Result<String, String> {
     let valid = value.strip_prefix(prefix).is_some_and(|sequence| {
         !sequence.is_empty() && sequence.bytes().all(|byte| byte.is_ascii_digit())
     });
     if valid {
         Ok(value)
     } else {
-        Err(format!("required {prefix} human key is unavailable"))
+        Err(format!("required {prefix} key is unavailable"))
     }
 }
 
@@ -671,7 +669,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn objective_projection_exposes_only_human_resource_references() {
+    fn objective_projection_exposes_only_resource_references() {
         let projected = project_objective_detail(json!({
             "id": "00001M10HW6BV",
             "resource_key": "O-543",
@@ -779,9 +777,9 @@ mod tests {
     }
 
     #[test]
-    fn human_resource_projection_rejects_noncanonical_keys() {
+    fn resource_projection_rejects_noncanonical_keys() {
         for (key, prefix) in [("T-key", "T-"), ("O-", "O-"), ("W-1x", "W-")] {
-            assert!(validate_human_ref(key.to_string(), prefix).is_err());
+            assert!(validate_resource_ref(key.to_string(), prefix).is_err());
         }
     }
 
