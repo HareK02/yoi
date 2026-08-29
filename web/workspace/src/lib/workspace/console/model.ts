@@ -1960,23 +1960,33 @@ function applyLogEntry(
         applyLoggedItem(projection, `${eventId}-history-${index}`, item)
       );
       break;
-    case "user_input":
-      projection.lines.push(
-        line(
-          eventId,
-          "user",
-          "User",
-          segmentsToText(arrayField(entry, "segments") as Segment[]),
-        ),
+    case "annotated_segment_start":
+      arrayField(entry, "history").forEach((historyEntry, index) =>
+        applyLoggedHistoryEntry(
+          projection,
+          `${eventId}-history-${index}`,
+          historyEntry,
+        )
       );
+      break;
+    case "user_input":
+    case "annotated_user_input":
+      applyLoggedUserInput(projection, eventId, entry);
       break;
     case "system_item":
       projection.lines.push(systemItemLine(eventId, entry["item"]));
       applyTaskSystemItem(projection, entry["item"]);
       break;
+    case "annotated_system_item":
+      applyLoggedSystemEntry(projection, eventId, entry["entry"]);
+      break;
     case "assistant_item":
     case "tool_result":
       applyLoggedItem(projection, eventId, entry["item"]);
+      break;
+    case "annotated_assistant_item":
+    case "annotated_tool_result":
+      applyLoggedHistoryEntry(projection, eventId, entry["entry"]);
       break;
     case "run_errored":
       projection.lines.push(
@@ -2054,6 +2064,52 @@ function compactMessageForState(
     default:
       return "Compacting…";
   }
+}
+
+function applyLoggedUserInput(
+  projection: ConsoleProjection,
+  eventId: string,
+  entry: Record<string, unknown>,
+): void {
+  let body = segmentsToText(arrayField(entry, "segments") as Segment[]);
+  if (!body && stringField(entry, "kind") === "annotated_user_input") {
+    body = loggedUserText(arrayField(entry, "history"));
+  }
+  projection.lines.push(line(eventId, "user", "User", body));
+}
+
+function loggedUserText(history: unknown[]): string {
+  for (const historyEntry of history) {
+    if (!isRecord(historyEntry) || !isRecord(historyEntry["item"])) continue;
+    const item = historyEntry["item"];
+    if (
+      stringField(item, "kind") !== "message" ||
+      stringField(item, "role") !== "user"
+    ) {
+      continue;
+    }
+    return loggedContentText(arrayField(item, "content"));
+  }
+  return "";
+}
+
+function applyLoggedHistoryEntry(
+  projection: ConsoleProjection,
+  eventId: string,
+  historyEntry: unknown,
+): void {
+  if (!isRecord(historyEntry)) return;
+  applyLoggedItem(projection, eventId, historyEntry["item"]);
+}
+
+function applyLoggedSystemEntry(
+  projection: ConsoleProjection,
+  eventId: string,
+  historyEntry: unknown,
+): void {
+  if (!isRecord(historyEntry)) return;
+  projection.lines.push(systemItemLine(eventId, historyEntry["item"]));
+  applyTaskSystemItem(projection, historyEntry["item"]);
 }
 
 function applyLoggedItem(
