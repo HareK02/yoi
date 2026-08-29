@@ -18155,7 +18155,12 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(existing.state, WorkerOperationState::Accepted);
+        assert_eq!(
+            existing.state,
+            WorkerOperationState::Accepted,
+            "diagnostics: {:?}",
+            existing.diagnostics
+        );
         let worker_id = existing.worker.unwrap().worker.worker_id;
         let worker = api
             .runtime

@@ -3740,7 +3740,13 @@ fn builtin_profile_source_archive(
     profile: &ProfileSelector,
 ) -> Result<ProfileSourceArchive, String> {
     let selected_profile = match profile {
-        ProfileSelector::Builtin(name) => name.clone(),
+        ProfileSelector::Builtin(name) => {
+            if name.starts_with("builtin:") {
+                name.clone()
+            } else {
+                format!("builtin:{name}")
+            }
+        }
         ProfileSelector::Named(name) => {
             return Err(format!(
                 "embedded runtime does not provide named Profile `{name}`"
