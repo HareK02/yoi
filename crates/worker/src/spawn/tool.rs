@@ -403,11 +403,10 @@ impl Tool for SubWorkerSpawnTool {
             allow: scope_allow.clone(),
             deny: Vec::new(),
         };
-        let mut child_manifest =
-            WorkerManifest::try_from(WorkerManifestConfig::builtin_defaults().merge(child_config))
-                .map_err(|error| {
-                    ToolError::ExecutionFailed(format!("resolve child manifest: {error}"))
-                })?;
+        let mut child_manifest = WorkerManifest::try_from(
+            WorkerManifestConfig::resolution_defaults().merge(child_config),
+        )
+        .map_err(|error| ToolError::ExecutionFailed(format!("resolve child manifest: {error}")))?;
         // Delegated children stay bound to their scoped session and cannot use
         // Workspace attachment tools to replace it with parent-level authority.
         child_manifest.feature.manage_workdir.enabled = false;
@@ -1631,7 +1630,7 @@ max_tokens = 3333
             Some(true)
         );
 
-        let manifest: WorkerManifest = WorkerManifestConfig::builtin_defaults()
+        let manifest: WorkerManifest = WorkerManifestConfig::resolution_defaults()
             .merge(parsed)
             .try_into()
             .unwrap();

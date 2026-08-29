@@ -184,15 +184,16 @@ fn load_spawn_config_json(
 ) -> Result<(WorkerManifest, PromptCatalogSource), String> {
     let config = serde_json::from_str::<WorkerManifestConfig>(config_json)
         .map_err(|e| format!("failed to parse --spawn-config-json: {e}"))?;
-    let manifest = WorkerManifest::try_from(WorkerManifestConfig::builtin_defaults().merge(config))
-        .map_err(|e| format!("failed to resolve --spawn-config-json: {e}"))?;
+    let manifest =
+        WorkerManifest::try_from(WorkerManifestConfig::resolution_defaults().merge(config))
+            .map_err(|e| format!("failed to resolve --spawn-config-json: {e}"))?;
     Ok((manifest, PromptCatalogSource::builtins_only()))
 }
 
 fn load_builtin_default_manifest(
     worker_name: &str,
 ) -> Result<(WorkerManifest, PromptCatalogSource), String> {
-    let mut config = WorkerManifestConfig::builtin_defaults();
+    let mut config = WorkerManifestConfig::resolution_defaults();
     config.worker.name = Some(worker_name.to_string());
     let manifest = WorkerManifest::try_from(config)
         .map_err(|e| format!("failed to resolve builtin worker defaults: {e}"))?;
@@ -259,7 +260,7 @@ fn load_single_manifest(
             absolute_path.display()
         )
     })?;
-    let mut config = WorkerManifestConfig::builtin_defaults().merge(
+    let mut config = WorkerManifestConfig::resolution_defaults().merge(
         WorkerManifestConfig::from_toml(&toml)
             .map_err(|e| format!("failed to parse manifest {}: {e}", path.display()))?
             .resolve_paths(base_dir),

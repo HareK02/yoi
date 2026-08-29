@@ -566,15 +566,16 @@ impl WorkerManifestConfig {
         })
     }
 
-    /// Base config populated with the in-code defaults listed in
-    /// [`crate::defaults`]. Profile and one-file Manifest resolvers start
-    /// from this layer so every per-field default lives at exactly one
-    /// call site (the `defaults` module).
+    /// Base config populated with the in-code per-field defaults listed in
+    /// [`crate::defaults`]. This is not a selectable Profile and does not
+    /// enable a launch capability surface. Profile and one-file Manifest
+    /// resolvers start from this layer so every per-field default lives at
+    /// exactly one call site (the `defaults` module).
     ///
     /// `TryFrom<WorkerManifestConfig>` also reads the same constants as a
     /// belt-and-suspenders fallback, so a manually-constructed config
     /// that skips this layer still resolves to the same values.
-    pub fn builtin_defaults() -> Self {
+    pub fn resolution_defaults() -> Self {
         Self {
             engine: EngineManifestConfig {
                 tool_output: ToolOutputLimitsPartial {
@@ -1973,7 +1974,7 @@ enabled = false
 "#,
         )
         .unwrap();
-        let manifest: WorkerManifest = WorkerManifestConfig::builtin_defaults()
+        let manifest: WorkerManifest = WorkerManifestConfig::resolution_defaults()
             .merge(cfg)
             .merge(WorkerManifestConfig {
                 worker: WorkerMetaConfig {
@@ -2074,7 +2075,7 @@ enabled = true
 "#,
         )
         .unwrap();
-        let manifest: WorkerManifest = WorkerManifestConfig::builtin_defaults()
+        let manifest: WorkerManifest = WorkerManifestConfig::resolution_defaults()
             .merge(base)
             .merge(upper)
             .merge(WorkerManifestConfig {
@@ -2137,7 +2138,7 @@ permission = "write"
 
     #[test]
     fn builtin_defaults_populates_worker_limit_defaults() {
-        let cfg = WorkerManifestConfig::builtin_defaults();
+        let cfg = WorkerManifestConfig::resolution_defaults();
         assert_eq!(
             cfg.engine.tool_output.default_max_bytes,
             Some(defaults::TOOL_OUTPUT_MAX_BYTES)
@@ -2172,7 +2173,7 @@ permission = "write"
             },
             ..Default::default()
         };
-        let merged = WorkerManifestConfig::builtin_defaults().merge(overlay);
+        let merged = WorkerManifestConfig::resolution_defaults().merge(overlay);
         let manifest: WorkerManifest = merged.try_into().unwrap();
         assert_eq!(
             manifest.engine.tool_output.default_max_bytes,

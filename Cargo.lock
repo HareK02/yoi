@@ -2629,6 +2629,7 @@ version = "0.1.0"
 dependencies = [
  "agen",
  "arc-swap",
+ "decodal",
  "protocol",
  "secrets",
  "serde",

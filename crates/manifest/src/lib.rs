@@ -1,3 +1,4 @@
+mod builtin_profile;
 mod config;
 pub mod defaults;
 mod model;
@@ -7,6 +8,11 @@ pub mod plugin;
 mod profile;
 mod scope;
 
+pub use builtin_profile::{
+    BUILTIN_DEFAULT_PROFILE, BUILTIN_PROFILE_CATALOG_ID, BUILTIN_PROFILE_RESOURCES,
+    BuiltinProfileCatalogSnapshot, BuiltinProfileImport, BuiltinProfileResource,
+    builtin_profile_catalog_snapshot, builtin_profile_entrypoints,
+};
 pub use config::{
     CompactionConfigPartial, EngineManifestConfig, FileUploadLimitsPartial,
     PermissionConfigPartial, ResolveError, SessionConfigPartial, ToolOutputLimitsPartial,
@@ -17,10 +23,11 @@ pub use model::{
 };
 pub use paths::user_profiles_path;
 pub use profile::{
-    ProfileDiscovery, ProfileError, ProfileManifestSnapshot, ProfileMetadata, ProfileRegistry,
-    ProfileRegistryEntry, ProfileRegistrySource, ProfileResolveOptions, ProfileResolver,
-    ProfileSelector, ProfileSource, ResolvedProfile, resolve_profile_artifact,
-    resolve_profile_artifact_value,
+    ProfileDiscovery, ProfileError, ProfileExecutionTarget, ProfileManifestSnapshot,
+    ProfileMetadata, ProfileRegistry, ProfileRegistryEntry, ProfileRegistrySource,
+    ProfileResolveOptions, ProfileResolver, ProfileSelector, ProfileSource, ResolvedProfile,
+    WorkspaceAuthorityRequirement, resolve_profile_artifact, resolve_profile_artifact_value,
+    validate_profile_execution_target,
 };
 pub use protocol::{Permission, ScopeRule};
 pub use scope::{DelegationScope, Scope, ScopeError, SharedScope};

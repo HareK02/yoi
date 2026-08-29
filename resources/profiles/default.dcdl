@@ -1,0 +1,34 @@
+import "./base.dcdl" // {
+    slug = "default";
+    description = "Standalone Yoi coding profile.";
+    scope = "workspace_write";
+    delegation_scope = "workspace_write";
+
+    feature = {
+        task = { enabled = true; };
+        memory = { enabled = false; staging = false; };
+        web = { enabled = true; };
+        image = { enabled = true; };
+        sub_worker = { enabled = true; };
+        flow = { enabled = false; };
+        worker = { enabled = false; direct_spawn = true; };
+        objective = { enabled = false; };
+        manage_workdir = { enabled = false; };
+        ticket = {
+            enabled = false;
+            authoring = false;
+            thread = false;
+            intake = false;
+            workflow = false;
+        };
+        merge_request = {
+            show = false;
+            open = false;
+            review = false;
+            readiness_check = false;
+            complete = false;
+        };
+        orchestration = { enabled = false; };
+        plugins = { enabled = false; };
+    };
+}

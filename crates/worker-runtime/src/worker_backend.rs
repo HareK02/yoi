@@ -422,7 +422,7 @@ impl ProfileRuntimeWorkerFactory {
     fn restore_fallback_manifest(
         worker_name: &str,
     ) -> Result<(manifest::WorkerManifest, PromptCatalogSource), String> {
-        let mut config = manifest::WorkerManifestConfig::builtin_defaults();
+        let mut config = manifest::WorkerManifestConfig::resolution_defaults();
         config.worker.name = Some(worker_name.to_string());
         let manifest = manifest::WorkerManifest::try_from(config)
             .map_err(|err| format!("failed to build restore fallback manifest: {err}"))?;

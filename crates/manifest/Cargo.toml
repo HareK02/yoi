@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 arc-swap = "1"
 agen = { workspace = true }
+decodal.workspace = true
 protocol = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
