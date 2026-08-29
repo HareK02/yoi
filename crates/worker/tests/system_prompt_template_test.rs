@@ -203,12 +203,12 @@ async fn session_start_state_captures_rendered_prompt() {
         .unwrap();
     let first = entries.first().expect("at least one entry");
     match first {
-        LogEntry::SegmentStart { system_prompt, .. } => {
+        LogEntry::AnnotatedSegmentStart { system_prompt, .. } => {
             let sp = system_prompt.as_deref().expect("system prompt set");
             assert!(sp.starts_with("hello"));
             assert!(sp.contains(&pwd.display().to_string()));
         }
-        other => panic!("expected SegmentStart as first entry, got {other:?}"),
+        other => panic!("expected AnnotatedSegmentStart as first entry, got {other:?}"),
     }
 }
 

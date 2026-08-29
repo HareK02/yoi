@@ -34,6 +34,7 @@ pub mod event_trace;
 pub mod fs_store;
 pub mod history;
 pub mod logged_item;
+pub mod public_snapshot;
 pub mod segment;
 pub mod segment_log;
 pub mod store;

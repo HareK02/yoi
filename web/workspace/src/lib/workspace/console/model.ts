@@ -650,9 +650,9 @@ function projectInternalWorkerSnapshot(
   eventId: string,
   cwd: string | null,
 ): InternalWorkerProjection {
-  const console = snapshotProjectionFromEntries(
+  const console = snapshotProjectionFromSession(
     `${eventId}:internal:${snapshot.worker.session_id}:snapshot`,
-    snapshot.entries,
+    snapshot.session,
     cwd,
   );
   console.status = snapshot.status;
@@ -905,9 +905,9 @@ export function applyProtocolEvent(
     case "snapshot": {
       next.status = event.data.status;
       next.cwd = event.data.greeting.cwd;
-      const snapshot = snapshotProjectionFromEntries(
+      const snapshot = snapshotProjectionFromSession(
         envelope.eventId,
-        event.data.entries,
+        event.data.session,
         next.cwd,
       );
       next.lines = snapshot.lines;
@@ -1008,9 +1008,9 @@ export function applyProtocolEvent(
       break;
     case "segment_rotated": {
       const retainedErrors = next.lines.filter((line) => line.kind === "error");
-      const segment = snapshotProjectionFromEntries(
+      const segment = snapshotProjectionFromSession(
         envelope.eventId,
-        [event.data.entry],
+        event.data.session,
         next.cwd,
       );
       next.lines = [...segment.lines, ...retainedErrors];
@@ -1925,9 +1925,9 @@ function applyTaskSystemItem(
   if (typeof body === "string") applyTaskSnapshot(projection, body);
 }
 
-function snapshotProjectionFromEntries(
+function snapshotProjectionFromSession(
   eventId: string,
-  entries: unknown[],
+  snapshot: unknown,
   cwd: string | null,
 ): ConsoleProjection {
   const projection: ConsoleProjection = {
@@ -1942,57 +1942,73 @@ function snapshotProjectionFromEntries(
     internalWorkers: [],
     removedInternalWorkers: {},
   };
+  const entries = isRecord(snapshot) ? arrayField(snapshot, "entries") : [];
   entries.forEach((entry, index) =>
-    applyLogEntry(projection, `${eventId}-snapshot-${index}`, entry)
+    applySessionEntry(projection, `${eventId}-snapshot-${index}`, entry)
   );
   return projection;
 }
 
-function applyLogEntry(
+function applySessionEntry(
   projection: ConsoleProjection,
-  eventId: string,
-  entry: unknown,
+  fallbackEventId: string,
+  value: unknown,
 ): void {
-  if (!isRecord(entry)) return;
-  switch (stringField(entry, "kind")) {
-    case "segment_start":
-      arrayField(entry, "history").forEach((item, index) =>
-        applyLoggedItem(projection, `${eventId}-history-${index}`, item)
-      );
-      break;
+  if (!isRecord(value)) return;
+  const eventId = stringField(value, "entry_id") ?? fallbackEventId;
+  switch (stringField(value, "kind")) {
     case "user_input":
       projection.lines.push(
         line(
           eventId,
           "user",
           "User",
-          segmentsToText(arrayField(entry, "segments") as Segment[]),
+          segmentsToText(arrayField(value, "segments") as Segment[]),
         ),
       );
       break;
-    case "system_item":
-      projection.lines.push(systemItemLine(eventId, entry["item"]));
-      applyTaskSystemItem(projection, entry["item"]);
+    case "message":
+      applyLoggedItem(projection, eventId, {
+        kind: "message",
+        role: value["role"],
+        content: value["content"],
+      });
       break;
-    case "assistant_item":
+    case "tool_call":
+      applyLoggedItem(projection, eventId, {
+        kind: "tool_call",
+        call_id: value["call_id"],
+        name: value["name"],
+        arguments: value["arguments"],
+      });
+      break;
     case "tool_result":
-      applyLoggedItem(projection, eventId, entry["item"]);
+      applyLoggedItem(projection, eventId, {
+        kind: "tool_result",
+        call_id: value["call_id"],
+        summary: value["summary"],
+        content: value["content"],
+        is_error: value["is_error"],
+      });
       break;
-    case "run_errored":
+    case "system_item": {
+      const item = value["data"];
+      projection.lines.push(systemItemLine(eventId, item ?? value));
+      applyTaskSystemItem(projection, item);
+      break;
+    }
+    case "run_error":
       projection.lines.push(
         line(
           eventId,
           "error",
           "Run error",
-          stringField(entry, "message") ?? "Worker run failed.",
+          stringField(value, "message") ?? "Worker run failed.",
           undefined,
           false,
           true,
         ),
       );
-      break;
-    case "extension":
-      applyExtensionEntry(projection, eventId, entry);
       break;
     default:
       break;

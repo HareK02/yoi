@@ -1,5 +1,6 @@
 //! Serializable history entries with restore-authoritative logical identity and origin.
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 
 use crate::{LoggedItem, SessionId};
@@ -175,6 +176,25 @@ pub fn legacy_segment_history(
     session_id: SessionId,
     items: impl IntoIterator<Item = LoggedItem>,
 ) -> Vec<LoggedHistoryEntry> {
-    let _ = session_id;
-    items.into_iter().map(legacy_logged_history).collect()
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| LoggedHistoryEntry {
+            item,
+            metadata: LoggedSessionHistoryMetadata {
+                // Legacy logs have no persisted entry id. Derive one solely from
+                // durable segment content rather than minting a new random value
+                // on every restore/read. The explicit LegacyUnknown origin keeps
+                // this compatibility identity from becoming trust authority.
+                entry_id: {
+                    let mut identity = Vec::with_capacity(24);
+                    identity.extend_from_slice(session_id.as_bytes());
+                    identity.extend_from_slice(&(index as u64).to_be_bytes());
+                    LoggedSessionHistoryEntryId(format!("l-{}", URL_SAFE_NO_PAD.encode(identity)))
+                },
+                origin: LoggedSessionHistoryOrigin::LegacyUnknown,
+                derivation: None,
+            },
+        })
+        .collect()
 }

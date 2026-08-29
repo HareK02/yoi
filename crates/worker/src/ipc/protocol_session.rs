@@ -30,8 +30,9 @@ pub fn subscribe_worker_protocol_session(handle: &WorkerHandle) -> WorkerProtoco
 pub fn live_log_entry_event(entry: LogEntry) -> Option<Event> {
     match entry {
         entry @ (LogEntry::SegmentStart { .. } | LogEntry::AnnotatedSegmentStart { .. }) => {
-            let value = serde_json::to_value(&entry).expect("LogEntry is Serialize");
-            Some(Event::SegmentRotated { entry: value })
+            let session =
+                session_store::public_snapshot::project_current_session_snapshot(&[entry]);
+            Some(Event::SegmentRotated { session })
         }
         LogEntry::UserInput { segments, .. } | LogEntry::AnnotatedUserInput { segments, .. } => {
             Some(Event::UserMessage { segments })

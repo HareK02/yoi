@@ -8,7 +8,9 @@ use crate::{
     CompletionKind, ErrorCode, Event, Greeting, InFlightBlock, InFlightSnapshot,
     InFlightToolCallState, InternalWorkerKind, InternalWorkerRef, InternalWorkerSnapshot,
     InvokeKind, MemoryWorkerEvent, Method, Permission, RewindSummary, RewindTarget, RewindTargetId,
-    RunResult, ScopeRule, Segment, ToolResultDisposition, TurnResult, WorkerEvent, WorkerStatus,
+    RunResult, ScopeRule, Segment, SessionContentPart, SessionEntryProvenance, SessionMessageRole,
+    SessionSnapshot, SessionSnapshotEntry, SessionSnapshotEntryData, SessionToolAttachment,
+    ToolResultDisposition, TurnResult, WorkerEvent, WorkerStatus,
     subscription::{
         EventSubscriptionSelector, SubscriptionEvent, SubscriptionEventPayload, SubscriptionFrame,
         SubscriptionFramePayload, SubscriptionId, SubscriptionRejectionCode, SubscriptionRequest,
@@ -63,6 +65,13 @@ pub fn generated_protocol_types() -> String {
     push_decl::<RewindSummary>(&cfg, &mut output);
     push_decl::<InFlightBlock>(&cfg, &mut output);
     push_decl::<InFlightSnapshot>(&cfg, &mut output);
+    push_decl::<SessionEntryProvenance>(&cfg, &mut output);
+    push_decl::<SessionMessageRole>(&cfg, &mut output);
+    push_decl::<SessionContentPart>(&cfg, &mut output);
+    push_decl::<SessionToolAttachment>(&cfg, &mut output);
+    push_decl::<SessionSnapshotEntryData>(&cfg, &mut output);
+    push_decl::<SessionSnapshotEntry>(&cfg, &mut output);
+    push_decl::<SessionSnapshot>(&cfg, &mut output);
     push_decl::<InternalWorkerKind>(&cfg, &mut output);
     push_decl::<InternalWorkerRef>(&cfg, &mut output);
     push_decl::<InternalWorkerSnapshot>(&cfg, &mut output);

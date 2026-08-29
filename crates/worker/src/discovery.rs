@@ -1481,7 +1481,9 @@ mod tests {
             let mut writer = JsonLineWriter::new(stream);
             writer
                 .write(&Event::Snapshot {
-                    entries: Vec::new(),
+                    session: protocol::SessionSnapshot {
+                        entries: Vec::new(),
+                    },
                     greeting: protocol::Greeting {
                         worker_name: "target".into(),
                         cwd: "/tmp".into(),
@@ -1514,7 +1516,9 @@ mod tests {
                 .unwrap();
             writer
                 .write(&Event::Snapshot {
-                    entries: Vec::new(),
+                    session: protocol::SessionSnapshot {
+                        entries: Vec::new(),
+                    },
                     greeting: protocol::Greeting {
                         worker_name: "target".into(),
                         cwd: "/tmp".into(),
@@ -1603,7 +1607,9 @@ mod tests {
             let mut writer = JsonLineWriter::new(stream);
             writer
                 .write(&Event::Snapshot {
-                    entries: Vec::new(),
+                    session: protocol::SessionSnapshot {
+                        entries: Vec::new(),
+                    },
                     greeting: protocol::Greeting {
                         worker_name: "target".into(),
                         cwd: "/tmp".into(),
@@ -1627,7 +1633,9 @@ mod tests {
             let mut writer = JsonLineWriter::new(writer_half);
             writer
                 .write(&Event::Snapshot {
-                    entries: Vec::new(),
+                    session: protocol::SessionSnapshot {
+                        entries: Vec::new(),
+                    },
                     greeting: protocol::Greeting {
                         worker_name: "target".into(),
                         cwd: "/tmp".into(),
@@ -1729,7 +1737,9 @@ mod tests {
                 .unwrap();
             writer
                 .write(&Event::Snapshot {
-                    entries: Vec::new(),
+                    session: protocol::SessionSnapshot {
+                        entries: Vec::new(),
+                    },
                     greeting: protocol::Greeting {
                         worker_name: "alerted".into(),
                         cwd: "/tmp".into(),
@@ -1779,7 +1789,9 @@ mod tests {
                     let mut writer = JsonLineWriter::new(stream);
                     let _ = writer
                         .write(&Event::Snapshot {
-                            entries: Vec::new(),
+                            session: protocol::SessionSnapshot {
+                                entries: Vec::new(),
+                            },
                             greeting: protocol::Greeting {
                                 worker_name: "child-live".into(),
                                 cwd: "/tmp".into(),

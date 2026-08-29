@@ -1530,7 +1530,9 @@ impl Runtime {
             }
         }
         Ok(protocol::Event::Snapshot {
-            entries: Vec::new(),
+            session: protocol::SessionSnapshot {
+                entries: Vec::new(),
+            },
             greeting: protocol::Greeting {
                 worker_name: worker_ref.worker_id.to_string(),
                 cwd: String::new(),
@@ -3152,7 +3154,9 @@ mod tests {
             ),
         );
         let snapshot = protocol::Event::Snapshot {
-            entries: Vec::new(),
+            session: protocol::SessionSnapshot {
+                entries: Vec::new(),
+            },
             greeting: protocol::Greeting {
                 worker_name: "parent".to_string(),
                 cwd: "/tmp".to_string(),
@@ -4581,7 +4585,16 @@ mod tests {
         backend.set_worker_snapshot(
             &detail.worker_ref,
             protocol::Event::Snapshot {
-                entries: vec![expected_entry.clone()],
+                session: protocol::SessionSnapshot {
+                    entries: vec![protocol::SessionSnapshotEntry {
+                        entry_id: "restored-log-entry".to_owned(),
+                        provenance: protocol::SessionEntryProvenance::LegacyUnknown,
+                        derived_from: Vec::new(),
+                        data: protocol::SessionSnapshotEntryData::RunError {
+                            message: expected_entry.to_string(),
+                        },
+                    }],
+                },
                 greeting: protocol::Greeting {
                     worker_name: "live-worker".to_string(),
                     cwd: "/tmp/live".to_string(),
@@ -4606,12 +4619,13 @@ mod tests {
             .unwrap();
         match snapshot {
             protocol::Event::Snapshot {
-                entries,
+                session,
                 greeting,
                 status,
                 ..
             } => {
-                assert_eq!(entries, vec![expected_entry]);
+                assert_eq!(session.entries.len(), 1);
+                assert_eq!(session.entries[0].entry_id, "restored-log-entry");
                 assert_eq!(greeting.worker_name, "live-worker");
                 assert_eq!(status, protocol::WorkerStatus::Running);
             }

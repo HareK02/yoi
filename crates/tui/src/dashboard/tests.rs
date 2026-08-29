@@ -849,7 +849,9 @@ async fn ticket_queue_notification_sends_notify_when_socket_available() {
         let mut writer = JsonLineWriter::new(writer);
         writer
             .write(&Event::Snapshot {
-                entries: Vec::new(),
+                session: protocol::SessionSnapshot {
+                    entries: Vec::new(),
+                },
                 greeting: protocol::Greeting {
                     worker_name: "test-orchestrator".to_string(),
                     cwd: temp.path().display().to_string(),
@@ -891,7 +893,9 @@ async fn send_notify_only_can_deliver_weak_notification_without_auto_run() {
         let mut writer = JsonLineWriter::new(writer);
         writer
             .write(&Event::Snapshot {
-                entries: Vec::new(),
+                session: protocol::SessionSnapshot {
+                    entries: Vec::new(),
+                },
                 greeting: protocol::Greeting {
                     worker_name: "yoi".to_string(),
                     cwd: temp.path().display().to_string(),

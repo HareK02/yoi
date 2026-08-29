@@ -910,7 +910,7 @@ mod tests {
                 timestamp_ms: 0,
             }),
             Event::Snapshot {
-                entries: vec![],
+                session: protocol::SessionSnapshot { entries: vec![] },
                 greeting: test_greeting(),
                 status: WorkerStatus::Idle,
                 in_flight: Default::default(),

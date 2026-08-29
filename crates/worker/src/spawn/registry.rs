@@ -806,11 +806,7 @@ fn internal_worker_snapshot(
     InternalWorkerSnapshot {
         worker,
         revision,
-        entries: snapshot
-            .entries
-            .into_iter()
-            .filter_map(|entry| serde_json::to_value(entry).ok())
-            .collect(),
+        session: snapshot.session,
         status: snapshot.status,
         error: snapshot.error,
         in_flight: snapshot.in_flight,
@@ -1045,7 +1041,7 @@ mod tests {
         let snapshots = registry.internal_worker_snapshots();
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].revision, 2);
-        assert_eq!(snapshots[0].entries.len(), 1);
+        assert_eq!(snapshots[0].session.entries.len(), 1);
 
         record.session.emit_test_text_delta("partial");
         let streamed = tokio::time::timeout(Duration::from_secs(1), parent_rx.recv())

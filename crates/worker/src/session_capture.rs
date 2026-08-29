@@ -8,6 +8,10 @@ use std::sync::Arc;
 
 use crate::session_history::{SessionHistoryMetadata, WorkerHistoryProvenance};
 use agen::{HistoryEntry, Item, Role};
+use protocol::{
+    SessionContentPart, SessionEntryProvenance, SessionMessageRole, SessionSnapshot,
+    SessionSnapshotEntryData,
+};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_SEARCH_LIMIT: usize = 20;
@@ -225,6 +229,66 @@ pub(crate) struct SessionCapture {
 }
 
 impl SessionCapture {
+    pub(crate) fn from_session_snapshot(
+        segment_id: impl Into<String>,
+        snapshot: SessionSnapshot,
+    ) -> Self {
+        let entries = snapshot
+            .entries
+            .into_iter()
+            .filter_map(|entry| {
+                let item = match entry.data {
+                    SessionSnapshotEntryData::UserInput { segments } => {
+                        Item::user_message(protocol::Segment::flatten_to_text(&segments))
+                    }
+                    SessionSnapshotEntryData::Message { role, content } => {
+                        let role = match role {
+                            SessionMessageRole::User => Role::User,
+                            SessionMessageRole::Assistant => Role::Assistant,
+                        };
+                        Item::Message {
+                            id: None,
+                            role,
+                            content: content
+                                .into_iter()
+                                .map(|part| match part {
+                                    SessionContentPart::Text { text } => {
+                                        agen::ContentPart::Text { text }
+                                    }
+                                    SessionContentPart::Refusal { refusal } => {
+                                        agen::ContentPart::Refusal { refusal }
+                                    }
+                                })
+                                .collect(),
+                            status: None,
+                        }
+                    }
+                    SessionSnapshotEntryData::ToolCall {
+                        call_id,
+                        name,
+                        arguments,
+                    } => Item::tool_call(call_id, name, arguments),
+                    SessionSnapshotEntryData::ToolResult {
+                        call_id,
+                        summary,
+                        content,
+                        is_error,
+                        attachments: _,
+                    } => Item::tool_result_item(call_id, summary, content, is_error),
+                    // Observation deliberately excludes system items and
+                    // controller errors from model-visible session evidence.
+                    SessionSnapshotEntryData::SystemItem { .. }
+                    | SessionSnapshotEntryData::RunError { .. } => return None,
+                };
+                Some(HistoryEntry::new(
+                    item,
+                    public_snapshot_metadata(entry.entry_id, entry.provenance),
+                ))
+            })
+            .collect();
+        Self::from_history_entries(segment_id, entries)
+    }
+
     pub(crate) fn new(segment_id: impl Into<String>, items: Vec<Item>) -> Self {
         let entries = items
             .into_iter()
@@ -540,6 +604,46 @@ impl SessionCapture {
             summary: entry.summary.clone(),
             excerpt,
         })
+    }
+}
+
+fn public_snapshot_metadata(
+    entry_id: String,
+    provenance: SessionEntryProvenance,
+) -> SessionHistoryMetadata {
+    let worker = session_store::LoggedWorkerSubject {
+        workspace_id: None,
+        runtime_id: None,
+        worker_id: "public-session-snapshot".to_owned(),
+    };
+    let origin = match provenance {
+        SessionEntryProvenance::HumanInput => WorkerHistoryProvenance::HumanInput {
+            account_id: "public-session-snapshot".to_owned(),
+        },
+        SessionEntryProvenance::WorkerInput => WorkerHistoryProvenance::WorkerInput {
+            actor: worker.clone(),
+        },
+        SessionEntryProvenance::FlowInstruction => WorkerHistoryProvenance::FlowInstruction {
+            selector: "public-session-snapshot".to_owned(),
+            definition_id: "public-session-snapshot".to_owned(),
+            definition_revision: 0,
+            instance_id: "public-session-snapshot".to_owned(),
+            state_id: "public-session-snapshot".to_owned(),
+        },
+        SessionEntryProvenance::BackendInstruction => {
+            WorkerHistoryProvenance::BackendInstruction { operation_id: None }
+        }
+        SessionEntryProvenance::ModelOutput => WorkerHistoryProvenance::ModelOutput {
+            worker: worker.clone(),
+        },
+        SessionEntryProvenance::ToolOutput => WorkerHistoryProvenance::ToolOutput { worker },
+        SessionEntryProvenance::DerivedSummary => WorkerHistoryProvenance::DerivedSummary,
+        SessionEntryProvenance::LegacyUnknown => WorkerHistoryProvenance::LegacyUnknown,
+    };
+    SessionHistoryMetadata {
+        entry_id: session_store::LoggedSessionHistoryEntryId(entry_id),
+        origin,
+        derivation: None,
     }
 }
 

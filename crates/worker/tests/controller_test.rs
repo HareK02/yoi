@@ -839,26 +839,26 @@ async fn snapshot_includes_user_input_for_in_flight_turn() {
     loop {
         let event = reader.next::<Event>().await.unwrap().unwrap();
         match event {
-            Event::Snapshot { entries, .. } => {
-                // Walk the entries, find a `LogEntry::UserInput` and
-                // confirm its segments flatten to our submitted text.
-                let mut found = false;
-                for value in &entries {
-                    let entry: session_store::LogEntry =
-                        serde_json::from_value(value.clone()).expect("LogEntry deserialise");
-                    if let session_store::LogEntry::UserInput { segments, .. }
-                    | session_store::LogEntry::AnnotatedUserInput { segments, .. } = entry
-                    {
-                        let text = protocol::Segment::flatten_to_text(&segments);
-                        if text == "hello in-flight" {
-                            found = true;
-                            break;
-                        }
+            Event::Snapshot { session, .. } => {
+                let found = session.entries.iter().any(|entry| match &entry.data {
+                    protocol::SessionSnapshotEntryData::UserInput { segments } => {
+                        protocol::Segment::flatten_to_text(segments) == "hello in-flight"
                     }
-                }
+                    protocol::SessionSnapshotEntryData::Message {
+                        role: protocol::SessionMessageRole::User,
+                        content,
+                    } => content.iter().any(|part| {
+                        matches!(
+                            part,
+                            protocol::SessionContentPart::Text { text }
+                                if text == "hello in-flight"
+                        )
+                    }),
+                    _ => false,
+                });
                 assert!(
                     found,
-                    "snapshot must carry the in-flight UserInput entry: {entries:?}"
+                    "snapshot must carry the in-flight UserInput entry: {session:?}"
                 );
                 return;
             }
@@ -2410,17 +2410,12 @@ async fn snapshot_contains_user_input(handle: &WorkerHandle, needle: &str) -> bo
     loop {
         let event = reader.next::<Event>().await.unwrap().unwrap();
         match event {
-            Event::Snapshot { entries, .. } => {
-                return entries.into_iter().any(|value| {
-                    let entry: session_store::LogEntry =
-                        serde_json::from_value(value).expect("LogEntry deserialise");
-                    match entry {
-                        session_store::LogEntry::UserInput { segments, .. }
-                        | session_store::LogEntry::AnnotatedUserInput { segments, .. } => {
-                            protocol::Segment::flatten_to_text(&segments).contains(needle)
-                        }
-                        _ => false,
+            Event::Snapshot { session, .. } => {
+                return session.entries.into_iter().any(|entry| match entry.data {
+                    protocol::SessionSnapshotEntryData::UserInput { segments } => {
+                        protocol::Segment::flatten_to_text(&segments).contains(needle)
                     }
+                    _ => false,
                 });
             }
             Event::Alert(_) => continue,

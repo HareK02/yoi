@@ -43,11 +43,84 @@ function consoleLine(id: string, kind: ConsoleLine["kind"]): ConsoleLine {
   };
 }
 
+function canonicalSession(logEntries: unknown[]): Event extends {
+  event: "snapshot";
+  data: infer D;
+} ? D extends { session: infer S } ? S : never : never {
+  const entries: Record<string, unknown>[] = [];
+  let sequence = 0;
+  const itemEntry = (item: Record<string, unknown>) => {
+    const kind = item["kind"];
+    if (kind === "reasoning" || item["role"] === "system") return;
+    entries.push({
+      entry_id: `legacy-test-${sequence++}`,
+      provenance: "legacy_unknown",
+      ...item,
+    });
+  };
+  for (const raw of logEntries) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const entry = raw as Record<string, unknown>;
+    switch (entry["kind"]) {
+      case "segment_start":
+      case "annotated_segment_start":
+        entries.length = 0;
+        for (const history of Array.isArray(entry["history"]) ? entry["history"] : []) {
+          const value = history as Record<string, unknown>;
+          itemEntry((value["item"] as Record<string, unknown> | undefined) ?? value);
+        }
+        break;
+      case "user_input":
+      case "annotated_user_input":
+        entries.push({
+          entry_id: `legacy-test-${sequence++}`,
+          provenance: "legacy_unknown",
+          kind: "user_input",
+          segments: entry["segments"] ?? [],
+        });
+        break;
+      case "assistant_item":
+      case "tool_result":
+      case "annotated_assistant_item":
+      case "annotated_tool_result": {
+        const annotated = entry["entry"] as Record<string, unknown> | undefined;
+        itemEntry((annotated?.["item"] as Record<string, unknown> | undefined) ??
+          (entry["item"] as Record<string, unknown>));
+        break;
+      }
+      case "system_item":
+      case "annotated_system_item": {
+        const annotated = entry["entry"] as Record<string, unknown> | undefined;
+        const item = (annotated?.["item"] as Record<string, unknown> | undefined) ??
+          (entry["item"] as Record<string, unknown>);
+        entries.push({
+          entry_id: `legacy-test-${sequence++}`,
+          provenance: "legacy_unknown",
+          kind: "system_item",
+          item_kind: item?.["kind"] ?? "system_item",
+          content: item?.["body"] ?? item?.["message"] ?? "",
+          data: item,
+        });
+        break;
+      }
+      case "run_errored":
+        entries.push({
+          entry_id: `legacy-test-${sequence++}`,
+          provenance: "legacy_unknown",
+          kind: "run_error",
+          message: entry["message"] ?? "Worker run failed.",
+        });
+        break;
+    }
+  }
+  return { entries } as never;
+}
+
 function snapshotEvent(cwd: string, entries: unknown[] = []): Event {
   return {
     event: "snapshot",
     data: {
-      entries,
+      session: canonicalSession(entries),
       greeting: {
         worker_name: "Worker",
         cwd,
@@ -138,7 +211,7 @@ Deno.test("segment rotation retains a live error beside the real SegmentStart hi
       event: {
         event: "segment_rotated",
         data: {
-          entry: {
+          session: canonicalSession([{
             kind: "segment_start",
             ts: 5,
             session_id: "session-1",
@@ -149,7 +222,7 @@ Deno.test("segment rotation retains a live error beside the real SegmentStart hi
               role: "user",
               content: [{ kind: "text", text: "retained conversation" }],
             }],
-          },
+          }]),
         },
       } satisfies Event,
     },
@@ -852,7 +925,7 @@ Deno.test("compaction service activity stays nested in one lifecycle item", () =
   );
 });
 
-Deno.test("snapshot normalizes orphaned running compaction to interrupted", () => {
+Deno.test("snapshot excludes storage-only compaction extension records", () => {
   const projection = projectConsole([{
     eventId: "snapshot",
     observedAtMs: 9_000,
@@ -876,10 +949,7 @@ Deno.test("snapshot normalizes orphaned running compaction to interrupted", () =
     }]),
   }]);
 
-  assertEquals(projection.lines.length, 1);
-  assertEquals(projection.lines[0].compaction?.state, "interrupted");
-  assertEquals(projection.lines[0].compaction?.endedAtMs, 9_000);
-  assertEquals(projection.lines[0].streaming, false);
+  assertEquals(projection.lines.length, 0);
 });
 
 Deno.test("createConsoleProjector ignores stale compaction revisions", () => {
@@ -1238,7 +1308,7 @@ Deno.test("projectConsole renders snapshot entries and in-flight output", () => 
       event: {
         event: "snapshot",
         data: {
-          entries: [
+          session: canonicalSession([
             {
               kind: "segment_start",
               ts: 1,
@@ -1300,7 +1370,7 @@ Deno.test("projectConsole renders snapshot entries and in-flight output", () => 
                 message: "Compacting…",
               },
             },
-          ],
+          ]),
           greeting: {
             worker_name: "Worker",
             cwd: "/repo",
@@ -1332,7 +1402,6 @@ Deno.test("projectConsole renders snapshot entries and in-flight output", () => 
       "user:new user:false",
       "assistant:assistant reply:false",
       "tool:Read(1 file)\n  /tmp/a.md:false",
-      "status:Compacting…:true",
       "in_flight:partial:true",
     ],
   );
@@ -1344,7 +1413,7 @@ Deno.test("projectConsole restores system items from snapshot entries", () => {
     event: {
       event: "snapshot",
       data: {
-        entries: [{
+        session: canonicalSession([{
           kind: "system_item",
           ts: 1,
           item: {
@@ -1352,7 +1421,7 @@ Deno.test("projectConsole restores system items from snapshot entries", () => {
             message: "Worker completed",
             body: "Child Worker coder-1 completed.",
           },
-        }],
+        }]),
         greeting: {
           worker_name: "Worker",
           cwd: "/repo",
@@ -1388,7 +1457,7 @@ Deno.test("projectConsole reseeds visible rows from segment rotation", () => {
       event: {
         event: "segment_rotated",
         data: {
-          entry: {
+          session: canonicalSession([{
             kind: "segment_start",
             ts: 10,
             session_id: "00000000-0000-0000-0000-000000000001",
@@ -1401,7 +1470,7 @@ Deno.test("projectConsole reseeds visible rows from segment rotation", () => {
                 content: [{ kind: "text", text: "after rotation seed" }],
               },
             ],
-          },
+          }]),
         },
       } satisfies Event,
     },
@@ -1773,7 +1842,7 @@ Deno.test("parent snapshot authoritatively replaces Internal Worker projections"
       kind: "sub_worker",
     },
     revision: 4,
-    entries: [{
+    session: canonicalSession([{
       kind: "assistant_item",
       ts: 1,
       item: {
@@ -1792,7 +1861,7 @@ Deno.test("parent snapshot authoritatively replaces Internal Worker projections"
         content: "content",
         is_error: false,
       },
-    }],
+    }]),
     status: "idle",
     in_flight: {
       blocks: [{
@@ -1934,18 +2003,20 @@ Deno.test("snapshot restores TaskStore state from system history", () => {
     `[Session TaskStore snapshot]\n\n\`\`\`json\n{\n  "tasks": [{"taskid": 3, "status": "pending", "subject": "Restored", "description": "From compaction"}]\n}\n\`\`\``;
   const event = snapshotEvent("/repo");
   if (event.event !== "snapshot") throw new Error("snapshot fixture expected");
-  event.data.entries = [{
-    kind: "segment_start",
-    ts: 1,
-    session_id: "00000000-0000-0000-0000-000000000001",
-    system_prompt: null,
-    config: {},
-    history: [{
-      kind: "message",
-      role: "system",
-      content: [{ kind: "text", text: taskSnapshot }],
+  event.data.session = {
+    entries: [{
+      entry_id: "task-reminder-1",
+      provenance: "backend_instruction",
+      kind: "system_item",
+      item_kind: "task_reminder",
+      content: taskSnapshot,
+      data: {
+        kind: "task_reminder",
+        body: taskSnapshot,
+        source: "automatic",
+      },
     }],
-  }];
+  };
 
   const projection = projectConsole([{ eventId: "task-snapshot", event }]);
   assertEquals(projection.tasks, [{

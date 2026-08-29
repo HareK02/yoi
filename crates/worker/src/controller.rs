@@ -84,10 +84,7 @@ impl WorkerHandle {
             (entries, entry_rx, in_flight)
         };
         let event = Event::Snapshot {
-            entries: entries
-                .into_iter()
-                .map(|entry| serde_json::to_value(entry).expect("log entry serializes"))
-                .collect(),
+            session: session_store::public_snapshot::project_current_session_snapshot(&entries),
             greeting: self.shared_state.greeting.clone(),
             status: self.shared_state.get_status(),
             in_flight,
@@ -1874,28 +1871,16 @@ where
     St: Store,
 {
     match worker.rewind_to(target, expected_head_entries) {
-        Ok(applied) => match applied
-            .entries
-            .into_iter()
-            .map(serde_json::to_value)
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(entries) => {
-                let _ = event_tx.send(Event::RewindApplied {
-                    entries,
-                    input: applied.input,
-                    summary: applied.summary,
-                });
-                true
-            }
-            Err(error) => {
-                let _ = event_tx.send(Event::Error {
-                    code: ErrorCode::Internal,
-                    message: format!("failed to encode rewind snapshot: {error}"),
-                });
-                false
-            }
-        },
+        Ok(applied) => {
+            let session =
+                session_store::public_snapshot::project_current_session_snapshot(&applied.entries);
+            let _ = event_tx.send(Event::RewindApplied {
+                session,
+                input: applied.input,
+                summary: applied.summary,
+            });
+            true
+        }
         Err(err) => {
             let _ = event_tx.send(Event::Error {
                 code: ErrorCode::InvalidRequest,
@@ -2101,7 +2086,9 @@ mod tests {
             let mut writer = JsonLineWriter::new(w);
             writer
                 .write(&Event::Snapshot {
-                    entries: Vec::new(),
+                    session: protocol::SessionSnapshot {
+                        entries: Vec::new(),
+                    },
                     greeting: protocol::Greeting {
                         worker_name: "parent".into(),
                         cwd: "/tmp".into(),
