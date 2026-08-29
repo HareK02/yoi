@@ -9261,9 +9261,8 @@ fn cleanup_working_directory_for_runtime(
             result.diagnostics,
         ));
     };
-    let record = workdir_record_from_summary(&api, runtime_id, &working_directory.summary);
-    api.store.upsert_workdir_registry(&record)?;
     let mut summary = working_directory.summary;
+    persist_workdir_cleanup_observation(&api, runtime_id, &summary)?;
     apply_workdir_occupancy_projection(&api, &mut summary)?;
     Ok(Json(BrowserWorkingDirectoryDetailResponse {
         workspace_id: api.config.workspace_id.clone(),
@@ -14154,11 +14153,7 @@ fn sync_runtime_workdir_observations(
                         api.store.upsert_workdir_registry(&updated)?;
                     }
                 } else {
-                    record.materialization_status =
-                        workdir_status_from_runtime_miss(result.diagnostics.as_slice()).to_string();
-                    record.cleanliness = "unknown".to_string();
-                    record.updated_at = now_registry_timestamp();
-                    api.store.upsert_workdir_registry(&record)?;
+                    persist_workdir_runtime_miss(api, record, result.diagnostics.as_slice())?;
                 }
             }
             Err(_) => {
@@ -14172,15 +14167,52 @@ fn sync_runtime_workdir_observations(
     Ok(response.diagnostics)
 }
 
-fn workdir_status_from_runtime_miss(diagnostics: &[RuntimeDiagnostic]) -> &'static str {
-    if diagnostics
+fn persist_workdir_cleanup_observation(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+    summary: &WorkingDirectorySummary,
+) -> ApiResult<()> {
+    if summary.status == WorkingDirectoryStatusKind::NotFound {
+        api.store.delete_workdir_registry(
+            &api.config.workspace_id,
+            summary.working_directory_id.as_str(),
+        )?;
+    } else {
+        let record = workdir_record_from_summary(api, runtime_id, summary);
+        api.store.upsert_workdir_registry(&record)?;
+    }
+    Ok(())
+}
+
+fn workdir_runtime_miss_is_not_found(diagnostics: &[RuntimeDiagnostic]) -> bool {
+    diagnostics
         .iter()
         .any(|diagnostic| diagnostic.code == "working_directory_not_found")
-    {
+}
+
+fn workdir_status_from_runtime_miss(diagnostics: &[RuntimeDiagnostic]) -> &'static str {
+    if workdir_runtime_miss_is_not_found(diagnostics) {
         "not_found"
     } else {
         "unknown"
     }
+}
+
+fn persist_workdir_runtime_miss(
+    api: &WorkspaceApi,
+    mut record: WorkdirRegistryRecord,
+    diagnostics: &[RuntimeDiagnostic],
+) -> ApiResult<()> {
+    if workdir_runtime_miss_is_not_found(diagnostics) {
+        api.store
+            .delete_workdir_registry(&api.config.workspace_id, record.workdir_id.as_str())?;
+    } else {
+        record.materialization_status = "unknown".to_string();
+        record.cleanliness = "unknown".to_string();
+        record.updated_at = now_registry_timestamp();
+        api.store.upsert_workdir_registry(&record)?;
+    }
+    Ok(())
 }
 
 fn sync_all_runtime_workdir_observations(api: &WorkspaceApi) -> Vec<RuntimeDiagnostic> {
@@ -16980,22 +17012,24 @@ mod tests {
 
     #[test]
     fn workdir_runtime_miss_uses_exact_typed_code() {
+        let typed_not_found = [RuntimeDiagnostic {
+            code: "working_directory_not_found".to_string(),
+            severity: DiagnosticSeverity::Warning,
+            message: "missing".to_string(),
+        }];
         assert_eq!(
-            workdir_status_from_runtime_miss(&[RuntimeDiagnostic {
-                code: "working_directory_not_found".to_string(),
-                severity: DiagnosticSeverity::Warning,
-                message: "missing".to_string(),
-            }]),
+            workdir_status_from_runtime_miss(&typed_not_found),
             "not_found"
         );
-        assert_eq!(
-            workdir_status_from_runtime_miss(&[RuntimeDiagnostic {
-                code: "some_other_not_found".to_string(),
-                severity: DiagnosticSeverity::Warning,
-                message: "not a typed workdir miss".to_string(),
-            }]),
-            "unknown"
-        );
+        assert!(workdir_runtime_miss_is_not_found(&typed_not_found));
+
+        let unrelated = [RuntimeDiagnostic {
+            code: "some_other_not_found".to_string(),
+            severity: DiagnosticSeverity::Warning,
+            message: "not a typed workdir miss".to_string(),
+        }];
+        assert_eq!(workdir_status_from_runtime_miss(&unrelated), "unknown");
+        assert!(!workdir_runtime_miss_is_not_found(&unrelated));
     }
 
     struct DeterministicExecutionBackend {
@@ -21306,6 +21340,87 @@ mod tests {
                 updated_at: now,
             })
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn confirmed_runtime_miss_removes_registry_record_but_unknown_is_retained() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        seed_cleanup_workdir(&api, "deleted-workdir", "present", "clean");
+        let deleted = api
+            .store
+            .get_workdir_registry(TEST_WORKSPACE_ID, "deleted-workdir")
+            .unwrap()
+            .unwrap();
+
+        persist_workdir_runtime_miss(
+            &api,
+            deleted,
+            &[RuntimeDiagnostic {
+                code: "working_directory_not_found".to_string(),
+                severity: DiagnosticSeverity::Warning,
+                message: "missing".to_string(),
+            }],
+        )
+        .unwrap();
+
+        assert!(
+            api.store
+                .get_workdir_registry(TEST_WORKSPACE_ID, "deleted-workdir")
+                .unwrap()
+                .is_none()
+        );
+
+        seed_cleanup_workdir(&api, "unknown-workdir", "present", "clean");
+        let unknown = api
+            .store
+            .get_workdir_registry(TEST_WORKSPACE_ID, "unknown-workdir")
+            .unwrap()
+            .unwrap();
+        persist_workdir_runtime_miss(
+            &api,
+            unknown,
+            &[RuntimeDiagnostic {
+                code: "runtime_unavailable".to_string(),
+                severity: DiagnosticSeverity::Warning,
+                message: "temporarily unavailable".to_string(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            api.store
+                .get_workdir_registry(TEST_WORKSPACE_ID, "unknown-workdir")
+                .unwrap()
+                .unwrap()
+                .materialization_status,
+            "unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_not_found_observation_removes_registry_record() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let working_directory_id = "cleanup-existing";
+        seed_cleanup_workdir(&api, working_directory_id, "present", "clean");
+        let record = api
+            .store
+            .get_workdir_registry(TEST_WORKSPACE_ID, working_directory_id)
+            .unwrap()
+            .unwrap();
+        let mut summary = workdir_summary_from_record(&record);
+        summary.status = WorkingDirectoryStatusKind::NotFound;
+
+        persist_workdir_cleanup_observation(&api, "runtime-test", &summary).unwrap();
+
+        assert!(
+            api.store
+                .get_workdir_registry(TEST_WORKSPACE_ID, working_directory_id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     fn seed_cleanup_link(api: &WorkspaceApi, runtime_worker_id: &str, workdir_id: &str) {
