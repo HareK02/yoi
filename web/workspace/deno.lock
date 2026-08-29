@@ -9,9 +9,9 @@
     "npm:@codemirror/view@6.43.8": "6.43.8",
     "npm:@fontsource/ibm-plex-mono@5.3.0": "5.3.0",
     "npm:@lezer/highlight@1.2.3": "1.2.3",
-    "npm:@sveltejs/adapter-static@3.0.9": "3.0.9_@sveltejs+kit@2.49.4__@sveltejs+vite-plugin-svelte@6.2.1___svelte@5.45.6___vite@7.2.7__svelte@5.45.6__typescript@5.9.3__vite@7.2.7_@sveltejs+vite-plugin-svelte@6.2.1__svelte@5.45.6__vite@7.2.7_svelte@5.45.6_typescript@5.9.3_vite@7.2.7",
-    "npm:@sveltejs/kit@2.49.4": "2.49.4_@sveltejs+vite-plugin-svelte@6.2.1__svelte@5.45.6__vite@7.2.7_svelte@5.45.6_typescript@5.9.3_vite@7.2.7",
-    "npm:@sveltejs/vite-plugin-svelte@6.2.1": "6.2.1_svelte@5.45.6_vite@7.2.7",
+    "npm:@sveltejs/adapter-static@3.0.9": "3.0.9_@sveltejs+kit@2.49.4__@sveltejs+vite-plugin-svelte@6.2.1___svelte@5.45.6___vite@7.2.7____yaml@2.9.0___yaml@2.9.0__svelte@5.45.6__typescript@5.9.3__vite@7.2.7___yaml@2.9.0__yaml@2.9.0_yaml@2.9.0",
+    "npm:@sveltejs/kit@2.49.4": "2.49.4_@sveltejs+vite-plugin-svelte@6.2.1__svelte@5.45.6__vite@7.2.7___yaml@2.9.0__yaml@2.9.0_svelte@5.45.6_typescript@5.9.3_vite@7.2.7__yaml@2.9.0_yaml@2.9.0",
+    "npm:@sveltejs/vite-plugin-svelte@6.2.1": "6.2.1_svelte@5.45.6_vite@7.2.7__yaml@2.9.0_yaml@2.9.0",
     "npm:clsx@2.1.1": "2.1.1",
     "npm:cookie@0.6.0": "0.6.0",
     "npm:decodal-codemirror@0.3.0": "0.3.0_@codemirror+language@6.12.4_@codemirror+view@6.43.8_@lezer+highlight@1.2.3_@lezer+lr@1.4.10",
@@ -23,7 +23,8 @@
     "npm:svelte-check@4.3.4": "4.3.4_svelte@5.45.6_typescript@5.9.3",
     "npm:svelte@5.45.6": "5.45.6",
     "npm:typescript@5.9.3": "5.9.3",
-    "npm:vite@7.2.7": "7.2.7"
+    "npm:vite@7.2.7": "7.2.7_yaml@2.9.0",
+    "npm:yaml@2.9.0": "2.9.0"
   },
   "jsr": {
     "@std/assert@1.0.19": {
@@ -433,13 +434,13 @@
         "acorn"
       ]
     },
-    "@sveltejs/adapter-static@3.0.9_@sveltejs+kit@2.49.4__@sveltejs+vite-plugin-svelte@6.2.1___svelte@5.45.6___vite@7.2.7__svelte@5.45.6__typescript@5.9.3__vite@7.2.7_@sveltejs+vite-plugin-svelte@6.2.1__svelte@5.45.6__vite@7.2.7_svelte@5.45.6_typescript@5.9.3_vite@7.2.7": {
+    "@sveltejs/adapter-static@3.0.9_@sveltejs+kit@2.49.4__@sveltejs+vite-plugin-svelte@6.2.1___svelte@5.45.6___vite@7.2.7____yaml@2.9.0___yaml@2.9.0__svelte@5.45.6__typescript@5.9.3__vite@7.2.7___yaml@2.9.0__yaml@2.9.0_yaml@2.9.0": {
       "integrity": "sha512-aytHXcMi7lb9ljsWUzXYQ0p5X1z9oWud2olu/EpmH7aCu4m84h7QLvb5Wp+CFirKcwoNnYvYWhyP/L8Vh1ztdw==",
       "dependencies": [
         "@sveltejs/kit"
       ]
     },
-    "@sveltejs/kit@2.49.4_@sveltejs+vite-plugin-svelte@6.2.1__svelte@5.45.6__vite@7.2.7_svelte@5.45.6_typescript@5.9.3_vite@7.2.7": {
+    "@sveltejs/kit@2.49.4_@sveltejs+vite-plugin-svelte@6.2.1__svelte@5.45.6__vite@7.2.7___yaml@2.9.0__yaml@2.9.0_svelte@5.45.6_typescript@5.9.3_vite@7.2.7__yaml@2.9.0_yaml@2.9.0": {
       "integrity": "sha512-JFtOqDoU0DI/+QSG8qnq5bKcehVb3tCHhOG4amsSYth5/KgO4EkJvi42xSAiyKmXAAULW1/Zdb6lkgGEgSxdZg==",
       "dependencies": [
         "@standard-schema/spec",
@@ -465,7 +466,7 @@
       ],
       "bin": true
     },
-    "@sveltejs/vite-plugin-svelte-inspector@5.0.2_@sveltejs+vite-plugin-svelte@6.2.1__svelte@5.45.6__vite@7.2.7_svelte@5.45.6_vite@7.2.7": {
+    "@sveltejs/vite-plugin-svelte-inspector@5.0.2_@sveltejs+vite-plugin-svelte@6.2.1__svelte@5.45.6__vite@7.2.7___yaml@2.9.0__yaml@2.9.0_svelte@5.45.6_vite@7.2.7__yaml@2.9.0_yaml@2.9.0": {
       "integrity": "sha512-TZzRTcEtZffICSAoZGkPSl6Etsj2torOVrx6Uw0KpXxrec9Gg6jFWQ60Q3+LmNGfZSxHRCZL7vXVZIWmuV50Ig==",
       "dependencies": [
         "@sveltejs/vite-plugin-svelte",
@@ -474,7 +475,7 @@
         "vite"
       ]
     },
-    "@sveltejs/vite-plugin-svelte@6.2.1_svelte@5.45.6_vite@7.2.7": {
+    "@sveltejs/vite-plugin-svelte@6.2.1_svelte@5.45.6_vite@7.2.7__yaml@2.9.0_yaml@2.9.0": {
       "integrity": "sha512-YZs/OSKOQAQCnJvM/P+F1URotNnYNeU3P2s4oIpzm1uFaqUEqRxUB0g5ejMjEb5Gjb9/PiBI5Ktrq4rUUF8UVQ==",
       "dependencies": [
         "@sveltejs/vite-plugin-svelte-inspector",
@@ -966,7 +967,7 @@
         "vfile-message"
       ]
     },
-    "vite@7.2.7": {
+    "vite@7.2.7_yaml@2.9.0": {
       "integrity": "sha512-ITcnkFeR3+fI8P1wMgItjGrR10170d8auB4EpMLPqmx6uxElH3a/hHGQabSHKdqd4FXWO1nFIp9rRn7JQ34ACQ==",
       "dependencies": [
         "esbuild",
@@ -974,14 +975,18 @@
         "picomatch",
         "postcss",
         "rollup",
-        "tinyglobby"
+        "tinyglobby",
+        "yaml"
       ],
       "optionalDependencies": [
         "fsevents"
       ],
+      "optionalPeers": [
+        "yaml"
+      ],
       "bin": true
     },
-    "vitefu@1.1.2_vite@7.2.7": {
+    "vitefu@1.1.2_vite@7.2.7__yaml@2.9.0_yaml@2.9.0": {
       "integrity": "sha512-zpKATdUbzbsycPFBN71nS2uzBUQiVnFoOrr2rvqv34S1lcAgMKKkjWleLGeiJlZ8lwCXvtWaRn7R3ZC16SYRuw==",
       "dependencies": [
         "vite"
@@ -992,6 +997,10 @@
     },
     "w3c-keyname@2.2.8": {
       "integrity": "sha512-dpojBhNsCNN7T82Tm7k26A6G9ML3NkhDsnw9n/eoxSRlVBB4CEtIQ/KTCLI2Fwf3ataSXRhYFkQi3SlnFwPvPQ=="
+    },
+    "yaml@2.9.0": {
+      "integrity": "sha512-2AvhNX3mb8zd6Zy7INTtSpl1F15HW6Wnqj0srWlkKLcpYl/gMIMJiyuGq2KeI2YFxUPjdlB+3Lc10seMLtL4cA==",
+      "bin": true
     },
     "zimmerframe@1.1.4": {
       "integrity": "sha512-B58NGBEoc8Y9MWWCQGl/gq9xBCe4IiKM0a2x7GZdQKOW5Exr8S1W24J6OgM1njK8xCRGvAJIL/MxXHf6SkmQKQ=="
@@ -1024,7 +1033,8 @@
     "packageJson": {
       "dependencies": [
         "npm:@fontsource/ibm-plex-mono@5.3.0",
-        "npm:gen-interface-jp@0.8.0"
+        "npm:gen-interface-jp@0.8.0",
+        "npm:yaml@2.9.0"
       ]
     }
   }

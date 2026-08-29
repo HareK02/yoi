@@ -279,4 +279,58 @@ mod tests {
         assert_eq!(grep.matched_files, 2);
         assert!(!grep.output.contains("c.txt"));
     }
+
+    #[test]
+    fn grep_content_groups_lines_by_file_and_marks_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("first.txt"),
+            "before\nneedle one\nafter\nomitted one\nomitted two\nbefore distant\nneedle distant\nafter distant\n",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("second.txt"), "needle two\n").unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let readable = RootAccess(root.clone());
+
+        let grep = run_grep(
+            &root,
+            root.clone(),
+            GrepRequest {
+                pattern: "needle".to_string(),
+                path: FsPath::root(),
+                glob: Some("*.txt".to_string()),
+                output_mode: GrepOutputMode::Content,
+                case_insensitive: false,
+                before_context: 1,
+                after_context: 1,
+                multiline: false,
+                file_type: None,
+                limit: 20,
+                offset: 0,
+            },
+            &readable,
+        )
+        .unwrap();
+
+        assert_eq!(grep.match_count, 3);
+        assert_eq!(grep.matched_files, 2);
+        assert_eq!(
+            grep.output,
+            concat!(
+                "first.txt\n",
+                "   1 │ before\n",
+                " > 2 │ needle one\n",
+                "   3 │ after\n",
+                "   …\n",
+                "   6 │ before distant\n",
+                " > 7 │ needle distant\n",
+                "   8 │ after distant\n",
+                "\n",
+                "second.txt\n",
+                " > 1 │ needle two\n",
+            )
+        );
+        assert_eq!(grep.output.matches("first.txt").count(), 1);
+        assert_eq!(grep.output.matches("second.txt").count(), 1);
+    }
 }
