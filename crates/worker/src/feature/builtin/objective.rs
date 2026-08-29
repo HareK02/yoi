@@ -209,9 +209,7 @@ impl WorkspaceHttpObjectiveBackend {
             .and_then(serde_json::Value::as_str)
             .filter(|key| is_canonical_resource_key(key, "T-"))
             .map(ToOwned::to_owned)
-            .ok_or_else(|| {
-                ToolError::ExecutionFailed("required T- human key is unavailable".to_string())
-            })
+            .ok_or_else(|| ToolError::ExecutionFailed("required T- key is unavailable".to_string()))
     }
 
     fn objective_url(&self, id: &str) -> String {
@@ -295,7 +293,7 @@ fn is_canonical_resource_key(resource_key: &str, prefix: &str) -> bool {
 fn objective_output(summary: String, response: ObjectiveDetail) -> Result<ToolOutput, ToolError> {
     if !is_canonical_resource_key(&response.resource_key, "O-") {
         return Err(ToolError::ExecutionFailed(
-            "required O- human key is unavailable".to_string(),
+            "required O- key is unavailable".to_string(),
         ));
     }
     let projected = serde_json::json!({
@@ -712,7 +710,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn objective_show_summary_uses_projected_human_key() {
+    async fn objective_show_summary_uses_projected_key() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
@@ -764,7 +762,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn objective_link_summaries_resolve_internal_ticket_ids_to_human_keys() {
+    async fn objective_link_summaries_resolve_internal_ticket_ids_to_keys() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
@@ -833,7 +831,7 @@ mod tests {
     }
 
     #[test]
-    fn objective_output_rejects_noncanonical_human_keys() {
+    fn objective_output_rejects_noncanonical_keys() {
         let response = ObjectiveDetail {
             resource_key: "O-internal".to_string(),
             title: "Objective".to_string(),

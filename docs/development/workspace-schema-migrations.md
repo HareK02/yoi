@@ -19,7 +19,7 @@ The Workspace Server owns one control-plane SQLite database. Schema changes are 
 
 Start exactly one instance of the new Server binary against the database. Startup applies migration 39 in one SQLite transaction after the Ticket and Merge Request component schemas are available. The migration:
 
-- rebuilds Ticket, Objective, assignment, Artifact, and human-key tables with Workspace-scoped composite identity;
+- rebuilds Ticket, Objective, assignment, Artifact, and resource-key tables with Workspace-scoped composite identity;
 - adds composite foreign keys for repository, Ticket, Objective, Worker, relation-target, and current-assignment references;
 - materializes assignment-specific Worker tombstones for pre-v39 historical assignments whose valid Worker UUID no longer has a matching live registry row (including Workers deleted by the legacy cleanup path and Workers moved between Runtimes); a Worker ID that resolves only in another Workspace remains a preflight error;
 - validates new historical assignment/event references with SQLite triggers while allowing those audit rows to survive later Ticket or Worker retention deletion; parent delete/Runtime-move triggers record exact Workspace-scoped tombstones, and startup accepts a missing live parent only when that tombstone exists, so an unrelated same ID in another Workspace cannot change the result; reservation operation ids remain intentionally unconstrained until their resources exist;

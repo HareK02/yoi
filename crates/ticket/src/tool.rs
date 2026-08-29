@@ -1546,7 +1546,7 @@ fn model_ticket_reference(
     match ticket.meta.resource_key {
         Some(resource_key) if is_canonical_ticket_resource_key(&resource_key) => Ok(resource_key),
         Some(_) => Err(ToolError::ExecutionFailed(format!(
-            "{tool_name} failed: required Ticket human key is unavailable"
+            "{tool_name} failed: required Ticket key is unavailable"
         ))),
         None => Ok(ticket.meta.id),
     }
