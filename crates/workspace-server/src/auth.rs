@@ -105,8 +105,13 @@ pub fn token_hash(token: &str) -> String {
 }
 
 pub fn new_user_code() -> String {
-    let hex = Uuid::now_v7().simple().to_string().to_ascii_uppercase();
-    format!("{}-{}", &hex[0..4], &hex[4..8])
+    user_code_from_uuid(Uuid::now_v7())
+}
+
+fn user_code_from_uuid(id: Uuid) -> String {
+    let hex = id.simple().to_string().to_ascii_uppercase();
+    let random_tail = &hex[24..32];
+    format!("{}-{}", &random_tail[..4], &random_tail[4..])
 }
 
 pub fn parse_bearer(headers: &HeaderMap) -> Option<String> {
@@ -205,5 +210,29 @@ pub fn auth_error(code: &str, message: &str) -> Error {
         runtime_id: "workspace-auth".to_string(),
         code: code.to_string(),
         message: message.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_code_uses_the_uuid_random_tail() {
+        let id = Uuid::parse_str("01234567-89ab-7cde-8123-456789abcdef").expect("UUID");
+        assert_eq!(user_code_from_uuid(id), "89AB-CDEF");
+    }
+
+    #[test]
+    fn user_code_preserves_the_human_readable_format() {
+        let code = new_user_code();
+        assert_eq!(code.len(), 9);
+        assert_eq!(code.as_bytes()[4], b'-');
+        assert!(
+            code.chars()
+                .enumerate()
+                .all(|(index, value)| index == 4 || value.is_ascii_hexdigit())
+        );
+        assert_eq!(code, code.to_ascii_uppercase());
     }
 }

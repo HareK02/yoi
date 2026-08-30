@@ -996,7 +996,7 @@ pub trait ControlPlaneStore: Send + Sync {
     fn create_api_token(&self, record: &ApiTokenRecord) -> Result<()>;
     fn resolve_api_token(&self, token_hash: &str) -> Result<Option<ApiTokenRecord>>;
     fn mark_api_token_used(&self, token_hash: &str, used_at: &str) -> Result<()>;
-    fn create_device_login_flow(&self, record: &DeviceLoginFlowRecord) -> Result<()>;
+    fn try_create_device_login_flow(&self, record: &DeviceLoginFlowRecord) -> Result<bool>;
     fn get_device_login_flow_by_user_code(
         &self,
         user_code: &str,
@@ -3123,14 +3123,15 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
-    fn create_device_login_flow(&self, record: &DeviceLoginFlowRecord) -> Result<()> {
+    fn try_create_device_login_flow(&self, record: &DeviceLoginFlowRecord) -> Result<bool> {
         self.with_conn(|conn| {
-            conn.execute(
+            let changed = conn.execute(
                 r#"INSERT INTO device_login_flows (device_code, user_code, verification_uri, client_name, user_id, api_token_id, issued_access_token, created_at, expires_at, approved_at, consumed_at)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                   ON CONFLICT(user_code) DO NOTHING"#,
                 params![record.device_code, record.user_code, record.verification_uri, record.client_name, record.user_id, record.api_token_id, record.issued_access_token, record.created_at, record.expires_at, record.approved_at, record.consumed_at],
             )?;
-            Ok(())
+            Ok(changed == 1)
         })
     }
 
@@ -13524,7 +13525,67 @@ CREATE TABLE ticket_assignment_operations (
             approved_at: None,
             consumed_at: None,
         };
-        store.create_device_login_flow(&flow).unwrap();
+        assert!(store.try_create_device_login_flow(&flow).unwrap());
+        let conflicting_flow = DeviceLoginFlowRecord {
+            device_code: "device-2".into(),
+            user_code: flow.user_code.clone(),
+            verification_uri: flow.verification_uri.clone(),
+            client_name: Some("other-cli".into()),
+            user_id: None,
+            api_token_id: None,
+            issued_access_token: None,
+            created_at: "2026-08-22T00:00:01Z".into(),
+            expires_at: "2026-08-22T00:10:01Z".into(),
+            approved_at: None,
+            consumed_at: None,
+        };
+        assert!(
+            !store
+                .try_create_device_login_flow(&conflicting_flow)
+                .expect("user code collision")
+        );
+        assert!(
+            store
+                .get_device_login_flow_by_device_code("device-2")
+                .expect("read conflicting flow")
+                .is_none()
+        );
+        let fresh_flow = DeviceLoginFlowRecord {
+            device_code: "device-3".into(),
+            user_code: "DCBA-5678".into(),
+            verification_uri: flow.verification_uri.clone(),
+            client_name: Some("retry-cli".into()),
+            user_id: None,
+            api_token_id: None,
+            issued_access_token: None,
+            created_at: "2026-08-22T00:00:02Z".into(),
+            expires_at: "2026-08-22T00:10:02Z".into(),
+            approved_at: None,
+            consumed_at: None,
+        };
+        assert!(
+            store
+                .try_create_device_login_flow(&fresh_flow)
+                .expect("fresh user code")
+        );
+        let device_code_conflict = DeviceLoginFlowRecord {
+            device_code: flow.device_code.clone(),
+            user_code: "ABCD-9999".into(),
+            verification_uri: flow.verification_uri.clone(),
+            client_name: Some("invalid-cli".into()),
+            user_id: None,
+            api_token_id: None,
+            issued_access_token: None,
+            created_at: "2026-08-22T00:00:03Z".into(),
+            expires_at: "2026-08-22T00:10:03Z".into(),
+            approved_at: None,
+            consumed_at: None,
+        };
+        assert!(
+            store
+                .try_create_device_login_flow(&device_code_conflict)
+                .is_err()
+        );
         store
             .approve_device_login_flow(
                 "device",

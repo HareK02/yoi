@@ -10576,35 +10576,48 @@ async fn post_device_login_start(
     State(api): State<ServerAuthApi>,
     Json(request): Json<DeviceLoginStartRequest>,
 ) -> ApiResult<Json<DeviceLoginStartResponse>> {
+    const MAX_CODE_ALLOCATION_ATTEMPTS: usize = 8;
+
     let auth = auth_public_config(&api.config);
-    let device_code = mint_secret("yoi_device");
-    let user_code = new_user_code();
     let verification_uri = format!(
         "{}/login/device",
         auth.public_base_url.trim_end_matches('/')
     );
-    let verification_uri_complete = format!("{verification_uri}?user_code={user_code}");
-    api.store.create_device_login_flow(&DeviceLoginFlowRecord {
-        device_code: device_code.clone(),
-        user_code: user_code.clone(),
-        verification_uri: verification_uri.clone(),
-        client_name: request.client_name,
-        user_id: None,
-        api_token_id: None,
-        issued_access_token: None,
-        created_at: crate::auth::now_rfc3339(),
-        expires_at: rfc3339_after(Duration::minutes(10)),
-        approved_at: None,
-        consumed_at: None,
-    })?;
-    Ok(Json(DeviceLoginStartResponse {
-        device_code,
-        user_code,
-        verification_uri,
-        verification_uri_complete,
-        expires_in: 600,
-        interval: 5,
-    }))
+    for _ in 0..MAX_CODE_ALLOCATION_ATTEMPTS {
+        let device_code = mint_secret("yoi_device");
+        let user_code = new_user_code();
+        let verification_uri_complete = format!("{verification_uri}?user_code={user_code}");
+        let flow = DeviceLoginFlowRecord {
+            device_code: device_code.clone(),
+            user_code: user_code.clone(),
+            verification_uri: verification_uri.clone(),
+            client_name: request.client_name.clone(),
+            user_id: None,
+            api_token_id: None,
+            issued_access_token: None,
+            created_at: crate::auth::now_rfc3339(),
+            expires_at: rfc3339_after(Duration::minutes(10)),
+            approved_at: None,
+            consumed_at: None,
+        };
+        if !api.store.try_create_device_login_flow(&flow)? {
+            continue;
+        }
+        return Ok(Json(DeviceLoginStartResponse {
+            device_code,
+            user_code,
+            verification_uri,
+            verification_uri_complete,
+            expires_in: 600,
+            interval: 5,
+        }));
+    }
+
+    Err(auth_error(
+        "device_login_code_allocation_failed",
+        "could not allocate a unique device login user code",
+    )
+    .into())
 }
 
 async fn post_device_login_approve(
@@ -17760,6 +17773,49 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(csrf_accepted.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn device_login_start_can_retry_while_previous_flow_is_pending() {
+        let workspace = tempfile::tempdir().unwrap();
+        let api = test_api(workspace.path()).await;
+        let app = build_router(api.clone());
+        let mut starts = Vec::new();
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/auth/device-login/start")
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"client_name":"retry-test"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            starts.push(
+                serde_json::from_slice::<serde_json::Value>(&body)
+                    .expect("device login start response"),
+            );
+        }
+
+        assert_ne!(starts[0]["device_code"], starts[1]["device_code"]);
+        assert_ne!(starts[0]["user_code"], starts[1]["user_code"]);
+        for start in starts {
+            let device_code = start["device_code"].as_str().expect("device code");
+            let user_code = start["user_code"].as_str().expect("user code");
+            assert_eq!(user_code.len(), 9);
+            assert!(
+                api.store
+                    .get_device_login_flow_by_device_code(device_code)
+                    .expect("stored device login flow")
+                    .is_some()
+            );
+        }
     }
 
     #[tokio::test]
