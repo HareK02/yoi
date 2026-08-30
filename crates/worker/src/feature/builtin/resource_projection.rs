@@ -422,27 +422,11 @@ fn project_relation(
     kind_key: &str,
 ) -> Result<ModelRelation, String> {
     let relation = object(value, "Ticket relation")?;
-    let relation_data = relation.get("relation").and_then(Value::as_object);
-    let kind = if kind_key == "kind" {
-        relation_data
-            .ok_or_else(|| "Ticket relation is missing relation data".to_string())
-            .and_then(|data| string_field(data, "kind"))?
-    } else {
-        string_field(relation, kind_key)?
-    };
-    let note = match relation_data {
-        Some(data) => optional_string(data, "note")?,
-        None => optional_string(relation, "note")?,
-    };
-    let created_at = match relation_data {
-        Some(data) => optional_string(data, "at")?,
-        None => optional_string(relation, "at")?,
-    };
     Ok(ModelRelation {
         ticket: resource_ref(relation, ticket_key, "T-")?,
-        kind,
-        note,
-        created_at,
+        kind: string_field(relation, kind_key)?,
+        note: optional_string(relation, "note")?,
+        created_at: optional_string(relation, "at")?,
     })
 }
 
@@ -774,6 +758,95 @@ mod tests {
         assert!(objective_json.contains("\"summary\":null"));
         assert!(!objective_json.contains("00001OBJECTIVEINTERNAL"));
         assert!(!objective_json.contains("00001TICKETINTERNAL"));
+    }
+
+    #[test]
+    fn relation_projection_accepts_current_workspace_api_shapes() {
+        let outgoing = project_relation(
+            &json!({
+                "ticket_id": "internal-source-ticket",
+                "kind": "depends_on",
+                "target": "internal-target-ticket",
+                "target_resource_key": "T-535",
+                "note": "required foundation",
+                "author": "internal-author",
+                "at": "2026-08-22T00:00:00Z"
+            }),
+            "target_resource_key",
+            "kind",
+        )
+        .expect("outgoing relation projection");
+        let incoming = project_relation(
+            &json!({
+                "source_ticket": "internal-source-ticket",
+                "source_resource_key": "T-536",
+                "inverse_kind": "blocks",
+                "forward_kind": "depends_on",
+                "note": null,
+                "author": "internal-author",
+                "at": "2026-08-22T00:01:00Z"
+            }),
+            "source_resource_key",
+            "forward_kind",
+        )
+        .expect("incoming relation projection");
+
+        let outgoing = serde_json::to_value(outgoing).expect("serialize outgoing relation");
+        assert_eq!(
+            outgoing,
+            json!({
+                "ticket": "T-535",
+                "kind": "depends_on",
+                "note": "required foundation",
+                "created_at": "2026-08-22T00:00:00Z"
+            })
+        );
+        let incoming = serde_json::to_value(incoming).expect("serialize incoming relation");
+        assert_eq!(
+            incoming,
+            json!({
+                "ticket": "T-536",
+                "kind": "depends_on",
+                "note": null,
+                "created_at": "2026-08-22T00:01:00Z"
+            })
+        );
+        let projection = format!("{outgoing}{incoming}");
+        for internal in [
+            "internal-source-ticket",
+            "internal-target-ticket",
+            "internal-author",
+        ] {
+            assert!(!projection.contains(internal));
+        }
+    }
+
+    #[test]
+    fn relation_projection_rejects_missing_workspace_keys() {
+        let outgoing = json!({
+            "kind": "depends_on",
+            "target": "internal-target-ticket",
+            "note": null,
+            "author": "internal-author",
+            "at": "2026-08-22T00:00:00Z"
+        });
+        let incoming = json!({
+            "source_resource_key": "not-a-ticket-key",
+            "forward_kind": "depends_on",
+            "note": null,
+            "author": "internal-author",
+            "at": "2026-08-22T00:01:00Z"
+        });
+        assert!(
+            project_relation(&outgoing, "target_resource_key", "kind")
+                .expect_err("missing outgoing key must fail")
+                .contains("T-")
+        );
+        assert!(
+            project_relation(&incoming, "source_resource_key", "forward_kind")
+                .expect_err("invalid incoming key must fail")
+                .contains("T-")
+        );
     }
 
     #[test]
