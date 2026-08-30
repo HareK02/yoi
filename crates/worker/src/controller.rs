@@ -884,8 +884,10 @@ where
             .register_tools(tools::web_builtin_tools(web_config));
     }
 
+    let worker_enabled = feature_config.worker.enabled;
+    let sub_worker_enabled = feature_config.sub_worker.enabled;
     let mut feature_registry = FeatureRegistryBuilder::new();
-    if feature_config.sub_worker.enabled {
+    if sub_worker_enabled && !worker_enabled {
         feature_registry.add_module(
             crate::feature::builtin::manage_worker::sub_worker_control_feature(
                 worker.workspace_client_handle(),
@@ -970,7 +972,7 @@ where
         feature_registry.add_module(
             crate::feature::builtin::manage_worker::manage_worker_feature(
                 workspace_client,
-                Some(spawned_registry.clone()),
+                sub_worker_enabled.then(|| spawned_registry.clone()),
                 feature_config.worker.direct_spawn,
             ),
         );

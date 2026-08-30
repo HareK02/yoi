@@ -901,6 +901,23 @@ mod tests {
                 .unwrap()
                 .contains("BOUNDARY_MARKER")
         );
-        catalog.worker_orchestration_guidance_section().unwrap();
+        let orchestration = catalog.worker_orchestration_guidance_section().unwrap();
+        for name in [
+            "SubWorkerSpawn",
+            "WorkerList",
+            "WorkerSendInput",
+            "WorkerStop",
+        ] {
+            assert!(
+                orchestration.contains(name),
+                "missing canonical tool {name}"
+            );
+        }
+        for alias in ["SubWorkerList", "SubWorkerSend", "SubWorkerStop"] {
+            assert!(
+                !orchestration.contains(alias),
+                "guidance referenced stale alias {alias}"
+            );
+        }
     }
 }
