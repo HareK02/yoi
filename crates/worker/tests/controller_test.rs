@@ -18,7 +18,8 @@ use workdir::{
 
 use worker::{
     Event, Method, Worker, WorkerController, WorkerFilesystemAuthority, WorkerHandle,
-    WorkerManifest, WorkerStatus, WorkerWorkspaceContext,
+    WorkerManifest, WorkerStatus, WorkerWorkspaceContext, WorkspaceClient, WorkspaceClientError,
+    WorkspaceRequest, WorkspaceResponse,
 };
 
 type TestStore = CombinedStore<FsStore, FsWorkerStore>;
@@ -179,9 +180,48 @@ async fn make_worker_with_pwd(
     make_worker_with_pwd_and_manifest(client, MANIFEST_TOML).await
 }
 
+#[derive(Debug)]
+struct NoopWorkspaceClient;
+
+impl WorkspaceClient for NoopWorkspaceClient {
+    fn workspace_id(&self) -> Option<&str> {
+        Some("workspace-test")
+    }
+
+    fn kind(&self) -> &str {
+        "test-noop"
+    }
+
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn execute(
+        &self,
+        _request: WorkspaceRequest,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        Err(WorkspaceClientError::Unavailable(
+            "test client does not execute requests".to_string(),
+        ))
+    }
+}
+
 async fn make_worker_with_pwd_and_manifest(
     client: MockClient,
     manifest_toml: &str,
+) -> (Worker<MockClient, TestStore>, std::path::PathBuf) {
+    make_worker_with_pwd_manifest_and_workspace_context(
+        client,
+        manifest_toml,
+        WorkerWorkspaceContext::local_filesystem(None),
+    )
+    .await
+}
+
+async fn make_worker_with_pwd_manifest_and_workspace_context(
+    client: MockClient,
+    manifest_toml: &str,
+    workspace_context: WorkerWorkspaceContext,
 ) -> (Worker<MockClient, TestStore>, std::path::PathBuf) {
     let manifest = WorkerManifest::from_toml(manifest_toml).unwrap();
     let store_tmp = tempfile::tempdir().unwrap();
@@ -202,16 +242,9 @@ async fn make_worker_with_pwd_and_manifest(
     let worker =
         Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(client);
     let authority = WorkerFilesystemAuthority::local(pwd.clone(), pwd.clone());
-    let worker = Worker::new(
-        manifest,
-        worker,
-        store,
-        WorkerWorkspaceContext::local_filesystem(None),
-        authority,
-        scope,
-    )
-    .await
-    .unwrap();
+    let worker = Worker::new(manifest, worker, store, workspace_context, authority, scope)
+        .await
+        .unwrap();
     (worker, pwd)
 }
 
@@ -663,6 +696,83 @@ permission = "write"
             "{} role SubWorker tool exposure mismatch: {names:?}",
             case.role
         );
+        for control_tool in ["WorkerList", "WorkerSendInput", "WorkerStop"] {
+            assert_eq!(
+                names.iter().any(|name| name == control_tool),
+                case.sub_worker_enabled,
+                "{} role {control_tool} exposure mismatch: {names:?}",
+                case.role
+            );
+        }
+        for stale_alias in ["SubWorkerList", "SubWorkerSend", "SubWorkerStop"] {
+            assert!(
+                !names.iter().any(|name| name == stale_alias),
+                "{} role exposed stale alias {stale_alias}: {names:?}",
+                case.role
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn worker_and_sub_worker_features_install_one_canonical_control_surface() {
+    let manifest = r#"
+[worker]
+name = "combined-worker-control-feature-test"
+pwd = "./"
+
+[model]
+scheme = "anthropic"
+model_id = "test-model"
+
+[engine]
+max_tokens = 100
+
+[feature.worker]
+enabled = true
+direct_spawn = false
+
+[feature.sub_worker]
+enabled = true
+
+[[scope.allow]]
+target = "./"
+permission = "write"
+
+[[delegation_scope.allow]]
+target = "/tmp"
+permission = "write"
+"#;
+    let client = MockClient::new(simple_text_events());
+    let client_for_assert = client.clone();
+    let worker = make_worker_with_pwd_manifest_and_workspace_context(
+        client,
+        manifest,
+        WorkerWorkspaceContext::with_client(None, Arc::new(NoopWorkspaceClient)),
+    )
+    .await
+    .0;
+    let handle = spawn_controller(worker).await;
+
+    handle.send(Method::run_text("Hello")).await.unwrap();
+    wait_for_status(&handle, WorkerStatus::Idle).await;
+
+    let request = wait_for_captured_request(&client_for_assert).await;
+    let names = request_tool_names(&request);
+    assert!(names.iter().any(|name| name == "SubWorkerSpawn"));
+    assert!(!names.iter().any(|name| name == "WorkerSpawn"));
+    for control_tool in ["WorkerList", "WorkerSendInput", "WorkerStop"] {
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.as_str() == control_tool)
+                .count(),
+            1,
+            "expected one {control_tool} contribution: {names:?}"
+        );
+    }
+    for stale_alias in ["SubWorkerList", "SubWorkerSend", "SubWorkerStop"] {
+        assert!(!names.iter().any(|name| name == stale_alias));
     }
 }
 

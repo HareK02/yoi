@@ -1226,14 +1226,11 @@ extract_threshold = 4000
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
 
-        let context = agen::tool::ToolExecutionContext::direct();
-        let list = (crate::spawn::comm_tools::sub_worker_list_tool(registry.clone()))().1;
-        let listed = list.execute("{}", context.clone()).await.unwrap();
         assert!(
-            listed
-                .content
-                .unwrap_or_default()
-                .contains("reviewer-child")
+            registry
+                .list_internal()
+                .iter()
+                .any(|record| record.worker_name == "reviewer-child")
         );
 
         let observation =
@@ -1256,13 +1253,11 @@ extract_threshold = 4000
                 .contains("reviewed")
         );
 
-        let send = (crate::spawn::comm_tools::sub_worker_send_tool(registry.clone()))().1;
-        send.execute(
-            r#"{"name":"reviewer-child","message":"review follow-up"}"#,
-            context.clone(),
-        )
-        .await
-        .unwrap();
+        record
+            .session
+            .send("review follow-up".to_string())
+            .await
+            .unwrap();
         assert_eq!(
             record.session.wait_until_idle().await,
             crate::internal_worker::InternalWorkerSessionStatus::Idle
@@ -1277,12 +1272,11 @@ extract_threshold = 4000
         assert!(latest_capture.session.entries.len() > first_capture.session.entries.len());
 
         fail_requests.store(true, Ordering::SeqCst);
-        send.execute(
-            r#"{"name":"reviewer-child","message":"trigger terminal failure"}"#,
-            context.clone(),
-        )
-        .await
-        .unwrap();
+        record
+            .session
+            .send("trigger terminal failure".to_string())
+            .await
+            .unwrap();
         assert_eq!(
             record.session.wait_until_idle().await,
             InternalWorkerSessionStatus::Stopped
@@ -1298,10 +1292,13 @@ extract_threshold = 4000
         );
         assert!(registry.get_internal("reviewer-child").is_some());
 
-        let stop = (crate::spawn::comm_tools::sub_worker_stop_tool(registry.clone()))().1;
-        stop.execute(r#"{"name":"reviewer-child"}"#, context)
-            .await
-            .unwrap();
+        assert!(
+            registry
+                .remove_internal("reviewer-child")
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert!(registry.get_internal("reviewer-child").is_none());
         assert!(spawner_scope.snapshot().is_writable(&workspace_root));
 
@@ -1315,9 +1312,6 @@ extract_threshold = 4000
         .await
         .unwrap();
         assert!(spawner_scope.snapshot().is_writable(&workspace_root));
-        drop(list);
-        drop(send);
-        drop(stop);
         drop(observation);
         drop(tool);
         drop(registry);

@@ -44,4 +44,4 @@ Observation is read-only evidence access. It does not authorize Ticket, Memory, 
 
 ## SubWorker output
 
-SubWorkers no longer expose a separate output cursor tool. `SubWorkerList`, `SubWorkerSend`, and `SubWorkerStop` retain parent-owned lifecycle control, while committed child output is read through `worker-observation`. Turn-completion notifications carry no transcript and only tell the parent to inspect the authoritative committed session at a natural boundary.
+SubWorkers no longer expose a separate output cursor or lifecycle tool family. `WorkerList`, `WorkerSendInput`, and `WorkerStop` retain parent-owned lifecycle control through a `{ kind: "sub_worker", name }` subject, while committed child output is read through `worker-observation`. Turn-completion notifications carry no transcript and only tell the parent to inspect the authoritative committed session at a natural boundary.

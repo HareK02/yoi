@@ -181,10 +181,17 @@ impl ToolCapabilities {
                 "MemoryReadDocument" => capabilities.memory_read_document = true,
                 "MemoryUpdateDocument" => capabilities.memory_update_document = true,
                 "SubWorkerSpawn" => capabilities.sub_worker_spawn = true,
-                "SubWorkerSend" => capabilities.sub_worker_send = true,
-                "SubWorkerStop" => capabilities.sub_worker_stop = true,
-                "SubWorkerList" => capabilities.sub_worker_list = true,
                 _ => {}
+            }
+        }
+        if capabilities.sub_worker_spawn {
+            for name in names {
+                match name.as_str() {
+                    "WorkerSendInput" => capabilities.sub_worker_send = true,
+                    "WorkerStop" => capabilities.sub_worker_stop = true,
+                    "WorkerList" => capabilities.sub_worker_list = true,
+                    _ => {}
+                }
             }
         }
         capabilities
@@ -315,6 +322,35 @@ fn append_trailing_section(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sub_worker_capabilities_follow_the_registered_canonical_control_tools() {
+        let names = [
+            "SubWorkerSpawn",
+            "WorkerList",
+            "WorkerSendInput",
+            "WorkerStop",
+        ]
+        .map(str::to_string);
+        let capabilities = ToolCapabilities::from_tool_names(&names);
+        assert!(capabilities.sub_worker_management());
+        assert!(capabilities.sub_worker_list);
+        assert!(capabilities.sub_worker_send);
+        assert!(capabilities.sub_worker_stop);
+
+        let stale_aliases = [
+            "SubWorkerSpawn",
+            "SubWorkerList",
+            "SubWorkerSend",
+            "SubWorkerStop",
+        ]
+        .map(str::to_string);
+        let capabilities = ToolCapabilities::from_tool_names(&stale_aliases);
+        assert!(capabilities.sub_worker_spawn);
+        assert!(!capabilities.sub_worker_list);
+        assert!(!capabilities.sub_worker_send);
+        assert!(!capabilities.sub_worker_stop);
+    }
 
     #[test]
     fn rejects_legacy_prefix_relative_and_missing_names() {
