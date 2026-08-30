@@ -37,7 +37,7 @@ use crate::working_directory::{
     WorkingDirectoryBinding, WorkingDirectoryDiagnostic, WorkingDirectoryMaterializer,
 };
 use async_trait::async_trait;
-use protocol::{Event, Method, Segment, WorkerStatus};
+use protocol::{ErrorCode, Event, Method, Segment, WorkerStatus};
 use session_store::{CombinedStore, LogEntry, WorkerAggregateStore, WorkerSessionStore};
 #[cfg(test)]
 use session_store::{FsStore, FsWorkerStore};
@@ -1442,7 +1442,6 @@ where
             let streams = subscribe_worker_protocol_session(&handle);
             let mut events = streams.events;
             let mut entry_events = streams.log_entries;
-            let bridge_handle = handle.clone();
             let bridge_busy = busy.clone();
             if let Err(message) = self.spawn_on_adapter_runtime(async move {
                 loop {
@@ -1450,12 +1449,28 @@ where
                         event = events.recv() => {
                             match event {
                                 Ok(event) => {
+                                    let next_busy = match &event {
+                                        Event::InvokeStart { .. }
+                                        | Event::Status {
+                                            status: WorkerStatus::Running,
+                                        } => Some(true),
+                                        Event::RunEnd { .. }
+                                        | Event::Error {
+                                            code: ErrorCode::NotPaused,
+                                            ..
+                                        }
+                                        | Event::Status {
+                                            status:
+                                                WorkerStatus::Idle
+                                                | WorkerStatus::Paused
+                                                | WorkerStatus::Stopped,
+                                        }
+                                        | Event::Shutdown => Some(false),
+                                        _ => None,
+                                    };
                                     let _ = bridge_context.publish_protocol_event(event);
-                                    if matches!(
-                                        bridge_handle.shared_state.get_status(),
-                                        WorkerStatus::Idle | WorkerStatus::Paused
-                                    ) {
-                                        bridge_busy.store(false, Ordering::SeqCst);
+                                    if let Some(next_busy) = next_busy {
+                                        bridge_busy.store(next_busy, Ordering::SeqCst);
                                     }
                                 }
                                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -2565,18 +2580,22 @@ mod tests {
     ) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let matches = {
+            let observed = {
                 let workers = backend.workers.lock().unwrap();
                 let execution = workers.get(worker_ref).expect("live Worker execution");
-                execution.handle.shared_state.get_status() == expected_status
-                    && execution.busy.load(Ordering::SeqCst) == expected_busy
+                (
+                    execution.handle.shared_state.get_status(),
+                    execution.busy.load(Ordering::SeqCst),
+                )
             };
-            if matches {
+            if observed == (expected_status, expected_busy) {
                 return;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "timed out waiting for adapter state {expected_status:?}, busy={expected_busy}"
+                "timed out waiting for adapter state {expected_status:?}, busy={expected_busy}; last observed status={:?}, busy={}",
+                observed.0,
+                observed.1,
             );
             std::thread::sleep(Duration::from_millis(10));
         }
