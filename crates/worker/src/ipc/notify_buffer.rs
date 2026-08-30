@@ -5,7 +5,7 @@
 //! `WorkerInterceptor::pending_history_appends`, which the Engine calls
 //! at the head of each turn loop iteration. The drain renders each
 //! pending entry into a typed `SystemItem` (with the `notify_wrapper`
-//! prompt applied), commits a `LogEntry::SystemItem` per entry through
+//! prompt applied), commits a `LogEntry::AnnotatedSystemItem` per entry through
 //! the session-log sink, and returns the corresponding
 //! `Item::system_message`s for the worker to append to its
 //! persistent history.

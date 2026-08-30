@@ -547,7 +547,9 @@ async fn run_e2e_rewind_fixture(
     let mut app = App::new_with_persistent_input_history(worker_name.clone(), &workspace_root);
     app.connected = true;
     app.handle_worker_event(Event::Snapshot {
-        entries: Vec::new(),
+        session: protocol::SessionSnapshot {
+            entries: Vec::new(),
+        },
         status: WorkerStatus::Idle,
         greeting: Greeting {
             worker_name: worker_name.clone(),
@@ -673,7 +675,9 @@ async fn run_e2e_rewind_fixture(
         if let Some(submitted_at) = pending_apply {
             if submitted_at.elapsed() >= apply_delay {
                 app.handle_worker_event(Event::RewindApplied {
-                    entries: Vec::new(),
+                    session: protocol::SessionSnapshot {
+                        entries: Vec::new(),
+                    },
                     input: vec![Segment::text("rewind-live-refresh")],
                     summary: RewindSummary {
                         truncated_to_entries: 1,
@@ -2023,13 +2027,13 @@ mod tests {
         let mut app = App::new("agent".to_string());
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
-            entries: vec![],
+            session: protocol::SessionSnapshot { entries: vec![] },
             status: WorkerStatus::Idle,
             in_flight: Default::default(),
             internal_workers: Vec::new(),
         });
         app.handle_worker_event(Event::RewindApplied {
-            entries: vec![],
+            session: protocol::SessionSnapshot { entries: vec![] },
             input: vec![Segment::Text {
                 content: "retry this".into(),
             }],
@@ -2050,7 +2054,7 @@ mod tests {
         let mut app = App::new("agent".to_string());
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
-            entries: vec![],
+            session: protocol::SessionSnapshot { entries: vec![] },
             status: WorkerStatus::Idle,
             in_flight: Default::default(),
             internal_workers: Vec::new(),
@@ -2058,7 +2062,7 @@ mod tests {
         type_keys(&mut app, "draft");
 
         app.handle_worker_event(Event::RewindApplied {
-            entries: vec![],
+            session: protocol::SessionSnapshot { entries: vec![] },
             input: vec![Segment::Text {
                 content: "retry this".into(),
             }],

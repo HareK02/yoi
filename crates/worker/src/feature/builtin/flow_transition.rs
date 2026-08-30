@@ -963,9 +963,12 @@ permission = "read"
             .append(
                 session_id,
                 segment_id,
-                &LogEntry::UserInput {
+                &LogEntry::AnnotatedUserInput {
                     ts: 1,
                     extensions: vec![],
+                    history: vec![crate::session_history::test_logged_history_entry(
+                        agen::Item::user_message("verify current Flow conditions"),
+                    )],
                     segments: vec![Segment::Text {
                         content: "verify current Flow conditions".into(),
                     }],

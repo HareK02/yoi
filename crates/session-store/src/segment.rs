@@ -4,11 +4,9 @@
 //! The caller (typically Worker) holds the Engine directly and calls these
 //! functions after state-mutating operations.
 
-use crate::logged_item::{LoggedItem, to_logged};
 use crate::segment_log::{self, LogEntry, SegmentOrigin};
 use crate::store::{Store, StoreError};
-use crate::system_item::SystemItem;
-use crate::{SegmentId, SessionId};
+use crate::{LoggedHistoryEntry, LoggedSystemHistoryEntry, SegmentId, SessionId};
 use agen::EngineResult;
 use agen::llm_client::RequestConfig;
 use agen::llm_client::types::Item;
@@ -18,7 +16,7 @@ use protocol::Segment;
 pub struct SegmentStartState<'a> {
     pub system_prompt: Option<&'a str>,
     pub config: &'a RequestConfig,
-    pub history: &'a [Item],
+    pub history: Vec<LoggedHistoryEntry>,
 }
 
 /// Create a new session + initial segment, writing the initial
@@ -44,12 +42,12 @@ pub fn create_segment_with_ids(
     segment_id: SegmentId,
     state: SegmentStartState<'_>,
 ) -> Result<(), StoreError> {
-    let entry = LogEntry::SegmentStart {
+    let entry = LogEntry::AnnotatedSegmentStart {
         ts: segment_log::now_millis(),
         session_id,
         system_prompt: state.system_prompt.map(String::from),
         config: state.config.clone(),
-        history: to_logged(state.history),
+        history: state.history.to_vec(),
         forked_from: None,
         compacted_from: None,
     };
@@ -70,12 +68,12 @@ pub fn create_compacted_segment(
     source_turn_count: usize,
 ) -> Result<SegmentId, StoreError> {
     let segment_id = crate::new_segment_id();
-    let entry = LogEntry::SegmentStart {
+    let entry = LogEntry::AnnotatedSegmentStart {
         ts: segment_log::now_millis(),
         session_id: source_session_id,
         system_prompt: state.system_prompt.map(String::from),
         config: state.config.clone(),
-        history: to_logged(state.history),
+        history: state.history.to_vec(),
         forked_from: None,
         compacted_from: Some(SegmentOrigin {
             segment_id: source_segment_id,
@@ -154,12 +152,12 @@ pub fn ensure_head_or_fork(
     }
     let source_segment_id = *segment_id;
     let fork_id = crate::new_segment_id();
-    let entry = LogEntry::SegmentStart {
+    let entry = LogEntry::AnnotatedSegmentStart {
         ts: segment_log::now_millis(),
         session_id,
         system_prompt: state.system_prompt.map(String::from),
         config: state.config.clone(),
-        history: to_logged(state.history),
+        history: state.history.to_vec(),
         forked_from: Some(SegmentOrigin {
             segment_id: source_segment_id,
             at_turn_index,
@@ -183,8 +181,9 @@ pub fn save_user_input(
     session_id: SessionId,
     segment_id: SegmentId,
     segments: Vec<Segment>,
+    history: Vec<LoggedHistoryEntry>,
 ) -> Result<(), StoreError> {
-    save_user_input_with_extensions(store, session_id, segment_id, segments, Vec::new())
+    save_user_input_with_extensions(store, session_id, segment_id, segments, history, Vec::new())
 }
 
 /// Atomically persist one typed user submission and Runtime-owned session
@@ -194,15 +193,17 @@ pub fn save_user_input_with_extensions(
     session_id: SessionId,
     segment_id: SegmentId,
     segments: Vec<Segment>,
+    history: Vec<LoggedHistoryEntry>,
     extensions: Vec<segment_log::SessionExtension>,
 ) -> Result<(), StoreError> {
     append_entry(
         store,
         session_id,
         segment_id,
-        LogEntry::UserInput {
+        LogEntry::AnnotatedUserInput {
             ts: segment_log::now_millis(),
             segments,
+            history,
             extensions,
         },
     )
@@ -220,64 +221,57 @@ pub fn save_delta(
     store: &impl Store,
     session_id: SessionId,
     segment_id: SegmentId,
-    new_items: &[Item],
+    new_items: &[LoggedHistoryEntry],
 ) -> Result<(), StoreError> {
     if new_items.is_empty() {
         return Ok(());
     }
 
     let ts = segment_log::now_millis();
-    for item in new_items {
+    for entry in new_items {
+        let item = Item::from(entry.item.clone());
         if item.is_user_message() {
             // Already persisted by save_user_input at submit time.
             continue;
         }
-        let entry = classify_history_item(item, ts);
+        let entry = classify_logged_history_entry(entry.clone(), ts);
         append_entry(store, session_id, segment_id, entry)?;
     }
     Ok(())
 }
 
-/// Map one history item to its singular `LogEntry` form. Used by the
-/// fallback `save_delta` path and the controller's worker-callback
-/// classifier so write classification lives in one place.
-pub fn classify_history_item(item: &Item, ts: u64) -> LogEntry {
+/// Map one annotated history entry to its singular `LogEntry` form. Used by
+/// the fallback `save_delta` path and the controller's worker-callback
+/// classifier so write classification lives in one place without discarding
+/// identity or provenance.
+/// Map one already-annotated history entry to its singular canonical record
+/// without changing its identity or provenance.
+pub fn classify_logged_history_entry(entry: LoggedHistoryEntry, ts: u64) -> LogEntry {
+    let item = Item::from(entry.item.clone());
     if item.is_tool_result() {
-        LogEntry::ToolResult {
-            ts,
-            item: LoggedItem::from(item),
-        }
-    } else if item.is_assistant_message() || item.is_tool_call() || item.is_reasoning() {
-        LogEntry::AssistantItem {
-            ts,
-            item: LoggedItem::from(item),
-        }
+        LogEntry::AnnotatedToolResult { ts, entry }
     } else {
-        // Defensive: anything else (future Item kinds) routes through
-        // AssistantItem rather than getting silently dropped.
-        LogEntry::AssistantItem {
-            ts,
-            item: LoggedItem::from(item),
-        }
+        // Assistant messages, tool calls, reasoning, and future non-user
+        // items all use the assistant-side canonical record.
+        LogEntry::AnnotatedAssistantItem { ts, entry }
     }
 }
 
-/// Append a single typed system item as `LogEntry::SystemItem`. Helper
-/// for the Worker-side interceptor commit path; mirrors the per-item
-/// commit shape used for assistant / tool result entries.
+/// Append one typed system item and its history metadata as a canonical
+/// `LogEntry::AnnotatedSystemItem`.
 pub fn append_system_item(
     store: &impl Store,
     session_id: SessionId,
     segment_id: SegmentId,
-    item: SystemItem,
+    entry: LoggedSystemHistoryEntry,
 ) -> Result<(), StoreError> {
     append_entry(
         store,
         session_id,
         segment_id,
-        LogEntry::SystemItem {
+        LogEntry::AnnotatedSystemItem {
             ts: segment_log::now_millis(),
-            item,
+            entry,
         },
     )
 }
@@ -430,12 +424,12 @@ pub fn fork(
 ) -> Result<(SessionId, SegmentId), StoreError> {
     let session_id = crate::new_session_id();
     let fork_id = crate::new_segment_id();
-    let entry = LogEntry::SegmentStart {
+    let entry = LogEntry::AnnotatedSegmentStart {
         ts: segment_log::now_millis(),
         session_id,
         system_prompt: state.system_prompt.map(String::from),
         config: state.config.clone(),
-        history: to_logged(state.history),
+        history: state.history.to_vec(),
         forked_from: None,
         compacted_from: None,
     };
@@ -470,7 +464,7 @@ pub fn fork_at(
         // segment), before any turn completes.
         entries
             .iter()
-            .position(|e| !matches!(e, LogEntry::SegmentStart { .. }))
+            .position(|e| !matches!(e, LogEntry::AnnotatedSegmentStart { .. }))
             .unwrap_or(entries.len())
     } else {
         entries
@@ -482,12 +476,12 @@ pub fn fork_at(
     let state = segment_log::collect_state(&entries[..cut]);
 
     let fork_id = crate::new_segment_id();
-    let entry = LogEntry::SegmentStart {
+    let entry = LogEntry::AnnotatedSegmentStart {
         ts: segment_log::now_millis(),
         session_id: source_session_id,
         system_prompt: state.system_prompt,
         config: state.config,
-        history: to_logged(&state.history),
+        history: state.annotated_history,
         forked_from: Some(SegmentOrigin {
             segment_id: source_id,
             at_turn_index,

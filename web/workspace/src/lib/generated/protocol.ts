@@ -73,11 +73,39 @@ export type InFlightBlock = { "kind": "text", text: string, finished?: boolean, 
 
 export type InFlightSnapshot = { blocks?: Array<InFlightBlock>, commands?: Array<CommandSnapshot>, };
 
+export type SessionEntryProvenance = "human_input" | "worker_input" | "flow_instruction" | "backend_instruction" | "model_output" | "tool_output" | "derived_summary" | "legacy_unknown";
+
+export type SessionMessageRole = "user" | "assistant";
+
+export type SessionContentPart = { "kind": "text", text: string, } | { "kind": "refusal", refusal: string, };
+
+export type SessionToolAttachment = { media_type: string,
+/**
+ * Base64-encoded durable attachment body. Public snapshots preserve the
+ * committed multimodal value instead of replacing it with placeholder text.
+ */
+data_base64: string, };
+
+export type SessionSnapshotEntryData = { "kind": "user_input", segments: Array<Segment>, } | { "kind": "message", role: SessionMessageRole, content: Array<SessionContentPart>, } | { "kind": "tool_call", call_id: string, name: string, arguments: string, } | { "kind": "tool_result", call_id: string, summary: string, content?: string | null, is_error: boolean, attachments?: Array<SessionToolAttachment>, } | { "kind": "system_item", item_kind: string, content: string, data?: unknown, } | { "kind": "run_error", message: string, };
+
+export type SessionSnapshotEntry = {
+/**
+ * Stable identity from durable history metadata, or a deterministic
+ * identity derived from the legacy segment and log position.
+ */
+entry_id: string,
+/**
+ * Timestamp copied from the durable log record that commits this entry.
+ */
+timestamp: number, provenance: SessionEntryProvenance, derived_from?: Array<string>, } & ({ "kind": "user_input", segments: Array<Segment>, } | { "kind": "message", role: SessionMessageRole, content: Array<SessionContentPart>, } | { "kind": "tool_call", call_id: string, name: string, arguments: string, } | { "kind": "tool_result", call_id: string, summary: string, content?: string | null, is_error: boolean, attachments?: Array<SessionToolAttachment>, } | { "kind": "system_item", item_kind: string, content: string, data?: unknown, } | { "kind": "run_error", message: string, });
+
+export type SessionSnapshot = { entries: Array<SessionSnapshotEntry>, };
+
 export type InternalWorkerKind = "sub_worker" | { "service": { kind: string, } };
 
 export type InternalWorkerRef = { session_id: string, name: string, parent_session_id?: string | null, kind: InternalWorkerKind, };
 
-export type InternalWorkerSnapshot = { worker: InternalWorkerRef, revision: number, entries: Array<unknown>, status: WorkerStatus, error?: string | null, in_flight?: InFlightSnapshot, internal_workers?: Array<InternalWorkerSnapshot>, };
+export type InternalWorkerSnapshot = { worker: InternalWorkerRef, revision: number, session: SessionSnapshot, status: WorkerStatus, error?: string | null, in_flight?: InFlightSnapshot, internal_workers?: Array<InternalWorkerSnapshot>, };
 
 export type Greeting = { worker_name: string, cwd: string, provider: string, model: string, scope_summary: string, tools: Array<string>,
 /**
@@ -193,7 +221,7 @@ summary: string,
  * Full tool output. Absent when the tool chose to return
  * summary-only, or when the result was pruned.
  */
-output?: string | null, disposition?: ToolResultDisposition | null, is_error: boolean, } } | { "event": "usage", "data": { input_tokens: number | null, output_tokens: number | null, cache_read_input_tokens?: number | null, } } | { "event": "run_end", "data": { result: RunResult, } } | { "event": "error", "data": { code: ErrorCode, message: string, } } | { "event": "snapshot", "data": { entries: Array<unknown>, greeting: Greeting, status: WorkerStatus,
+output?: string | null, disposition?: ToolResultDisposition | null, is_error: boolean, } } | { "event": "usage", "data": { input_tokens: number | null, output_tokens: number | null, cache_read_input_tokens?: number | null, } } | { "event": "run_end", "data": { result: RunResult, } } | { "event": "error", "data": { code: ErrorCode, message: string, } } | { "event": "snapshot", "data": { session: SessionSnapshot, greeting: Greeting, status: WorkerStatus,
 /**
  * Unfinished model output that has already streamed in the current
  * run but is not yet represented by committed snapshot entries.
@@ -203,4 +231,4 @@ in_flight?: InFlightSnapshot,
  * Parent-owned Internal Worker sessions visible to this client.
  * Service-private Internal Workers are deliberately excluded.
  */
-internal_workers?: Array<InternalWorkerSnapshot>, } } | { "event": "internal_worker", "data": { worker: InternalWorkerRef, revision: number, event: Event, } } | { "event": "internal_worker_removed", "data": { worker: InternalWorkerRef, revision: number, } } | { "event": "segment_rotated", "data": { entry: unknown, } } | { "event": "status", "data": { status: WorkerStatus, } } | { "event": "command", "data": { event: CommandEvent, } } | { "event": "completions", "data": { kind: CompletionKind, entries: Array<CompletionEntry>, } } | { "event": "rewind_targets", "data": { head_entries: number, targets: Array<RewindTarget>, } } | { "event": "rewind_applied", "data": { entries: Array<unknown>, input: Array<Segment>, summary: RewindSummary, } } | { "event": "workers_listed", "data": { workers: unknown, } } | { "event": "worker_restored", "data": { result: unknown, } } | { "event": "peer_registered", "data": { result: unknown, } } | { "event": "alert", "data": Alert } | { "event": "memory_worker", "data": MemoryWorkerEvent } | { "event": "compact_start", "data": { lifecycle: CompactionLifecycle, } } | { "event": "compact_done", "data": { lifecycle: CompactionLifecycle, } } | { "event": "compact_failed", "data": { lifecycle: CompactionLifecycle, } } | { "event": "shutdown" };
+internal_workers?: Array<InternalWorkerSnapshot>, } } | { "event": "internal_worker", "data": { worker: InternalWorkerRef, revision: number, event: Event, } } | { "event": "internal_worker_removed", "data": { worker: InternalWorkerRef, revision: number, } } | { "event": "segment_rotated", "data": { session: SessionSnapshot, } } | { "event": "status", "data": { status: WorkerStatus, } } | { "event": "command", "data": { event: CommandEvent, } } | { "event": "completions", "data": { kind: CompletionKind, entries: Array<CompletionEntry>, } } | { "event": "rewind_targets", "data": { head_entries: number, targets: Array<RewindTarget>, } } | { "event": "rewind_applied", "data": { session: SessionSnapshot, input: Array<Segment>, summary: RewindSummary, } } | { "event": "workers_listed", "data": { workers: unknown, } } | { "event": "worker_restored", "data": { result: unknown, } } | { "event": "peer_registered", "data": { result: unknown, } } | { "event": "alert", "data": Alert } | { "event": "memory_worker", "data": MemoryWorkerEvent } | { "event": "compact_start", "data": { lifecycle: CompactionLifecycle, } } | { "event": "compact_done", "data": { lifecycle: CompactionLifecycle, } } | { "event": "compact_failed", "data": { lifecycle: CompactionLifecycle, } } | { "event": "shutdown" };

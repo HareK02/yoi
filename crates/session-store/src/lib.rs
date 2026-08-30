@@ -26,14 +26,16 @@
 //! let (session_id, segment_id) = create_segment(&store, SegmentStartState {
 //!     system_prompt: None,
 //!     config: &config,
-//!     history: &[],
+//!     history: Vec::new(),
 //! })?;
 //! ```
 
 pub mod event_trace;
 pub mod fs_store;
 pub mod history;
+mod legacy_session_log;
 pub mod logged_item;
+pub mod public_snapshot;
 pub mod segment;
 pub mod segment_log;
 pub mod store;
@@ -48,11 +50,11 @@ pub use fs_store::FsStore;
 pub use history::{
     LoggedHistoryDerivation, LoggedHistoryEntry, LoggedSessionHistoryEntryId,
     LoggedSessionHistoryMetadata, LoggedSessionHistoryOrigin, LoggedSystemHistoryEntry,
-    LoggedWorkerSubject, legacy_logged_history, legacy_segment_history,
+    LoggedWorkerSubject,
 };
 pub use logged_item::{LoggedContentPart, LoggedItem, LoggedRole, from_logged, to_logged};
 pub use segment::{
-    SegmentStartState, append_entry, append_system_item, classify_history_item,
+    SegmentStartState, append_entry, append_system_item, classify_logged_history_entry,
     create_compacted_segment, create_segment, create_segment_with_ids, ensure_head_or_fork, fork,
     fork_at, restore, restore_by_segment, save_config_changed, save_delta, save_extension,
     save_run_completed, save_run_errored, save_turn_end, save_usage, save_user_input,

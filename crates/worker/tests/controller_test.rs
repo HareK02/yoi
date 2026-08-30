@@ -35,28 +35,15 @@ fn history_from_sink(handle: &WorkerHandle) -> Vec<Item> {
             LogEntry::AnnotatedSegmentStart { history, .. } => {
                 items.extend(history.into_iter().map(|entry| Item::from(entry.item)));
             }
-            LogEntry::SegmentStart { history, .. } => {
-                items.extend(history.into_iter().map(Item::from));
-            }
             LogEntry::AnnotatedUserInput { history, .. } => {
                 items.extend(history.into_iter().map(|entry| Item::from(entry.item)));
-            }
-            LogEntry::UserInput { segments, .. } => {
-                let text = protocol::Segment::flatten_to_text(&segments);
-                items.push(Item::user_message(text));
             }
             LogEntry::AnnotatedAssistantItem { entry, .. }
             | LogEntry::AnnotatedToolResult { entry, .. } => {
                 items.push(Item::from(entry.item));
             }
-            LogEntry::AssistantItem { item, .. } | LogEntry::ToolResult { item, .. } => {
-                items.push(Item::from(item));
-            }
             LogEntry::AnnotatedSystemItem { entry, .. } => {
                 items.push(entry.item.to_history_item());
-            }
-            LogEntry::SystemItem { item, .. } => {
-                items.push(item.to_history_item());
             }
             _ => {}
         }
@@ -67,7 +54,6 @@ fn history_from_sink(handle: &WorkerHandle) -> Vec<Item> {
 fn system_item(entry: &LogEntry) -> Option<&session_store::SystemItem> {
     match entry {
         LogEntry::AnnotatedSystemItem { entry, .. } => Some(&entry.item),
-        LogEntry::SystemItem { item, .. } => Some(item),
         _ => None,
     }
 }
@@ -839,26 +825,26 @@ async fn snapshot_includes_user_input_for_in_flight_turn() {
     loop {
         let event = reader.next::<Event>().await.unwrap().unwrap();
         match event {
-            Event::Snapshot { entries, .. } => {
-                // Walk the entries, find a `LogEntry::UserInput` and
-                // confirm its segments flatten to our submitted text.
-                let mut found = false;
-                for value in &entries {
-                    let entry: session_store::LogEntry =
-                        serde_json::from_value(value.clone()).expect("LogEntry deserialise");
-                    if let session_store::LogEntry::UserInput { segments, .. }
-                    | session_store::LogEntry::AnnotatedUserInput { segments, .. } = entry
-                    {
-                        let text = protocol::Segment::flatten_to_text(&segments);
-                        if text == "hello in-flight" {
-                            found = true;
-                            break;
-                        }
+            Event::Snapshot { session, .. } => {
+                let found = session.entries.iter().any(|entry| match &entry.data {
+                    protocol::SessionSnapshotEntryData::UserInput { segments } => {
+                        protocol::Segment::flatten_to_text(segments) == "hello in-flight"
                     }
-                }
+                    protocol::SessionSnapshotEntryData::Message {
+                        role: protocol::SessionMessageRole::User,
+                        content,
+                    } => content.iter().any(|part| {
+                        matches!(
+                            part,
+                            protocol::SessionContentPart::Text { text }
+                                if text == "hello in-flight"
+                        )
+                    }),
+                    _ => false,
+                });
                 assert!(
                     found,
-                    "snapshot must carry the in-flight UserInput entry: {entries:?}"
+                    "snapshot must carry the in-flight UserInput entry: {session:?}"
                 );
                 return;
             }
@@ -1095,7 +1081,7 @@ async fn run_with_paste_segment_inlines_content_and_emits_typed_user_message() {
     // Mixed input: plain text + a paste chip + trailing text. Worker must
     // flatten this into one user-message string (paste content inlined,
     // no `[Clipboard ...]` label leaking to the LLM); the committed
-    // `LogEntry::UserInput` must carry the typed segments unchanged so
+    // `LogEntry::AnnotatedUserInput` must carry the typed segments unchanged so
     // socket clients can derive `Event::UserMessage` and re-render the chip.
     let segments = vec![
         protocol::Segment::text("see "),
@@ -1130,7 +1116,7 @@ async fn run_with_paste_segment_inlines_content_and_emits_typed_user_message() {
                 _ => {}
             },
             entry = entry_rx.recv() => match entry {
-                Ok(session_store::LogEntry::UserInput { segments, .. } | session_store::LogEntry::AnnotatedUserInput { segments, .. }) => {
+                Ok(session_store::LogEntry::AnnotatedUserInput { segments, .. }) => {
                     user_input_segments = Some(segments);
                     if saw_turn_end {
                         break;
@@ -2410,17 +2396,12 @@ async fn snapshot_contains_user_input(handle: &WorkerHandle, needle: &str) -> bo
     loop {
         let event = reader.next::<Event>().await.unwrap().unwrap();
         match event {
-            Event::Snapshot { entries, .. } => {
-                return entries.into_iter().any(|value| {
-                    let entry: session_store::LogEntry =
-                        serde_json::from_value(value).expect("LogEntry deserialise");
-                    match entry {
-                        session_store::LogEntry::UserInput { segments, .. }
-                        | session_store::LogEntry::AnnotatedUserInput { segments, .. } => {
-                            protocol::Segment::flatten_to_text(&segments).contains(needle)
-                        }
-                        _ => false,
+            Event::Snapshot { session, .. } => {
+                return session.entries.into_iter().any(|entry| match entry.data {
+                    protocol::SessionSnapshotEntryData::UserInput { segments } => {
+                        protocol::Segment::flatten_to_text(&segments).contains(needle)
                     }
+                    _ => false,
                 });
             }
             Event::Alert(_) => continue,

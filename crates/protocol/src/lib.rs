@@ -340,8 +340,7 @@ pub struct InternalWorkerRef {
 pub struct InternalWorkerSnapshot {
     pub worker: InternalWorkerRef,
     pub revision: u64,
-    #[cfg_attr(feature = "typescript", ts(type = "Array<unknown>"))]
-    pub entries: Vec<serde_json::Value>,
+    pub session: SessionSnapshot,
     #[serde(default)]
     pub status: WorkerStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -364,12 +363,114 @@ pub enum ToolResultDisposition {
     OutcomeUnknown,
 }
 
+/// Canonical, storage-independent projection of committed session history.
+///
+/// Worker protocols expose this DTO instead of append-log records. New
+/// storage variants can therefore be added without teaching every client how
+/// to replay the durable log format.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct SessionSnapshot {
+    pub entries: Vec<SessionSnapshotEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum SessionEntryProvenance {
+    HumanInput,
+    WorkerInput,
+    FlowInstruction,
+    BackendInstruction,
+    ModelOutput,
+    ToolOutput,
+    DerivedSummary,
+    LegacyUnknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct SessionSnapshotEntry {
+    /// Stable identity from durable history metadata, or a deterministic
+    /// identity derived from the legacy segment and log position.
+    pub entry_id: String,
+    /// Timestamp copied from the durable log record that commits this entry.
+    pub timestamp: u64,
+    pub provenance: SessionEntryProvenance,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derived_from: Vec<String>,
+    #[serde(flatten)]
+    pub data: SessionSnapshotEntryData,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionSnapshotEntryData {
+    UserInput {
+        segments: Vec<Segment>,
+    },
+    Message {
+        role: SessionMessageRole,
+        content: Vec<SessionContentPart>,
+    },
+    ToolCall {
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
+    ToolResult {
+        call_id: String,
+        summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+        is_error: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<SessionToolAttachment>,
+    },
+    SystemItem {
+        item_kind: String,
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
+        data: Option<serde_json::Value>,
+    },
+    RunError {
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMessageRole {
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionContentPart {
+    Text { text: String },
+    Refusal { refusal: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct SessionToolAttachment {
+    pub media_type: String,
+    /// Base64-encoded durable attachment body. Public snapshots preserve the
+    /// committed multimodal value instead of replacing it with placeholder text.
+    pub data_base64: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum Event {
     /// A user input message was accepted, persisted as
-    /// `LogEntry::UserInput`, and is about to start a new turn.
+    /// `LogEntry::AnnotatedUserInput`, and is about to start a new turn.
     /// Broadcast to every subscribed client so TUI / GUI instances show
     /// the same user line that reconnect snapshots would replay from
     /// history; clients must not synthesize a separate pending/fake
@@ -390,7 +491,7 @@ pub enum Event {
     /// of parsing free-text prefixes like `[Notification] …` or
     /// `[File: …]`.
     ///
-    /// One event per `LogEntry::SystemItem` commit. Disk-side and
+    /// One event per `LogEntry::AnnotatedSystemItem` commit. Disk-side and
     /// wire-side are 1:1.
     SystemItem {
         #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
@@ -555,8 +656,7 @@ pub enum Event {
     /// role-specific entry events (`SegmentRotated` / `SystemItem`) —
     /// there is no generic "every committed entry" broadcast.
     Snapshot {
-        #[cfg_attr(feature = "typescript", ts(type = "Array<unknown>"))]
-        entries: Vec<serde_json::Value>,
+        session: SessionSnapshot,
         greeting: Greeting,
         #[serde(default)]
         status: WorkerStatus,
@@ -589,14 +689,10 @@ pub enum Event {
     /// Server-side segment log rotated to a fresh `SegmentStart`.
     ///
     /// Fires on compaction and on auto-fork when the store head drifts
-    /// from the live writer's cached head. Clients drop their derived
-    /// view and reseed from `entry.history` exactly the way they would
-    /// from a connect-time `Snapshot`.
-    ///
-    /// Payload is the JSON form of `session_store::LogEntry::SegmentStart`.
+    /// A compaction/fork has replaced the authoritative segment. Clients drop
+    /// their derived view and reseed from the canonical committed snapshot.
     SegmentRotated {
-        #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
-        entry: serde_json::Value,
+        session: SessionSnapshot,
     },
     /// Current Worker controller status. Broadcast on every controller-level
     /// transition and included in `History` snapshots for late attach.
@@ -623,11 +719,10 @@ pub enum Event {
         head_entries: usize,
         targets: Vec<RewindTarget>,
     },
-    /// A rewind has truncated the authoritative session. `entries` is the
-    /// retained session-log prefix clients should use to reseed display state.
+    /// A rewind has truncated the authoritative session. `session` is the
+    /// retained canonical snapshot clients should use to reseed display state.
     RewindApplied {
-        #[cfg_attr(feature = "typescript", ts(type = "Array<unknown>"))]
-        entries: Vec<serde_json::Value>,
+        session: SessionSnapshot,
         input: Vec<Segment>,
         summary: RewindSummary,
     },
@@ -1440,7 +1535,17 @@ mod tests {
     #[test]
     fn event_snapshot_format() {
         let event = Event::Snapshot {
-            entries: vec![serde_json::json!({"kind": "user_input", "ts": 1, "segments": []})],
+            session: SessionSnapshot {
+                entries: vec![SessionSnapshotEntry {
+                    entry_id: "entry-1".into(),
+                    timestamp: 1,
+                    provenance: SessionEntryProvenance::HumanInput,
+                    derived_from: Vec::new(),
+                    data: SessionSnapshotEntryData::UserInput {
+                        segments: Vec::new(),
+                    },
+                }],
+            },
             greeting: Greeting {
                 worker_name: "test".into(),
                 cwd: "/tmp".into(),
@@ -1458,8 +1563,12 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["event"], "snapshot");
-        assert!(parsed["data"]["entries"].is_array());
-        assert_eq!(parsed["data"]["entries"][0]["kind"], "user_input");
+        assert!(parsed["data"]["session"]["entries"].is_array());
+        assert_eq!(
+            parsed["data"]["session"]["entries"][0]["kind"],
+            "user_input"
+        );
+        assert_eq!(parsed["data"]["session"]["entries"][0]["timestamp"], 1);
         assert_eq!(parsed["data"]["greeting"]["worker_name"], "test");
         assert_eq!(parsed["data"]["greeting"]["tools"][0], "Read");
         assert_eq!(parsed["data"]["greeting"]["context_window"], 200_000);
@@ -1469,7 +1578,7 @@ mod tests {
 
     #[test]
     fn event_snapshot_in_flight_roundtrip_and_default() {
-        let inbound = r#"{"event":"snapshot","data":{"entries":[],"greeting":{"worker_name":"test","cwd":"/tmp","provider":"p","model":"m","scope_summary":"s","tools":[]},"status":"running"}}"#;
+        let inbound = r#"{"event":"snapshot","data":{"session":{"entries":[]},"greeting":{"worker_name":"test","cwd":"/tmp","provider":"p","model":"m","scope_summary":"s","tools":[]},"status":"running"}}"#;
         let decoded: Event = serde_json::from_str(inbound).unwrap();
         match decoded {
             Event::Snapshot { in_flight, .. } => assert!(in_flight.is_empty()),
@@ -1477,7 +1586,9 @@ mod tests {
         }
 
         let event = Event::Snapshot {
-            entries: Vec::new(),
+            session: SessionSnapshot {
+                entries: Vec::new(),
+            },
             greeting: Greeting {
                 worker_name: "test".into(),
                 cwd: "/tmp".into(),
@@ -1543,15 +1654,17 @@ mod tests {
     #[test]
     fn event_segment_rotated_roundtrip() {
         let event = Event::SegmentRotated {
-            entry: serde_json::json!({"kind": "segment_start", "ts": 1, "history": []}),
+            session: SessionSnapshot {
+                entries: Vec::new(),
+            },
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["event"], "segment_rotated");
-        assert_eq!(parsed["data"]["entry"]["kind"], "segment_start");
+        assert!(parsed["data"]["session"]["entries"].is_array());
         let decoded: Event = serde_json::from_str(&json).unwrap();
         match decoded {
-            Event::SegmentRotated { entry } => assert_eq!(entry["kind"], "segment_start"),
+            Event::SegmentRotated { session } => assert!(session.entries.is_empty()),
             other => panic!("expected SegmentRotated, got {other:?}"),
         }
     }
@@ -1627,8 +1740,8 @@ mod tests {
     }
 
     #[test]
-    fn event_snapshot_legacy_without_status_defaults_to_idle() {
-        let json = r#"{"event":"snapshot","data":{"entries":[],"greeting":{"worker_name":"test","cwd":"/tmp","provider":"anthropic","model":"claude","scope_summary":"","tools":[]}}}"#;
+    fn event_snapshot_without_status_defaults_to_idle() {
+        let json = r#"{"event":"snapshot","data":{"session":{"entries":[]},"greeting":{"worker_name":"test","cwd":"/tmp","provider":"anthropic","model":"claude","scope_summary":"","tools":[]}}}"#;
         let decoded: Event = serde_json::from_str(json).unwrap();
         match decoded {
             Event::Snapshot {
@@ -2039,11 +2152,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_snapshot_defaults_internal_workers_to_empty() {
+    fn snapshot_defaults_internal_workers_to_empty() {
         let snapshot: Event = serde_json::from_value(serde_json::json!({
             "event": "snapshot",
             "data": {
-                "entries": [],
+                "session": { "entries": [] },
                 "greeting": {
                     "worker_name": "parent",
                     "cwd": ".",

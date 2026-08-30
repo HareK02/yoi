@@ -5,7 +5,6 @@
 //! retained only as explicit `LegacyUnknown` entries.
 
 use agen::{HistoryEntry, Item};
-use protocol::Segment;
 use session_store::{
     LogEntry, LoggedHistoryDerivation, LoggedHistoryEntry, LoggedSessionHistoryEntryId,
     LoggedSessionHistoryMetadata, LoggedSessionHistoryOrigin, LoggedWorkerSubject, SegmentId,
@@ -17,6 +16,32 @@ pub type SessionHistoryMetadata = LoggedSessionHistoryMetadata;
 pub type WorkerHistoryProvenance = LoggedSessionHistoryOrigin;
 pub type SessionHistoryDerivation = LoggedHistoryDerivation;
 pub type WorkerSubjectSnapshot = LoggedWorkerSubject;
+
+#[cfg(test)]
+pub(crate) fn test_logged_history_entry(item: impl Into<Item>) -> LoggedHistoryEntry {
+    LoggedHistoryEntry {
+        item: session_store::LoggedItem::from(item.into()),
+        metadata: LoggedSessionHistoryMetadata {
+            entry_id: LoggedSessionHistoryEntryId::new(),
+            origin: LoggedSessionHistoryOrigin::LegacyUnknown,
+            derivation: None,
+        },
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_logged_system_entry(
+    item: session_store::SystemItem,
+) -> session_store::LoggedSystemHistoryEntry {
+    session_store::LoggedSystemHistoryEntry {
+        item,
+        metadata: LoggedSessionHistoryMetadata {
+            entry_id: LoggedSessionHistoryEntryId::new(),
+            origin: LoggedSessionHistoryOrigin::LegacyUnknown,
+            derivation: None,
+        },
+    }
+}
 
 pub(crate) fn worker_subject(session_id: SessionId) -> WorkerSubjectSnapshot {
     WorkerSubjectSnapshot {
@@ -53,10 +78,6 @@ pub(crate) fn to_logged_history_entry(
     }
 }
 
-fn legacy_entry(item: Item) -> HistoryEntry<SessionHistoryMetadata> {
-    HistoryEntry::new(item, SessionHistoryMetadata::legacy_unknown())
-}
-
 fn from_logged(entry: &LoggedHistoryEntry) -> HistoryEntry<SessionHistoryMetadata> {
     HistoryEntry::new(Item::from(entry.item.clone()), entry.metadata.clone())
 }
@@ -74,32 +95,15 @@ pub(crate) fn restore_history_entries(
             LogEntry::AnnotatedSegmentStart { history: seed, .. } => {
                 history = seed.iter().map(from_logged).collect();
             }
-            LogEntry::SegmentStart { history: seed, .. } => {
-                history = seed
-                    .iter()
-                    .cloned()
-                    .map(Item::from)
-                    .map(legacy_entry)
-                    .collect();
-            }
             LogEntry::AnnotatedUserInput { history: input, .. } => {
                 history.extend(input.iter().map(from_logged))
             }
-            LogEntry::UserInput { segments, .. } => history.push(legacy_entry(Item::user_message(
-                Segment::flatten_to_text(segments),
-            ))),
             LogEntry::AnnotatedAssistantItem { entry, .. }
             | LogEntry::AnnotatedToolResult { entry, .. } => history.push(from_logged(entry)),
-            LogEntry::AssistantItem { item, .. } | LogEntry::ToolResult { item, .. } => {
-                history.push(legacy_entry(Item::from(item.clone())));
-            }
             LogEntry::AnnotatedSystemItem { entry, .. } => history.push(HistoryEntry::new(
                 entry.item.to_history_item(),
                 entry.metadata.clone(),
             )),
-            LogEntry::SystemItem { item, .. } => {
-                history.push(legacy_entry(item.to_history_item()));
-            }
             _ => {}
         }
     }
@@ -110,22 +114,8 @@ pub(crate) fn restore_history_entries(
 mod tests {
     use super::*;
     use agen::llm_client::RequestConfig;
+    use protocol::Segment;
     use session_store::LogEntry;
-
-    #[test]
-    fn legacy_user_role_is_not_inferred_as_human_authority() {
-        let entries = vec![LogEntry::UserInput {
-            ts: 1,
-            segments: vec![Segment::text("legacy")],
-            extensions: Vec::new(),
-        }];
-        let restored =
-            restore_history_entries(SessionId::now_v7(), SegmentId::now_v7(), &entries).unwrap();
-        assert!(matches!(
-            restored[0].annotation.origin,
-            WorkerHistoryProvenance::LegacyUnknown
-        ));
-    }
 
     #[test]
     fn typed_flow_and_unknown_caller_input_round_trip_without_role_inference() {

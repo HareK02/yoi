@@ -765,7 +765,7 @@ impl App {
 
     fn method_for_run(&mut self, segments: Vec<Segment>) -> Method {
         // TurnHeader / UserMessage blocks are pushed only after the Worker
-        // emits `Event::UserMessage` from a committed `LogEntry::UserInput`.
+        // emits `Event::UserMessage` from a committed `LogEntry::AnnotatedUserInput`.
         // Locally we only clear the input buffer and forward the method,
         // while remembering enough local state to undo the visible submit if
         // the accepted run produced no assistant output and was rolled back.
@@ -1098,10 +1098,9 @@ impl App {
                 self.blocks.push(Block::UserMessage { segments });
                 self.assistant_streaming = false;
             }
-            Event::SegmentRotated { entry } => {
+            Event::SegmentRotated { session } => {
                 let retained_run_errors = self.run_error_messages.clone();
-                self.reset_for_rotation();
-                self.apply_log_entry_raw(&entry);
+                self.restore_session(&session, self.greeting.clone());
                 for message in retained_run_errors {
                     self.blocks.push(Block::Alert {
                         level: AlertLevel::Error,
@@ -1408,14 +1407,14 @@ impl App {
                 self.latest_memory_worker_event = Some(event.message);
             }
             Event::Snapshot {
-                entries,
+                session,
                 greeting,
                 status,
                 in_flight,
                 internal_workers,
             } => {
                 self.rewind_refresh_fence = false;
-                self.restore_snapshot(&entries, greeting, in_flight);
+                self.restore_snapshot(&session, greeting, in_flight);
                 self.replace_internal_worker_snapshots(internal_workers);
                 self.set_worker_status(status);
             }
@@ -1455,11 +1454,11 @@ impl App {
                 }
             }
             Event::RewindApplied {
-                entries,
+                session,
                 input,
                 summary,
             } => {
-                self.restore_rewind_snapshot(&entries);
+                self.restore_rewind_snapshot(&session);
                 self.rewind_refresh_fence = true;
                 let restored_composer = if self.input.is_empty() {
                     self.input.replace_with_segments(&input);
@@ -2173,7 +2172,7 @@ impl App {
     ) -> InternalWorkerView {
         let mut app = App::new(snapshot.worker.name.clone());
         app.mode = mode;
-        app.restore_entries(&snapshot.entries, None);
+        app.restore_session(&snapshot.session, None);
         app.apply_in_flight_snapshot(snapshot.in_flight);
         app.set_worker_status(snapshot.status);
         if let Some(error) = snapshot.error {
@@ -2254,14 +2253,14 @@ impl App {
 
     fn restore_snapshot(
         &mut self,
-        entries: &[serde_json::Value],
+        session: &protocol::SessionSnapshot,
         greeting: protocol::Greeting,
         in_flight: InFlightSnapshot,
     ) {
         self.greeting = Some(greeting.clone());
         self.context_window = greeting.context_window;
         self.session_context_tokens = greeting.context_tokens;
-        self.restore_entries(entries, Some(greeting));
+        self.restore_session(session, Some(greeting));
         self.apply_in_flight_snapshot(in_flight);
     }
 
@@ -2270,7 +2269,7 @@ impl App {
     /// session tail; always clear/replay from it even if this TUI instance has
     /// somehow lost connect-time greeting metadata. Skipping the restore in
     /// that case would leave old post-target output visible after success.
-    fn restore_rewind_snapshot(&mut self, entries: &[serde_json::Value]) {
+    fn restore_rewind_snapshot(&mut self, session: &protocol::SessionSnapshot) {
         let greeting = self.greeting.clone().or_else(|| {
             self.blocks.iter().find_map(|b| match b {
                 Block::Greeting(g) => Some(g.clone()),
@@ -2283,7 +2282,7 @@ impl App {
             self.session_context_tokens = greeting.context_tokens;
         }
         let missing_greeting = greeting.is_none();
-        self.restore_entries(entries, greeting);
+        self.restore_session(session, greeting);
         if missing_greeting {
             self.blocks.push(Block::Alert {
                 level: AlertLevel::Warn,
@@ -2293,9 +2292,9 @@ impl App {
         }
     }
 
-    fn restore_entries(
+    fn restore_session(
         &mut self,
-        entries: &[serde_json::Value],
+        session: &protocol::SessionSnapshot,
         greeting: Option<protocol::Greeting>,
     ) {
         self.run_error_messages.clear();
@@ -2309,78 +2308,83 @@ impl App {
         }
         self.assistant_streaming = false;
 
-        for entry in entries {
-            self.apply_log_entry_raw(entry);
+        for entry in &session.entries {
+            use protocol::{SessionContentPart, SessionMessageRole, SessionSnapshotEntryData};
+            match &entry.data {
+                SessionSnapshotEntryData::UserInput { segments } => {
+                    self.turn_index += 1;
+                    self.blocks.push(Block::TurnHeader {
+                        turn: self.turn_index,
+                    });
+                    if !segments.is_empty() {
+                        self.blocks.push(Block::UserMessage {
+                            segments: segments.clone(),
+                        });
+                    }
+                }
+                SessionSnapshotEntryData::Message { role, content } => {
+                    let role = match role {
+                        SessionMessageRole::User => agen::Role::User,
+                        SessionMessageRole::Assistant => agen::Role::Assistant,
+                    };
+                    let item = agen::Item::Message {
+                        id: None,
+                        role,
+                        content: content
+                            .iter()
+                            .map(|part| match part {
+                                SessionContentPart::Text { text } => {
+                                    agen::ContentPart::Text { text: text.clone() }
+                                }
+                                SessionContentPart::Refusal { refusal } => {
+                                    agen::ContentPart::Refusal {
+                                        refusal: refusal.clone(),
+                                    }
+                                }
+                            })
+                            .collect(),
+                        status: None,
+                    };
+                    let value = serde_json::to_value(item).expect("Item is Serialize");
+                    self.push_history_item(&value);
+                }
+                SessionSnapshotEntryData::ToolCall {
+                    call_id,
+                    name,
+                    arguments,
+                } => {
+                    let item =
+                        agen::Item::tool_call(call_id.clone(), name.clone(), arguments.clone());
+                    let value = serde_json::to_value(item).expect("Item is Serialize");
+                    self.push_history_item(&value);
+                }
+                SessionSnapshotEntryData::ToolResult {
+                    call_id,
+                    summary,
+                    content,
+                    is_error,
+                    ..
+                } => {
+                    let item = agen::Item::tool_result_item(
+                        call_id.clone(),
+                        summary.clone(),
+                        content.clone(),
+                        *is_error,
+                    );
+                    let value = serde_json::to_value(item).expect("Item is Serialize");
+                    self.push_history_item(&value);
+                }
+                SessionSnapshotEntryData::SystemItem { data, .. } => {
+                    if let Some(data) = data {
+                        self.apply_system_item(data);
+                    }
+                }
+                SessionSnapshotEntryData::RunError { message } => {
+                    self.push_run_error(message.clone());
+                }
+            }
         }
-
         self.mark_orphan_tool_calls_incomplete_pass();
-    }
-
-    /// Drop the derived view in preparation for replaying a new
-    /// `SegmentStart` (compaction / fork). Greeting is preserved
-    /// because the Worker identity hasn't changed.
-    fn reset_for_rotation(&mut self) {
-        let greeting = self.blocks.iter().find_map(|b| match b {
-            Block::Greeting(g) => Some(g.clone()),
-            _ => None,
-        });
-        self.turn_index = 0;
-        self.blocks.clear();
-        self.cache = FileCache::new();
-        self.task_store = TaskStore::new();
-        self.task_pane_scroll = 0;
-        if let Some(g) = greeting {
-            self.greeting = Some(g.clone());
-            self.blocks.push(Block::Greeting(g));
-        }
-    }
-
-    /// Walk a single `LogEntry` JSON value and translate it into blocks
-    /// the live event path would have produced. Shared between
-    /// `restore_snapshot` (replay path) and `apply_log_entry` (live
-    /// path).
-    fn apply_log_entry_raw(&mut self, value: &serde_json::Value) {
-        let Ok(entry) = serde_json::from_value::<session_store::LogEntry>(value.clone()) else {
-            return;
-        };
-        match entry {
-            session_store::LogEntry::SegmentStart { history, .. } => {
-                for logged in history {
-                    let item: agen::Item = logged.into();
-                    let item_value = serde_json::to_value(&item).expect("Item is Serialize");
-                    self.push_history_item(&item_value);
-                }
-            }
-            session_store::LogEntry::UserInput { segments, .. } => {
-                self.turn_index += 1;
-                self.blocks.push(Block::TurnHeader {
-                    turn: self.turn_index,
-                });
-                if !segments.is_empty() {
-                    self.blocks.push(Block::UserMessage { segments });
-                }
-            }
-            session_store::LogEntry::AssistantItem { item, .. }
-            | session_store::LogEntry::ToolResult { item, .. } => {
-                let it: agen::Item = item.into();
-                let item_value = serde_json::to_value(&it).expect("Item is Serialize");
-                self.push_history_item(&item_value);
-            }
-            session_store::LogEntry::SystemItem { item, .. } => {
-                let value = serde_json::to_value(&item).expect("SystemItem is Serialize");
-                self.apply_system_item(&value);
-            }
-            session_store::LogEntry::Extension {
-                domain, payload, ..
-            } if domain == "yoi.compaction" => {
-                self.apply_compaction_extension(&payload);
-            }
-            session_store::LogEntry::RunErrored { message, .. } => {
-                self.push_run_error(message);
-            }
-            // Non-history-bearing variants don't affect the block view.
-            _ => {}
-        }
     }
 
     /// Dispatch one `SystemItem` JSON value into the appropriate block.
@@ -2388,58 +2392,6 @@ impl App {
     /// Kind-based routing replaces the old free-text `[Notification]` /
     /// `[File: …]` parsing path: each kind maps directly to a typed
     /// block (`Block::Notify`, `Block::WorkerEvent`, …).
-    fn apply_compaction_extension(&mut self, payload: &serde_json::Value) {
-        if payload.get("kind").and_then(|value| value.as_str()) != Some("compaction_block") {
-            return;
-        }
-        match payload.get("state").and_then(|value| value.as_str()) {
-            Some("running") => {
-                if self.last_streaming_compact_mut().is_none() {
-                    self.blocks.push(Block::Compact(CompactEvent::Streaming {
-                        started_at: Instant::now(),
-                    }));
-                }
-            }
-            Some("done") => {
-                let new_segment_id = payload
-                    .get("new_segment_id")
-                    .and_then(|value| value.as_str())
-                    .and_then(|value| value.parse::<uuid::Uuid>().ok())
-                    .unwrap_or_else(uuid::Uuid::nil);
-                if let Some(evt) = self.last_streaming_compact_mut() {
-                    *evt = CompactEvent::Done {
-                        new_segment_id,
-                        elapsed_secs: None,
-                    };
-                } else {
-                    self.blocks.push(Block::Compact(CompactEvent::Done {
-                        new_segment_id,
-                        elapsed_secs: None,
-                    }));
-                }
-            }
-            Some("failed") => {
-                let error = payload
-                    .get("error")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("compact failed")
-                    .to_string();
-                if let Some(evt) = self.last_streaming_compact_mut() {
-                    *evt = CompactEvent::Failed {
-                        error,
-                        elapsed_secs: None,
-                    };
-                } else {
-                    self.blocks.push(Block::Compact(CompactEvent::Failed {
-                        error,
-                        elapsed_secs: None,
-                    }));
-                }
-            }
-            _ => {}
-        }
-    }
-
     fn apply_system_item(&mut self, value: &serde_json::Value) {
         let Ok(item) = serde_json::from_value::<session_store::SystemItem>(value.clone()) else {
             // Unknown / forward-compat shape: fall back to rendering the
@@ -2540,6 +2492,15 @@ fn fmt_millis(ms: u64) -> String {
     } else {
         format!("{ms}ms")
     }
+}
+
+#[cfg(test)]
+fn public_session(values: Vec<serde_json::Value>) -> protocol::SessionSnapshot {
+    let entries = values
+        .into_iter()
+        .map(|value| serde_json::from_value(value).expect("LogEntry deserializes"))
+        .collect::<Vec<session_store::LogEntry>>();
+    session_store::public_snapshot::project_current_session_snapshot(&entries)
 }
 
 fn message_text(item: &serde_json::Value) -> String {
@@ -2685,7 +2646,7 @@ mod rewind_refresh_tests {
         });
 
         app.handle_worker_event(Event::RewindApplied {
-            entries: vec![],
+            session: protocol::SessionSnapshot { entries: vec![] },
             input: vec![Segment::text("selected rewind input")],
             summary: summary(3),
         });
@@ -2704,7 +2665,7 @@ mod rewind_refresh_tests {
         });
 
         app.handle_worker_event(Event::RewindApplied {
-            entries: vec![],
+            session: protocol::SessionSnapshot { entries: vec![] },
             input: vec![Segment::text("rewound input")],
             summary: summary(1),
         });
@@ -2747,7 +2708,7 @@ mod rewind_refresh_tests {
         });
 
         app.handle_worker_event(Event::RewindApplied {
-            entries: vec![],
+            session: protocol::SessionSnapshot { entries: vec![] },
             input: vec![Segment::text("rewound input")],
             summary: summary(2),
         });
@@ -2975,6 +2936,17 @@ mod composer_history_persistence_tests {
 #[cfg(test)]
 mod completion_flow_tests {
     use super::*;
+
+    fn annotated(item: agen::Item) -> session_store::LoggedHistoryEntry {
+        session_store::LoggedHistoryEntry {
+            item: session_store::LoggedItem::from(item),
+            metadata: session_store::LoggedSessionHistoryMetadata {
+                entry_id: session_store::LoggedSessionHistoryEntryId::new(),
+                origin: session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
+                derivation: None,
+            },
+        }
+    }
 
     #[test]
     fn typing_at_creates_completion_state_and_emits_query() {
@@ -3278,7 +3250,7 @@ mod completion_flow_tests {
     #[test]
     fn committed_user_message_survives_fresh_segment_rotation() {
         let mut app = App::new("test".into());
-        let start = session_store::LogEntry::SegmentStart {
+        let start = session_store::LogEntry::AnnotatedSegmentStart {
             ts: session_store::segment_log::now_millis(),
             session_id: uuid::Uuid::nil(),
             system_prompt: None,
@@ -3289,7 +3261,9 @@ mod completion_flow_tests {
         };
 
         app.handle_worker_event(Event::SegmentRotated {
-            entry: serde_json::to_value(start).expect("LogEntry is Serialize"),
+            session: public_session(vec![
+                serde_json::to_value(start).expect("LogEntry is Serialize"),
+            ]),
         });
         app.handle_worker_event(Event::UserMessage {
             segments: vec![Segment::text("first persisted message")],
@@ -3533,23 +3507,23 @@ mod completion_flow_tests {
     }
 
     #[test]
-    fn snapshot_renders_system_message_block_from_session_start() {
+    fn snapshot_excludes_system_prompt_history_from_public_blocks() {
         let mut app = App::new("test".into());
-        let session_start = session_store::LogEntry::SegmentStart {
+        let session_start = session_store::LogEntry::AnnotatedSegmentStart {
             ts: 1,
             session_id: uuid::Uuid::nil(),
             system_prompt: None,
             config: Default::default(),
-            history: vec![session_store::LoggedItem::from(
-                &agen::Item::system_message("[File: src/main.rs]\nfn main() {}"),
-            )],
+            history: vec![annotated(agen::Item::system_message(
+                "[File: src/main.rs]\nfn main() {}",
+            ))],
             forked_from: None,
             compacted_from: None,
         };
         let session_start_value = serde_json::to_value(&session_start).unwrap();
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
-            entries: vec![session_start_value],
+            session: public_session(vec![session_start_value]),
             status: WorkerStatus::Running,
             in_flight: Default::default(),
             internal_workers: Vec::new(),
@@ -3557,10 +3531,8 @@ mod completion_flow_tests {
 
         assert!(matches!(app.worker_status, WorkerStatus::Running));
         assert!(app.running);
-        assert!(matches!(
-            app.blocks.get(1),
-            Some(Block::SystemMessage { text }) if text == "[File: src/main.rs]\nfn main() {}"
-        ));
+        assert_eq!(app.blocks.len(), 1);
+        assert!(matches!(app.blocks.first(), Some(Block::Greeting(_))));
     }
 
     #[test]
@@ -3595,7 +3567,7 @@ mod completion_flow_tests {
         };
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
-            entries: vec![serde_json::to_value(run_errored).unwrap()],
+            session: public_session(vec![serde_json::to_value(run_errored).unwrap()]),
             status: WorkerStatus::Idle,
             in_flight: Default::default(),
             internal_workers: Vec::new(),
@@ -3623,7 +3595,7 @@ mod completion_flow_tests {
             code: ErrorCode::ProviderError,
             message: "provider unavailable".into(),
         });
-        let segment_start = session_store::LogEntry::SegmentStart {
+        let segment_start = session_store::LogEntry::AnnotatedSegmentStart {
             ts: 5,
             session_id: uuid::Uuid::nil(),
             system_prompt: None,
@@ -3633,7 +3605,7 @@ mod completion_flow_tests {
             compacted_from: None,
         };
         app.handle_worker_event(Event::SegmentRotated {
-            entry: serde_json::to_value(segment_start).unwrap(),
+            session: public_session(vec![serde_json::to_value(segment_start).unwrap()]),
         });
 
         let errors = app
@@ -3656,7 +3628,9 @@ mod completion_flow_tests {
         let mut app = App::new("test".into());
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
-            entries: Vec::new(),
+            session: protocol::SessionSnapshot {
+                entries: Vec::new(),
+            },
             status: WorkerStatus::Running,
             in_flight: InFlightSnapshot {
                 blocks: vec![
@@ -3762,7 +3736,9 @@ mod completion_flow_tests {
             },
             revision,
             status: WorkerStatus::Idle,
-            entries: Vec::new(),
+            session: protocol::SessionSnapshot {
+                entries: Vec::new(),
+            },
             in_flight: protocol::InFlightSnapshot::default(),
             error: None,
             internal_workers: Vec::new(),
@@ -3977,7 +3953,9 @@ mod completion_flow_tests {
         assert_eq!(app.selected_worker_view().worker_name, "parent");
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
-            entries: Vec::new(),
+            session: protocol::SessionSnapshot {
+                entries: Vec::new(),
+            },
             status: WorkerStatus::Idle,
             in_flight: Default::default(),
             internal_workers: Vec::new(),
@@ -4026,7 +4004,9 @@ mod completion_flow_tests {
         });
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
-            entries: Vec::new(),
+            session: protocol::SessionSnapshot {
+                entries: Vec::new(),
+            },
             status: WorkerStatus::Idle,
             in_flight: Default::default(),
             internal_workers: vec![InternalWorkerSnapshot {
@@ -4037,7 +4017,9 @@ mod completion_flow_tests {
                     kind: protocol::InternalWorkerKind::SubWorker,
                 },
                 revision: 4,
-                entries: Vec::new(),
+                session: protocol::SessionSnapshot {
+                    entries: Vec::new(),
+                },
                 status: WorkerStatus::Running,
                 error: None,
                 in_flight: Default::default(),
@@ -4193,7 +4175,9 @@ mod completion_flow_tests {
         greeting.context_tokens = 45_000;
 
         app.handle_worker_event(Event::Snapshot {
-            entries: Vec::new(),
+            session: protocol::SessionSnapshot {
+                entries: Vec::new(),
+            },
             greeting,
             status: WorkerStatus::Idle,
             in_flight: Default::default(),
@@ -4363,40 +4347,37 @@ mod completion_flow_tests {
         });
 
         let assistant_item_entries = vec![
-            serde_json::json!({
-                "kind": "assistant_item",
-                "ts": 1,
-                "item": {
-                    "kind": "tool_call",
-                    "call_id": "c1",
-                    "name": "TaskCreate",
-                    "arguments": r#"{"subject":"a","description":"A"}"#,
-                },
-            }),
-            serde_json::json!({
-                "kind": "assistant_item",
-                "ts": 2,
-                "item": {
-                    "kind": "tool_call",
-                    "call_id": "c2",
-                    "name": "TaskCreate",
-                    "arguments": r#"{"subject":"b","description":"B"}"#,
-                },
-            }),
-            serde_json::json!({
-                "kind": "assistant_item",
-                "ts": 3,
-                "item": {
-                    "kind": "tool_call",
-                    "call_id": "u1",
-                    "name": "TaskUpdate",
-                    "arguments": r#"{"taskid":2,"status":"inprogress"}"#,
-                },
-            }),
+            serde_json::to_value(session_store::LogEntry::AnnotatedAssistantItem {
+                ts: 1,
+                entry: annotated(agen::Item::tool_call(
+                    "c1",
+                    "TaskCreate",
+                    r#"{"subject":"a","description":"A"}"#,
+                )),
+            })
+            .unwrap(),
+            serde_json::to_value(session_store::LogEntry::AnnotatedAssistantItem {
+                ts: 2,
+                entry: annotated(agen::Item::tool_call(
+                    "c2",
+                    "TaskCreate",
+                    r#"{"subject":"b","description":"B"}"#,
+                )),
+            })
+            .unwrap(),
+            serde_json::to_value(session_store::LogEntry::AnnotatedAssistantItem {
+                ts: 3,
+                entry: annotated(agen::Item::tool_call(
+                    "u1",
+                    "TaskUpdate",
+                    r#"{"taskid":2,"status":"inprogress"}"#,
+                )),
+            })
+            .unwrap(),
         ];
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
-            entries: assistant_item_entries,
+            session: public_session(assistant_item_entries),
             status: WorkerStatus::Running,
             in_flight: Default::default(),
             internal_workers: Vec::new(),

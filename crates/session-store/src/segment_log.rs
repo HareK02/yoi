@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::history::{LoggedHistoryEntry, LoggedSystemHistoryEntry};
 use crate::logged_item::LoggedItem;
-use crate::system_item::SystemItem;
 
 /// A single segment log entry, serialized as one JSONL line.
 ///
@@ -50,28 +49,7 @@ impl SessionExtension {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LogEntry {
-    /// Segment start. Always the first entry in a segment log.
-    /// For forked segments, `history` contains the seed state from the parent.
-    SegmentStart {
-        ts: u64,
-        /// Session this segment belongs to. Compaction / fork inherits
-        /// the source segment's session_id; only fresh "new conversation"
-        /// segments mint a new session_id.
-        session_id: crate::SessionId,
-        system_prompt: Option<String>,
-        config: RequestConfig,
-        history: Vec<LoggedItem>,
-        /// Origin: forked from a sibling segment at a specific turn boundary.
-        /// The referenced segment is guaranteed to share `session_id`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        forked_from: Option<SegmentOrigin>,
-        /// Origin: compacted from a sibling segment at a specific turn boundary.
-        /// The referenced segment is guaranteed to share `session_id`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        compacted_from: Option<SegmentOrigin>,
-    },
-
-    /// Schema-v2 segment seed. Retained entries keep their stable logical
+    /// Canonical segment seed. Retained entries keep their stable logical
     /// identity and origin across fork/compaction/restore.
     AnnotatedSegmentStart {
         ts: u64,
@@ -105,22 +83,7 @@ pub enum LogEntry {
     /// restore conservatively instead of re-running a dangling tool call.
     Invoke { ts: u64, trigger: InvokeKind },
 
-    /// User input accepted at submit time. Carries the original typed
-    /// `Vec<Segment>` so clients can re-render typed atoms (paste chips,
-    /// file refs) on segment restore.
-    /// Replay flattens these into a `Item::user_message` for the worker
-    /// history; the worker layer never sees segments directly.
-    UserInput {
-        ts: u64,
-        segments: Vec<Segment>,
-        /// Typed durable state committed atomically with this input record.
-        /// Runtime-owned Flow invocation uses this to avoid a Backend-instance
-        /// commit that can get ahead of Worker history.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        extensions: Vec<SessionExtension>,
-    },
-
-    /// Schema-v2 user submission with its exact model-visible entries. Typed
+    /// Canonical user submission with its exact model-visible entries. Typed
     /// Flow instructions and caller-attributed input remain separate entries.
     AnnotatedUserInput {
         ts: u64,
@@ -130,34 +93,18 @@ pub enum LogEntry {
         history: Vec<LoggedHistoryEntry>,
     },
 
-    /// Schema-v2 model output and metadata committed as one journal record.
+    /// Canonical model output and metadata committed as one journal record.
     AnnotatedAssistantItem { ts: u64, entry: LoggedHistoryEntry },
 
-    /// One assistant-side item appended to history — assistant message,
-    /// reasoning, or tool call. Singular: one entry per history item so
-    /// the wire-side `Event::*` lane and on-disk LogEntry stay 1:1.
-    AssistantItem { ts: u64, item: LoggedItem },
-
-    /// Schema-v2 tool output and metadata committed as one journal record.
+    /// Canonical tool output and metadata committed as one journal record.
     AnnotatedToolResult { ts: u64, entry: LoggedHistoryEntry },
 
-    /// One tool-execution result appended to history.
-    ToolResult { ts: u64, item: LoggedItem },
-
-    /// Schema-v2 typed system event and model-visible metadata committed
+    /// Canonical typed system event and model-visible metadata committed
     /// together.
     AnnotatedSystemItem {
         ts: u64,
         entry: LoggedSystemHistoryEntry,
     },
-
-    /// One typed agent-injected system item: notification, child-Worker
-    /// lifecycle event, `@<path>` / `/<slug>` resolution payload. Each
-    /// `SystemItem` carries kind metadata that the LLM
-    /// itself never sees (the LLM gets `Item::system_message` with the
-    /// item's denormalised `body`), but live clients and replay paths
-    /// dispatch on `kind` for typed rendering.
-    SystemItem { ts: u64, item: SystemItem },
 
     /// Turn boundary. Records the turn count after increment.
     TurnEnd { ts: u64, turn_count: usize },
@@ -260,6 +207,10 @@ pub struct RestoredState {
     pub system_prompt: Option<String>,
     pub config: RequestConfig,
     pub history: Vec<Item>,
+    /// Canonical persisted history with stable identity and provenance. This is
+    /// the authority for rewrites, forks, and annotated restore; `history` is
+    /// retained as the model-facing item projection.
+    pub annotated_history: Vec<LoggedHistoryEntry>,
     pub turn_count: usize,
     /// AgentTurns consumed by the active paused/yielded logical run.
     pub active_run_turn_count: Option<usize>,
@@ -276,7 +227,7 @@ pub struct RestoredState {
     /// session-store は domain を不透明扱いし、各ドメインが自前で fold する。
     pub extensions: Vec<(String, serde_json::Value)>,
     /// User submissions in original typed form, in submit order.
-    /// One entry per `LogEntry::UserInput`; the K-th entry corresponds to
+    /// One entry per `LogEntry::AnnotatedUserInput`; the K-th entry corresponds to
     /// the K-th `Item::user_message` derived during replay (modulo
     /// pre-compaction history seeded via `SegmentStart.history`, whose
     /// original segments are not preserved). Used by clients to re-render
@@ -291,6 +242,7 @@ pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
         system_prompt: None,
         config: RequestConfig::default(),
         history: Vec::new(),
+        annotated_history: Vec::new(),
         turn_count: 0,
         active_run_turn_count: None,
         last_run_interrupted: false,
@@ -304,18 +256,6 @@ pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
         state.entries_count += 1;
 
         match entry {
-            LogEntry::SegmentStart {
-                session_id,
-                system_prompt,
-                config,
-                history,
-                ..
-            } => {
-                state.session_id = Some(*session_id);
-                state.system_prompt = system_prompt.clone();
-                state.config = config.clone();
-                state.history = history.iter().cloned().map(Item::from).collect();
-            }
             LogEntry::AnnotatedSegmentStart {
                 session_id,
                 system_prompt,
@@ -326,6 +266,7 @@ pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
                 state.session_id = Some(*session_id);
                 state.system_prompt = system_prompt.clone();
                 state.config = config.clone();
+                state.annotated_history = history.clone();
                 state.history = history
                     .iter()
                     .cloned()
@@ -338,26 +279,13 @@ pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
                 state.last_run_interrupted = true;
                 state.active_run_turn_count = Some(0);
             }
-            LogEntry::UserInput {
-                segments,
-                extensions,
-                ..
-            } => {
-                let text = Segment::flatten_to_text(segments);
-                state.history.push(Item::user_message(text));
-                state.user_segments.push(segments.clone());
-                state.extensions.extend(
-                    extensions
-                        .iter()
-                        .map(|extension| (extension.domain.clone(), extension.payload.clone())),
-                );
-            }
             LogEntry::AnnotatedUserInput {
                 segments,
                 extensions,
                 history,
                 ..
             } => {
+                state.annotated_history.extend(history.iter().cloned());
                 state
                     .history
                     .extend(history.iter().cloned().map(|entry| Item::from(entry.item)));
@@ -370,19 +298,15 @@ pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
             }
             LogEntry::AnnotatedAssistantItem { entry, .. }
             | LogEntry::AnnotatedToolResult { entry, .. } => {
+                state.annotated_history.push(entry.clone());
                 state.history.push(Item::from(entry.item.clone()));
             }
             LogEntry::AnnotatedSystemItem { entry, .. } => {
+                state.annotated_history.push(LoggedHistoryEntry {
+                    item: LoggedItem::from(entry.item.to_history_item()),
+                    metadata: entry.metadata.clone(),
+                });
                 state.history.push(entry.item.to_history_item());
-            }
-            LogEntry::AssistantItem { item, .. } => {
-                state.history.push(Item::from(item.clone()));
-            }
-            LogEntry::ToolResult { item, .. } => {
-                state.history.push(Item::from(item.clone()));
-            }
-            LogEntry::SystemItem { item, .. } => {
-                state.history.push(item.to_history_item());
             }
             LogEntry::TurnEnd { turn_count, .. } => {
                 if let Some(active_turn_count) = &mut state.active_run_turn_count {
@@ -465,6 +389,20 @@ pub fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        LoggedSessionHistoryEntryId, LoggedSessionHistoryMetadata, LoggedSessionHistoryOrigin,
+    };
+
+    fn annotated(item: Item) -> LoggedHistoryEntry {
+        LoggedHistoryEntry {
+            item: LoggedItem::from(item),
+            metadata: LoggedSessionHistoryMetadata {
+                entry_id: LoggedSessionHistoryEntryId::new(),
+                origin: LoggedSessionHistoryOrigin::LegacyUnknown,
+                derivation: None,
+            },
+        }
+    }
 
     #[test]
     fn replay_empty() {
@@ -476,12 +414,12 @@ mod tests {
 
     #[test]
     fn replay_segment_start_sets_initial_state() {
-        let state = collect_state(&[LogEntry::SegmentStart {
+        let state = collect_state(&[LogEntry::AnnotatedSegmentStart {
             ts: 1000,
             session_id: uuid::Uuid::nil(),
             system_prompt: Some("You are helpful.".into()),
             config: RequestConfig::default().with_max_tokens(1024),
-            history: vec![Item::user_message("seed").into()],
+            history: vec![annotated(Item::user_message("seed"))],
             forked_from: None,
             compacted_from: None,
         }]);
@@ -494,7 +432,7 @@ mod tests {
     #[test]
     fn replay_full_turn() {
         let state = collect_state(&[
-            LogEntry::SegmentStart {
+            LogEntry::AnnotatedSegmentStart {
                 ts: 1000,
                 session_id: uuid::Uuid::nil(),
                 system_prompt: None,
@@ -503,14 +441,15 @@ mod tests {
                 forked_from: None,
                 compacted_from: None,
             },
-            LogEntry::UserInput {
+            LogEntry::AnnotatedUserInput {
                 ts: 2000,
                 extensions: vec![],
                 segments: vec![Segment::text("Hello")],
+                history: vec![annotated(Item::user_message("Hello"))],
             },
-            LogEntry::AssistantItem {
+            LogEntry::AnnotatedAssistantItem {
                 ts: 3000,
-                item: Item::assistant_message("Hi!").into(),
+                entry: annotated(Item::assistant_message("Hi!")),
             },
             LogEntry::TurnEnd {
                 ts: 3100,
@@ -531,7 +470,7 @@ mod tests {
     #[test]
     fn replay_incomplete_invoke_is_interrupted() {
         let state = collect_state(&[
-            LogEntry::SegmentStart {
+            LogEntry::AnnotatedSegmentStart {
                 ts: 1000,
                 session_id: uuid::Uuid::nil(),
                 system_prompt: None,
@@ -544,14 +483,15 @@ mod tests {
                 ts: 2000,
                 trigger: InvokeKind::UserSend,
             },
-            LogEntry::UserInput {
+            LogEntry::AnnotatedUserInput {
                 ts: 2001,
                 extensions: vec![],
                 segments: vec![Segment::text("run a tool")],
+                history: vec![annotated(Item::user_message("run a tool"))],
             },
-            LogEntry::AssistantItem {
+            LogEntry::AnnotatedAssistantItem {
                 ts: 3000,
-                item: Item::tool_call("call_1", "side_effect", "{}").into(),
+                entry: annotated(Item::tool_call("call_1", "side_effect", "{}")),
             },
         ]);
 
@@ -561,7 +501,7 @@ mod tests {
     #[test]
     fn replay_with_tool_calls() {
         let state = collect_state(&[
-            LogEntry::SegmentStart {
+            LogEntry::AnnotatedSegmentStart {
                 ts: 1000,
                 session_id: uuid::Uuid::nil(),
                 system_prompt: None,
@@ -570,22 +510,27 @@ mod tests {
                 forked_from: None,
                 compacted_from: None,
             },
-            LogEntry::UserInput {
+            LogEntry::AnnotatedUserInput {
                 ts: 2000,
                 extensions: vec![],
                 segments: vec![Segment::text("Check weather")],
+                history: vec![annotated(Item::user_message("Check weather"))],
             },
-            LogEntry::AssistantItem {
+            LogEntry::AnnotatedAssistantItem {
                 ts: 3000,
-                item: Item::tool_call("call_1", "get_weather", r#"{"city":"Tokyo"}"#).into(),
+                entry: annotated(Item::tool_call(
+                    "call_1",
+                    "get_weather",
+                    r#"{"city":"Tokyo"}"#,
+                )),
             },
-            LogEntry::ToolResult {
+            LogEntry::AnnotatedToolResult {
                 ts: 3500,
-                item: Item::tool_result("call_1", "Sunny, 25C").into(),
+                entry: annotated(Item::tool_result("call_1", "Sunny, 25C")),
             },
-            LogEntry::AssistantItem {
+            LogEntry::AnnotatedAssistantItem {
                 ts: 4000,
-                item: Item::assistant_message("It's sunny in Tokyo!").into(),
+                entry: annotated(Item::assistant_message("It's sunny in Tokyo!")),
             },
             LogEntry::TurnEnd {
                 ts: 4100,
@@ -599,9 +544,9 @@ mod tests {
 
     #[test]
     fn replay_restores_durable_tool_image_detail() {
-        let entry = LogEntry::ToolResult {
+        let entry = LogEntry::AnnotatedToolResult {
             ts: 3500,
-            item: Item::tool_result_item_with_attachments(
+            entry: annotated(Item::tool_result_item_with_attachments(
                 "call_image",
                 "attached",
                 None,
@@ -609,8 +554,7 @@ mod tests {
                 vec![agen::tool::Attachment::Image(
                     agen::tool::ImageAttachment::new("image/png", b"durable-image".to_vec()),
                 )],
-            )
-            .into(),
+            )),
         };
         let persisted = serde_json::to_string(&entry).unwrap();
         let restored_entry: LogEntry = serde_json::from_str(&persisted).unwrap();
@@ -630,7 +574,7 @@ mod tests {
     #[test]
     fn replay_config_changed() {
         let state = collect_state(&[
-            LogEntry::SegmentStart {
+            LogEntry::AnnotatedSegmentStart {
                 ts: 1000,
                 session_id: uuid::Uuid::nil(),
                 system_prompt: None,
@@ -650,7 +594,7 @@ mod tests {
     #[test]
     fn replay_llm_usage_appends_to_usage_history() {
         let state = collect_state(&[
-            LogEntry::SegmentStart {
+            LogEntry::AnnotatedSegmentStart {
                 ts: 1000,
                 session_id: uuid::Uuid::nil(),
                 system_prompt: None,
@@ -659,10 +603,11 @@ mod tests {
                 forked_from: None,
                 compacted_from: None,
             },
-            LogEntry::UserInput {
+            LogEntry::AnnotatedUserInput {
                 ts: 2000,
                 extensions: vec![],
                 segments: vec![Segment::text("hi")],
+                history: vec![annotated(Item::user_message("hi"))],
             },
             LogEntry::LlmUsage {
                 ts: 2100,
@@ -672,9 +617,9 @@ mod tests {
                 cache_write_tokens: 0,
                 output_tokens: 10,
             },
-            LogEntry::AssistantItem {
+            LogEntry::AnnotatedAssistantItem {
                 ts: 2200,
-                item: Item::assistant_message("yo").into(),
+                entry: annotated(Item::assistant_message("yo")),
             },
             LogEntry::LlmUsage {
                 ts: 3100,
@@ -698,7 +643,7 @@ mod tests {
     #[test]
     fn replay_without_llm_usage_keeps_usage_history_empty() {
         let state = collect_state(&[
-            LogEntry::SegmentStart {
+            LogEntry::AnnotatedSegmentStart {
                 ts: 1000,
                 session_id: uuid::Uuid::nil(),
                 system_prompt: None,
@@ -707,10 +652,11 @@ mod tests {
                 forked_from: None,
                 compacted_from: None,
             },
-            LogEntry::UserInput {
+            LogEntry::AnnotatedUserInput {
                 ts: 2000,
                 extensions: vec![],
                 segments: vec![Segment::text("hi")],
+                history: vec![annotated(Item::user_message("hi"))],
             },
         ]);
         assert!(state.usage_history.is_empty());
@@ -771,7 +717,7 @@ mod tests {
     #[test]
     fn replay_invoke_marker_only_mutates_interrupted_state() {
         let state = collect_state(&[
-            LogEntry::SegmentStart {
+            LogEntry::AnnotatedSegmentStart {
                 ts: 0,
                 session_id: uuid::Uuid::nil(),
                 system_prompt: None,
@@ -784,10 +730,11 @@ mod tests {
                 ts: 100,
                 trigger: InvokeKind::UserSend,
             },
-            LogEntry::UserInput {
+            LogEntry::AnnotatedUserInput {
                 ts: 101,
                 extensions: vec![],
                 segments: vec![Segment::text("hi")],
+                history: vec![annotated(Item::user_message("hi"))],
             },
             LogEntry::TurnEnd {
                 ts: 200,
@@ -806,7 +753,7 @@ mod tests {
     #[test]
     fn replay_paused_turn_abandoned_clears_interrupted_marker() {
         let state = collect_state(&[
-            LogEntry::SegmentStart {
+            LogEntry::AnnotatedSegmentStart {
                 ts: 0,
                 session_id: uuid::Uuid::nil(),
                 system_prompt: None,
@@ -830,7 +777,7 @@ mod tests {
     #[test]
     fn replay_restores_active_run_budget_across_compaction_checkpoint() {
         let state = collect_state(&[
-            LogEntry::SegmentStart {
+            LogEntry::AnnotatedSegmentStart {
                 ts: 0,
                 session_id: uuid::Uuid::nil(),
                 system_prompt: None,
@@ -861,7 +808,7 @@ mod tests {
         }))
         .expect("legacy run-completed entry");
         let state = collect_state(&[
-            LogEntry::SegmentStart {
+            LogEntry::AnnotatedSegmentStart {
                 ts: 0,
                 session_id: uuid::Uuid::nil(),
                 system_prompt: None,
@@ -924,7 +871,7 @@ mod tests {
     #[test]
     fn replay_extension_collects_domain_payload_pairs() {
         let state = collect_state(&[
-            LogEntry::SegmentStart {
+            LogEntry::AnnotatedSegmentStart {
                 ts: 1000,
                 session_id: uuid::Uuid::nil(),
                 system_prompt: None,
@@ -983,9 +930,12 @@ mod tests {
     #[test]
     fn user_input_extensions_restore_with_the_same_committed_input() {
         let segments = vec![Segment::text("Flow instructions"), Segment::text("Ticket")];
-        let entry = LogEntry::UserInput {
+        let entry = LogEntry::AnnotatedUserInput {
             ts: 9999,
             segments: segments.clone(),
+            history: vec![annotated(Item::user_message(Segment::flatten_to_text(
+                &segments,
+            )))],
             extensions: vec![SessionExtension::new(
                 "flow.runtime.v1",
                 serde_json::json!({ "state": "implement", "revision": 0 }),
@@ -1000,7 +950,7 @@ mod tests {
         assert_eq!(state.extensions[0].1["state"], "implement");
     }
 
-    /// Mixed segments survive a JSON round-trip through `LogEntry::UserInput`,
+    /// Mixed segments survive a JSON round-trip through `LogEntry::AnnotatedUserInput`,
     /// and `collect_state` derives `Item::user_message` from the flattened
     /// text while preserving the original segments separately. This covers
     /// the segments → flatten → Item replay path from the ticket.
@@ -1020,16 +970,19 @@ mod tests {
                 path: "src/main.rs".into(),
             },
         ];
-        let entry = LogEntry::UserInput {
+        let entry = LogEntry::AnnotatedUserInput {
             ts: 4242,
             extensions: vec![],
             segments: segments.clone(),
+            history: vec![annotated(Item::user_message(Segment::flatten_to_text(
+                &segments,
+            )))],
         };
         // JSON round-trip preserves the variant byte-for-byte.
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: LogEntry = serde_json::from_str(&json).unwrap();
         let state = collect_state(&[
-            LogEntry::SegmentStart {
+            LogEntry::AnnotatedSegmentStart {
                 ts: 1,
                 session_id: uuid::Uuid::nil(),
                 system_prompt: None,

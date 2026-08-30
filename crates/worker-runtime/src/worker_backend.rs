@@ -67,8 +67,7 @@ const USER_INPUT_COMMIT_TIMEOUT: Duration = Duration::from_secs(9);
 
 fn user_input_has_submission(entry: &LogEntry, submission_id: &str) -> bool {
     let extensions = match entry {
-        LogEntry::UserInput { extensions, .. }
-        | LogEntry::AnnotatedUserInput { extensions, .. } => extensions,
+        LogEntry::AnnotatedUserInput { extensions, .. } => extensions,
         _ => return false,
     };
     extensions.iter().any(|extension| {
@@ -3244,8 +3243,7 @@ mod tests {
         assert!(entries.iter().any(|entry| {
             matches!(
                 entry,
-                LogEntry::UserInput { segments, .. }
-                | LogEntry::AnnotatedUserInput { segments, .. }
+                LogEntry::AnnotatedUserInput { segments, .. }
                     if segments == &vec![Segment::text("start the ticket")]
             )
         }));
@@ -3253,8 +3251,7 @@ mod tests {
             .iter()
             .find_map(|entry| {
                 let extensions = match entry {
-                    LogEntry::UserInput { extensions, .. }
-                    | LogEntry::AnnotatedUserInput { extensions, .. } => extensions,
+                    LogEntry::AnnotatedUserInput { extensions, .. } => extensions,
                     _ => return None,
                 };
                 extensions

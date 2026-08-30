@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{LoggedItem, SessionId};
+use crate::LoggedItem;
 
 /// Stable logical identity of one model-visible history entry.
 ///
@@ -142,12 +142,15 @@ mod tests {
     #[test]
     fn annotated_segment_start_is_restore_visible_without_projecting_metadata() {
         let session_id = uuid::Uuid::now_v7();
-        let history_entry = legacy_logged_history(LoggedItem::Message {
-            role: LoggedRole::Assistant,
-            content: vec![crate::LoggedContentPart::Text {
-                text: "answer".into(),
-            }],
-        });
+        let history_entry = LoggedHistoryEntry {
+            item: LoggedItem::Message {
+                role: LoggedRole::Assistant,
+                content: vec![crate::LoggedContentPart::Text {
+                    text: "answer".into(),
+                }],
+            },
+            metadata: LoggedSessionHistoryMetadata::legacy_unknown(),
+        };
         let state = crate::collect_state(&[crate::LogEntry::AnnotatedSegmentStart {
             ts: 1,
             session_id,
@@ -159,22 +162,4 @@ mod tests {
         }]);
         assert_eq!(state.history[0].as_text(), Some("answer"));
     }
-}
-
-/// Legacy Session Logs did not persist annotations. Decode helpers explicitly
-/// create `LegacyUnknown`; they never infer Human/System authority from role or
-/// plaintext.
-pub fn legacy_logged_history(item: LoggedItem) -> LoggedHistoryEntry {
-    LoggedHistoryEntry {
-        item,
-        metadata: LoggedSessionHistoryMetadata::legacy_unknown(),
-    }
-}
-
-pub fn legacy_segment_history(
-    session_id: SessionId,
-    items: impl IntoIterator<Item = LoggedItem>,
-) -> Vec<LoggedHistoryEntry> {
-    let _ = session_id;
-    items.into_iter().map(legacy_logged_history).collect()
 }

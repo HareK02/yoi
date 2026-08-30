@@ -335,7 +335,7 @@ enum InternalWorkerSessionCommand {
 /// task; protocol access is consumed only by the owning parent registry.
 #[derive(Debug, Clone)]
 pub(crate) struct InternalWorkerSessionSnapshot {
-    pub entries: Vec<LogEntry>,
+    pub session: protocol::SessionSnapshot,
     pub status: WorkerStatus,
     pub error: Option<String>,
     pub in_flight: InFlightSnapshot,
@@ -402,7 +402,7 @@ impl InternalWorkerSessionHandle {
             (entries, snapshot_from_guard(&guard))
         };
         InternalWorkerSessionSnapshot {
-            entries,
+            session: session_store::public_snapshot::project_current_session_snapshot(&entries),
             status: match self.status() {
                 InternalWorkerSessionStatus::Running => WorkerStatus::Running,
                 InternalWorkerSessionStatus::Paused => WorkerStatus::Paused,

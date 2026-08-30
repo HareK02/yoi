@@ -900,7 +900,6 @@ where
         self.state.increment_entries();
         if let Some(in_flight) = &self.in_flight {
             let committed_item = match &entry {
-                LogEntry::AssistantItem { item, .. } => Some(item.clone()),
                 LogEntry::AnnotatedAssistantItem { entry, .. } => Some(entry.item.clone()),
                 _ => None,
             };
@@ -1207,11 +1206,11 @@ pub struct Worker<C: LlmClient, St: Store> {
     memory_task: Option<JoinHandle<()>>,
     /// Typed user submissions in submit order. K-th entry corresponds to
     /// the K-th `Item::user_message` in `worker.history()` (modulo seed
-    /// history loaded via `SegmentStart.history`, whose original segments
+    /// history loaded via `AnnotatedSegmentStart.history`, whose original segments
     /// are not preserved). Populated from log on `restore_from_manifest`,
     /// appended after `save_user_input` on each `run`. Pre-`Event::Snapshot`
     /// this fed `WorkerSharedState.user_segments`; the new wire format
-    /// carries typed atoms via `LogEntry::UserInput { segments }` so
+    /// carries typed atoms via `LogEntry::AnnotatedUserInput { segments }` so
     /// this remains purely an in-memory tracker for compact alignment.
     user_segments: Vec<Vec<Segment>>,
     /// Worker-side session-log mirror + broadcast sink. Populated alongside
@@ -1221,7 +1220,8 @@ pub struct Worker<C: LlmClient, St: Store> {
     sink: SegmentLogSink,
     /// `true` once `wire_history_persistence` has installed the
     /// `Engine::on_history_append` callback that commits each appended
-    /// item as a singular `LogEntry::AssistantItem` / `ToolResult`
+    /// item as a singular `LogEntry::AnnotatedAssistantItem` /
+    /// `AnnotatedToolResult`
     /// directly through the writer. Tests that drive `Worker::new` without
     /// going through the controller leave this `false`; `persist_turn`
     /// then walks the post-`history_before` slice inline so entries
@@ -1345,15 +1345,16 @@ impl<C: LlmClient + 'static, St: Store + Clone + 'static> Worker<C, St> {
     }
 
     /// Wire `Engine::on_history_append` to commit each appended item
-    /// directly as a singular `LogEntry::AssistantItem` / `ToolResult`
+    /// directly as a singular `LogEntry::AnnotatedAssistantItem` /
+    /// `AnnotatedToolResult`
     /// through the writer. The controller calls this once per spawned
     /// Worker after the worker is built; tests that drive `Worker::new` may
     /// opt in to the same wiring or leave it off (in which case
     /// `persist_turn`'s inline fallback writes entries at turn end).
     ///
     /// `user_message` items are skipped because they are committed
-    /// up-front via `commit_entry(LogEntry::UserInput { segments })`.
-    /// `role:system` items are committed as typed `LogEntry::SystemItem`
+    /// up-front via `commit_entry(LogEntry::AnnotatedUserInput { segments })`.
+    /// `role:system` items are committed as typed `LogEntry::AnnotatedSystemItem`
     /// entries by their producers (for example `WorkerInterceptor` and
     /// interrupted-turn prep) before they reach the worker's history, so this
     /// callback would otherwise double-write them.
@@ -1941,8 +1942,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         }
 
         let input = match entries.get(target.user_input_entry_index) {
-            Some(LogEntry::UserInput { segments, .. })
-            | Some(LogEntry::AnnotatedUserInput { segments, .. }) => segments.clone(),
+            Some(LogEntry::AnnotatedUserInput { segments, .. }) => segments.clone(),
             _ => {
                 return Err(RewindError::Invalid(
                     "rewind target is no longer a user message".into(),
@@ -2081,8 +2081,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// Cheap clone via `Option<Clone>`.
     /// Snapshot of the typed user segments tracked alongside worker
     /// history. The K-th entry corresponds to the K-th `Item::user_message`
-    /// derived from `LogEntry::UserInput` entries (post-compaction); seed
-    /// history loaded via `SegmentStart.history` does not contribute,
+    /// derived from `LogEntry::AnnotatedUserInput` entries (post-compaction); seed
+    /// history loaded via `AnnotatedSegmentStart.history` does not contribute,
     /// which is acceptable because the original segments are unrecoverable.
     pub fn user_segments(&self) -> &[Vec<Segment>] {
         &self.user_segments
@@ -3533,12 +3533,13 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         // slice from `history_before` inline so the test's
         // `restore`-style assertions still see entries on disk.
         if !self.history_persistence_wired {
-            let new_items: Vec<Item> = self.session.history().entries()[history_before..]
+            let new_entries: Vec<_> = self.session.history().entries()[history_before..]
                 .iter()
-                .map(|entry| entry.item.clone())
+                .map(to_logged_history_entry)
                 .collect();
             let ts = segment_log::now_millis();
-            for item in &new_items {
+            for history_entry in new_entries {
+                let item = Item::from(history_entry.item.clone());
                 if item.is_user_message() {
                     continue;
                 }
@@ -3551,7 +3552,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 ) {
                     continue;
                 }
-                let entry = session_store::classify_history_item(item, ts);
+                let entry = session_store::classify_logged_history_entry(history_entry, ts);
                 self.commit_entry(entry)?;
             }
         }
@@ -6257,8 +6258,7 @@ fn build_rewind_targets(segment_id: uuid::Uuid, entries: &[LogEntry]) -> Vec<Rew
     let mut targets = Vec::new();
     for (entry_index, entry) in entries.iter().enumerate() {
         let (segments, ts) = match entry {
-            LogEntry::UserInput { segments, ts, .. }
-            | LogEntry::AnnotatedUserInput { segments, ts, .. } => (segments, ts),
+            LogEntry::AnnotatedUserInput { segments, ts, .. } => (segments, ts),
             _ => continue,
         };
         turn_index += 1;
@@ -6300,8 +6300,7 @@ fn rewind_truncate_entries(entries: &[LogEntry], user_input_entry_index: usize) 
 
 fn suffix_has_tool_side_effects(entries: &[LogEntry]) -> bool {
     entries.iter().any(|entry| match entry {
-        LogEntry::ToolResult { .. } | LogEntry::AnnotatedToolResult { .. } => true,
-        LogEntry::AssistantItem { item, .. } => logged_item_is_tool_call(item),
+        LogEntry::AnnotatedToolResult { .. } => true,
         LogEntry::AnnotatedAssistantItem { entry, .. } => logged_item_is_tool_call(&entry.item),
         _ => false,
     })
@@ -7636,7 +7635,7 @@ mod build_summary_prompt_tests {
         );
         assert!(checkpoint.is_none());
 
-        let mut replacement_entries = vec![LogEntry::SegmentStart {
+        let mut replacement_entries = vec![LogEntry::AnnotatedSegmentStart {
             ts: segment_log::now_millis(),
             session_id: uuid::Uuid::nil(),
             system_prompt: None,
@@ -7964,9 +7963,12 @@ mod build_summary_prompt_tests {
         );
         append_test_entry(
             worker,
-            LogEntry::UserInput {
+            LogEntry::AnnotatedUserInput {
                 ts: ts + 1,
                 extensions: vec![],
+                history: vec![crate::session_history::test_logged_history_entry(
+                    Item::user_message(text),
+                )],
                 segments: vec![text_segment(text)],
             },
         );
@@ -7986,16 +7988,18 @@ mod build_summary_prompt_tests {
         append_user_turn(&worker, 20, "second message");
         append_test_entry(
             &worker,
-            LogEntry::ToolResult {
+            LogEntry::AnnotatedToolResult {
                 ts: 30,
-                item: session_store::LoggedItem::ToolResult {
-                    call_id: "call-1".into(),
-                    summary: "wrote a file".into(),
-                    content: None,
-                    attachments: Vec::new(),
-                    disposition: Default::default(),
-                    is_error: false,
-                },
+                entry: crate::session_history::test_logged_history_entry(
+                    session_store::LoggedItem::ToolResult {
+                        call_id: "call-1".into(),
+                        summary: "wrote a file".into(),
+                        content: None,
+                        attachments: Vec::new(),
+                        disposition: Default::default(),
+                        is_error: false,
+                    },
+                ),
             },
         );
 
@@ -8029,16 +8033,18 @@ mod build_summary_prompt_tests {
         append_user_turn(&worker, 20, "second message");
         append_test_entry(
             &worker,
-            LogEntry::ToolResult {
+            LogEntry::AnnotatedToolResult {
                 ts: 30,
-                item: session_store::LoggedItem::ToolResult {
-                    call_id: "call-1".into(),
-                    summary: "wrote a file".into(),
-                    content: None,
-                    attachments: Vec::new(),
-                    disposition: Default::default(),
-                    is_error: false,
-                },
+                entry: crate::session_history::test_logged_history_entry(
+                    session_store::LoggedItem::ToolResult {
+                        call_id: "call-1".into(),
+                        summary: "wrote a file".into(),
+                        content: None,
+                        attachments: Vec::new(),
+                        disposition: Default::default(),
+                        is_error: false,
+                    },
+                ),
             },
         );
         let (head_entries, targets) = worker.list_rewind_targets().unwrap();
@@ -8456,9 +8462,9 @@ mod build_summary_prompt_tests {
         worker.wire_history_persistence();
         let dangling_call = Item::tool_call("call-1", "SideEffect", "{}");
         worker
-            .commit_entry(LogEntry::AssistantItem {
+            .commit_entry(LogEntry::AnnotatedAssistantItem {
                 ts: segment_log::now_millis(),
-                item: dangling_call.clone().into(),
+                entry: crate::session_history::test_logged_history_entry(dangling_call.clone()),
             })
             .unwrap();
         worker.set_history_for_test(vec![dangling_call]);
@@ -8863,9 +8869,12 @@ mod build_summary_prompt_tests {
         );
         worker.set_history_for_test(vec![evidence.clone()]);
         worker
-            .commit_entry(LogEntry::UserInput {
+            .commit_entry(LogEntry::AnnotatedUserInput {
                 ts: segment_log::now_millis(),
                 extensions: vec![],
+                history: vec![crate::session_history::test_logged_history_entry(
+                    evidence.clone(),
+                )],
                 segments: vec![text_segment(
                     "The cancellation regression must leave this evidence available for retry.",
                 )],

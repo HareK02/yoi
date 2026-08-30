@@ -84,10 +84,7 @@ impl WorkerHandle {
             (entries, entry_rx, in_flight)
         };
         let event = Event::Snapshot {
-            entries: entries
-                .into_iter()
-                .map(|entry| serde_json::to_value(entry).expect("log entry serializes"))
-                .collect(),
+            session: session_store::public_snapshot::project_current_session_snapshot(&entries),
             greeting: self.shared_state.greeting.clone(),
             status: self.shared_state.get_status(),
             in_flight,
@@ -634,8 +631,8 @@ fn protocol_command_status(status: WorkdirCommandStatus) -> ProtocolCommandStatu
 ///
 /// `Worker::wire_history_persistence` is called separately to wire the
 /// per-item history commit callback so every assistant / tool item
-/// landing in `worker.history` becomes a singular `LogEntry::AssistantItem`
-/// / `ToolResult` commit through the sync writer.
+/// landing in `worker.history` becomes a singular `LogEntry::AnnotatedAssistantItem`
+/// / `AnnotatedToolResult` commit through the sync writer.
 pub(crate) fn wire_event_bridges_on_engine<C, St>(
     worker: &mut Worker<C, St>,
     event_tx: &broadcast::Sender<Event>,
@@ -1320,7 +1317,7 @@ async fn controller_loop<C, St>(
                 }
                 // Stage the run without a speculative user-message echo.
                 // `Worker::run` validates the input, commits
-                // `LogEntry::UserInput`, and the session-log sink turns that
+                // `LogEntry::AnnotatedUserInput`, and the session-log sink turns that
                 // committed entry into the live `Event::UserMessage`. That
                 // keeps every client ordered against `SegmentStart` replay and
                 // makes persisted history the single source of visible user
@@ -1346,7 +1343,7 @@ async fn controller_loop<C, St>(
             Method::Notify { message, auto_run } => {
                 // Client-side live echo is delivered as `Event::SystemItem`
                 // once the interceptor commits the corresponding
-                // `LogEntry::SystemItem` entry — drained out of the
+                // `LogEntry::AnnotatedSystemItem` entry — drained out of the
                 // notify buffer + broadcast through the sink. No
                 // separate echo here.
                 worker.push_notify(message, auto_run);
@@ -1874,28 +1871,16 @@ where
     St: Store,
 {
     match worker.rewind_to(target, expected_head_entries) {
-        Ok(applied) => match applied
-            .entries
-            .into_iter()
-            .map(serde_json::to_value)
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(entries) => {
-                let _ = event_tx.send(Event::RewindApplied {
-                    entries,
-                    input: applied.input,
-                    summary: applied.summary,
-                });
-                true
-            }
-            Err(error) => {
-                let _ = event_tx.send(Event::Error {
-                    code: ErrorCode::Internal,
-                    message: format!("failed to encode rewind snapshot: {error}"),
-                });
-                false
-            }
-        },
+        Ok(applied) => {
+            let session =
+                session_store::public_snapshot::project_current_session_snapshot(&applied.entries);
+            let _ = event_tx.send(Event::RewindApplied {
+                session,
+                input: applied.input,
+                summary: applied.summary,
+            });
+            true
+        }
         Err(err) => {
             let _ = event_tx.send(Event::Error {
                 code: ErrorCode::InvalidRequest,
@@ -2101,7 +2086,9 @@ mod tests {
             let mut writer = JsonLineWriter::new(w);
             writer
                 .write(&Event::Snapshot {
-                    entries: Vec::new(),
+                    session: protocol::SessionSnapshot {
+                        entries: Vec::new(),
+                    },
                     greeting: protocol::Greeting {
                         worker_name: "parent".into(),
                         cwd: "/tmp".into(),

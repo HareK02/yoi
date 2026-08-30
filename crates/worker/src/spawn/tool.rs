@@ -960,9 +960,7 @@ mod tests {
 
     use crate::WorkspaceId;
     use agen::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
-    use agen::llm_client::types::ContentPart;
     use agen::llm_client::{ClientError, LlmClient, Request};
-    use agen::{Item, Role};
     use async_trait::async_trait;
     use futures::Stream;
     use manifest::{AuthRef, ModelManifest, SchemeKind, WorkerManifest};
@@ -1252,9 +1250,11 @@ extract_threshold = 4000
         )
         .await
         .unwrap();
-        assert!(first_capture.entries.iter().map(|entry| &entry.item).any(|item| {
-            matches!(item, Item::Message { role: Role::Assistant, content, .. } if content.iter().any(|part| matches!(part, ContentPart::Text { text } if text.contains("reviewed"))))
-        }));
+        assert!(
+            serde_json::to_string(&first_capture.session)
+                .unwrap()
+                .contains("reviewed")
+        );
 
         let send = (crate::spawn::comm_tools::sub_worker_send_tool(registry.clone()))().1;
         send.execute(
@@ -1274,7 +1274,7 @@ extract_threshold = 4000
         )
         .await
         .unwrap();
-        assert!(latest_capture.entries.len() > first_capture.entries.len());
+        assert!(latest_capture.session.entries.len() > first_capture.session.entries.len());
 
         fail_requests.store(true, Ordering::SeqCst);
         send.execute(

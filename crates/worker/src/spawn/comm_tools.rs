@@ -278,7 +278,21 @@ mod tests {
 
     fn snapshot(entries: Vec<serde_json::Value>) -> Event {
         Event::Snapshot {
-            entries,
+            session: protocol::SessionSnapshot {
+                entries: entries
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, value)| protocol::SessionSnapshotEntry {
+                        entry_id: format!("test-{index}"),
+                        timestamp: index as u64,
+                        provenance: protocol::SessionEntryProvenance::LegacyUnknown,
+                        derived_from: Vec::new(),
+                        data: protocol::SessionSnapshotEntryData::RunError {
+                            message: value.to_string(),
+                        },
+                    })
+                    .collect(),
+            },
             greeting: Greeting {
                 worker_name: "server".into(),
                 cwd: "/tmp".into(),

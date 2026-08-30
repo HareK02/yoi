@@ -6,7 +6,7 @@ use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use session_store::{LogEntry, collect_state};
+use session_store::LogEntry;
 
 use super::manage_worker::{WORKER_CONTROL_SERVICE_ID, WorkerControlService};
 use crate::feature::{
@@ -61,7 +61,7 @@ pub struct WorkerObservationSubject {
 #[derive(Debug, Clone)]
 pub struct WorkerSessionCapture {
     pub segment_id: String,
-    pub entries: Vec<agen::HistoryEntry<crate::SessionHistoryMetadata>>,
+    pub session: protocol::SessionSnapshot,
 }
 
 impl WorkerSessionCapture {
@@ -69,17 +69,9 @@ impl WorkerSessionCapture {
         segment_id: impl Into<String>,
         log_entries: &[LogEntry],
     ) -> Result<Self, String> {
-        let segment_id = segment_id.into();
-        let state = collect_state(log_entries);
-        let parsed_segment_id = segment_id.parse().unwrap_or_default();
-        let entries = crate::session_history::restore_history_entries(
-            state.session_id.unwrap_or_default(),
-            parsed_segment_id,
-            log_entries,
-        )?;
         Ok(Self {
-            segment_id,
-            entries,
+            segment_id: segment_id.into(),
+            session: session_store::public_snapshot::project_current_session_snapshot(log_entries),
         })
     }
 }
@@ -115,7 +107,7 @@ struct WorkspaceWorkerObservationListResponse {
 #[derive(Debug, Deserialize)]
 struct WorkspaceWorkerObservationCaptureResponse {
     segment_id: String,
-    entries: Vec<serde_json::Value>,
+    session: protocol::SessionSnapshot,
 }
 
 pub struct WorkspaceClientWorkerObservationProvider {
@@ -173,26 +165,9 @@ impl WorkerObservationProvider for WorkspaceClientWorkerObservationProvider {
         let body = workspace_response_body(response)?;
         let response = serde_json::from_str::<WorkspaceWorkerObservationCaptureResponse>(&body)
             .map_err(|error| WorkerObservationError::Unavailable(error.to_string()))?;
-        let entries = response
-            .entries
-            .into_iter()
-            .map(|entry| {
-                serde_json::from_value(entry)
-                    .map_err(|error| WorkerObservationError::Unavailable(error.to_string()))
-            })
-            .collect::<Result<Vec<session_store::LogEntry>, _>>()?;
-        let state = collect_state(&entries);
-        let segment_id = response.segment_id;
-        let parsed_segment_id = segment_id.parse().unwrap_or_default();
-        let typed_entries = crate::session_history::restore_history_entries(
-            state.session_id.unwrap_or_default(),
-            parsed_segment_id,
-            &entries,
-        )
-        .map_err(WorkerObservationError::Unavailable)?;
         Ok(WorkerSessionCapture {
-            segment_id,
-            entries: typed_entries,
+            segment_id: response.segment_id,
+            session: response.session,
         })
     }
 }
@@ -420,16 +395,9 @@ impl WorkerObservationProvider for SpawnedSubWorkerObservationProvider {
             .get_internal(name)
             .ok_or(WorkerObservationError::NotFound)?;
         let entries = record.session.entries();
-        let state = collect_state(&entries);
-        let typed_entries = crate::session_history::restore_history_entries(
-            state.session_id.unwrap_or_default(),
-            Default::default(),
-            &entries,
-        )
-        .map_err(WorkerObservationError::Unavailable)?;
         Ok(WorkerSessionCapture {
             segment_id: format!("subworker:{name}"),
-            entries: typed_entries,
+            session: session_store::public_snapshot::project_current_session_snapshot(&entries),
         })
     }
 }
@@ -699,9 +667,9 @@ async fn latest_view(
         .capture_worker_session(subject)
         .await
         .map_err(tool_error)?;
-    Ok(SessionCapture::from_history_entries(
+    Ok(SessionCapture::from_session_snapshot(
         capture.segment_id,
-        capture.entries,
+        capture.session,
     ))
 }
 
@@ -799,16 +767,43 @@ mod tests {
                 .clone()
                 .into_iter()
                 .enumerate()
-                .map(|(index, item)| {
-                    let mut metadata = crate::SessionHistoryMetadata::legacy_unknown();
-                    metadata.entry_id =
-                        session_store::LoggedSessionHistoryEntryId(format!("fake-{index:08}"));
-                    agen::HistoryEntry::new(item, metadata)
+                .filter_map(|(index, item)| {
+                    let data = match item {
+                        Item::Message { role, content, .. } => {
+                            let role = match role {
+                                Role::User => protocol::SessionMessageRole::User,
+                                Role::Assistant => protocol::SessionMessageRole::Assistant,
+                                Role::System => return None,
+                            };
+                            protocol::SessionSnapshotEntryData::Message {
+                                role,
+                                content: content
+                                    .into_iter()
+                                    .map(|part| match part {
+                                        agen::ContentPart::Text { text } => {
+                                            protocol::SessionContentPart::Text { text }
+                                        }
+                                        agen::ContentPart::Refusal { refusal } => {
+                                            protocol::SessionContentPart::Refusal { refusal }
+                                        }
+                                    })
+                                    .collect(),
+                            }
+                        }
+                        _ => return None,
+                    };
+                    Some(protocol::SessionSnapshotEntry {
+                        entry_id: format!("fake-{index:08}"),
+                        timestamp: index as u64,
+                        provenance: protocol::SessionEntryProvenance::LegacyUnknown,
+                        derived_from: Vec::new(),
+                        data,
+                    })
                 })
                 .collect();
             Ok(WorkerSessionCapture {
                 segment_id: "segment".to_string(),
-                entries,
+                session: protocol::SessionSnapshot { entries },
             })
         }
     }

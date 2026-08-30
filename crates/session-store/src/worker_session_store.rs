@@ -20,7 +20,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-const SESSION_SCHEMA_VERSION: u32 = 2;
+const SESSION_SCHEMA_VERSION: u32 = 3;
+const PREVIOUS_SESSION_SCHEMA_VERSION: u32 = 2;
 const LEGACY_SESSION_SCHEMA_VERSION: u32 = 1;
 const SESSION_FILE: &str = "session.json";
 const SEGMENTS_DIR: &str = "segments";
@@ -47,9 +48,15 @@ impl WorkerSessionStore {
             Ok(bytes) => {
                 let mut manifest: SessionManifest = serde_json::from_slice(&bytes)?;
                 match manifest.schema_version {
-                    SESSION_SCHEMA_VERSION => {}
-                    LEGACY_SESSION_SCHEMA_VERSION => {
-                        validate_legacy_segment_logs(&root)?;
+                    SESSION_SCHEMA_VERSION => {
+                        validate_canonical_segment_logs(&root)?;
+                    }
+                    PREVIOUS_SESSION_SCHEMA_VERSION | LEGACY_SESSION_SCHEMA_VERSION => {
+                        migrate_segment_logs_to_v3(
+                            &root,
+                            manifest.session_id,
+                            manifest.schema_version,
+                        )?;
                         manifest.schema_version = SESSION_SCHEMA_VERSION;
                         atomic_write_json(&root.join(SESSION_FILE), &manifest)?;
                     }
@@ -144,6 +151,41 @@ impl WorkerSessionStore {
             .join(format!("{segment_id}.trace.jsonl"))
     }
 
+    fn append_log_entry(&self, path: &Path, entry: &LogEntry) -> Result<(), StoreError> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| std::io::Error::other("Worker Session append lock was poisoned"))?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .append(true)
+            .open(path)?;
+        let committed_len = truncate_uncommitted_tail(&mut file)?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut existing = Vec::new();
+        file.read_to_end(&mut existing)?;
+        parse_jsonl::<LogEntry>(&existing)?;
+        let line = serde_json::to_string(entry)?;
+        let mut record = Vec::with_capacity(line.len() + 1);
+        record.extend_from_slice(line.as_bytes());
+        record.push(b'\n');
+        if let Err(write_error) = file.write_all(&record) {
+            return match file.set_len(committed_len) {
+                Ok(()) => Err(write_error.into()),
+                Err(rollback_error) => Err(std::io::Error::new(
+                    rollback_error.kind(),
+                    format!(
+                        "session append failed ({write_error}) and rollback failed: {rollback_error}"
+                    ),
+                )
+                .into()),
+            };
+        }
+        Ok(())
+    }
+
     fn append_line(&self, path: &Path, line: &str) -> Result<(), StoreError> {
         let _guard = self
             .append_lock
@@ -183,7 +225,7 @@ impl Store for WorkerSessionStore {
         entry: &LogEntry,
     ) -> Result<(), StoreError> {
         self.ensure_session(session_id, true)?;
-        self.append_line(&self.log_path(segment_id), &serde_json::to_string(entry)?)
+        self.append_log_entry(&self.log_path(segment_id), entry)
     }
 
     fn read_all(
@@ -286,35 +328,136 @@ impl Store for WorkerSessionStore {
     }
 }
 
-fn validate_legacy_segment_logs(root: &Path) -> Result<(), StoreError> {
+fn segment_log_paths(root: &Path) -> Result<Vec<(SegmentId, PathBuf)>, StoreError> {
     let segments = root.join(SEGMENTS_DIR);
     if !segments.exists() {
-        return Ok(());
+        return Ok(Vec::new());
     }
+    let mut paths = Vec::new();
     for entry in fs::read_dir(&segments)? {
         let entry = entry?;
         let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
+            return Err(StoreError::Corrupt {
+                line: 0,
+                message: format!("non-UTF-8 Worker Session segment path: {}", path.display()),
+            });
         };
-        if !name.ends_with(".jsonl") || name.ends_with(".trace.jsonl") {
+        if name.ends_with(".trace.jsonl") || name.starts_with('.') {
             continue;
         }
-        let contents = fs::read_to_string(&path)?;
-        for (line_index, line) in contents.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            serde_json::from_str::<LogEntry>(line).map_err(|error| StoreError::Corrupt {
-                line: line_index + 1,
+        if !name.ends_with(".jsonl") {
+            continue;
+        }
+        if !metadata.file_type().is_file() {
+            return Err(StoreError::Corrupt {
+                line: 0,
                 message: format!(
-                    "cannot migrate legacy Worker Session log {}: {error}",
+                    "Worker Session segment is not a regular file: {}",
+                    path.display()
+                ),
+            });
+        }
+        let segment_id =
+            name.trim_end_matches(".jsonl")
+                .parse()
+                .map_err(|_| StoreError::Corrupt {
+                    line: 0,
+                    message: format!("invalid Worker Session segment name: {name}"),
+                })?;
+        paths.push((segment_id, path));
+    }
+    paths.sort_by_key(|(segment_id, _)| *segment_id);
+    Ok(paths)
+}
+
+fn migrate_segment_logs_to_v3(
+    root: &Path,
+    session_id: SessionId,
+    source_schema_version: u32,
+) -> Result<(), StoreError> {
+    struct MigrationPlan {
+        path: PathBuf,
+        source: Vec<u8>,
+        output: Vec<u8>,
+    }
+
+    // Phase 1 is strictly read-only. Every segment must parse and canonicalize
+    // successfully before the first authoritative byte is replaced.
+    let mut plans = Vec::new();
+    for (segment_id, path) in segment_log_paths(root)? {
+        let source = fs::read(&path)?;
+        let canonical = parse_legacy_jsonl(source_schema_version, session_id, segment_id, &source)
+            .map_err(|error| StoreError::Corrupt {
+                line: 0,
+                message: format!(
+                    "cannot migrate Worker Session log {}: {error}",
                     path.display()
                 ),
             })?;
+        let mut output = Vec::new();
+        for entry in canonical {
+            serde_json::to_writer(&mut output, &entry)?;
+            output.push(b'\n');
+        }
+        plans.push(MigrationPlan {
+            path,
+            source,
+            output,
+        });
+    }
+
+    // Fence the complete preflight snapshot before starting phase 2. Session
+    // open is the exclusive restore boundary; this additionally fails closed
+    // if an unexpected writer raced the preflight.
+    for plan in &plans {
+        if fs::read(&plan.path)? != plan.source {
+            return Err(StoreError::Corrupt {
+                line: 0,
+                message: format!(
+                    "Worker Session segment changed during migration: {}",
+                    plan.path.display()
+                ),
+            });
         }
     }
+
+    for plan in plans {
+        atomic_write_bytes(&plan.path, &plan.output)?;
+    }
     Ok(())
+}
+
+fn validate_canonical_segment_logs(root: &Path) -> Result<(), StoreError> {
+    for (_, path) in segment_log_paths(root)? {
+        let _: Vec<LogEntry> = parse_jsonl(&fs::read(&path)?)?;
+    }
+    Ok(())
+}
+
+fn parse_legacy_jsonl(
+    schema_version: u32,
+    session_id: SessionId,
+    segment_id: SegmentId,
+    bytes: &[u8],
+) -> Result<Vec<LogEntry>, serde_json::Error> {
+    let text = std::str::from_utf8(bytes).map_err(|error| {
+        serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    })?;
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(line_index, line)| {
+            crate::legacy_session_log::decode_entry(
+                schema_version,
+                line,
+                session_id,
+                segment_id,
+                line_index,
+            )
+        })
+        .collect()
 }
 
 fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreError> {
@@ -418,7 +561,21 @@ fn truncate_uncommitted_tail(file: &mut File) -> std::io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Store, new_segment_id, new_session_id};
+    use crate::{
+        LoggedHistoryEntry, LoggedItem, LoggedSessionHistoryEntryId, LoggedSessionHistoryMetadata,
+        LoggedSessionHistoryOrigin, Store, new_segment_id, new_session_id,
+    };
+
+    fn annotated(item: agen::Item) -> LoggedHistoryEntry {
+        LoggedHistoryEntry {
+            item: LoggedItem::from(item),
+            metadata: LoggedSessionHistoryMetadata {
+                entry_id: LoggedSessionHistoryEntryId::new(),
+                origin: LoggedSessionHistoryOrigin::LegacyUnknown,
+                derivation: None,
+            },
+        }
+    }
 
     #[test]
     fn canonical_layout_and_single_session_invariant() {
@@ -445,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_logs_are_validated_and_promoted_to_v2() {
+    fn schema_v1_logs_are_rewritten_and_promoted_to_v3() {
         let root = tempfile::tempdir().unwrap();
         let session_id = new_session_id();
         let segment_id = new_segment_id();
@@ -467,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_migration_rejects_corrupt_log_before_manifest_update() {
+    fn schema_v1_migration_rejects_corrupt_log_before_v3_manifest_update() {
         let root = tempfile::tempdir().unwrap();
         let session_id = new_session_id();
         let manifest = SessionManifest {
@@ -490,6 +647,280 @@ mod tests {
         let persisted: SessionManifest =
             serde_json::from_slice(&fs::read(root.path().join(SESSION_FILE)).unwrap()).unwrap();
         assert_eq!(persisted.schema_version, LEGACY_SESSION_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn schema_v2_migration_rewrites_legacy_records_with_stable_unknown_provenance() {
+        let root = tempfile::tempdir().unwrap();
+        let session_id = new_session_id();
+        let segment_id = new_segment_id();
+        fs::create_dir_all(root.path().join(SEGMENTS_DIR)).unwrap();
+        atomic_write_json(
+            &root.path().join(SESSION_FILE),
+            &SessionManifest {
+                schema_version: PREVIOUS_SESSION_SCHEMA_VERSION,
+                session_id,
+            },
+        )
+        .unwrap();
+        let source = vec![
+            serde_json::json!({
+                "kind": "segment_start",
+                "ts": 1,
+                "session_id": session_id,
+                "system_prompt": null,
+                "config": agen::llm_client::RequestConfig::default(),
+                "history": [LoggedItem::from(agen::Item::assistant_message("prior"))],
+                "forked_from": null,
+                "compacted_from": null
+            }),
+            serde_json::json!({
+                "kind": "user_input",
+                "ts": 2,
+                "segments": [{ "kind": "text", "content": "hello" }],
+                "extensions": []
+            }),
+            serde_json::json!({
+                "kind": "assistant_item",
+                "ts": 3,
+                "item": LoggedItem::from(agen::Item::assistant_message("reply"))
+            }),
+        ];
+        let path = root
+            .path()
+            .join(SEGMENTS_DIR)
+            .join(format!("{segment_id}.jsonl"));
+        let mut bytes = Vec::new();
+        for entry in source {
+            serde_json::to_writer(&mut bytes, &entry).unwrap();
+            bytes.push(b'\n');
+        }
+        fs::write(&path, bytes).unwrap();
+
+        let store = WorkerSessionStore::new(root.path()).unwrap();
+        let first = store.read_all(session_id, segment_id).unwrap();
+        assert!(matches!(first[0], LogEntry::AnnotatedSegmentStart { .. }));
+        assert!(matches!(first[1], LogEntry::AnnotatedUserInput { .. }));
+        assert!(matches!(first[2], LogEntry::AnnotatedAssistantItem { .. }));
+        let first_bytes = fs::read(&path).unwrap();
+        drop(store);
+
+        let reopened = WorkerSessionStore::new(root.path()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), first_bytes);
+        let snapshot = crate::public_snapshot::project_current_session_snapshot(
+            &reopened.read_all(session_id, segment_id).unwrap(),
+        );
+        assert_eq!(snapshot.entries.len(), 3);
+        assert_eq!(
+            snapshot
+                .entries
+                .iter()
+                .map(|entry| entry.timestamp)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(snapshot.entries.iter().all(|entry| {
+            entry.provenance == protocol::SessionEntryProvenance::LegacyUnknown
+                && entry.entry_id.len() <= 64
+        }));
+    }
+
+    #[test]
+    fn schema_v2_preflight_keeps_earlier_segments_unchanged_when_later_is_corrupt() {
+        let root = tempfile::tempdir().unwrap();
+        let session_id = new_session_id();
+        let valid_segment = uuid::Uuid::from_u128(1);
+        let corrupt_segment = uuid::Uuid::from_u128(2);
+        fs::create_dir_all(root.path().join(SEGMENTS_DIR)).unwrap();
+        atomic_write_json(
+            &root.path().join(SESSION_FILE),
+            &SessionManifest {
+                schema_version: PREVIOUS_SESSION_SCHEMA_VERSION,
+                session_id,
+            },
+        )
+        .unwrap();
+        let manifest_before = fs::read(root.path().join(SESSION_FILE)).unwrap();
+
+        let valid_path = root
+            .path()
+            .join(SEGMENTS_DIR)
+            .join(format!("{valid_segment}.jsonl"));
+        let valid_entry = serde_json::json!({
+            "kind": "segment_start",
+            "ts": 1,
+            "session_id": session_id,
+            "system_prompt": null,
+            "config": agen::llm_client::RequestConfig::default(),
+            "history": [LoggedItem::from(agen::Item::assistant_message("prior"))],
+            "forked_from": null,
+            "compacted_from": null
+        });
+        let mut valid_bytes = serde_json::to_vec(&valid_entry).unwrap();
+        valid_bytes.push(b'\n');
+        fs::write(&valid_path, &valid_bytes).unwrap();
+        let corrupt_path = root
+            .path()
+            .join(SEGMENTS_DIR)
+            .join(format!("{corrupt_segment}.jsonl"));
+        fs::write(&corrupt_path, b"{not-json}\n").unwrap();
+        let corrupt_before = fs::read(&corrupt_path).unwrap();
+
+        let error = match WorkerSessionStore::new(root.path()) {
+            Ok(_) => panic!("later corrupt segment must fail migration preflight"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StoreError::Corrupt { .. }));
+        assert_eq!(fs::read(&valid_path).unwrap(), valid_bytes);
+        assert_eq!(fs::read(&corrupt_path).unwrap(), corrupt_before);
+        assert_eq!(
+            fs::read(root.path().join(SESSION_FILE)).unwrap(),
+            manifest_before
+        );
+    }
+
+    #[test]
+    fn current_jsonl_requires_annotations_across_append_rewrite_and_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let session_id = new_session_id();
+        let segment_id = new_segment_id();
+        let store = WorkerSessionStore::new(root.path()).unwrap();
+        store
+            .create_segment(
+                session_id,
+                segment_id,
+                &[LogEntry::AnnotatedSegmentStart {
+                    ts: 1,
+                    session_id,
+                    system_prompt: None,
+                    config: agen::llm_client::RequestConfig::default(),
+                    history: vec![annotated(agen::Item::user_message("seed"))],
+                    forked_from: None,
+                    compacted_from: None,
+                }],
+            )
+            .unwrap();
+        store
+            .append(
+                session_id,
+                segment_id,
+                &LogEntry::AnnotatedAssistantItem {
+                    ts: 2,
+                    entry: annotated(agen::Item::assistant_message("reply")),
+                },
+            )
+            .unwrap();
+
+        let before_rewrite = store.read_all(session_id, segment_id).unwrap();
+        store
+            .create_segment(session_id, segment_id, &before_rewrite)
+            .unwrap();
+        drop(store);
+
+        let reopened = WorkerSessionStore::new(root.path()).unwrap();
+        let restored = reopened.read_all(session_id, segment_id).unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored).unwrap(),
+            serde_json::to_value(&before_rewrite).unwrap()
+        );
+        for entry in &restored {
+            match entry {
+                LogEntry::AnnotatedSegmentStart { history, .. } => assert!(history.iter().all(
+                    |entry| !entry.metadata.entry_id.0.is_empty()
+                        && matches!(
+                            entry.metadata.origin,
+                            LoggedSessionHistoryOrigin::LegacyUnknown
+                        )
+                )),
+                LogEntry::AnnotatedAssistantItem { entry, .. } => {
+                    assert!(!entry.metadata.entry_id.0.is_empty());
+                    assert!(matches!(
+                        entry.metadata.origin,
+                        LoggedSessionHistoryOrigin::LegacyUnknown
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        let log = fs::read_to_string(reopened.log_path(segment_id)).unwrap();
+        for line in log.lines() {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            let kind = value["kind"].as_str().unwrap();
+            assert!(
+                !matches!(
+                    kind,
+                    "segment_start"
+                        | "user_input"
+                        | "assistant_item"
+                        | "tool_result"
+                        | "system_item"
+                ),
+                "current-schema JSONL contains legacy history record: {kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_v3_rejects_legacy_records_and_new_writes_are_canonical() {
+        let root = tempfile::tempdir().unwrap();
+        let session_id = new_session_id();
+        let segment_id = new_segment_id();
+        let store = WorkerSessionStore::new(root.path()).unwrap();
+        store
+            .create_segment(
+                session_id,
+                segment_id,
+                &[LogEntry::AnnotatedSegmentStart {
+                    ts: 1,
+                    session_id,
+                    system_prompt: None,
+                    config: agen::llm_client::RequestConfig::default(),
+                    history: vec![annotated(agen::Item::assistant_message("seed"))],
+                    forked_from: None,
+                    compacted_from: None,
+                }],
+            )
+            .unwrap();
+        store
+            .append(
+                session_id,
+                segment_id,
+                &LogEntry::AnnotatedUserInput {
+                    ts: 2,
+                    segments: vec![protocol::Segment::Text {
+                        content: "new".into(),
+                    }],
+                    history: vec![annotated(agen::Item::user_message("new"))],
+                    extensions: Vec::new(),
+                },
+            )
+            .unwrap();
+        let entries = store.read_all(session_id, segment_id).unwrap();
+        assert!(matches!(entries[0], LogEntry::AnnotatedSegmentStart { .. }));
+        assert!(matches!(entries[1], LogEntry::AnnotatedUserInput { .. }));
+        drop(store);
+
+        let path = root
+            .path()
+            .join(SEGMENTS_DIR)
+            .join(format!("{segment_id}.jsonl"));
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        serde_json::to_writer(
+            &mut file,
+            &serde_json::json!({
+                "kind": "system_item",
+                "ts": 3,
+                "item": { "kind": "legacy_ignored", "slug": "legacy" }
+            }),
+        )
+        .unwrap();
+        file.write_all(b"\n").unwrap();
+        let error = match WorkerSessionStore::new(root.path()) {
+            Ok(_) => panic!("schema v3 must reject a legacy history record"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StoreError::Corrupt { .. }));
     }
 
     #[test]

@@ -539,9 +539,9 @@ mod tests {
                 text: "done".into(),
             }],
         };
-        let assistant_entry = LogEntry::AssistantItem {
+        let assistant_entry = LogEntry::AnnotatedAssistantItem {
             ts: 1,
-            item: assistant_item.clone(),
+            entry: crate::session_history::test_logged_history_entry(assistant_item.clone()),
         };
 
         let in_flight_guard = in_flight.snapshot_guard();
@@ -593,9 +593,9 @@ mod tests {
                 text: "done".into(),
             }],
         };
-        let assistant_entry = LogEntry::AssistantItem {
+        let assistant_entry = LogEntry::AnnotatedAssistantItem {
             ts: 1,
-            item: assistant_item.clone(),
+            entry: crate::session_history::test_logged_history_entry(assistant_item.clone()),
         };
 
         in_flight.clear_for_committed_item_then(&assistant_item, || {
@@ -608,7 +608,7 @@ mod tests {
 
         assert!(matches!(
             entries_snapshot.as_slice(),
-            [LogEntry::AssistantItem { item, .. }] if item == &assistant_item
+            [LogEntry::AnnotatedAssistantItem { entry, .. }] if entry.item == assistant_item
         ));
         assert!(in_flight_snapshot.is_empty());
     }

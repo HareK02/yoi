@@ -60,7 +60,7 @@ pub(crate) struct WorkerInterceptor {
     pending_notifies: NotifyBuffer,
     /// Submit-scoped stash of resolver-produced typed system items.
     /// Drained inside `on_prompt_submit`, committed as
-    /// `LogEntry::SystemItem` entries through `log_writer`, and
+    /// `LogEntry::AnnotatedSystemItem` entries through `log_writer`, and
     /// returned to the worker as `Item::system_message` via
     /// `PromptAction::ContinueWith`. Populated by `Worker::run`
     /// immediately before handing off to the worker.
@@ -71,7 +71,7 @@ pub(crate) struct WorkerInterceptor {
     /// Workspace scope associated with Prompt projection provenance.
     prompt_workspace_id: Option<String>,
     /// Type-erased commit handle. The interceptor uses it to commit
-    /// `LogEntry::SystemItem` entries directly (sync) before
+    /// `LogEntry::AnnotatedSystemItem` entries directly (sync) before
     /// returning the corresponding `Item::system_message`s up to the
     /// worker. `None` in tests / `Worker::new` paths where no writer is
     /// attached.
@@ -142,7 +142,7 @@ impl WorkerInterceptor {
         self
     }
 
-    /// Commit each `SystemItem` as its own `LogEntry::SystemItem`
+    /// Commit each `SystemItem` as its own `LogEntry::AnnotatedSystemItem`
     /// entry through the attached writer (no-op when no writer is
     /// wired). Sync — writes complete before the matching
     /// `Item::system_message`s reach the worker via
@@ -540,7 +540,6 @@ mod tests {
             entry: session_store::LogEntry,
         ) -> Result<(), session_store::StoreError> {
             let item = match entry {
-                session_store::LogEntry::SystemItem { item, .. } => Some(item),
                 session_store::LogEntry::AnnotatedSystemItem { entry, .. } => Some(entry.item),
                 _ => None,
             };

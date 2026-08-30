@@ -8557,7 +8557,7 @@ async fn scoped_capture_worker_observation_session(
                 message: "worker protocol closed before the session snapshot".to_string(),
             })
         })?;
-    let protocol::Event::Snapshot { entries, .. } = event else {
+    let protocol::Event::Snapshot { session, .. } = event else {
         return Err(ApiError::from(Error::RuntimeOperationFailed {
             runtime_id: target.runtime_id.clone(),
             code: "worker_observation_missing_snapshot".to_string(),
@@ -8566,7 +8566,7 @@ async fn scoped_capture_worker_observation_session(
     };
     Ok(Json(serde_json::json!({
         "segment_id": format!("runtime:{}:worker:{}", target.runtime_id, target.worker_id),
-        "entries": entries,
+        "session": session,
     })))
 }
 
@@ -16842,7 +16842,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(capture["entries"].is_array());
+        assert!(capture["session"]["entries"].is_array());
 
         let revoked = api
             .store
