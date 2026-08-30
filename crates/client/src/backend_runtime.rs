@@ -1,11 +1,16 @@
+use crate::{BackendApiClient, BackendApiClientError};
 use futures::{SinkExt, StreamExt};
 use protocol::stream::{decode_event, encode_method};
 use protocol::{ErrorCode, Event, Method};
+use reqwest::Method as HttpMethod;
 use std::collections::VecDeque;
 use std::fmt;
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 pub use workdir::workspace::WorkingDirectorySummary as BackendWorkingDirectorySummary;
 pub use workspace_api::{
     Diagnostic as BackendDiagnostic, DiagnosticSeverity as BackendDiagnosticSeverity,
@@ -113,6 +118,7 @@ pub struct BackendRuntimeClient {
 #[derive(Debug)]
 pub enum BackendRuntimeClientError {
     InvalidTarget(String),
+    Api(BackendApiClientError),
     Http(reqwest::Error),
 }
 
@@ -120,12 +126,19 @@ impl fmt::Display for BackendRuntimeClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidTarget(message) => f.write_str(message),
+            Self::Api(error) => write!(f, "{error}"),
             Self::Http(error) => write!(f, "{error}"),
         }
     }
 }
 
 impl std::error::Error for BackendRuntimeClientError {}
+
+impl From<BackendApiClientError> for BackendRuntimeClientError {
+    fn from(error: BackendApiClientError) -> Self {
+        Self::Api(error)
+    }
+}
 
 impl From<reqwest::Error> for BackendRuntimeClientError {
     fn from(error: reqwest::Error) -> Self {
@@ -137,7 +150,7 @@ pub async fn list_backend_workers(
     target: &BackendRuntimeListTarget,
 ) -> Result<BackendRuntimeListResponse<BackendWorkerSummary>, BackendRuntimeClientError> {
     validate_list_target(target)?;
-    let http = reqwest::Client::new();
+    let api = BackendApiClient::from_stored_token(&target.base_url)?;
     if let Some(runtime_id) = target.runtime_id.as_deref() {
         let path = backend_runtime_workers_path(
             target
@@ -146,12 +159,9 @@ pub async fn list_backend_workers(
                 .expect("validated Backend Workspace scope"),
             runtime_id,
         );
-        let url = join_base_and_path(&target.base_url, &path);
-        return Ok(http
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
+        let response = api.request(HttpMethod::GET, &path)?.send().await?;
+        api.check_status(response.status())?;
+        return Ok(response
             .json::<BackendRuntimeListResponse<BackendWorkerSummary>>()
             .await?);
     }
@@ -162,12 +172,9 @@ pub async fn list_backend_workers(
             .as_deref()
             .expect("validated Backend Workspace scope"),
     );
-    let runtime_url = join_base_and_path(&target.base_url, &runtime_path);
-    let runtimes = http
-        .get(runtime_url)
-        .send()
-        .await?
-        .error_for_status()?
+    let response = api.request(HttpMethod::GET, &runtime_path)?.send().await?;
+    api.check_status(response.status())?;
+    let runtimes = response
         .json::<BackendRuntimeListResponse<BackendRuntimeSummary>>()
         .await?;
 
@@ -181,29 +188,43 @@ pub async fn list_backend_workers(
                 .expect("validated Backend Workspace scope"),
             &runtime.runtime_id,
         );
-        let url = join_base_and_path(&target.base_url, &path);
-        match http
-            .get(url)
-            .send()
-            .await
-            .and_then(|response| response.error_for_status())
-        {
-            Ok(response) => {
-                let response = response
-                    .json::<BackendRuntimeListResponse<BackendWorkerSummary>>()
-                    .await?;
-                diagnostics.extend(response.diagnostics);
-                items.extend(response.items);
+        let response = match api.request(HttpMethod::GET, &path)?.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                diagnostics.push(BackendDiagnostic {
+                    code: "runtime_worker_list_failed".to_string(),
+                    severity: BackendDiagnosticSeverity::Error,
+                    message: format!(
+                        "failed to list workers for runtime {}: {error}",
+                        runtime.runtime_id
+                    ),
+                });
+                continue;
             }
-            Err(error) => diagnostics.push(BackendDiagnostic {
+        };
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            api.check_status(response.status())?;
+        }
+        if !response.status().is_success() {
+            diagnostics.push(BackendDiagnostic {
                 code: "runtime_worker_list_failed".to_string(),
                 severity: BackendDiagnosticSeverity::Error,
                 message: format!(
-                    "failed to list workers for runtime {}: {error}",
-                    runtime.runtime_id
+                    "failed to list workers for runtime {}: Backend returned HTTP {}",
+                    runtime.runtime_id,
+                    response.status().as_u16()
                 ),
-            }),
+            });
+            continue;
         }
+        let response = response
+            .json::<BackendRuntimeListResponse<BackendWorkerSummary>>()
+            .await?;
+        diagnostics.extend(response.diagnostics);
+        items.extend(response.items);
     }
 
     Ok(BackendRuntimeListResponse {
@@ -224,7 +245,7 @@ pub async fn list_backend_stopped_workers(
             "stopped worker listing requires a runtime id".to_string(),
         ));
     };
-    let http = reqwest::Client::new();
+    let api = BackendApiClient::from_stored_token(&target.base_url)?;
     let path = backend_runtime_workers_path(
         target
             .workspace_id
@@ -232,12 +253,12 @@ pub async fn list_backend_stopped_workers(
             .expect("validated Backend Workspace scope"),
         runtime_id,
     );
-    let url = join_base_and_path(&target.base_url, &format!("{path}?status=stopped"));
-    Ok(http
-        .get(url)
+    let response = api
+        .request(HttpMethod::GET, &format!("{path}?status=stopped"))?
         .send()
-        .await?
-        .error_for_status()?
+        .await?;
+    api.check_status(response.status())?;
+    Ok(response
         .json::<BackendRuntimeListResponse<BackendWorkerSummary>>()
         .await?)
 }
@@ -246,33 +267,33 @@ pub async fn restore_backend_worker(
     target: &BackendRuntimeTarget,
 ) -> Result<BackendWorkerRestoreResponse, BackendRuntimeClientError> {
     validate_target(target)?;
-    let http = reqwest::Client::new();
+    let api = BackendApiClient::from_stored_token(&target.base_url)?;
     let path = backend_runtime_worker_restore_path(
         &target.workspace_id,
         &target.runtime_id,
         &target.worker_id,
     );
-    let url = join_base_and_path(&target.base_url, &path);
-    Ok(http
-        .post(url)
+    let response = api
+        .request(HttpMethod::POST, &path)?
         .json(&serde_json::json!({}))
         .send()
-        .await?
-        .error_for_status()?
-        .json::<BackendWorkerRestoreResponse>()
-        .await?)
+        .await?;
+    api.check_status(response.status())?;
+    Ok(response.json::<BackendWorkerRestoreResponse>().await?)
 }
 
 impl BackendRuntimeClient {
     pub async fn connect(target: BackendRuntimeTarget) -> Result<Self, BackendRuntimeClientError> {
         validate_target(&target)?;
+        let api = BackendApiClient::from_stored_token(&target.base_url)?;
         let (event_tx, rx) = mpsc::unbounded_channel();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
 
         let protocol_target = target.clone();
         let protocol_event_tx = event_tx.clone();
         let protocol_task = tokio::spawn(async move {
-            run_worker_protocol_transport(protocol_target, command_rx, protocol_event_tx).await;
+            run_worker_protocol_transport(protocol_target, api, command_rx, protocol_event_tx)
+                .await;
         });
 
         Ok(Self {
@@ -317,11 +338,21 @@ impl Drop for BackendRuntimeClient {
 
 async fn run_worker_protocol_transport(
     target: BackendRuntimeTarget,
+    api: BackendApiClient,
     mut commands: mpsc::UnboundedReceiver<Method>,
     tx: mpsc::UnboundedSender<Event>,
 ) {
-    let url = protocol_ws_url(&target);
-    match connect_async(&url).await {
+    let request = match protocol_ws_request(&target, &api) {
+        Ok(request) => request,
+        Err(error) => {
+            let _ = tx.send(diagnostic_event(format!(
+                "Backend protocol request could not be constructed for {}: {error}",
+                target.display_label()
+            )));
+            return;
+        }
+    };
+    match connect_async(request).await {
         Ok((ws, _)) => {
             let (mut sink, mut stream) = ws.split();
             loop {
@@ -387,10 +418,8 @@ async fn run_worker_protocol_transport(
             }
         }
         Err(error) => {
-            let _ = tx.send(diagnostic_event(format!(
-                "Backend protocol WebSocket connect failed for {}: {error}",
-                target.display_label()
-            )));
+            let message = protocol_connect_error_message(&target, &api, &error);
+            let _ = tx.send(diagnostic_event(message));
             while commands.recv().await.is_some() {
                 let _ = tx.send(diagnostic_event(format!(
                     "Backend protocol command was not sent because command stream is unavailable for {}",
@@ -399,6 +428,29 @@ async fn run_worker_protocol_transport(
             }
         }
     }
+}
+
+fn protocol_connect_error_message(
+    target: &BackendRuntimeTarget,
+    api: &BackendApiClient,
+    error: &tokio_tungstenite::tungstenite::Error,
+) -> String {
+    if let tokio_tungstenite::tungstenite::Error::Http(response) = error {
+        if let Ok(status) = reqwest::StatusCode::from_u16(response.status().as_u16()) {
+            if matches!(
+                status,
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            ) {
+                if let Err(error) = api.check_status(status) {
+                    return error.to_string();
+                }
+            }
+        }
+    }
+    format!(
+        "Backend protocol WebSocket connect failed for {}: {error}",
+        target.display_label()
+    )
 }
 
 fn diagnostic_event(message: impl Into<String>) -> Event {
@@ -496,6 +548,19 @@ fn backend_runtime_worker_restore_path(
     )
 }
 
+fn protocol_ws_request(
+    target: &BackendRuntimeTarget,
+    api: &BackendApiClient,
+) -> Result<tokio_tungstenite::tungstenite::http::Request<()>, String> {
+    let mut request = protocol_ws_url(target)
+        .into_client_request()
+        .map_err(|error| error.to_string())?;
+    let value = HeaderValue::from_str(&api.authorization_header_value())
+        .map_err(|_| "saved Backend token is not a valid Authorization header".to_string())?;
+    request.headers_mut().insert(AUTHORIZATION, value);
+    Ok(request)
+}
+
 fn protocol_ws_url(target: &BackendRuntimeTarget) -> String {
     let path = format!(
         "/api/w/{}/runtimes/{}/workers/{}/protocol/ws",
@@ -554,6 +619,26 @@ mod tests {
         assert_eq!(
             protocol_ws_url(&target),
             "ws://127.0.0.1:8787/api/w/workspace%20alpha/runtimes/runtime%2Fone/workers/worker%20one/protocol/ws"
+        );
+    }
+
+    #[test]
+    fn protocol_request_attaches_saved_bearer_authorization() {
+        let target = BackendRuntimeTarget::new(
+            "http://127.0.0.1:8787/",
+            "workspace alpha",
+            "runtime/one",
+            "worker one",
+        );
+        let api = BackendApiClient::from_access_token_for_test(
+            "http://127.0.0.1:8787",
+            "websocket-secret",
+        )
+        .unwrap();
+        let request = protocol_ws_request(&target, &api).unwrap();
+        assert_eq!(
+            request.headers().get(AUTHORIZATION).unwrap(),
+            "Bearer websocket-secret"
         );
     }
 
