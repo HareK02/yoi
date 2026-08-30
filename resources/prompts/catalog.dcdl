@@ -10,6 +10,7 @@ commonMergeRequest = import "./common/merge-request.md";
 commonTickets = import "./common/tickets.md";
 commonToolUsage = import "./common/tool-usage.md";
 commonWorkerObservation = import "./common/worker-observation.md";
+commonWorkspaceWorkerDiscovery = import "./common/workspace-worker-discovery.md";
 commonWorkerOrchestration = import "./common/worker-orchestration.md";
 commonWorkspace = import "./common/workspace.md";
 commonWriting = import "./common/writing.md";
@@ -40,6 +41,7 @@ in
         tickets = commonTickets.content;
         tool_usage = commonToolUsage.content;
         worker_observation = commonWorkerObservation.content;
+        workspace_worker_discovery = commonWorkspaceWorkerDiscovery.content;
         worker_orchestration = commonWorkerOrchestration.content;
         workspace = commonWorkspace.content;
         writing = commonWriting.content;

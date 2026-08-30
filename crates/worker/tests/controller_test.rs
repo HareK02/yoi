@@ -181,6 +181,30 @@ async fn make_worker_with_pwd(
 }
 
 #[derive(Debug)]
+struct AvailableWorkspaceClient;
+
+impl WorkspaceClient for AvailableWorkspaceClient {
+    fn workspace_id(&self) -> Option<&str> {
+        Some("workspace-1")
+    }
+
+    fn kind(&self) -> &str {
+        "test"
+    }
+
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn execute(
+        &self,
+        _request: WorkspaceRequest,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        Err(WorkspaceClientError::Unavailable("test".to_string()))
+    }
+}
+
+#[derive(Debug)]
 struct NoopWorkspaceClient;
 
 impl WorkspaceClient for NoopWorkspaceClient {
@@ -774,6 +798,45 @@ permission = "write"
     for stale_alias in ["SubWorkerList", "SubWorkerSend", "SubWorkerStop"] {
         assert!(!names.iter().any(|name| name == stale_alias));
     }
+}
+
+#[tokio::test]
+async fn workspace_worker_discovery_requires_workspace_authority_and_stays_separate_from_worker_list()
+ {
+    let manifest_toml = r#"
+[worker]
+name = "workspace-worker-discovery-test"
+pwd = "./"
+
+[model]
+scheme = "anthropic"
+model_id = "test-model"
+
+[engine]
+max_tokens = 100
+
+[feature.workspace_worker_discovery]
+enabled = true
+
+[[scope.allow]]
+target = "./"
+permission = "write"
+"#;
+    let client = MockClient::new(simple_text_events());
+    let client_for_assert = client.clone();
+    let (worker, _pwd) = make_worker_with_pwd_manifest_and_workspace_context(
+        client,
+        manifest_toml,
+        WorkerWorkspaceContext::with_client(None, Arc::new(AvailableWorkspaceClient)),
+    )
+    .await;
+    let handle = spawn_controller(worker).await;
+    handle.send(Method::run_text("Hello")).await.unwrap();
+    wait_for_status(&handle, WorkerStatus::Idle).await;
+    let request = wait_for_captured_request(&client_for_assert).await;
+    let names = request_tool_names(&request);
+    assert!(names.iter().any(|name| name == "ListWorkspaceWorkers"));
+    assert!(!names.iter().any(|name| name == "WorkerList"));
 }
 
 #[tokio::test]

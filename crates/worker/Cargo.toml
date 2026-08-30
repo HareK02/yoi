@@ -27,6 +27,7 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tools = { workspace = true }
 workdir = { workspace = true }
+workspace-api = { workspace = true }
 minijinja = "2.19.0"
 chrono = "0.4"
 config-source = { path = "../config-source" }

@@ -6618,6 +6618,7 @@ dependencies = [
  "wasmtime",
  "wat",
  "workdir",
+ "workspace-api",
  "yoi-plugin-pdk",
 ]
 

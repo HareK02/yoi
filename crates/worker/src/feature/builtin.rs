@@ -17,6 +17,7 @@ pub mod session_explore;
 pub mod task;
 pub mod ticket;
 pub mod worker_observation;
+pub mod workspace_worker_discovery;
 
 pub(crate) use memory_extract::{MemoryExtractFeature, MemoryExtractState, render_extract_input};
 pub(crate) use session_explore::{SessionExploreFeature, SessionExploreState};

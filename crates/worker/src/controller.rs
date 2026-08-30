@@ -958,6 +958,23 @@ where
             crate::feature::builtin::manage_workdir::manage_workdir_feature(workspace_client),
         );
     }
+    if feature_config.workspace_worker_discovery.enabled {
+        let workspace_client = worker.workspace_client_handle();
+        let has_workspace_identity = workspace_client.workspace_id().is_some_and(|workspace_id| {
+            !workspace_id.is_empty() && !workspace_id.chars().any(char::is_control)
+        });
+        if !workspace_client.is_available() || !has_workspace_identity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Workspace Worker discovery requires Backend Workspace API authority",
+            ));
+        }
+        feature_registry.add_module(
+            crate::feature::builtin::workspace_worker_discovery::workspace_worker_discovery_feature(
+                workspace_client,
+            ),
+        );
+    }
     if feature_config.worker.enabled {
         let workspace_client = worker.workspace_client_handle();
         let has_workspace_identity = workspace_client.workspace_id().is_some_and(|workspace_id| {

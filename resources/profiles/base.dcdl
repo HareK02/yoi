@@ -28,6 +28,7 @@ feature = {
     image = { enabled = true; };
     sub_worker = { enabled = false; };
     worker = { enabled = false; };
+    workspace_worker_discovery = { enabled = false; };
     objective = { enabled = true; };
     ticket = { enabled = true; authoring = true; thread = true; };
     merge_request = {

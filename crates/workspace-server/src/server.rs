@@ -65,7 +65,8 @@ use workspace_api::{
     ObjectiveLinkTicketRequest, ObjectiveStateRequest, PutRepositorySshHostTrustRequest,
     RepositoryAccessProjection, RepositorySshCredential, RepositorySshHostTrust,
     RotateRepositorySshCredentialRequest, TICKET_ORCHESTRATION_PLANS_QUERY_PATH,
-    TICKET_RELATIONS_QUERY_PATH,
+    TICKET_RELATIONS_QUERY_PATH, WorkspaceWorkerDiscoveryItem, WorkspaceWorkerDiscoveryPage,
+    WorkspaceWorkerSubject,
 };
 
 use crate::auth::{
@@ -1063,7 +1064,13 @@ async fn authorize_scoped_workspace_request(
             .map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
         let digest = worker_runtime::auth::request_body_digest(&body);
         *request.body_mut() = axum::body::Body::from(body);
-        let permission = if path.starts_with("/api/runtime/v1/workspaces/")
+        let permission = if path
+            .split('?')
+            .next()
+            .is_some_and(|path| path.ends_with("/worker-discovery/workers"))
+        {
+            worker_runtime::auth::WORKSPACE_WORKER_DISCOVERY_PERMISSION
+        } else if path.starts_with("/api/runtime/v1/workspaces/")
             || path.contains("/profile-source-archives/")
         {
             worker_runtime::auth::BACKEND_RESOURCE_FETCH_PERMISSION
@@ -1135,7 +1142,13 @@ async fn authorize_workspace_api_request(
         };
         let digest = worker_runtime::auth::request_body_digest(&body);
         *request.body_mut() = axum::body::Body::from(body);
-        let permission = if path.starts_with("/api/runtime/v1/workspaces/")
+        let permission = if path
+            .split('?')
+            .next()
+            .is_some_and(|path| path.ends_with("/worker-discovery/workers"))
+        {
+            worker_runtime::auth::WORKSPACE_WORKER_DISCOVERY_PERMISSION
+        } else if path.starts_with("/api/runtime/v1/workspaces/")
             || path.contains("/profile-source-archives/")
         {
             worker_runtime::auth::BACKEND_RESOURCE_FETCH_PERMISSION
@@ -2467,6 +2480,10 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/worker-observation/session",
             post(scoped_capture_worker_observation_session),
+        )
+        .route(
+            "/api/w/{workspace_id}/worker-discovery/workers",
+            get(scoped_discover_workspace_workers),
         )
         .route(
             "/api/w/{workspace_id}/workers",
@@ -8216,6 +8233,144 @@ async fn scoped_get_workspace_worker(
             }
             .into()
         })
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceWorkerDiscoveryQuery {
+    cursor: Option<String>,
+    limit: Option<usize>,
+    query: Option<String>,
+}
+
+async fn scoped_discover_workspace_workers(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Query(query): Query<WorkspaceWorkerDiscoveryQuery>,
+    source: Option<Extension<crate::worker_source::VerifiedRuntimeRequestSource>>,
+) -> Response {
+    let Some(Extension(_source)) = source else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "workspace_worker_discovery_source_required"
+            })),
+        )
+            .into_response();
+    };
+
+    if let Err(error) = validate_workspace_scope(&api, &path.workspace_id) {
+        return error.into_response();
+    }
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let cursor = query.cursor.as_deref();
+    let query = match query.query.as_deref().map(str::trim) {
+        Some("") | None => None,
+        Some(query) if query.len() <= 128 => Some(query),
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_workspace_worker_discovery_query"
+                })),
+            )
+                .into_response();
+        }
+    };
+    let filter_fingerprint = workspace_worker_discovery_filter_fingerprint(query);
+    let offset = match query_cursor_offset(cursor, filter_fingerprint) {
+        Ok(offset) => offset,
+        Err(()) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_workspace_worker_discovery_cursor"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let workers = match workers_response(api) {
+        Ok(workers) => workers,
+        Err(error) => return error.into_response(),
+    };
+    Json(workspace_worker_discovery_page(
+        workers.items,
+        query,
+        offset,
+        limit,
+        filter_fingerprint,
+    ))
+    .into_response()
+}
+
+fn workspace_worker_discovery_page(
+    workers: Vec<workspace_api::WorkerSummary>,
+    query: Option<&str>,
+    offset: usize,
+    limit: usize,
+    filter_fingerprint: u64,
+) -> WorkspaceWorkerDiscoveryPage {
+    let mut workers = workers
+        .into_iter()
+        .filter(|worker| worker.workspace.visibility == "workspace_scoped")
+        .filter(|worker| {
+            query.is_none_or(|query| {
+                worker.resource_key == query
+                    || worker.display_name == query
+                    || worker.label == query
+            })
+        })
+        .collect::<Vec<_>>();
+    workers.sort_by(|left, right| left.resource_key.cmp(&right.resource_key));
+    let total = workers.len();
+    let page = workers
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|worker| WorkspaceWorkerDiscoveryItem {
+            subject: WorkspaceWorkerSubject::RuntimeWorker {
+                runtime_id: worker.runtime_id,
+                worker_id: worker.worker_id,
+            },
+            resource_key: worker.resource_key,
+            display_name: worker.display_name,
+            profile: worker.profile,
+            status: Some(worker.state),
+        })
+        .collect::<Vec<_>>();
+    let next_offset = offset.saturating_add(page.len());
+    WorkspaceWorkerDiscoveryPage {
+        workers: page,
+        next_cursor: (next_offset < total)
+            .then(|| format!("v1:{next_offset}:{filter_fingerprint:016x}")),
+    }
+}
+
+fn query_cursor_offset(
+    cursor: Option<&str>,
+    filter_fingerprint: u64,
+) -> std::result::Result<usize, ()> {
+    let Some(cursor) = cursor else {
+        return Ok(0);
+    };
+    let mut parts = cursor.split(':');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("v1"), Some(offset), Some(fingerprint), None)
+            if u64::from_str_radix(fingerprint, 16).ok() == Some(filter_fingerprint) =>
+        {
+            offset.parse().map_err(|_| ())
+        }
+        _ => Err(()),
+    }
+}
+
+fn workspace_worker_discovery_filter_fingerprint(query: Option<&str>) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    query.hash(&mut hasher);
+    hasher.finish()
 }
 
 async fn scoped_list_workers(
@@ -22314,6 +22469,171 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(valid.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn workspace_worker_discovery_filters_internal_workers_and_paginates_typed_subjects() {
+        fn summary(
+            key: &str,
+            worker_id: &str,
+            name: &str,
+            visibility: &str,
+        ) -> workspace_api::WorkerSummary {
+            workspace_api::WorkerSummary {
+                runtime_id: "runtime-test".to_string(),
+                worker_id: worker_id.to_string(),
+                resource_key: key.to_string(),
+                host_id: "host-test".to_string(),
+                display_name: name.to_string(),
+                label: name.to_string(),
+                profile: Some("builtin:coder".to_string()),
+                singleton_key: None,
+                tags: Vec::new(),
+                workspace: workspace_api::WorkerWorkspaceSummary {
+                    visibility: visibility.to_string(),
+                    identity: "workspace-test".to_string(),
+                    workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
+                },
+                state: "idle".to_string(),
+                last_seen_at: None,
+                pinned: false,
+                retention_state: "normal".to_string(),
+                implementation: workspace_api::WorkerImplementationSummary {
+                    kind: "remote".to_string(),
+                    display_hint: "remote".to_string(),
+                },
+                capabilities: workspace_api::WorkerCapabilitySummary {
+                    can_stop: true,
+                    can_spawn_followup: false,
+                },
+                working_directory: None,
+                diagnostics: Vec::new(),
+            }
+        }
+
+        let fingerprint = workspace_worker_discovery_filter_fingerprint(None);
+        let first = workspace_worker_discovery_page(
+            vec![
+                summary("W-3", "internal", "service", "backend_internal"),
+                summary("W-2", "worker-b", "beta", "workspace_scoped"),
+                summary("W-1", "worker-a", "alpha", "workspace_scoped"),
+            ],
+            None,
+            0,
+            1,
+            fingerprint,
+        );
+        assert_eq!(first.workers.len(), 1);
+        assert_eq!(first.workers[0].resource_key, "W-1");
+        assert_eq!(
+            first.workers[0].subject,
+            WorkspaceWorkerSubject::RuntimeWorker {
+                runtime_id: "runtime-test".to_string(),
+                worker_id: "worker-a".to_string(),
+            }
+        );
+        let cursor = first.next_cursor.as_deref().unwrap();
+        let offset = query_cursor_offset(Some(cursor), fingerprint).unwrap();
+        let second = workspace_worker_discovery_page(
+            vec![
+                summary("W-3", "internal", "service", "backend_internal"),
+                summary("W-2", "worker-b", "beta", "workspace_scoped"),
+                summary("W-1", "worker-a", "alpha", "workspace_scoped"),
+            ],
+            None,
+            offset,
+            1,
+            fingerprint,
+        );
+        assert_eq!(second.workers[0].resource_key, "W-2");
+        assert!(second.next_cursor.is_none());
+
+        let lookup_fingerprint = workspace_worker_discovery_filter_fingerprint(Some("beta"));
+        let lookup = workspace_worker_discovery_page(
+            vec![summary("W-2", "worker-b", "beta", "workspace_scoped")],
+            Some("beta"),
+            0,
+            10,
+            lookup_fingerprint,
+        );
+        assert_eq!(lookup.workers[0].resource_key, "W-2");
+        assert!(query_cursor_offset(Some(cursor), lookup_fingerprint).is_err());
+    }
+
+    #[tokio::test]
+    async fn workspace_worker_discovery_requires_dedicated_source_proof() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut api = test_api(workspace.path()).await;
+        let identity =
+            worker_runtime::auth::RuntimeIdentityMaterial::generate("runtime-test").unwrap();
+        configure_runtime_request_auth(&mut api, &identity, "runtime-test");
+        seed_worker_source_member(&api, "runtime-test", "worker-caller");
+        seed_worker_source_member(&api, "runtime-test", "worker-target");
+        let target_key = api
+            .store
+            .resource_key(
+                TEST_WORKSPACE_ID,
+                WorkspaceResourceKind::Worker,
+                "worker-target",
+            )
+            .unwrap()
+            .unwrap();
+        let target = format!(
+            "/api/w/{TEST_WORKSPACE_ID}/worker-discovery/workers?limit=1&query={target_key}"
+        );
+        let signer = worker_runtime::auth::RuntimeRequestSourceSigner::from_identity(&identity);
+        let issue = |permission| {
+            signer
+                .issue(
+                    "server-test",
+                    TEST_WORKSPACE_ID,
+                    Some("worker-caller"),
+                    permission,
+                    "GET",
+                    &target,
+                    b"",
+                    i64::try_from(worker_runtime::auth::unix_now_seconds()).unwrap_or(i64::MAX),
+                    30,
+                )
+                .unwrap()
+        };
+        let app = build_router(api);
+
+        let generic = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&target)
+                    .header(
+                        worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER,
+                        issue(worker_runtime::auth::WORKSPACE_REQUEST_PERMISSION),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(generic.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(&target)
+                    .header(
+                        worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER,
+                        issue(worker_runtime::auth::WORKSPACE_WORKER_DISCOVERY_PERMISSION),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: WorkspaceWorkerDiscoveryPage =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(body.workers.is_empty());
+        assert!(body.next_cursor.is_none());
     }
 
     #[tokio::test]
