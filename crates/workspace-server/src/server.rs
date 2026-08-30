@@ -44,7 +44,9 @@ use webauthn_rs::prelude::{
     PublicKeyCredential, RegisterPublicKeyCredential, RequestChallengeResponse, Webauthn,
     WebauthnBuilder,
 };
-use workdir::http::{WorkdirSessionOperation, WorkdirSessionOperationResult};
+use workdir::http::{
+    WorkdirSessionOperation, WorkdirSessionOperationResult, WorkdirTransportError,
+};
 use workdir::workspace::{
     MaterializerKind, WorkingDirectoryCleanupTarget,
     WorkingDirectoryDetailResponse as BrowserWorkingDirectoryDetailResponse,
@@ -6932,12 +6934,56 @@ fn validated_current_worker_attachment(
     Ok(link)
 }
 
+#[derive(Debug)]
+enum WorkdirOperationApiError {
+    Api(ApiError),
+    Provider(WorkdirTransportError),
+}
+
+impl From<ApiError> for WorkdirOperationApiError {
+    fn from(error: ApiError) -> Self {
+        Self::Api(error)
+    }
+}
+
+impl From<Error> for WorkdirOperationApiError {
+    fn from(error: Error) -> Self {
+        Self::Api(error.into())
+    }
+}
+
+impl From<WorkdirTransportError> for WorkdirOperationApiError {
+    fn from(error: WorkdirTransportError) -> Self {
+        Self::Provider(error)
+    }
+}
+
+impl IntoResponse for WorkdirOperationApiError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Api(error) => error.into_response(),
+            Self::Provider(error) => {
+                let status = StatusCode::from_u16(error.code.http_status())
+                    .expect("Workdir transport error status is valid");
+                let log = ApiErrorLog {
+                    kind: format!("workdir_session_operation_{}", error.code.as_str()),
+                    message: error.message.clone(),
+                    diagnostics: Vec::new(),
+                };
+                let mut response = (status, Json(error)).into_response();
+                response.extensions_mut().insert(log);
+                response
+            }
+        }
+    }
+}
+
 async fn scoped_execute_current_worker_workdir_operation(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
     headers: HeaderMap,
     Json(request): Json<WorkspaceWorkdirSessionOperationRequest>,
-) -> ApiResult<Json<WorkdirSessionOperationResult>> {
+) -> std::result::Result<Json<WorkdirSessionOperationResult>, WorkdirOperationApiError> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let worker = current_worker_identity(&api, &path.workspace_id, &headers)?;
     let expected_session_fence = request.expected_session_fence;
@@ -7076,7 +7122,8 @@ async fn current_worker_command_session(
     external_handle: &CommandHandle,
     delegations: &[workdir::WorkdirDelegationRequest],
     expected_session_fence: Option<&str>,
-) -> ApiResult<(workdir::AppliedWorkdirDelegation, CommandHandle)> {
+) -> std::result::Result<(workdir::AppliedWorkdirDelegation, CommandHandle), WorkdirOperationApiError>
+{
     let _link = validated_current_worker_attachment(api, worker, expected_session_fence)?;
     let command = api
         .workdir_sessions
@@ -7084,7 +7131,7 @@ async fn current_worker_command_session(
         .expect("Workdir session registry lock poisoned")
         .command(worker, external_handle)
         .ok_or_else(|| {
-            ApiError::from(current_worker_workdir_operation_error(
+            WorkdirOperationApiError::Provider(current_worker_workdir_operation_error(
                 worker,
                 workdir::WorkdirError::UnknownCommand(external_handle.0.clone()),
             ))
@@ -7101,14 +7148,10 @@ async fn current_worker_command_session(
 }
 
 fn current_worker_workdir_operation_error(
-    worker: &RuntimeWorkerRef,
+    _worker: &RuntimeWorkerRef,
     error: workdir::WorkdirError,
-) -> Error {
-    Error::RuntimeOperationFailed {
-        runtime_id: worker.runtime_id.clone(),
-        code: "workdir_session_operation_failed".to_string(),
-        message: error.to_string(),
-    }
+) -> WorkdirTransportError {
+    WorkdirTransportError::from_workdir_error(&error)
 }
 
 async fn execute_workdir_session_operation(
@@ -15735,6 +15778,107 @@ mod tests {
         )))
         .into_response();
         assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn workdir_operation_errors_preserve_typed_public_status_and_code() {
+        for (code, expected_status) in [
+            (
+                workdir::http::WorkdirTransportErrorCode::InvalidRequest,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                workdir::http::WorkdirTransportErrorCode::NotFound,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                workdir::http::WorkdirTransportErrorCode::UnknownCommand,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                workdir::http::WorkdirTransportErrorCode::Conflict,
+                StatusCode::CONFLICT,
+            ),
+            (
+                workdir::http::WorkdirTransportErrorCode::Unsupported,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                workdir::http::WorkdirTransportErrorCode::Unavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                workdir::http::WorkdirTransportErrorCode::Internal,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ] {
+            let response = WorkdirOperationApiError::Provider(WorkdirTransportError {
+                code,
+                message: "safe provider message".to_string(),
+            })
+            .into_response();
+            assert_eq!(response.status(), expected_status);
+            let log = response.extensions().get::<ApiErrorLog>().unwrap();
+            assert_eq!(
+                log.kind,
+                format!("workdir_session_operation_{}", code.as_str())
+            );
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let decoded: WorkdirTransportError = serde_json::from_slice(&body).unwrap();
+            assert_eq!(decoded.code, code);
+            assert_eq!(decoded.message, "safe provider message");
+        }
+    }
+
+    #[tokio::test]
+    async fn local_and_remote_validation_errors_share_workspace_classification() {
+        let worker = RuntimeWorkerRef::new("runtime", "worker");
+        let local = current_worker_workdir_operation_error(
+            &worker,
+            workdir::WorkdirError::InvalidGlob("[".to_string()),
+        );
+        let remote = current_worker_workdir_operation_error(
+            &worker,
+            WorkdirTransportError {
+                code: workdir::http::WorkdirTransportErrorCode::InvalidRequest,
+                message: "Workdir operation request is invalid".to_string(),
+            }
+            .into_workdir_error(),
+        );
+        assert_eq!(local, remote);
+
+        for public in [local, remote] {
+            let response = WorkdirOperationApiError::Provider(public).into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let decoded: WorkdirTransportError = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                decoded.code,
+                workdir::http::WorkdirTransportErrorCode::InvalidRequest
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn workdir_operation_error_response_redacts_provider_internal_details() {
+        let error = workdir::WorkdirError::Io {
+            path: PathBuf::from("/host/private/worktree/secret.txt"),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "token=secret"),
+        };
+        let public = current_worker_workdir_operation_error(
+            &RuntimeWorkerRef::new("runtime", "worker"),
+            error,
+        );
+        let response = WorkdirOperationApiError::Provider(public).into_response();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!text.contains("/host/private"));
+        assert!(!text.contains("token=secret"));
+        let decoded: WorkdirTransportError = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            decoded.code,
+            workdir::http::WorkdirTransportErrorCode::Internal
+        );
     }
 
     #[test]
