@@ -26,7 +26,10 @@ use standalone::{StandaloneHost, StandaloneLaunchConfig};
 use tokio::sync::{broadcast, mpsc};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use client::{BackendRuntimeClient, BackendRuntimeTarget, WorkerClient, WorkerRuntimeCommand};
+use client::{
+    BackendRuntimeClient, BackendRuntimeTarget, StandaloneSessionResumeIntent, WorkerClient,
+    WorkerRuntimeCommand,
+};
 
 use crate::app::{ActionbarNoticeLevel, ActionbarNoticeSource, App};
 use crate::composer_keys::{ComposerEditAction, composer_edit_action};
@@ -277,6 +280,31 @@ pub(crate) async fn run_standalone(
     let host = StandaloneHost::start(launch)
         .await
         .map_err(|error| io::Error::other(format!("Standalone Worker startup failed: {error}")))?;
+    run_standalone_host(host, worker_name, history_root).await
+}
+
+pub(crate) async fn run_standalone_restore(
+    intent: StandaloneSessionResumeIntent,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let session_id = intent.session_id.parse().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Invalid standalone session ID: {error}"),
+        )
+    })?;
+    let host = StandaloneHost::restore(intent.state_dir, session_id)
+        .await
+        .map_err(|error| io::Error::other(format!("Standalone restore failed: {error}")))?;
+    let worker_label = format!("standalone-{}", session_id.short());
+    let history_root = host.record().cwd.canonical_path.clone();
+    run_standalone_host(host, worker_label, history_root).await
+}
+
+async fn run_standalone_host(
+    host: StandaloneHost,
+    worker_label: String,
+    history_root: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut connection = ConsoleConnection::standalone(host);
 
     let mut terminal = match enter_fullscreen() {
@@ -286,7 +314,7 @@ pub(crate) async fn run_standalone(
             return Err(error);
         }
     };
-    let mut app = App::new_with_persistent_input_history(worker_name, &history_root);
+    let mut app = App::new_with_persistent_input_history(worker_label, &history_root);
     let run_result = run_loop(&mut terminal, &mut app, &mut connection, None).await;
     let shutdown_result = connection
         .shutdown()

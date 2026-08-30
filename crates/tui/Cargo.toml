@@ -11,6 +11,7 @@ e2e-test = []
 [dependencies]
 client = { workspace = true }
 standalone = { workspace = true }
+thiserror.workspace = true
 protocol = { workspace = true }
 ratatui = { version = "0.30.0", features = ["scrolling-regions"] }
 base64 = "0.22.1"

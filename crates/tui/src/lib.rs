@@ -19,6 +19,7 @@ mod role_session_registry;
 mod scroll;
 pub mod setup_model;
 mod spawn;
+mod standalone_picker;
 mod task;
 mod text_selection;
 mod tool;
@@ -51,6 +52,9 @@ pub enum LaunchMode {
         worker_name: Option<String>,
         profile: Option<String>,
     },
+    /// Restore one client-owned standalone session. The current cwd is the default scope;
+    /// `include_all` opts into all standalone sessions under the same client data root.
+    StandaloneResume { include_all: bool },
     /// `yoi --worker <name>`: attach to a live Worker by name if possible;
     /// otherwise launch the Worker runtime command with `--worker <name>` so it
     /// resumes from name-keyed state or creates a fresh same-name Worker.
@@ -168,6 +172,13 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
             }
             Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
         },
+        LaunchMode::StandaloneResume { include_all } => {
+            match standalone_picker::pick(target.as_ref(), include_all) {
+                Ok(Some(intent)) => console::run_standalone_restore(intent).await,
+                Ok(None) => Ok(()),
+                Err(error) => Err(Box::new(error) as Box<dyn std::error::Error>),
+            }
+        }
         LaunchMode::WorkerName {
             worker_name,
             socket_override,

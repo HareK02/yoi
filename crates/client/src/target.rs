@@ -133,6 +133,19 @@ pub struct WorkerResume {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StandaloneSessionListIntent {
+    pub state_dir: PathBuf,
+    pub cwd: PathBuf,
+    pub include_all: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StandaloneSessionResumeIntent {
+    pub state_dir: PathBuf,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Dashboard {
     Local {
         runtime_command: WorkerRuntimeCommand,
@@ -203,6 +216,26 @@ pub trait Target: fmt::Debug + Send + Sync {
     fn worker_by_name(&self) -> Result<WorkerByName, TargetError>;
 
     fn resume_worker(&self) -> Result<WorkerResume, TargetError>;
+
+    fn standalone_session_list(
+        &self,
+        _include_all: bool,
+    ) -> Result<StandaloneSessionListIntent, TargetError> {
+        Err(TargetError::unsupported(
+            "standalone session listing",
+            self.kind(),
+        ))
+    }
+
+    fn standalone_session_resume(
+        &self,
+        _session_id: String,
+    ) -> Result<StandaloneSessionResumeIntent, TargetError> {
+        Err(TargetError::unsupported(
+            "standalone session restore",
+            self.kind(),
+        ))
+    }
 
     fn dashboard(&self) -> Result<Dashboard, TargetError>;
 
@@ -310,6 +343,29 @@ impl Target for StandaloneTarget {
 
     fn resume_worker(&self) -> Result<WorkerResume, TargetError> {
         Err(TargetError::unsupported("Worker restore", self.kind()))
+    }
+
+    fn standalone_session_list(
+        &self,
+        include_all: bool,
+    ) -> Result<StandaloneSessionListIntent, TargetError> {
+        let cwd = std::env::current_dir()
+            .map_err(|error| TargetError::invalid(self.kind(), error.to_string()))?;
+        Ok(StandaloneSessionListIntent {
+            state_dir: self.state_dir.clone(),
+            cwd,
+            include_all,
+        })
+    }
+
+    fn standalone_session_resume(
+        &self,
+        session_id: String,
+    ) -> Result<StandaloneSessionResumeIntent, TargetError> {
+        Ok(StandaloneSessionResumeIntent {
+            state_dir: self.state_dir.clone(),
+            session_id,
+        })
     }
 
     fn dashboard(&self) -> Result<Dashboard, TargetError> {
@@ -572,6 +628,29 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Worker spawn is not supported by Backend target"
+        );
+    }
+
+    #[test]
+    fn standalone_target_builds_explicit_session_intents() {
+        let target = StandaloneTarget::new("/tmp/yoi-client-sessions");
+        let list = target.standalone_session_list(true).unwrap();
+        assert_eq!(list.state_dir, PathBuf::from("/tmp/yoi-client-sessions"));
+        assert!(list.include_all);
+        assert!(list.cwd.is_absolute());
+
+        let resume = target
+            .standalone_session_resume("019d1234-0000-7000-8000-000000000000".to_string())
+            .unwrap();
+        assert_eq!(resume.state_dir, list.state_dir);
+        assert_eq!(resume.session_id, "019d1234-0000-7000-8000-000000000000");
+
+        assert!(
+            LocalTarget::new()
+                .standalone_session_list(false)
+                .unwrap_err()
+                .to_string()
+                .contains("not supported")
         );
     }
 

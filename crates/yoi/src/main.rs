@@ -502,10 +502,20 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
     let mut socket_override = None;
     let mut runtime_id = None;
     let mut worker_id = None;
+    let mut standalone_resume = false;
+    let mut standalone_all = false;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
         match arg.as_str() {
+            "--resume" => {
+                standalone_resume = true;
+                i += 1;
+            }
+            "--all" => {
+                standalone_all = true;
+                i += 1;
+            }
             "--worker" => {
                 let value = args
                     .get(i + 1)
@@ -687,10 +697,33 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
         &workspace_root,
     )?;
 
+    if standalone_all && !standalone_resume {
+        return Err(ParseError("--all requires --resume".to_string()));
+    }
+    if standalone_resume {
+        if target.kind() != TargetKind::Standalone {
+            return Err(ParseError(
+                "--resume is a Standalone option and requires --local".to_string(),
+            ));
+        }
+        if worker_name.is_some()
+            || profile.is_some()
+            || session.is_some()
+            || socket_override.is_some()
+            || runtime_id.is_some()
+            || worker_id.is_some()
+        {
+            return Err(ParseError(
+                "--local --resume cannot be combined with Worker, profile, session, socket, or Runtime selectors"
+                    .to_string(),
+            ));
+        }
+    }
+
     if target.kind() == TargetKind::Standalone {
         if session.is_some() {
             return Err(ParseError(
-                "--local starts a fresh Standalone Worker; --session restore requires the legacy local Runtime"
+                "--local does not accept legacy --session; use --local --resume for Standalone session restore"
                     .to_string(),
             ));
         }
@@ -725,7 +758,11 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
         });
     }
 
-    let mode = if let Some(profile) = profile {
+    let mode = if standalone_resume {
+        LaunchMode::StandaloneResume {
+            include_all: standalone_all,
+        }
+    } else if let Some(profile) = profile {
         LaunchMode::Spawn {
             worker_name,
             profile: Some(profile),
@@ -1661,6 +1698,7 @@ const TOP_LEVEL_HELP: &str = r#"yoi
 
 Usage:
   yoi [TARGET] [CONSOLE_OPTIONS]
+  yoi --local --resume [--all]
   yoi [TARGET] workers [-r|--stopped] [--workspace <PATH>] [--runtime-id <ID>]
   yoi [TARGET] resume [--workspace <PATH>|--all] [--runtime-id <ID>]
   yoi [TARGET] panel [-r|--stopped] [--workspace <PATH>]
@@ -1670,7 +1708,9 @@ Usage:
 Target selection:
   Target options are top-level options and must appear before the command.
 
-      --local              Start a one-process Standalone Worker (no Server or Runtime)
+      --local              Start or restore a client-owned one-process Standalone Worker
+      --resume             With --local, open the Standalone session picker for the current cwd
+      --all                With --local --resume, include sessions from every cwd identity
       --backend <URL>      Use a Workspace Backend explicitly
       --workspace-id <ID>  Scope Backend routes to a Workspace id
 
@@ -2081,6 +2121,42 @@ backend = "shared"
     }
 
     #[test]
+    fn parser_local_resume_uses_standalone_picker_scope() {
+        let mode = parse_args_from(["--local", "--resume"]).unwrap();
+        let Mode::Tui { target, mode, .. } = mode else {
+            panic!("expected TUI mode")
+        };
+        assert_eq!(target.kind(), TargetKind::Standalone);
+        assert!(matches!(
+            mode,
+            LaunchMode::StandaloneResume { include_all: false }
+        ));
+        let intent = target.standalone_session_list(false).unwrap();
+        assert!(intent.state_dir.ends_with("client/standalone-sessions"));
+        assert!(!intent.include_all);
+
+        let mode = parse_args_from(["--local", "--resume", "--all"]).unwrap();
+        let Mode::Tui { mode, .. } = mode else {
+            panic!("expected TUI mode")
+        };
+        assert!(matches!(
+            mode,
+            LaunchMode::StandaloneResume { include_all: true }
+        ));
+
+        assert_eq!(
+            parse_args_from(["--resume"]).unwrap_err().to_string(),
+            "--resume is a Standalone option and requires --local"
+        );
+        assert_eq!(
+            parse_args_from(["--local", "--all"])
+                .unwrap_err()
+                .to_string(),
+            "--all requires --resume"
+        );
+    }
+
+    #[test]
     fn parser_rejects_standalone_and_backend_target_together() {
         let err = parse_args_from(["--local", "--backend", "http://backend.example"]).unwrap_err();
         assert_eq!(
@@ -2101,7 +2177,7 @@ backend = "shared"
         let err = parse_args_slice_with_connection_resolver(&session_args, &resolver).unwrap_err();
         assert_eq!(
             err.0,
-            "--local starts a fresh Standalone Worker; --session restore requires the legacy local Runtime"
+            "--local does not accept legacy --session; use --local --resume for Standalone session restore"
         );
 
         let socket_args = [
@@ -2567,7 +2643,6 @@ backend = "shared"
     fn parse_rejects_legacy_resume_flags() {
         let cases = [
             (vec!["-r".to_string()], "unknown argument: -r"),
-            (vec!["--resume".to_string()], "unknown argument: --resume"),
             (
                 vec![
                     "--worker".to_string(),
