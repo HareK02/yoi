@@ -438,7 +438,32 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             return Ok(Mode::Plugin(plugin_cli));
         }
         "login" => {
-            return parse_login_args(&args[1..], connection_resolver);
+            if target_selection.explicit_local {
+                return Err(ParseError(
+                    "yoi login requires a Backend target and cannot use --local".to_string(),
+                ));
+            }
+            if target_selection.workspace_id.is_some() {
+                return Err(ParseError(
+                    "yoi login authenticates a Backend and does not accept --workspace-id"
+                        .to_string(),
+                ));
+            }
+            let mut login_args = args[1..].to_vec();
+            if let Some(backend_url) = target_selection.backend_url {
+                if login_args
+                    .iter()
+                    .any(|arg| arg == "--backend" || arg.starts_with("--backend="))
+                {
+                    return Err(ParseError(
+                        "--backend may be provided either before or after login, not both"
+                            .to_string(),
+                    ));
+                }
+                login_args.insert(0, backend_url);
+                login_args.insert(0, "--backend".to_string());
+            }
+            return parse_login_args(&login_args, connection_resolver);
         }
         "mcp" => {
             let _target = resolve_local_cli_connection(connection_resolver, CliCommand::Mcp)?;
@@ -2004,6 +2029,43 @@ backend = "shared"
         assert!(!TOP_LEVEL_HELP.contains("yoi workspace"));
         assert!(!TOP_LEVEL_HELP.contains("yoi server"));
         assert!(!TOP_LEVEL_HELP.contains("TARGET_OPTIONS"));
+    }
+
+    #[test]
+    fn parse_login_preserves_top_level_backend_selector() {
+        match parse_args_from(["--backend", "http://127.0.0.1:8787", "login", "--no-wait"]).unwrap()
+        {
+            Mode::Login {
+                backend_url,
+                no_wait,
+            } => {
+                assert_eq!(backend_url, "http://127.0.0.1:8787");
+                assert!(no_wait);
+            }
+            other => panic!("expected Login mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_login_rejects_non_backend_or_duplicate_target_selectors() {
+        assert!(
+            parse_args_from(["--local", "login"])
+                .unwrap_err()
+                .to_string()
+                .contains("cannot use --local")
+        );
+        assert!(
+            parse_args_from([
+                "--backend",
+                "http://127.0.0.1:8787",
+                "login",
+                "--backend",
+                "http://127.0.0.1:8788",
+            ])
+            .unwrap_err()
+            .to_string()
+            .contains("not both")
+        );
     }
 
     #[test]
