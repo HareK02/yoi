@@ -94,12 +94,14 @@ fn extend_history(
     let mut attached_segments = false;
     for entry in history {
         let data = if !attached_segments
-            && matches!(
-                entry.metadata.origin,
-                LoggedSessionHistoryOrigin::HumanInput { .. }
-            )
             && input_segments.is_some()
-        {
+            && matches!(
+                &entry.item,
+                LoggedItem::Message {
+                    role: LoggedRole::User,
+                    ..
+                }
+            ) {
             attached_segments = true;
             SessionSnapshotEntryData::UserInput {
                 segments: input_segments.cloned().unwrap_or_default(),
@@ -293,7 +295,10 @@ mod tests {
     use agen::llm_client::RequestConfig;
 
     use super::*;
-    use crate::{LoggedSessionHistoryEntryId, LoggedSessionHistoryMetadata, LoggedWorkerSubject};
+    use crate::{
+        LoggedHistoryDerivation, LoggedSessionHistoryEntryId, LoggedSessionHistoryMetadata,
+        LoggedWorkerSubject,
+    };
 
     #[test]
     fn current_projection_is_stable_and_hides_reasoning_and_system_prompts() {
@@ -350,6 +355,92 @@ mod tests {
         assert!(!json.contains("secret prompt"));
         assert!(!json.contains("secret reasoning"));
         assert!(json.contains("visible"));
+    }
+
+    #[test]
+    fn annotated_user_input_attaches_segments_to_first_user_role_entry_for_any_origin() {
+        let session_id = crate::new_session_id();
+        let segments = vec![Segment::Text {
+            content: "normal submit".into(),
+        }];
+
+        for origin in [
+            LoggedSessionHistoryOrigin::LegacyUnknown,
+            LoggedSessionHistoryOrigin::FlowInstruction {
+                selector: "builtin:coder-review".into(),
+                definition_id: "flow-definition".into(),
+                definition_revision: 7,
+                instance_id: "flow-instance".into(),
+                state_id: "implement".into(),
+            },
+        ] {
+            let user_entry_id = LoggedSessionHistoryEntryId::new();
+            let source_entry_id = LoggedSessionHistoryEntryId::new();
+            let log = vec![
+                LogEntry::AnnotatedSegmentStart {
+                    ts: 1,
+                    session_id,
+                    system_prompt: None,
+                    config: RequestConfig::default(),
+                    history: Vec::new(),
+                    forked_from: None,
+                    compacted_from: None,
+                },
+                LogEntry::AnnotatedUserInput {
+                    ts: 2,
+                    segments: segments.clone(),
+                    history: vec![
+                        LoggedHistoryEntry {
+                            item: LoggedItem::Message {
+                                role: LoggedRole::System,
+                                content: vec![LoggedContentPart::Text {
+                                    text: "flow instruction".into(),
+                                }],
+                            },
+                            metadata: LoggedSessionHistoryMetadata {
+                                entry_id: LoggedSessionHistoryEntryId::new(),
+                                origin: LoggedSessionHistoryOrigin::FlowInstruction {
+                                    selector: "builtin:coder-review".into(),
+                                    definition_id: "flow-definition".into(),
+                                    definition_revision: 7,
+                                    instance_id: "flow-instance".into(),
+                                    state_id: "implement".into(),
+                                },
+                                derivation: None,
+                            },
+                        },
+                        LoggedHistoryEntry {
+                            item: LoggedItem::Message {
+                                role: LoggedRole::User,
+                                content: vec![LoggedContentPart::Text {
+                                    text: "normal submit".into(),
+                                }],
+                            },
+                            metadata: LoggedSessionHistoryMetadata {
+                                entry_id: user_entry_id.clone(),
+                                origin: origin.clone(),
+                                derivation: Some(LoggedHistoryDerivation {
+                                    sources: vec![source_entry_id.clone()],
+                                }),
+                            },
+                        },
+                    ],
+                    extensions: Vec::new(),
+                },
+            ];
+
+            let snapshot = project_current_session_snapshot(&log);
+            assert_eq!(snapshot.entries.len(), 1);
+            assert_eq!(snapshot.entries[0].entry_id, user_entry_id.0);
+            assert_eq!(snapshot.entries[0].provenance, provenance(&origin));
+            assert_eq!(snapshot.entries[0].derived_from, vec![source_entry_id.0]);
+            assert_eq!(
+                snapshot.entries[0].data,
+                SessionSnapshotEntryData::UserInput {
+                    segments: segments.clone(),
+                }
+            );
+        }
     }
 
     #[test]
