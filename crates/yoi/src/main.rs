@@ -1791,10 +1791,25 @@ fn print_help() {
     println!("{TOP_LEVEL_HELP}");
 }
 
+const RESUME_HELP: &str = r#"yoi resume
+
+Usage:
+  yoi [TARGET] resume [--workspace <PATH>|--all] [--runtime-id <ID>]
+
+Target options:
+      --local              Restore from the client-owned Standalone session store
+      --backend <URL>      Restore a stopped Backend Workspace Worker
+      --workspace-id <ID>  Scope Backend routes to a Workspace id
+
+Options:
+      --workspace <PATH>   Scope Standalone sessions to this cwd identity (defaults to cwd)
+      --all                Include Standalone sessions from every cwd identity
+      --runtime-id <ID>    Restrict the Backend stopped-Worker picker to a Runtime id
+  -h, --help               Print help
+"#;
+
 fn print_resume_help() {
-    println!(
-        "yoi resume\n\nUsage:\n  yoi [TARGET] resume [--workspace <PATH>|--all] [--runtime-id <ID>]\n\nTarget options:\n      --local              Use local Worker records explicitly\n      --backend <URL>      Use Backend Worker records explicitly\n      --workspace-id <ID>  Scope Backend routes to a Workspace id\n\nOptions:\n      --workspace <PATH>   Open the Worker picker scoped to this local workspace (defaults to cwd)\n      --all                Open the Worker picker across this host/data dir\n      --runtime-id <ID>    Restrict Backend picker to a Runtime id\n  -h, --help               Print help\n"
-    );
+    println!("{RESUME_HELP}");
 }
 
 fn print_memory_lint_help() {
@@ -2774,11 +2789,15 @@ backend = "shared"
     }
 
     #[test]
-    fn parse_resume_help() {
+    fn parse_resume_help_uses_standalone_session_store_terminology() {
         match parse_args_from(["resume", "--help"]).unwrap() {
             Mode::ResumeHelp => {}
             _ => panic!("expected ResumeHelp mode"),
         }
+        assert!(RESUME_HELP.contains("Standalone session store"));
+        assert!(RESUME_HELP.contains("Backend stopped-Worker picker"));
+        assert!(!RESUME_HELP.contains("local Worker records"));
+        assert!(!RESUME_HELP.contains("local workspace"));
     }
 
     #[test]
