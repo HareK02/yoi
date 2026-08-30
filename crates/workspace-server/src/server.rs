@@ -6448,9 +6448,18 @@ fn canonical_ticket_resource_key(resource_key: &str) -> Option<&str> {
         .then_some(resource_key)
 }
 
-fn ticket_notification_content(resource_key: &str, current_state: &str) -> String {
+fn ticket_notification_content(
+    resource_key: &str,
+    previous_state: &str,
+    current_state: &str,
+) -> String {
+    if previous_state == current_state {
+        return format!(
+            "Ticket {resource_key} has new activity while {current_state}. Reread the current Ticket before acting."
+        );
+    }
     format!(
-        "Ticket {resource_key} changed to {current_state}. Reread the current Ticket before acting."
+        "Ticket {resource_key} changed state from {previous_state} to {current_state}. Reread the current Ticket before acting."
     )
 }
 
@@ -6528,7 +6537,7 @@ fn notify_ticket_recipients(
     api: &WorkspaceApi,
     workspace_id: &str,
     ticket_id: &str,
-    _previous_state: &str,
+    previous_state: &str,
     current_state: &str,
     source: Option<RuntimeWorkerRef>,
 ) {
@@ -6562,7 +6571,7 @@ fn notify_ticket_recipients(
     recipients.sort();
     recipients.dedup();
 
-    let content = ticket_notification_content(resource_key, current_state);
+    let content = ticket_notification_content(resource_key, previous_state, current_state);
     for recipient in recipients {
         if source.as_ref().is_some_and(|source| source == &recipient) {
             continue;
@@ -18312,16 +18321,19 @@ mod tests {
     }
 
     #[test]
-    fn ticket_notification_projection_exposes_only_resource_key_and_current_state() {
+    fn ticket_notification_projection_distinguishes_state_changes_from_new_activity() {
         const INTERNAL_ID: &str = "00001KZ9SR97B";
-        for current_state in ["queued", "inprogress"] {
-            let content = ticket_notification_content("T-429", current_state);
-            assert_eq!(
-                content,
-                format!(
-                    "Ticket T-429 changed to {current_state}. Reread the current Ticket before acting."
-                )
-            );
+        let state_change = ticket_notification_content("T-429", "ready", "queued");
+        assert_eq!(
+            state_change,
+            "Ticket T-429 changed state from ready to queued. Reread the current Ticket before acting."
+        );
+        let new_activity = ticket_notification_content("T-429", "inprogress", "inprogress");
+        assert_eq!(
+            new_activity,
+            "Ticket T-429 has new activity while inprogress. Reread the current Ticket before acting."
+        );
+        for content in [state_change, new_activity] {
             assert!(!content.contains(INTERNAL_ID));
             for forbidden in [
                 "workspace_id",
@@ -18496,15 +18508,23 @@ mod tests {
         }
 
         let inputs = execution.take_inputs();
-        let expected_states = ["queued", "inprogress", "inprogress", "inprogress"];
+        let expected_states = [
+            ("ready", "queued"),
+            ("inprogress", "inprogress"),
+            ("inprogress", "inprogress"),
+            ("inprogress", "inprogress"),
+        ];
         assert_eq!(inputs.len(), expected_states.len());
-        for ((recipient, content), current_state) in inputs.iter().zip(expected_states) {
+        for ((recipient, content), (previous_state, current_state)) in
+            inputs.iter().zip(expected_states)
+        {
             assert_eq!(recipient.worker_id.to_string(), orchestrator.worker_id);
             assert!(!content.contains(&ticket.id));
             assert_eq!(
                 content,
                 &ticket_notification_content(
                     ticket.resource_key.as_deref().unwrap(),
+                    previous_state,
                     current_state,
                 )
             );
@@ -19623,6 +19643,7 @@ mod tests {
             notifications[0].1,
             ticket_notification_content(
                 ticket_ref.resource_key.as_deref().unwrap(),
+                TicketWorkflowState::Queued.as_str(),
                 TicketWorkflowState::Queued.as_str()
             )
         );
