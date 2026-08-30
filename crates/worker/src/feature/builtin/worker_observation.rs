@@ -794,6 +794,7 @@ mod tests {
                     };
                     Some(protocol::SessionSnapshotEntry {
                         entry_id: format!("fake-{index:08}"),
+                        timestamp: index as u64,
                         provenance: protocol::SessionEntryProvenance::LegacyUnknown,
                         derived_from: Vec::new(),
                         data,

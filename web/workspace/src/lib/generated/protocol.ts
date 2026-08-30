@@ -93,7 +93,11 @@ export type SessionSnapshotEntry = {
  * Stable identity from durable history metadata, or a deterministic
  * identity derived from the legacy segment and log position.
  */
-entry_id: string, provenance: SessionEntryProvenance, derived_from?: Array<string>, } & ({ "kind": "user_input", segments: Array<Segment>, } | { "kind": "message", role: SessionMessageRole, content: Array<SessionContentPart>, } | { "kind": "tool_call", call_id: string, name: string, arguments: string, } | { "kind": "tool_result", call_id: string, summary: string, content?: string | null, is_error: boolean, attachments?: Array<SessionToolAttachment>, } | { "kind": "system_item", item_kind: string, content: string, data?: unknown, } | { "kind": "run_error", message: string, });
+entry_id: string,
+/**
+ * Timestamp copied from the durable log record that commits this entry.
+ */
+timestamp: number, provenance: SessionEntryProvenance, derived_from?: Array<string>, } & ({ "kind": "user_input", segments: Array<Segment>, } | { "kind": "message", role: SessionMessageRole, content: Array<SessionContentPart>, } | { "kind": "tool_call", call_id: string, name: string, arguments: string, } | { "kind": "tool_result", call_id: string, summary: string, content?: string | null, is_error: boolean, attachments?: Array<SessionToolAttachment>, } | { "kind": "system_item", item_kind: string, content: string, data?: unknown, } | { "kind": "run_error", message: string, });
 
 export type SessionSnapshot = { entries: Array<SessionSnapshotEntry>, };
 

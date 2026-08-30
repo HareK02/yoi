@@ -109,7 +109,7 @@ impl ToolPart {
 #[derive(Debug, Clone)]
 pub(crate) struct OverviewItem {
     pub id: SessionEntryRef,
-    pub origin: WorkerHistoryProvenance,
+    pub origin: SessionEntryProvenance,
     pub entry_range: [u64; 2],
     pub kind: ReferenceKind,
     pub label: String,
@@ -120,7 +120,7 @@ pub(crate) struct OverviewItem {
 #[derive(Debug, Clone)]
 pub(crate) struct ReferenceEntry {
     pub id: SessionEntryRef,
-    pub origin: WorkerHistoryProvenance,
+    pub origin: SessionEntryProvenance,
     pub entry_range: [u64; 2],
     pub kind: ReferenceKind,
     pub tool_part: Option<ToolPart>,
@@ -146,7 +146,7 @@ pub(crate) struct SearchOptions {
 #[derive(Debug, Clone)]
 pub(crate) struct SearchHit {
     pub id: SessionEntryRef,
-    pub origin: WorkerHistoryProvenance,
+    pub origin: SessionEntryProvenance,
     pub kind: ReferenceKind,
     pub tool_part: Option<ToolPart>,
     pub tool_name: Option<String>,
@@ -192,7 +192,7 @@ impl Default for ReadOptions {
 #[derive(Debug, Clone)]
 pub(crate) struct ReadEntry {
     pub id: SessionEntryRef,
-    pub origin: WorkerHistoryProvenance,
+    pub origin: SessionEntryProvenance,
     pub kind: ReferenceKind,
     pub tool_part: Option<ToolPart>,
     pub tool_name: Option<String>,
@@ -211,7 +211,7 @@ pub(crate) struct ReadResult {
 pub(crate) struct SessionEntryEvidence {
     pub segment_id: String,
     pub entry_ref: SessionEntryRef,
-    pub origin: WorkerHistoryProvenance,
+    pub origin: SessionEntryProvenance,
     pub entry_range: [u64; 2],
     pub kind: ReferenceKind,
     pub tool_part: Option<ToolPart>,
@@ -221,9 +221,16 @@ pub(crate) struct SessionEntryEvidence {
 }
 
 #[derive(Debug, Clone)]
+struct CapturedHistoryEntry {
+    item: Item,
+    entry_id: session_store::LoggedSessionHistoryEntryId,
+    origin: SessionEntryProvenance,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct SessionCapture {
     segment_id: String,
-    entries: Arc<Vec<HistoryEntry<SessionHistoryMetadata>>>,
+    entries: Arc<Vec<CapturedHistoryEntry>>,
     overview: Vec<OverviewItem>,
     index: Vec<ReferenceEntry>,
 }
@@ -280,35 +287,49 @@ impl SessionCapture {
                     SessionSnapshotEntryData::SystemItem { .. }
                     | SessionSnapshotEntryData::RunError { .. } => return None,
                 };
-                Some(HistoryEntry::new(
+                Some(CapturedHistoryEntry {
                     item,
-                    public_snapshot_metadata(entry.entry_id, entry.provenance),
-                ))
+                    entry_id: session_store::LoggedSessionHistoryEntryId(entry.entry_id),
+                    origin: entry.provenance,
+                })
             })
             .collect();
-        Self::from_history_entries(segment_id, entries)
+        Self::from_captured_entries(segment_id, entries)
     }
 
     pub(crate) fn new(segment_id: impl Into<String>, items: Vec<Item>) -> Self {
         let entries = items
             .into_iter()
             .enumerate()
-            .map(|(index, item)| {
-                let mut metadata = SessionHistoryMetadata::legacy_unknown();
-                metadata.entry_id =
-                    session_store::LoggedSessionHistoryEntryId(format!("{index:08}"));
-                HistoryEntry::new(item, metadata)
+            .map(|(index, item)| CapturedHistoryEntry {
+                item,
+                entry_id: session_store::LoggedSessionHistoryEntryId(format!("{index:08}")),
+                origin: SessionEntryProvenance::LegacyUnknown,
             })
             .collect();
-        Self::from_history_entries(segment_id, entries)
+        Self::from_captured_entries(segment_id, entries)
     }
 
     pub(crate) fn from_history_entries(
         segment_id: impl Into<String>,
         entries: Vec<HistoryEntry<SessionHistoryMetadata>>,
     ) -> Self {
+        let entries = entries
+            .into_iter()
+            .map(|entry| CapturedHistoryEntry {
+                item: entry.item,
+                entry_id: entry.annotation.entry_id,
+                origin: public_provenance(&entry.annotation.origin),
+            })
+            .collect();
+        Self::from_captured_entries(segment_id, entries)
+    }
+
+    fn from_captured_entries(
+        segment_id: impl Into<String>,
+        entries: Vec<CapturedHistoryEntry>,
+    ) -> Self {
         let segment_id = segment_id.into();
-        let entries = Arc::new(entries);
         let mut overview = Vec::new();
         let mut index = Vec::new();
 
@@ -317,7 +338,7 @@ impl SessionCapture {
             let entry_range = [idx as u64, idx as u64];
             match item {
                 Item::Message { role, content, .. } => {
-                    let Some(kind) = message_reference_kind(&entry.annotation.origin, role) else {
+                    let Some(kind) = message_reference_kind(&entry.origin, role) else {
                         continue;
                     };
                     let text = content
@@ -327,10 +348,10 @@ impl SessionCapture {
                         .join("");
                     let label = format!("{} message", kind.as_str());
                     let summary = truncate_chars(&text, 240);
-                    let id = SessionEntryRef::from_history_entry_id(&entry.annotation.entry_id);
+                    let id = SessionEntryRef::from_history_entry_id(&entry.entry_id);
                     index.push(ReferenceEntry {
                         id: id.clone(),
-                        origin: entry.annotation.origin.clone(),
+                        origin: entry.origin.clone(),
                         entry_range,
                         kind,
                         tool_part: None,
@@ -342,7 +363,7 @@ impl SessionCapture {
                     if matches!(kind, ReferenceKind::User | ReferenceKind::Assistant) {
                         overview.push(OverviewItem {
                             id: id.clone(),
-                            origin: entry.annotation.origin.clone(),
+                            origin: entry.origin.clone(),
                             entry_range,
                             kind,
                             label,
@@ -356,8 +377,8 @@ impl SessionCapture {
                 } => {
                     let text = format!("{name}\n{arguments}");
                     index.push(ReferenceEntry {
-                        id: SessionEntryRef::from_history_entry_id(&entry.annotation.entry_id),
-                        origin: entry.annotation.origin.clone(),
+                        id: SessionEntryRef::from_history_entry_id(&entry.entry_id),
+                        origin: entry.origin.clone(),
                         entry_range,
                         kind: ReferenceKind::Tool,
                         tool_part: Some(ToolPart::Input),
@@ -383,8 +404,8 @@ impl SessionCapture {
                         content.as_deref().unwrap_or_default(),
                     );
                     index.push(ReferenceEntry {
-                        id: SessionEntryRef::from_history_entry_id(&entry.annotation.entry_id),
-                        origin: entry.annotation.origin.clone(),
+                        id: SessionEntryRef::from_history_entry_id(&entry.entry_id),
+                        origin: entry.origin.clone(),
                         entry_range,
                         kind: ReferenceKind::Tool,
                         tool_part: Some(ToolPart::Output),
@@ -424,7 +445,7 @@ impl SessionCapture {
 
         Self {
             segment_id,
-            entries,
+            entries: Arc::new(entries),
             overview,
             index,
         }
@@ -607,65 +628,41 @@ impl SessionCapture {
     }
 }
 
-fn public_snapshot_metadata(
-    entry_id: String,
-    provenance: SessionEntryProvenance,
-) -> SessionHistoryMetadata {
-    let worker = session_store::LoggedWorkerSubject {
-        workspace_id: None,
-        runtime_id: None,
-        worker_id: "public-session-snapshot".to_owned(),
-    };
-    let origin = match provenance {
-        SessionEntryProvenance::HumanInput => WorkerHistoryProvenance::HumanInput {
-            account_id: "public-session-snapshot".to_owned(),
-        },
-        SessionEntryProvenance::WorkerInput => WorkerHistoryProvenance::WorkerInput {
-            actor: worker.clone(),
-        },
-        SessionEntryProvenance::FlowInstruction => WorkerHistoryProvenance::FlowInstruction {
-            selector: "public-session-snapshot".to_owned(),
-            definition_id: "public-session-snapshot".to_owned(),
-            definition_revision: 0,
-            instance_id: "public-session-snapshot".to_owned(),
-            state_id: "public-session-snapshot".to_owned(),
-        },
-        SessionEntryProvenance::BackendInstruction => {
-            WorkerHistoryProvenance::BackendInstruction { operation_id: None }
+fn public_provenance(origin: &WorkerHistoryProvenance) -> SessionEntryProvenance {
+    match origin {
+        WorkerHistoryProvenance::HumanInput { .. } => SessionEntryProvenance::HumanInput,
+        WorkerHistoryProvenance::WorkerInput { .. } => SessionEntryProvenance::WorkerInput,
+        WorkerHistoryProvenance::FlowInstruction { .. } => SessionEntryProvenance::FlowInstruction,
+        WorkerHistoryProvenance::BackendInstruction { .. } => {
+            SessionEntryProvenance::BackendInstruction
         }
-        SessionEntryProvenance::ModelOutput => WorkerHistoryProvenance::ModelOutput {
-            worker: worker.clone(),
-        },
-        SessionEntryProvenance::ToolOutput => WorkerHistoryProvenance::ToolOutput { worker },
-        SessionEntryProvenance::DerivedSummary => WorkerHistoryProvenance::DerivedSummary,
-        SessionEntryProvenance::LegacyUnknown => WorkerHistoryProvenance::LegacyUnknown,
-    };
-    SessionHistoryMetadata {
-        entry_id: session_store::LoggedSessionHistoryEntryId(entry_id),
-        origin,
-        derivation: None,
+        WorkerHistoryProvenance::ModelOutput { .. } => SessionEntryProvenance::ModelOutput,
+        WorkerHistoryProvenance::ToolOutput { .. } => SessionEntryProvenance::ToolOutput,
+        WorkerHistoryProvenance::DerivedSummary => SessionEntryProvenance::DerivedSummary,
+        WorkerHistoryProvenance::LegacyUnknown => SessionEntryProvenance::LegacyUnknown,
     }
 }
 
 fn message_reference_kind(
-    origin: &WorkerHistoryProvenance,
+    origin: &SessionEntryProvenance,
     provider_role: &Role,
 ) -> Option<ReferenceKind> {
     match origin {
-        WorkerHistoryProvenance::HumanInput { .. }
-        | WorkerHistoryProvenance::WorkerInput { .. } => Some(ReferenceKind::User),
-        WorkerHistoryProvenance::ModelOutput { .. } => Some(ReferenceKind::Assistant),
-        WorkerHistoryProvenance::ToolOutput { .. } => Some(ReferenceKind::Tool),
-        WorkerHistoryProvenance::LegacyUnknown => match provider_role {
+        SessionEntryProvenance::HumanInput | SessionEntryProvenance::WorkerInput => {
+            Some(ReferenceKind::User)
+        }
+        SessionEntryProvenance::ModelOutput => Some(ReferenceKind::Assistant),
+        SessionEntryProvenance::ToolOutput => Some(ReferenceKind::Tool),
+        SessionEntryProvenance::LegacyUnknown => match provider_role {
             Role::User => Some(ReferenceKind::User),
             Role::Assistant => Some(ReferenceKind::Assistant),
             Role::System => None,
         },
         // Flow/backend/system content remains out of the observation surface
         // even when represented with a provider user/system role.
-        WorkerHistoryProvenance::FlowInstruction { .. }
-        | WorkerHistoryProvenance::BackendInstruction { .. }
-        | WorkerHistoryProvenance::DerivedSummary => None,
+        SessionEntryProvenance::FlowInstruction
+        | SessionEntryProvenance::BackendInstruction
+        | SessionEntryProvenance::DerivedSummary => None,
     }
 }
 
@@ -762,13 +759,13 @@ mod tests {
         assert_eq!(overview.len(), 1);
         assert!(matches!(
             overview[0].origin,
-            WorkerHistoryProvenance::HumanInput { .. }
+            SessionEntryProvenance::HumanInput
         ));
         let evidence = capture.evidence_for(overview[0].id.as_str()).unwrap();
         assert!(evidence.excerpt.ends_with("remember my preference"));
         assert!(matches!(
             evidence.origin,
-            WorkerHistoryProvenance::HumanInput { .. }
+            SessionEntryProvenance::HumanInput
         ));
     }
 

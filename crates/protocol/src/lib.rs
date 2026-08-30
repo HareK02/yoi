@@ -394,6 +394,8 @@ pub struct SessionSnapshotEntry {
     /// Stable identity from durable history metadata, or a deterministic
     /// identity derived from the legacy segment and log position.
     pub entry_id: String,
+    /// Timestamp copied from the durable log record that commits this entry.
+    pub timestamp: u64,
     pub provenance: SessionEntryProvenance,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub derived_from: Vec<String>,
@@ -1536,6 +1538,7 @@ mod tests {
             session: SessionSnapshot {
                 entries: vec![SessionSnapshotEntry {
                     entry_id: "entry-1".into(),
+                    timestamp: 1,
                     provenance: SessionEntryProvenance::HumanInput,
                     derived_from: Vec::new(),
                     data: SessionSnapshotEntryData::UserInput {
@@ -1565,6 +1568,7 @@ mod tests {
             parsed["data"]["session"]["entries"][0]["kind"],
             "user_input"
         );
+        assert_eq!(parsed["data"]["session"]["entries"][0]["timestamp"], 1);
         assert_eq!(parsed["data"]["greeting"]["worker_name"], "test");
         assert_eq!(parsed["data"]["greeting"]["tools"][0], "Read");
         assert_eq!(parsed["data"]["greeting"]["context_window"], 200_000);

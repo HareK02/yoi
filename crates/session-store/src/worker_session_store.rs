@@ -381,6 +381,15 @@ fn segment_log_paths(root: &Path) -> Result<Vec<(SegmentId, PathBuf)>, StoreErro
 }
 
 fn migrate_segment_logs_to_v3(root: &Path, session_id: SessionId) -> Result<(), StoreError> {
+    struct MigrationPlan {
+        path: PathBuf,
+        source: Vec<u8>,
+        output: Vec<u8>,
+    }
+
+    // Phase 1 is strictly read-only. Every segment must parse and canonicalize
+    // successfully before the first authoritative byte is replaced.
+    let mut plans = Vec::new();
     for (segment_id, path) in segment_log_paths(root)? {
         let source = fs::read(&path)?;
         let entries: Vec<LogEntry> = parse_jsonl(&source).map_err(|error| StoreError::Corrupt {
@@ -403,19 +412,30 @@ fn migrate_segment_logs_to_v3(root: &Path, session_id: SessionId) -> Result<(), 
             serde_json::to_writer(&mut output, &entry)?;
             output.push(b'\n');
         }
+        plans.push(MigrationPlan {
+            path,
+            source,
+            output,
+        });
+    }
 
-        // Opening a Session is the exclusive restore boundary, but retain an
-        // unchanged-source fence so a racing writer cannot be silently lost.
-        if fs::read(&path)? != source {
+    // Fence the complete preflight snapshot before starting phase 2. Session
+    // open is the exclusive restore boundary; this additionally fails closed
+    // if an unexpected writer raced the preflight.
+    for plan in &plans {
+        if fs::read(&plan.path)? != plan.source {
             return Err(StoreError::Corrupt {
                 line: 0,
                 message: format!(
                     "Worker Session segment changed during migration: {}",
-                    path.display()
+                    plan.path.display()
                 ),
             });
         }
-        atomic_write_bytes(&path, &output)?;
+    }
+
+    for plan in plans {
+        atomic_write_bytes(&plan.path, &plan.output)?;
     }
     Ok(())
 }
@@ -774,10 +794,71 @@ mod tests {
             &reopened.read_all(session_id, segment_id).unwrap(),
         );
         assert_eq!(snapshot.entries.len(), 3);
+        assert_eq!(
+            snapshot
+                .entries
+                .iter()
+                .map(|entry| entry.timestamp)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
         assert!(snapshot.entries.iter().all(|entry| {
             entry.provenance == protocol::SessionEntryProvenance::LegacyUnknown
                 && entry.entry_id.len() <= 64
         }));
+    }
+
+    #[test]
+    fn schema_v2_preflight_keeps_earlier_segments_unchanged_when_later_is_corrupt() {
+        let root = tempfile::tempdir().unwrap();
+        let session_id = new_session_id();
+        let valid_segment = uuid::Uuid::from_u128(1);
+        let corrupt_segment = uuid::Uuid::from_u128(2);
+        fs::create_dir_all(root.path().join(SEGMENTS_DIR)).unwrap();
+        atomic_write_json(
+            &root.path().join(SESSION_FILE),
+            &SessionManifest {
+                schema_version: PREVIOUS_SESSION_SCHEMA_VERSION,
+                session_id,
+            },
+        )
+        .unwrap();
+        let manifest_before = fs::read(root.path().join(SESSION_FILE)).unwrap();
+
+        let valid_path = root
+            .path()
+            .join(SEGMENTS_DIR)
+            .join(format!("{valid_segment}.jsonl"));
+        let valid_entry = LogEntry::SegmentStart {
+            ts: 1,
+            session_id,
+            system_prompt: None,
+            config: agen::llm_client::RequestConfig::default(),
+            history: vec![LoggedItem::from(agen::Item::assistant_message("prior"))],
+            forked_from: None,
+            compacted_from: None,
+        };
+        let mut valid_bytes = serde_json::to_vec(&valid_entry).unwrap();
+        valid_bytes.push(b'\n');
+        fs::write(&valid_path, &valid_bytes).unwrap();
+        let corrupt_path = root
+            .path()
+            .join(SEGMENTS_DIR)
+            .join(format!("{corrupt_segment}.jsonl"));
+        fs::write(&corrupt_path, b"{not-json}\n").unwrap();
+        let corrupt_before = fs::read(&corrupt_path).unwrap();
+
+        let error = match WorkerSessionStore::new(root.path()) {
+            Ok(_) => panic!("later corrupt segment must fail migration preflight"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StoreError::Corrupt { .. }));
+        assert_eq!(fs::read(&valid_path).unwrap(), valid_bytes);
+        assert_eq!(fs::read(&corrupt_path).unwrap(), corrupt_before);
+        assert_eq!(
+            fs::read(root.path().join(SESSION_FILE)).unwrap(),
+            manifest_before
+        );
     }
 
     #[test]

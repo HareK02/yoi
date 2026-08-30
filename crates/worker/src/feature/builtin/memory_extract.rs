@@ -185,12 +185,9 @@ impl Tool for StageMemoryCandidateTool {
             })?);
         }
         if matches!(params.kind, CandidateKind::Preference)
-            && entries.iter().any(|entry| {
-                !matches!(
-                    entry.origin,
-                    crate::WorkerHistoryProvenance::HumanInput { .. }
-                )
-            })
+            && entries
+                .iter()
+                .any(|entry| !matches!(entry.origin, protocol::SessionEntryProvenance::HumanInput))
         {
             return Err(ToolError::InvalidArgument(
                 "preference candidates require exclusively HumanInput evidence; model, Worker, Flow, backend, derived, and legacy-unknown origins are not preference authority"
@@ -324,10 +321,23 @@ fn evidence_kind(entry: &SessionEntryEvidence) -> EvidenceKind {
     }
 }
 
-fn evidence_origin(origin: &crate::WorkerHistoryProvenance) -> EvidenceOrigin {
-    use crate::WorkerHistoryProvenance as Origin;
-    let mut evidence = EvidenceOrigin {
-        kind: EvidenceOriginKind::LegacyUnknown,
+fn evidence_origin(origin: &protocol::SessionEntryProvenance) -> EvidenceOrigin {
+    use protocol::SessionEntryProvenance as Origin;
+    let kind = match origin {
+        Origin::HumanInput => EvidenceOriginKind::HumanInput,
+        Origin::WorkerInput => EvidenceOriginKind::WorkerInput,
+        Origin::FlowInstruction => EvidenceOriginKind::FlowInstruction,
+        Origin::BackendInstruction => EvidenceOriginKind::BackendInstruction,
+        Origin::ModelOutput => EvidenceOriginKind::ModelOutput,
+        Origin::ToolOutput => EvidenceOriginKind::ToolOutput,
+        Origin::DerivedSummary => EvidenceOriginKind::DerivedSummary,
+        Origin::LegacyUnknown => EvidenceOriginKind::LegacyUnknown,
+    };
+    EvidenceOrigin {
+        kind,
+        // The public SessionSnapshot intentionally excludes account, Worker,
+        // Runtime, and Flow internals. Preserve the authenticated origin class
+        // without inventing missing control-plane identity fields.
         account_id: None,
         workspace_id: None,
         runtime_id: None,
@@ -335,46 +345,7 @@ fn evidence_origin(origin: &crate::WorkerHistoryProvenance) -> EvidenceOrigin {
         flow_selector: None,
         flow_definition_id: None,
         flow_definition_revision: None,
-    };
-    match origin {
-        Origin::HumanInput { account_id } => {
-            evidence.kind = EvidenceOriginKind::HumanInput;
-            evidence.account_id = Some(account_id.clone());
-        }
-        Origin::WorkerInput { actor } => {
-            evidence.kind = EvidenceOriginKind::WorkerInput;
-            evidence.workspace_id = actor.workspace_id.clone();
-            evidence.runtime_id = actor.runtime_id.clone();
-            evidence.worker_id = Some(actor.worker_id.clone());
-        }
-        Origin::FlowInstruction {
-            selector,
-            definition_id,
-            definition_revision,
-            ..
-        } => {
-            evidence.kind = EvidenceOriginKind::FlowInstruction;
-            evidence.flow_selector = Some(selector.clone());
-            evidence.flow_definition_id = Some(definition_id.clone());
-            evidence.flow_definition_revision = Some(*definition_revision);
-        }
-        Origin::BackendInstruction { .. } => evidence.kind = EvidenceOriginKind::BackendInstruction,
-        Origin::ModelOutput { worker } => {
-            evidence.kind = EvidenceOriginKind::ModelOutput;
-            evidence.workspace_id = worker.workspace_id.clone();
-            evidence.runtime_id = worker.runtime_id.clone();
-            evidence.worker_id = Some(worker.worker_id.clone());
-        }
-        Origin::ToolOutput { worker } => {
-            evidence.kind = EvidenceOriginKind::ToolOutput;
-            evidence.workspace_id = worker.workspace_id.clone();
-            evidence.runtime_id = worker.runtime_id.clone();
-            evidence.worker_id = Some(worker.worker_id.clone());
-        }
-        Origin::DerivedSummary => evidence.kind = EvidenceOriginKind::DerivedSummary,
-        Origin::LegacyUnknown => evidence.kind = EvidenceOriginKind::LegacyUnknown,
     }
-    evidence
 }
 
 fn staging_evidence(entry: &SessionEntryEvidence) -> StagingEvidence {
@@ -502,12 +473,10 @@ mod tests {
     }
 
     #[test]
-    fn human_origin_projects_account_authority_into_evidence() {
-        let origin = evidence_origin(&crate::WorkerHistoryProvenance::HumanInput {
-            account_id: "account-1".into(),
-        });
+    fn public_human_origin_preserves_class_without_inventing_account_authority() {
+        let origin = evidence_origin(&protocol::SessionEntryProvenance::HumanInput);
         assert_eq!(origin.kind, EvidenceOriginKind::HumanInput);
-        assert_eq!(origin.account_id.as_deref(), Some("account-1"));
+        assert_eq!(origin.account_id, None);
     }
 
     #[test]

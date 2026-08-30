@@ -33,6 +33,7 @@ pub fn project_session_snapshot(session_id: SessionId, log: &[LogEntry]) -> Sess
     for (log_index, record) in log.iter().enumerate() {
         match record {
             LogEntry::SegmentStart {
+                ts,
                 session_id,
                 history,
                 ..
@@ -41,57 +42,65 @@ pub fn project_session_snapshot(session_id: SessionId, log: &[LogEntry]) -> Sess
                 entries.clear();
                 for (item_index, item) in history.iter().enumerate() {
                     if let Some(data) = project_item(item) {
-                        entries.push(legacy_entry(&session_key, log_index, item_index, data));
+                        entries.push(legacy_entry(&session_key, log_index, item_index, *ts, data));
                     }
                 }
             }
             LogEntry::AnnotatedSegmentStart {
+                ts,
                 session_id,
                 history,
                 ..
             } => {
                 session_key = *session_id;
                 entries.clear();
-                extend_history(&mut entries, history, None);
+                extend_history(&mut entries, history, None, *ts);
             }
-            LogEntry::UserInput { segments, .. } => entries.push(legacy_entry(
+            LogEntry::UserInput { ts, segments, .. } => entries.push(legacy_entry(
                 &session_key,
                 log_index,
                 0,
+                *ts,
                 SessionSnapshotEntryData::UserInput {
                     segments: segments.clone(),
                 },
             )),
             LogEntry::AnnotatedUserInput {
-                segments, history, ..
-            } => extend_history(&mut entries, history, Some(segments)),
-            LogEntry::AssistantItem { item, .. } | LogEntry::ToolResult { item, .. } => {
+                ts,
+                segments,
+                history,
+                ..
+            } => extend_history(&mut entries, history, Some(segments), *ts),
+            LogEntry::AssistantItem { ts, item } | LogEntry::ToolResult { ts, item } => {
                 if let Some(data) = project_item(item) {
-                    entries.push(legacy_entry(&session_key, log_index, 0, data));
+                    entries.push(legacy_entry(&session_key, log_index, 0, *ts, data));
                 }
             }
-            LogEntry::AnnotatedAssistantItem { entry, .. }
-            | LogEntry::AnnotatedToolResult { entry, .. } => {
+            LogEntry::AnnotatedAssistantItem { ts, entry }
+            | LogEntry::AnnotatedToolResult { ts, entry } => {
                 if let Some(data) = project_item(&entry.item) {
-                    entries.push(history_entry(entry, data));
+                    entries.push(history_entry(entry, *ts, data));
                 }
             }
-            LogEntry::SystemItem { item, .. } => entries.push(system_entry(
+            LogEntry::SystemItem { ts, item } => entries.push(system_entry(
                 item,
                 legacy_entry_id(&session_key, log_index, 0),
+                *ts,
                 SessionEntryProvenance::LegacyUnknown,
                 Vec::new(),
             )),
-            LogEntry::AnnotatedSystemItem { entry, .. } => entries.push(system_entry(
+            LogEntry::AnnotatedSystemItem { ts, entry } => entries.push(system_entry(
                 &entry.item,
                 entry.metadata.entry_id.0.clone(),
+                *ts,
                 provenance(&entry.metadata.origin),
                 derivation_ids(entry),
             )),
-            LogEntry::RunErrored { message, .. } => entries.push(legacy_entry(
+            LogEntry::RunErrored { ts, message, .. } => entries.push(legacy_entry(
                 &session_key,
                 log_index,
                 0,
+                *ts,
                 SessionSnapshotEntryData::RunError {
                     message: message.clone(),
                 },
@@ -116,6 +125,7 @@ fn extend_history(
     output: &mut Vec<SessionSnapshotEntry>,
     history: &[LoggedHistoryEntry],
     input_segments: Option<&Vec<Segment>>,
+    timestamp: u64,
 ) {
     let mut attached_segments = false;
     for entry in history {
@@ -136,16 +146,18 @@ fn extend_history(
             };
             data
         };
-        output.push(history_entry(entry, data));
+        output.push(history_entry(entry, timestamp, data));
     }
 }
 
 fn history_entry(
     entry: &LoggedHistoryEntry,
+    timestamp: u64,
     data: SessionSnapshotEntryData,
 ) -> SessionSnapshotEntry {
     SessionSnapshotEntry {
         entry_id: entry.metadata.entry_id.0.clone(),
+        timestamp,
         provenance: provenance(&entry.metadata.origin),
         derived_from: entry
             .metadata
@@ -182,10 +194,12 @@ fn legacy_entry(
     session_key: &SessionId,
     log_index: usize,
     item_index: usize,
+    timestamp: u64,
     data: SessionSnapshotEntryData,
 ) -> SessionSnapshotEntry {
     SessionSnapshotEntry {
         entry_id: legacy_entry_id(session_key, log_index, item_index),
+        timestamp,
         provenance: SessionEntryProvenance::LegacyUnknown,
         derived_from: Vec::new(),
         data,
@@ -283,6 +297,7 @@ fn project_item(item: &LoggedItem) -> Option<SessionSnapshotEntryData> {
 fn system_entry(
     item: &SystemItem,
     entry_id: String,
+    timestamp: u64,
     provenance: SessionEntryProvenance,
     derived_from: Vec<String>,
 ) -> SessionSnapshotEntry {
@@ -298,6 +313,7 @@ fn system_entry(
         .to_owned();
     SessionSnapshotEntry {
         entry_id,
+        timestamp,
         provenance,
         derived_from,
         data: SessionSnapshotEntryData::SystemItem {
@@ -351,6 +367,7 @@ mod tests {
         let second = project_session_snapshot(session_id, &log);
         assert_eq!(first, second);
         assert_eq!(first.entries.len(), 1);
+        assert_eq!(first.entries[0].timestamp, 1);
         assert_eq!(
             first.entries[0].provenance,
             SessionEntryProvenance::LegacyUnknown

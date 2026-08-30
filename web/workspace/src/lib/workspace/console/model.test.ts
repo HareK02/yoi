@@ -2108,6 +2108,7 @@ Deno.test("snapshot restores TaskStore state from system history", () => {
   event.data.session = {
     entries: [{
       entry_id: "task-reminder-1",
+      timestamp: 1,
       provenance: "backend_instruction",
       kind: "system_item",
       item_kind: "task_reminder",

@@ -284,6 +284,7 @@ mod tests {
                     .enumerate()
                     .map(|(index, value)| protocol::SessionSnapshotEntry {
                         entry_id: format!("test-{index}"),
+                        timestamp: index as u64,
                         provenance: protocol::SessionEntryProvenance::LegacyUnknown,
                         derived_from: Vec::new(),
                         data: protocol::SessionSnapshotEntryData::RunError {

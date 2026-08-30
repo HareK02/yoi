@@ -4588,6 +4588,7 @@ mod tests {
                 session: protocol::SessionSnapshot {
                     entries: vec![protocol::SessionSnapshotEntry {
                         entry_id: "restored-log-entry".to_owned(),
+                        timestamp: 1,
                         provenance: protocol::SessionEntryProvenance::LegacyUnknown,
                         derived_from: Vec::new(),
                         data: protocol::SessionSnapshotEntryData::RunError {
