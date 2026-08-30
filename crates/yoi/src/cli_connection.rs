@@ -116,7 +116,8 @@ fn standalone_target() -> Result<Box<dyn Target>, ParseError> {
             )
         })?
         .join("client")
-        .join("standalone-sessions");
+        .join("standalone")
+        .join("sessions");
     Ok(Box::new(StandaloneTarget::new(state_dir)))
 }
 

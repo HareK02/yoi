@@ -2132,7 +2132,7 @@ backend = "shared"
             LaunchMode::StandaloneResume { include_all: false }
         ));
         let intent = target.standalone_session_list(false).unwrap();
-        assert!(intent.state_dir.ends_with("client/standalone-sessions"));
+        assert!(intent.state_dir.ends_with("client/standalone/sessions"));
         assert!(!intent.include_all);
 
         let mode = parse_args_from(["--local", "--resume", "--all"]).unwrap();
