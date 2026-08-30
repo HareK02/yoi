@@ -5108,14 +5108,34 @@ where
         workspace_context: WorkerWorkspaceContext,
         filesystem_authority: WorkerFilesystemAuthority,
     ) -> Result<Self, WorkerError> {
+        Self::from_manifest_with_context_and_model_client(
+            manifest,
+            store,
+            loader,
+            workspace_context,
+            filesystem_authority,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn from_manifest_with_context_and_model_client(
+        manifest: WorkerManifest,
+        store: St,
+        loader: PromptCatalogSource,
+        workspace_context: WorkerWorkspaceContext,
+        filesystem_authority: WorkerFilesystemAuthority,
+        model_client: Option<Box<dyn LlmClient>>,
+    ) -> Result<Self, WorkerError> {
         validate_workspace_memory_snapshot(&manifest.worker.name, &manifest, &workspace_context)?;
-        let common = prepare_worker_common_with_context(
+        let common = prepare_worker_common_with_context_and_model_client(
             &manifest,
             &loader,
             /* parse_template */ true,
             workspace_context,
             filesystem_authority,
             manifest.scope.clone(),
+            model_client,
         )?;
 
         // Segment creation is deferred to the first run (see
@@ -6593,6 +6613,26 @@ fn prepare_worker_common_with_context(
     filesystem_authority: WorkerFilesystemAuthority,
     scope_config: ScopeConfig,
 ) -> Result<WorkerCommon, WorkerError> {
+    prepare_worker_common_with_context_and_model_client(
+        manifest,
+        loader,
+        parse_template,
+        workspace_context,
+        filesystem_authority,
+        scope_config,
+        None,
+    )
+}
+
+fn prepare_worker_common_with_context_and_model_client(
+    manifest: &WorkerManifest,
+    loader: &PromptCatalogSource,
+    parse_template: bool,
+    workspace_context: WorkerWorkspaceContext,
+    filesystem_authority: WorkerFilesystemAuthority,
+    scope_config: ScopeConfig,
+    model_client: Option<Box<dyn LlmClient>>,
+) -> Result<WorkerCommon, WorkerError> {
     let filesystem_authority = match filesystem_authority {
         WorkerFilesystemAuthority::None => WorkerFilesystemAuthority::None,
         WorkerFilesystemAuthority::Local(local) => {
@@ -6627,6 +6667,7 @@ fn prepare_worker_common_with_context(
         workspace_context,
         filesystem_authority,
         scope,
+        model_client,
     )
 }
 
@@ -6637,6 +6678,7 @@ fn prepare_worker_common_from_scope(
     workspace_context: WorkerWorkspaceContext,
     filesystem_authority: WorkerFilesystemAuthority,
     scope: Scope,
+    model_client: Option<Box<dyn LlmClient>>,
 ) -> Result<WorkerCommon, WorkerError> {
     if let Some(local) = filesystem_authority.as_local() {
         if !scope.is_readable(&local.root) {
@@ -6653,7 +6695,10 @@ fn prepare_worker_common_from_scope(
     let delegation_scope =
         DelegationScope::from_config(&manifest.delegation_scope).map_err(WorkerError::Scope)?;
 
-    let client = crate::model_client::build_client(&manifest.model)?;
+    let client = match model_client {
+        Some(client) => client,
+        None => crate::model_client::build_client(&manifest.model)?,
+    };
     let prompts = Arc::new(ArcSwap::from(PromptCatalog::load(loader)?));
     let system_prompt_template = if parse_template {
         Some(

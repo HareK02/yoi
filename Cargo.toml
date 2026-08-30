@@ -5,6 +5,7 @@ members = [
     "crates/agen",
     "crates/agen-macros",
     "crates/session-store",
+    "crates/standalone",
     "crates/secrets",
     "crates/manifest",
     "crates/mcp",
@@ -36,6 +37,7 @@ default-members = [
     "crates/agen",
     "crates/agen-macros",
     "crates/session-store",
+    "crates/standalone",
     "crates/secrets",
     "crates/manifest",
     "crates/mcp",
@@ -87,6 +89,7 @@ protocol = { path = "crates/protocol" }
 session-metrics = { path = "crates/session-metrics" }
 session-analytics = { path = "crates/session-analytics" }
 session-store = { path = "crates/session-store" }
+standalone = { path = "crates/standalone" }
 secrets = { path = "crates/secrets" }
 tools = { path = "crates/tools" }
 config-source = { path = "crates/config-source" }

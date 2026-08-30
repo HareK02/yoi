@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::{
-    PromptCatalogSource, Worker, WorkerController, WorkerFilesystemAuthority,
-    WorkerWorkspaceContext,
+    PromptCatalogSource, Worker, WorkerBootstrapLayout, WorkerControllerTransport,
+    WorkerFilesystemAuthority, WorkerWorkspaceContext, start_worker_controller,
 };
 use clap::{CommandFactory, FromArgMatches, Parser};
 use manifest::{Permission, ScopeConfig, ScopeRule, WorkerManifest, WorkerManifestConfig, paths};
@@ -634,13 +634,22 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let (handle, shutdown_rx) = match WorkerController::spawn(worker, &runtime_base).await {
-        Ok(pair) => pair,
+    let started = match start_worker_controller(
+        worker,
+        WorkerBootstrapLayout::Direct {
+            runtime_base: runtime_base.clone(),
+        },
+        WorkerControllerTransport::UnixSocket,
+    )
+    .await
+    {
+        Ok(started) => started,
         Err(e) => {
             eprintln!("error: failed to start worker controller: {e}");
             return ExitCode::FAILURE;
         }
     };
+    let (handle, shutdown_rx) = (started.handle, started.shutdown);
 
     let socket_path = handle.runtime_dir.socket_path();
     // Machine-readable ready line for parents that spawned this Worker
