@@ -730,7 +730,7 @@ mod tests {
 
     fn test_snapshot() -> Event {
         Event::Snapshot {
-            entries: vec![],
+            session: protocol::SessionSnapshot { entries: vec![] },
             greeting: Greeting {
                 worker_name: "ticket-intake".to_string(),
                 cwd: "/tmp".to_string(),
