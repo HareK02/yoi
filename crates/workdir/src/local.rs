@@ -1944,8 +1944,8 @@ mod tests {
             GrepRequest {
                 pattern: "NEEDLE".into(),
                 path: WorkdirPath::new("src/main.rs").unwrap(),
-                glob: None,
-                file_type: None,
+                glob: Some("src/*.rs".into()),
+                file_type: Some("rust".into()),
                 case_insensitive: false,
                 before_context: 0,
                 after_context: 0,

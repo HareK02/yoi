@@ -2353,8 +2353,8 @@ mod tests {
             operation: WorkdirSessionOperation::Grep(GrepRequest {
                 pattern: "hello".into(),
                 path: WorkdirPath::new("hello.txt").unwrap(),
-                glob: None,
-                file_type: None,
+                glob: Some("*.txt".into()),
+                file_type: Some("txt".into()),
                 case_insensitive: false,
                 before_context: 0,
                 after_context: 0,

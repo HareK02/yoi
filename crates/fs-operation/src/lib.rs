@@ -157,6 +157,22 @@ mod tests {
         }
     }
 
+    fn grep_request(path: &str, pattern: &str) -> GrepRequest {
+        GrepRequest {
+            pattern: pattern.to_string(),
+            path: FsPath::new(path).unwrap(),
+            glob: None,
+            file_type: None,
+            case_insensitive: false,
+            before_context: 0,
+            after_context: 0,
+            multiline: false,
+            output_mode: GrepOutputMode::Content,
+            limit: 10,
+            offset: 0,
+        }
+    }
+
     #[test]
     fn logical_paths_reject_absolute_parent_and_backslash_forms() {
         assert!(FsPath::new("src/lib.rs").is_ok());
@@ -289,25 +305,10 @@ mod tests {
         let root = temp.path().canonicalize().unwrap();
         let readable = RootAccess(root.clone());
 
-        let direct = run_grep(
-            &root,
-            selected,
-            GrepRequest {
-                pattern: "needle".to_string(),
-                path: FsPath::new("selected.txt").unwrap(),
-                glob: None,
-                file_type: None,
-                case_insensitive: false,
-                before_context: 1,
-                after_context: 1,
-                multiline: false,
-                output_mode: GrepOutputMode::Content,
-                limit: 10,
-                offset: 0,
-            },
-            &readable,
-        )
-        .unwrap();
+        let mut request = grep_request("selected.txt", "needle");
+        request.before_context = 1;
+        request.after_context = 1;
+        let direct = run_grep(&root, selected, request, &readable).unwrap();
 
         assert_eq!(direct.match_count, 1);
         assert_eq!(direct.matched_files, 1);
@@ -346,6 +347,115 @@ mod tests {
     }
 
     #[test]
+    fn grep_direct_file_applies_glob_and_type_filters_for_every_output_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let nested = temp.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let selected = nested.join("selected.rs");
+        std::fs::write(&selected, "needle one\nneedle two\n").unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let readable = RootAccess(root.clone());
+
+        for mode in [
+            GrepOutputMode::Content,
+            GrepOutputMode::FilesWithMatches,
+            GrepOutputMode::Count,
+        ] {
+            for (glob, file_type) in [(Some("other/*.rs"), None), (None, Some("python"))] {
+                let mut request = grep_request("nested/selected.rs", "needle");
+                request.output_mode = mode;
+                request.glob = glob.map(str::to_string);
+                request.file_type = file_type.map(str::to_string);
+
+                let excluded = run_grep(&root, selected.clone(), request, &readable).unwrap();
+                assert_eq!(excluded.output, "", "mode {mode:?}");
+                assert_eq!(excluded.match_count, 0, "mode {mode:?}");
+                assert_eq!(excluded.matched_files, 0, "mode {mode:?}");
+                assert!(!excluded.truncated, "mode {mode:?}");
+            }
+
+            let mut request = grep_request("nested/selected.rs", "needle");
+            request.output_mode = mode;
+            request.glob = Some("nested/*.rs".to_string());
+            request.file_type = Some("rust".to_string());
+            let matched = run_grep(&root, selected.clone(), request, &readable).unwrap();
+
+            match mode {
+                GrepOutputMode::Content => {
+                    assert_eq!(matched.match_count, 2);
+                    assert_eq!(matched.matched_files, 1);
+                    assert!(matched.output.starts_with("nested/selected.rs\n"));
+                    assert!(matched.output.contains("> 1 │ needle one"));
+                    assert!(matched.output.contains("> 2 │ needle two"));
+                }
+                GrepOutputMode::FilesWithMatches => {
+                    assert_eq!(matched.match_count, 1);
+                    assert_eq!(matched.matched_files, 1);
+                    assert_eq!(matched.output, "nested/selected.rs\n");
+                }
+                GrepOutputMode::Count => {
+                    assert_eq!(matched.match_count, 2);
+                    assert_eq!(matched.matched_files, 1);
+                    assert_eq!(matched.output, "nested/selected.rs:2\n");
+                }
+            }
+            assert!(!matched.truncated, "mode {mode:?}");
+        }
+    }
+
+    #[test]
+    fn grep_direct_file_preserves_explicit_hidden_and_gitignored_behavior() {
+        let temp = tempfile::tempdir().unwrap();
+        let hidden = temp.path().join(".hidden.rs");
+        let ignored = temp.path().join("ignored.rs");
+        std::fs::write(&hidden, "needle hidden\n").unwrap();
+        std::fs::write(&ignored, "needle ignored\n").unwrap();
+        std::fs::write(temp.path().join(".gitignore"), "ignored.rs\n").unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let readable = RootAccess(root.clone());
+
+        for (path, expected) in [
+            (".hidden.rs", "needle hidden"),
+            ("ignored.rs", "needle ignored"),
+        ] {
+            let result = run_grep(
+                &root,
+                root.join(path),
+                grep_request(path, "needle"),
+                &readable,
+            )
+            .unwrap();
+            assert_eq!(result.match_count, 1, "path {path}");
+            assert!(result.output.contains(expected), "path {path}");
+        }
+    }
+
+    #[test]
+    fn grep_direct_file_preserves_case_multiline_and_bounds() {
+        let temp = tempfile::tempdir().unwrap();
+        let selected = temp.path().join("selected.txt");
+        std::fs::write(&selected, "NEEDLE first\nstart\nfinish\nneedle last\n").unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let readable = RootAccess(root.clone());
+
+        let mut case_request = grep_request("selected.txt", "needle");
+        case_request.case_insensitive = true;
+        case_request.offset = 1;
+        case_request.limit = 1;
+        let bounded = run_grep(&root, selected.clone(), case_request, &readable).unwrap();
+        assert_eq!(bounded.match_count, 1);
+        assert!(!bounded.output.contains("NEEDLE first"));
+        assert!(bounded.output.contains("needle last"));
+        assert!(bounded.truncated);
+
+        let mut multiline_request = grep_request("selected.txt", "start\\nfinish");
+        multiline_request.multiline = true;
+        let multiline = run_grep(&root, selected, multiline_request, &readable).unwrap();
+        assert_eq!(multiline.match_count, 1);
+        assert!(multiline.output.contains("start\nfinish"));
+    }
+
+    #[test]
     fn grep_returns_not_found_for_a_missing_direct_path() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -355,19 +465,7 @@ mod tests {
         let error = run_grep(
             &root,
             missing.clone(),
-            GrepRequest {
-                pattern: "needle".to_string(),
-                path: FsPath::new("missing.txt").unwrap(),
-                glob: None,
-                file_type: None,
-                case_insensitive: false,
-                before_context: 0,
-                after_context: 0,
-                multiline: false,
-                output_mode: GrepOutputMode::Content,
-                limit: 10,
-                offset: 0,
-            },
+            grep_request("missing.txt", "needle"),
             &readable,
         )
         .unwrap_err();
@@ -384,22 +482,22 @@ mod tests {
         let root = temp.path().canonicalize().unwrap();
         let readable = RootAccess(root.clone());
         std::fs::create_dir(root.join("target-dir")).unwrap();
+        std::fs::write(root.join("target-file.rs"), "needle file\n").unwrap();
+        symlink(root.join("target-file.rs"), root.join("file-link.rs")).unwrap();
         symlink(root.join("target-dir"), root.join("directory-link")).unwrap();
         symlink(root.join("missing-target"), root.join("broken-link")).unwrap();
 
-        let request = |path: &str| GrepRequest {
-            pattern: "needle".to_string(),
-            path: FsPath::new(path).unwrap(),
-            glob: None,
-            file_type: None,
-            case_insensitive: false,
-            before_context: 0,
-            after_context: 0,
-            multiline: false,
-            output_mode: GrepOutputMode::Content,
-            limit: 10,
-            offset: 0,
-        };
+        let request = |path: &str| grep_request(path, "needle");
+
+        let file_result = run_grep(
+            &root,
+            root.join("file-link.rs"),
+            request("file-link.rs"),
+            &readable,
+        )
+        .unwrap();
+        assert_eq!(file_result.match_count, 1);
+        assert!(file_result.output.starts_with("file-link.rs\n"));
 
         let directory_error = run_grep(
             &root,
@@ -424,6 +522,32 @@ mod tests {
         assert!(matches!(
             broken_error,
             FsError::BrokenSymlink { path, .. } if path == root.join("broken-link")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_rejects_a_direct_special_file_as_invalid_argument() {
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("grep.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let readable = RootAccess(root.clone());
+
+        let error = run_grep(
+            &root,
+            socket,
+            grep_request("grep.sock", "needle"),
+            &readable,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            FsError::InvalidArgument(message)
+                if message.contains("must be a regular file or directory")
         ));
     }
 

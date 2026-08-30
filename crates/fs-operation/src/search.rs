@@ -7,8 +7,8 @@ use grep_regex::RegexMatcherBuilder;
 use grep_searcher::sinks::UTF8 as UTF8Sink;
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use ignore::WalkBuilder;
-use ignore::overrides::OverrideBuilder;
-use ignore::types::TypesBuilder;
+use ignore::overrides::{Override, OverrideBuilder};
+use ignore::types::{Types, TypesBuilder};
 
 use crate::{FsError, GrepOutputMode, GrepRequest, GrepResult, direct_symlink};
 
@@ -126,6 +126,38 @@ fn logical_display(root: &Path, path: &Path) -> String {
 
 const DEFAULT_HEAD_LIMIT: usize = 250;
 
+fn build_overrides(base: &Path, glob: Option<&str>) -> Result<Option<Override>, FsError> {
+    let Some(glob) = glob else {
+        return Ok(None);
+    };
+    let mut builder = OverrideBuilder::new(base);
+    builder
+        .add(glob)
+        .map_err(|error| FsError::InvalidGlob(error.to_string()))?;
+    builder
+        .build()
+        .map(Some)
+        .map_err(|error| FsError::InvalidGlob(error.to_string()))
+}
+
+fn build_types(file_type: Option<&str>) -> Result<Option<Types>, FsError> {
+    let Some(file_type) = file_type else {
+        return Ok(None);
+    };
+    let mut builder = TypesBuilder::new();
+    builder.add_defaults();
+    builder.select(file_type);
+    builder
+        .build()
+        .map(Some)
+        .map_err(|error| FsError::InvalidArgument(format!("invalid type {file_type}: {error}")))
+}
+
+fn direct_file_selected(path: &Path, overrides: Option<&Override>, types: Option<&Types>) -> bool {
+    !overrides.is_some_and(|filter| filter.matched(path, false).is_ignore())
+        && !types.is_some_and(|filter| filter.matched(path, false).is_ignore())
+}
+
 struct GrepParams {
     pattern: String,
     path: Option<PathBuf>,
@@ -237,32 +269,9 @@ pub fn run_grep(
         });
     }
 
-    let mut wb = WalkBuilder::new(&base);
-    wb.hidden(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .ignore(true)
-        .parents(true)
-        .follow_links(false);
-
-    if let Some(t) = p.file_type.as_deref() {
-        let mut tb = TypesBuilder::new();
-        tb.add_defaults();
-        tb.select(t);
-        let types = tb
-            .build()
-            .map_err(|e| FsError::InvalidArgument(format!("invalid type {t}: {e}")))?;
-        wb.types(types);
-    }
-    if let Some(g) = p.glob.as_deref() {
-        let mut ob = OverrideBuilder::new(&base);
-        ob.add(g).map_err(|e| FsError::InvalidGlob(e.to_string()))?;
-        let ov = ob
-            .build()
-            .map_err(|e| FsError::InvalidGlob(e.to_string()))?;
-        wb.overrides(ov);
-    }
+    let filter_base = if base_meta.is_file() { root } else { &base };
+    let types = build_types(p.file_type.as_deref())?;
+    let overrides = build_overrides(filter_base, p.glob.as_deref())?;
 
     let mode = p.output_mode.unwrap_or_default();
     let head_limit = p.head_limit.unwrap_or(DEFAULT_HEAD_LIMIT);
@@ -277,72 +286,131 @@ pub fn run_grep(
         lines: Vec::new(),
         truncated: false,
     };
+    let mut matching_files_seen = 0;
+    let mut matches_seen = 0;
 
-    // Per-mode walker state.
-    let mut matching_files_seen: usize = 0;
-    let mut matches_seen: usize = 0;
+    if base_meta.is_file() {
+        if direct_file_selected(&base, overrides.as_ref(), types.as_ref()) {
+            scan_path(
+                &mut searcher,
+                &matcher,
+                &base,
+                mode,
+                &mut report,
+                &mut matching_files_seen,
+                &mut matches_seen,
+                offset,
+                head_limit,
+            )?;
+        }
+        return Ok(report.into_result(root));
+    }
 
-    'walker: for entry in wb.build().flatten() {
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+    let mut walker = WalkBuilder::new(&base);
+    walker
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .ignore(true)
+        .parents(true)
+        .follow_links(false);
+    if let Some(types) = types {
+        walker.types(types);
+    }
+    if let Some(overrides) = overrides {
+        walker.overrides(overrides);
+    }
+
+    for entry in walker.build().flatten() {
+        if !entry
+            .file_type()
+            .map(|kind| kind.is_file())
+            .unwrap_or(false)
+        {
             continue;
         }
         let path = entry.path();
         if !access.is_readable(path) {
             continue;
         }
-
-        match mode {
-            GrepOutputMode::FilesWithMatches => {
-                let hit = scan_any_match(&mut searcher, &matcher, path)?;
-                if !hit {
-                    continue;
-                }
-                if matching_files_seen >= offset {
-                    report.files.push(path.to_path_buf());
-                    if report.files.len() >= head_limit {
-                        report.truncated = true;
-                        break 'walker;
-                    }
-                }
-                matching_files_seen += 1;
-            }
-            GrepOutputMode::Count => {
-                let count = scan_count(&mut searcher, &matcher, path)?;
-                if count == 0 {
-                    continue;
-                }
-                if matching_files_seen >= offset {
-                    report.counts.push((path.to_path_buf(), count));
-                    if report.counts.len() >= head_limit {
-                        report.truncated = true;
-                        break 'walker;
-                    }
-                }
-                matching_files_seen += 1;
-            }
-            GrepOutputMode::Content => {
-                let before_count = matches_seen;
-                let mut sink = ContentSink {
-                    path: path.to_path_buf(),
-                    lines: &mut report.lines,
-                    matches_seen: &mut matches_seen,
-                    offset,
-                    head_limit,
-                };
-                searcher
-                    .search_path(&matcher, path, &mut sink)
-                    .map_err(|e| FsError::io(path, e))?;
-                // If we hit head_limit during this file, stop walking.
-                if matches_seen >= offset.saturating_add(head_limit) && matches_seen > before_count
-                {
-                    report.truncated = true;
-                    break 'walker;
-                }
-            }
+        if scan_path(
+            &mut searcher,
+            &matcher,
+            path,
+            mode,
+            &mut report,
+            &mut matching_files_seen,
+            &mut matches_seen,
+            offset,
+            head_limit,
+        )? {
+            break;
         }
     }
 
     Ok(report.into_result(root))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_path(
+    searcher: &mut Searcher,
+    matcher: &grep_regex::RegexMatcher,
+    path: &Path,
+    mode: GrepOutputMode,
+    report: &mut GrepReport,
+    matching_files_seen: &mut usize,
+    matches_seen: &mut usize,
+    offset: usize,
+    head_limit: usize,
+) -> Result<bool, FsError> {
+    match mode {
+        GrepOutputMode::FilesWithMatches => {
+            if !scan_any_match(searcher, matcher, path)? {
+                return Ok(false);
+            }
+            if *matching_files_seen >= offset {
+                report.files.push(path.to_path_buf());
+                if report.files.len() >= head_limit {
+                    report.truncated = true;
+                    return Ok(true);
+                }
+            }
+            *matching_files_seen += 1;
+        }
+        GrepOutputMode::Count => {
+            let count = scan_count(searcher, matcher, path)?;
+            if count == 0 {
+                return Ok(false);
+            }
+            if *matching_files_seen >= offset {
+                report.counts.push((path.to_path_buf(), count));
+                if report.counts.len() >= head_limit {
+                    report.truncated = true;
+                    return Ok(true);
+                }
+            }
+            *matching_files_seen += 1;
+        }
+        GrepOutputMode::Content => {
+            let before_count = *matches_seen;
+            let mut sink = ContentSink {
+                path: path.to_path_buf(),
+                lines: &mut report.lines,
+                matches_seen,
+                offset,
+                head_limit,
+            };
+            searcher
+                .search_path(matcher, path, &mut sink)
+                .map_err(|error| FsError::io(path, error))?;
+            if *matches_seen >= offset.saturating_add(head_limit) && *matches_seen > before_count {
+                report.truncated = true;
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn scan_any_match(
