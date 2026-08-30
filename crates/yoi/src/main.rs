@@ -755,6 +755,12 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
     }
 
     if target.kind() == TargetKind::Standalone {
+        if runtime_id.is_some() || worker_id.is_some() {
+            return Err(ParseError(
+                "Standalone does not accept Backend Runtime selectors; use --backend with --runtime-id/--worker-id"
+                    .to_string(),
+            ));
+        }
         if session.is_some() {
             return Err(ParseError(
                 "--local does not accept legacy --session; use --local --resume for Standalone session restore"
@@ -2043,6 +2049,25 @@ backend = "shared"
             }
             _ => panic!("expected OpenWorker mode"),
         }
+    }
+
+    #[test]
+    fn parse_standalone_rejects_backend_runtime_selectors() {
+        let runtime_error = parse_args_from(["--local", "--runtime-id", "runtime-a"])
+            .unwrap_err()
+            .to_string();
+        assert!(runtime_error.contains("Standalone does not accept Backend Runtime selectors"));
+
+        let worker_error = parse_args_from([
+            "--local",
+            "--runtime-id",
+            "runtime-a",
+            "--worker-id",
+            "worker-b",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(worker_error.contains("Standalone does not accept Backend Runtime selectors"));
     }
 
     #[test]
