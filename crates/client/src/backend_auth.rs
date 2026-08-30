@@ -1,3 +1,4 @@
+use crate::BackendOrigin;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::Duration;
@@ -9,9 +10,11 @@ pub struct BackendAuthTarget {
 
 impl BackendAuthTarget {
     pub fn new(base_url: impl Into<String>) -> Self {
-        Self {
-            base_url: base_url.into(),
-        }
+        let base_url = base_url.into();
+        let base_url = BackendOrigin::parse(&base_url)
+            .map(|origin| origin.to_string())
+            .unwrap_or(base_url);
+        Self { base_url }
     }
 
     fn api_url(&self, path: &str) -> String {

@@ -8,7 +8,8 @@
 //!
 //! TUI / GUI / E2E ハーネスはこの crate に依存して protocol を喋る。
 
-pub mod backend_auth;
+pub mod backend_api;
+mod backend_auth;
 pub mod backend_runtime;
 pub mod backend_workspace;
 pub mod runtime_command;
@@ -18,6 +19,10 @@ pub mod ticket_role;
 mod worker_client;
 mod workspace_product;
 
+pub use backend_api::{
+    BackendApiClient, BackendApiClientError, BackendOrigin, backend_token_file_path,
+    save_backend_token,
+};
 pub use backend_auth::{
     BackendAuthClientError, BackendAuthTarget, DeviceLoginPollResponse, DeviceLoginStartResponse,
     poll_device_login, start_device_login, wait_for_device_login,

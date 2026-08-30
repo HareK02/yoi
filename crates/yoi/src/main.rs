@@ -22,7 +22,7 @@ use cli_connection::{
 };
 use client::{BackendAuthTarget, Target, TargetKind, start_device_login, wait_for_device_login};
 use memory_lint::{LintCliOptions, LintStatus};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use session_store::SegmentId;
 use tui::{LaunchMode, LaunchOptions};
 
@@ -1220,63 +1220,14 @@ async fn run_login(backend_url: &str, no_wait: bool) -> Result<(), ParseError> {
     )
     .await
     .map_err(|error| ParseError(error.to_string()))?;
-    save_backend_token(backend_url, &token)?;
-    println!("Saved Backend API token for {backend_url}");
-    Ok(())
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct BackendTokenFile {
-    #[serde(default)]
-    tokens: BTreeMap<String, BackendTokenEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BackendTokenEntry {
-    token_type: String,
-    access_token: String,
-}
-
-fn save_backend_token(backend_url: &str, access_token: &str) -> Result<(), ParseError> {
-    let path = backend_token_path().ok_or_else(|| {
-        ParseError("HOME or XDG_CONFIG_HOME is required to save Backend token".to_string())
-    })?;
-    let mut file = if path.is_file() {
-        let contents = fs::read_to_string(&path)
-            .map_err(|error| ParseError(format!("failed to read {}: {error}", path.display())))?;
-        serde_json::from_str::<BackendTokenFile>(&contents)
-            .map_err(|error| ParseError(format!("failed to parse {}: {error}", path.display())))?
-    } else {
-        BackendTokenFile::default()
-    };
-    file.tokens.insert(
-        backend_url.trim_end_matches('/').to_string(),
-        BackendTokenEntry {
-            token_type: "Bearer".to_string(),
-            access_token: access_token.to_string(),
-        },
+    let token_path = client::save_backend_token(backend_url, "Bearer", &token)
+        .map_err(|error| ParseError(error.to_string()))?;
+    println!(
+        "Saved Backend API token for {} in {}",
+        client::BackendOrigin::parse(backend_url).map_err(|error| ParseError(error.to_string()))?,
+        token_path.display()
     );
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
-            ParseError(format!("failed to create {}: {error}", parent.display()))
-        })?;
-    }
-    let serialized = serde_json::to_string_pretty(&file)
-        .map_err(|error| ParseError(format!("failed to serialize Backend token file: {error}")))?;
-    fs::write(&path, format!("{serialized}\n"))
-        .map_err(|error| ParseError(format!("failed to write {}: {error}", path.display())))?;
     Ok(())
-}
-
-fn backend_token_path() -> Option<PathBuf> {
-    yoi_config_dir().map(|dir| dir.join("backend-tokens.json"))
-}
-
-fn yoi_config_dir() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(home).join("yoi"));
-    }
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config").join("yoi"))
 }
 
 fn parse_plugin_args(args: &[String]) -> Result<plugin_cli::PluginCliCommand, ParseError> {

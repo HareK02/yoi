@@ -14,7 +14,7 @@ use workspace_api::{
     TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_PATH,
 };
 
-use crate::BackendWorkspaceClientError;
+use crate::{BackendApiClient, BackendWorkspaceClientError};
 
 const DEFAULT_PRODUCT_LIST_LIMIT: usize = 1_000;
 
@@ -47,9 +47,9 @@ struct BackendWorkspaceOrchestratorResponse {
 /// Construction requires both the selected Backend URL and Workspace identity.
 /// Callers should derive these once from `Target::resolve()` and must not retry
 /// failed requests against repository-local state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct BackendWorkspaceProductClient {
-    base_url: String,
+    api: BackendApiClient,
     workspace_id: String,
 }
 
@@ -58,22 +58,32 @@ impl BackendWorkspaceProductClient {
         base_url: impl Into<String>,
         workspace_id: impl Into<String>,
     ) -> Result<Self, BackendWorkspaceClientError> {
-        let base_url = base_url.into().trim_end_matches('/').to_string();
-        if base_url.is_empty() {
-            return Err(BackendWorkspaceClientError::InvalidTarget(
-                "Backend base URL must not be empty".into(),
-            ));
-        }
+        let base_url = base_url.into();
+        let api = BackendApiClient::from_stored_token(&base_url)?;
         let workspace_id = workspace_id.into();
         if workspace_id.trim().is_empty() {
             return Err(BackendWorkspaceClientError::InvalidTarget(
                 "Backend Workspace identity must not be empty".into(),
             ));
         }
-        Ok(Self {
-            base_url,
-            workspace_id,
-        })
+        Ok(Self { api, workspace_id })
+    }
+
+    #[cfg(test)]
+    fn new_with_access_token(
+        base_url: impl Into<String>,
+        workspace_id: impl Into<String>,
+        access_token: &str,
+    ) -> Result<Self, BackendWorkspaceClientError> {
+        let base_url = base_url.into();
+        let api = BackendApiClient::from_access_token_for_test(&base_url, access_token)?;
+        let workspace_id = workspace_id.into();
+        if workspace_id.trim().is_empty() {
+            return Err(BackendWorkspaceClientError::InvalidTarget(
+                "Backend Workspace identity must not be empty".into(),
+            ));
+        }
+        Ok(Self { api, workspace_id })
     }
 
     pub fn workspace_id(&self) -> &str {
@@ -316,7 +326,7 @@ impl BackendWorkspaceProductClient {
         body: Option<&B>,
     ) -> Result<R, BackendWorkspaceClientError> {
         let response = self.request(method, path, body)?.send()?;
-        let response = ensure_success(response)?;
+        self.api.check_status(response.status())?;
         response.json().map_err(BackendWorkspaceClientError::Http)
     }
 
@@ -326,7 +336,8 @@ impl BackendWorkspaceProductClient {
         path: &str,
         body: Option<&B>,
     ) -> Result<(), BackendWorkspaceClientError> {
-        ensure_success(self.request(method, path, body)?.send()?)?;
+        let response = self.request(method, path, body)?.send()?;
+        self.api.check_status(response.status())?;
         Ok(())
     }
 
@@ -336,14 +347,12 @@ impl BackendWorkspaceProductClient {
         path: &str,
         body: Option<&B>,
     ) -> Result<reqwest::blocking::RequestBuilder, BackendWorkspaceClientError> {
-        let client = reqwest::blocking::Client::builder().build()?;
-        let url = format!(
-            "{}/api/w/{}/{}",
-            self.base_url,
+        let path = format!(
+            "/api/w/{}/{}",
             encode_path_segment(&self.workspace_id),
             path.trim_start_matches('/')
         );
-        let request = client.request(method, url);
+        let request = self.api.blocking_request(method, &path)?;
         Ok(match body {
             Some(body) => request.json(body),
             None => request,
@@ -588,19 +597,6 @@ fn ticket_client_error(error: BackendWorkspaceClientError) -> TicketError {
     TicketError::Sqlite(format!("Backend request failed: {error}"))
 }
 
-fn ensure_success(
-    response: reqwest::blocking::Response,
-) -> Result<reqwest::blocking::Response, BackendWorkspaceClientError> {
-    if response.status().is_success() {
-        return Ok(response);
-    }
-    let status = response.status().as_u16();
-    let message = response
-        .text()
-        .unwrap_or_else(|_| "Backend request failed".to_string());
-    Err(BackendWorkspaceClientError::RequestFailed { status, message })
-}
-
 fn ticket_reference(id: &TicketIdOrSlug) -> String {
     match id {
         TicketIdOrSlug::Id(id) => id.to_string(),
@@ -698,24 +694,32 @@ mod tests {
     fn objective_list_uses_workspace_scoped_backend_route() {
         let body = r#"{"workspace_id":"workspace-a","limit":1000,"items":[],"source":"sqlite","diagnostics":[]}"#;
         let (base_url, request, handle) = one_response_server("200 OK", body);
-        let client = BackendWorkspaceProductClient::new(base_url, "workspace-a").unwrap();
+        let client = BackendWorkspaceProductClient::new_with_access_token(
+            base_url,
+            "workspace-a",
+            "test-backend-token",
+        )
+        .unwrap();
 
         let response = client.list_objectives(1_000).unwrap();
 
         assert!(response.items.is_empty());
-        assert!(
-            request
-                .recv()
-                .unwrap()
-                .starts_with("GET /api/w/workspace-a/objectives?limit=1000 ")
-        );
+        let request = request.recv().unwrap();
+        assert!(request.starts_with("GET /api/w/workspace-a/objectives?limit=1000 "));
+        assert!(request.contains("authorization: Bearer test-backend-token\r\n"));
         handle.join().unwrap();
     }
 
     #[test]
     fn backend_mutation_failure_is_returned_without_local_fallback() {
-        let (base_url, request, handle) = one_response_server("403 Forbidden", "denied");
-        let client = BackendWorkspaceProductClient::new(base_url, "workspace-a").unwrap();
+        let (base_url, request, handle) =
+            one_response_server("403 Forbidden", "test-backend-token");
+        let client = BackendWorkspaceProductClient::new_with_access_token(
+            base_url,
+            "workspace-a",
+            "test-backend-token",
+        )
+        .unwrap();
 
         let error = client
             .create_objective(&ObjectiveCreateRequest {
@@ -727,6 +731,7 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("403"));
+        assert!(!error.to_string().contains("test-backend-token"));
         assert!(
             request
                 .recv()
@@ -739,7 +744,12 @@ mod tests {
     #[test]
     fn ticket_relation_query_uses_workspace_scoped_backend_route() {
         let (base_url, request, handle) = one_response_server("200 OK", "[]");
-        let client = BackendWorkspaceProductClient::new(base_url, "workspace-a").unwrap();
+        let client = BackendWorkspaceProductClient::new_with_access_token(
+            base_url,
+            "workspace-a",
+            "test-backend-token",
+        )
+        .unwrap();
 
         let relations = client
             .query_ticket_relations(
@@ -758,7 +768,12 @@ mod tests {
     #[test]
     fn orchestration_plan_query_uses_workspace_scoped_backend_route() {
         let (base_url, request, handle) = one_response_server("200 OK", "[]");
-        let client = BackendWorkspaceProductClient::new(base_url, "workspace-a").unwrap();
+        let client = BackendWorkspaceProductClient::new_with_access_token(
+            base_url,
+            "workspace-a",
+            "test-backend-token",
+        )
+        .unwrap();
 
         let records = TicketBackend::query_orchestration_plan_records(&client, None, None).unwrap();
 
@@ -784,7 +799,12 @@ mod tests {
                 r#"{"runtime_id":"embedded","worker_id":"worker-1"}"#,
             ),
         ]);
-        let client = BackendWorkspaceProductClient::new(base_url, "workspace-a").unwrap();
+        let client = BackendWorkspaceProductClient::new_with_access_token(
+            base_url,
+            "workspace-a",
+            "test-backend-token",
+        )
+        .unwrap();
 
         let status = client.launch_ticket_intake("T-1").unwrap();
 
@@ -806,7 +826,12 @@ mod tests {
     fn workspace_orchestrator_launch_uses_scoped_backend_route() {
         let body = r#"{"disposition":"created","worker":{"runtime_id":"embedded","worker_id":"worker-2"}}"#;
         let (base_url, request, handle) = one_response_server("200 OK", body);
-        let client = BackendWorkspaceProductClient::new(base_url, "workspace-a").unwrap();
+        let client = BackendWorkspaceProductClient::new_with_access_token(
+            base_url,
+            "workspace-a",
+            "test-backend-token",
+        )
+        .unwrap();
 
         let status = client.start_workspace_orchestrator().unwrap();
 
@@ -822,7 +847,12 @@ mod tests {
 
     #[test]
     fn product_client_requires_workspace_identity() {
-        let error = BackendWorkspaceProductClient::new("http://127.0.0.1:8787", "").unwrap_err();
+        let error = BackendWorkspaceProductClient::new_with_access_token(
+            "http://127.0.0.1:8787",
+            "",
+            "test-backend-token",
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("Workspace identity"));
     }
 
