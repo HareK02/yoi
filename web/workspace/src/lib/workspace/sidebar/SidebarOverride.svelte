@@ -8,8 +8,5 @@
   const { sidebar }: Props = $props();
   const controller = getSidebarController();
 
-  $effect(() => {
-    controller.setSidebar(sidebar);
-    return () => controller.clearSidebar(sidebar);
-  });
+  $effect(() => controller.registerSidebar(sidebar));
 </script>

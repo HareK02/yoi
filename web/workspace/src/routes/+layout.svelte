@@ -5,22 +5,21 @@
   import { provideHeaderController, type HeaderController } from '$lib/workspace/header/context';
   import GlobalSidebar from '$lib/workspace/sidebar/GlobalSidebar.svelte';
   import SidebarFrame from '$lib/workspace/sidebar/SidebarFrame.svelte';
-  import { SIDEBAR_CONTEXT, type SidebarSnippet } from '$lib/workspace/sidebar/context';
+  import { SIDEBAR_CONTEXT, type SidebarController, type SidebarSnippet } from '$lib/workspace/sidebar/context';
+  import { createOverrideStack } from '$lib/workspace/sidebar/override-stack';
   import '../app.css';
   import type { LayoutProps } from './$types';
 
   let { children }: LayoutProps = $props();
   let sidebar = $state<SidebarSnippet | null>(null);
+  const sidebarOverrides = createOverrideStack<SidebarSnippet>((activeSidebar) => {
+    sidebar = activeSidebar;
+  });
   const headerController = $state<HeaderController>({ content: null });
 
   provideHeaderController(headerController);
-  setContext(SIDEBAR_CONTEXT, {
-    setSidebar(snippet: SidebarSnippet) {
-      sidebar = snippet;
-    },
-    clearSidebar(snippet: SidebarSnippet) {
-      if (sidebar === snippet) sidebar = null;
-    },
+  setContext<SidebarController>(SIDEBAR_CONTEXT, {
+    registerSidebar: sidebarOverrides.register,
   });
 </script>
 

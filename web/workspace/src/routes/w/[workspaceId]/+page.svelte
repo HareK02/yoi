@@ -49,8 +49,8 @@
     <small>Read typed Ticket records</small>
   </a>
   <a class="workspace-action-card" href={runtimeSettingsHref}>
-    <span>Runtime Inventory</span>
-    <strong>Open admin runtime inventory</strong>
+    <span>Runtimes</span>
+    <strong>Open admin Runtimes</strong>
     <small>{data.hosts?.items.length ?? 0} host{(data.hosts?.items.length ?? 0) === 1 ? '' : 's'} visible</small>
   </a>
   <a class="workspace-action-card" href={workersHref}>

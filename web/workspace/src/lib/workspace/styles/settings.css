@@ -16,7 +16,6 @@
     gap: var(--space-5);
   }
 
-  .settings-hero,
   .settings-notice,
   .settings-section-header,
   .settings-patterns {
@@ -183,7 +182,6 @@
   }
 
   @media (max-width: 760px) {
-    .settings-hero,
     .settings-notice,
     .settings-section-header,
     .settings-patterns {
@@ -345,18 +343,11 @@
     display: grid;
     gap: var(--space-5);
   }
-  .settings-nav {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-3);
-  }
-  .settings-nav a,
   .settings-section-card,
   .button-link {
     color: inherit;
     text-decoration: none;
   }
-  .settings-nav a,
   .settings-section-card {
     display: grid;
     gap: var(--space-1);
@@ -366,14 +357,10 @@
     border-radius: var(--radius-panel);
     background: var(--bg-raised);
   }
-  .settings-nav a:hover,
-  .settings-nav a:focus-visible,
-  .settings-nav a.active,
   .settings-section-card:hover,
   .settings-section-card:focus-visible {
     background: var(--interactive-hover);
   }
-  .settings-nav span,
   .settings-section-card h3 {
     color: var(--text-strong);
     font-weight: 800;

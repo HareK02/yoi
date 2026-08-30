@@ -4,8 +4,7 @@ import type { Snippet } from "svelte";
 export type SidebarSnippet = Snippet<[]>;
 
 export type SidebarController = {
-  setSidebar(snippet: SidebarSnippet): void;
-  clearSidebar(snippet: SidebarSnippet): void;
+  registerSidebar(sidebar: SidebarSnippet): () => void;
 };
 
 export const SIDEBAR_CONTEXT = Symbol("yoi-sidebar-context");

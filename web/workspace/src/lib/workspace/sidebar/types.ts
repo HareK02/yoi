@@ -39,6 +39,13 @@ export type Runtime = {
   os: string;
   arch: string;
   diagnostics: Diagnostic[];
+  management?: {
+    built_in: boolean;
+    config_managed: boolean;
+    removable: boolean;
+    endpoint_configured: boolean;
+    token_ref_configured: boolean;
+  };
 };
 
 export type Host = {

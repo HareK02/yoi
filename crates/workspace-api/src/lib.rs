@@ -237,6 +237,7 @@ pub enum RuntimeSourceStatus {
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeIdentityAuthority {
     RuntimeRegistryProjection,
+    ServerRuntimeConfiguration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -259,6 +260,46 @@ pub struct RuntimeSummary {
     pub worker_creation_available: bool,
     pub os: String,
     pub arch: String,
+    #[serde(default)]
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeManagementSummary {
+    pub built_in: bool,
+    pub config_managed: bool,
+    pub removable: bool,
+    pub endpoint_configured: bool,
+    pub token_ref_configured: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceRuntimeResource {
+    #[serde(flatten)]
+    pub runtime: RuntimeSummary,
+    pub management: RuntimeManagementSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CreateRemoteRuntimeRequest {
+    pub runtime_id: String,
+    pub display_name: Option<String>,
+    pub endpoint: String,
+    pub token_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeConnectionTestResponse {
+    pub workspace_id: String,
+    pub runtime_id: String,
+    pub checked_at: String,
+    pub state: String,
+    pub protocol_version: Option<String>,
+    pub compatibility_basis: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    pub health_result: String,
     #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,
 }

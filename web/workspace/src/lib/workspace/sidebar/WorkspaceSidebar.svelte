@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { Snippet } from 'svelte';
   import './sidebar.css';
   import ObjectivesNavSection from './ObjectivesNavSection.svelte';
   import MemoryNavSection from './MemoryNavSection.svelte';
@@ -12,9 +13,15 @@
     workspace: WorkspaceResponse | null;
     workspaceError?: string | null;
     currentPath?: string;
+    content?: Snippet | null;
   };
 
-  let { workspace, workspaceError = null, currentPath = '/' }: Props = $props();
+  let {
+    workspace,
+    workspaceError = null,
+    currentPath = '/',
+    content = null,
+  }: Props = $props();
 
   let workspaceId = $derived(workspace?.workspace_id ?? '');
 </script>
@@ -38,11 +45,15 @@
     {/if}
   </header>
 
-  <nav class="sidebar-sections" aria-label="Workspace sections">
-    <TicketsNavSection {currentPath} {workspaceId} />
-    <ObjectivesNavSection {currentPath} {workspaceId} />
-    <MemoryNavSection {currentPath} {workspaceId} />
-    <MergeRequestsNavSection {currentPath} {workspaceId} />
-    <WorkersNavSection {currentPath} {workspaceId} />
-  </nav>
+  {#if content}
+    {@render content()}
+  {:else}
+    <nav class="sidebar-sections" aria-label="Workspace sections">
+      <TicketsNavSection {currentPath} {workspaceId} />
+      <ObjectivesNavSection {currentPath} {workspaceId} />
+      <MemoryNavSection {currentPath} {workspaceId} />
+      <MergeRequestsNavSection {currentPath} {workspaceId} />
+      <WorkersNavSection {currentPath} {workspaceId} />
+    </nav>
+  {/if}
 </div>

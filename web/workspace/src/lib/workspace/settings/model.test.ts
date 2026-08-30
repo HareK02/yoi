@@ -71,13 +71,13 @@ Deno.test("Repository access settings are editable and canonically routed", () =
   );
 });
 
-Deno.test("runtime connections are editable without advertising raw authority leaks", () => {
+Deno.test("Runtimes are one editable REST resource without authority leaks", () => {
   const runtimeSection = SETTINGS_SECTIONS.find((section) =>
-    section.id === "runtime-connections"
+    section.id === "runtimes"
   );
   assert(
     runtimeSection?.status === "editable",
-    "Runtime Connections should be editable",
+    "Runtimes should be editable",
   );
 
   const allText = [
@@ -91,13 +91,13 @@ Deno.test("runtime connections are editable without advertising raw authority le
   ].join("\n");
 
   assert(
-    allText.includes("restart_required=true") ||
-      allText.includes("Restart-required"),
-    "restart-required pattern should be visible",
+    allText.includes("canonical") && allText.includes("REST resource"),
+    "Runtime settings should describe the canonical REST resource",
   );
   assert(
-    allText.includes("not echoed back") || allText.includes("not echoed"),
-    "endpoint submission should not imply endpoint echoing",
+    !allText.includes("restart_required") &&
+      !allText.includes("Restart-required"),
+    "Runtime settings should not retain obsolete restart-required semantics",
   );
 
   for (
@@ -120,12 +120,12 @@ Deno.test("runtime connections are editable without advertising raw authority le
 Deno.test("diagnostic labels preserve severity and code", () => {
   const diagnostic = {
     severity: "warning",
-    code: "runtime_registry_restart_required",
-    message: "Restart required.",
+    code: "configured_runtime_unavailable",
+    message: "Configured Runtime unavailable.",
   } as const;
   assert(
     diagnosticLabel(diagnostic) ===
-      "warning: runtime_registry_restart_required",
+      "warning: configured_runtime_unavailable",
     "diagnostic label should be bounded and stable",
   );
 });

@@ -107,7 +107,7 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
         "workspaceRoute(workspaceId, '/settings/runtimes')",
       ) &&
       workspacePage.includes("workspaceRoute(workspaceId, '/workers')"),
-    "top workspace page should link to Tickets, Runtime Inventory under Settings, and the Workers page",
+    "top workspace page should link to Tickets, Runtimes under Settings, and the Workers page",
   );
   assert(
     !workspacePage.includes("workerConsoleHref") &&
@@ -599,21 +599,24 @@ Deno.test("workspace Runtime inventory lives under Settings admin routes", async
 
   assert(
     !sidebar.includes("RuntimesNavSection") &&
-      settingsModel.includes('id: "runtime-inventory"') &&
+      settingsModel.includes('id: "runtimes"') &&
       settingsModel.includes("return `${SETTINGS_ROUTE}/runtimes`;"),
-    "Runtime inventory should be admin Settings navigation, not primary workspace sidebar navigation",
+    "Runtimes should be admin Settings navigation, not primary workspace sidebar navigation",
   );
   assert(
-    runtimesPage.includes("Runtime Inventory") &&
+    runtimesPage.includes("Add remote Runtime") &&
       runtimesPage.includes("Open workdirs") &&
-      runtimesPage.includes("runtimes-table") &&
+      runtimesPage.includes("settings-runtime-table") &&
+      runtimesPage.includes(
+        "/runtimes/${encodeURIComponent(runtime.runtime_id)}/connection-tests",
+      ) &&
       runtimesPage.includes(
         "/settings/runtimes/${encodeURIComponent(runtime.runtime_id)}/workdirs",
       ),
-    "Settings Runtime Inventory page should table Runtimes and link to each Runtime's workdirs",
+    "Settings Runtimes page should expose canonical REST actions and link to each Runtime's workdirs",
   );
   assert(
-    workdirsPage.includes("Runtime Inventory") &&
+    workdirsPage.includes(">Runtimes</a>") &&
       workdirsPage.includes("workdirs-table") &&
       workdirsLoad.includes("/working-directories"),
     "Runtime workdirs should remain backed by Runtime APIs without legacy Runtime route redirects",
@@ -834,9 +837,10 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
     "Sidebar styles should define their layer order before component rules so base link styles do not win by import order",
   );
   assert(
-    sidebarOverride.includes("controller.setSidebar(sidebar)") &&
-      sidebarOverride.includes("controller.clearSidebar(sidebar)"),
-    "SidebarOverride should register and clean up the child-provided sidebar snippet",
+    sidebarOverride.includes("controller.registerSidebar(sidebar)") &&
+      rootLayout.includes("createOverrideStack<SidebarSnippet>") &&
+      rootLayout.includes("registerSidebar: sidebarOverrides.register"),
+    "SidebarOverride should register a nested sidebar whose cleanup restores the parent override",
   );
   assert(
     rootLayoutLoad.includes("export const load") &&
