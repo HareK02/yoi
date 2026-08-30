@@ -270,6 +270,11 @@ fn parse_top_level_target_selection(
                 i += 1;
             }
             "--backend" => {
+                if selection.backend_url.is_some() {
+                    return Err(ParseError(
+                        "--backend must not be provided more than once".to_string(),
+                    ));
+                }
                 if selection.explicit_local {
                     return Err(ParseError(
                         "--local and --backend are mutually exclusive".to_string(),
@@ -295,6 +300,11 @@ fn parse_top_level_target_selection(
                 i += 2;
             }
             arg if arg.starts_with("--backend=") => {
+                if selection.backend_url.is_some() {
+                    return Err(ParseError(
+                        "--backend must not be provided more than once".to_string(),
+                    ));
+                }
                 if selection.explicit_local {
                     return Err(ParseError(
                         "--local and --backend are mutually exclusive".to_string(),
@@ -1289,6 +1299,11 @@ fn parse_login_args<R: CliConnectionResolver + ?Sized>(
     while i < args.len() {
         match args[i].as_str() {
             "--backend" => {
+                if backend_url.is_some() {
+                    return Err(ParseError(
+                        "--backend must not be provided more than once".to_string(),
+                    ));
+                }
                 let value = args
                     .get(i + 1)
                     .ok_or_else(|| ParseError("--backend requires a URL".to_string()))?;
@@ -1299,6 +1314,11 @@ fn parse_login_args<R: CliConnectionResolver + ?Sized>(
                 i += 2;
             }
             arg if arg.starts_with("--backend=") => {
+                if backend_url.is_some() {
+                    return Err(ParseError(
+                        "--backend must not be provided more than once".to_string(),
+                    ));
+                }
                 let value = arg.trim_start_matches("--backend=");
                 if value.is_empty() {
                     return Err(ParseError("--backend requires a URL".to_string()));
@@ -2043,6 +2063,27 @@ backend = "shared"
                 assert!(no_wait);
             }
             other => panic!("expected Login mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_login_rejects_repeated_backend_selectors_in_each_scope() {
+        for args in [
+            vec![
+                "--backend",
+                "http://127.0.0.1:8787",
+                "--backend=http://127.0.0.1:8788",
+                "login",
+            ],
+            vec![
+                "login",
+                "--backend",
+                "http://127.0.0.1:8787",
+                "--backend=http://127.0.0.1:8788",
+            ],
+        ] {
+            let error = parse_args_from(args).unwrap_err().to_string();
+            assert!(error.contains("must not be provided more than once"));
         }
     }
 
