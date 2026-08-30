@@ -77,7 +77,7 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: WorkerHandle)
     let mut writer = JsonLineWriter::new(writer);
 
     // Hold the in-flight stream lock while taking the session-log mirror
-    // snapshot. `LogEntry::AssistantItem` is mirror-only for live clients,
+    // snapshot. `LogEntry::AnnotatedAssistantItem` is mirror-only for live clients,
     // so a finalized assistant block must be observed either as an already
     // committed entry or as the still-present in-flight block. This lock
     // order matches `append_entry` (in-flight clear before sink publish) and

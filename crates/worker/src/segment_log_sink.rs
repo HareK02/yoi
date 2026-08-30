@@ -50,7 +50,7 @@ struct SinkInner {
     /// Broadcast channel for live entry updates. The same `Sender`
     /// survives session swaps so existing subscribers keep their
     /// receiver — they observe the swap as a freshly broadcast
-    /// `LogEntry::SegmentStart` and reset their view accordingly.
+    /// `LogEntry::AnnotatedSegmentStart` and reset their view accordingly.
     broadcast_tx: broadcast::Sender<LogEntry>,
 }
 
@@ -89,9 +89,9 @@ impl SegmentLogSink {
     ///
     /// Live broadcast fires for committed session-log entries that
     /// socket clients must see in log order:
-    ///   - `LogEntry::SegmentStart` → `Event::SegmentRotated` on the wire.
-    ///   - `LogEntry::UserInput`    → `Event::UserMessage`.
-    ///   - `LogEntry::SystemItem`   → `Event::SystemItem`.
+    ///   - `LogEntry::AnnotatedSegmentStart` → `Event::SegmentRotated` on the wire.
+    ///   - `LogEntry::AnnotatedUserInput`    → `Event::UserMessage`.
+    ///   - `LogEntry::AnnotatedSystemItem`   → `Event::SystemItem`.
     ///   - `LogEntry::Invoke`       → `Event::InvokeStart`.
     /// Everything else (AssistantItem, ToolResult, TurnEnd,
     /// RunCompleted, RunErrored, PausedTurnAbandoned, LlmUsage, Extension,
@@ -120,11 +120,8 @@ impl SegmentLogSink {
     fn is_live_relevant(entry: &LogEntry) -> bool {
         matches!(
             entry,
-            LogEntry::SegmentStart { .. }
-                | LogEntry::AnnotatedSegmentStart { .. }
-                | LogEntry::UserInput { .. }
+            LogEntry::AnnotatedSegmentStart { .. }
                 | LogEntry::AnnotatedUserInput { .. }
-                | LogEntry::SystemItem { .. }
                 | LogEntry::AnnotatedSystemItem { .. }
                 | LogEntry::Invoke { .. }
         )
@@ -132,7 +129,7 @@ impl SegmentLogSink {
 
     /// Atomically swap the mirror to `[initial]` and broadcast the new
     /// session-start entry. Used during compaction / fork: the new
-    /// `LogEntry::SegmentStart` is the first entry of the replacement
+    /// `LogEntry::AnnotatedSegmentStart` is the first entry of the replacement
     /// session, and existing subscribers transition by replaying it
     /// like any other live entry.
     ///
@@ -234,7 +231,7 @@ mod tests {
     use session_store::segment_log::now_millis;
 
     fn session_start() -> LogEntry {
-        LogEntry::SegmentStart {
+        LogEntry::AnnotatedSegmentStart {
             ts: now_millis(),
             session_id: uuid::Uuid::nil(),
             system_prompt: None,
@@ -253,9 +250,12 @@ mod tests {
     }
 
     fn user_input(text: &str) -> LogEntry {
-        LogEntry::UserInput {
+        LogEntry::AnnotatedUserInput {
             ts: now_millis(),
             extensions: vec![],
+            history: vec![crate::session_history::test_logged_history_entry(
+                agen::Item::user_message(text),
+            )],
             segments: vec![protocol::Segment::Text {
                 content: text.to_owned(),
             }],
@@ -270,7 +270,10 @@ mod tests {
 
         let (snapshot, mut rx) = sink.subscribe_with_snapshot();
         assert_eq!(snapshot.len(), 2);
-        assert!(matches!(snapshot[0], LogEntry::SegmentStart { .. }));
+        assert!(matches!(
+            snapshot[0],
+            LogEntry::AnnotatedSegmentStart { .. }
+        ));
         assert!(matches!(
             snapshot[1],
             LogEntry::TurnEnd { turn_count: 1, .. }
@@ -279,13 +282,15 @@ mod tests {
     }
 
     fn notification_entry(text: &str) -> LogEntry {
-        LogEntry::SystemItem {
+        LogEntry::AnnotatedSystemItem {
             ts: now_millis(),
-            item: session_store::SystemItem::Notification {
-                message: text.to_owned(),
-                body: format!("[Notification] {text}"),
-                prompt_provenance: None,
-            },
+            entry: crate::session_history::test_logged_system_entry(
+                session_store::SystemItem::Notification {
+                    message: text.to_owned(),
+                    body: format!("[Notification] {text}"),
+                    prompt_provenance: None,
+                },
+            ),
         }
     }
 
@@ -305,7 +310,7 @@ mod tests {
         // for Event::UserMessage.
         sink.publish(user_input("hi from log"));
         match rx.try_recv() {
-            Ok(LogEntry::UserInput { segments, .. }) => {
+            Ok(LogEntry::AnnotatedUserInput { segments, .. }) => {
                 assert_eq!(segments.len(), 1);
             }
             other => panic!("expected UserInput, got {other:?}"),
@@ -314,7 +319,7 @@ mod tests {
         // SystemItem is live-relevant.
         sink.publish(notification_entry("hi"));
         match rx.try_recv() {
-            Ok(LogEntry::SystemItem { .. }) => {}
+            Ok(LogEntry::AnnotatedSystemItem { .. }) => {}
             other => panic!("expected SystemItem, got {other:?}"),
         }
 
@@ -332,7 +337,7 @@ mod tests {
 
         assert_eq!(snapshot.len(), 1);
         match rx.try_recv() {
-            Ok(LogEntry::SystemItem { .. }) => {}
+            Ok(LogEntry::AnnotatedSystemItem { .. }) => {}
             other => panic!("unexpected: {other:?}"),
         }
         assert!(rx.try_recv().is_err());
@@ -348,13 +353,16 @@ mod tests {
         sink.reset_with_initial(session_start());
 
         match rx.try_recv() {
-            Ok(LogEntry::SegmentStart { .. }) => {}
+            Ok(LogEntry::AnnotatedSegmentStart { .. }) => {}
             other => panic!("expected SegmentStart broadcast, got {other:?}"),
         }
 
         let (post_snapshot, _) = sink.subscribe_with_snapshot();
         assert_eq!(post_snapshot.len(), 1);
-        assert!(matches!(post_snapshot[0], LogEntry::SegmentStart { .. }));
+        assert!(matches!(
+            post_snapshot[0],
+            LogEntry::AnnotatedSegmentStart { .. }
+        ));
     }
 
     #[test]

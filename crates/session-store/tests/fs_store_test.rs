@@ -1,12 +1,25 @@
 use agen::EngineResult;
 use agen::llm_client::types::{Item, RequestConfig};
 use session_store::{
-    FsStore, LogEntry, Store, TraceEntry, collect_state, new_segment_id, new_session_id,
+    FsStore, LogEntry, LoggedHistoryEntry, LoggedItem, LoggedSessionHistoryEntryId,
+    LoggedSessionHistoryMetadata, LoggedSessionHistoryOrigin, Store, TraceEntry, collect_state,
+    new_segment_id, new_session_id,
 };
 use std::io::Write;
 
+fn annotated(item: Item) -> LoggedHistoryEntry {
+    LoggedHistoryEntry {
+        item: LoggedItem::from(item),
+        metadata: LoggedSessionHistoryMetadata {
+            entry_id: LoggedSessionHistoryEntryId::new(),
+            origin: LoggedSessionHistoryOrigin::LegacyUnknown,
+            derivation: None,
+        },
+    }
+}
+
 fn nil_session_start(ts: u64, session_id: uuid::Uuid) -> LogEntry {
-    LogEntry::SegmentStart {
+    LogEntry::AnnotatedSegmentStart {
         ts,
         session_id,
         system_prompt: None,
@@ -25,7 +38,7 @@ fn round_trip_write_and_read() {
     let segid = new_segment_id();
 
     let entries = vec![
-        LogEntry::SegmentStart {
+        LogEntry::AnnotatedSegmentStart {
             ts: 1000,
             session_id: sid,
             system_prompt: Some("You are helpful.".into()),
@@ -34,14 +47,15 @@ fn round_trip_write_and_read() {
             forked_from: None,
             compacted_from: None,
         },
-        LogEntry::UserInput {
+        LogEntry::AnnotatedUserInput {
             ts: 2000,
             extensions: vec![],
             segments: vec![protocol::Segment::text("Hello")],
+            history: vec![annotated(Item::user_message("Hello"))],
         },
-        LogEntry::AssistantItem {
+        LogEntry::AnnotatedAssistantItem {
             ts: 3000,
-            item: Item::assistant_message("Hi there!").into(),
+            entry: annotated(Item::assistant_message("Hi there!")),
         },
         LogEntry::TurnEnd {
             ts: 3100,
@@ -79,14 +93,14 @@ fn create_segment_writes_all_entries() {
     let sid = new_session_id();
     let segid = new_segment_id();
 
-    let entries = [LogEntry::SegmentStart {
+    let entries = [LogEntry::AnnotatedSegmentStart {
         ts: 1000,
         session_id: sid,
         system_prompt: None,
         config: RequestConfig::default(),
         history: vec![
-            Item::user_message("seed").into(),
-            Item::assistant_message("ok").into(),
+            annotated(Item::user_message("seed")),
+            annotated(Item::assistant_message("ok")),
         ],
         forked_from: None,
         compacted_from: None,
@@ -205,7 +219,7 @@ fn read_entry_count_matches_append_tally() {
     let segid = new_segment_id();
 
     let entries = [
-        LogEntry::SegmentStart {
+        LogEntry::AnnotatedSegmentStart {
             ts: 1000,
             session_id: sid,
             system_prompt: None,
@@ -214,10 +228,11 @@ fn read_entry_count_matches_append_tally() {
             forked_from: None,
             compacted_from: None,
         },
-        LogEntry::UserInput {
+        LogEntry::AnnotatedUserInput {
             ts: 2000,
             extensions: vec![],
             segments: vec![protocol::Segment::text("Hello")],
+            history: vec![annotated(Item::user_message("Hello"))],
         },
     ];
 
@@ -254,10 +269,11 @@ fn unterminated_utf8_tail_is_ignored_and_replaced_on_append() {
     assert_eq!(store.read_all(sid, segid).unwrap().len(), 1);
     assert_eq!(store.read_entry_count(sid, segid).unwrap(), 1);
 
-    let next = LogEntry::UserInput {
+    let next = LogEntry::AnnotatedUserInput {
         ts: 2,
         extensions: vec![],
         segments: vec![protocol::Segment::text("recovered")],
+        history: vec![annotated(Item::user_message("recovered"))],
     };
     store.append(sid, segid, &next).unwrap();
 

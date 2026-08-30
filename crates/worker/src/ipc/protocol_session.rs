@@ -29,18 +29,12 @@ pub fn subscribe_worker_protocol_session(handle: &WorkerHandle) -> WorkerProtoco
 
 pub fn live_log_entry_event(entry: LogEntry) -> Option<Event> {
     match entry {
-        entry @ (LogEntry::SegmentStart { .. } | LogEntry::AnnotatedSegmentStart { .. }) => {
+        entry @ LogEntry::AnnotatedSegmentStart { .. } => {
             let session =
                 session_store::public_snapshot::project_current_session_snapshot(&[entry]);
             Some(Event::SegmentRotated { session })
         }
-        LogEntry::UserInput { segments, .. } | LogEntry::AnnotatedUserInput { segments, .. } => {
-            Some(Event::UserMessage { segments })
-        }
-        LogEntry::SystemItem { item, .. } => {
-            let value = serde_json::to_value(&item).expect("SystemItem is Serialize");
-            Some(Event::SystemItem { item: value })
-        }
+        LogEntry::AnnotatedUserInput { segments, .. } => Some(Event::UserMessage { segments }),
         LogEntry::AnnotatedSystemItem { entry, .. } => {
             let value = serde_json::to_value(&entry.item).expect("SystemItem is Serialize");
             Some(Event::SystemItem { item: value })
@@ -89,9 +83,12 @@ mod tests {
     #[test]
     fn user_input_log_entry_maps_to_user_message_event() {
         let segments = vec![protocol::Segment::text("hello from log")];
-        let event = live_log_entry_event(LogEntry::UserInput {
+        let event = live_log_entry_event(LogEntry::AnnotatedUserInput {
             ts: session_store::segment_log::now_millis(),
             extensions: vec![],
+            history: vec![crate::session_history::test_logged_history_entry(
+                agen::Item::user_message("hello from log"),
+            )],
             segments: segments.clone(),
         })
         .expect("UserInput must be live-relevant");

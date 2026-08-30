@@ -765,7 +765,7 @@ impl App {
 
     fn method_for_run(&mut self, segments: Vec<Segment>) -> Method {
         // TurnHeader / UserMessage blocks are pushed only after the Worker
-        // emits `Event::UserMessage` from a committed `LogEntry::UserInput`.
+        // emits `Event::UserMessage` from a committed `LogEntry::AnnotatedUserInput`.
         // Locally we only clear the input buffer and forward the method,
         // while remembering enough local state to undo the visible submit if
         // the accepted run produced no assistant output and was rolled back.
@@ -2937,6 +2937,17 @@ mod composer_history_persistence_tests {
 mod completion_flow_tests {
     use super::*;
 
+    fn annotated(item: agen::Item) -> session_store::LoggedHistoryEntry {
+        session_store::LoggedHistoryEntry {
+            item: session_store::LoggedItem::from(item),
+            metadata: session_store::LoggedSessionHistoryMetadata {
+                entry_id: session_store::LoggedSessionHistoryEntryId::new(),
+                origin: session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
+                derivation: None,
+            },
+        }
+    }
+
     #[test]
     fn typing_at_creates_completion_state_and_emits_query() {
         let mut app = App::new("test".into());
@@ -3239,7 +3250,7 @@ mod completion_flow_tests {
     #[test]
     fn committed_user_message_survives_fresh_segment_rotation() {
         let mut app = App::new("test".into());
-        let start = session_store::LogEntry::SegmentStart {
+        let start = session_store::LogEntry::AnnotatedSegmentStart {
             ts: session_store::segment_log::now_millis(),
             session_id: uuid::Uuid::nil(),
             system_prompt: None,
@@ -3498,14 +3509,14 @@ mod completion_flow_tests {
     #[test]
     fn snapshot_excludes_system_prompt_history_from_public_blocks() {
         let mut app = App::new("test".into());
-        let session_start = session_store::LogEntry::SegmentStart {
+        let session_start = session_store::LogEntry::AnnotatedSegmentStart {
             ts: 1,
             session_id: uuid::Uuid::nil(),
             system_prompt: None,
             config: Default::default(),
-            history: vec![session_store::LoggedItem::from(
-                &agen::Item::system_message("[File: src/main.rs]\nfn main() {}"),
-            )],
+            history: vec![annotated(agen::Item::system_message(
+                "[File: src/main.rs]\nfn main() {}",
+            ))],
             forked_from: None,
             compacted_from: None,
         };
@@ -3584,7 +3595,7 @@ mod completion_flow_tests {
             code: ErrorCode::ProviderError,
             message: "provider unavailable".into(),
         });
-        let segment_start = session_store::LogEntry::SegmentStart {
+        let segment_start = session_store::LogEntry::AnnotatedSegmentStart {
             ts: 5,
             session_id: uuid::Uuid::nil(),
             system_prompt: None,
@@ -4336,36 +4347,33 @@ mod completion_flow_tests {
         });
 
         let assistant_item_entries = vec![
-            serde_json::json!({
-                "kind": "assistant_item",
-                "ts": 1,
-                "item": {
-                    "kind": "tool_call",
-                    "call_id": "c1",
-                    "name": "TaskCreate",
-                    "arguments": r#"{"subject":"a","description":"A"}"#,
-                },
-            }),
-            serde_json::json!({
-                "kind": "assistant_item",
-                "ts": 2,
-                "item": {
-                    "kind": "tool_call",
-                    "call_id": "c2",
-                    "name": "TaskCreate",
-                    "arguments": r#"{"subject":"b","description":"B"}"#,
-                },
-            }),
-            serde_json::json!({
-                "kind": "assistant_item",
-                "ts": 3,
-                "item": {
-                    "kind": "tool_call",
-                    "call_id": "u1",
-                    "name": "TaskUpdate",
-                    "arguments": r#"{"taskid":2,"status":"inprogress"}"#,
-                },
-            }),
+            serde_json::to_value(session_store::LogEntry::AnnotatedAssistantItem {
+                ts: 1,
+                entry: annotated(agen::Item::tool_call(
+                    "c1",
+                    "TaskCreate",
+                    r#"{"subject":"a","description":"A"}"#,
+                )),
+            })
+            .unwrap(),
+            serde_json::to_value(session_store::LogEntry::AnnotatedAssistantItem {
+                ts: 2,
+                entry: annotated(agen::Item::tool_call(
+                    "c2",
+                    "TaskCreate",
+                    r#"{"subject":"b","description":"B"}"#,
+                )),
+            })
+            .unwrap(),
+            serde_json::to_value(session_store::LogEntry::AnnotatedAssistantItem {
+                ts: 3,
+                entry: annotated(agen::Item::tool_call(
+                    "u1",
+                    "TaskUpdate",
+                    r#"{"taskid":2,"status":"inprogress"}"#,
+                )),
+            })
+            .unwrap(),
         ];
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),

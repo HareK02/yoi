@@ -35,28 +35,15 @@ fn history_from_sink(handle: &WorkerHandle) -> Vec<Item> {
             LogEntry::AnnotatedSegmentStart { history, .. } => {
                 items.extend(history.into_iter().map(|entry| Item::from(entry.item)));
             }
-            LogEntry::SegmentStart { history, .. } => {
-                items.extend(history.into_iter().map(Item::from));
-            }
             LogEntry::AnnotatedUserInput { history, .. } => {
                 items.extend(history.into_iter().map(|entry| Item::from(entry.item)));
-            }
-            LogEntry::UserInput { segments, .. } => {
-                let text = protocol::Segment::flatten_to_text(&segments);
-                items.push(Item::user_message(text));
             }
             LogEntry::AnnotatedAssistantItem { entry, .. }
             | LogEntry::AnnotatedToolResult { entry, .. } => {
                 items.push(Item::from(entry.item));
             }
-            LogEntry::AssistantItem { item, .. } | LogEntry::ToolResult { item, .. } => {
-                items.push(Item::from(item));
-            }
             LogEntry::AnnotatedSystemItem { entry, .. } => {
                 items.push(entry.item.to_history_item());
-            }
-            LogEntry::SystemItem { item, .. } => {
-                items.push(item.to_history_item());
             }
             _ => {}
         }
@@ -67,7 +54,6 @@ fn history_from_sink(handle: &WorkerHandle) -> Vec<Item> {
 fn system_item(entry: &LogEntry) -> Option<&session_store::SystemItem> {
     match entry {
         LogEntry::AnnotatedSystemItem { entry, .. } => Some(&entry.item),
-        LogEntry::SystemItem { item, .. } => Some(item),
         _ => None,
     }
 }
@@ -1095,7 +1081,7 @@ async fn run_with_paste_segment_inlines_content_and_emits_typed_user_message() {
     // Mixed input: plain text + a paste chip + trailing text. Worker must
     // flatten this into one user-message string (paste content inlined,
     // no `[Clipboard ...]` label leaking to the LLM); the committed
-    // `LogEntry::UserInput` must carry the typed segments unchanged so
+    // `LogEntry::AnnotatedUserInput` must carry the typed segments unchanged so
     // socket clients can derive `Event::UserMessage` and re-render the chip.
     let segments = vec![
         protocol::Segment::text("see "),
@@ -1130,7 +1116,7 @@ async fn run_with_paste_segment_inlines_content_and_emits_typed_user_message() {
                 _ => {}
             },
             entry = entry_rx.recv() => match entry {
-                Ok(session_store::LogEntry::UserInput { segments, .. } | session_store::LogEntry::AnnotatedUserInput { segments, .. }) => {
+                Ok(session_store::LogEntry::AnnotatedUserInput { segments, .. }) => {
                     user_input_segments = Some(segments);
                     if saw_turn_end {
                         break;

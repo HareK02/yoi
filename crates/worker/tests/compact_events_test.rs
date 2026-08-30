@@ -25,6 +25,17 @@ use worker::{Worker, WorkerController};
 
 type TestStore = CombinedStore<FsStore, FsWorkerStore>;
 
+fn annotated(item: Item) -> session_store::LoggedHistoryEntry {
+    session_store::LoggedHistoryEntry {
+        item: session_store::LoggedItem::from(item),
+        metadata: session_store::LoggedSessionHistoryMetadata {
+            entry_id: session_store::LoggedSessionHistoryEntryId::new(),
+            origin: session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
+            derivation: None,
+        },
+    }
+}
+
 #[derive(Clone)]
 struct MockClient {
     responses: Arc<Vec<Vec<LlmEvent>>>,
@@ -210,7 +221,6 @@ fn system_texts_in_sink_session_start(
                 .into_iter()
                 .map(|entry| entry.item)
                 .collect::<Vec<_>>(),
-            session_store::LogEntry::SegmentStart { history, .. } => history,
             _ => continue,
         };
         return history
@@ -310,17 +320,14 @@ permission = "write"
     // Simulate a foreign writer appending to the same segment. This bumps
     // the on-disk entry count past the Worker's own append tally without
     // updating the Worker's `entries_written`.
-    store
-        .append(
-            session_id,
-            source_segment_id,
-            &LogEntry::UserInput {
-                ts: 9999,
-                segments: vec![protocol::Segment::text("interloper")],
-                extensions: vec![],
-            },
-        )
-        .unwrap();
+    session_store::save_user_input(
+        &store,
+        session_id,
+        source_segment_id,
+        vec![protocol::Segment::text("interloper")],
+        vec![annotated(Item::user_message("interloper"))],
+    )
+    .unwrap();
 
     // Next run triggers ensure_segment_head, which sees the drift.
     worker.run_text("second").await.unwrap();
@@ -348,11 +355,6 @@ permission = "write"
             session_id: seg_session,
             forked_from: Some(origin),
             ..
-        }
-        | LogEntry::SegmentStart {
-            session_id: seg_session,
-            forked_from: Some(origin),
-            ..
         } => {
             assert_eq!(*seg_session, session_id);
             assert_eq!(origin.segment_id, source_segment_id);
@@ -366,7 +368,7 @@ permission = "write"
     assert_eq!(source_after.len(), source_len_before + 1);
     assert!(matches!(
         source_after.last(),
-        Some(LogEntry::UserInput { .. })
+        Some(LogEntry::AnnotatedUserInput { .. })
     ));
 }
 

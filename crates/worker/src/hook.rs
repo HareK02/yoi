@@ -161,7 +161,7 @@ impl From<HookTurnEndAction> for TurnEndAction {
 ///
 /// Hook code can use this handle only when the Worker host includes it in an
 /// event-specific context. The handle queues typed requests; the host drains the
-/// queue, commits each entry through `LogEntry::SystemItem`, and only then makes
+/// queue, commits each entry through `LogEntry::AnnotatedSystemItem`, and only then makes
 /// the matching system message visible to the model. It deliberately exposes no
 /// raw `agen::Item`, history writer, event sender, `Worker`, `Engine`, or
 /// notification buffer.

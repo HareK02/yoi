@@ -12,13 +12,12 @@ use crate::{
     LoggedSessionHistoryOrigin, SessionId, SystemItem,
 };
 
-/// Project a complete current-segment log. A valid segment always starts with
-/// one of the two SegmentStart records; malformed partial input uses the nil
-/// session only to keep the public failure projection deterministic.
+/// Project a complete current-segment log. A valid segment starts with one
+/// canonical annotated SegmentStart record; malformed partial input uses the
+/// nil session only to keep the public failure projection deterministic.
 pub fn project_current_session_snapshot(log: &[LogEntry]) -> SessionSnapshot {
     let session_id = log.iter().find_map(|entry| match entry {
-        LogEntry::SegmentStart { session_id, .. }
-        | LogEntry::AnnotatedSegmentStart { session_id, .. } => Some(*session_id),
+        LogEntry::AnnotatedSegmentStart { session_id, .. } => Some(*session_id),
         _ => None,
     });
     project_session_snapshot(session_id.unwrap_or_else(SessionId::nil), log)
@@ -32,20 +31,6 @@ pub fn project_session_snapshot(session_id: SessionId, log: &[LogEntry]) -> Sess
 
     for (log_index, record) in log.iter().enumerate() {
         match record {
-            LogEntry::SegmentStart {
-                ts,
-                session_id,
-                history,
-                ..
-            } => {
-                session_key = *session_id;
-                entries.clear();
-                for (item_index, item) in history.iter().enumerate() {
-                    if let Some(data) = project_item(item) {
-                        entries.push(legacy_entry(&session_key, log_index, item_index, *ts, data));
-                    }
-                }
-            }
             LogEntry::AnnotatedSegmentStart {
                 ts,
                 session_id,
@@ -56,39 +41,18 @@ pub fn project_session_snapshot(session_id: SessionId, log: &[LogEntry]) -> Sess
                 entries.clear();
                 extend_history(&mut entries, history, None, *ts);
             }
-            LogEntry::UserInput { ts, segments, .. } => entries.push(legacy_entry(
-                &session_key,
-                log_index,
-                0,
-                *ts,
-                SessionSnapshotEntryData::UserInput {
-                    segments: segments.clone(),
-                },
-            )),
             LogEntry::AnnotatedUserInput {
                 ts,
                 segments,
                 history,
                 ..
             } => extend_history(&mut entries, history, Some(segments), *ts),
-            LogEntry::AssistantItem { ts, item } | LogEntry::ToolResult { ts, item } => {
-                if let Some(data) = project_item(item) {
-                    entries.push(legacy_entry(&session_key, log_index, 0, *ts, data));
-                }
-            }
             LogEntry::AnnotatedAssistantItem { ts, entry }
             | LogEntry::AnnotatedToolResult { ts, entry } => {
                 if let Some(data) = project_item(&entry.item) {
                     entries.push(history_entry(entry, *ts, data));
                 }
             }
-            LogEntry::SystemItem { ts, item } => entries.push(system_entry(
-                item,
-                legacy_entry_id(&session_key, log_index, 0),
-                *ts,
-                SessionEntryProvenance::LegacyUnknown,
-                Vec::new(),
-            )),
             LogEntry::AnnotatedSystemItem { ts, entry } => entries.push(system_entry(
                 &entry.item,
                 entry.metadata.entry_id.0.clone(),
@@ -332,9 +296,9 @@ mod tests {
     use crate::{LoggedSessionHistoryEntryId, LoggedSessionHistoryMetadata, LoggedWorkerSubject};
 
     #[test]
-    fn legacy_projection_is_stable_and_hides_reasoning_and_system_prompts() {
+    fn current_projection_is_stable_and_hides_reasoning_and_system_prompts() {
         let session_id = crate::new_session_id();
-        let log = vec![LogEntry::SegmentStart {
+        let log = vec![LogEntry::AnnotatedSegmentStart {
             ts: 1,
             session_id,
             system_prompt: None,
@@ -358,7 +322,17 @@ mod tests {
                         text: "visible".into(),
                     }],
                 },
-            ],
+            ]
+            .into_iter()
+            .map(|item| LoggedHistoryEntry {
+                item,
+                metadata: LoggedSessionHistoryMetadata {
+                    entry_id: LoggedSessionHistoryEntryId::new(),
+                    origin: LoggedSessionHistoryOrigin::LegacyUnknown,
+                    derivation: None,
+                },
+            })
+            .collect(),
             forked_from: None,
             compacted_from: None,
         }];

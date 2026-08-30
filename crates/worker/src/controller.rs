@@ -631,8 +631,8 @@ fn protocol_command_status(status: WorkdirCommandStatus) -> ProtocolCommandStatu
 ///
 /// `Worker::wire_history_persistence` is called separately to wire the
 /// per-item history commit callback so every assistant / tool item
-/// landing in `worker.history` becomes a singular `LogEntry::AssistantItem`
-/// / `ToolResult` commit through the sync writer.
+/// landing in `worker.history` becomes a singular `LogEntry::AnnotatedAssistantItem`
+/// / `AnnotatedToolResult` commit through the sync writer.
 pub(crate) fn wire_event_bridges_on_engine<C, St>(
     worker: &mut Worker<C, St>,
     event_tx: &broadcast::Sender<Event>,
@@ -1317,7 +1317,7 @@ async fn controller_loop<C, St>(
                 }
                 // Stage the run without a speculative user-message echo.
                 // `Worker::run` validates the input, commits
-                // `LogEntry::UserInput`, and the session-log sink turns that
+                // `LogEntry::AnnotatedUserInput`, and the session-log sink turns that
                 // committed entry into the live `Event::UserMessage`. That
                 // keeps every client ordered against `SegmentStart` replay and
                 // makes persisted history the single source of visible user
@@ -1343,7 +1343,7 @@ async fn controller_loop<C, St>(
             Method::Notify { message, auto_run } => {
                 // Client-side live echo is delivered as `Event::SystemItem`
                 // once the interceptor commits the corresponding
-                // `LogEntry::SystemItem` entry — drained out of the
+                // `LogEntry::AnnotatedSystemItem` entry — drained out of the
                 // notify buffer + broadcast through the sink. No
                 // separate echo here.
                 worker.push_notify(message, auto_run);

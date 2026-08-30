@@ -623,6 +623,17 @@ mod tests {
 
     const SOURCE: WorkerVisibilitySource = WorkerVisibilitySource::ResumePicker;
 
+    fn annotated(item: agen::Item) -> session_store::LoggedHistoryEntry {
+        session_store::LoggedHistoryEntry {
+            item: session_store::LoggedItem::from(item),
+            metadata: session_store::LoggedSessionHistoryMetadata {
+                entry_id: session_store::LoggedSessionHistoryEntryId::new(),
+                origin: session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
+                derivation: None,
+            },
+        }
+    }
+
     #[test]
     fn stored_metadata_summary_uses_segment_marker_without_reading_session_log() {
         let dir = tempdir().unwrap();
@@ -1207,7 +1218,7 @@ mod tests {
             .append(
                 session_id,
                 segment_id,
-                &LogEntry::SegmentStart {
+                &LogEntry::AnnotatedSegmentStart {
                     ts,
                     session_id,
                     system_prompt: None,
@@ -1231,9 +1242,10 @@ mod tests {
             .append(
                 session_id,
                 segment_id,
-                &LogEntry::UserInput {
+                &LogEntry::AnnotatedUserInput {
                     ts,
                     segments: vec![protocol::Segment::text(text)],
+                    history: vec![annotated(agen::Item::user_message(text))],
                     extensions: vec![],
                 },
             )

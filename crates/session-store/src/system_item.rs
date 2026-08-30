@@ -8,7 +8,7 @@
 //! `kind` instead of parsing text prefixes like `[Notification] …` or
 //! `[File: …]`.
 //!
-//! Persisted as the payload of [`crate::LogEntry::SystemItem`] (one
+//! Persisted as the payload of [`crate::LogEntry::AnnotatedSystemItem`] (one
 //! entry per item), and broadcast live as the payload of
 //! `Event::SystemItem` on the wire.
 //!

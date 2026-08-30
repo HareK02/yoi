@@ -470,7 +470,7 @@ pub struct SessionToolAttachment {
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum Event {
     /// A user input message was accepted, persisted as
-    /// `LogEntry::UserInput`, and is about to start a new turn.
+    /// `LogEntry::AnnotatedUserInput`, and is about to start a new turn.
     /// Broadcast to every subscribed client so TUI / GUI instances show
     /// the same user line that reconnect snapshots would replay from
     /// history; clients must not synthesize a separate pending/fake
@@ -491,7 +491,7 @@ pub enum Event {
     /// of parsing free-text prefixes like `[Notification] …` or
     /// `[File: …]`.
     ///
-    /// One event per `LogEntry::SystemItem` commit. Disk-side and
+    /// One event per `LogEntry::AnnotatedSystemItem` commit. Disk-side and
     /// wire-side are 1:1.
     SystemItem {
         #[cfg_attr(feature = "typescript", ts(type = "unknown"))]

@@ -16,6 +16,21 @@ use session_store::{FsStore, LogEntry, SegmentStartState, Store, collect_state};
 // Helpers
 // =============================================================================
 
+fn annotated(items: &[Item]) -> Vec<session_store::LoggedHistoryEntry> {
+    items
+        .iter()
+        .cloned()
+        .map(|item| session_store::LoggedHistoryEntry {
+            item: session_store::LoggedItem::from(item),
+            metadata: session_store::LoggedSessionHistoryMetadata {
+                entry_id: session_store::LoggedSessionHistoryEntryId::new(),
+                origin: session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
+                derivation: None,
+            },
+        })
+        .collect()
+}
+
 fn simple_text_events() -> Vec<Event> {
     vec![
         Event::text_block_start(0),
@@ -144,6 +159,7 @@ async fn run_and_persist(
         session_id,
         segment_id,
         vec![protocol::Segment::text(input)],
+        annotated(&[Item::user_message(input)]),
     )
     .unwrap();
 
@@ -154,8 +170,8 @@ async fn run_and_persist(
     worker.engine = locked.unlock();
 
     let projected = worker.history();
-    let new_items = &projected[history_before..];
-    session_store::save_delta(store, session_id, segment_id, new_items).unwrap();
+    let new_items = annotated(&projected[history_before..]);
+    session_store::save_delta(store, session_id, segment_id, &new_items).unwrap();
     session_store::save_turn_end(store, session_id, segment_id, worker.turn_count()).unwrap();
 
     match &result {
@@ -219,7 +235,7 @@ async fn session_run_logs_entries() {
         SegmentStartState {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
-            history: &worker.history(),
+            history: annotated(&worker.history()),
         },
     )
     .unwrap();
@@ -237,7 +253,10 @@ async fn session_run_logs_entries() {
     );
 
     // First entry is SegmentStart
-    assert!(matches!(&entries[0], LogEntry::SegmentStart { .. }));
+    assert!(matches!(
+        &entries[0],
+        LogEntry::AnnotatedSegmentStart { .. }
+    ));
 
     // Has a RunCompleted with Finished
     let has_finished = entries.iter().any(|e| {
@@ -264,7 +283,7 @@ async fn session_restore_round_trip() {
         SegmentStartState {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
-            history: &worker.history(),
+            history: annotated(&worker.history()),
         },
     )
     .unwrap();
@@ -303,7 +322,7 @@ async fn session_run_with_tool_call() {
         SegmentStartState {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
-            history: &worker.history(),
+            history: annotated(&worker.history()),
         },
     )
     .unwrap();
@@ -314,12 +333,12 @@ async fn session_run_with_tool_call() {
 
     let has_tool_results = entries
         .iter()
-        .any(|e| matches!(e, LogEntry::ToolResult { .. }));
+        .any(|e| matches!(e, LogEntry::AnnotatedToolResult { .. }));
     assert!(has_tool_results, "should have ToolResult entry");
 
     let has_assistant = entries
         .iter()
-        .any(|e| matches!(e, LogEntry::AssistantItem { .. }));
+        .any(|e| matches!(e, LogEntry::AnnotatedAssistantItem { .. }));
     assert!(has_assistant, "should have AssistantItem entry");
 }
 
@@ -338,7 +357,7 @@ async fn session_resume_after_pause() {
         SegmentStartState {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
-            history: &worker.history(),
+            history: annotated(&worker.history()),
         },
     )
     .unwrap();
@@ -377,7 +396,7 @@ async fn session_fork_creates_new_session() {
         SegmentStartState {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
-            history: &worker.history(),
+            history: annotated(&worker.history()),
         },
     )
     .unwrap();
@@ -390,7 +409,7 @@ async fn session_fork_creates_new_session() {
         SegmentStartState {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
-            history: &worker.history(),
+            history: annotated(&worker.history()),
         },
     )
     .unwrap();
@@ -399,7 +418,10 @@ async fn session_fork_creates_new_session() {
     // Fork should have a SegmentStart with the current history
     let fork_entries = store.read_all(fork_sid, fork_segid).unwrap();
     assert_eq!(fork_entries.len(), 1);
-    assert!(matches!(&fork_entries[0], LogEntry::SegmentStart { .. }));
+    assert!(matches!(
+        &fork_entries[0],
+        LogEntry::AnnotatedSegmentStart { .. }
+    ));
 
     let fork_state = collect_state(&fork_entries);
     assert_eq!(fork_state.session_id, Some(fork_sid));
@@ -418,7 +440,7 @@ async fn session_fork_at_truncates_within_session() {
         SegmentStartState {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
-            history: &worker.history(),
+            history: annotated(&worker.history()),
         },
     )
     .unwrap();
@@ -445,6 +467,23 @@ async fn session_fork_at_truncates_within_session() {
         .expect("source segment has the matching TurnEnd");
     let source_state_at_fork = collect_state(&all_entries[..=turn_end_pos]);
     assert_eq!(fork_state.history.len(), source_state_at_fork.history.len());
+    assert_eq!(
+        fork_state.annotated_history, source_state_at_fork.annotated_history,
+        "fork_at must preserve every retained history entry identity and provenance",
+    );
+    assert!(fork_state.annotated_history.iter().all(|entry| {
+        !entry.metadata.entry_id.0.is_empty()
+            && matches!(
+                entry.metadata.origin,
+                session_store::LoggedSessionHistoryOrigin::LegacyUnknown
+                    | session_store::LoggedSessionHistoryOrigin::HumanInput { .. }
+                    | session_store::LoggedSessionHistoryOrigin::WorkerInput { .. }
+                    | session_store::LoggedSessionHistoryOrigin::BackendInstruction { .. }
+                    | session_store::LoggedSessionHistoryOrigin::ModelOutput { .. }
+                    | session_store::LoggedSessionHistoryOrigin::ToolOutput { .. }
+                    | session_store::LoggedSessionHistoryOrigin::DerivedSummary
+            )
+    }));
 
     // list_segments should show both source and fork in the same Session.
     let segs = store.list_segments(sid).unwrap();
@@ -463,7 +502,7 @@ async fn session_config_changed_logged() {
         SegmentStartState {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
-            history: &worker.history(),
+            history: annotated(&worker.history()),
         },
     )
     .unwrap();
@@ -496,7 +535,7 @@ async fn session_auto_forks_on_conflict() {
         SegmentStartState {
             system_prompt: worker_a.get_system_prompt(),
             config: worker_a.request_config(),
-            history: &worker_a.history(),
+            history: annotated(&worker_a.history()),
         },
     )
     .unwrap();
@@ -505,12 +544,14 @@ async fn session_auto_forks_on_conflict() {
     let mut entries_written: usize = 1;
 
     // Simulate another Worker writing to the same segment behind our back.
-    let extra_entry = LogEntry::UserInput {
-        ts: 9999,
-        extensions: vec![],
-        segments: vec![protocol::Segment::text("Interloper")],
-    };
-    store.append(sid, original_segid, &extra_entry).unwrap();
+    session_store::save_user_input(
+        &store,
+        sid,
+        original_segid,
+        vec![protocol::Segment::text("Interloper")],
+        annotated(&[Item::user_message("Interloper")]),
+    )
+    .unwrap();
 
     // Now the on-disk count exceeds our tally — ensure_head_or_fork should auto-fork.
     session_store::ensure_head_or_fork(
@@ -522,7 +563,7 @@ async fn session_auto_forks_on_conflict() {
         SegmentStartState {
             system_prompt: worker_a.get_system_prompt(),
             config: worker_a.request_config(),
-            history: &worker_a.history(),
+            history: annotated(&worker_a.history()),
         },
     )
     .unwrap();
@@ -543,7 +584,7 @@ async fn session_auto_forks_on_conflict() {
     // The new segment records its lineage forward via forked_from; the
     // source segment is left immutable (no terminal marker written back).
     match &fork_entries[0] {
-        LogEntry::SegmentStart {
+        LogEntry::AnnotatedSegmentStart {
             forked_from: Some(origin),
             ..
         } => {
@@ -563,7 +604,7 @@ async fn session_auto_forks_on_conflict() {
     );
     let has_interloper = original_entries
         .iter()
-        .any(|e| matches!(e, LogEntry::UserInput { .. }));
+        .any(|e| matches!(e, LogEntry::AnnotatedUserInput { .. }));
     assert!(has_interloper);
 }
 
@@ -581,7 +622,7 @@ async fn nested_past_fork_leaves_ancestors_immutable() {
         SegmentStartState {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
-            history: &worker.history(),
+            history: annotated(&worker.history()),
         },
     )
     .unwrap();
@@ -618,7 +659,7 @@ async fn nested_past_fork_leaves_ancestors_immutable() {
 
     // fork2's lineage points at fork1, not the root.
     match &store.read_all(sid, fork2).unwrap()[0] {
-        LogEntry::SegmentStart {
+        LogEntry::AnnotatedSegmentStart {
             forked_from: Some(origin),
             ..
         } => assert_eq!(origin.segment_id, fork1),

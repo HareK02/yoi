@@ -112,8 +112,12 @@ impl InternalSpawnedWorkerRecord {
     fn stop_summary(&self) -> SubWorkerStopSummary {
         let mut counts = BTreeMap::<String, u64>::new();
         for entry in self.session.entries() {
-            if let session_store::LogEntry::AssistantItem {
-                item: LoggedItem::ToolCall { name, .. },
+            if let session_store::LogEntry::AnnotatedAssistantItem {
+                entry:
+                    session_store::LoggedHistoryEntry {
+                        item: LoggedItem::ToolCall { name, .. },
+                        ..
+                    },
                 ..
             } = entry
             {
@@ -1024,11 +1028,16 @@ mod tests {
                     && worker.parent_session_id.as_deref() == Some("parent-session")
                     && matches!(*event, Event::TextDone { ref text } if text == "answer")
         ));
-        record.session.publish_test_entry(LogEntry::UserInput {
-            ts: 1,
-            segments: vec![protocol::Segment::text("question")],
-            extensions: Vec::new(),
-        });
+        record
+            .session
+            .publish_test_entry(LogEntry::AnnotatedUserInput {
+                ts: 1,
+                segments: vec![protocol::Segment::text("question")],
+                history: vec![crate::session_history::test_logged_history_entry(
+                    agen::Item::user_message("question"),
+                )],
+                extensions: Vec::new(),
+            });
         let committed = tokio::time::timeout(Duration::from_secs(1), parent_rx.recv())
             .await
             .unwrap()
@@ -1159,14 +1168,18 @@ mod tests {
         let (mut record, _events) = record("child", InternalWorkerVisibility::ParentClient).await;
         record.change_tracker = Some(tracker);
         for (index, name) in ["Read", "Read", "Grep"].into_iter().enumerate() {
-            record.session.publish_test_entry(LogEntry::AssistantItem {
-                ts: index as u64,
-                item: LoggedItem::ToolCall {
-                    call_id: format!("call-{index}"),
-                    name: name.to_string(),
-                    arguments: "{}".to_string(),
-                },
-            });
+            record
+                .session
+                .publish_test_entry(LogEntry::AnnotatedAssistantItem {
+                    ts: index as u64,
+                    entry: crate::session_history::test_logged_history_entry(
+                        LoggedItem::ToolCall {
+                            call_id: format!("call-{index}"),
+                            name: name.to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                    ),
+                });
         }
         registry.start_protocol_forwarding(record.clone());
         install_record(&registry, record);
