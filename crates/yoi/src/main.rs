@@ -29,6 +29,7 @@ use tui::{LaunchMode, LaunchOptions};
 enum Mode {
     Help,
     ResumeHelp,
+    WorkersHelp,
     MemoryLintHelp,
     MemoryLint(LintCliOptions),
     Mcp(mcp_cli::McpCliCommand),
@@ -86,6 +87,10 @@ async fn main() -> ExitCode {
         }
         Mode::ResumeHelp => {
             print_resume_help();
+            ExitCode::SUCCESS
+        }
+        Mode::WorkersHelp => {
+            print_workers_help();
             ExitCode::SUCCESS
         }
         Mode::MemoryLintHelp => {
@@ -838,11 +843,7 @@ fn parse_workers_args<R: CliConnectionResolver + ?Sized>(
     while i < args.len() {
         let arg = &args[i];
         match arg.as_str() {
-            "--help" | "-h" => {
-                return Err(ParseError(
-                    "usage: yoi [--local|--backend <URL>] [--workspace-id <ID>] workers [-r|--stopped] [--workspace <PATH>] [--runtime-id <ID>]".to_string(),
-                ));
-            }
+            "--help" | "-h" => return Ok(Mode::WorkersHelp),
             "-r" | "--restoreable" | "--stopped" => {
                 include_stopped = true;
                 i += 1;
@@ -1789,6 +1790,28 @@ Options:
 
 fn print_help() {
     println!("{TOP_LEVEL_HELP}");
+}
+
+const WORKERS_HELP: &str = r#"yoi workers
+
+Usage:
+  yoi --backend <URL> [--workspace-id <ID>] workers [-r|--stopped] [--workspace <PATH>] [--runtime-id <ID>]
+
+Authority:
+  Lists Workers from the selected Backend Workspace. Standalone sessions are restored with
+  `yoi --local --resume` and are not part of the Workspace Worker catalog.
+
+Options:
+      --backend <URL>      Use this Workspace Backend
+      --workspace-id <ID>  Scope Backend routes to a Workspace id
+      --workspace <PATH>   Resolve Backend Workspace identity from this repository root
+  -r, --stopped            List stopped Backend Workers
+      --runtime-id <ID>    Restrict the Backend Worker picker to a Runtime id
+  -h, --help               Print help
+"#;
+
+fn print_workers_help() {
+    println!("{WORKERS_HELP}");
 }
 
 const RESUME_HELP: &str = r#"yoi resume
@@ -2786,6 +2809,18 @@ backend = "shared"
             Mode::Help => {}
             _ => panic!("expected Help mode"),
         }
+    }
+
+    #[test]
+    fn parse_workers_help_is_backend_only_and_target_independent() {
+        match parse_args_from(["workers", "--help"]).unwrap() {
+            Mode::WorkersHelp => {}
+            other => panic!("expected WorkersHelp mode, got {other:?}"),
+        }
+        assert!(WORKERS_HELP.contains("selected Backend Workspace"));
+        assert!(WORKERS_HELP.contains("--local --resume"));
+        assert!(!WORKERS_HELP.contains("[--local|--backend"));
+        assert!(!WORKERS_HELP.contains("local Worker records"));
     }
 
     #[test]
