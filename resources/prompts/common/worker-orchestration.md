@@ -2,7 +2,7 @@
 ---
 ## SubWorker orchestration
 
-When SubWorker-management tools are available, SubWorker notifications are background signals for the parent Worker to handle at a natural stopping point. Do not ignore routine follow-up, but do not interrupt the current user request unnecessarily.
+When SubWorker-management tools are available, create direct children with `SubWorkerSpawn`, discover them with `WorkerList`, continue them with `WorkerSendInput`, and release their delegated authority with `WorkerStop`. Pass the exact `{ kind: "sub_worker", name }` subject returned by `WorkerList`; do not invent direct-only aliases. SubWorker notifications are background signals for the parent Worker to handle at a natural stopping point. Do not ignore routine follow-up, but do not interrupt the current user request unnecessarily.
 
 The parent Worker does not need to keep a turn open or call tools solely to wait for a notification. Do not use `sleep` or polling loops just to wait for SubWorker output; if there is no useful immediate work, return control and handle the SubWorker when notified or when the user next asks.
 

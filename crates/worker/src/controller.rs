@@ -884,8 +884,10 @@ where
             .register_tools(tools::web_builtin_tools(web_config));
     }
 
+    let worker_enabled = feature_config.worker.enabled;
+    let sub_worker_enabled = feature_config.sub_worker.enabled;
     let mut feature_registry = FeatureRegistryBuilder::new();
-    if feature_config.sub_worker.enabled {
+    if sub_worker_enabled && !worker_enabled {
         feature_registry.add_module(
             crate::feature::builtin::manage_worker::sub_worker_control_feature(
                 worker.workspace_client_handle(),
@@ -956,6 +958,23 @@ where
             crate::feature::builtin::manage_workdir::manage_workdir_feature(workspace_client),
         );
     }
+    if feature_config.workspace_worker_discovery.enabled {
+        let workspace_client = worker.workspace_client_handle();
+        let has_workspace_identity = workspace_client.workspace_id().is_some_and(|workspace_id| {
+            !workspace_id.is_empty() && !workspace_id.chars().any(char::is_control)
+        });
+        if !workspace_client.is_available() || !has_workspace_identity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Workspace Worker discovery requires Backend Workspace API authority",
+            ));
+        }
+        feature_registry.add_module(
+            crate::feature::builtin::workspace_worker_discovery::workspace_worker_discovery_feature(
+                workspace_client,
+            ),
+        );
+    }
     if feature_config.worker.enabled {
         let workspace_client = worker.workspace_client_handle();
         let has_workspace_identity = workspace_client.workspace_id().is_some_and(|workspace_id| {
@@ -970,7 +989,7 @@ where
         feature_registry.add_module(
             crate::feature::builtin::manage_worker::manage_worker_feature(
                 workspace_client,
-                Some(spawned_registry.clone()),
+                sub_worker_enabled.then(|| spawned_registry.clone()),
                 feature_config.worker.direct_spawn,
             ),
         );

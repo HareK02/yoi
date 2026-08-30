@@ -8,6 +8,8 @@ import "./base.dcdl" // {
         memory = { enabled = true; };
         web = { enabled = true; };
         sub_worker = { enabled = true; };
+        worker = { enabled = true; direct_spawn = false; };
+        workspace_worker_discovery = { enabled = true; };
         manage_workdir = { enabled = true; };
         ticket = { enabled = true; authoring = true; thread = true; };
     };

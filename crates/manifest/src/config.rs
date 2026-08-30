@@ -92,6 +92,8 @@ pub struct FeatureConfigPartial {
     #[serde(default)]
     pub worker: Option<WorkerFeatureConfigPartial>,
     #[serde(default)]
+    pub workspace_worker_discovery: Option<FeatureFlagConfigPartial>,
+    #[serde(default)]
     pub objective: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
     pub manage_workdir: Option<FeatureFlagConfigPartial>,
@@ -119,6 +121,11 @@ impl FeatureConfigPartial {
             ),
             flow: merge_option(self.flow, other.flow, FeatureFlagConfigPartial::merge),
             worker: merge_option(self.worker, other.worker, WorkerFeatureConfigPartial::merge),
+            workspace_worker_discovery: merge_option(
+                self.workspace_worker_discovery,
+                other.workspace_worker_discovery,
+                FeatureFlagConfigPartial::merge,
+            ),
             objective: merge_option(
                 self.objective,
                 other.objective,
@@ -265,6 +272,10 @@ impl From<FeatureConfigPartial> for FeatureConfig {
                 .worker
                 .map(WorkerFeatureConfig::from)
                 .unwrap_or_default(),
+            workspace_worker_discovery: value
+                .workspace_worker_discovery
+                .map(FeatureFlagConfig::from)
+                .unwrap_or_default(),
             objective: value
                 .objective
                 .map(FeatureFlagConfig::from)
@@ -394,6 +405,7 @@ impl From<FeatureConfig> for FeatureConfigPartial {
             sub_worker: Some(value.sub_worker.into()),
             flow: Some(value.flow.into()),
             worker: Some(value.worker.into()),
+            workspace_worker_discovery: Some(value.workspace_worker_discovery.into()),
             objective: Some(value.objective.into()),
             manage_workdir: Some(value.manage_workdir.into()),
             ticket: Some(value.ticket.into()),

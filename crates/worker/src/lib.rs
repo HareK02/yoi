@@ -52,6 +52,6 @@ pub use worker::{
     LocalWorkingDirectory, WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN, Worker, WorkerError,
     WorkerFilesystemAuthority, WorkerRunResult, WorkerWorkspaceContext, WorkspaceClient,
     WorkspaceClientError, WorkspaceId, WorkspaceIdError, WorkspacePromptCatalogResolution,
-    WorkspaceRequest, WorkspaceRequestMethod, WorkspaceResponse, apply_worker_manifest,
-    marker_workspace_client, unavailable_workspace_client,
+    WorkspaceRequest, WorkspaceRequestMethod, WorkspaceResponse, WorkspaceWorkerDiscoveryRequest,
+    apply_worker_manifest, marker_workspace_client, unavailable_workspace_client,
 };

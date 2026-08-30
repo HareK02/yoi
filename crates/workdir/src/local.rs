@@ -1943,9 +1943,9 @@ mod tests {
             &workdir,
             GrepRequest {
                 pattern: "NEEDLE".into(),
-                path: WorkdirPath::root(),
-                glob: None,
-                file_type: None,
+                path: WorkdirPath::new("src/main.rs").unwrap(),
+                glob: Some("src/*.rs".into()),
+                file_type: Some("rust".into()),
                 case_insensitive: false,
                 before_context: 0,
                 after_context: 0,

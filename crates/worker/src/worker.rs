@@ -251,6 +251,13 @@ impl WorkspacePromptCatalogResolution {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceWorkerDiscoveryRequest {
+    pub cursor: Option<String>,
+    pub limit: usize,
+    pub query: Option<String>,
+}
+
 /// Path-free Workspace operation authority injected by Runtime/host code.
 ///
 /// Workers receive this trait object rather than a Backend URL. The concrete
@@ -262,6 +269,18 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
     fn is_available(&self) -> bool;
     fn execute(&self, request: WorkspaceRequest)
     -> Result<WorkspaceResponse, WorkspaceClientError>;
+
+    /// Lists Workspace-visible Workers through dedicated Runtime-owned source
+    /// proof. Implementations must not fall back to generic Workspace request
+    /// authority.
+    fn list_workspace_workers(
+        &self,
+        _request: WorkspaceWorkerDiscoveryRequest,
+    ) -> Result<workspace_api::WorkspaceWorkerDiscoveryPage, WorkspaceClientError> {
+        Err(WorkspaceClientError::Unavailable(
+            "Workspace Worker discovery authority is unavailable".to_string(),
+        ))
+    }
 
     /// Resolve the Workspace's current immutable Prompt projection for future
     /// operation boundaries. Creation and restore continue to use persisted

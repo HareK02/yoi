@@ -118,6 +118,10 @@ pub struct FeatureConfig {
     pub flow: FeatureFlagConfig,
     #[serde(default)]
     pub worker: WorkerFeatureConfig,
+    /// Privileged read-only discovery of visible Workspace Workers. Backend
+    /// source proof remains required for every listing operation.
+    #[serde(default)]
+    pub workspace_worker_discovery: FeatureFlagConfig,
     #[serde(default)]
     pub objective: FeatureFlagConfig,
     #[serde(default)]
@@ -142,6 +146,7 @@ impl Default for FeatureConfig {
             sub_worker: FeatureFlagConfig::disabled(),
             flow: FeatureFlagConfig::disabled(),
             worker: WorkerFeatureConfig::disabled(),
+            workspace_worker_discovery: FeatureFlagConfig::disabled(),
             objective: FeatureFlagConfig::disabled(),
             manage_workdir: FeatureFlagConfig::disabled(),
             ticket: TicketFeatureConfig::default(),

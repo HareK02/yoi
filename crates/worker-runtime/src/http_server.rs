@@ -1721,17 +1721,8 @@ impl RuntimeHttpWorkdirError {
 impl From<workdir::WorkdirError> for RuntimeHttpWorkdirError {
     fn from(error: workdir::WorkdirError) -> Self {
         let payload = WorkdirTransportError::from_workdir_error(&error);
-        let status = match payload.code {
-            WorkdirTransportErrorCode::NotFound | WorkdirTransportErrorCode::UnknownCommand => {
-                StatusCode::NOT_FOUND
-            }
-            WorkdirTransportErrorCode::Conflict => StatusCode::CONFLICT,
-            WorkdirTransportErrorCode::Unsupported | WorkdirTransportErrorCode::InvalidRequest => {
-                StatusCode::BAD_REQUEST
-            }
-            WorkdirTransportErrorCode::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
-            WorkdirTransportErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
-        };
+        let status = StatusCode::from_u16(payload.code.http_status())
+            .expect("Workdir transport error status is valid");
         Self { status, payload }
     }
 }
@@ -1886,8 +1877,8 @@ mod tests {
     use manifest::{Scope, SharedScope};
     use tower::ServiceExt;
     use workdir::{
-        LocalWorkdirSession, ReadRequest, StatRequest, Workdir, WorkdirPath,
-        WorkdirSessionCapabilities,
+        GrepOutputMode, GrepRequest, LocalWorkdirSession, ReadRequest, StatRequest, Workdir,
+        WorkdirPath, WorkdirSessionCapabilities,
     };
 
     fn test_bundle(profile: ProfileSelector) -> ConfigBundle {
@@ -2347,6 +2338,40 @@ mod tests {
         .await
         .expect("owned operation");
         assert!(matches!(result, WorkdirSessionOperationResult::Stat(_)));
+
+        let grep = WorkdirSessionOperationRequest {
+            delegations: Vec::new(),
+            operation: WorkdirSessionOperation::Grep(GrepRequest {
+                pattern: "hello".into(),
+                path: WorkdirPath::new("hello.txt").unwrap(),
+                glob: Some("*.txt".into()),
+                file_type: Some("txt".into()),
+                case_insensitive: false,
+                before_context: 0,
+                after_context: 0,
+                multiline: false,
+                output_mode: GrepOutputMode::Content,
+                limit: 10,
+                offset: 0,
+            }),
+        };
+        let Json(result) = run_workdir_session_operation(
+            State(state.clone()),
+            Path("session-1".to_string()),
+            Some(Extension(auth.clone())),
+            Ok(Json(grep)),
+        )
+        .await
+        .expect("grep direct file through provider operation");
+        match result {
+            WorkdirSessionOperationResult::Grep(result) => {
+                assert_eq!(result.match_count, 1);
+                assert_eq!(result.matched_files, 1);
+                assert!(result.output.starts_with("hello.txt\n"));
+                assert!(result.output.contains("> 1 │ hello"));
+            }
+            other => panic!("unexpected workdir grep result: {other:?}"),
+        }
 
         #[cfg(unix)]
         {

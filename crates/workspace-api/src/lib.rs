@@ -324,6 +324,35 @@ pub struct WorkerCapabilitySummary {
     pub can_spawn_followup: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkspaceWorkerSubject {
+    RuntimeWorker {
+        runtime_id: String,
+        worker_id: String,
+    },
+}
+
+/// Bounded, model-safe projection used by privileged Workspace Worker discovery.
+/// Runtime placement appears only in the typed subject required by Worker
+/// control operations; provider and launch internals are intentionally omitted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceWorkerDiscoveryItem {
+    pub subject: WorkspaceWorkerSubject,
+    pub resource_key: String,
+    pub display_name: String,
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceWorkerDiscoveryPage {
+    pub workers: Vec<WorkspaceWorkerDiscoveryItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
 /// Workspace-authoritative Worker projection.
 ///
 /// `resource_key` is required here even though Runtime-internal Worker summaries

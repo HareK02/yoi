@@ -946,9 +946,11 @@ fn apply_role_profile(
     value["feature"]["sub_worker"] = serde_json::json!({ "enabled": sub_worker });
     value["feature"]["flow"] = serde_json::json!({ "enabled": slug == "coder" });
     value["feature"]["worker"] = serde_json::json!({
-        "enabled": slug == "orchestrator",
-        "direct_spawn": slug != "orchestrator"
+        "enabled": matches!(slug, "companion" | "orchestrator"),
+        "direct_spawn": !matches!(slug, "companion" | "orchestrator")
     });
+    value["feature"]["workspace_worker_discovery"] =
+        serde_json::json!({ "enabled": slug == "companion" });
     value["feature"]["manage_workdir"] = serde_json::json!({
         "enabled": matches!(slug, "companion" | "orchestrator")
     });
@@ -1423,7 +1425,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_companion_uses_sub_worker_control_without_worker_control() {
+    fn builtin_companion_combines_runtime_and_sub_worker_control_with_discovery() {
         let tmp = TempDir::new().unwrap();
         let resolved = ProfileResolver::new()
             .with_workspace_base(tmp.path())
@@ -1435,7 +1437,9 @@ mod tests {
 
         assert!(resolved.manifest.feature.manage_workdir.enabled);
         assert!(resolved.manifest.feature.sub_worker.enabled);
-        assert!(!resolved.manifest.feature.worker.enabled);
+        assert!(resolved.manifest.feature.worker.enabled);
+        assert!(!resolved.manifest.feature.worker.direct_spawn);
+        assert!(resolved.manifest.feature.workspace_worker_discovery.enabled);
     }
 
     #[test]

@@ -22,7 +22,7 @@ enum OutputMode {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GrepParams {
     pattern: String,
-    /// Logical Workdir-relative path to search. Defaults to the Workdir root.
+    /// Logical Workdir-relative file or directory to search. Defaults to the Workdir root.
     #[serde(default)]
     path: Option<String>,
     #[serde(default)]
@@ -129,7 +129,7 @@ pub fn grep_tool(session: WorkdirSessionHandle) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(GrepParams);
         let meta = ToolMeta::new("Grep")
-            .description("Search Workdir file contents with a regex. Content results group lines by file; `>` marks matching lines and unmarked lines are context. Glob/Grep traversal executes inside the WorkdirSession provider. Results are bounded and Workdir-relative.")
+            .description("Search a Workdir file or directory with a regex. Content results group lines by file; `>` marks matching lines and unmarked lines are context. Directory traversal executes inside the WorkdirSession provider. Results are bounded and Workdir-relative.")
             .input_schema(serde_json::to_value(schema).expect("Grep schema serialization"));
         let tool: Arc<dyn Tool> = Arc::new(GrepTool {
             session: session.clone(),

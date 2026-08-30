@@ -17,6 +17,7 @@ const WORKER_MUTATION_SOURCE_SIGNING_INPUT_PREFIX: &str = "yoi-worker-source-v1.
 pub const WORKER_REMOVE_PERMISSION: &str = "workspace:worker-remove";
 pub const RUNTIME_REQUEST_SOURCE_PROOF_HEADER: &str = "x-yoi-runtime-request-proof";
 pub const WORKSPACE_REQUEST_PERMISSION: &str = "workspace:request";
+pub const WORKSPACE_WORKER_DISCOVERY_PERMISSION: &str = "workspace:worker-discovery";
 pub const BACKEND_RESOURCE_FETCH_PERMISSION: &str = "workspace:resource-fetch";
 const RUNTIME_REQUEST_SOURCE_PROOF_PREFIX: &str = "yoi-runtime-request-v1";
 const RUNTIME_REQUEST_SOURCE_SIGNING_INPUT_PREFIX: &str = "yoi-runtime-request-v1.";

@@ -4450,7 +4450,9 @@ mod tests {
             .unwrap();
         assert!(companion.feature.manage_workdir.enabled);
         assert!(companion.feature.sub_worker.enabled);
-        assert!(!companion.feature.worker.enabled);
+        assert!(companion.feature.worker.enabled);
+        assert!(!companion.feature.worker.direct_spawn);
+        assert!(companion.feature.workspace_worker_discovery.enabled);
         let coder = archive
             .resolve_profile("builtin:coder", root.path(), "embedded-test-coder")
             .unwrap();

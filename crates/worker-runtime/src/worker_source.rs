@@ -9,8 +9,8 @@ use worker::{
 use crate::auth::{
     RUNTIME_REQUEST_SOURCE_PROOF_HEADER, RuntimeAuthError, RuntimeIdentityMaterial,
     RuntimeRequestSourceSigner, RuntimeWorkerMutationSourceSigner, WORKER_REMOVE_PERMISSION,
-    WORKSPACE_REQUEST_PERMISSION, WorkerMutationActorKind, WorkerMutationOperation,
-    WorkerMutationSourceClaims, new_token_id,
+    WORKSPACE_REQUEST_PERMISSION, WORKSPACE_WORKER_DISCOVERY_PERMISSION, WorkerMutationActorKind,
+    WorkerMutationOperation, WorkerMutationSourceClaims, new_token_id,
 };
 use crate::runtime::RuntimeWorkspaceScope;
 use crate::worker_backend::WorkspacePromptProjectionCache;
@@ -343,6 +343,51 @@ impl RuntimeOwnedWorkspaceClient {
         self.request_timeout = request_timeout;
         self
     }
+
+    fn execute_with_permission(
+        &self,
+        request: WorkspaceRequest,
+        permission: &'static str,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        let base_url = self.base_url.clone();
+        let workspace_id = self.workspace_id.clone();
+        let runtime_id = self.runtime_id.clone();
+        let worker_id = self.worker_id.clone();
+        let request_source_signer = self.request_source_signer.clone();
+        let request_source_audience = self.request_source_audience.clone();
+        let request_timeout = self.request_timeout;
+        if tokio::runtime::Handle::try_current().is_ok() {
+            std::thread::spawn(move || {
+                execute_runtime_owned_workspace_http(
+                    &base_url,
+                    &workspace_id,
+                    &runtime_id,
+                    &worker_id,
+                    request_source_signer.as_ref(),
+                    request_source_audience.as_deref(),
+                    request_timeout,
+                    permission,
+                    request,
+                )
+            })
+            .join()
+            .map_err(|_| {
+                WorkspaceClientError::Request("workspace request thread panicked".to_string())
+            })?
+        } else {
+            execute_runtime_owned_workspace_http(
+                &self.base_url,
+                &self.workspace_id,
+                &self.runtime_id,
+                &self.worker_id,
+                self.request_source_signer.as_ref(),
+                self.request_source_audience.as_deref(),
+                self.request_timeout,
+                permission,
+                request,
+            )
+        }
+    }
 }
 
 impl std::fmt::Debug for RuntimeOwnedWorkspaceClient {
@@ -377,42 +422,40 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
         &self,
         request: WorkspaceRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
-        let base_url = self.base_url.clone();
-        let workspace_id = self.workspace_id.clone();
-        let runtime_id = self.runtime_id.clone();
-        let worker_id = self.worker_id.clone();
-        let request_source_signer = self.request_source_signer.clone();
-        let request_source_audience = self.request_source_audience.clone();
-        let request_timeout = self.request_timeout;
-        if tokio::runtime::Handle::try_current().is_ok() {
-            std::thread::spawn(move || {
-                execute_runtime_owned_workspace_http(
-                    &base_url,
-                    &workspace_id,
-                    &runtime_id,
-                    &worker_id,
-                    request_source_signer.as_ref(),
-                    request_source_audience.as_deref(),
-                    request_timeout,
-                    request,
-                )
-            })
-            .join()
-            .map_err(|_| {
-                WorkspaceClientError::Request("workspace request thread panicked".to_string())
-            })?
-        } else {
-            execute_runtime_owned_workspace_http(
-                &self.base_url,
-                &self.workspace_id,
-                &self.runtime_id,
-                &self.worker_id,
-                self.request_source_signer.as_ref(),
-                self.request_source_audience.as_deref(),
-                self.request_timeout,
-                request,
-            )
+        self.execute_with_permission(request, WORKSPACE_REQUEST_PERMISSION)
+    }
+
+    fn list_workspace_workers(
+        &self,
+        request: worker::WorkspaceWorkerDiscoveryRequest,
+    ) -> Result<workspace_api::WorkspaceWorkerDiscoveryPage, WorkspaceClientError> {
+        let mut path = format!(
+            "/api/w/{}/worker-discovery/workers?limit={}",
+            self.workspace_id, request.limit
+        );
+        if let Some(cursor) = request.cursor.as_deref() {
+            path.push_str("&cursor=");
+            path.push_str(&percent_encode_query(cursor));
         }
+        if let Some(query) = request.query.as_deref() {
+            path.push_str("&query=");
+            path.push_str(&percent_encode_query(query));
+        }
+        let response = self.execute_with_permission(
+            WorkspaceRequest::get(path),
+            WORKSPACE_WORKER_DISCOVERY_PERMISSION,
+        )?;
+        if !(200..300).contains(&response.status) {
+            return Err(WorkspaceClientError::Request(format!(
+                "Workspace Worker discovery failed with HTTP {}: {}",
+                response.status, response.body
+            )));
+        }
+        serde_json::from_str(&response.body).map_err(|error| {
+            WorkspaceClientError::Request(format!(
+                "invalid Workspace Worker discovery response: {error}"
+            ))
+        })
     }
 
     fn current_prompt_projection(
@@ -506,6 +549,19 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
     }
 }
 
+fn percent_encode_query(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
 fn execute_runtime_owned_workspace_http(
     base_url: &str,
     workspace_id: &str,
@@ -514,6 +570,7 @@ fn execute_runtime_owned_workspace_http(
     request_source_signer: Option<&RuntimeRequestSourceSigner>,
     request_source_audience: Option<&str>,
     request_timeout: Option<Duration>,
+    permission: &'static str,
     request: WorkspaceRequest,
 ) -> Result<WorkspaceResponse, WorkspaceClientError> {
     if !request.path.starts_with('/') || request.path.starts_with("//") {
@@ -553,7 +610,7 @@ fn execute_runtime_owned_workspace_http(
                 audience,
                 workspace_id,
                 Some(worker_id),
-                WORKSPACE_REQUEST_PERMISSION,
+                permission,
                 method.as_str(),
                 &request.path,
                 body.as_bytes(),
@@ -900,6 +957,85 @@ mod tests {
         assert_eq!(
             claims.path,
             "/api/w/workspace-a/tickets/search?state=planning&limit=20"
+        );
+    }
+
+    #[test]
+    fn workspace_worker_discovery_signs_dedicated_permission_and_encoded_query() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::Mutex;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let received = Arc::new(Mutex::new(String::new()));
+        let received_for_server = received.clone();
+        let body = serde_json::json!({
+            "workers": [{
+                "subject": {
+                    "kind": "runtime_worker",
+                    "runtime_id": "runtime-b",
+                    "worker_id": "worker-b"
+                },
+                "resource_key": "W-2",
+                "display_name": "coder two",
+                "profile": "builtin:coder",
+                "status": "idle"
+            }],
+            "next_cursor": "v1:1"
+        })
+        .to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = [0_u8; 4096];
+            let count = stream.read(&mut bytes).unwrap();
+            *received_for_server.lock().unwrap() =
+                String::from_utf8_lossy(&bytes[..count]).into_owned();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let identity = RuntimeIdentityMaterial::generate("runtime-a").unwrap();
+        let client = RuntimeOwnedWorkspaceClient::new(
+            "workspace-a",
+            format!("http://{address}"),
+            "runtime-a",
+            "worker-a",
+        )
+        .with_runtime_request_source(&identity, "server-a");
+        let page = client
+            .list_workspace_workers(worker::WorkspaceWorkerDiscoveryRequest {
+                cursor: Some("v1:0".to_string()),
+                limit: 1,
+                query: Some("coder two".to_string()),
+            })
+            .unwrap();
+        assert_eq!(page.workers[0].resource_key, "W-2");
+        server.join().unwrap();
+
+        let request = received.lock().unwrap().clone();
+        assert!(request.contains(
+            "GET /api/w/workspace-a/worker-discovery/workers?limit=1&cursor=v1%3A0&query=coder%20two "
+        ));
+        let token = request
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case(RUNTIME_REQUEST_SOURCE_PROOF_HEADER)
+                        .then(|| value.trim())
+                })
+            })
+            .unwrap();
+        let claims = decode_runtime_request_source_claims(token).unwrap();
+        assert_eq!(claims.permission, WORKSPACE_WORKER_DISCOVERY_PERMISSION);
+        assert_eq!(
+            claims.path,
+            "/api/w/workspace-a/worker-discovery/workers?limit=1&cursor=v1%3A0&query=coder%20two"
         );
     }
 

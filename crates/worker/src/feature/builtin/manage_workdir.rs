@@ -195,11 +195,16 @@ impl WorkspaceAttachedWorkdirSession {
             .execute(request)
             .map_err(workspace_workdir_error)?;
         if !response.is_success() {
-            return Err(WorkdirError::Transport(format!(
-                "Workspace Workdir API returned HTTP {}: {}",
-                response.status,
-                bounded_error_body(&response.body)
-            )));
+            return Err(
+                serde_json::from_str::<workdir::http::WorkdirTransportError>(&response.body)
+                    .map(workdir::http::WorkdirTransportError::into_workdir_error)
+                    .unwrap_or_else(|_| {
+                        WorkdirError::Transport(format!(
+                            "Workspace Workdir operation failed with HTTP {}",
+                            response.status
+                        ))
+                    }),
+            );
         }
         serde_json::from_str(&response.body).map_err(|error| {
             WorkdirError::Transport(format!(
@@ -795,6 +800,21 @@ mod tests {
         }
     }
 
+    fn error_response(
+        status: u16,
+        code: workdir::http::WorkdirTransportErrorCode,
+        message: &str,
+    ) -> WorkspaceResponse {
+        WorkspaceResponse {
+            status,
+            body: serde_json::to_string(&workdir::http::WorkdirTransportError {
+                code,
+                message: message.to_string(),
+            })
+            .unwrap(),
+        }
+    }
+
     fn workdir_json(id: &str) -> serde_json::Value {
         json!({
             "working_directory_id": id,
@@ -1173,6 +1193,48 @@ mod tests {
             serde_json::from_str(requests[1].body.as_deref().unwrap()).unwrap();
         assert_eq!(validation["operation"]["operation"], "stat");
         assert_eq!(validation["delegations"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn attached_session_preserves_typed_provider_validation_error() {
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![error_response(
+            400,
+            workdir::http::WorkdirTransportErrorCode::InvalidRequest,
+            "Workdir operation request is invalid",
+        )]));
+        let session = WorkspaceAttachedWorkdirSession::handle(client);
+
+        let error = session
+            .glob(workdir::GlobRequest {
+                pattern: "[".to_string(),
+                path: workdir::WorkdirPath::root(),
+                limit: 10,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, WorkdirError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn attached_session_does_not_expose_untyped_workspace_error_body() {
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![WorkspaceResponse {
+            status: 502,
+            body: "secret token and /host/private/path".to_string(),
+        }]));
+        let session = WorkspaceAttachedWorkdirSession::handle(client);
+
+        let error = session
+            .stat(StatRequest {
+                path: workdir::WorkdirPath::root(),
+            })
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(matches!(error, WorkdirError::Transport(_)));
+        assert!(!message.contains("secret token"));
+        assert!(!message.contains("/host/private/path"));
+        assert!(message.contains("HTTP 502"));
     }
 
     #[tokio::test]
