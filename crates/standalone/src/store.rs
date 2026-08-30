@@ -304,8 +304,14 @@ impl StandaloneSessionStore {
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     let existing = read_lease(&path, id)?;
-                    if existing.is_live() {
-                        return Err(StandaloneStoreError::SessionLeased(id));
+                    match existing.liveness() {
+                        LeaseLiveness::Live => {
+                            return Err(StandaloneStoreError::SessionLeased(id));
+                        }
+                        LeaseLiveness::Unknown => {
+                            return Err(StandaloneStoreError::LeaseLivenessUnknown(id));
+                        }
+                        LeaseLiveness::Stale => {}
                     }
                     if policy == StaleLeasePolicy::Reject {
                         return Err(StandaloneStoreError::StaleLease(id));
@@ -363,10 +369,10 @@ impl StandaloneSessionStore {
         let lease_path = session_dir.join(LEASE_FILE);
         if lease_path.exists() {
             let lease = read_lease(&lease_path, id)?;
-            return Err(if lease.is_live() {
-                StandaloneStoreError::SessionLeased(id)
-            } else {
-                StandaloneStoreError::StaleLease(id)
+            return Err(match lease.liveness() {
+                LeaseLiveness::Live => StandaloneStoreError::SessionLeased(id),
+                LeaseLiveness::Stale => StandaloneStoreError::StaleLease(id),
+                LeaseLiveness::Unknown => StandaloneStoreError::LeaseLivenessUnknown(id),
             });
         }
         fs::remove_dir_all(self.session_dir(id)).map_err(StandaloneStoreError::Io)?;
@@ -572,15 +578,49 @@ impl LeaseRecord {
         Ok(Self {
             lease_id: Uuid::now_v7(),
             pid: std::process::id(),
-            process_start_marker: process_start_marker(std::process::id()),
+            process_start_marker: match observe_process(std::process::id()) {
+                ProcessObservation::Running { start_marker } => Some(start_marker),
+                ProcessObservation::Missing | ProcessObservation::Unobservable => None,
+            },
             acquired_at_unix_ms: now_unix_ms()?,
         })
     }
 
-    fn is_live(&self) -> bool {
-        process_start_marker(self.pid)
-            .zip(self.process_start_marker)
-            .is_some_and(|(current, recorded)| current == recorded)
+    fn liveness(&self) -> LeaseLiveness {
+        classify_lease_liveness(self.process_start_marker, observe_process(self.pid))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseLiveness {
+    Live,
+    Stale,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessObservation {
+    Running { start_marker: u64 },
+    Missing,
+    Unobservable,
+}
+
+fn classify_lease_liveness(
+    recorded_start_marker: Option<u64>,
+    observation: ProcessObservation,
+) -> LeaseLiveness {
+    match (recorded_start_marker, observation) {
+        (Some(recorded), ProcessObservation::Running { start_marker })
+            if recorded == start_marker =>
+        {
+            LeaseLiveness::Live
+        }
+        (Some(_), ProcessObservation::Running { .. }) | (_, ProcessObservation::Missing) => {
+            LeaseLiveness::Stale
+        }
+        (None, ProcessObservation::Running { .. }) | (_, ProcessObservation::Unobservable) => {
+            LeaseLiveness::Unknown
+        }
     }
 }
 
@@ -591,15 +631,44 @@ fn read_lease(path: &Path, id: StandaloneSessionId) -> Result<LeaseRecord, Stand
 }
 
 #[cfg(target_os = "linux")]
-fn process_start_marker(pid: u32) -> Option<u64> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let tail = stat.rsplit_once(") ")?.1;
+fn observe_process(pid: u32) -> ProcessObservation {
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return if pid != std::process::id() && linux_proc_is_observable() {
+                ProcessObservation::Missing
+            } else {
+                ProcessObservation::Unobservable
+            };
+        }
+        Err(_) => return ProcessObservation::Unobservable,
+    };
+    parse_linux_process_start_marker(&stat)
+        .map(|start_marker| ProcessObservation::Running { start_marker })
+        .unwrap_or(ProcessObservation::Unobservable)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_is_observable() -> bool {
+    fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|stat| parse_linux_process_start_marker(&stat))
+        .is_some()
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_process_start_marker(stat: &str) -> Option<u64> {
+    let (_, tail) = stat.rsplit_once(") ")?;
     tail.split_whitespace().nth(19)?.parse().ok()
 }
 
 #[cfg(not(target_os = "linux"))]
-fn process_start_marker(pid: u32) -> Option<u64> {
-    (pid == std::process::id()).then_some(0)
+fn observe_process(pid: u32) -> ProcessObservation {
+    if pid == std::process::id() {
+        ProcessObservation::Running { start_marker: 0 }
+    } else {
+        ProcessObservation::Unobservable
+    }
 }
 
 fn now_unix_ms() -> Result<u64, StandaloneStoreError> {
@@ -651,6 +720,8 @@ pub enum StandaloneStoreError {
     },
     #[error("standalone session {0} is already active")]
     SessionLeased(StandaloneSessionId),
+    #[error("standalone session {0} lease liveness cannot be proven; recovery is rejected")]
+    LeaseLivenessUnknown(StandaloneSessionId),
     #[error("standalone session {0} has a stale lease; explicit recovery is required")]
     StaleLease(StandaloneSessionId),
     #[error("standalone session lease ownership changed")]
@@ -671,4 +742,37 @@ pub enum StandaloneStoreError {
     Json(#[source] serde_json::Error),
     #[error("standalone state I/O failed")]
     Io(#[source] io::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LeaseLiveness, ProcessObservation, classify_lease_liveness};
+
+    #[test]
+    fn lease_liveness_requires_positive_live_or_stale_evidence() {
+        assert_eq!(
+            classify_lease_liveness(Some(41), ProcessObservation::Running { start_marker: 41 }),
+            LeaseLiveness::Live
+        );
+        assert_eq!(
+            classify_lease_liveness(Some(41), ProcessObservation::Running { start_marker: 42 }),
+            LeaseLiveness::Stale
+        );
+        assert_eq!(
+            classify_lease_liveness(Some(41), ProcessObservation::Missing),
+            LeaseLiveness::Stale
+        );
+        assert_eq!(
+            classify_lease_liveness(None, ProcessObservation::Running { start_marker: 41 }),
+            LeaseLiveness::Unknown
+        );
+        assert_eq!(
+            classify_lease_liveness(Some(41), ProcessObservation::Unobservable),
+            LeaseLiveness::Unknown
+        );
+        assert_eq!(
+            classify_lease_liveness(None, ProcessObservation::Unobservable),
+            LeaseLiveness::Unknown
+        );
+    }
 }

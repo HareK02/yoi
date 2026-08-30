@@ -427,6 +427,49 @@ async fn standalone_restore_recovers_only_a_proven_stale_lease() -> TestResult {
 }
 
 #[tokio::test]
+async fn standalone_restore_rejects_lease_with_missing_start_marker() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let state_dir = temp.path().join("state");
+    let launch = StandaloneLaunchConfig::new(
+        temp.path(),
+        &state_dir,
+        manifest::ProfileSelector::Default,
+        "standalone-unknown-lease-test",
+    )
+    .resolve()?;
+    let host =
+        StandaloneHost::start_with_model_client(launch, ScriptedClient::new(Vec::new())).await?;
+    let session_id = host.session_id();
+    host.shutdown().await?;
+    let session_dir = state_dir.join(session_id.to_string());
+    std::fs::write(
+        session_dir.join("lease.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "lease_id": uuid::Uuid::now_v7(),
+            "pid": std::process::id(),
+            "acquired_at_unix_ms": 1
+        }))?,
+    )?;
+
+    let store = StandaloneSessionStore::open(&state_dir)?;
+    assert!(matches!(
+        store.acquire_lease(session_id, StaleLeasePolicy::Recover),
+        Err(StandaloneStoreError::LeaseLivenessUnknown(id)) if id == session_id
+    ));
+    let restore = StandaloneHost::restore_with_model_client(
+        state_dir,
+        session_id,
+        ScriptedClient::new(Vec::new()),
+    )
+    .await;
+    assert!(matches!(
+        restore,
+        Err(StandaloneStartupError::LeaseLivenessUnknown)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn standalone_metadata_fails_closed_on_incomplete_or_newer_records() -> TestResult {
     let temp = tempfile::tempdir()?;
     let state_dir = temp.path().join("state");

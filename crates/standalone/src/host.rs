@@ -41,6 +41,8 @@ pub enum StandaloneStartupError {
     StateStore,
     #[error("the standalone session is already active")]
     SessionActive,
+    #[error("the standalone session lease cannot be observed safely; recovery is rejected")]
+    LeaseLivenessUnknown,
     #[error("the standalone session working directory is unavailable or changed")]
     WorkingDirectoryUnavailable,
     #[error("the resolved Worker configuration or persisted history is invalid")]
@@ -380,6 +382,9 @@ async fn stop_started_worker(started: BootstrappedWorker) {
 fn classify_store_startup_error(error: StandaloneStoreError) -> StandaloneStartupError {
     match error {
         StandaloneStoreError::SessionLeased(_) => StandaloneStartupError::SessionActive,
+        StandaloneStoreError::LeaseLivenessUnknown(_) => {
+            StandaloneStartupError::LeaseLivenessUnknown
+        }
         StandaloneStoreError::CwdUnavailable(_)
         | StandaloneStoreError::CwdNotDirectory
         | StandaloneStoreError::CwdIdentityMismatch => {
