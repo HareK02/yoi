@@ -11,6 +11,7 @@ pub mod ipc;
 pub mod model_client;
 pub mod prompt;
 pub mod runtime;
+pub mod runtime_command;
 pub mod segment_log_sink;
 mod session_capture;
 mod session_history;

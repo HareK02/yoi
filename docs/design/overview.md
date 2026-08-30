@@ -12,12 +12,13 @@ That rule shapes the crate split. The runtime can restart, attach, compact, or d
 - `session-store` owns replayable append-only conversation/session logs.
 - `pod-store` owns current Worker metadata keyed by Worker name.
 - `protocol` defines the socket message boundary between clients and Workers.
-- `client` contains reusable one-shot socket/runtime-command mechanics so lower crates do not depend on the product CLI.
+- `standalone` owns the client-side, one-process Standalone host and its dedicated session store. It does not create Runtime Workers, PID/socket catalogs, or Workspace product authority.
+- `client` contains reusable Backend Workspace/Runtime clients plus the shared `Target` boundary. Its normal targets are exactly Standalone and Backend; it is not a subprocess launcher or repository-local product backend.
 - `manifest` resolves Profiles, Manifests, model/provider references, scopes, prompts, and tool permission policy into a runtime contract.
 - `tools` implements built-in tools with bounded output and policy-aware execution.
 - `memory` owns generated memory summary/decision/request records, linting, staging, and audit observations.
 - `workspace-server` is the local Workspace control-plane seam. It can project Tickets, Workers, lifecycle, usage, and orchestration events, but browser/API operations must stay on opaque backend identities instead of raw local paths, sockets, Worker names, or session files.
-- `tui` is a UI over Worker authority; it should not invent durable state.
+- `tui` is a UI over either one in-process Standalone session or Backend Workspace/Runtime Worker authority; it should not invent a local Worker catalog or durable product state.
 
 ## Why these boundaries exist
 

@@ -14,9 +14,9 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::runtime_command::WorkerRuntimeCommand;
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
-use client::WorkerRuntimeCommand;
 use manifest::{Permission, ScopeRule};
 use protocol::stream::JsonLineReader;
 use protocol::{Event, Method, WorkerStatus};

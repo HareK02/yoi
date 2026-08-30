@@ -1,11 +1,9 @@
 use std::{fmt, path::PathBuf};
 
-use crate::{BackendRuntimeListTarget, BackendRuntimeTarget, WorkerRuntimeCommand};
+use crate::{BackendRuntimeListTarget, BackendRuntimeTarget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetKind {
-    /// Legacy local Runtime process/socket authority.
-    Local,
     /// One-process Standalone authority with no Runtime or Workspace backend.
     Standalone,
     Backend,
@@ -13,7 +11,6 @@ pub enum TargetKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedTarget {
-    Local,
     Standalone,
     Backend {
         base_url: String,
@@ -24,7 +21,6 @@ pub enum ResolvedTarget {
 impl ResolvedTarget {
     pub fn kind(&self) -> TargetKind {
         match self {
-            Self::Local => TargetKind::Local,
             Self::Standalone => TargetKind::Standalone,
             Self::Backend { .. } => TargetKind::Backend,
         }
@@ -34,29 +30,9 @@ impl ResolvedTarget {
 impl fmt::Display for TargetKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Local => f.write_str("local"),
             Self::Standalone => f.write_str("Standalone"),
             Self::Backend => f.write_str("Backend"),
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LocalTarget;
-
-impl LocalTarget {
-    pub fn new() -> Self {
-        Self
-    }
-
-    fn runtime_command(&self) -> Result<WorkerRuntimeCommand, TargetError> {
-        WorkerRuntimeCommand::resolve().map_err(TargetError::local_runtime_command)
-    }
-}
-
-impl Default for LocalTarget {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -113,23 +89,8 @@ impl WorkerConnectionSelector {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorkerSpawn {
-    LegacyLocal {
-        runtime_command: WorkerRuntimeCommand,
-    },
-    Standalone {
-        state_dir: PathBuf,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkerByName {
-    pub runtime_command: WorkerRuntimeCommand,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkerResume {
-    pub runtime_command: WorkerRuntimeCommand,
+pub struct WorkerSpawn {
+    pub state_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,20 +107,14 @@ pub struct StandaloneSessionResumeIntent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Dashboard {
-    Local {
-        runtime_command: WorkerRuntimeCommand,
-    },
-    Backend {
-        base_url: String,
-        workspace_id: String,
-    },
+pub struct Dashboard {
+    pub base_url: String,
+    pub workspace_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerList {
-    pub local_runtime_command: Option<WorkerRuntimeCommand>,
-    pub backend_target: Option<BackendRuntimeListTarget>,
+    pub backend_target: BackendRuntimeListTarget,
     pub include_stopped: bool,
 }
 
@@ -185,12 +140,6 @@ impl TargetError {
             message: format!("invalid {target} target: {}", message.into()),
         }
     }
-
-    fn local_runtime_command(error: std::io::Error) -> Self {
-        Self {
-            message: format!("failed to resolve local Worker runtime command: {error}"),
-        }
-    }
 }
 
 impl fmt::Display for TargetError {
@@ -207,15 +156,13 @@ pub trait Target: fmt::Debug + Send + Sync {
     /// Resolve the target once for Workspace product-state operations.
     ///
     /// Backend targets must carry an explicit Workspace identity. Callers use
-    /// this value instead of rediscovering Backend/local authority from cwd or
-    /// process configuration after command dispatch.
+    /// this value instead of rediscovering authority from cwd or process
+    /// configuration after command dispatch.
     fn resolve(&self) -> Result<ResolvedTarget, TargetError>;
 
-    fn spawn_worker(&self) -> Result<WorkerSpawn, TargetError>;
-
-    fn worker_by_name(&self) -> Result<WorkerByName, TargetError>;
-
-    fn resume_worker(&self) -> Result<WorkerResume, TargetError>;
+    fn spawn_worker(&self) -> Result<WorkerSpawn, TargetError> {
+        Err(TargetError::unsupported("Worker spawn", self.kind()))
+    }
 
     fn standalone_session_list(
         &self,
@@ -237,61 +184,12 @@ pub trait Target: fmt::Debug + Send + Sync {
         ))
     }
 
-    fn dashboard(&self) -> Result<Dashboard, TargetError>;
-
-    fn list_workers(&self, request: WorkerListRequest) -> Result<WorkerList, TargetError>;
-
-    fn connect_worker(
-        &self,
-        selector: WorkerConnectionSelector,
-    ) -> Result<WorkerConnection, TargetError>;
-}
-
-impl Target for LocalTarget {
-    fn kind(&self) -> TargetKind {
-        TargetKind::Local
-    }
-
-    fn resolve(&self) -> Result<ResolvedTarget, TargetError> {
-        Ok(ResolvedTarget::Local)
-    }
-
-    fn spawn_worker(&self) -> Result<WorkerSpawn, TargetError> {
-        Ok(WorkerSpawn::LegacyLocal {
-            runtime_command: self.runtime_command()?,
-        })
-    }
-
-    fn worker_by_name(&self) -> Result<WorkerByName, TargetError> {
-        Ok(WorkerByName {
-            runtime_command: self.runtime_command()?,
-        })
-    }
-
-    fn resume_worker(&self) -> Result<WorkerResume, TargetError> {
-        Ok(WorkerResume {
-            runtime_command: self.runtime_command()?,
-        })
-    }
-
     fn dashboard(&self) -> Result<Dashboard, TargetError> {
-        Ok(Dashboard::Local {
-            runtime_command: self.runtime_command()?,
-        })
+        Err(TargetError::unsupported("Worker dashboard", self.kind()))
     }
 
-    fn list_workers(&self, request: WorkerListRequest) -> Result<WorkerList, TargetError> {
-        if request.runtime_id.is_some() {
-            return Err(TargetError::unsupported(
-                "Explicit runtime id for local worker listing",
-                self.kind(),
-            ));
-        }
-        Ok(WorkerList {
-            local_runtime_command: Some(self.runtime_command()?),
-            backend_target: None,
-            include_stopped: request.include_stopped,
-        })
+    fn list_workers(&self, _request: WorkerListRequest) -> Result<WorkerList, TargetError> {
+        Err(TargetError::unsupported("Worker listing", self.kind()))
     }
 
     fn connect_worker(
@@ -329,20 +227,9 @@ impl Target for StandaloneTarget {
     }
 
     fn spawn_worker(&self) -> Result<WorkerSpawn, TargetError> {
-        Ok(WorkerSpawn::Standalone {
+        Ok(WorkerSpawn {
             state_dir: self.state_dir.clone(),
         })
-    }
-
-    fn worker_by_name(&self) -> Result<WorkerByName, TargetError> {
-        Err(TargetError::unsupported(
-            "Worker name attachment",
-            self.kind(),
-        ))
-    }
-
-    fn resume_worker(&self) -> Result<WorkerResume, TargetError> {
-        Err(TargetError::unsupported("Worker restore", self.kind()))
     }
 
     fn standalone_session_list(
@@ -367,24 +254,6 @@ impl Target for StandaloneTarget {
             session_id,
         })
     }
-
-    fn dashboard(&self) -> Result<Dashboard, TargetError> {
-        Err(TargetError::unsupported("Worker dashboard", self.kind()))
-    }
-
-    fn list_workers(&self, _request: WorkerListRequest) -> Result<WorkerList, TargetError> {
-        Err(TargetError::unsupported("Worker listing", self.kind()))
-    }
-
-    fn connect_worker(
-        &self,
-        _selector: WorkerConnectionSelector,
-    ) -> Result<WorkerConnection, TargetError> {
-        Err(TargetError::unsupported(
-            "Backend runtime worker connection",
-            self.kind(),
-        ))
-    }
 }
 
 impl Target for BackendTarget {
@@ -405,44 +274,27 @@ impl Target for BackendTarget {
         })
     }
 
-    fn spawn_worker(&self) -> Result<WorkerSpawn, TargetError> {
-        Err(TargetError::unsupported("Worker spawn", self.kind()))
-    }
-
-    fn worker_by_name(&self) -> Result<WorkerByName, TargetError> {
-        Err(TargetError::unsupported(
-            "Worker name attachment",
-            self.kind(),
-        ))
-    }
-
-    fn resume_worker(&self) -> Result<WorkerResume, TargetError> {
-        Err(TargetError::unsupported("Worker resume", self.kind()))
-    }
-
     fn dashboard(&self) -> Result<Dashboard, TargetError> {
-        match self.resolve()? {
-            ResolvedTarget::Backend {
-                base_url,
-                workspace_id,
-            } => Ok(Dashboard::Backend {
-                base_url,
-                workspace_id,
-            }),
-            ResolvedTarget::Local | ResolvedTarget::Standalone => {
-                unreachable!("BackendTarget cannot resolve as a local target")
-            }
-        }
+        let ResolvedTarget::Backend {
+            base_url,
+            workspace_id,
+        } = self.resolve()?
+        else {
+            unreachable!("BackendTarget resolves only Backend authority")
+        };
+        Ok(Dashboard {
+            base_url,
+            workspace_id,
+        })
     }
 
     fn list_workers(&self, request: WorkerListRequest) -> Result<WorkerList, TargetError> {
         Ok(WorkerList {
-            local_runtime_command: None,
-            backend_target: Some(BackendRuntimeListTarget::new(
+            backend_target: BackendRuntimeListTarget::new(
                 self.base_url.clone(),
                 self.workspace_id.clone(),
                 request.runtime_id,
-            )),
+            ),
             include_stopped: request.include_stopped,
         })
     }
@@ -499,38 +351,33 @@ mod tests {
     }
 
     #[test]
-    fn local_target_resolves_local_product_state_authority() {
-        assert_eq!(LocalTarget::new().resolve().unwrap(), ResolvedTarget::Local);
-    }
-
-    #[test]
-    fn standalone_target_carries_in_process_state_without_resolving_runtime_command() {
+    fn standalone_target_carries_in_process_state_without_runtime_command() {
         let target = StandaloneTarget::new("/tmp/yoi-standalone-state");
 
         assert_eq!(target.kind(), TargetKind::Standalone);
         assert_eq!(target.resolve().unwrap(), ResolvedTarget::Standalone);
         assert_eq!(
             target.spawn_worker().unwrap(),
-            WorkerSpawn::Standalone {
+            WorkerSpawn {
                 state_dir: PathBuf::from("/tmp/yoi-standalone-state"),
             }
         );
     }
 
     #[test]
-    fn standalone_target_never_falls_back_to_legacy_local_operations() {
+    fn standalone_target_never_exposes_workspace_worker_operations() {
         let target = StandaloneTarget::new("/tmp/yoi-standalone-state");
 
-        assert_eq!(
-            target.worker_by_name().unwrap_err().to_string(),
-            "Worker name attachment is not supported by Standalone target"
-        );
         assert_eq!(
             target
                 .list_workers(WorkerListRequest::new(None))
                 .unwrap_err()
                 .to_string(),
             "Worker listing is not supported by Standalone target"
+        );
+        assert_eq!(
+            target.dashboard().unwrap_err().to_string(),
+            "Worker dashboard is not supported by Standalone target"
         );
     }
 
@@ -540,23 +387,10 @@ mod tests {
 
         assert_eq!(
             target.dashboard().unwrap(),
-            Dashboard::Backend {
+            Dashboard {
                 base_url: "http://127.0.0.1:8787".to_string(),
                 workspace_id: "workspace-a".to_string(),
             }
-        );
-    }
-
-    #[test]
-    fn backend_target_rejects_dashboard_without_workspace_selection() {
-        let target = BackendTarget::new("http://127.0.0.1:8787", None::<String>);
-
-        assert!(
-            target
-                .dashboard()
-                .unwrap_err()
-                .to_string()
-                .contains("workspace selection is required")
         );
     }
 
@@ -567,26 +401,13 @@ mod tests {
             .list_workers(WorkerListRequest::new(Some("runtime-a".to_string())))
             .unwrap();
 
+        assert_eq!(workers.backend_target.base_url, "http://127.0.0.1:8787");
         assert_eq!(
-            workers.backend_target.as_ref().unwrap().base_url,
-            "http://127.0.0.1:8787"
-        );
-        assert_eq!(
-            workers
-                .backend_target
-                .as_ref()
-                .unwrap()
-                .workspace_id
-                .as_deref(),
+            workers.backend_target.workspace_id.as_deref(),
             Some("workspace-a")
         );
         assert_eq!(
-            workers
-                .backend_target
-                .as_ref()
-                .unwrap()
-                .runtime_id
-                .as_deref(),
+            workers.backend_target.runtime_id.as_deref(),
             Some("runtime-a")
         );
     }
@@ -605,33 +426,6 @@ mod tests {
     }
 
     #[test]
-    fn backend_target_rejects_worker_connection_before_workspace_selection() {
-        let target = BackendTarget::new("http://127.0.0.1:8787", None::<String>);
-        let error =
-            match target.connect_worker(WorkerConnectionSelector::new("runtime-a", "worker-b")) {
-                Ok(_) => panic!("unscoped connection must fail"),
-                Err(error) => error,
-            };
-
-        assert!(
-            error
-                .to_string()
-                .contains("workspace selection is required")
-        );
-    }
-
-    #[test]
-    fn backend_target_rejects_local_worker_operations() {
-        let target = BackendTarget::new("http://127.0.0.1:8787", None::<String>);
-        let err = target.spawn_worker().unwrap_err();
-
-        assert_eq!(
-            err.to_string(),
-            "Worker spawn is not supported by Backend target"
-        );
-    }
-
-    #[test]
     fn standalone_target_builds_explicit_session_intents() {
         let target = StandaloneTarget::new("/tmp/yoi-client-sessions");
         let list = target.standalone_session_list(true).unwrap();
@@ -644,25 +438,5 @@ mod tests {
             .unwrap();
         assert_eq!(resume.state_dir, list.state_dir);
         assert_eq!(resume.session_id, "019d1234-0000-7000-8000-000000000000");
-
-        assert!(
-            LocalTarget::new()
-                .standalone_session_list(false)
-                .unwrap_err()
-                .to_string()
-                .contains("not supported")
-        );
-    }
-
-    #[test]
-    fn local_target_builds_local_worker_list() {
-        let target = LocalTarget::new();
-        let workers = target
-            .list_workers(WorkerListRequest::with_stopped(None))
-            .unwrap();
-
-        assert!(workers.local_runtime_command.is_some());
-        assert!(workers.backend_target.is_none());
-        assert!(workers.include_stopped);
     }
 }

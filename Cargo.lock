@@ -638,7 +638,6 @@ name = "client"
 version = "0.1.0"
 dependencies = [
  "futures",
- "manifest",
  "protocol",
  "reqwest",
  "serde",
@@ -5325,7 +5324,6 @@ dependencies = [
  "base64 0.22.1",
  "client",
  "crossterm 0.28.1",
- "fs4",
  "manifest",
  "protocol",
  "pulldown-cmark",
@@ -5342,7 +5340,6 @@ dependencies = [
  "toml",
  "unicode-width",
  "uuid",
- "worker",
 ]
 
 [[package]]
