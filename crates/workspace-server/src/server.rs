@@ -22561,6 +22561,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_worker_discovery_does_not_create_or_expand_control_grants() {
+        let workspace = tempfile::tempdir().unwrap();
+        let api = test_api(workspace.path()).await;
+        seed_worker_source_member(&api, "runtime-test", "worker-caller");
+        seed_worker_source_member(&api, "runtime-test", "worker-target");
+        let controller = RuntimeWorkerRef::new("runtime-test", "worker-caller");
+        let target = RuntimeWorkerRef::new("runtime-test", "worker-target");
+        let before = api
+            .store
+            .list_active_worker_control_grants(TEST_WORKSPACE_ID, &controller, 10)
+            .unwrap();
+        assert!(before.is_empty());
+
+        let discovered = workspace_worker_discovery_page(
+            vec![workspace_api::WorkerSummary {
+                runtime_id: target.runtime_id.clone(),
+                worker_id: target.worker_id.clone(),
+                resource_key: "W-2".to_string(),
+                host_id: "host-test".to_string(),
+                display_name: "ungranted-peer".to_string(),
+                label: "ungranted-peer".to_string(),
+                profile: Some("builtin:coder".to_string()),
+                singleton_key: None,
+                tags: Vec::new(),
+                workspace: workspace_api::WorkerWorkspaceSummary {
+                    visibility: "workspace_scoped".to_string(),
+                    identity: "workspace-test".to_string(),
+                    workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
+                },
+                state: "idle".to_string(),
+                last_seen_at: None,
+                pinned: false,
+                retention_state: "normal".to_string(),
+                implementation: workspace_api::WorkerImplementationSummary {
+                    kind: "remote".to_string(),
+                    display_hint: "remote".to_string(),
+                },
+                capabilities: workspace_api::WorkerCapabilitySummary {
+                    can_stop: true,
+                    can_spawn_followup: false,
+                },
+                working_directory: None,
+                diagnostics: Vec::new(),
+            }],
+            None,
+            0,
+            10,
+            workspace_worker_discovery_filter_fingerprint(None),
+        );
+        let WorkspaceWorkerSubject::RuntimeWorker {
+            runtime_id,
+            worker_id,
+        } = &discovered.workers[0].subject;
+        assert_eq!(discovered.workers[0].resource_key, "W-2");
+        let discovered_target = RuntimeWorkerRef::new(runtime_id, worker_id);
+        let error = authorize_known_worker_permission(
+            &api,
+            TEST_WORKSPACE_ID,
+            &controller,
+            &discovered_target,
+            "send_input",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::UnknownWorker { worker } if worker == target
+        ));
+
+        let after = api
+            .store
+            .list_active_worker_control_grants(TEST_WORKSPACE_ID, &controller, 10)
+            .unwrap();
+        assert!(after.is_empty());
+    }
+
+    #[tokio::test]
     async fn workspace_worker_discovery_requires_dedicated_source_proof() {
         let workspace = tempfile::tempdir().unwrap();
         let mut api = test_api(workspace.path()).await;
