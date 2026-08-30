@@ -107,6 +107,31 @@ pub enum WorkdirTransportErrorCode {
     Internal,
 }
 
+impl WorkdirTransportErrorCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::Conflict => "conflict",
+            Self::Unsupported => "unsupported",
+            Self::InvalidRequest => "invalid_request",
+            Self::UnknownCommand => "unknown_command",
+            Self::Unavailable => "unavailable",
+            Self::Internal => "internal",
+        }
+    }
+
+    /// Shared public HTTP classification for Runtime and Workspace Workdir operation boundaries.
+    pub const fn http_status(self) -> u16 {
+        match self {
+            Self::NotFound | Self::UnknownCommand => 404,
+            Self::Conflict => 409,
+            Self::Unsupported | Self::InvalidRequest => 400,
+            Self::Unavailable => 503,
+            Self::Internal => 500,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkdirTransportError {
     pub code: WorkdirTransportErrorCode,
@@ -125,6 +150,9 @@ impl WorkdirTransportError {
                     code: Code::Unsupported,
                     message: format!("Workdir capability {capability:?} is not available"),
                 };
+            }
+            WorkdirError::UnsupportedOperation(_) => {
+                (Code::Unsupported, "Workdir operation is not supported")
             }
             WorkdirError::UnknownCommand(_) => {
                 (Code::UnknownCommand, "Workdir command was not found")
@@ -161,7 +189,7 @@ impl WorkdirTransportError {
         match self.code {
             Code::NotFound => WorkdirError::NotFound("<remote>".into()),
             Code::Conflict => WorkdirError::Conflict(self.message),
-            Code::Unsupported => WorkdirError::Unavailable(self.message),
+            Code::Unsupported => WorkdirError::UnsupportedOperation(self.message),
             Code::UnknownCommand => WorkdirError::UnknownCommand("<remote>".to_string()),
             Code::InvalidRequest => WorkdirError::InvalidArgument(self.message),
             Code::Unavailable => WorkdirError::Unavailable(self.message),
@@ -517,13 +545,13 @@ mod client {
             .json::<WorkdirTransportError>()
             .await
             .map(WorkdirTransportError::into_workdir_error)
-            .unwrap_or_else(|error| {
-                WorkdirError::Unavailable(format!("Runtime HTTP error: {error}"))
+            .unwrap_or_else(|_| {
+                WorkdirError::Transport("Runtime Workdir error response was invalid".to_string())
             })
     }
 
-    fn http_unavailable(error: reqwest::Error) -> WorkdirError {
-        WorkdirError::Unavailable(format!("Runtime Workdir HTTP request failed: {error}"))
+    fn http_unavailable(_error: reqwest::Error) -> WorkdirError {
+        WorkdirError::Transport("Runtime Workdir HTTP request failed".to_string())
     }
 
     pub use self::RemoteWorkdirSession as ClientSession;
@@ -535,6 +563,57 @@ pub use client::{ClientSession as RemoteWorkdirSession, WorkdirHttpAuthorization
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_error_round_trip_keeps_public_classification() {
+        for (code, expected_status, expected_error) in [
+            (
+                WorkdirTransportErrorCode::InvalidRequest,
+                400,
+                "invalid argument",
+            ),
+            (WorkdirTransportErrorCode::NotFound, 404, "file not found"),
+            (
+                WorkdirTransportErrorCode::UnknownCommand,
+                404,
+                "unknown Workdir session command",
+            ),
+            (
+                WorkdirTransportErrorCode::Conflict,
+                409,
+                "modified externally",
+            ),
+            (WorkdirTransportErrorCode::Unsupported, 400, "unsupported"),
+            (WorkdirTransportErrorCode::Unavailable, 503, "unavailable"),
+            (WorkdirTransportErrorCode::Internal, 500, "transport failed"),
+        ] {
+            let transport = WorkdirTransportError {
+                code,
+                message: "safe provider message".to_string(),
+            };
+            assert_eq!(code.http_status(), expected_status);
+            let workdir_error = transport.clone().into_workdir_error();
+            assert!(workdir_error.to_string().contains(expected_error));
+            assert_eq!(
+                WorkdirTransportError::from_workdir_error(&workdir_error).code,
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn local_validation_errors_share_invalid_request_classification() {
+        for error in [
+            WorkdirError::InvalidGlob("[".to_string()),
+            WorkdirError::InvalidRegex("(".to_string()),
+            WorkdirError::InvalidArgument("limit must be positive".to_string()),
+        ] {
+            let transport = WorkdirTransportError::from_workdir_error(&error);
+            assert_eq!(transport.code, WorkdirTransportErrorCode::InvalidRequest);
+            assert_eq!(transport.code.http_status(), 400);
+            assert_eq!(transport.message, "Workdir operation request is invalid");
+        }
+    }
 
     #[test]
     fn transport_failure_remains_distinct_from_session_unavailable() {

@@ -225,6 +225,9 @@ pub enum WorkdirError {
     #[error("Workdir session does not support {0:?}")]
     Unsupported(WorkdirSessionCapability),
 
+    #[error("Workdir operation is unsupported: {0}")]
+    UnsupportedOperation(String),
+
     #[error("invalid Workdir path: {0}")]
     InvalidPath(String),
 

@@ -1721,17 +1721,8 @@ impl RuntimeHttpWorkdirError {
 impl From<workdir::WorkdirError> for RuntimeHttpWorkdirError {
     fn from(error: workdir::WorkdirError) -> Self {
         let payload = WorkdirTransportError::from_workdir_error(&error);
-        let status = match payload.code {
-            WorkdirTransportErrorCode::NotFound | WorkdirTransportErrorCode::UnknownCommand => {
-                StatusCode::NOT_FOUND
-            }
-            WorkdirTransportErrorCode::Conflict => StatusCode::CONFLICT,
-            WorkdirTransportErrorCode::Unsupported | WorkdirTransportErrorCode::InvalidRequest => {
-                StatusCode::BAD_REQUEST
-            }
-            WorkdirTransportErrorCode::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
-            WorkdirTransportErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
-        };
+        let status = StatusCode::from_u16(payload.code.http_status())
+            .expect("Workdir transport error status is valid");
         Self { status, payload }
     }
 }
