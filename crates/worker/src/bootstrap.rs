@@ -130,6 +130,29 @@ where
         Ok(PreparedWorker::new(worker, self.layout, self.transport))
     }
 
+    pub async fn prepare_restored(
+        self,
+        worker_name: &str,
+    ) -> Result<PreparedWorker<Box<dyn LlmClient>, St>, WorkerBootstrapError> {
+        let mut worker =
+            Worker::restore_pending_from_worker_metadata_with_context_and_model_client(
+                worker_name,
+                self.manifest,
+                self.store,
+                self.prompt_catalog,
+                self.workspace_context,
+                self.filesystem_authority,
+                self.model_client,
+            )
+            .await
+            .map_err(WorkerBootstrapError::Worker)?;
+
+        if let Some(workdir_session) = self.workdir_session {
+            worker.bind_workdir_session(Some(workdir_session));
+        }
+        Ok(PreparedWorker::new(worker, self.layout, self.transport))
+    }
+
     pub async fn start(self) -> Result<BootstrappedWorker, WorkerBootstrapError> {
         self.prepare().await?.start().await
     }

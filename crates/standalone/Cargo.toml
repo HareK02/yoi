@@ -7,11 +7,15 @@ license.workspace = true
 
 [dependencies]
 agen.workspace = true
+fs4.workspace = true
 manifest.workspace = true
 protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 session-store.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
+uuid = { workspace = true, features = ["v7"] }
 worker.workspace = true
 
 [dev-dependencies]
@@ -19,4 +23,3 @@ async-trait.workspace = true
 futures.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
-uuid = { workspace = true, features = ["v7"] }
