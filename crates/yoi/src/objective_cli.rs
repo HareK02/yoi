@@ -118,6 +118,9 @@ pub fn run(
     cli: ObjectiveCli,
     target: ResolvedTarget,
 ) -> Result<ObjectiveCliOutput, ObjectiveCliError> {
+    if cli == ObjectiveCli::Help {
+        return Ok(success(help_text().to_string()));
+    }
     match target {
         ResolvedTarget::Standalone => Err(ObjectiveCliError::new(
             "Standalone is a one-shot Worker host, not Objective storage authority; select a Backend target",
@@ -359,8 +362,13 @@ mod tests {
     }
 
     #[test]
-    fn help_states_backend_authority() {
-        assert!(help_text().contains("require the Workspace-scoped Backend"));
-        assert!(!help_text().contains("repository-file"));
+    fn help_is_available_without_objective_storage_authority() {
+        let output = run(ObjectiveCli::Help, ResolvedTarget::Standalone).unwrap();
+        assert!(
+            output
+                .stdout
+                .contains("require the Workspace-scoped Backend")
+        );
+        assert!(!output.stdout.contains("repository-file"));
     }
 }

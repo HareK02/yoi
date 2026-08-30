@@ -178,9 +178,12 @@ pub fn parse_ticket_args(args: &[String]) -> Result<TicketCli, TicketCliError> {
 }
 
 pub fn run(cli: TicketCli, target: ResolvedTarget) -> Result<TicketCliOutput, TicketCliError> {
+    if cli == TicketCli::Help {
+        return Ok(success(help_text().to_string()));
+    }
     match target {
         ResolvedTarget::Standalone => Err(TicketCliError::new(
-            "Standalone is a one-shot Worker host, not Ticket storage authority; select a Backend target; select a Backend target",
+            "Standalone is a one-shot Worker host, not Ticket storage authority; select a Backend target",
         )),
         ResolvedTarget::Backend {
             base_url,
@@ -966,8 +969,9 @@ mod tests {
     }
 
     #[test]
-    fn help_states_backend_authority() {
-        assert!(help_text().contains("Workspace-scoped Backend"));
-        assert!(!help_text().contains("repository-file Ticket backend"));
+    fn help_is_available_without_ticket_storage_authority() {
+        let output = run(TicketCli::Help, ResolvedTarget::Standalone).unwrap();
+        assert!(output.stdout.contains("Workspace-scoped Backend"));
+        assert!(!output.stdout.contains("repository-file Ticket backend"));
     }
 }
