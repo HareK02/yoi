@@ -35,6 +35,14 @@ pub struct WorkerBootstrap<St> {
     workdir_session: Option<WorkdirSessionHandle>,
 }
 
+/// A constructed Worker whose host-owned live bindings can still be installed
+/// before Feature installation and controller exposure.
+pub struct PreparedWorker<C: LlmClient, St: Store> {
+    worker: Worker<C, St>,
+    layout: WorkerBootstrapLayout,
+    transport: WorkerControllerTransport,
+}
+
 /// Live controller returned only after Worker construction and feature
 /// installation have completed successfully.
 pub struct BootstrappedWorker {
@@ -99,7 +107,12 @@ where
         self
     }
 
-    pub async fn start(self) -> Result<BootstrappedWorker, WorkerBootstrapError> {
+    /// Construct the Worker without exposing a controller handle. Runtime hosts
+    /// use this seam to bind Workdir, observation, Flow, and other live services
+    /// before [`PreparedWorker::start`] performs Feature installation.
+    pub async fn prepare(
+        self,
+    ) -> Result<PreparedWorker<Box<dyn LlmClient>, St>, WorkerBootstrapError> {
         let mut worker = Worker::from_manifest_with_context_and_model_client(
             self.manifest,
             self.store,
@@ -114,7 +127,43 @@ where
         if let Some(workdir_session) = self.workdir_session {
             worker.bind_workdir_session(Some(workdir_session));
         }
-        start_worker_controller(worker, self.layout, self.transport).await
+        Ok(PreparedWorker::new(worker, self.layout, self.transport))
+    }
+
+    pub async fn start(self) -> Result<BootstrappedWorker, WorkerBootstrapError> {
+        self.prepare().await?.start().await
+    }
+}
+
+impl<C, St> PreparedWorker<C, St>
+where
+    C: LlmClient + Clone + 'static,
+    St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+{
+    /// Wrap a restored Worker in the same pre-exposure lifecycle used by fresh
+    /// bootstraps.
+    pub fn new(
+        worker: Worker<C, St>,
+        layout: WorkerBootstrapLayout,
+        transport: WorkerControllerTransport,
+    ) -> Self {
+        Self {
+            worker,
+            layout,
+            transport,
+        }
+    }
+
+    pub fn worker(&self) -> &Worker<C, St> {
+        &self.worker
+    }
+
+    pub fn worker_mut(&mut self) -> &mut Worker<C, St> {
+        &mut self.worker
+    }
+
+    pub async fn start(self) -> Result<BootstrappedWorker, WorkerBootstrapError> {
+        start_worker_controller(self.worker, self.layout, self.transport).await
     }
 }
 

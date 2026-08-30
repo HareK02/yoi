@@ -46,6 +46,8 @@ use tokio::runtime::Runtime;
 use tokio::sync::broadcast;
 use workdir::{LocalWorkdirSession, Workdir, WorkdirSessionCapabilities, WorkdirSessionHandle};
 
+#[cfg(test)]
+use worker::WorkerController;
 use worker::feature::builtin::{
     CompositeWorkerObservationProvider, WorkerObservationError, WorkerObservationProvider,
     WorkerObservationSubject, WorkerObservationSubjectRef, WorkerSessionCapture,
@@ -54,9 +56,10 @@ use worker::feature::builtin::{
 #[cfg(feature = "ws-server")]
 use worker::ipc::protocol_session::{live_log_entry_event, subscribe_worker_protocol_session};
 use worker::{
-    PromptCatalogSource, SegmentLogSink, WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN, Worker,
-    WorkerController, WorkerControllerTransport, WorkerError, WorkerFilesystemAuthority,
-    WorkerHandle, WorkerSharedState, WorkerWorkspaceContext, WorkspaceClient, WorkspaceId,
+    PreparedWorker, PromptCatalogSource, SegmentLogSink, WORKER_INPUT_SUBMISSION_EXTENSION_DOMAIN,
+    Worker, WorkerBootstrap, WorkerBootstrapError, WorkerBootstrapLayout,
+    WorkerControllerTransport, WorkerError, WorkerFilesystemAuthority, WorkerHandle,
+    WorkerSharedState, WorkerWorkspaceContext, WorkspaceClient, WorkspaceId,
 };
 
 const DEFAULT_BACKEND_ID: &str = "worker-crate";
@@ -881,15 +884,31 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             )?;
         let store = CombinedStore::new(session_store, worker_metadata_store);
 
-        let mut worker = Worker::from_manifest_with_context(
+        let run_dir = worker_aggregate_dir
+            .join("runs")
+            .join(request.run_generation.to_string());
+        let mut prepared = WorkerBootstrap::new(
             manifest,
             store,
             loader,
             workspace_context,
             filesystem_authority,
+            WorkerBootstrapLayout::RuntimeManagedRun {
+                run_dir: run_dir.clone(),
+            },
+            self.controller_transport,
         )
+        .prepare()
         .await
-        .map_err(|err| format!("failed to create Worker from profile: {err}"))?;
+        .map_err(|error| match error {
+            WorkerBootstrapError::Worker(source) => {
+                format!("failed to create Worker from profile: {source}")
+            }
+            WorkerBootstrapError::Controller { source, .. } => {
+                format!("failed to prepare Worker controller: {source}")
+            }
+        })?;
+        let worker = prepared.worker_mut();
         validate_worker_memory_settings(worker.manifest(), &request.request)?;
         if let Some(binding) = request.working_directory.as_ref() {
             worker.bind_workdir_session(Some(runtime_local_workdir_session(
@@ -935,21 +954,16 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         }
 
         let workspace_client = worker.workspace_client_handle();
-        let run_dir = worker_aggregate_dir
-            .join("runs")
-            .join(request.run_generation.to_string());
-        let (handle, shutdown_rx) = WorkerController::spawn_runtime_managed_run_with_transport(
-            worker,
-            &run_dir,
-            self.controller_transport,
-        )
-        .await
-        .map_err(|err| {
-            format!(
-                "failed to spawn Worker controller in {}: {err}",
+        let started = prepared.start().await.map_err(|error| match error {
+            WorkerBootstrapError::Worker(source) => {
+                format!("failed to prepare Worker before controller start: {source}")
+            }
+            WorkerBootstrapError::Controller { source, .. } => format!(
+                "failed to spawn Worker controller in {}: {source}",
                 run_dir.display()
-            )
+            ),
         })?;
+        let (handle, shutdown_rx) = (started.handle, started.shutdown);
         if flow_transition_enabled {
             handle.shared_state.enable_flow_transition();
         }
@@ -1118,18 +1132,25 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         let run_dir = worker_aggregate_dir
             .join("runs")
             .join(request.run_generation.to_string());
-        let (handle, shutdown_rx) = WorkerController::spawn_runtime_managed_run_with_transport(
+        let started = PreparedWorker::new(
             worker,
-            &run_dir,
+            WorkerBootstrapLayout::RuntimeManagedRun {
+                run_dir: run_dir.clone(),
+            },
             self.controller_transport,
         )
+        .start()
         .await
-        .map_err(|err| {
-            format!(
-                "failed to spawn restored Worker controller in {}: {err}",
+        .map_err(|error| match error {
+            WorkerBootstrapError::Worker(source) => {
+                format!("failed to prepare restored Worker: {source}")
+            }
+            WorkerBootstrapError::Controller { source, .. } => format!(
+                "failed to spawn restored Worker controller in {}: {source}",
                 run_dir.display()
-            )
+            ),
         })?;
+        let (handle, shutdown_rx) = (started.handle, started.shutdown);
         if flow_transition_enabled {
             handle.shared_state.enable_flow_transition();
         }
@@ -3092,8 +3113,67 @@ mod tests {
     }
 
     #[test]
+    fn profile_runtime_factory_uses_shared_worker_bootstrap_seams() {
+        let source = include_str!("worker_backend.rs");
+        let production = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .map(|(production, _)| production)
+            .expect("worker backend test module marker");
+        let factory = production
+            .split_once("impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory")
+            .map(|(_, factory)| factory)
+            .expect("profile runtime factory implementation");
+        let (fresh, restore) = factory
+            .split_once("async fn restore_controller")
+            .expect("fresh and restore factory paths");
+        let assert_in_order = |path: &str, markers: &[&str]| {
+            let mut offset = 0;
+            for marker in markers {
+                let relative = path[offset..]
+                    .find(marker)
+                    .unwrap_or_else(|| panic!("missing ordered factory marker {marker}"));
+                offset += relative + marker.len();
+            }
+        };
+        assert_in_order(
+            fresh,
+            &[
+                "WorkerBootstrap::new(",
+                ".prepare()",
+                "worker.bind_workdir_session(",
+                "worker.bind_worker_observation_provider(",
+                "install_runtime_flow_transition_feature()",
+                "prepared.start()",
+            ],
+        );
+        assert_in_order(
+            restore,
+            &[
+                "Worker::restore_from_worker_metadata_with_context(",
+                "worker.bind_workdir_session(",
+                "worker.bind_worker_observation_provider(",
+                "install_runtime_flow_transition_feature()",
+                "PreparedWorker::new(",
+                ".start()",
+            ],
+        );
+        assert!(
+            production.contains("WorkerBootstrap::new("),
+            "fresh runtime Workers must use the shared construction bootstrap"
+        );
+        assert!(
+            production.contains("PreparedWorker::new("),
+            "restored runtime Workers must use the shared pre-exposure lifecycle"
+        );
+        assert!(
+            !production.contains("WorkerController::spawn_runtime_managed_run_with_transport"),
+            "runtime factory paths must not bypass the shared controller lifecycle"
+        );
+    }
+
+    #[test]
     #[serial_test::serial(worker_allocation)]
-    fn in_process_runtime_reopens_persisted_worker_without_overlong_unix_socket() {
+    fn shared_bootstrap_preserves_in_process_transport_for_fresh_and_restored_runtime_workers() {
         let root = tempfile::tempdir().unwrap();
         let long_component = "embedded-workspace-store-segment".repeat(4);
         let runtime_store_dir = root.path().join(long_component);

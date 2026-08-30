@@ -25,8 +25,8 @@ mod permission;
 mod worker;
 
 pub use bootstrap::{
-    BootstrappedWorker, WorkerBootstrap, WorkerBootstrapError, WorkerBootstrapLayout,
-    start_worker_controller,
+    BootstrappedWorker, PreparedWorker, WorkerBootstrap, WorkerBootstrapError,
+    WorkerBootstrapLayout, start_worker_controller,
 };
 pub use compact::token_counter::{EstimateSource, SplitPoint, TokenEstimate};
 pub use controller::{ShutdownReceiver, WorkerController, WorkerControllerTransport, WorkerHandle};

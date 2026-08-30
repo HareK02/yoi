@@ -17,7 +17,7 @@ worker
 ```
 
 `standalone` は `tui`、`worker-runtime`、`yoi-workspace-server` に依存しない。
-`worker` の direct entrypoint と `standalone` は同じ `start_worker_controller` lifecycle を使い、後者は `WorkerBootstrap` で fresh Worker construction も共有する。
+`worker` の direct entrypoint、`worker-runtime` の fresh/restore factory、`standalone` は同じ controller lifecycle を使う。fresh runtime/standalone construction は `WorkerBootstrap` を共有し、Runtime は `prepare()` 後かつ Feature install/controller exposure 前に Workdir、observation、Flow の live binding を追加する。restore は replay 済み Worker を `PreparedWorker` へ渡して同じ pre-exposure lifecycle を通す。
 
 ## authority と lifecycle
 
