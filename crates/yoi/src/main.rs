@@ -382,6 +382,14 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             return Ok(Mode::WorkerRuntime(args[1..].to_vec()));
         }
         "objective" => {
+            let cli = objective_cli::parse_objective_args(&args[1..])
+                .map_err(|e| ParseError(e.to_string()))?;
+            if cli == objective_cli::ObjectiveCli::Help {
+                return Ok(Mode::Objective {
+                    cli,
+                    target: client::ResolvedTarget::Standalone,
+                });
+            }
             let workspace_root = current_dir()?;
             let target = resolve_tui_target(
                 connection_resolver,
@@ -391,8 +399,6 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             )?
             .resolve()
             .map_err(|error| ParseError(error.to_string()))?;
-            let cli = objective_cli::parse_objective_args(&args[1..])
-                .map_err(|e| ParseError(e.to_string()))?;
             return Ok(Mode::Objective { cli, target });
         }
         "session" => {
@@ -402,6 +408,14 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             return Ok(Mode::Session(session_cli));
         }
         "ticket" => {
+            let cli =
+                ticket_cli::parse_ticket_args(&args[1..]).map_err(|e| ParseError(e.to_string()))?;
+            if cli == ticket_cli::TicketCli::Help {
+                return Ok(Mode::Ticket {
+                    cli,
+                    target: client::ResolvedTarget::Standalone,
+                });
+            }
             let workspace_root = current_dir()?;
             let target = resolve_tui_target(
                 connection_resolver,
@@ -411,8 +425,6 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             )?
             .resolve()
             .map_err(|error| ParseError(error.to_string()))?;
-            let cli =
-                ticket_cli::parse_ticket_args(&args[1..]).map_err(|e| ParseError(e.to_string()))?;
             return Ok(Mode::Ticket { cli, target });
         }
         "plugin" => {
@@ -2446,6 +2458,42 @@ backend = "shared"
                 assert!(options.json);
             }
             _ => panic!("expected Session analyze mode"),
+        }
+    }
+
+    #[test]
+    fn parser_resolves_ticket_help_before_backend_target_authority() {
+        match parse_args_from([
+            "--backend",
+            "http://unconfigured-backend.example",
+            "ticket",
+            "--help",
+        ])
+        .unwrap()
+        {
+            Mode::Ticket {
+                cli: ticket_cli::TicketCli::Help,
+                target: client::ResolvedTarget::Standalone,
+            } => {}
+            other => panic!("expected target-independent Ticket help, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_resolves_objective_help_before_backend_target_authority() {
+        match parse_args_from([
+            "--backend",
+            "http://unconfigured-backend.example",
+            "objective",
+            "--help",
+        ])
+        .unwrap()
+        {
+            Mode::Objective {
+                cli: objective_cli::ObjectiveCli::Help,
+                target: client::ResolvedTarget::Standalone,
+            } => {}
+            other => panic!("expected target-independent Objective help, got {other:?}"),
         }
     }
 
