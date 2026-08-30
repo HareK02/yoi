@@ -62,12 +62,12 @@ use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeE
 use workspace_api::{
     CreateRemoteRuntimeRequest, CreateRepositorySshCredentialRequest,
     DeleteRepositorySshCredentialRequest, DeleteRepositorySshHostTrustRequest,
-    ObjectiveCreateRequest, ObjectiveEditRequest, ObjectiveLinkTicketRequest, ObjectiveStateRequest,
-    PutRepositorySshHostTrustRequest, RepositoryAccessProjection, RepositorySshCredential,
-    RepositorySshHostTrust, RotateRepositorySshCredentialRequest, RuntimeConnectionTestResponse,
-    RuntimeManagementSummary, TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_PATH,
-    WorkspaceRuntimeResource, WorkspaceWorkerDiscoveryItem, WorkspaceWorkerDiscoveryPage,
-    WorkspaceWorkerSubject,
+    ObjectiveCreateRequest, ObjectiveEditRequest, ObjectiveLinkTicketRequest,
+    ObjectiveStateRequest, PutRepositorySshHostTrustRequest, RepositoryAccessProjection,
+    RepositorySshCredential, RepositorySshHostTrust, RotateRepositorySshCredentialRequest,
+    RuntimeConnectionTestResponse, RuntimeManagementSummary, TICKET_ORCHESTRATION_PLANS_QUERY_PATH,
+    TICKET_RELATIONS_QUERY_PATH, WorkspaceRuntimeResource, WorkspaceWorkerDiscoveryItem,
+    WorkspaceWorkerDiscoveryPage, WorkspaceWorkerSubject,
 };
 
 use crate::auth::{
@@ -18370,7 +18370,12 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(existing.state, WorkerOperationState::Accepted);
+        assert_eq!(
+            existing.state,
+            WorkerOperationState::Accepted,
+            "diagnostics: {:?}",
+            existing.diagnostics
+        );
         let worker_id = existing.worker.unwrap().worker.worker_id;
         let worker = api
             .runtime

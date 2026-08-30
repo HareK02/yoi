@@ -1,21 +1,6 @@
 use std::fmt;
-use std::fs;
-use std::path::{Component, Path, PathBuf};
 
-use chrono::Utc;
 use client::{BackendWorkspaceProductClient, ResolvedTarget};
-use project_record::{allocate_record_id, unix_epoch_millis_now, validate_record_id};
-use serde::Deserialize;
-use ticket::config::TicketConfig;
-
-const OBJECTIVE_ROOT_RELATIVE_PATH: &str = ".yoi/objectives";
-const REQUIRED_SECTION_HEADINGS: [&str; 5] = [
-    "## Goal",
-    "## Motivation / background",
-    "## Strategy / design direction",
-    "## Success criteria / exit conditions",
-    "## Decision context",
-];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObjectiveCli {
@@ -33,12 +18,12 @@ pub enum ObjectiveCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateOptions {
-    pub title: String,
-    pub linked_tickets: Vec<String>,
+    title: String,
+    linked_tickets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObjectiveListState {
+enum ObjectiveListState {
     Active,
     Paused,
     Done,
@@ -46,15 +31,14 @@ pub enum ObjectiveListState {
     All,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListOptions {
-    pub state: ObjectiveListState,
+    state: ObjectiveListState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectiveCliStatus {
     Success,
-    Failure,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,18 +64,6 @@ impl fmt::Display for ObjectiveCliError {
 
 impl std::error::Error for ObjectiveCliError {}
 
-impl From<std::io::Error> for ObjectiveCliError {
-    fn from(error: std::io::Error) -> Self {
-        Self::new(error.to_string())
-    }
-}
-
-impl From<ticket::config::TicketConfigError> for ObjectiveCliError {
-    fn from(error: ticket::config::TicketConfigError) -> Self {
-        Self::new(error.to_string())
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ObjectiveState {
     Active,
@@ -101,15 +73,6 @@ enum ObjectiveState {
 }
 
 impl ObjectiveState {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Paused => "paused",
-            Self::Done => "done",
-            Self::Archived => "archived",
-        }
-    }
-
     fn parse(value: &str) -> Option<Self> {
         match value {
             "active" => Some(Self::Active),
@@ -119,23 +82,6 @@ impl ObjectiveState {
             _ => None,
         }
     }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ObjectiveFrontmatter {
-    title: String,
-    state: String,
-    created_at: String,
-    updated_at: String,
-    #[serde(default)]
-    linked_tickets: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct ObjectiveRecord {
-    id: String,
-    meta: ObjectiveFrontmatter,
-    body: String,
 }
 
 pub fn parse_objective_args(args: &[String]) -> Result<ObjectiveCli, ObjectiveCliError> {
@@ -172,13 +118,13 @@ pub fn run(
     cli: ObjectiveCli,
     target: ResolvedTarget,
 ) -> Result<ObjectiveCliOutput, ObjectiveCliError> {
+    if cli == ObjectiveCli::Help {
+        return Ok(success(help_text().to_string()));
+    }
     match target {
-        ResolvedTarget::Local => {
-            let workspace = std::env::current_dir().map_err(|error| {
-                ObjectiveCliError::new(format!("failed to resolve current directory: {error}"))
-            })?;
-            run_in_workspace(cli, &workspace)
-        }
+        ResolvedTarget::Standalone => Err(ObjectiveCliError::new(
+            "Standalone is a one-shot Worker host, not Objective storage authority; select a Backend target",
+        )),
         ResolvedTarget::Backend {
             base_url,
             workspace_id,
@@ -262,319 +208,6 @@ fn run_with_backend(
             Ok(success("doctor: ok\n".to_string()))
         }
     }
-}
-
-pub fn run_in_workspace(
-    cli: ObjectiveCli,
-    workspace: &Path,
-) -> Result<ObjectiveCliOutput, ObjectiveCliError> {
-    match cli {
-        ObjectiveCli::Help => Ok(success(help_text().to_string())),
-        ObjectiveCli::Command(ObjectiveCommand::Create(options)) => create(workspace, options),
-        ObjectiveCli::Command(ObjectiveCommand::List(options)) => list(workspace, options),
-        ObjectiveCli::Command(ObjectiveCommand::Show { id }) => show(workspace, id),
-        ObjectiveCli::Command(ObjectiveCommand::Doctor) => doctor(workspace),
-    }
-}
-
-fn create(
-    workspace: &Path,
-    options: CreateOptions,
-) -> Result<ObjectiveCliOutput, ObjectiveCliError> {
-    let title = options.title.trim();
-    if title.is_empty() {
-        return Err(ObjectiveCliError::new("create --title must not be empty"));
-    }
-    validate_ticket_links(workspace, &options.linked_tickets)?;
-
-    let root = objective_root(workspace);
-    fs::create_dir_all(&root)?;
-    let base_millis = unix_epoch_millis_now().map_err(|error| {
-        ObjectiveCliError::new(format!("failed to read objective id timestamp: {error}"))
-    })?;
-    let id = allocate_record_id(base_millis, |candidate| root.join(candidate).exists()).map_err(
-        |error| ObjectiveCliError::new(format!("failed to allocate unique objective id: {error}")),
-    )?;
-    let dir = root.join(&id);
-
-    fs::create_dir_all(&dir)?;
-    fs::write(
-        dir.join("item.md"),
-        render_objective_item(title, &options.linked_tickets),
-    )?;
-    Ok(success(format!("created\t{id}\n")))
-}
-
-fn list(workspace: &Path, options: ListOptions) -> Result<ObjectiveCliOutput, ObjectiveCliError> {
-    let mut records = load_objectives(workspace)?;
-    records.sort_by(|a, b| {
-        b.meta
-            .updated_at
-            .cmp(&a.meta.updated_at)
-            .then(a.id.cmp(&b.id))
-    });
-    let mut stdout = String::from("state\tid\ttitle\tupdated_at\tlinked_tickets\n");
-    for record in records {
-        let state = ObjectiveState::parse(&record.meta.state);
-        if !list_state_matches(options.state, state) {
-            continue;
-        }
-        stdout.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\n",
-            record.meta.state,
-            record.id,
-            record.meta.title,
-            record.meta.updated_at,
-            record.meta.linked_tickets.join(",")
-        ));
-    }
-    Ok(success(stdout))
-}
-
-fn show(workspace: &Path, id: String) -> Result<ObjectiveCliOutput, ObjectiveCliError> {
-    validate_record_component(&id)?;
-    let record = load_objective(&objective_root(workspace).join(&id), &id)?;
-    let mut stdout = String::new();
-    stdout.push_str(&format!("# {}\n\n", record.meta.title));
-    stdout.push_str(&format!("State: {}\n", record.meta.state));
-    stdout.push_str(&format!("ID: {}\n", record.id));
-    stdout.push_str(&format!("Updated: {}\n", record.meta.updated_at));
-    stdout.push_str("\n## item.md\n\n---\n");
-    stdout.push_str(&format!("title: {}\n", yaml_string(&record.meta.title)));
-    stdout.push_str(&format!("state: {}\n", yaml_string(&record.meta.state)));
-    stdout.push_str(&format!(
-        "created_at: {}\n",
-        yaml_string(&record.meta.created_at)
-    ));
-    stdout.push_str(&format!(
-        "updated_at: {}\n",
-        yaml_string(&record.meta.updated_at)
-    ));
-    stdout.push_str(&format!(
-        "linked_tickets: {}\n",
-        yaml_string_array(&record.meta.linked_tickets)
-    ));
-    stdout.push_str("---\n\n");
-    stdout.push_str(&record.body);
-    if !stdout.ends_with('\n') {
-        stdout.push('\n');
-    }
-    Ok(success(stdout))
-}
-
-fn doctor(workspace: &Path) -> Result<ObjectiveCliOutput, ObjectiveCliError> {
-    let root = objective_root(workspace);
-    if !root.exists() {
-        return Ok(success("doctor: ok\n".to_string()));
-    }
-    let mut diagnostics = Vec::new();
-    for entry in sorted_dirs(&root)? {
-        let id = entry.file_name().to_string_lossy().to_string();
-        if let Err(error) = validate_record_component(&id) {
-            diagnostics.push(format!("error\t{id}\t{error}"));
-            continue;
-        }
-        match load_objective(&entry.path(), &id) {
-            Ok(record) => validate_record(workspace, &record, &mut diagnostics)?,
-            Err(error) => diagnostics.push(format!("error\t{id}\t{error}")),
-        }
-    }
-    if diagnostics.is_empty() {
-        Ok(success("doctor: ok\n".to_string()))
-    } else {
-        let mut stdout = String::new();
-        for diagnostic in diagnostics {
-            stdout.push_str(&diagnostic);
-            stdout.push('\n');
-        }
-        Ok(ObjectiveCliOutput {
-            status: ObjectiveCliStatus::Failure,
-            stdout,
-        })
-    }
-}
-
-fn validate_record(
-    workspace: &Path,
-    record: &ObjectiveRecord,
-    diagnostics: &mut Vec<String>,
-) -> Result<(), ObjectiveCliError> {
-    if record.meta.title.trim().is_empty() {
-        diagnostics.push(format!("error\t{}\ttitle must not be empty", record.id));
-    }
-    if ObjectiveState::parse(&record.meta.state).is_none() {
-        diagnostics.push(format!(
-            "error\t{}\tinvalid state {}; expected active|paused|done|archived",
-            record.id, record.meta.state
-        ));
-    }
-    for field in [
-        record.meta.created_at.as_str(),
-        record.meta.updated_at.as_str(),
-    ] {
-        if field.trim().is_empty() {
-            diagnostics.push(format!(
-                "error\t{}\ttimestamps must not be empty",
-                record.id
-            ));
-        }
-    }
-    for heading in REQUIRED_SECTION_HEADINGS {
-        if !record.body.contains(heading) {
-            diagnostics.push(format!("error\t{}\tmissing section {heading}", record.id));
-        }
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    for ticket_id in &record.meta.linked_tickets {
-        if !seen.insert(ticket_id) {
-            diagnostics.push(format!(
-                "warning\t{}\tduplicate linked ticket {}",
-                record.id, ticket_id
-            ));
-        }
-    }
-    if let Err(error) = validate_ticket_links(workspace, &record.meta.linked_tickets) {
-        diagnostics.push(format!("error\t{}\t{error}", record.id));
-    }
-    Ok(())
-}
-
-fn load_objectives(workspace: &Path) -> Result<Vec<ObjectiveRecord>, ObjectiveCliError> {
-    let root = objective_root(workspace);
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    let mut records = Vec::new();
-    for entry in sorted_dirs(&root)? {
-        let id = entry.file_name().to_string_lossy().to_string();
-        records.push(load_objective(&entry.path(), &id)?);
-    }
-    Ok(records)
-}
-
-fn load_objective(dir: &Path, id: &str) -> Result<ObjectiveRecord, ObjectiveCliError> {
-    validate_record_component(id)?;
-    let path = dir.join("item.md");
-    let raw = fs::read_to_string(&path)
-        .map_err(|error| ObjectiveCliError::new(format!("{}: {error}", path.display())))?;
-    let (frontmatter, body) = split_frontmatter(&raw).ok_or_else(|| {
-        ObjectiveCliError::new(format!("{}: missing YAML frontmatter", path.display()))
-    })?;
-    let meta: ObjectiveFrontmatter = serde_yaml::from_str(frontmatter).map_err(|error| {
-        ObjectiveCliError::new(format!(
-            "{}: invalid YAML frontmatter: {error}",
-            path.display()
-        ))
-    })?;
-    Ok(ObjectiveRecord {
-        id: id.to_string(),
-        meta,
-        body: body.to_string(),
-    })
-}
-
-fn split_frontmatter(raw: &str) -> Option<(&str, &str)> {
-    let rest = raw.strip_prefix("---\n")?;
-    let (frontmatter, body) = rest.split_once("\n---\n")?;
-    Some((frontmatter, body))
-}
-
-fn validate_ticket_links(workspace: &Path, ticket_ids: &[String]) -> Result<(), ObjectiveCliError> {
-    let config = TicketConfig::load_workspace(workspace)?;
-    let ticket_root = config.backend_root().to_path_buf();
-    for ticket_id in ticket_ids {
-        validate_record_component(ticket_id)?;
-        let item = ticket_root.join(ticket_id).join("item.md");
-        if !item.is_file() {
-            return Err(ObjectiveCliError::new(format!(
-                "linked ticket {ticket_id} does not exist as canonical Ticket id under {}",
-                ticket_root.display()
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn validate_record_component(value: &str) -> Result<(), ObjectiveCliError> {
-    if value.is_empty() || value == "." || value == ".." {
-        return Err(ObjectiveCliError::new(format!(
-            "invalid path-derived id component: {value}"
-        )));
-    }
-    let path = Path::new(value);
-    if path.components().count() != 1 {
-        return Err(ObjectiveCliError::new(format!(
-            "invalid path-derived id component: {value}"
-        )));
-    }
-    match path.components().next() {
-        Some(Component::Normal(_)) => validate_record_id(value).map_err(|error| {
-            ObjectiveCliError::new(format!("{value} is not a canonical record id: {error}"))
-        }),
-        _ => Err(ObjectiveCliError::new(format!(
-            "invalid path-derived id component: {value}"
-        ))),
-    }
-}
-
-fn sorted_dirs(root: &Path) -> Result<Vec<fs::DirEntry>, ObjectiveCliError> {
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            entries.push(entry);
-        }
-    }
-    entries.sort_by_key(|entry| entry.file_name());
-    Ok(entries)
-}
-
-fn objective_root(workspace: &Path) -> PathBuf {
-    workspace.join(OBJECTIVE_ROOT_RELATIVE_PATH)
-}
-
-fn list_state_matches(filter: ObjectiveListState, state: Option<ObjectiveState>) -> bool {
-    match filter {
-        ObjectiveListState::All => true,
-        ObjectiveListState::Active => state == Some(ObjectiveState::Active),
-        ObjectiveListState::Paused => state == Some(ObjectiveState::Paused),
-        ObjectiveListState::Done => state == Some(ObjectiveState::Done),
-        ObjectiveListState::Archived => state == Some(ObjectiveState::Archived),
-    }
-}
-
-fn objective_body_template() -> String {
-    "## Goal\n\nTBD\n\n## Motivation / background\n\nTBD\n\n## Strategy / design direction\n\nTBD\n\n## Success criteria / exit conditions\n\n- TBD\n\n## Decision context\n\n- TBD\n"
-        .to_string()
-}
-
-fn render_objective_item(title: &str, linked_tickets: &[String]) -> String {
-    let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    format!(
-        "---\ntitle: {}\nstate: {}\ncreated_at: {}\nupdated_at: {}\nlinked_tickets: {}\n---\n\n{}\n",
-        yaml_string(title),
-        yaml_string(ObjectiveState::Active.as_str()),
-        yaml_string(&now),
-        yaml_string(&now),
-        yaml_string_array(linked_tickets),
-        objective_body_template()
-    )
-}
-
-fn yaml_string(value: &str) -> String {
-    format!("{:?}", value)
-}
-
-fn yaml_string_array(values: &[String]) -> String {
-    if values.is_empty() {
-        return "[]".to_string();
-    }
-    let items = values
-        .iter()
-        .map(|value| yaml_string(value))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("[{items}]")
 }
 
 fn parse_create(args: &[String]) -> Result<CreateOptions, ObjectiveCliError> {
@@ -675,6 +308,21 @@ fn parse_list_state(value: &str) -> Result<ObjectiveListState, ObjectiveCliError
     }
 }
 
+fn list_state_matches(filter: ObjectiveListState, state: Option<ObjectiveState>) -> bool {
+    match filter {
+        ObjectiveListState::All => true,
+        ObjectiveListState::Active => state == Some(ObjectiveState::Active),
+        ObjectiveListState::Paused => state == Some(ObjectiveState::Paused),
+        ObjectiveListState::Done => state == Some(ObjectiveState::Done),
+        ObjectiveListState::Archived => state == Some(ObjectiveState::Archived),
+    }
+}
+
+fn objective_body_template() -> String {
+    "## Goal\n\nTBD\n\n## Motivation / background\n\nTBD\n\n## Strategy / design direction\n\nTBD\n\n## Success criteria / exit conditions\n\n- TBD\n\n## Decision context\n\n- TBD\n"
+        .to_string()
+}
+
 fn success(stdout: String) -> ObjectiveCliOutput {
     ObjectiveCliOutput {
         status: ObjectiveCliStatus::Success,
@@ -683,137 +331,44 @@ fn success(stdout: String) -> ObjectiveCliOutput {
 }
 
 fn help_text() -> &'static str {
-    "yoi objective\n\nUsage:\n  yoi objective create --title <TITLE> [--ticket <TICKET_ID> ...]\n  yoi objective list [--state active|paused|done|archived|all]\n  yoi objective show <OBJECTIVE_ID>\n  yoi objective doctor\n\nBackend targets use the Workspace-scoped Objective API selected by the shared client Target. Explicit local targets preserve the repository-file Objective backend. Linked Tickets must be canonical opaque Ticket IDs; Objective links are non-blocking context, not Ticket dependencies.\n"
+    "yoi objective\n\nUsage:\n  yoi objective create --title <TITLE> [--ticket <TICKET_ID> ...]\n  yoi objective list [--state active|paused|done|archived|all]\n  yoi objective show <OBJECTIVE_ID>\n  yoi objective doctor\n\nObjective commands require the Workspace-scoped Backend selected by the shared client Target. Standalone does not provide Objective authority.\n"
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
     }
 
-    fn run(temp: &TempDir, values: &[&str]) -> ObjectiveCliOutput {
-        let cli = parse_objective_args(&args(values)).unwrap();
-        run_in_workspace(cli, temp.path()).unwrap()
-    }
-
-    fn create_ticket_dir(temp: &TempDir, ticket_id: &str) {
-        let dir = temp.path().join(".yoi/tickets").join(ticket_id);
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(
-            dir.join("item.md"),
-            "---\ntitle: \"Ticket\"\nstate: \"planning\"\ncreated_at: \"2026-06-09T00:00:00Z\"\nupdated_at: \"2026-06-09T00:00:00Z\"\n---\n\nBody\n",
-        )
-        .unwrap();
-    }
-
-    fn created_id(output: &ObjectiveCliOutput) -> String {
-        output
-            .stdout
-            .strip_prefix("created\t")
-            .unwrap()
-            .trim()
-            .to_string()
+    #[test]
+    fn standalone_rejects_objective_storage_operations() {
+        let cli = parse_objective_args(&args(&["list"])).unwrap();
+        let error = run(cli, ResolvedTarget::Standalone).unwrap_err();
+        assert!(error.to_string().contains("select a Backend target"));
     }
 
     #[test]
-    fn objective_cli_creates_lists_and_shows_records() {
-        let temp = TempDir::new().unwrap();
-        create_ticket_dir(&temp, "00001KTKMS0VG");
-
-        let created = run(
-            &temp,
-            &[
-                "create",
-                "--title",
-                "Medium-term goal",
-                "--ticket",
-                "00001KTKMS0VG",
-            ],
-        );
-        let objective_id = created_id(&created);
-        validate_record_id(&objective_id).unwrap();
-        assert_eq!(objective_id.len(), project_record::RECORD_ID_WIDTH);
-        assert!(
-            temp.path()
-                .join(".yoi/objectives")
-                .join(&objective_id)
-                .join("item.md")
-                .exists()
-        );
-
-        let listed = run(&temp, &["list", "--state", "active"]);
-        assert!(listed.stdout.contains(&objective_id));
-        assert!(listed.stdout.contains("00001KTKMS0VG"));
-
-        let shown = run(&temp, &["show", &objective_id]);
-        assert!(shown.stdout.contains("# Medium-term goal"));
-        assert!(
-            shown
-                .stdout
-                .contains("## Success criteria / exit conditions")
-        );
-        assert!(shown.stdout.contains("00001KTKMS0VG"));
+    fn objective_parser_keeps_backend_command_contract() {
+        assert!(matches!(
+            parse_objective_args(&args(&["create", "--title", "Goal"])).unwrap(),
+            ObjectiveCli::Command(ObjectiveCommand::Create(_))
+        ));
+        assert!(matches!(
+            parse_objective_args(&args(&["list", "--state", "active"])).unwrap(),
+            ObjectiveCli::Command(ObjectiveCommand::List(_))
+        ));
     }
 
     #[test]
-    fn objective_cli_validates_ticket_links() {
-        let temp = TempDir::new().unwrap();
-        let cli = parse_objective_args(&args(&[
-            "create",
-            "--title",
-            "Broken link",
-            "--ticket",
-            "0000000000ABC",
-        ]))
-        .unwrap();
-        let err = run_in_workspace(cli, temp.path()).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("linked ticket 0000000000ABC does not exist")
-        );
-    }
-
-    #[test]
-    fn objective_doctor_reports_invalid_linked_ticket() {
-        let temp = TempDir::new().unwrap();
-        let dir = temp.path().join(".yoi/objectives/0000000000001");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(
-            dir.join("item.md"),
-            "---\ntitle: \"Goal\"\nstate: \"active\"\ncreated_at: \"2026-06-09T00:00:00Z\"\nupdated_at: \"2026-06-09T00:00:00Z\"\nlinked_tickets: [\"0000000000ABD\"]\n---\n\n## Goal\n\nText\n\n## Motivation / background\n\nText\n\n## Strategy / design direction\n\nText\n\n## Success criteria / exit conditions\n\n- Text\n\n## Decision context\n\n- Text\n",
-        )
-        .unwrap();
-
-        let output = run(&temp, &["doctor"]);
-        assert_eq!(output.status, ObjectiveCliStatus::Failure);
+    fn help_is_available_without_objective_storage_authority() {
+        let output = run(ObjectiveCli::Help, ResolvedTarget::Standalone).unwrap();
         assert!(
             output
                 .stdout
-                .contains("linked ticket 0000000000ABD does not exist")
+                .contains("require the Workspace-scoped Backend")
         );
-    }
-
-    #[test]
-    fn objective_doctor_accepts_well_formed_records() {
-        let temp = TempDir::new().unwrap();
-        create_ticket_dir(&temp, "00001KTKMS0VG");
-        run(
-            &temp,
-            &[
-                "create",
-                "--title",
-                "Good objective",
-                "--ticket",
-                "00001KTKMS0VG",
-            ],
-        );
-
-        let output = run(&temp, &["doctor"]);
-        assert_eq!(output.status, ObjectiveCliStatus::Success);
-        assert_eq!(output.stdout, "doctor: ok\n");
+        assert!(!output.stdout.contains("repository-file"));
     }
 }

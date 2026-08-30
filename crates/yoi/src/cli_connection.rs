@@ -1,4 +1,4 @@
-use client::{BackendTarget, LocalTarget, Target, TargetKind};
+use client::{BackendTarget, StandaloneTarget, Target, TargetKind};
 use serde::Deserialize;
 
 use super::{ParseError, read_client_default_connection, resolve_backend_url};
@@ -74,13 +74,14 @@ impl CliCommand {
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum ClientDefaultConnection {
-    Local,
+    #[serde(rename = "local")]
+    Standalone,
     Backend,
 }
 
 impl Default for ClientDefaultConnection {
     fn default() -> Self {
-        Self::Local
+        Self::Standalone
     }
 }
 
@@ -89,7 +90,7 @@ pub(crate) enum CliConnectionInput<'a> {
     DefaultTarget {
         workspace_id: Option<&'a str>,
     },
-    LocalTarget,
+    StandaloneTarget,
     BackendTarget {
         explicit_backend_url: Option<String>,
         workspace_id: Option<&'a str>,
@@ -107,6 +108,20 @@ pub(crate) trait CliConnectionResolver {
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct ClientConfigCliConnectionResolver;
 
+fn standalone_target() -> Result<Box<dyn Target>, ParseError> {
+    let state_dir = manifest::paths::data_dir()
+        .ok_or_else(|| {
+            ParseError(
+                "Standalone state directory is unavailable; set YOI_DATA_DIR, YOI_HOME, XDG_DATA_HOME, or HOME"
+                    .to_string(),
+            )
+        })?
+        .join("client")
+        .join("standalone")
+        .join("sessions");
+    Ok(Box::new(StandaloneTarget::new(state_dir)))
+}
+
 impl CliConnectionResolver for ClientConfigCliConnectionResolver {
     fn resolve_connection(
         &self,
@@ -116,15 +131,15 @@ impl CliConnectionResolver for ClientConfigCliConnectionResolver {
         match (command.connection_requirement(), input) {
             (
                 CliConnectionRequirement::LocalOnly,
-                CliConnectionInput::DefaultTarget { .. } | CliConnectionInput::LocalTarget,
-            ) => Ok(Box::new(LocalTarget::new())),
+                CliConnectionInput::DefaultTarget { .. } | CliConnectionInput::StandaloneTarget,
+            ) => standalone_target(),
             (CliConnectionRequirement::LocalOnly, CliConnectionInput::BackendTarget { .. }) => {
                 Err(ParseError(format!(
-                    "{} uses a local connection target and cannot accept Backend target options",
+                    "{} uses a host-only connection target and cannot accept Backend target options",
                     command.display_name()
                 )))
             }
-            (CliConnectionRequirement::BackendOnly, CliConnectionInput::LocalTarget) => {
+            (CliConnectionRequirement::BackendOnly, CliConnectionInput::StandaloneTarget) => {
                 Err(ParseError(format!(
                     "{} requires a Backend connection target",
                     command.display_name()
@@ -147,14 +162,14 @@ impl CliConnectionResolver for ClientConfigCliConnectionResolver {
                 resolve_backend_url(explicit_backend_url, workspace_id)?,
                 workspace_id.map(str::to_string),
             ))),
-            (CliConnectionRequirement::ConnectionAware, CliConnectionInput::LocalTarget) => {
-                Ok(Box::new(LocalTarget::new()))
+            (CliConnectionRequirement::ConnectionAware, CliConnectionInput::StandaloneTarget) => {
+                standalone_target()
             }
             (
                 CliConnectionRequirement::ConnectionAware,
                 CliConnectionInput::DefaultTarget { workspace_id },
             ) => match read_client_default_connection()? {
-                ClientDefaultConnection::Local => Ok(Box::new(LocalTarget::new())),
+                ClientDefaultConnection::Standalone => standalone_target(),
                 ClientDefaultConnection::Backend => Ok(Box::new(BackendTarget::new(
                     resolve_backend_url(None, workspace_id)?,
                     workspace_id.map(str::to_string),
@@ -168,11 +183,11 @@ pub(crate) fn resolve_local_cli_connection<R: CliConnectionResolver + ?Sized>(
     resolver: &R,
     command: CliCommand,
 ) -> Result<Box<dyn Target>, ParseError> {
-    let target = resolver.resolve_connection(command, CliConnectionInput::LocalTarget)?;
+    let target = resolver.resolve_connection(command, CliConnectionInput::StandaloneTarget)?;
     match target.kind() {
-        TargetKind::Local => Ok(target),
+        TargetKind::Standalone => Ok(target),
         TargetKind::Backend => Err(ParseError(format!(
-            "{} resolved a Backend target where a local target was required",
+            "{} resolved a Backend target where a Standalone target was required",
             command.display_name()
         ))),
     }
@@ -193,8 +208,8 @@ pub(crate) fn resolve_backend_cli_connection<R: CliConnectionResolver + ?Sized>(
     )?;
     match target.kind() {
         TargetKind::Backend => Ok(target),
-        TargetKind::Local => Err(ParseError(format!(
-            "{} resolved a local target where a Backend target was required",
+        TargetKind::Standalone => Err(ParseError(format!(
+            "{} resolved a non-Backend target where a Backend target was required",
             command.display_name()
         ))),
     }
@@ -213,7 +228,7 @@ pub(crate) fn resolve_connection_aware_cli_connection<R: CliConnectionResolver +
         ));
     }
     if explicit_local {
-        return resolver.resolve_connection(command, CliConnectionInput::LocalTarget);
+        return resolver.resolve_connection(command, CliConnectionInput::StandaloneTarget);
     }
     if explicit_backend_url.is_some() {
         return resolver.resolve_connection(
@@ -232,7 +247,7 @@ pub(crate) fn backend_target_option_error_for_local_command(
     option: &str,
 ) -> ParseError {
     ParseError(format!(
-        "{} uses a local connection target and cannot accept Backend target option `{option}`",
+        "{} uses a host-only connection target and cannot accept Backend target option `{option}`",
         command.display_name()
     ))
 }
@@ -294,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_connection_resolver_rejects_local_only_backend_target() {
+    fn cli_connection_resolver_rejects_host_only_backend_target() {
         let resolver = ClientConfigCliConnectionResolver;
         let err = resolver
             .resolve_connection(
@@ -308,15 +323,15 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "yoi keys uses a local connection target and cannot accept Backend target options"
+            "yoi keys uses a host-only connection target and cannot accept Backend target options"
         );
     }
 
     #[test]
-    fn cli_connection_resolver_rejects_backend_only_local_target() {
+    fn cli_connection_resolver_rejects_backend_only_standalone_target() {
         let resolver = ClientConfigCliConnectionResolver;
         let err = resolver
-            .resolve_connection(CliCommand::Login, CliConnectionInput::LocalTarget)
+            .resolve_connection(CliCommand::Login, CliConnectionInput::StandaloneTarget)
             .unwrap_err();
 
         assert_eq!(
@@ -340,7 +355,7 @@ mod tests {
         let workers = target
             .list_workers(client::WorkerListRequest::new(None))
             .unwrap();
-        let backend_target = workers.backend_target.as_ref().unwrap();
+        let backend_target = workers.backend_target;
         assert_eq!(backend_target.base_url, "http://127.0.0.1:8787");
         assert_eq!(backend_target.workspace_id, None);
     }

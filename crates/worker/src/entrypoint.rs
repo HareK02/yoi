@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::{
-    PromptCatalogSource, Worker, WorkerController, WorkerFilesystemAuthority,
-    WorkerWorkspaceContext,
+    PromptCatalogSource, Worker, WorkerBootstrapLayout, WorkerControllerTransport,
+    WorkerFilesystemAuthority, WorkerWorkspaceContext, start_worker_controller,
 };
 use clap::{CommandFactory, FromArgMatches, Parser};
 use manifest::{Permission, ScopeConfig, ScopeRule, WorkerManifest, WorkerManifestConfig, paths};
@@ -184,15 +184,16 @@ fn load_spawn_config_json(
 ) -> Result<(WorkerManifest, PromptCatalogSource), String> {
     let config = serde_json::from_str::<WorkerManifestConfig>(config_json)
         .map_err(|e| format!("failed to parse --spawn-config-json: {e}"))?;
-    let manifest = WorkerManifest::try_from(WorkerManifestConfig::builtin_defaults().merge(config))
-        .map_err(|e| format!("failed to resolve --spawn-config-json: {e}"))?;
+    let manifest =
+        WorkerManifest::try_from(WorkerManifestConfig::resolution_defaults().merge(config))
+            .map_err(|e| format!("failed to resolve --spawn-config-json: {e}"))?;
     Ok((manifest, PromptCatalogSource::builtins_only()))
 }
 
 fn load_builtin_default_manifest(
     worker_name: &str,
 ) -> Result<(WorkerManifest, PromptCatalogSource), String> {
-    let mut config = WorkerManifestConfig::builtin_defaults();
+    let mut config = WorkerManifestConfig::resolution_defaults();
     config.worker.name = Some(worker_name.to_string());
     let manifest = WorkerManifest::try_from(config)
         .map_err(|e| format!("failed to resolve builtin worker defaults: {e}"))?;
@@ -259,7 +260,7 @@ fn load_single_manifest(
             absolute_path.display()
         )
     })?;
-    let mut config = WorkerManifestConfig::builtin_defaults().merge(
+    let mut config = WorkerManifestConfig::resolution_defaults().merge(
         WorkerManifestConfig::from_toml(&toml)
             .map_err(|e| format!("failed to parse manifest {}: {e}", path.display()))?
             .resolve_paths(base_dir),
@@ -633,13 +634,22 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let (handle, shutdown_rx) = match WorkerController::spawn(worker, &runtime_base).await {
-        Ok(pair) => pair,
+    let started = match start_worker_controller(
+        worker,
+        WorkerBootstrapLayout::Direct {
+            runtime_base: runtime_base.clone(),
+        },
+        WorkerControllerTransport::UnixSocket,
+    )
+    .await
+    {
+        Ok(started) => started,
         Err(e) => {
             eprintln!("error: failed to start worker controller: {e}");
             return ExitCode::FAILURE;
         }
     };
+    let (handle, shutdown_rx) = (started.handle, started.shutdown);
 
     let socket_path = handle.runtime_dir.socket_path();
     // Machine-readable ready line for parents that spawned this Worker

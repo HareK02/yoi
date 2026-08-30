@@ -9,7 +9,6 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
     future::Future,
     path::PathBuf,
     pin::Pin,
@@ -3722,94 +3721,6 @@ fn builtin_profile_config_bundle(
     .with_computed_digest())
 }
 
-fn builtin_profile_source_archive(
-    profile: &ProfileSelector,
-) -> Result<ProfileSourceArchive, String> {
-    let selected = embedded_profile_label(profile)
-        .ok_or_else(|| "profile selector must identify a concrete profile".to_string())?;
-    let selected_path = embedded_profile_path(profile)?;
-    let mut entrypoints = BTreeMap::new();
-    for slug in [
-        "companion",
-        "intake",
-        "orchestrator",
-        "coder",
-        "reviewer",
-        "memory-consolidation",
-    ] {
-        entrypoints.insert(format!("builtin:{slug}"), format!("profiles/{slug}.dcdl"));
-    }
-    entrypoints.insert(selected, selected_path);
-
-    let mut sources = BTreeMap::new();
-    sources.insert(
-        "profiles/base.dcdl".to_string(),
-        include_str!("../../../resources/profiles/base.dcdl").to_string(),
-    );
-    sources.insert(
-        "profiles/companion.dcdl".to_string(),
-        include_str!("../../../resources/profiles/companion.dcdl").to_string(),
-    );
-    sources.insert(
-        "profiles/intake.dcdl".to_string(),
-        include_str!("../../../resources/profiles/intake.dcdl").to_string(),
-    );
-    sources.insert(
-        "profiles/orchestrator.dcdl".to_string(),
-        include_str!("../../../resources/profiles/orchestrator.dcdl").to_string(),
-    );
-    sources.insert(
-        "profiles/coder.dcdl".to_string(),
-        include_str!("../../../resources/profiles/coder.dcdl").to_string(),
-    );
-    sources.insert(
-        "profiles/reviewer.dcdl".to_string(),
-        include_str!("../../../resources/profiles/reviewer.dcdl").to_string(),
-    );
-    sources.insert(
-        "profiles/memory-consolidation.dcdl".to_string(),
-        include_str!("../../../resources/profiles/memory-consolidation.dcdl").to_string(),
-    );
-
-    let mut imports = BTreeMap::new();
-    for slug in [
-        "companion",
-        "intake",
-        "orchestrator",
-        "coder",
-        "reviewer",
-        "memory-consolidation",
-    ] {
-        imports.insert(
-            format!("profiles/{slug}.dcdl\0./base.dcdl"),
-            "profiles/base.dcdl".to_string(),
-        );
-    }
-
-    ProfileSourceArchive::build(ProfileSourceArchiveInput {
-        id: "builtin-decodal-profiles-v1".to_string(),
-        entrypoints,
-        imports,
-        sources,
-    })
-    .map_err(|err| err.to_string())
-}
-
-fn embedded_profile_path(profile: &ProfileSelector) -> Result<String, String> {
-    match profile {
-        ProfileSelector::Builtin(name) => match name.strip_prefix("builtin:").unwrap_or(name) {
-            "companion" => Ok("profiles/companion.dcdl".to_string()),
-            "intake" => Ok("profiles/intake.dcdl".to_string()),
-            "orchestrator" => Ok("profiles/orchestrator.dcdl".to_string()),
-            "coder" => Ok("profiles/coder.dcdl".to_string()),
-            "reviewer" => Ok("profiles/reviewer.dcdl".to_string()),
-            "memory-consolidation" => Ok("profiles/memory-consolidation.dcdl".to_string()),
-            other => Err(format!("unknown builtin profile selector: builtin:{other}")),
-        },
-        ProfileSelector::Named(name) => Err(format!("unknown named profile selector: {name}")),
-    }
-}
-
 fn embedded_profile_label(profile: &ProfileSelector) -> Option<String> {
     Some(match profile {
         ProfileSelector::Builtin(name) | ProfileSelector::Named(name) => {
@@ -3823,6 +3734,39 @@ fn embedded_profile_label(profile: &ProfileSelector) -> Option<String> {
             }
         }
     })
+}
+
+fn builtin_profile_source_archive(
+    profile: &ProfileSelector,
+) -> Result<ProfileSourceArchive, String> {
+    let selected_profile = match profile {
+        ProfileSelector::Builtin(name) => {
+            if name.starts_with("builtin:") {
+                name.clone()
+            } else {
+                format!("builtin:{name}")
+            }
+        }
+        ProfileSelector::Named(name) => {
+            return Err(format!(
+                "embedded runtime does not provide named Profile `{name}`"
+            ));
+        }
+    };
+    let catalog = manifest::builtin_profile_catalog_snapshot();
+    if !catalog.entrypoints.contains_key(&selected_profile) {
+        return Err(format!(
+            "embedded runtime does not provide Profile `{selected_profile}`"
+        ));
+    }
+
+    ProfileSourceArchive::build(ProfileSourceArchiveInput {
+        id: catalog.id.to_owned(),
+        sources: catalog.sources,
+        entrypoints: catalog.entrypoints,
+        imports: catalog.imports,
+    })
+    .map_err(|error| format!("failed to build built-in Profile source archive: {error}"))
 }
 
 const MEMORY_CONSOLIDATION_PROFILE: &str = "memory-consolidation";
@@ -4453,6 +4397,37 @@ mod tests {
         assert!(companion.feature.worker.enabled);
         assert!(!companion.feature.worker.direct_spawn);
         assert!(companion.feature.workspace_worker_discovery.enabled);
+        let default_from_archive = archive
+            .resolve_profile("builtin:default", root.path(), "embedded-test-default")
+            .unwrap();
+        let default_from_native = manifest::ProfileResolver::new()
+            .with_workspace_base(root.path())
+            .resolve(
+                &manifest::ProfileSelector::source_named(
+                    manifest::ProfileRegistrySource::Builtin,
+                    "default",
+                ),
+                manifest::ProfileResolveOptions::with_worker_name("embedded-test-default"),
+            )
+            .unwrap()
+            .manifest;
+        let mut archive_value = serde_json::to_value(&default_from_archive).unwrap();
+        let mut native_value = serde_json::to_value(&default_from_native).unwrap();
+        let archive_profile = archive_value
+            .as_object_mut()
+            .and_then(|value| value.remove("profile"))
+            .expect("archive resolution records Profile provenance");
+        let native_profile = native_value
+            .as_object_mut()
+            .and_then(|value| value.remove("profile"))
+            .expect("native resolution records Profile provenance");
+        assert_eq!(archive_value, native_value);
+        assert_eq!(archive_profile["source"]["kind"], "archive");
+        assert_eq!(native_profile["source"]["kind"], "registry");
+        assert!(default_from_archive.feature.sub_worker.enabled);
+        assert!(!default_from_archive.feature.ticket.enabled);
+        assert!(!default_from_archive.feature.objective.enabled);
+
         let coder = archive
             .resolve_profile("builtin:coder", root.path(), "embedded-test-coder")
             .unwrap();

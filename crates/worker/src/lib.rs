@@ -1,3 +1,4 @@
+pub mod bootstrap;
 pub mod compact;
 pub mod controller;
 pub mod discovery;
@@ -10,6 +11,7 @@ pub mod ipc;
 pub mod model_client;
 pub mod prompt;
 pub mod runtime;
+pub mod runtime_command;
 pub mod segment_log_sink;
 mod session_capture;
 mod session_history;
@@ -23,6 +25,10 @@ mod interrupt_prep;
 mod permission;
 mod worker;
 
+pub use bootstrap::{
+    BootstrappedWorker, PreparedWorker, WorkerBootstrap, WorkerBootstrapError,
+    WorkerBootstrapLayout, start_worker_controller,
+};
 pub use compact::token_counter::{EstimateSource, SplitPoint, TokenEstimate};
 pub use controller::{ShutdownReceiver, WorkerController, WorkerControllerTransport, WorkerHandle};
 pub use hook::{Hook, HookEventKind, HookRegistryBuilder};

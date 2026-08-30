@@ -237,6 +237,20 @@ impl WorkerController {
         .await
     }
 
+    /// Spawn a direct Worker while letting an in-process host select the
+    /// controller transport explicitly.
+    pub async fn spawn_with_transport<C, St>(
+        worker: Worker<C, St>,
+        runtime_base: &Path,
+        transport: WorkerControllerTransport,
+    ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
+    where
+        C: LlmClient + Clone + 'static,
+        St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+    {
+        Self::spawn_inner(worker, runtime_base, false, None, transport).await
+    }
+
     /// Spawn a Worker owned by `worker-runtime`.
     ///
     /// The controller still uses an ephemeral directory for Unix sockets and

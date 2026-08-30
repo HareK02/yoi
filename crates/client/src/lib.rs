@@ -1,21 +1,13 @@
-//! Worker プロトコルを喋るクライアント。
+//! Backend Workspace/Runtime と既存 Worker protocol へ接続するクライアント。
 //!
-//! - [`WorkerClient`]: 既存 worker の Unix ソケットへ接続して `Method` を送り、
-//!   `Event` を受け取る低レベル接続。
-//! - [`spawn`]: worker バイナリをサブプロセスとして起動し、`YOI-READY`
-//!   ハンドシェイクが終わるまで待つフロー。subprocess を立ち上げる必要が
-//!   ない呼び出し側 (=既存 worker に attach する場合) は使わなくてよい。
-//!
-//! TUI / GUI / E2E ハーネスはこの crate に依存して protocol を喋る。
+//! Standalone execution is owned by the `standalone` crate and does not spawn
+//! a Worker subprocess through this crate.
 
 pub mod backend_api;
 mod backend_auth;
 pub mod backend_runtime;
 pub mod backend_workspace;
-pub mod runtime_command;
-pub mod spawn;
 pub mod target;
-pub mod ticket_role;
 mod worker_client;
 mod workspace_product;
 
@@ -40,22 +32,10 @@ pub use backend_workspace::{
     CreateBackendWorkspaceRepository, CreateBackendWorkspaceRequest,
     CreateBackendWorkspaceResponse, create_backend_workspace, list_backend_workspaces,
 };
-pub use runtime_command::WorkerRuntimeCommand;
 pub use target::{
-    BackendTarget, Dashboard, LocalTarget, ResolvedTarget, Target, TargetError, TargetKind,
-    WorkerByName, WorkerConnection, WorkerConnectionSelector, WorkerList, WorkerListRequest,
-    WorkerResume, WorkerSpawn,
-};
-
-pub use spawn::{
-    SpawnConfig, SpawnError, SpawnReady, WorkerProcessLaunchConfig, WorkerProcessLaunchOptions,
-    spawn_worker, spawn_worker_with_options,
-};
-pub use ticket_role::{
-    TicketRef, TicketRoleLaunchContext, TicketRoleLaunchError, TicketRoleLaunchOptions,
-    TicketRoleLaunchPlan, TicketRoleLaunchResult, TicketRolePreRunWarning,
-    launch_ticket_role_worker, launch_ticket_role_worker_with_options, plan_ticket_role_launch,
-    plan_ticket_role_launch_with_config,
+    BackendTarget, Dashboard, ResolvedTarget, StandaloneSessionListIntent,
+    StandaloneSessionResumeIntent, StandaloneTarget, Target, TargetError, TargetKind,
+    WorkerConnection, WorkerConnectionSelector, WorkerList, WorkerListRequest, WorkerSpawn,
 };
 pub use worker_client::WorkerClient;
 pub use workspace_api::{ObjectiveDetail, ObjectiveSummary};

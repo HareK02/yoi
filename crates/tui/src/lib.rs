@@ -8,24 +8,19 @@ mod command;
 mod composer_history;
 mod composer_keys;
 mod console;
-mod dashboard;
 #[cfg(feature = "e2e-test")]
 mod e2e_observer;
 mod input;
 pub mod keys;
 mod markdown;
-mod picker;
-mod role_session_registry;
 mod scroll;
 pub mod setup_model;
-mod spawn;
+mod standalone_picker;
 mod task;
 mod text_selection;
 mod tool;
 mod ui;
 mod view_mode;
-mod worker_list;
-mod workspace_panel;
 
 use std::io;
 use std::path::PathBuf;
@@ -34,7 +29,6 @@ use std::process::ExitCode;
 use crossterm::event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste};
 use crossterm::execute;
 use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
-use session_store::SegmentId;
 
 use client::{Target, WorkerConnectionSelector, WorkerListRequest};
 
@@ -47,42 +41,69 @@ pub struct LaunchOptions {
 
 #[derive(Debug, Clone)]
 pub enum LaunchMode {
+    /// Start one client-owned in-process Standalone Worker.
     Spawn {
         worker_name: Option<String>,
         profile: Option<String>,
     },
-    /// `yoi --worker <name>`: attach to a live Worker by name if possible;
-    /// otherwise launch the Worker runtime command with `--worker <name>` so it
-    /// resumes from name-keyed state or creates a fresh same-name Worker.
-    WorkerName {
-        worker_name: String,
-        socket_override: Option<PathBuf>,
-    },
-    /// `yoi workers` / `yoi --backend <url>`: list workers through the selected
-    /// connection target, then attach to the selected Worker.
+    /// Restore one client-owned standalone session. The current cwd is the default scope;
+    /// `include_all` opts into all standalone sessions under the same client data root.
+    StandaloneResume { include_all: bool },
+    /// List Backend Workers and attach to the selected Worker.
     Workers {
         runtime_id: Option<String>,
         include_stopped: bool,
-        all: bool,
     },
-    /// `yoi --backend <url> --runtime-id <id> --worker-id <id>`: open one Worker
-    /// through the selected connection target.
+    /// Open one Backend Worker through the selected connection target.
     OpenWorker {
         runtime_id: String,
         worker_id: String,
     },
-    /// `yoi resume`: open the Worker picker, then attach to the selected live Worker
-    /// or restore the selected stopped Worker by name. Without `--all`, the picker
-    /// is scoped to the current runtime workspace.
-    Resume { all: bool },
-    /// `yoi --session <UUID>`: skip the picker, go straight to the
-    /// resume name dialog with `id` baked in.
-    ResumeWithSession {
-        id: SegmentId,
-        worker_name: Option<String>,
-    },
-    /// `yoi panel`: open the workspace Dashboard from the current workspace.
-    Panel { include_stopped: bool },
+    /// Open the Backend Workspace dashboard.
+    Panel,
+}
+
+struct TerminalModeGuard {
+    active: bool,
+}
+
+impl TerminalModeGuard {
+    fn new() -> Self {
+        Self { active: true }
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        self.active = false;
+        let mut stdout = io::stdout();
+        execute!(
+            stdout,
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            DisableBracketedPaste,
+            crossterm::cursor::Show
+        )?;
+        disable_raw_mode()
+    }
+}
+
+impl Drop for TerminalModeGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let mut stdout = io::stdout();
+            let _ = execute!(
+                stdout,
+                DisableMouseCapture,
+                LeaveAlternateScreen,
+                DisableBracketedPaste,
+                crossterm::cursor::Show
+            );
+            let _ = disable_raw_mode();
+            self.active = false;
+        }
+    }
 }
 
 pub async fn launch(options: LaunchOptions) -> ExitCode {
@@ -109,6 +130,7 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
         eprintln!("yoi: {e}");
         return ExitCode::FAILURE;
     }
+    let mut terminal_mode = TerminalModeGuard::new();
 
     let result = match mode {
         LaunchMode::Spawn {
@@ -116,49 +138,34 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
             profile,
         } => match target.spawn_worker() {
             Ok(spawn) => {
-                console::run_spawn(None, worker_name, profile, spawn.runtime_command).await
-            }
-            Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
-        },
-        LaunchMode::WorkerName {
-            worker_name,
-            socket_override,
-        } => match target.worker_by_name() {
-            Ok(worker_by_name) => {
-                console::run_worker_name(
+                console::run_standalone(
+                    workspace_root.clone(),
+                    spawn.state_dir,
                     worker_name,
-                    socket_override,
-                    worker_by_name.runtime_command,
+                    profile,
                 )
                 .await
             }
             Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
         },
+        LaunchMode::StandaloneResume { include_all } => {
+            match standalone_picker::pick(target.as_ref(), include_all) {
+                Ok(Some(intent)) => console::run_standalone_restore(intent).await,
+                Ok(None) => Ok(()),
+                Err(error) => Err(Box::new(error) as Box<dyn std::error::Error>),
+            }
+        }
         LaunchMode::Workers {
             runtime_id,
             include_stopped,
-            all,
         } => match target.list_workers(if include_stopped {
             WorkerListRequest::with_stopped(runtime_id)
         } else {
             WorkerListRequest::new(runtime_id)
         }) {
             Ok(worker_list) => {
-                if let Some(target) = worker_list.backend_target {
-                    backend_worker_picker::run(target, worker_list.include_stopped).await
-                } else if let Some(runtime_command) = worker_list.local_runtime_command {
-                    console::run_worker_picker(
-                        runtime_command,
-                        workspace_root.clone(),
-                        all,
-                        worker_list.include_stopped,
-                    )
+                backend_worker_picker::run(worker_list.backend_target, worker_list.include_stopped)
                     .await
-                } else {
-                    Err(Box::new(io::Error::other(
-                        "worker list target did not include a local or backend source",
-                    )) as Box<dyn std::error::Error>)
-                }
             }
             Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
         },
@@ -169,26 +176,10 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
             Ok(connection) => console::run_backend_runtime(connection.target).await,
             Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
         },
-        LaunchMode::Resume { all } => match target.resume_worker() {
-            Ok(resume) => {
-                console::run_resume(resume.runtime_command, workspace_root.clone(), all).await
+        LaunchMode::Panel => match target.dashboard() {
+            Ok(dashboard) => {
+                backend_dashboard::launch(dashboard.base_url, dashboard.workspace_id).await
             }
-            Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
-        },
-        LaunchMode::ResumeWithSession { id, worker_name } => match target.spawn_worker() {
-            Ok(spawn) => {
-                console::run_spawn(Some(id), worker_name, None, spawn.runtime_command).await
-            }
-            Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
-        },
-        LaunchMode::Panel { include_stopped } => match target.dashboard() {
-            Ok(client::Dashboard::Local { runtime_command }) => {
-                dashboard::launch(runtime_command, include_stopped).await
-            }
-            Ok(client::Dashboard::Backend {
-                base_url,
-                workspace_id,
-            }) => backend_dashboard::launch(base_url, workspace_id).await,
             Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
         },
     };
@@ -198,15 +189,7 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
     // alternate-screen buffer.
     #[cfg(feature = "e2e-test")]
     e2e_observer::emit("tui", "terminal_cleanup_started", serde_json::json!({}));
-    let mut stdout = io::stdout();
-    let _ = execute!(
-        stdout,
-        DisableMouseCapture,
-        LeaveAlternateScreen,
-        DisableBracketedPaste
-    );
-    let _ = disable_raw_mode();
-    let _ = execute!(stdout, crossterm::cursor::Show);
+    let _ = terminal_mode.restore();
     #[cfg(feature = "e2e-test")]
     e2e_observer::emit("tui", "terminal_cleanup_finished", serde_json::json!({}));
 
@@ -217,14 +200,7 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            // SpawnError has already been painted into the inline
-            // viewport's final frame, so it's already visible in the
-            // user's scrollback — printing it again would be a noisy
-            // duplicate. Other errors (worker-name failures, terminal setup
-            // hiccups, etc.) need surfacing here.
-            if e.downcast_ref::<spawn::SpawnError>().is_none() {
-                eprintln!("yoi: {e}");
-            }
+            eprintln!("yoi: {e}");
             #[cfg(feature = "e2e-test")]
             e2e_observer::emit("tui", "exit", serde_json::json!({ "status": "failure" }));
             ExitCode::FAILURE

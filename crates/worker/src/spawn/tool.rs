@@ -403,11 +403,10 @@ impl Tool for SubWorkerSpawnTool {
             allow: scope_allow.clone(),
             deny: Vec::new(),
         };
-        let mut child_manifest =
-            WorkerManifest::try_from(WorkerManifestConfig::builtin_defaults().merge(child_config))
-                .map_err(|error| {
-                    ToolError::ExecutionFailed(format!("resolve child manifest: {error}"))
-                })?;
+        let mut child_manifest = WorkerManifest::try_from(
+            WorkerManifestConfig::resolution_defaults().merge(child_config),
+        )
+        .map_err(|error| ToolError::ExecutionFailed(format!("resolve child manifest: {error}")))?;
         // Delegated children stay bound to their scoped session and cannot use
         // Workspace attachment tools to replace it with parent-level authority.
         child_manifest.feature.manage_workdir.enabled = false;
@@ -1625,7 +1624,7 @@ max_tokens = 3333
             Some(true)
         );
 
-        let manifest: WorkerManifest = WorkerManifestConfig::builtin_defaults()
+        let manifest: WorkerManifest = WorkerManifestConfig::resolution_defaults()
             .merge(parsed)
             .try_into()
             .unwrap();
@@ -1845,7 +1844,7 @@ max_tokens = 3333
     }
 
     #[test]
-    fn invalid_ambiguous_and_no_default_diagnostics_include_available_selectors() {
+    fn invalid_and_ambiguous_diagnostics_include_available_selectors() {
         let tmp = TempDir::new().unwrap();
         let project = tmp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -1863,17 +1862,21 @@ max_tokens = 3333
         assert!(invalid.contains("Use `default`, `inherit`"));
         assert!(invalid.contains("`project:coder`"));
 
-        let default_error = build_spawn_config_json_for_profile(
-            &parent,
-            &available,
-            &project,
-            "child",
-            None,
-            &scope,
-            SpawnProfileSelector::Default,
+        let default_config: serde_json::Value = serde_json::from_str(
+            &build_spawn_config_json_for_profile(
+                &parent,
+                &available,
+                &project,
+                "child",
+                None,
+                &scope,
+                SpawnProfileSelector::Default,
+            )
+            .unwrap(),
         )
-        .unwrap_err();
-        assert!(default_error.contains("no default profile is configured"));
+        .unwrap();
+        assert_eq!(default_config["feature"]["sub_worker"]["enabled"], true);
+        assert_eq!(default_config["feature"]["ticket"]["enabled"], false);
 
         let user_config = tmp.path().join("user-profiles.toml");
         std::fs::write(&user_config, "[profile]\ncoder = \"user-coder.toml\"\n").unwrap();

@@ -6,9 +6,14 @@
 //! from launch context.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::builtin_profile::{
+    BUILTIN_DEFAULT_PROFILE, builtin_profile_catalog_snapshot, builtin_profile_entrypoints,
+    resolve_builtin_profile_artifact,
+};
 use crate::config::{
     CompactionConfigPartial, FeatureConfigPartial, PermissionConfigPartial, SessionConfigPartial,
 };
@@ -22,45 +27,6 @@ use crate::{
 
 const PROFILE_FORMAT_V1: &str = "yoi.profile.v1";
 const BUILTIN_MODEL_CATALOG: &str = include_str!("../../../resources/models/builtin.toml");
-
-struct BuiltinProfile {
-    name: &'static str,
-    label: &'static str,
-    description: &'static str,
-}
-
-const BUILTIN_PROFILES: &[BuiltinProfile] = &[
-    BuiltinProfile {
-        name: "companion",
-        label: "builtin:companion",
-        description: "Bundled Companion role profile",
-    },
-    BuiltinProfile {
-        name: "intake",
-        label: "builtin:intake",
-        description: "Bundled Intake role profile",
-    },
-    BuiltinProfile {
-        name: "orchestrator",
-        label: "builtin:orchestrator",
-        description: "Bundled Orchestrator role profile",
-    },
-    BuiltinProfile {
-        name: "coder",
-        label: "builtin:coder",
-        description: "Bundled Coder role profile",
-    },
-    BuiltinProfile {
-        name: "reviewer",
-        label: "builtin:reviewer",
-        description: "Bundled Reviewer role profile",
-    },
-    BuiltinProfile {
-        name: "memory-consolidation",
-        label: "builtin:memory-consolidation",
-        description: "Bundled Memory staging consolidation profile",
-    },
-];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -159,6 +125,108 @@ impl ProfileSelector {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileExecutionTarget {
+    Workspace,
+    Standalone,
+}
+
+impl fmt::Display for ProfileExecutionTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Workspace => formatter.write_str("workspace"),
+            Self::Standalone => formatter.write_str("standalone"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WorkspaceAuthorityRequirement {
+    Flow,
+    ManageWorkdir,
+    Memory,
+    MergeRequest,
+    Objective,
+    Orchestration,
+    Plugins,
+    Ticket,
+    Worker,
+}
+
+impl fmt::Display for WorkspaceAuthorityRequirement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Flow => formatter.write_str("feature.flow"),
+            Self::ManageWorkdir => formatter.write_str("feature.manage_workdir"),
+            Self::Memory => formatter.write_str("feature.memory"),
+            Self::MergeRequest => formatter.write_str("feature.merge_request"),
+            Self::Objective => formatter.write_str("feature.objective"),
+            Self::Orchestration => formatter.write_str("feature.orchestration"),
+            Self::Plugins => formatter.write_str("feature.plugins or plugin packages"),
+            Self::Ticket => formatter.write_str("feature.ticket"),
+            Self::Worker => formatter.write_str("feature.worker"),
+        }
+    }
+}
+
+pub fn validate_profile_execution_target(
+    manifest: &WorkerManifest,
+    target: ProfileExecutionTarget,
+) -> Result<(), ProfileError> {
+    if target == ProfileExecutionTarget::Workspace {
+        return Ok(());
+    }
+
+    let feature = &manifest.feature;
+    let mut requirements = BTreeSet::new();
+    if feature.flow.enabled {
+        requirements.insert(WorkspaceAuthorityRequirement::Flow);
+    }
+    if feature.manage_workdir.enabled {
+        requirements.insert(WorkspaceAuthorityRequirement::ManageWorkdir);
+    }
+    if feature.memory.enabled || feature.memory.staging {
+        requirements.insert(WorkspaceAuthorityRequirement::Memory);
+    }
+    if feature.merge_request.show
+        || feature.merge_request.open
+        || feature.merge_request.review
+        || feature.merge_request.readiness_check
+        || feature.merge_request.complete
+    {
+        requirements.insert(WorkspaceAuthorityRequirement::MergeRequest);
+    }
+    if feature.objective.enabled {
+        requirements.insert(WorkspaceAuthorityRequirement::Objective);
+    }
+    if feature.orchestration.enabled {
+        requirements.insert(WorkspaceAuthorityRequirement::Orchestration);
+    }
+    if feature.plugins.enabled || !manifest.plugins.is_empty() {
+        requirements.insert(WorkspaceAuthorityRequirement::Plugins);
+    }
+    if feature.ticket.enabled
+        || feature.ticket.authoring
+        || feature.ticket.thread
+        || feature.ticket.intake
+        || feature.ticket.workflow
+    {
+        requirements.insert(WorkspaceAuthorityRequirement::Ticket);
+    }
+    if feature.worker.enabled {
+        requirements.insert(WorkspaceAuthorityRequirement::Worker);
+    }
+
+    if requirements.is_empty() {
+        Ok(())
+    } else {
+        Err(ProfileError::UnsupportedExecutionTarget {
+            target,
+            requirements: requirements.into_iter().collect(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProfileSource {
@@ -217,13 +285,14 @@ impl ProfileRegistryEntry {
         source: ProfileRegistrySource,
         name: &'static str,
         label: &'static str,
+        provenance: String,
         description: Option<String>,
     ) -> Self {
         Self {
             source,
             name: name.to_string(),
             path: None,
-            provenance: label.to_string(),
+            provenance,
             description,
             is_default: false,
             artifact: ProfileRegistryArtifact::Builtin { label },
@@ -321,11 +390,15 @@ pub struct ProfileDiscovery {
 }
 
 impl ProfileDiscovery {
-    pub fn for_cwd(_cwd: &Path) -> Self {
+    pub fn user_settings() -> Self {
         Self {
             user_config: paths::user_profiles_path(),
             project_config: None,
         }
+    }
+
+    pub fn for_cwd(_cwd: &Path) -> Self {
+        Self::user_settings()
     }
     pub fn with_sources(user_config: Option<PathBuf>, project_config: Option<PathBuf>) -> Self {
         Self {
@@ -412,14 +485,21 @@ impl ProfileResolver {
                 options,
             ),
             ProfileSelector::Named { .. } | ProfileSelector::Default => {
-                let cwd = std::env::current_dir().map_err(|source| ProfileError::CommandIo {
-                    path: PathBuf::from("."),
-                    source,
-                })?;
-                let registry = ProfileDiscovery::for_cwd(&cwd).discover()?;
+                let registry = ProfileDiscovery::user_settings().discover()?;
                 self.resolve_from_registry(selector, &registry, options)
             }
         }
+    }
+
+    pub fn resolve_for_target(
+        &self,
+        selector: &ProfileSelector,
+        options: ProfileResolveOptions,
+        target: ProfileExecutionTarget,
+    ) -> Result<ResolvedProfile, ProfileError> {
+        let resolved = self.resolve(selector, options)?;
+        validate_profile_execution_target(&resolved.manifest, target)?;
+        Ok(resolved)
     }
     /// Resolve a registry/default selector against an already-discovered
     /// registry. Callers such as SubWorkerSpawn use this to bind discovery to the
@@ -503,7 +583,7 @@ impl ProfileResolver {
                 .as_deref()
                 .unwrap_or_else(|| Path::new(".")),
         )?;
-        let raw_artifact = builtin_profile_artifact(label).ok_or_else(|| {
+        let raw_artifact = resolve_builtin_profile_artifact(label)?.ok_or_else(|| {
             ProfileError::InvalidProfile(format!("unknown builtin profile artifact `{label}`"))
         })?;
         resolve_profile_value(
@@ -565,7 +645,8 @@ fn resolve_profile_value(
         memory: profile.memory.map(Into::into),
         skills: profile.skills,
     };
-    let config = WorkerManifestConfig::builtin_defaults().merge(config.resolve_paths(profile_dir));
+    let config =
+        WorkerManifestConfig::resolution_defaults().merge(config.resolve_paths(profile_dir));
     let mut manifest = WorkerManifest::try_from(config).map_err(ProfileError::ManifestResolve)?;
     manifest.profile = Some(ProfileManifestSnapshot {
         source: source.clone(),
@@ -759,14 +840,30 @@ fn load_profile_registry_file(
 }
 
 fn add_builtin_profiles(registry: &mut ProfileRegistry) {
-    for profile in BUILTIN_PROFILES {
+    let catalog = builtin_profile_catalog_snapshot();
+    let digest = catalog.digest();
+    for profile in builtin_profile_entrypoints() {
+        let label = profile
+            .selector
+            .expect("built-in Profile entrypoint must have a selector");
+        let name = label
+            .strip_prefix("builtin:")
+            .expect("built-in Profile selector must be source-qualified");
         registry.push_entry(ProfileRegistryEntry::embedded(
             ProfileRegistrySource::Builtin,
-            profile.name,
-            profile.label,
+            name,
+            label,
+            format!("{}#{digest}", profile.path),
             Some(profile.description.into()),
         ));
     }
+    registry.set_default(ProfileDefault {
+        source: Some(ProfileRegistrySource::Builtin),
+        name: BUILTIN_DEFAULT_PROFILE
+            .strip_prefix("builtin:")
+            .expect("built-in default selector must be source-qualified")
+            .to_owned(),
+    });
 }
 
 fn parse_profile_ref(raw: &str) -> (Option<ProfileRegistrySource>, String) {
@@ -802,203 +899,6 @@ fn read_profile_artifact_file(path: &Path) -> Result<serde_json::Value, ProfileE
             ),
         }),
     }
-}
-
-fn builtin_profile_artifact(label: &str) -> Option<serde_json::Value> {
-    let mut value = builtin_base_profile_artifact();
-    match label {
-        "builtin:companion" | "companion" => {
-            apply_role_profile(
-                &mut value,
-                "companion",
-                "Workspace companion profile.",
-                "workspace_write",
-                true,
-                true,
-                true,
-                true,
-            );
-            Some(value)
-        }
-        "builtin:intake" | "intake" => {
-            apply_role_profile(
-                &mut value,
-                "intake",
-                "Ticket intake profile.",
-                "workspace_write",
-                true,
-                true,
-                true,
-                false,
-            );
-            Some(value)
-        }
-        "builtin:orchestrator" | "orchestrator" => {
-            apply_role_profile(
-                &mut value,
-                "orchestrator",
-                "Ticket orchestrator profile.",
-                "workspace_write",
-                true,
-                true,
-                true,
-                false,
-            );
-            Some(value)
-        }
-        "builtin:coder" | "coder" => {
-            apply_role_profile(
-                &mut value,
-                "coder",
-                "Ticket implementation coder profile.",
-                "workspace_write",
-                true,
-                true,
-                true,
-                true,
-            );
-            Some(value)
-        }
-        "builtin:reviewer" | "reviewer" => {
-            apply_role_profile(
-                &mut value,
-                "reviewer",
-                "Ticket review profile.",
-                "workspace_read",
-                true,
-                true,
-                true,
-                false,
-            );
-            Some(value)
-        }
-        "builtin:memory-consolidation" | "memory-consolidation" => {
-            value["slug"] = serde_json::Value::String("memory-consolidation".to_string());
-            value["description"] =
-                serde_json::Value::String("Memory staging consolidation profile.".to_string());
-            value["feature"]["task"] = serde_json::json!({ "enabled": false });
-            value["feature"]["memory"] = serde_json::json!({ "enabled": true, "staging": true });
-            value["feature"]["web"] = serde_json::json!({ "enabled": false });
-            value["feature"]["sub_worker"] = serde_json::json!({ "enabled": false });
-            value["feature"]["objective"] = serde_json::json!({ "enabled": false });
-            value["feature"]["ticket"] = serde_json::json!({ "enabled": false, "thread": false });
-            Some(value)
-        }
-        _ => None,
-    }
-}
-
-fn builtin_base_profile_artifact() -> serde_json::Value {
-    serde_json::json!({
-        "slug": "default",
-        "description": "Default Yoi coding profile.",
-        "model": { "ref": "codex-oauth/gpt-5.5" },
-        "session": { "record_event_trace": true },
-        "engine": { "reasoning": "high" },
-        "compaction": {
-            "kind": "tokens",
-            "threshold": 240000,
-            "request_threshold": 270000,
-            "worker_context_max_tokens": 100000
-        },
-        "feature": {
-            "task": { "enabled": true },
-            "memory": { "enabled": true },
-            "web": { "enabled": true },
-            "image": { "enabled": true },
-            "sub_worker": { "enabled": true },
-            "worker": { "enabled": false },
-            "objective": { "enabled": true },
-            "ticket": { "enabled": true, "authoring": true, "thread": true }
-        },
-        "memory": {
-            "extract_threshold": 50000,
-            "consolidation_threshold_files": 5,
-            "consolidation_threshold_bytes": 50000
-        },
-        "web": {
-            "enabled": true,
-            "search": {
-                "provider": "brave",
-                "api_key_secret": "web/brave/default"
-            }
-        }
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn apply_role_profile(
-    value: &mut serde_json::Value,
-    slug: &str,
-    description: &str,
-    _scope: &str,
-    task: bool,
-    memory: bool,
-    web: bool,
-    sub_worker: bool,
-) {
-    value["slug"] = serde_json::Value::String(slug.to_string());
-    value["description"] = serde_json::Value::String(description.to_string());
-    value["feature"]["task"] = serde_json::json!({ "enabled": task });
-    value["feature"]["memory"] = serde_json::json!({ "enabled": memory });
-    value["feature"]["web"] = serde_json::json!({ "enabled": web });
-    value["feature"]["image"] = serde_json::json!({ "enabled": true });
-    value["feature"]["sub_worker"] = serde_json::json!({ "enabled": sub_worker });
-    value["feature"]["flow"] = serde_json::json!({ "enabled": slug == "coder" });
-    value["feature"]["worker"] = serde_json::json!({
-        "enabled": matches!(slug, "companion" | "orchestrator"),
-        "direct_spawn": !matches!(slug, "companion" | "orchestrator")
-    });
-    value["feature"]["workspace_worker_discovery"] =
-        serde_json::json!({ "enabled": slug == "companion" });
-    value["feature"]["manage_workdir"] = serde_json::json!({
-        "enabled": matches!(slug, "companion" | "orchestrator")
-    });
-    value["feature"]["orchestration"] = serde_json::json!({ "enabled": slug == "orchestrator" });
-    let ticket = match slug {
-        "companion" => serde_json::json!({ "enabled": true, "authoring": true, "thread": true }),
-        "intake" => {
-            serde_json::json!({ "enabled": true, "authoring": true, "thread": true, "intake": true })
-        }
-        "orchestrator" => {
-            serde_json::json!({ "enabled": true, "thread": true, "workflow": true })
-        }
-        "coder" => serde_json::json!({ "enabled": true, "thread": true }),
-        "reviewer" => serde_json::json!({ "enabled": true, "thread": true }),
-        _ => serde_json::json!({ "enabled": true, "authoring": true, "thread": true }),
-    };
-    value["feature"]["ticket"] = ticket;
-    let merge_request = match slug {
-        "coder" => serde_json::json!({
-            "show": true,
-            "open": true,
-            "review": false,
-            "readiness_check": false,
-            "complete": false
-        }),
-        "reviewer" => serde_json::json!({
-            "show": true,
-            "open": false,
-            "review": true,
-            "readiness_check": false,
-            "complete": false
-        }),
-        "orchestrator" => serde_json::json!({
-            "show": true,
-            "open": false,
-            "review": false,
-            "readiness_check": true,
-            "complete": true
-        }),
-        _ => serde_json::json!({
-            "show": false,
-            "open": false,
-            "review": false,
-            "readiness_check": false,
-            "complete": false
-        }),
-    };
-    value["feature"]["merge_request"] = merge_request;
 }
 
 fn reject_manifest_shaped_profile(value: &serde_json::Value) -> Result<(), ProfileError> {
@@ -1290,6 +1190,13 @@ pub enum ProfileError {
         #[source]
         source: toml::de::Error,
     },
+    #[error("failed to evaluate built-in Profile `{selector}`: {message}")]
+    BuiltinProfileEvaluation { selector: String, message: String },
+    #[error("Profile requires unsupported {target} launch authorities: {requirements:?}")]
+    UnsupportedExecutionTarget {
+        target: ProfileExecutionTarget,
+        requirements: Vec<WorkspaceAuthorityRequirement>,
+    },
     #[error("no default profile is configured")]
     NoDefaultProfile,
     #[error("profile resolution requires an explicit runtime Worker name")]
@@ -1343,18 +1250,21 @@ mod tests {
         );
     }
     #[test]
-    fn builtin_profiles_do_not_define_an_implicit_default() {
+    fn builtin_default_is_explicit_registry_authority() {
         let registry = ProfileDiscovery::with_sources(None, None)
             .discover()
             .unwrap();
-        assert!(matches!(
-            registry.default_entry(),
-            Err(ProfileError::NoDefaultProfile)
-        ));
-        assert!(matches!(
-            registry.select(&ProfileSelector::Default),
-            Err(ProfileError::NoDefaultProfile)
-        ));
+        let default = registry.default_entry().unwrap();
+        assert_eq!(default.source, ProfileRegistrySource::Builtin);
+        assert_eq!(default.name, "default");
+        assert_eq!(default.qualified_name(), BUILTIN_DEFAULT_PROFILE);
+        assert!(default.is_default);
+        assert!(
+            default
+                .provenance
+                .starts_with("profiles/default.dcdl#sha256:")
+        );
+        assert_eq!(registry.select(&ProfileSelector::Default).unwrap(), default);
     }
     #[test]
     fn builtin_role_profiles_are_registered_and_resolve() {
@@ -1407,6 +1317,92 @@ mod tests {
                 "unexpected error for {field}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn builtin_default_resolves_as_a_standalone_local_capability_profile() {
+        let tmp = TempDir::new().unwrap();
+        let resolved = ProfileResolver::new()
+            .with_workspace_base(tmp.path())
+            .resolve_for_target(
+                &ProfileSelector::source_named(ProfileRegistrySource::Builtin, "default"),
+                ProfileResolveOptions::with_worker_name("standalone-worker"),
+                ProfileExecutionTarget::Standalone,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            &resolved.source,
+            ProfileSource::Registry {
+                source: ProfileRegistrySource::Builtin,
+                name,
+                path: None,
+                provenance: Some(provenance),
+                ..
+            } if name == "default" && provenance.starts_with("profiles/default.dcdl#sha256:")
+        ));
+        assert!(resolved.manifest.feature.task.enabled);
+        assert!(resolved.manifest.feature.web.enabled);
+        assert!(resolved.manifest.feature.image.enabled);
+        assert!(resolved.manifest.feature.sub_worker.enabled);
+        assert!(resolved.manifest.scope.allow.iter().any(|rule| {
+            rule.permission == protocol::Permission::Write && rule.target == tmp.path()
+        }));
+        assert!(resolved.manifest.delegation_scope.allow.iter().any(|rule| {
+            rule.permission == protocol::Permission::Write && rule.target == tmp.path()
+        }));
+        assert!(!resolved.manifest.feature.memory.enabled);
+        assert!(!resolved.manifest.feature.ticket.enabled);
+        assert!(!resolved.manifest.feature.objective.enabled);
+        assert!(!resolved.manifest.feature.flow.enabled);
+        assert!(!resolved.manifest.feature.worker.enabled);
+        assert!(!resolved.manifest.feature.manage_workdir.enabled);
+        assert!(!resolved.manifest.feature.plugins.enabled);
+        assert!(resolved.manifest.plugins.is_empty());
+    }
+
+    #[test]
+    fn standalone_rejects_profiles_that_require_workspace_authority() {
+        let tmp = TempDir::new().unwrap();
+        let error = ProfileResolver::new()
+            .with_workspace_base(tmp.path())
+            .resolve_for_target(
+                &ProfileSelector::source_named(ProfileRegistrySource::Builtin, "coder"),
+                ProfileResolveOptions::with_worker_name("standalone-worker"),
+                ProfileExecutionTarget::Standalone,
+            )
+            .unwrap_err();
+        let diagnostic = error.to_string();
+
+        let ProfileError::UnsupportedExecutionTarget {
+            target,
+            requirements,
+        } = error
+        else {
+            panic!("unexpected error: {error}");
+        };
+        assert_eq!(target, ProfileExecutionTarget::Standalone);
+        assert!(requirements.contains(&WorkspaceAuthorityRequirement::Memory));
+        assert!(requirements.contains(&WorkspaceAuthorityRequirement::MergeRequest));
+        assert!(requirements.contains(&WorkspaceAuthorityRequirement::Ticket));
+        assert!(!diagnostic.contains(tmp.path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn repository_markers_do_not_change_builtin_profile_authority() {
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path().join("repository/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(tmp.path().join("repository/.yoi")).unwrap();
+        std::fs::write(
+            tmp.path().join("repository/.yoi/profiles.toml"),
+            "default = { source = 'project', name = 'shadow' }\n",
+        )
+        .unwrap();
+
+        let discovery = ProfileDiscovery::for_cwd(&nested);
+        assert_eq!(discovery.user_config, paths::user_profiles_path());
+        assert!(discovery.project_config.is_none());
     }
 
     #[test]

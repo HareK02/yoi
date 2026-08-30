@@ -639,7 +639,6 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "futures",
- "manifest",
  "protocol",
  "reqwest",
  "serde",
@@ -2630,6 +2629,7 @@ version = "0.1.0"
 dependencies = [
  "agen",
  "arc-swap",
+ "decodal",
  "protocol",
  "secrets",
  "serde",
@@ -4617,6 +4617,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "standalone"
+version = "0.1.0"
+dependencies = [
+ "agen",
+ "async-trait",
+ "fs4",
+ "futures",
+ "manifest",
+ "protocol",
+ "serde",
+ "serde_json",
+ "session-store",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+ "worker",
+]
+
+[[package]]
 name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5305,7 +5325,6 @@ dependencies = [
  "base64 0.22.1",
  "client",
  "crossterm 0.28.1",
- "fs4",
  "manifest",
  "protocol",
  "pulldown-cmark",
@@ -5314,13 +5333,14 @@ dependencies = [
  "serde",
  "serde_json",
  "session-store",
+ "standalone",
  "tempfile",
+ "thiserror 2.0.18",
  "ticket",
  "tokio",
  "toml",
  "unicode-width",
  "uuid",
- "worker",
 ]
 
 [[package]]

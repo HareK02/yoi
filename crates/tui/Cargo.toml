@@ -10,11 +10,13 @@ e2e-test = []
 
 [dependencies]
 client = { workspace = true }
+standalone = { workspace = true }
+thiserror.workspace = true
 protocol = { workspace = true }
 ratatui = { version = "0.30.0", features = ["scrolling-regions"] }
 base64 = "0.22.1"
 crossterm = "0.28"
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde_json = { workspace = true }
 unicode-width = "0.2.2"
 uuid = { workspace = true }
@@ -22,10 +24,8 @@ toml = { workspace = true }
 manifest = { workspace = true }
 secrets = { workspace = true }
 session-store = { workspace = true }
-fs4 = { workspace = true }
 ticket = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-worker = { path = "../worker" }
 pulldown-cmark = { version = "0.13.3", default-features = false }
 agen.workspace = true
 

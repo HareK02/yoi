@@ -1,4 +1,3 @@
-use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -21,25 +20,17 @@ use protocol::{Event, Method, WorkerStatus};
 use protocol::{Greeting, RewindSummary, RewindTarget, RewindTargetId, Segment};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use session_store::SegmentId;
-use tokio::sync::mpsc;
+use standalone::{StandaloneHost, StandaloneLaunchConfig};
+use tokio::sync::{broadcast, mpsc};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use client::{BackendRuntimeClient, BackendRuntimeTarget, WorkerClient, WorkerRuntimeCommand};
+use client::{BackendRuntimeClient, BackendRuntimeTarget, StandaloneSessionResumeIntent};
 
 use crate::app::{ActionbarNoticeLevel, ActionbarNoticeSource, App};
 use crate::composer_keys::{ComposerEditAction, composer_edit_action};
-use crate::picker::PickerOutcome;
-use crate::spawn::{SpawnOutcome, SpawnReady};
-use crate::{picker, spawn, ui};
+use crate::ui;
 
 pub(crate) type ConsoleTerminal = Terminal<CrosstermBackend<io::Stdout>>;
-
-/// Narrow request bridge used when the workspace Dashboard opens a Worker Console.
-pub(crate) struct DashboardConsoleOpenRequest {
-    pub(crate) worker_name: String,
-    pub(crate) socket_override: Option<PathBuf>,
-}
 
 /// Enable SGR coordinates plus normal mouse tracking. This captures clicks,
 /// releases, and wheel events without drag-capture modes (`?1002h`/`?1003h`)
@@ -128,75 +119,155 @@ fn copy_selection_to_terminal(app: &mut App) -> bool {
     copy_selection_to_writer(app, &mut stdout)
 }
 
-fn resolve_socket(worker_name: &str, override_path: Option<PathBuf>) -> PathBuf {
-    if let Some(p) = override_path {
-        return p;
-    }
-    manifest::paths::worker_socket_path(worker_name).unwrap_or_else(|| {
-        PathBuf::from("/tmp")
-            .join("yoi")
-            .join(worker_name)
-            .join("sock")
-    })
-}
-
-pub(crate) async fn run_worker_name(
-    worker_name: String,
-    socket_override: Option<PathBuf>,
-    runtime_command: WorkerRuntimeCommand,
-) -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(feature = "e2e-test")]
-    if std::env::var_os("YOI_TUI_TEST_REWIND_FIXTURE").is_some() {
-        let mut terminal = enter_fullscreen()?;
-        terminal.clear()?;
-        let result = run_e2e_rewind_fixture(&mut terminal, worker_name).await;
-        let _ = leave_fullscreen(&mut terminal);
-        return result;
-    }
-
-    if let Some(client) = try_connect_live_pod(&worker_name, socket_override.clone()).await {
-        let mut terminal = enter_fullscreen()?;
-        run_connected_pod(&mut terminal, worker_name, client, runtime_command.clone()).await?;
-        return Ok(());
-    }
-
-    let ready = match spawn::run_worker_name(worker_name, runtime_command.clone()).await? {
-        SpawnOutcome::Ready(r) => r,
-        SpawnOutcome::Cancelled => return Ok(()),
-    };
-    let mut terminal = enter_fullscreen()?;
-    terminal.clear()?;
-    let result = run_ready_pod(&mut terminal, ready, runtime_command).await;
-    let _ = leave_fullscreen(&mut terminal);
-    result
-}
-
 enum ConsoleConnection {
-    LegacySocket(WorkerClient),
     BackendRuntime(BackendRuntimeClient),
+    Standalone {
+        host: Option<StandaloneHost>,
+        events: broadcast::Receiver<Event>,
+        initial_snapshot: Option<Event>,
+    },
 }
 
 impl ConsoleConnection {
+    fn standalone(host: StandaloneHost) -> Self {
+        let events = host.subscribe();
+        let initial_snapshot = Some(host.snapshot());
+        Self::Standalone {
+            host: Some(host),
+            events,
+            initial_snapshot,
+        }
+    }
+
     fn try_next_event(&mut self) -> Option<Event> {
         match self {
-            Self::LegacySocket(client) => client.try_next_event(),
             Self::BackendRuntime(client) => client.try_next_event(),
+            Self::Standalone {
+                events,
+                initial_snapshot,
+                ..
+            } => initial_snapshot.take().or_else(|| events.try_recv().ok()),
         }
     }
 
     async fn next_event(&mut self) -> Option<Event> {
         match self {
-            Self::LegacySocket(client) => client.next_event().await,
             Self::BackendRuntime(client) => client.next_event().await,
+            Self::Standalone { host, events, .. } => loop {
+                match events.recv().await {
+                    Ok(event) => break Some(event),
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let Some(host) = host.as_ref() else {
+                            break None;
+                        };
+                        break Some(host.snapshot());
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break None,
+                }
+            },
         }
     }
 
     async fn send(&mut self, method: &Method) -> Result<(), Box<dyn std::error::Error>> {
         match self {
-            Self::LegacySocket(client) => Ok(client.send(method).await?),
             Self::BackendRuntime(client) => Ok(client.send(method).await?),
+            Self::Standalone { host, .. } => {
+                let host = host.as_ref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "Standalone Worker has already shut down",
+                    )
+                })?;
+                Ok(host.send(method.clone()).await?)
+            }
         }
     }
+
+    async fn shutdown(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Self::Standalone { host, .. } = self
+            && let Some(host) = host.take()
+        {
+            host.shutdown().await?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) async fn run_standalone(
+    workspace_root: PathBuf,
+    state_dir: PathBuf,
+    worker_name: Option<String>,
+    profile: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let worker_name = worker_name.unwrap_or_else(|| "local".to_string());
+    let profile = profile.map_or(manifest::ProfileSelector::Default, |profile| {
+        manifest::ProfileSelector::parse_cli(&profile)
+    });
+    let history_root = workspace_root.clone();
+    let launch = StandaloneLaunchConfig {
+        state_dir,
+        cwd: workspace_root,
+        profile,
+        worker_name: worker_name.clone(),
+    }
+    .resolve()
+    .map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Standalone launch configuration failed: {error}"),
+        )
+    })?;
+    let host = StandaloneHost::start(launch)
+        .await
+        .map_err(|error| io::Error::other(format!("Standalone Worker startup failed: {error}")))?;
+    run_standalone_host(host, worker_name, history_root).await
+}
+
+pub(crate) async fn run_standalone_restore(
+    intent: StandaloneSessionResumeIntent,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let session_id = intent.session_id.parse().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Invalid standalone session ID: {error}"),
+        )
+    })?;
+    let host = StandaloneHost::restore(intent.state_dir, session_id)
+        .await
+        .map_err(|error| io::Error::other(format!("Standalone restore failed: {error}")))?;
+    let worker_label = format!("standalone-{}", session_id.short());
+    let history_root = host.record().cwd.canonical_path.clone();
+    run_standalone_host(host, worker_label, history_root).await
+}
+
+async fn run_standalone_host(
+    host: StandaloneHost,
+    worker_label: String,
+    history_root: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut connection = ConsoleConnection::standalone(host);
+
+    let mut terminal = match enter_fullscreen() {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            let _ = connection.shutdown().await;
+            return Err(error);
+        }
+    };
+    let mut app = App::new_with_persistent_input_history(worker_label, &history_root);
+    let run_result = run_loop(&mut terminal, &mut app, &mut connection).await;
+    let shutdown_result = connection
+        .shutdown()
+        .await
+        .map_err(|error| io::Error::other(format!("Standalone Worker shutdown failed: {error}")));
+    let leave_result = leave_fullscreen(&mut terminal);
+
+    if let Err(error) = run_result {
+        return Err(error);
+    }
+    shutdown_result?;
+    leave_result?;
+    Ok(())
 }
 
 pub(crate) async fn run_backend_runtime(
@@ -208,198 +279,9 @@ pub(crate) async fn run_backend_runtime(
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut app = App::new_with_persistent_input_history(worker_label, &workspace_root);
     app.connected = true;
-    let result = run_loop(
-        &mut terminal,
-        &mut app,
-        ConsoleConnection::BackendRuntime(client),
-        None,
-    )
-    .await;
+    let mut connection = ConsoleConnection::BackendRuntime(client);
+    let result = run_loop(&mut terminal, &mut app, &mut connection).await;
     let _ = leave_fullscreen(&mut terminal);
-    result
-}
-
-async fn run_connected_pod(
-    terminal: &mut ConsoleTerminal,
-    worker_name: String,
-    client: WorkerClient,
-    runtime_command: WorkerRuntimeCommand,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let mut app = App::new_with_persistent_input_history(worker_name, &workspace_root);
-    app.connected = true;
-    run_loop(
-        terminal,
-        &mut app,
-        ConsoleConnection::LegacySocket(client),
-        Some(runtime_command),
-    )
-    .await
-}
-
-pub(crate) async fn open_from_dashboard(
-    terminal: &mut ConsoleTerminal,
-    request: DashboardConsoleOpenRequest,
-    runtime_command: WorkerRuntimeCommand,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let DashboardConsoleOpenRequest {
-        worker_name,
-        socket_override,
-    } = request;
-
-    if let Some(client) = try_connect_live_pod(&worker_name, socket_override).await {
-        return run_connected_pod(terminal, worker_name, client, runtime_command.clone()).await;
-    }
-
-    let ready =
-        spawn_worker_name_from_fullscreen(terminal, &worker_name, runtime_command.clone()).await?;
-    run_ready_pod(terminal, ready, runtime_command).await
-}
-
-async fn spawn_worker_name_from_fullscreen(
-    terminal: &mut ConsoleTerminal,
-    worker_name: &str,
-    runtime_command: WorkerRuntimeCommand,
-) -> Result<SpawnReady, Box<dyn std::error::Error>> {
-    leave_fullscreen(terminal)?;
-    let outcome = spawn::run_worker_name(worker_name.to_string(), runtime_command).await;
-    enter_fullscreen_existing(terminal)?;
-    terminal.clear()?;
-
-    match outcome? {
-        SpawnOutcome::Ready(ready) => Ok(ready),
-        SpawnOutcome::Cancelled => Err(Box::new(NestedOpenCancelled)),
-    }
-}
-
-async fn try_connect_live_pod(
-    worker_name: &str,
-    socket_override: Option<PathBuf>,
-) -> Option<WorkerClient> {
-    let preferred_socket = resolve_socket(worker_name, socket_override.clone());
-    connect_live_pod(worker_name, preferred_socket, socket_override.is_none())
-        .await
-        .map(|(_, client)| client)
-}
-
-#[derive(Debug)]
-struct NestedOpenCancelled;
-
-impl std::fmt::Display for NestedOpenCancelled {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Worker open was cancelled")
-    }
-}
-
-impl std::error::Error for NestedOpenCancelled {}
-
-async fn run_ready_pod(
-    terminal: &mut ConsoleTerminal,
-    ready: SpawnReady,
-    runtime_command: WorkerRuntimeCommand,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let SpawnReady {
-        worker_name,
-        socket_path,
-    } = ready;
-    run(terminal, worker_name, &socket_path, runtime_command).await
-}
-
-async fn connect_live_pod(
-    worker_name: &str,
-    preferred_socket: PathBuf,
-    allow_registry_fallback: bool,
-) -> Option<(PathBuf, WorkerClient)> {
-    if let Ok(client) = WorkerClient::connect(&preferred_socket).await {
-        return Some((preferred_socket, client));
-    }
-
-    if !allow_registry_fallback {
-        return None;
-    }
-    let registry_socket = picker::live_socket_for_worker(worker_name)?;
-    if registry_socket == preferred_socket {
-        return None;
-    }
-    WorkerClient::connect(&registry_socket)
-        .await
-        .ok()
-        .map(|client| (registry_socket, client))
-}
-
-pub(crate) async fn run_resume(
-    runtime_command: WorkerRuntimeCommand,
-    workspace_root: PathBuf,
-    all: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    run_worker_picker(runtime_command, workspace_root, all, true).await
-}
-
-pub(crate) async fn run_worker_picker(
-    runtime_command: WorkerRuntimeCommand,
-    workspace_root: PathBuf,
-    all: bool,
-    include_stopped: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Pick a Worker in its own inline viewport, dropping the viewport before
-    // attaching/restoring so each phase gets fresh vertical room.
-    let picker_options = if all {
-        picker::PickerOptions::all()
-    } else {
-        picker::PickerOptions::workspace(workspace_root)
-    }
-    .with_stopped(include_stopped);
-    let (worker_name, socket_override) = match picker::run(picker_options).await? {
-        PickerOutcome::Picked {
-            worker_name,
-            socket_override,
-        } => (worker_name, socket_override),
-        PickerOutcome::Cancelled => return Ok(()),
-    };
-    run_worker_name(worker_name, socket_override, runtime_command).await
-}
-
-pub(crate) fn is_recoverable_dashboard_open_error(error: &(dyn Error + 'static)) -> bool {
-    error.is::<spawn::SpawnError>() || error.is::<NestedOpenCancelled>()
-}
-
-pub(crate) async fn run_spawn(
-    resume_from: Option<SegmentId>,
-    worker_name: Option<String>,
-    profile: Option<String>,
-    runtime_command: WorkerRuntimeCommand,
-) -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(feature = "e2e-test")]
-    if std::env::var_os("YOI_TUI_TEST_REWIND_FIXTURE").is_some() {
-        let mut terminal = enter_fullscreen()?;
-        terminal.clear()?;
-        let fixture_worker_name = worker_name.unwrap_or_else(|| "e2e-rewind".to_string());
-        let result = run_e2e_rewind_fixture(&mut terminal, fixture_worker_name).await;
-        let _ = leave_fullscreen(&mut terminal);
-        return result;
-    }
-
-    let ready = match spawn::run(resume_from, worker_name, profile, runtime_command.clone()).await?
-    {
-        SpawnOutcome::Ready(r) => r,
-        SpawnOutcome::Cancelled => return Ok(()),
-    };
-
-    let SpawnReady {
-        worker_name,
-        socket_path,
-    } = ready;
-
-    let mut terminal = enter_fullscreen()?;
-    let result = run(&mut terminal, worker_name, &socket_path, runtime_command).await;
-
-    // Leave alt-screen explicitly before `main`'s terminal restore path.
-    let _ = execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    );
-
     result
 }
 
@@ -421,19 +303,6 @@ pub(crate) fn enter_dashboard_fullscreen() -> Result<ConsoleTerminal, Box<dyn st
     Ok(Terminal::new(backend)?)
 }
 
-fn enter_fullscreen_existing(
-    terminal: &mut ConsoleTerminal,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Re-enable the same least-intrusive wheel mouse mode after returning from
-    // nested inline screens.
-    execute!(
-        terminal.backend_mut(),
-        EnterAlternateScreen,
-        EnableSinglePodMouseCapture
-    )?;
-    Ok(())
-}
-
 fn leave_fullscreen(terminal: &mut ConsoleTerminal) -> io::Result<()> {
     execute!(
         terminal.backend_mut(),
@@ -444,40 +313,6 @@ fn leave_fullscreen(terminal: &mut ConsoleTerminal) -> io::Result<()> {
 
 pub(crate) fn leave_dashboard_fullscreen(terminal: &mut ConsoleTerminal) -> io::Result<()> {
     leave_fullscreen(terminal)
-}
-
-async fn run(
-    terminal: &mut ConsoleTerminal,
-    worker_name: String,
-    socket_path: &std::path::Path,
-    runtime_command: WorkerRuntimeCommand,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let mut app = App::new_with_persistent_input_history(worker_name, &workspace_root);
-
-    match WorkerClient::connect(socket_path).await {
-        Ok(client) => {
-            app.connected = true;
-            // The Worker sends `Event::Snapshot` automatically on connect;
-            // no explicit method call is required to fetch history.
-            run_loop(
-                terminal,
-                &mut app,
-                ConsoleConnection::LegacySocket(client),
-                Some(runtime_command),
-            )
-            .await?;
-        }
-        Err(e) => {
-            app.push_error(format!(
-                "Failed to connect to {}: {e}",
-                socket_path.display()
-            ));
-            terminal.draw(|f| ui::draw(f, &mut app))?;
-            run_disconnected(&mut app)?;
-        }
-    }
-    Ok(())
 }
 
 type TerminalEventResult = io::Result<TermEvent>;
@@ -749,14 +584,13 @@ async fn drain_terminal_events(
     app: &mut App,
     client: &mut ConsoleConnection,
     term_rx: &mut mpsc::UnboundedReceiver<TerminalEventResult>,
-    runtime_command: Option<&WorkerRuntimeCommand>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut handled = false;
     for _ in 0..TERMINAL_EVENT_DRAIN_LIMIT {
         match term_rx.try_recv() {
             Ok(event) => {
                 handled = true;
-                handle_terminal_event(app, client, event?, runtime_command).await?;
+                handle_terminal_event(app, client, event?).await?;
                 if app.quit {
                     break;
                 }
@@ -795,8 +629,7 @@ async fn drain_worker_events(
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
-    mut client: ConsoleConnection,
-    runtime_command: Option<WorkerRuntimeCommand>,
+    client: &mut ConsoleConnection,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_terminal_reader, mut term_rx) = TerminalEventReader::spawn()?;
 
@@ -807,12 +640,11 @@ async fn run_loop(
             break;
         }
 
-        let handled_term_event =
-            drain_terminal_events(app, &mut client, &mut term_rx, runtime_command.as_ref()).await?;
+        let handled_term_event = drain_terminal_events(app, client, &mut term_rx).await?;
         if app.quit {
             break;
         }
-        let handled_worker_event = drain_worker_events(app, &mut client).await?;
+        let handled_worker_event = drain_worker_events(app, client).await?;
         if handled_term_event || handled_worker_event {
             terminal.draw(|f| ui::draw(f, app))?;
             continue;
@@ -820,8 +652,7 @@ async fn run_loop(
 
         match next_loop_input(&mut term_rx, app.connected, client.next_event()).await {
             LoopInput::Terminal(term_event) => {
-                handle_terminal_event(app, &mut client, term_event?, runtime_command.as_ref())
-                    .await?;
+                handle_terminal_event(app, client, term_event?).await?;
             }
             LoopInput::Worker(event) => match event {
                 Some(ev) => {
@@ -847,7 +678,6 @@ async fn handle_terminal_event(
     app: &mut App,
     client: &mut ConsoleConnection,
     event: TermEvent,
-    _runtime_command: Option<&WorkerRuntimeCommand>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match event {
         TermEvent::Key(key) => {
@@ -865,19 +695,6 @@ async fn handle_terminal_event(
             // No-op: next draw repaints in full.
         }
         _ => {}
-    }
-    Ok(())
-}
-
-fn run_disconnected(_app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
-    loop {
-        if event::poll(std::time::Duration::from_millis(100))?
-            && let TermEvent::Key(key) = event::read()?
-            && let KeyCode::Char('c') = key.code
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-        {
-            break;
-        }
     }
     Ok(())
 }

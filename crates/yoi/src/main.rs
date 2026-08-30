@@ -23,13 +23,13 @@ use cli_connection::{
 use client::{BackendAuthTarget, Target, TargetKind, start_device_login, wait_for_device_login};
 use memory_lint::{LintCliOptions, LintStatus};
 use serde::Deserialize;
-use session_store::SegmentId;
 use tui::{LaunchMode, LaunchOptions};
 
 #[derive(Debug)]
 enum Mode {
     Help,
     ResumeHelp,
+    WorkersHelp,
     MemoryLintHelp,
     MemoryLint(LintCliOptions),
     Mcp(mcp_cli::McpCliCommand),
@@ -89,6 +89,10 @@ async fn main() -> ExitCode {
             print_resume_help();
             ExitCode::SUCCESS
         }
+        Mode::WorkersHelp => {
+            print_workers_help();
+            ExitCode::SUCCESS
+        }
         Mode::MemoryLintHelp => {
             print_memory_lint_help();
             ExitCode::SUCCESS
@@ -129,10 +133,8 @@ async fn main() -> ExitCode {
             match tokio::task::spawn_blocking(move || objective_cli::run(cli, target)).await {
                 Ok(Ok(output)) => {
                     print!("{}", output.stdout);
-                    match output.status {
-                        objective_cli::ObjectiveCliStatus::Success => ExitCode::SUCCESS,
-                        objective_cli::ObjectiveCliStatus::Failure => ExitCode::FAILURE,
-                    }
+                    let objective_cli::ObjectiveCliStatus::Success = output.status;
+                    ExitCode::SUCCESS
                 }
                 Ok(Err(e)) => {
                     eprintln!("yoi objective: {e}");
@@ -220,6 +222,24 @@ fn resolve_tui_target<R: CliConnectionResolver + ?Sized>(
     selection: &TargetSelection,
     workspace_root: &Path,
 ) -> Result<Box<dyn Target>, ParseError> {
+    if selection.explicit_local {
+        return resolve_connection_aware_cli_connection(
+            connection_resolver,
+            command,
+            true,
+            None,
+            None,
+        );
+    }
+
+    if selection.backend_url.is_none()
+        && let Ok(target) =
+            resolve_connection_aware_cli_connection(connection_resolver, command, false, None, None)
+        && target.kind() == TargetKind::Standalone
+    {
+        return Ok(target);
+    }
+
     let workspace_id = match selection.workspace_id.clone() {
         Some(workspace_id) => Some(workspace_id),
         None => resolve_workspace_id_from_root(workspace_root)?,
@@ -250,6 +270,11 @@ fn parse_top_level_target_selection(
                 i += 1;
             }
             "--backend" => {
+                if selection.backend_url.is_some() {
+                    return Err(ParseError(
+                        "--backend must not be provided more than once".to_string(),
+                    ));
+                }
                 if selection.explicit_local {
                     return Err(ParseError(
                         "--local and --backend are mutually exclusive".to_string(),
@@ -275,6 +300,11 @@ fn parse_top_level_target_selection(
                 i += 2;
             }
             arg if arg.starts_with("--backend=") => {
+                if selection.backend_url.is_some() {
+                    return Err(ParseError(
+                        "--backend must not be provided more than once".to_string(),
+                    ));
+                }
                 if selection.explicit_local {
                     return Err(ParseError(
                         "--local and --backend are mutually exclusive".to_string(),
@@ -336,7 +366,6 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             LaunchMode::Workers {
                 runtime_id: None,
                 include_stopped: false,
-                all: false,
             }
         } else {
             LaunchMode::Spawn {
@@ -368,6 +397,14 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             return Ok(Mode::WorkerRuntime(args[1..].to_vec()));
         }
         "objective" => {
+            let cli = objective_cli::parse_objective_args(&args[1..])
+                .map_err(|e| ParseError(e.to_string()))?;
+            if cli == objective_cli::ObjectiveCli::Help {
+                return Ok(Mode::Objective {
+                    cli,
+                    target: client::ResolvedTarget::Standalone,
+                });
+            }
             let workspace_root = current_dir()?;
             let target = resolve_tui_target(
                 connection_resolver,
@@ -377,8 +414,6 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             )?
             .resolve()
             .map_err(|error| ParseError(error.to_string()))?;
-            let cli = objective_cli::parse_objective_args(&args[1..])
-                .map_err(|e| ParseError(e.to_string()))?;
             return Ok(Mode::Objective { cli, target });
         }
         "session" => {
@@ -388,6 +423,14 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             return Ok(Mode::Session(session_cli));
         }
         "ticket" => {
+            let cli =
+                ticket_cli::parse_ticket_args(&args[1..]).map_err(|e| ParseError(e.to_string()))?;
+            if cli == ticket_cli::TicketCli::Help {
+                return Ok(Mode::Ticket {
+                    cli,
+                    target: client::ResolvedTarget::Standalone,
+                });
+            }
             let workspace_root = current_dir()?;
             let target = resolve_tui_target(
                 connection_resolver,
@@ -397,8 +440,6 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             )?
             .resolve()
             .map_err(|error| ParseError(error.to_string()))?;
-            let cli =
-                ticket_cli::parse_ticket_args(&args[1..]).map_err(|e| ParseError(e.to_string()))?;
             return Ok(Mode::Ticket { cli, target });
         }
         "plugin" => {
@@ -407,7 +448,32 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             return Ok(Mode::Plugin(plugin_cli));
         }
         "login" => {
-            return parse_login_args(&args[1..], connection_resolver);
+            if target_selection.explicit_local {
+                return Err(ParseError(
+                    "yoi login requires a Backend target and cannot use --local".to_string(),
+                ));
+            }
+            if target_selection.workspace_id.is_some() {
+                return Err(ParseError(
+                    "yoi login authenticates a Backend and does not accept --workspace-id"
+                        .to_string(),
+                ));
+            }
+            let mut login_args = args[1..].to_vec();
+            if let Some(backend_url) = target_selection.backend_url {
+                if login_args
+                    .iter()
+                    .any(|arg| arg == "--backend" || arg.starts_with("--backend="))
+                {
+                    return Err(ParseError(
+                        "--backend may be provided either before or after login, not both"
+                            .to_string(),
+                    ));
+                }
+                login_args.insert(0, backend_url);
+                login_args.insert(0, "--backend".to_string());
+            }
+            return parse_login_args(&login_args, connection_resolver);
         }
         "mcp" => {
             let _target = resolve_local_cli_connection(connection_resolver, CliCommand::Mcp)?;
@@ -422,17 +488,20 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
                 &target_selection,
                 &panel_options.workspace_root,
             )?;
-            if panel_options.include_stopped && target.kind() == TargetKind::Backend {
+            if panel_options.include_stopped {
                 return Err(ParseError(
-                    "yoi panel -r is only supported for local targets; Backend panel restore UI is not implemented"
+                    "yoi panel -r was a removed host-local Worker path; Backend panel restore UI is not implemented"
                         .to_string(),
+                ));
+            }
+            if target.kind() != TargetKind::Backend {
+                return Err(ParseError(
+                    "yoi panel requires a Backend connection target".to_string(),
                 ));
             }
             return Ok(Mode::Tui {
                 target,
-                mode: LaunchMode::Panel {
-                    include_stopped: panel_options.include_stopped,
-                },
+                mode: LaunchMode::Panel,
                 workspace_root: panel_options.workspace_root,
             });
         }
@@ -502,10 +571,20 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
     let mut socket_override = None;
     let mut runtime_id = None;
     let mut worker_id = None;
+    let mut standalone_resume = false;
+    let mut standalone_all = false;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
         match arg.as_str() {
+            "--resume" => {
+                standalone_resume = true;
+                i += 1;
+            }
+            "--all" => {
+                standalone_all = true;
+                i += 1;
+            }
             "--worker" => {
                 let value = args
                     .get(i + 1)
@@ -687,6 +766,50 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
         &workspace_root,
     )?;
 
+    if standalone_all && !standalone_resume {
+        return Err(ParseError("--all requires --resume".to_string()));
+    }
+    if standalone_resume {
+        if target.kind() != TargetKind::Standalone {
+            return Err(ParseError(
+                "--resume is a Standalone option and requires --local".to_string(),
+            ));
+        }
+        if worker_name.is_some()
+            || profile.is_some()
+            || session.is_some()
+            || socket_override.is_some()
+            || runtime_id.is_some()
+            || worker_id.is_some()
+        {
+            return Err(ParseError(
+                "--local --resume cannot be combined with Worker, profile, session, socket, or Runtime selectors"
+                    .to_string(),
+            ));
+        }
+    }
+
+    if target.kind() == TargetKind::Standalone {
+        if runtime_id.is_some() || worker_id.is_some() {
+            return Err(ParseError(
+                "Standalone does not accept Backend Runtime selectors; use --backend with --runtime-id/--worker-id"
+                    .to_string(),
+            ));
+        }
+        if session.is_some() {
+            return Err(ParseError(
+                "--local does not accept legacy --session; use --local --resume for Standalone session restore"
+                    .to_string(),
+            ));
+        }
+        if socket_override.is_some() {
+            return Err(ParseError(
+                "--local uses an in-process Standalone connection and does not accept --socket"
+                    .to_string(),
+            ));
+        }
+    }
+
     if let (Some(runtime_id), Some(worker_id)) = (runtime_id.clone(), worker_id) {
         return Ok(Mode::Tui {
             target,
@@ -704,31 +827,41 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
             mode: LaunchMode::Workers {
                 runtime_id,
                 include_stopped: false,
-                all: false,
             },
             workspace_root,
         });
     }
 
-    let mode = if let Some(profile) = profile {
+    if target.kind() == TargetKind::Standalone && (session.is_some() || socket_override.is_some()) {
+        return Err(ParseError(
+            "Standalone does not accept legacy Worker session or socket selectors; use --resume for the standalone session store"
+                .to_string(),
+        ));
+    }
+
+    let mode = if standalone_resume {
+        LaunchMode::StandaloneResume {
+            include_all: standalone_all,
+        }
+    } else if target.kind() == TargetKind::Standalone {
         LaunchMode::Spawn {
             worker_name,
-            profile: Some(profile),
-        }
-    } else if let Some(session) = session {
-        LaunchMode::ResumeWithSession {
-            id: parse_session_id(&session.to_string_lossy())?,
-            worker_name,
-        }
-    } else if let Some(worker_name) = worker_name {
-        LaunchMode::WorkerName {
-            worker_name,
-            socket_override,
+            profile,
         }
     } else {
-        LaunchMode::Spawn {
-            worker_name: None,
-            profile: None,
+        if worker_name.is_some()
+            || profile.is_some()
+            || session.is_some()
+            || socket_override.is_some()
+        {
+            return Err(ParseError(
+                "Backend target does not accept host-local Worker, profile, session, or socket selectors"
+                    .to_string(),
+            ));
+        }
+        LaunchMode::Workers {
+            runtime_id: None,
+            include_stopped: false,
         }
     };
 
@@ -751,11 +884,7 @@ fn parse_workers_args<R: CliConnectionResolver + ?Sized>(
     while i < args.len() {
         let arg = &args[i];
         match arg.as_str() {
-            "--help" | "-h" => {
-                return Err(ParseError(
-                    "usage: yoi [--local|--backend <URL>] [--workspace-id <ID>] workers [-r|--stopped] [--workspace <PATH>] [--runtime-id <ID>]".to_string(),
-                ));
-            }
+            "--help" | "-h" => return Ok(Mode::WorkersHelp),
             "-r" | "--restoreable" | "--stopped" => {
                 include_stopped = true;
                 i += 1;
@@ -820,12 +949,17 @@ fn parse_workers_args<R: CliConnectionResolver + ?Sized>(
         target_selection,
         &workspace_root,
     )?;
+    if target.kind() != TargetKind::Backend {
+        return Err(ParseError(
+            "yoi workers requires a Backend connection target; use yoi --local --resume for Standalone sessions"
+                .to_string(),
+        ));
+    }
     Ok(Mode::Tui {
         target,
         mode: LaunchMode::Workers {
             runtime_id,
             include_stopped,
-            all: false,
         },
         workspace_root,
     })
@@ -927,13 +1061,29 @@ fn parse_resume_args<R: CliConnectionResolver + ?Sized>(
         &workspace_root,
     )?;
 
-    Ok(Mode::Tui {
-        target,
-        mode: LaunchMode::Workers {
+    let mode = if target.kind() == TargetKind::Standalone {
+        if runtime_id.is_some() {
+            return Err(ParseError(
+                "Standalone resume does not accept --runtime-id".to_string(),
+            ));
+        }
+        LaunchMode::StandaloneResume { include_all: all }
+    } else {
+        if all {
+            return Err(ParseError(
+                "Backend resume does not accept --all; select a Runtime explicitly when needed"
+                    .to_string(),
+            ));
+        }
+        LaunchMode::Workers {
             runtime_id,
             include_stopped: true,
-            all,
-        },
+        }
+    };
+
+    Ok(Mode::Tui {
+        target,
+        mode,
         workspace_root,
     })
 }
@@ -1082,23 +1232,22 @@ fn read_client_default_connection() -> Result<ClientDefaultConnection, ParseErro
 }
 
 fn read_client_config() -> Result<Option<ClientConfigFile>, ParseError> {
+    let path = client_global_config_path();
+    read_client_config_from_global_path(path.as_deref())
+}
+
+fn read_client_config_from_global_path(
+    path: Option<&Path>,
+) -> Result<Option<ClientConfigFile>, ParseError> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let Some(overlay) = read_client_config_overlay(path)? else {
+        return Ok(None);
+    };
     let mut config = ClientConfigFile::default();
-    let mut found = false;
-
-    if let Some(path) = client_global_config_path() {
-        if let Some(overlay) = read_client_config_overlay(&path)? {
-            config.apply_overlay(overlay);
-            found = true;
-        }
-    }
-
-    let cwd_path = client_cwd_config_path()?;
-    if let Some(overlay) = read_client_config_overlay(&cwd_path)? {
-        config.apply_overlay(overlay);
-        found = true;
-    }
-
-    Ok(found.then_some(config))
+    config.apply_overlay(overlay);
+    Ok(Some(config))
 }
 
 fn read_client_config_overlay(path: &Path) -> Result<Option<ClientConfigOverlay>, ParseError> {
@@ -1116,14 +1265,10 @@ fn client_global_config_path() -> Option<PathBuf> {
     manifest::paths::data_dir().map(|dir| dir.join("client").join("config.toml"))
 }
 
-fn client_cwd_config_path() -> Result<PathBuf, ParseError> {
-    Ok(current_dir()?.join(".yoi").join("client.config.toml"))
-}
-
 fn client_config_location_message() -> String {
     match client_global_config_path() {
-        Some(path) => format!("{} or <cwd>/.yoi/client.config.toml", path.display()),
-        None => "<data_dir>/client/config.toml or <cwd>/.yoi/client.config.toml".to_string(),
+        Some(path) => path.display().to_string(),
+        None => "<data_dir>/client/config.toml".to_string(),
     }
 }
 
@@ -1154,6 +1299,11 @@ fn parse_login_args<R: CliConnectionResolver + ?Sized>(
     while i < args.len() {
         match args[i].as_str() {
             "--backend" => {
+                if backend_url.is_some() {
+                    return Err(ParseError(
+                        "--backend must not be provided more than once".to_string(),
+                    ));
+                }
                 let value = args
                     .get(i + 1)
                     .ok_or_else(|| ParseError("--backend requires a URL".to_string()))?;
@@ -1164,6 +1314,11 @@ fn parse_login_args<R: CliConnectionResolver + ?Sized>(
                 i += 2;
             }
             arg if arg.starts_with("--backend=") => {
+                if backend_url.is_some() {
+                    return Err(ParseError(
+                        "--backend must not be provided more than once".to_string(),
+                    ));
+                }
                 let value = arg.trim_start_matches("--backend=");
                 if value.is_empty() {
                     return Err(ParseError("--backend requires a URL".to_string()));
@@ -1582,75 +1737,54 @@ fn parse_panel_args(args: &[String]) -> Result<PanelCliOptions, ParseError> {
     })
 }
 
-fn parse_session_id(value: &str) -> Result<SegmentId, ParseError> {
-    value
-        .parse()
-        .map_err(|_| ParseError(format!("invalid --session UUID: {value}")))
-}
-
 const TOP_LEVEL_HELP: &str = r#"yoi
 
 Usage:
-  yoi [TARGET] [CONSOLE_OPTIONS]
-  yoi [TARGET] workers [-r|--stopped] [--workspace <PATH>] [--runtime-id <ID>]
-  yoi [TARGET] resume [--workspace <PATH>|--all] [--runtime-id <ID>]
-  yoi [TARGET] panel [-r|--stopped] [--workspace <PATH>]
+  yoi [TARGET]
+  yoi --local --resume [--all]
+  yoi [TARGET] workers [-r|--stopped] [--runtime-id <ID>]
+  yoi [TARGET] resume [--all] [--runtime-id <ID>]
+  yoi --backend <URL> [--workspace-id <ID>] panel
   yoi [--backend <URL>] login [--no-wait]
-  yoi <LOCAL_COMMAND> [OPTIONS]
+  yoi <HOST_COMMAND> [OPTIONS]
 
 Target selection:
-  Target options are top-level options and must appear before the command.
-
-      --local              Use the local Worker runtime explicitly
+      --local              Use the client-owned one-process Standalone host
+      --resume             With --local, restore from the Standalone session store
+      --all                With Standalone restore, include sessions from every cwd identity
       --backend <URL>      Use a Workspace Backend explicitly
       --workspace-id <ID>  Scope Backend routes to a Workspace id
 
-  If no target is explicit, connection-aware commands use the merged client config:
-      <data_dir>/client/config.toml
-      <cwd>/.yoi/client.config.toml
-
-  Supported client config keys:
-      default_connection = "local" | "backend"
-      default_backend = "<name>"
-      [backends.<name>] url = "https://backend.example"
-      [workspaces.<workspace_id>] backend = "<name>"
+  If no target is explicit, connection-aware commands use the merged client config.
+  `default_connection = "local"` selects Standalone; it does not enable a filesystem
+  Ticket, Objective, Worker catalog, PID, socket, or subprocess authority.
 
 Connection-aware commands:
-  yoi                         Local: open a new Console. Backend: open Backend Workers.
-  yoi workers                 List/select Workers for the selected target.
-  yoi workers -r              Include stopped Workers. --restoreable is accepted as a legacy alias.
-  yoi resume                  Open the Worker picker with stopped Workers included.
-  yoi panel                   Open the dashboard/panel TUI for the selected target.
-  yoi panel -r                Local only: include stopped/restorable Worker rows.
+  yoi                         Standalone: new Console. Backend: Worker picker.
+  yoi resume                  Standalone session picker or stopped Backend Worker picker.
+  yoi workers                 Backend Workspace Worker picker.
+  yoi panel                   Backend Workspace dashboard.
 
 Console options:
-      --workspace <PATH>   Local workspace root for local Console/Worker lists (defaults to cwd)
-      --worker <NAME>      Open/create a named local Worker Console
-      --socket <PATH>      Attach to a local Worker socket; requires --worker
-      --session <UUID>     Resume a local session segment
-      --profile <REF>      Select a reusable Profile recipe for a fresh local Worker
-      --runtime-id <ID>    Backend Runtime id for Backend Worker list/attach
-      --worker-id <ID>     Backend Worker id to attach; requires --runtime-id
+      --workspace <PATH>   Standalone cwd or client display scope (defaults to cwd)
+      --profile <REF>      Select the Standalone Profile recipe
+      --runtime-id <ID>    Backend Runtime id
+      --worker-id <ID>     Backend Worker id; requires --runtime-id
 
-Local commands:
+Host commands:
   keys                         Manage local model/API keys
   setup-model                  Configure a local model provider
-  worker [WORKER_OPTIONS]      Run the local Worker runtime CLI
-  worker delete <NAME>         Delete local Worker records
-  worker prune                 Prune old local Worker records
-  ticket <COMMAND>             Manage Tickets through the selected target
-  objective <COMMAND>          Manage Objectives through the selected target
+  worker [WORKER_OPTIONS]      Run the direct Worker process entrypoint
+  ticket <COMMAND>             Manage Tickets through a Backend target
+  objective <COMMAND>          Manage Objectives through a Backend target
   plugin <COMMAND>             Build/check/list/show plugins
   mcp <COMMAND>                Inspect configured MCP servers
   memory lint                  Lint local memory files
-  session <COMMAND>            Inspect/prune local session logs
-
-Backend-only commands:
-  login                        Run Backend device login and save the API token
+  session <COMMAND>            Inspect/prune Standalone session logs
 
 Standalone binaries:
   yoi-server         Workspace Backend server/admin CLI
-  yoi-runtime   Worker Runtime REST server
+  yoi-runtime        Worker Runtime server
 
 Options:
   -h, --help                   Print help
@@ -1660,10 +1794,47 @@ fn print_help() {
     println!("{TOP_LEVEL_HELP}");
 }
 
+const WORKERS_HELP: &str = r#"yoi workers
+
+Usage:
+  yoi --backend <URL> [--workspace-id <ID>] workers [-r|--stopped] [--workspace <PATH>] [--runtime-id <ID>]
+
+Authority:
+  Lists Workers from the selected Backend Workspace. Standalone sessions are restored with
+  `yoi --local --resume` and are not part of the Workspace Worker catalog.
+
+Options:
+      --backend <URL>      Use this Workspace Backend
+      --workspace-id <ID>  Scope Backend routes to a Workspace id
+      --workspace <PATH>   Resolve Backend Workspace identity from this repository root
+  -r, --stopped            List stopped Backend Workers
+      --runtime-id <ID>    Restrict the Backend Worker picker to a Runtime id
+  -h, --help               Print help
+"#;
+
+fn print_workers_help() {
+    println!("{WORKERS_HELP}");
+}
+
+const RESUME_HELP: &str = r#"yoi resume
+
+Usage:
+  yoi [TARGET] resume [--workspace <PATH>|--all] [--runtime-id <ID>]
+
+Target options:
+      --local              Restore from the client-owned Standalone session store
+      --backend <URL>      Restore a stopped Backend Workspace Worker
+      --workspace-id <ID>  Scope Backend routes to a Workspace id
+
+Options:
+      --workspace <PATH>   Scope Standalone sessions to this cwd identity (defaults to cwd)
+      --all                Include Standalone sessions from every cwd identity
+      --runtime-id <ID>    Restrict the Backend stopped-Worker picker to a Runtime id
+  -h, --help               Print help
+"#;
+
 fn print_resume_help() {
-    println!(
-        "yoi resume\n\nUsage:\n  yoi [TARGET] resume [--workspace <PATH>|--all] [--runtime-id <ID>]\n\nTarget options:\n      --local              Use local Worker records explicitly\n      --backend <URL>      Use Backend Worker records explicitly\n      --workspace-id <ID>  Scope Backend routes to a Workspace id\n\nOptions:\n      --workspace <PATH>   Open the Worker picker scoped to this local workspace (defaults to cwd)\n      --all                Open the Worker picker across this host/data dir\n      --runtime-id <ID>    Restrict Backend picker to a Runtime id\n  -h, --help               Print help\n"
-    );
+    println!("{RESUME_HELP}");
 }
 
 fn print_memory_lint_help() {
@@ -1676,7 +1847,7 @@ fn print_memory_lint_help() {
 mod tests {
     use super::*;
     use crate::cli_connection::CliConnectionInput;
-    use client::{BackendTarget, LocalTarget, TargetKind, WorkerListRequest};
+    use client::{BackendTarget, StandaloneTarget, Target, TargetKind, WorkerListRequest};
 
     struct FixedCliConnectionResolver {
         backend_url: &'static str,
@@ -1689,8 +1860,10 @@ mod tests {
             input: CliConnectionInput<'_>,
         ) -> Result<Box<dyn Target>, ParseError> {
             match input {
-                CliConnectionInput::DefaultTarget { .. } | CliConnectionInput::LocalTarget => {
-                    Ok(Box::new(LocalTarget::new()))
+                CliConnectionInput::DefaultTarget { .. } | CliConnectionInput::StandaloneTarget => {
+                    Ok(Box::new(StandaloneTarget::new(
+                        "/tmp/yoi-test-standalone-state",
+                    )))
                 }
                 CliConnectionInput::BackendTarget { workspace_id, .. } => Ok(Box::new(
                     BackendTarget::new(self.backend_url, workspace_id.map(str::to_string)),
@@ -1712,7 +1885,11 @@ mod tests {
             let workspace_id = match input {
                 CliConnectionInput::DefaultTarget { workspace_id }
                 | CliConnectionInput::BackendTarget { workspace_id, .. } => workspace_id,
-                CliConnectionInput::LocalTarget => return Ok(Box::new(LocalTarget::new())),
+                CliConnectionInput::StandaloneTarget => {
+                    return Ok(Box::new(StandaloneTarget::new(
+                        "/tmp/yoi-test-standalone-state",
+                    )));
+                }
             };
             Ok(Box::new(BackendTarget::new(
                 self.backend_url,
@@ -1722,33 +1899,27 @@ mod tests {
     }
 
     #[test]
-    fn parser_uses_local_target_for_workers_without_backend_option() {
+    fn parser_never_uses_host_local_worker_catalog_without_backend_option() {
         let resolver = FixedCliConnectionResolver {
             backend_url: "http://fake-backend.example",
         };
         let args = vec!["workers".to_string()];
-        let mode = parse_args_slice_with_connection_resolver(&args, &resolver).unwrap();
+        let error = parse_args_slice_with_connection_resolver(&args, &resolver).unwrap_err();
 
-        match mode {
-            Mode::Tui {
-                target,
-                mode: LaunchMode::Workers { runtime_id, .. },
-                ..
-            } => {
-                assert_eq!(runtime_id, None);
-                assert_eq!(target.kind(), TargetKind::Local);
-                let workers = target.list_workers(WorkerListRequest::new(None)).unwrap();
-                assert!(workers.local_runtime_command.is_some());
-                assert!(workers.backend_target.is_none());
-            }
-            other => panic!("expected Workers mode, got {other:?}"),
-        }
+        assert!(
+            error
+                .to_string()
+                .contains("requires a Backend connection target")
+        );
     }
 
     #[test]
-    fn client_config_default_connection_defaults_to_local() {
+    fn client_config_default_connection_defaults_to_standalone() {
         let config = ClientConfigFile::default();
-        assert_eq!(config.default_connection, ClientDefaultConnection::Local);
+        assert_eq!(
+            config.default_connection,
+            ClientDefaultConnection::Standalone
+        );
     }
 
     #[test]
@@ -1821,11 +1992,9 @@ backend = "shared"
 
     #[test]
     fn top_level_help_matches_current_target_surface() {
-        assert!(TOP_LEVEL_HELP.contains("Target options are top-level options"));
-        assert!(TOP_LEVEL_HELP.contains("--local"));
-        assert!(TOP_LEVEL_HELP.contains("--backend <URL>"));
-        assert!(TOP_LEVEL_HELP.contains("<data_dir>/client/config.toml"));
-        assert!(TOP_LEVEL_HELP.contains("<cwd>/.yoi/client.config.toml"));
+        assert!(TOP_LEVEL_HELP.contains("Target selection:"));
+        assert!(TOP_LEVEL_HELP.contains("client config"));
+        assert!(TOP_LEVEL_HELP.contains("default_connection = \"local\""));
         assert!(TOP_LEVEL_HELP.contains("yoi-server"));
         assert!(TOP_LEVEL_HELP.contains("yoi-runtime"));
         assert!(!TOP_LEVEL_HELP.contains("yoi workspace"));
@@ -1834,30 +2003,70 @@ backend = "shared"
     }
 
     #[test]
-    fn parse_local_only_commands_reject_backend_target_options() {
-        let err = parse_args_from(["keys", "--workspace-id=workspace-a"]).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "yoi keys uses a local connection target and cannot accept Backend target option `--workspace-id=workspace-a`"
+    fn parse_login_preserves_top_level_backend_selector() {
+        match parse_args_from(["--backend", "http://127.0.0.1:8787", "login", "--no-wait"]).unwrap()
+        {
+            Mode::Login {
+                backend_url,
+                no_wait,
+            } => {
+                assert_eq!(backend_url, "http://127.0.0.1:8787");
+                assert!(no_wait);
+            }
+            other => panic!("expected Login mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_login_rejects_repeated_backend_selectors_in_each_scope() {
+        for args in [
+            vec![
+                "--backend",
+                "http://127.0.0.1:8787",
+                "--backend=http://127.0.0.1:8788",
+                "login",
+            ],
+            vec![
+                "login",
+                "--backend",
+                "http://127.0.0.1:8787",
+                "--backend=http://127.0.0.1:8788",
+            ],
+        ] {
+            let error = parse_args_from(args).unwrap_err().to_string();
+            assert!(error.contains("must not be provided more than once"));
+        }
+    }
+
+    #[test]
+    fn parse_login_rejects_non_backend_or_duplicate_target_selectors() {
+        assert!(
+            parse_args_from(["--local", "login"])
+                .unwrap_err()
+                .to_string()
+                .contains("cannot use --local")
+        );
+        assert!(
+            parse_args_from([
+                "--backend",
+                "http://127.0.0.1:8787",
+                "login",
+                "--backend",
+                "http://127.0.0.1:8788",
+            ])
+            .unwrap_err()
+            .to_string()
+            .contains("not both")
         );
     }
 
     #[test]
-    fn parse_worker_name_mode() {
-        match parse_args_from(["--worker", "agent", "--socket", "/tmp/agent.sock"]).unwrap() {
-            Mode::Tui {
-                mode:
-                    LaunchMode::WorkerName {
-                        worker_name,
-                        socket_override,
-                    },
-                ..
-            } => {
-                assert_eq!(worker_name, "agent");
-                assert_eq!(socket_override, Some(PathBuf::from("/tmp/agent.sock")));
-            }
-            _ => panic!("expected WorkerName mode"),
-        }
+    fn parse_local_only_commands_reject_backend_target_options() {
+        let err = parse_args_from(["keys", "--workspace-id=workspace-a"]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "yoi keys uses a host-only connection target and cannot accept Backend target option `--workspace-id=workspace-a`"
+        );
     }
 
     #[test]
@@ -1897,6 +2106,25 @@ backend = "shared"
     }
 
     #[test]
+    fn parse_standalone_rejects_backend_runtime_selectors() {
+        let runtime_error = parse_args_from(["--local", "--runtime-id", "runtime-a"])
+            .unwrap_err()
+            .to_string();
+        assert!(runtime_error.contains("Standalone does not accept Backend Runtime selectors"));
+
+        let worker_error = parse_args_from([
+            "--local",
+            "--runtime-id",
+            "runtime-a",
+            "--worker-id",
+            "worker-b",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(worker_error.contains("Standalone does not accept Backend Runtime selectors"));
+    }
+
+    #[test]
     fn parse_backend_runtime_target_requires_runtime_for_worker_identity() {
         let err = parse_args_from(["--backend", "http://127.0.0.1:8787", "--worker-id", "w"])
             .unwrap_err();
@@ -1919,19 +2147,8 @@ backend = "shared"
                 let workers = target
                     .list_workers(WorkerListRequest::new(runtime_id.clone()))
                     .unwrap();
-                assert_eq!(
-                    workers.backend_target.as_ref().unwrap().base_url,
-                    "http://127.0.0.1:8787"
-                );
-                assert_eq!(
-                    workers
-                        .backend_target
-                        .as_ref()
-                        .unwrap()
-                        .runtime_id
-                        .as_deref(),
-                    Some("r")
-                );
+                assert_eq!(workers.backend_target.base_url, "http://127.0.0.1:8787");
+                assert_eq!(workers.backend_target.runtime_id.as_deref(), Some("r"));
                 assert_eq!(runtime_id.as_deref(), Some("r"));
             }
             _ => panic!("expected Workers mode"),
@@ -1958,23 +2175,113 @@ backend = "shared"
                 let workers = target
                     .list_workers(WorkerListRequest::new(runtime_id.clone()))
                     .unwrap();
+                assert_eq!(workers.backend_target.base_url, "http://127.0.0.1:8787");
                 assert_eq!(
-                    workers.backend_target.as_ref().unwrap().base_url,
-                    "http://127.0.0.1:8787"
-                );
-                assert_eq!(
-                    workers
-                        .backend_target
-                        .as_ref()
-                        .unwrap()
-                        .workspace_id
-                        .as_deref(),
+                    workers.backend_target.workspace_id.as_deref(),
                     Some("workspace-a")
                 );
                 assert_eq!(runtime_id, None);
             }
             _ => panic!("expected Workers mode"),
         }
+    }
+
+    #[test]
+    fn parser_explicit_local_overrides_default_backend_with_standalone_target() {
+        let resolver = DefaultBackendCliConnectionResolver {
+            backend_url: "http://default-backend.example",
+        };
+        let args = ["--local", "--worker", "my-local-worker"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        let mode = parse_args_slice_with_connection_resolver(&args, &resolver).unwrap();
+        let Mode::Tui { target, mode, .. } = mode else {
+            panic!("expected TUI mode")
+        };
+
+        assert_eq!(target.kind(), TargetKind::Standalone);
+        assert!(matches!(
+            mode,
+            LaunchMode::Spawn {
+                worker_name: Some(ref name),
+                profile: None,
+            } if name == "my-local-worker"
+        ));
+        assert!(target.spawn_worker().unwrap().state_dir.is_absolute());
+    }
+
+    #[test]
+    fn parser_local_resume_uses_standalone_picker_scope() {
+        let mode = parse_args_from(["--local", "--resume"]).unwrap();
+        let Mode::Tui { target, mode, .. } = mode else {
+            panic!("expected TUI mode")
+        };
+        assert_eq!(target.kind(), TargetKind::Standalone);
+        assert!(matches!(
+            mode,
+            LaunchMode::StandaloneResume { include_all: false }
+        ));
+        let intent = target.standalone_session_list(false).unwrap();
+        assert!(intent.state_dir.ends_with("client/standalone/sessions"));
+        assert!(!intent.include_all);
+
+        let mode = parse_args_from(["--local", "--resume", "--all"]).unwrap();
+        let Mode::Tui { mode, .. } = mode else {
+            panic!("expected TUI mode")
+        };
+        assert!(matches!(
+            mode,
+            LaunchMode::StandaloneResume { include_all: true }
+        ));
+
+        assert_eq!(
+            parse_args_from(["--local", "--all"])
+                .unwrap_err()
+                .to_string(),
+            "--all requires --resume"
+        );
+    }
+
+    #[test]
+    fn parser_rejects_standalone_and_backend_target_together() {
+        let err = parse_args_from(["--local", "--backend", "http://backend.example"]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "--local and --backend are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn parser_standalone_rejects_legacy_session_and_socket_inputs() {
+        let resolver = DefaultBackendCliConnectionResolver {
+            backend_url: "http://default-backend.example",
+        };
+        let session_args = ["--local", "--session", "session-1"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        let err = parse_args_slice_with_connection_resolver(&session_args, &resolver).unwrap_err();
+        assert_eq!(
+            err.0,
+            "--local does not accept legacy --session; use --local --resume for Standalone session restore"
+        );
+
+        let socket_args = [
+            "--local",
+            "--worker",
+            "worker-a",
+            "--socket",
+            "/tmp/worker.sock",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+        let err = parse_args_slice_with_connection_resolver(&socket_args, &resolver).unwrap_err();
+        assert_eq!(
+            err.0,
+            "--local uses an in-process Standalone connection and does not accept --socket"
+        );
     }
 
     #[test]
@@ -2009,61 +2316,43 @@ backend = "shared"
     }
 
     #[test]
-    fn parse_resume_subcommand_defaults_to_workspace_scope() {
+    fn parse_resume_subcommand_uses_standalone_store_by_default() {
         match parse_args_from(["resume"]).unwrap() {
             Mode::Tui {
-                mode:
-                    LaunchMode::Workers {
-                        include_stopped,
-                        all,
-                        ..
-                    },
+                target,
+                mode: LaunchMode::StandaloneResume { include_all },
                 ..
             } => {
-                assert!(include_stopped);
-                assert!(!all);
+                assert_eq!(target.kind(), TargetKind::Standalone);
+                assert!(!include_all);
             }
-            _ => panic!("expected Workers mode"),
+            other => panic!("expected StandaloneResume mode, got {other:?}"),
         }
     }
 
     #[test]
-    fn parse_resume_workspace_scope() {
+    fn parse_resume_preserves_standalone_cwd_scope() {
         match parse_args_from(["resume", "--workspace", "/tmp/resume-workspace"]).unwrap() {
             Mode::Tui {
-                mode:
-                    LaunchMode::Workers {
-                        include_stopped,
-                        all,
-                        ..
-                    },
+                mode: LaunchMode::StandaloneResume { include_all },
                 workspace_root,
                 ..
             } => {
-                assert!(include_stopped);
-                assert!(!all);
+                assert!(!include_all);
                 assert_eq!(workspace_root, PathBuf::from("/tmp/resume-workspace"));
             }
-            _ => panic!("expected Workers mode"),
+            other => panic!("expected StandaloneResume mode, got {other:?}"),
         }
     }
 
     #[test]
-    fn parse_resume_all_scope() {
+    fn parse_resume_all_expands_only_standalone_store_scope() {
         match parse_args_from(["resume", "--all"]).unwrap() {
             Mode::Tui {
-                mode:
-                    LaunchMode::Workers {
-                        include_stopped,
-                        all,
-                        ..
-                    },
+                mode: LaunchMode::StandaloneResume { include_all },
                 ..
-            } => {
-                assert!(include_stopped);
-                assert!(all);
-            }
-            _ => panic!("expected Workers mode"),
+            } => assert!(include_all),
+            other => panic!("expected StandaloneResume mode, got {other:?}"),
         }
     }
 
@@ -2103,6 +2392,88 @@ backend = "shared"
     }
 
     #[test]
+    fn explicit_standalone_ignores_malformed_repository_workspace_identity() {
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repository.path().join(".yoi")).unwrap();
+        std::fs::write(
+            repository.path().join(".yoi/workspace.toml"),
+            "this is not valid toml = [",
+        )
+        .unwrap();
+        let resolver = FixedCliConnectionResolver {
+            backend_url: "http://fake-backend.example",
+        };
+
+        let target = resolve_tui_target(
+            &resolver,
+            CliCommand::DefaultTui,
+            &TargetSelection {
+                explicit_local: true,
+                ..TargetSelection::default()
+            },
+            repository.path(),
+        )
+        .unwrap();
+
+        assert_eq!(target.kind(), TargetKind::Standalone);
+    }
+
+    #[test]
+    fn default_standalone_ignores_malformed_repository_workspace_identity() {
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repository.path().join(".yoi")).unwrap();
+        std::fs::write(
+            repository.path().join(".yoi/workspace.toml"),
+            "this is not valid toml = [",
+        )
+        .unwrap();
+        let resolver = FixedCliConnectionResolver {
+            backend_url: "http://fake-backend.example",
+        };
+
+        let target = resolve_tui_target(
+            &resolver,
+            CliCommand::DefaultTui,
+            &TargetSelection::default(),
+            repository.path(),
+        )
+        .unwrap();
+
+        assert_eq!(target.kind(), TargetKind::Standalone);
+    }
+
+    #[test]
+    fn client_config_reader_uses_only_the_supplied_global_path() {
+        let root = tempfile::tempdir().unwrap();
+        let global = root.path().join("client/config.toml");
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(
+            &global,
+            "default_connection = \"local\"\n[backends.main]\nurl = \"http://backend.example\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("repository/.yoi")).unwrap();
+        std::fs::write(
+            root.path().join("repository/.yoi/client.config.toml"),
+            "this is not valid toml = [",
+        )
+        .unwrap();
+
+        let config = read_client_config_from_global_path(Some(&global))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            config.default_connection,
+            ClientDefaultConnection::Standalone
+        );
+        assert_eq!(
+            config.backends["main"].url.as_deref(),
+            Some("http://backend.example")
+        );
+    }
+
+    #[test]
     fn default_backend_target_inherits_workspace_identity_from_workspace_root() {
         let workspace = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(workspace.path().join(".yoi")).unwrap();
@@ -2137,7 +2508,7 @@ backend = "shared"
         match parse_args_from(["ticket", "doctor"]).unwrap() {
             Mode::Ticket {
                 cli: ticket_cli::TicketCli::Command(ticket_cli::TicketCommand::Doctor),
-                target: client::ResolvedTarget::Local,
+                target: client::ResolvedTarget::Standalone,
             } => {}
             _ => panic!("expected Ticket doctor mode"),
         }
@@ -2208,11 +2579,47 @@ backend = "shared"
     }
 
     #[test]
+    fn parser_resolves_ticket_help_before_backend_target_authority() {
+        match parse_args_from([
+            "--backend",
+            "http://unconfigured-backend.example",
+            "ticket",
+            "--help",
+        ])
+        .unwrap()
+        {
+            Mode::Ticket {
+                cli: ticket_cli::TicketCli::Help,
+                target: client::ResolvedTarget::Standalone,
+            } => {}
+            other => panic!("expected target-independent Ticket help, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_resolves_objective_help_before_backend_target_authority() {
+        match parse_args_from([
+            "--backend",
+            "http://unconfigured-backend.example",
+            "objective",
+            "--help",
+        ])
+        .unwrap()
+        {
+            Mode::Objective {
+                cli: objective_cli::ObjectiveCli::Help,
+                target: client::ResolvedTarget::Standalone,
+            } => {}
+            other => panic!("expected target-independent Objective help, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_ticket_help_uses_ticket_mode() {
         match parse_args_from(["ticket", "--help"]).unwrap() {
             Mode::Ticket {
                 cli: ticket_cli::TicketCli::Help,
-                target: client::ResolvedTarget::Local,
+                target: client::ResolvedTarget::Standalone,
             } => {}
             _ => panic!("expected Ticket help mode"),
         }
@@ -2250,24 +2657,6 @@ backend = "shared"
     fn parse_setup_model_rejects_arguments() {
         let err = parse_args_from(["setup-model", "extra"]).unwrap_err();
         assert_eq!(err.to_string(), "yoi setup-model does not accept arguments");
-    }
-
-    #[test]
-    fn parse_literal_worker_name_still_available_with_flag() {
-        match parse_args_from(["--worker", "worker"]).unwrap() {
-            Mode::Tui {
-                mode:
-                    LaunchMode::WorkerName {
-                        worker_name,
-                        socket_override,
-                    },
-                ..
-            } => {
-                assert_eq!(worker_name, "worker");
-                assert_eq!(socket_override, None);
-            }
-            _ => panic!("expected WorkerName mode"),
-        }
     }
 
     #[test]
@@ -2394,36 +2783,9 @@ backend = "shared"
     }
 
     #[test]
-    fn parse_session_accepts_explicit_runtime_pod_identity() {
-        let segment_id = session_store::new_segment_id();
-        match parse_args_from([
-            "--session",
-            &segment_id.to_string(),
-            "--worker",
-            "explicit-name",
-        ])
-        .unwrap()
-        {
-            Mode::Tui {
-                mode:
-                    LaunchMode::ResumeWithSession {
-                        id,
-                        worker_name: Some(worker_name),
-                    },
-                ..
-            } => {
-                assert_eq!(id, segment_id);
-                assert_eq!(worker_name, "explicit-name");
-            }
-            _ => panic!("expected ResumeWithSession mode with explicit worker name"),
-        }
-    }
-
-    #[test]
     fn parse_rejects_legacy_resume_flags() {
         let cases = [
             (vec!["-r".to_string()], "unknown argument: -r"),
-            (vec!["--resume".to_string()], "unknown argument: --resume"),
             (
                 vec![
                     "--worker".to_string(),
@@ -2509,48 +2871,6 @@ backend = "shared"
     }
 
     #[test]
-    fn parse_panel_mode() {
-        match parse_args_from(["panel", "--workspace", "/tmp/other-workspace"]).unwrap() {
-            Mode::Tui {
-                mode:
-                    LaunchMode::Panel {
-                        include_stopped: false,
-                    },
-                workspace_root,
-                ..
-            } => assert_eq!(workspace_root, PathBuf::from("/tmp/other-workspace")),
-            _ => panic!("expected Panel mode"),
-        }
-    }
-
-    #[test]
-    fn parse_panel_stopped_mode() {
-        for flag in ["-r", "--stopped", "--restoreable"] {
-            match parse_args_from(["panel", flag, "--workspace", "/tmp/other-workspace"]).unwrap() {
-                Mode::Tui {
-                    mode:
-                        LaunchMode::Panel {
-                            include_stopped: true,
-                        },
-                    workspace_root,
-                    ..
-                } => assert_eq!(workspace_root, PathBuf::from("/tmp/other-workspace")),
-                _ => panic!("expected Panel stopped mode for {flag}"),
-            }
-        }
-    }
-
-    #[test]
-    fn parse_backend_panel_stopped_is_not_supported() {
-        let err =
-            parse_args_from(["--backend", "http://127.0.0.1:8787", "panel", "-r"]).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "yoi panel -r is only supported for local targets; Backend panel restore UI is not implemented"
-        );
-    }
-
-    #[test]
     fn parse_dashboard_word_is_not_an_alias_or_worker_name() {
         let err = parse_args_from(["dashboard"]).unwrap_err();
         assert_eq!(err.to_string(), "unknown command `dashboard`");
@@ -2571,11 +2891,27 @@ backend = "shared"
     }
 
     #[test]
-    fn parse_resume_help() {
+    fn parse_workers_help_is_backend_only_and_target_independent() {
+        match parse_args_from(["workers", "--help"]).unwrap() {
+            Mode::WorkersHelp => {}
+            other => panic!("expected WorkersHelp mode, got {other:?}"),
+        }
+        assert!(WORKERS_HELP.contains("selected Backend Workspace"));
+        assert!(WORKERS_HELP.contains("--local --resume"));
+        assert!(!WORKERS_HELP.contains("[--local|--backend"));
+        assert!(!WORKERS_HELP.contains("local Worker records"));
+    }
+
+    #[test]
+    fn parse_resume_help_uses_standalone_session_store_terminology() {
         match parse_args_from(["resume", "--help"]).unwrap() {
             Mode::ResumeHelp => {}
             _ => panic!("expected ResumeHelp mode"),
         }
+        assert!(RESUME_HELP.contains("Standalone session store"));
+        assert!(RESUME_HELP.contains("Backend stopped-Worker picker"));
+        assert!(!RESUME_HELP.contains("local Worker records"));
+        assert!(!RESUME_HELP.contains("local workspace"));
     }
 
     #[test]
@@ -2584,5 +2920,31 @@ backend = "shared"
             Mode::MemoryLintHelp => {}
             _ => panic!("expected MemoryLintHelp mode"),
         }
+    }
+    #[test]
+    fn parse_backend_panel_uses_backend_dashboard_only() {
+        match parse_args_from([
+            "--backend",
+            "http://127.0.0.1:8787",
+            "--workspace-id",
+            "workspace-a",
+            "panel",
+        ])
+        .unwrap()
+        {
+            Mode::Tui {
+                target,
+                mode: LaunchMode::Panel,
+                ..
+            } => assert_eq!(target.kind(), TargetKind::Backend),
+            other => panic!("expected Backend Panel mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_panel_rejects_removed_host_local_restore_path() {
+        let err =
+            parse_args_from(["--backend", "http://127.0.0.1:8787", "panel", "-r"]).unwrap_err();
+        assert!(err.to_string().contains("removed host-local Worker path"));
     }
 }
