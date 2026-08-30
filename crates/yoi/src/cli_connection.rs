@@ -1,4 +1,4 @@
-use client::{BackendTarget, LocalTarget, Target, TargetKind};
+use client::{BackendTarget, LocalTarget, StandaloneTarget, Target, TargetKind};
 use serde::Deserialize;
 
 use super::{ParseError, read_client_default_connection, resolve_backend_url};
@@ -107,6 +107,18 @@ pub(crate) trait CliConnectionResolver {
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct ClientConfigCliConnectionResolver;
 
+fn standalone_target() -> Result<Box<dyn Target>, ParseError> {
+    let state_dir = manifest::paths::data_dir()
+        .ok_or_else(|| {
+            ParseError(
+                "Standalone state directory is unavailable; set YOI_DATA_DIR, YOI_HOME, XDG_DATA_HOME, or HOME"
+                    .to_string(),
+            )
+        })?
+        .join("standalone");
+    Ok(Box::new(StandaloneTarget::new(state_dir)))
+}
+
 impl CliConnectionResolver for ClientConfigCliConnectionResolver {
     fn resolve_connection(
         &self,
@@ -147,6 +159,11 @@ impl CliConnectionResolver for ClientConfigCliConnectionResolver {
                 resolve_backend_url(explicit_backend_url, workspace_id)?,
                 workspace_id.map(str::to_string),
             ))),
+            (CliConnectionRequirement::ConnectionAware, CliConnectionInput::LocalTarget)
+                if command == CliCommand::DefaultTui =>
+            {
+                standalone_target()
+            }
             (CliConnectionRequirement::ConnectionAware, CliConnectionInput::LocalTarget) => {
                 Ok(Box::new(LocalTarget::new()))
             }
@@ -171,6 +188,10 @@ pub(crate) fn resolve_local_cli_connection<R: CliConnectionResolver + ?Sized>(
     let target = resolver.resolve_connection(command, CliConnectionInput::LocalTarget)?;
     match target.kind() {
         TargetKind::Local => Ok(target),
+        TargetKind::Standalone => Err(ParseError(format!(
+            "{} resolved Standalone where a legacy local target was required",
+            command.display_name()
+        ))),
         TargetKind::Backend => Err(ParseError(format!(
             "{} resolved a Backend target where a local target was required",
             command.display_name()
@@ -193,8 +214,8 @@ pub(crate) fn resolve_backend_cli_connection<R: CliConnectionResolver + ?Sized>(
     )?;
     match target.kind() {
         TargetKind::Backend => Ok(target),
-        TargetKind::Local => Err(ParseError(format!(
-            "{} resolved a local target where a Backend target was required",
+        TargetKind::Local | TargetKind::Standalone => Err(ParseError(format!(
+            "{} resolved a non-Backend target where a Backend target was required",
             command.display_name()
         ))),
     }

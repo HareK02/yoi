@@ -36,7 +36,7 @@ use crossterm::execute;
 use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
 use session_store::SegmentId;
 
-use client::{Target, WorkerConnectionSelector, WorkerListRequest};
+use client::{Target, WorkerConnectionSelector, WorkerListRequest, WorkerSpawn};
 
 #[derive(Debug)]
 pub struct LaunchOptions {
@@ -85,6 +85,49 @@ pub enum LaunchMode {
     Panel { include_stopped: bool },
 }
 
+struct TerminalModeGuard {
+    active: bool,
+}
+
+impl TerminalModeGuard {
+    fn new() -> Self {
+        Self { active: true }
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        self.active = false;
+        let mut stdout = io::stdout();
+        execute!(
+            stdout,
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            DisableBracketedPaste,
+            crossterm::cursor::Show
+        )?;
+        disable_raw_mode()
+    }
+}
+
+impl Drop for TerminalModeGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let mut stdout = io::stdout();
+            let _ = execute!(
+                stdout,
+                DisableMouseCapture,
+                LeaveAlternateScreen,
+                DisableBracketedPaste,
+                crossterm::cursor::Show
+            );
+            let _ = disable_raw_mode();
+            self.active = false;
+        }
+    }
+}
+
 pub async fn launch(options: LaunchOptions) -> ExitCode {
     let LaunchOptions {
         target,
@@ -109,14 +152,19 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
         eprintln!("yoi: {e}");
         return ExitCode::FAILURE;
     }
+    let mut terminal_mode = TerminalModeGuard::new();
 
     let result = match mode {
         LaunchMode::Spawn {
             worker_name,
             profile,
         } => match target.spawn_worker() {
-            Ok(spawn) => {
-                console::run_spawn(None, worker_name, profile, spawn.runtime_command).await
+            Ok(WorkerSpawn::LegacyLocal { runtime_command }) => {
+                console::run_spawn(None, worker_name, profile, runtime_command).await
+            }
+            Ok(WorkerSpawn::Standalone { state_dir }) => {
+                console::run_standalone(workspace_root.clone(), state_dir, worker_name, profile)
+                    .await
             }
             Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
         },
@@ -176,9 +224,13 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
             Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
         },
         LaunchMode::ResumeWithSession { id, worker_name } => match target.spawn_worker() {
-            Ok(spawn) => {
-                console::run_spawn(Some(id), worker_name, None, spawn.runtime_command).await
+            Ok(WorkerSpawn::LegacyLocal { runtime_command }) => {
+                console::run_spawn(Some(id), worker_name, None, runtime_command).await
             }
+            Ok(WorkerSpawn::Standalone { .. }) => Err(Box::new(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Standalone session restore is not implemented",
+            )) as Box<dyn std::error::Error>),
             Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
         },
         LaunchMode::Panel { include_stopped } => match target.dashboard() {
@@ -198,15 +250,7 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
     // alternate-screen buffer.
     #[cfg(feature = "e2e-test")]
     e2e_observer::emit("tui", "terminal_cleanup_started", serde_json::json!({}));
-    let mut stdout = io::stdout();
-    let _ = execute!(
-        stdout,
-        DisableMouseCapture,
-        LeaveAlternateScreen,
-        DisableBracketedPaste
-    );
-    let _ = disable_raw_mode();
-    let _ = execute!(stdout, crossterm::cursor::Show);
+    let _ = terminal_mode.restore();
     #[cfg(feature = "e2e-test")]
     e2e_observer::emit("tui", "terminal_cleanup_finished", serde_json::json!({}));
 

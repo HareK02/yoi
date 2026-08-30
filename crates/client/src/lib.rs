@@ -37,9 +37,9 @@ pub use backend_workspace::{
 };
 pub use runtime_command::WorkerRuntimeCommand;
 pub use target::{
-    BackendTarget, Dashboard, LocalTarget, ResolvedTarget, Target, TargetError, TargetKind,
-    WorkerByName, WorkerConnection, WorkerConnectionSelector, WorkerList, WorkerListRequest,
-    WorkerResume, WorkerSpawn,
+    BackendTarget, Dashboard, LocalTarget, ResolvedTarget, StandaloneTarget, Target, TargetError,
+    TargetKind, WorkerByName, WorkerConnection, WorkerConnectionSelector, WorkerList,
+    WorkerListRequest, WorkerResume, WorkerSpawn,
 };
 
 pub use spawn::{

@@ -214,6 +214,9 @@ pub fn run(cli: TicketCli, target: ResolvedTarget) -> Result<TicketCliOutput, Ti
             })?;
             run_in_workspace(cli, &workspace)
         }
+        ResolvedTarget::Standalone => Err(TicketCliError::new(
+            "Standalone is a one-shot Worker host, not Ticket storage authority",
+        )),
         ResolvedTarget::Backend {
             base_url,
             workspace_id,

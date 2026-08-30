@@ -179,6 +179,9 @@ pub fn run(
             })?;
             run_in_workspace(cli, &workspace)
         }
+        ResolvedTarget::Standalone => Err(ObjectiveCliError::new(
+            "Standalone is a one-shot Worker host, not Objective storage authority",
+        )),
         ResolvedTarget::Backend {
             base_url,
             workspace_id,

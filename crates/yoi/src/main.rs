@@ -687,6 +687,21 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
         &workspace_root,
     )?;
 
+    if target.kind() == TargetKind::Standalone {
+        if session.is_some() {
+            return Err(ParseError(
+                "--local starts a fresh Standalone Worker; --session restore requires the legacy local Runtime"
+                    .to_string(),
+            ));
+        }
+        if socket_override.is_some() {
+            return Err(ParseError(
+                "--local uses an in-process Standalone connection and does not accept --socket"
+                    .to_string(),
+            ));
+        }
+    }
+
     if let (Some(runtime_id), Some(worker_id)) = (runtime_id.clone(), worker_id) {
         return Ok(Mode::Tui {
             target,
@@ -714,6 +729,11 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
         LaunchMode::Spawn {
             worker_name,
             profile: Some(profile),
+        }
+    } else if target.kind() == TargetKind::Standalone {
+        LaunchMode::Spawn {
+            worker_name,
+            profile: None,
         }
     } else if let Some(session) = session {
         LaunchMode::ResumeWithSession {
@@ -1650,7 +1670,7 @@ Usage:
 Target selection:
   Target options are top-level options and must appear before the command.
 
-      --local              Use the local Worker runtime explicitly
+      --local              Start a one-process Standalone Worker (no Server or Runtime)
       --backend <URL>      Use a Workspace Backend explicitly
       --workspace-id <ID>  Scope Backend routes to a Workspace id
 
@@ -1725,7 +1745,9 @@ fn print_memory_lint_help() {
 mod tests {
     use super::*;
     use crate::cli_connection::CliConnectionInput;
-    use client::{BackendTarget, LocalTarget, TargetKind, WorkerListRequest};
+    use client::{
+        BackendTarget, LocalTarget, StandaloneTarget, Target, TargetKind, WorkerListRequest,
+    };
 
     struct FixedCliConnectionResolver {
         backend_url: &'static str,
@@ -1761,7 +1783,11 @@ mod tests {
             let workspace_id = match input {
                 CliConnectionInput::DefaultTarget { workspace_id }
                 | CliConnectionInput::BackendTarget { workspace_id, .. } => workspace_id,
-                CliConnectionInput::LocalTarget => return Ok(Box::new(LocalTarget::new())),
+                CliConnectionInput::LocalTarget => {
+                    return Ok(Box::new(StandaloneTarget::new(
+                        "/tmp/yoi-test-standalone-state",
+                    )));
+                }
             };
             Ok(Box::new(BackendTarget::new(
                 self.backend_url,
@@ -2024,6 +2050,75 @@ backend = "shared"
             }
             _ => panic!("expected Workers mode"),
         }
+    }
+
+    #[test]
+    fn parser_explicit_local_overrides_default_backend_with_standalone_target() {
+        let resolver = DefaultBackendCliConnectionResolver {
+            backend_url: "http://default-backend.example",
+        };
+        let args = ["--local", "--worker", "my-local-worker"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        let mode = parse_args_slice_with_connection_resolver(&args, &resolver).unwrap();
+        let Mode::Tui { target, mode, .. } = mode else {
+            panic!("expected TUI mode")
+        };
+
+        assert_eq!(target.kind(), TargetKind::Standalone);
+        assert!(matches!(
+            mode,
+            LaunchMode::Spawn {
+                worker_name: Some(ref name),
+                profile: None,
+            } if name == "my-local-worker"
+        ));
+        assert!(matches!(
+            target.spawn_worker().unwrap(),
+            client::WorkerSpawn::Standalone { .. }
+        ));
+    }
+
+    #[test]
+    fn parser_rejects_standalone_and_backend_target_together() {
+        let err = parse_args_from(["--local", "--backend", "http://backend.example"]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "--local and --backend are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn parser_standalone_rejects_legacy_session_and_socket_inputs() {
+        let resolver = DefaultBackendCliConnectionResolver {
+            backend_url: "http://default-backend.example",
+        };
+        let session_args = ["--local", "--session", "session-1"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        let err = parse_args_slice_with_connection_resolver(&session_args, &resolver).unwrap_err();
+        assert_eq!(
+            err.0,
+            "--local starts a fresh Standalone Worker; --session restore requires the legacy local Runtime"
+        );
+
+        let socket_args = [
+            "--local",
+            "--worker",
+            "worker-a",
+            "--socket",
+            "/tmp/worker.sock",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+        let err = parse_args_slice_with_connection_resolver(&socket_args, &resolver).unwrap_err();
+        assert_eq!(
+            err.0,
+            "--local uses an in-process Standalone connection and does not accept --socket"
+        );
     }
 
     #[test]

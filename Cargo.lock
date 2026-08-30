@@ -5331,6 +5331,7 @@ dependencies = [
  "serde",
  "serde_json",
  "session-store",
+ "standalone",
  "tempfile",
  "ticket",
  "tokio",

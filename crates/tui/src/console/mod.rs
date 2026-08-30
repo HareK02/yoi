@@ -22,7 +22,8 @@ use protocol::{Greeting, RewindSummary, RewindTarget, RewindTargetId, Segment};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use session_store::SegmentId;
-use tokio::sync::mpsc;
+use standalone::{StandaloneHost, StandaloneLaunchConfig};
+use tokio::sync::{broadcast, mpsc};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use client::{BackendRuntimeClient, BackendRuntimeTarget, WorkerClient, WorkerRuntimeCommand};
@@ -174,13 +175,33 @@ pub(crate) async fn run_worker_name(
 enum ConsoleConnection {
     LegacySocket(WorkerClient),
     BackendRuntime(BackendRuntimeClient),
+    Standalone {
+        host: Option<StandaloneHost>,
+        events: broadcast::Receiver<Event>,
+        initial_snapshot: Option<Event>,
+    },
 }
 
 impl ConsoleConnection {
+    fn standalone(host: StandaloneHost) -> Self {
+        let events = host.subscribe();
+        let initial_snapshot = Some(host.snapshot());
+        Self::Standalone {
+            host: Some(host),
+            events,
+            initial_snapshot,
+        }
+    }
+
     fn try_next_event(&mut self) -> Option<Event> {
         match self {
             Self::LegacySocket(client) => client.try_next_event(),
             Self::BackendRuntime(client) => client.try_next_event(),
+            Self::Standalone {
+                events,
+                initial_snapshot,
+                ..
+            } => initial_snapshot.take().or_else(|| events.try_recv().ok()),
         }
     }
 
@@ -188,6 +209,18 @@ impl ConsoleConnection {
         match self {
             Self::LegacySocket(client) => client.next_event().await,
             Self::BackendRuntime(client) => client.next_event().await,
+            Self::Standalone { host, events, .. } => loop {
+                match events.recv().await {
+                    Ok(event) => break Some(event),
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let Some(host) = host.as_ref() else {
+                            break None;
+                        };
+                        break Some(host.snapshot());
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break None,
+                }
+            },
         }
     }
 
@@ -195,8 +228,78 @@ impl ConsoleConnection {
         match self {
             Self::LegacySocket(client) => Ok(client.send(method).await?),
             Self::BackendRuntime(client) => Ok(client.send(method).await?),
+            Self::Standalone { host, .. } => {
+                let host = host.as_ref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "Standalone Worker has already shut down",
+                    )
+                })?;
+                Ok(host.send(method.clone()).await?)
+            }
         }
     }
+
+    async fn shutdown(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Self::Standalone { host, .. } = self
+            && let Some(host) = host.take()
+        {
+            host.shutdown().await?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) async fn run_standalone(
+    workspace_root: PathBuf,
+    state_dir: PathBuf,
+    worker_name: Option<String>,
+    profile: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let worker_name = worker_name.unwrap_or_else(|| "local".to_string());
+    let profile = profile.map_or(manifest::ProfileSelector::Default, |profile| {
+        manifest::ProfileSelector::parse_cli(&profile)
+    });
+    let history_root = workspace_root.clone();
+    let launch = StandaloneLaunchConfig {
+        state_dir,
+        cwd: workspace_root,
+        profile,
+        worker_name: worker_name.clone(),
+    }
+    .resolve()
+    .map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Standalone launch configuration failed: {error}"),
+        )
+    })?;
+    let host = StandaloneHost::start(launch)
+        .await
+        .map_err(|error| io::Error::other(format!("Standalone Worker startup failed: {error}")))?;
+    let mut connection = ConsoleConnection::standalone(host);
+
+    let mut terminal = match enter_fullscreen() {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            let _ = connection.shutdown().await;
+            return Err(error);
+        }
+    };
+    let mut app = App::new_with_persistent_input_history(worker_name, &history_root);
+    let run_result = run_loop(&mut terminal, &mut app, &mut connection, None).await;
+    let shutdown_result = connection
+        .shutdown()
+        .await
+        .map_err(|error| io::Error::other(format!("Standalone Worker shutdown failed: {error}")));
+    let leave_result = leave_fullscreen(&mut terminal);
+
+    if let Err(error) = run_result {
+        return Err(error);
+    }
+    shutdown_result?;
+    leave_result?;
+    Ok(())
 }
 
 pub(crate) async fn run_backend_runtime(
@@ -208,13 +311,8 @@ pub(crate) async fn run_backend_runtime(
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut app = App::new_with_persistent_input_history(worker_label, &workspace_root);
     app.connected = true;
-    let result = run_loop(
-        &mut terminal,
-        &mut app,
-        ConsoleConnection::BackendRuntime(client),
-        None,
-    )
-    .await;
+    let mut connection = ConsoleConnection::BackendRuntime(client);
+    let result = run_loop(&mut terminal, &mut app, &mut connection, None).await;
     let _ = leave_fullscreen(&mut terminal);
     result
 }
@@ -228,13 +326,8 @@ async fn run_connected_pod(
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut app = App::new_with_persistent_input_history(worker_name, &workspace_root);
     app.connected = true;
-    run_loop(
-        terminal,
-        &mut app,
-        ConsoleConnection::LegacySocket(client),
-        Some(runtime_command),
-    )
-    .await
+    let mut connection = ConsoleConnection::LegacySocket(client);
+    run_loop(terminal, &mut app, &mut connection, Some(runtime_command)).await
 }
 
 pub(crate) async fn open_from_dashboard(
@@ -460,13 +553,8 @@ async fn run(
             app.connected = true;
             // The Worker sends `Event::Snapshot` automatically on connect;
             // no explicit method call is required to fetch history.
-            run_loop(
-                terminal,
-                &mut app,
-                ConsoleConnection::LegacySocket(client),
-                Some(runtime_command),
-            )
-            .await?;
+            let mut connection = ConsoleConnection::LegacySocket(client);
+            run_loop(terminal, &mut app, &mut connection, Some(runtime_command)).await?;
         }
         Err(e) => {
             app.push_error(format!(
@@ -791,7 +879,7 @@ async fn drain_worker_events(
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
-    mut client: ConsoleConnection,
+    client: &mut ConsoleConnection,
     runtime_command: Option<WorkerRuntimeCommand>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_terminal_reader, mut term_rx) = TerminalEventReader::spawn()?;
@@ -804,11 +892,11 @@ async fn run_loop(
         }
 
         let handled_term_event =
-            drain_terminal_events(app, &mut client, &mut term_rx, runtime_command.as_ref()).await?;
+            drain_terminal_events(app, client, &mut term_rx, runtime_command.as_ref()).await?;
         if app.quit {
             break;
         }
-        let handled_worker_event = drain_worker_events(app, &mut client).await?;
+        let handled_worker_event = drain_worker_events(app, client).await?;
         if handled_term_event || handled_worker_event {
             terminal.draw(|f| ui::draw(f, app))?;
             continue;
@@ -816,8 +904,7 @@ async fn run_loop(
 
         match next_loop_input(&mut term_rx, app.connected, client.next_event()).await {
             LoopInput::Terminal(term_event) => {
-                handle_terminal_event(app, &mut client, term_event?, runtime_command.as_ref())
-                    .await?;
+                handle_terminal_event(app, client, term_event?, runtime_command.as_ref()).await?;
             }
             LoopInput::Worker(event) => match event {
                 Some(ev) => {
