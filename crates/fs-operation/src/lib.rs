@@ -281,6 +281,153 @@ mod tests {
     }
 
     #[test]
+    fn grep_accepts_a_direct_file_without_searching_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        let selected = temp.path().join("selected.txt");
+        std::fs::write(&selected, "before\nneedle selected\nafter\n").unwrap();
+        std::fs::write(temp.path().join("sibling.txt"), "needle sibling\n").unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let readable = RootAccess(root.clone());
+
+        let direct = run_grep(
+            &root,
+            selected,
+            GrepRequest {
+                pattern: "needle".to_string(),
+                path: FsPath::new("selected.txt").unwrap(),
+                glob: None,
+                file_type: None,
+                case_insensitive: false,
+                before_context: 1,
+                after_context: 1,
+                multiline: false,
+                output_mode: GrepOutputMode::Content,
+                limit: 10,
+                offset: 0,
+            },
+            &readable,
+        )
+        .unwrap();
+
+        assert_eq!(direct.match_count, 1);
+        assert_eq!(direct.matched_files, 1);
+        assert_eq!(
+            direct.output,
+            concat!(
+                "selected.txt\n",
+                "   1 │ before\n",
+                " > 2 │ needle selected\n",
+                "   3 │ after\n",
+            )
+        );
+        assert!(!direct.output.contains("sibling"));
+
+        let directory = run_grep(
+            &root,
+            root.clone(),
+            GrepRequest {
+                pattern: "needle".to_string(),
+                path: FsPath::root(),
+                glob: None,
+                file_type: None,
+                case_insensitive: false,
+                before_context: 0,
+                after_context: 0,
+                multiline: false,
+                output_mode: GrepOutputMode::Content,
+                limit: 10,
+                offset: 0,
+            },
+            &readable,
+        )
+        .unwrap();
+        assert_eq!(directory.match_count, 2);
+        assert_eq!(directory.matched_files, 2);
+    }
+
+    #[test]
+    fn grep_returns_not_found_for_a_missing_direct_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let missing = root.join("missing.txt");
+        let readable = RootAccess(root.clone());
+
+        let error = run_grep(
+            &root,
+            missing.clone(),
+            GrepRequest {
+                pattern: "needle".to_string(),
+                path: FsPath::new("missing.txt").unwrap(),
+                glob: None,
+                file_type: None,
+                case_insensitive: false,
+                before_context: 0,
+                after_context: 0,
+                multiline: false,
+                output_mode: GrepOutputMode::Content,
+                limit: 10,
+                offset: 0,
+            },
+            &readable,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, FsError::NotFound(path) if path == missing));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_keeps_direct_symlink_directory_and_broken_path_guards() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let readable = RootAccess(root.clone());
+        std::fs::create_dir(root.join("target-dir")).unwrap();
+        symlink(root.join("target-dir"), root.join("directory-link")).unwrap();
+        symlink(root.join("missing-target"), root.join("broken-link")).unwrap();
+
+        let request = |path: &str| GrepRequest {
+            pattern: "needle".to_string(),
+            path: FsPath::new(path).unwrap(),
+            glob: None,
+            file_type: None,
+            case_insensitive: false,
+            before_context: 0,
+            after_context: 0,
+            multiline: false,
+            output_mode: GrepOutputMode::Content,
+            limit: 10,
+            offset: 0,
+        };
+
+        let directory_error = run_grep(
+            &root,
+            root.join("directory-link"),
+            request("directory-link"),
+            &readable,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            directory_error,
+            FsError::SymlinkDirectoryNotTraversed { tool: "Grep", path, .. }
+                if path == root.join("directory-link")
+        ));
+
+        let broken_error = run_grep(
+            &root,
+            root.join("broken-link"),
+            request("broken-link"),
+            &readable,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            broken_error,
+            FsError::BrokenSymlink { path, .. } if path == root.join("broken-link")
+        ));
+    }
+
+    #[test]
     fn grep_content_groups_lines_by_file_and_marks_matches() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(

@@ -1943,7 +1943,7 @@ mod tests {
             &workdir,
             GrepRequest {
                 pattern: "NEEDLE".into(),
-                path: WorkdirPath::root(),
+                path: WorkdirPath::new("src/main.rs").unwrap(),
                 glob: None,
                 file_type: None,
                 case_insensitive: false,

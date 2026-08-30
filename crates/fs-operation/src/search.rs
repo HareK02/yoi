@@ -221,13 +221,15 @@ pub fn run_grep(
         std::io::ErrorKind::NotFound => FsError::NotFound(base.clone()),
         _ => FsError::io(&base, e),
     })?;
-    if !base_meta.is_dir() {
+    if !base_meta.is_file() && !base_meta.is_dir() {
         return Err(FsError::InvalidArgument(format!(
-            "grep search path is not a directory: {}",
+            "grep search path must be a regular file or directory: {}",
             base.display()
         )));
     }
-    if let Some(info) = symlink.as_ref() {
+    if base_meta.is_dir()
+        && let Some(info) = symlink.as_ref()
+    {
         return Err(FsError::SymlinkDirectoryNotTraversed {
             tool: "Grep",
             path: base.clone(),

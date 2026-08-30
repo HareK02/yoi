@@ -1886,8 +1886,8 @@ mod tests {
     use manifest::{Scope, SharedScope};
     use tower::ServiceExt;
     use workdir::{
-        LocalWorkdirSession, ReadRequest, StatRequest, Workdir, WorkdirPath,
-        WorkdirSessionCapabilities,
+        GrepOutputMode, GrepRequest, LocalWorkdirSession, ReadRequest, StatRequest, Workdir,
+        WorkdirPath, WorkdirSessionCapabilities,
     };
 
     fn test_bundle(profile: ProfileSelector) -> ConfigBundle {
@@ -2347,6 +2347,40 @@ mod tests {
         .await
         .expect("owned operation");
         assert!(matches!(result, WorkdirSessionOperationResult::Stat(_)));
+
+        let grep = WorkdirSessionOperationRequest {
+            delegations: Vec::new(),
+            operation: WorkdirSessionOperation::Grep(GrepRequest {
+                pattern: "hello".into(),
+                path: WorkdirPath::new("hello.txt").unwrap(),
+                glob: None,
+                file_type: None,
+                case_insensitive: false,
+                before_context: 0,
+                after_context: 0,
+                multiline: false,
+                output_mode: GrepOutputMode::Content,
+                limit: 10,
+                offset: 0,
+            }),
+        };
+        let Json(result) = run_workdir_session_operation(
+            State(state.clone()),
+            Path("session-1".to_string()),
+            Some(Extension(auth.clone())),
+            Ok(Json(grep)),
+        )
+        .await
+        .expect("grep direct file through provider operation");
+        match result {
+            WorkdirSessionOperationResult::Grep(result) => {
+                assert_eq!(result.match_count, 1);
+                assert_eq!(result.matched_files, 1);
+                assert!(result.output.starts_with("hello.txt\n"));
+                assert!(result.output.contains("> 1 │ hello"));
+            }
+            other => panic!("unexpected workdir grep result: {other:?}"),
+        }
 
         #[cfg(unix)]
         {
