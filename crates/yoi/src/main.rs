@@ -217,6 +217,24 @@ fn resolve_tui_target<R: CliConnectionResolver + ?Sized>(
     selection: &TargetSelection,
     workspace_root: &Path,
 ) -> Result<Box<dyn Target>, ParseError> {
+    if selection.explicit_local {
+        return resolve_connection_aware_cli_connection(
+            connection_resolver,
+            command,
+            true,
+            None,
+            None,
+        );
+    }
+
+    if selection.backend_url.is_none()
+        && let Ok(target) =
+            resolve_connection_aware_cli_connection(connection_resolver, command, false, None, None)
+        && target.kind() == TargetKind::Standalone
+    {
+        return Ok(target);
+    }
+
     let workspace_id = match selection.workspace_id.clone() {
         Some(workspace_id) => Some(workspace_id),
         None => resolve_workspace_id_from_root(workspace_root)?,
@@ -1160,23 +1178,22 @@ fn read_client_default_connection() -> Result<ClientDefaultConnection, ParseErro
 }
 
 fn read_client_config() -> Result<Option<ClientConfigFile>, ParseError> {
+    let path = client_global_config_path();
+    read_client_config_from_global_path(path.as_deref())
+}
+
+fn read_client_config_from_global_path(
+    path: Option<&Path>,
+) -> Result<Option<ClientConfigFile>, ParseError> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let Some(overlay) = read_client_config_overlay(path)? else {
+        return Ok(None);
+    };
     let mut config = ClientConfigFile::default();
-    let mut found = false;
-
-    if let Some(path) = client_global_config_path() {
-        if let Some(overlay) = read_client_config_overlay(&path)? {
-            config.apply_overlay(overlay);
-            found = true;
-        }
-    }
-
-    let cwd_path = client_cwd_config_path()?;
-    if let Some(overlay) = read_client_config_overlay(&cwd_path)? {
-        config.apply_overlay(overlay);
-        found = true;
-    }
-
-    Ok(found.then_some(config))
+    config.apply_overlay(overlay);
+    Ok(Some(config))
 }
 
 fn read_client_config_overlay(path: &Path) -> Result<Option<ClientConfigOverlay>, ParseError> {
@@ -1194,14 +1211,10 @@ fn client_global_config_path() -> Option<PathBuf> {
     manifest::paths::data_dir().map(|dir| dir.join("client").join("config.toml"))
 }
 
-fn client_cwd_config_path() -> Result<PathBuf, ParseError> {
-    Ok(current_dir()?.join(".yoi").join("client.config.toml"))
-}
-
 fn client_config_location_message() -> String {
     match client_global_config_path() {
-        Some(path) => format!("{} or <cwd>/.yoi/client.config.toml", path.display()),
-        None => "<data_dir>/client/config.toml or <cwd>/.yoi/client.config.toml".to_string(),
+        Some(path) => path.display().to_string(),
+        None => "<data_dir>/client/config.toml".to_string(),
     }
 }
 
@@ -2247,6 +2260,88 @@ backend = "shared"
             }
             _ => panic!("expected Worker cleanup prune mode"),
         }
+    }
+
+    #[test]
+    fn explicit_standalone_ignores_malformed_repository_workspace_identity() {
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repository.path().join(".yoi")).unwrap();
+        std::fs::write(
+            repository.path().join(".yoi/workspace.toml"),
+            "this is not valid toml = [",
+        )
+        .unwrap();
+        let resolver = FixedCliConnectionResolver {
+            backend_url: "http://fake-backend.example",
+        };
+
+        let target = resolve_tui_target(
+            &resolver,
+            CliCommand::DefaultTui,
+            &TargetSelection {
+                explicit_local: true,
+                ..TargetSelection::default()
+            },
+            repository.path(),
+        )
+        .unwrap();
+
+        assert_eq!(target.kind(), TargetKind::Standalone);
+    }
+
+    #[test]
+    fn default_standalone_ignores_malformed_repository_workspace_identity() {
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repository.path().join(".yoi")).unwrap();
+        std::fs::write(
+            repository.path().join(".yoi/workspace.toml"),
+            "this is not valid toml = [",
+        )
+        .unwrap();
+        let resolver = FixedCliConnectionResolver {
+            backend_url: "http://fake-backend.example",
+        };
+
+        let target = resolve_tui_target(
+            &resolver,
+            CliCommand::DefaultTui,
+            &TargetSelection::default(),
+            repository.path(),
+        )
+        .unwrap();
+
+        assert_eq!(target.kind(), TargetKind::Standalone);
+    }
+
+    #[test]
+    fn client_config_reader_uses_only_the_supplied_global_path() {
+        let root = tempfile::tempdir().unwrap();
+        let global = root.path().join("client/config.toml");
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(
+            &global,
+            "default_connection = \"local\"\n[backends.main]\nurl = \"http://backend.example\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("repository/.yoi")).unwrap();
+        std::fs::write(
+            root.path().join("repository/.yoi/client.config.toml"),
+            "this is not valid toml = [",
+        )
+        .unwrap();
+
+        let config = read_client_config_from_global_path(Some(&global))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            config.default_connection,
+            ClientDefaultConnection::Standalone
+        );
+        assert_eq!(
+            config.backends["main"].url.as_deref(),
+            Some("http://backend.example")
+        );
     }
 
     #[test]

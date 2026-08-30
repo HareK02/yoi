@@ -31,7 +31,7 @@ worker
 
 ## CLI / TUI routing
 
-- `yoi` の connection-aware command は `TargetKind::Standalone | Backend` の二択で dispatch する。`--local` と client config の `default_connection = "local"` は Standalone を選ぶ入力であり、旧 LocalBackend を有効化しない。
+- `yoi` の connection-aware command は `TargetKind::Standalone | Backend` の二択で dispatch する。`--local` と client config の `default_connection = "local"` は Standalone を選ぶ入力であり、旧 LocalBackend を有効化しない。 Client config は repository `.yoi/client.config.toml` を読まず、repository `.yoi/workspace.toml` は Backend Workspace identity が必要な場合だけ参照する。
 - Standalone の通常起動は `StandaloneHost`、restore は専用 `StandaloneStore` の session picker を使う。Workspace Worker list、PID、Unix socket、subprocess は探索しない。
 - `workers`、Backend Worker restore、Workspace panel、Ticket、Objective は Backend authority を要求する。Standalone から repository-local filesystem backend へ fallback しない。
 - `yoi worker` は Runtime や明示的な process-owned integration が使う direct Worker entrypoint として残るが、通常の `yoi` / TUI 起動経路からは呼び出さない。
