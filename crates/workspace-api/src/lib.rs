@@ -172,30 +172,30 @@ pub struct WorkingDirectoryOccupancy {
 pub struct WorkingDirectorySummary {
     pub working_directory_id: String,
     pub repository_id: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creation_selector: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creation_ref: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creation_tree: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_selector: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_ref: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_tree: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional, type = "number | null"))]
     pub observed_at_epoch_seconds: Option<u64>,
     pub materializer_kind: WorkingDirectoryMaterializerKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanup_target: Option<WorkingDirectoryCleanupTarget>,
     pub status: WorkingDirectoryStatusKind,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanliness: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_worker_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occupied_by: Option<WorkingDirectoryOccupancy>,
 }
 
@@ -781,6 +781,48 @@ mod tests {
             "operation_id": "operation-1"
         });
         assert!(serde_json::from_value::<WorkingDirectoryCreateRequest>(incomplete).is_err());
+    }
+
+    #[test]
+    fn workdir_summary_omits_absent_optional_fields_on_the_wire() {
+        let value = serde_json::to_value(WorkingDirectorySummary {
+            working_directory_id: "workdir-1".into(),
+            repository_id: "main".into(),
+            creation_selector: None,
+            creation_ref: None,
+            creation_tree: None,
+            current_selector: None,
+            current_ref: None,
+            current_tree: None,
+            observed_at_epoch_seconds: None,
+            materializer_kind: WorkingDirectoryMaterializerKind::RuntimeGitCache,
+            cleanup_target: None,
+            status: WorkingDirectoryStatusKind::Active,
+            cleanliness: None,
+            primary_worker_id: None,
+            occupied_by: None,
+        })
+        .expect("serialize Workdir summary");
+        let object = value.as_object().expect("Workdir summary object");
+
+        for key in [
+            "creation_selector",
+            "creation_ref",
+            "creation_tree",
+            "current_selector",
+            "current_ref",
+            "current_tree",
+            "observed_at_epoch_seconds",
+            "cleanup_target",
+            "cleanliness",
+            "primary_worker_id",
+            "occupied_by",
+        ] {
+            assert!(
+                !object.contains_key(key),
+                "absent field {key} must be omitted"
+            );
+        }
     }
 
     #[test]
