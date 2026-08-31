@@ -8,6 +8,8 @@ use agen::llm_client::error::ClientError;
 use agen::llm_client::event::{Event as LlmEvent, StopReason};
 use agen::llm_client::types::Request;
 use async_trait::async_trait;
+use client::Client;
+use client::transport::in_process::Socket as InProcessSocket;
 use futures::{Stream, stream};
 use protocol::{Event, Method};
 use standalone::{
@@ -88,17 +90,29 @@ async fn in_process_host_runs_text_and_read_tool_then_shuts_down() {
     let host = StandaloneHost::start_with_model_client(launch, client)
         .await
         .expect("start in-process host");
-    let mut events = host.subscribe();
+    let mut protocol_client = host.connect();
 
-    host.send(Method::run_text("read the probe"))
+    protocol_client
+        .send(&Method::run_text("read the probe"))
         .await
         .expect("submit input");
 
     tokio::time::timeout(Duration::from_secs(30), async {
+        let mut saw_user_message = false;
         let mut saw_text = false;
         let mut saw_tool_result = false;
         loop {
-            match events.recv().await.expect("worker event") {
+            match protocol_client
+                .next_event()
+                .await
+                .expect("protocol event")
+                .expect("worker event")
+            {
+                Event::UserMessage { segments }
+                    if format!("{segments:?}").contains("read the probe") =>
+                {
+                    saw_user_message = true;
+                }
                 Event::TextDelta { text } if text.contains("standalone response") => {
                     saw_text = true;
                 }
@@ -106,6 +120,10 @@ async fn in_process_host_runs_text_and_read_tool_then_shuts_down() {
                     saw_tool_result = true;
                 }
                 Event::RunEnd { .. } => {
+                    assert!(
+                        saw_user_message,
+                        "stream must expose the committed user message"
+                    );
                     assert!(saw_text, "stream must expose the model text delta");
                     assert!(saw_tool_result, "stream must expose the tool result");
                     break;
@@ -251,15 +269,18 @@ async fn standalone_restore_preserves_history_tasks_notifications_and_cwd_scope(
     ]);
     let host = StandaloneHost::start_with_model_client(launch, first_client).await?;
     let session_id = host.session_id();
-    let mut events = host.subscribe();
-    host.send(Method::run_text("first request")).await?;
-    wait_for_run_end(&mut events).await?;
-    host.send(Method::Notify {
-        message: "persisted notification".to_string(),
-        auto_run: true,
-    })
-    .await?;
-    wait_for_run_end(&mut events).await?;
+    let mut protocol_client = host.connect();
+    protocol_client
+        .send(&Method::run_text("first request"))
+        .await?;
+    wait_for_run_end(&mut protocol_client).await?;
+    protocol_client
+        .send(&Method::Notify {
+            message: "persisted notification".to_string(),
+            auto_run: true,
+        })
+        .await?;
+    wait_for_run_end(&mut protocol_client).await?;
     host.shutdown().await?;
 
     let store = StandaloneSessionStore::open(&state_dir)?;
@@ -288,16 +309,24 @@ async fn standalone_restore_preserves_history_tasks_notifications_and_cwd_scope(
     let host =
         StandaloneHost::restore_with_model_client(state_dir.clone(), session_id, second_client)
             .await?;
-    let snapshot = format!("{:?}", host.snapshot());
+    let mut protocol_client = host.connect();
+    let snapshot = format!(
+        "{:?}",
+        protocol_client
+            .next_event()
+            .await
+            .expect("restored protocol stream")
+            .expect("restored snapshot")
+    );
     assert!(snapshot.contains("first request"), "{snapshot}");
     assert!(snapshot.contains("first answer"), "{snapshot}");
     assert!(snapshot.contains("persisted task"), "{snapshot}");
     assert!(snapshot.contains("persisted notification"), "{snapshot}");
 
-    let mut events = host.subscribe();
-    host.send(Method::run_text("continue after restore"))
+    protocol_client
+        .send(&Method::run_text("continue after restore"))
         .await?;
-    wait_for_run_end(&mut events).await?;
+    wait_for_run_end(&mut protocol_client).await?;
     let request = second_inspection
         .requests()
         .into_iter()
@@ -503,10 +532,10 @@ async fn standalone_metadata_fails_closed_on_incomplete_or_newer_records() -> Te
     Ok(())
 }
 
-async fn wait_for_run_end(events: &mut tokio::sync::broadcast::Receiver<Event>) -> TestResult {
+async fn wait_for_run_end(client: &mut Client<InProcessSocket>) -> TestResult {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if matches!(events.recv().await, Ok(Event::RunEnd { .. })) {
+            if matches!(client.next_event().await, Ok(Some(Event::RunEnd { .. }))) {
                 break;
             }
         }

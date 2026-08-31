@@ -8,9 +8,7 @@ pub mod host;
 pub mod launch;
 pub mod store;
 
-pub use host::{
-    StandaloneHost, StandaloneRequestError, StandaloneShutdownError, StandaloneStartupError,
-};
+pub use host::{StandaloneHost, StandaloneShutdownError, StandaloneStartupError};
 pub use launch::{ResolvedStandaloneLaunch, StandaloneLaunchConfig, StandaloneLaunchError};
 pub use store::{
     StaleLeasePolicy, StandaloneCwdIdentity, StandaloneListScope, StandaloneSessionId,

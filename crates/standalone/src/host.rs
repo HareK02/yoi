@@ -2,14 +2,20 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use agen::llm_client::client::LlmClient;
+use client::Client;
+use client::transport::in_process::{Peer as InProcessPeer, Socket as InProcessSocket};
+use protocol::stream::{decode_method, encode_event};
 use protocol::{Event, Method};
 use session_store::{
     CombinedStore, FsStore, FsWorkerStore, WorkerActiveSegmentRef, WorkerMetadataStore,
 };
 use thiserror::Error;
-use tokio::sync::broadcast;
 use worker::bootstrap::{WorkerBootstrap, WorkerBootstrapError, WorkerBootstrapLayout};
 use worker::controller::WorkerControllerTransport;
+use worker::ipc::protocol_session::{
+    WorkerProtocolSessionStreams, dispatch_worker_protocol_method, live_log_entry_event,
+    subscribe_worker_protocol_session,
+};
 use worker::{BootstrappedWorker, WorkerError, WorkerFilesystemAuthority, WorkerWorkspaceContext};
 
 use crate::launch::ResolvedStandaloneLaunch;
@@ -53,12 +59,6 @@ pub enum StandaloneStartupError {
     FeatureComposition,
     #[error("the in-process Worker controller could not start")]
     Controller,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-pub enum StandaloneRequestError {
-    #[error("the standalone Worker is no longer accepting requests")]
-    WorkerUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -277,19 +277,15 @@ impl StandaloneHost {
         &self.record
     }
 
-    pub async fn send(&self, method: Method) -> Result<(), StandaloneRequestError> {
-        self.handle
-            .send(method)
-            .await
-            .map_err(|_| StandaloneRequestError::WorkerUnavailable)
-    }
-
-    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
-        self.handle.subscribe()
-    }
-
-    pub fn snapshot(&self) -> Event {
-        self.handle.snapshot_event()
+    /// Open one complete client-side Worker protocol session.
+    ///
+    /// Working events, committed session entries, alert snapshots, and the
+    /// initial history snapshot are merged behind the client boundary.
+    pub fn connect(&self) -> Client<InProcessSocket> {
+        let streams = subscribe_worker_protocol_session(&self.handle);
+        let (socket, peer) = InProcessSocket::pair();
+        tokio::spawn(run_protocol_session(self.handle.clone(), streams, peer));
+        Client::new(socket)
     }
 
     pub fn with_shutdown_timeout(mut self, shutdown_timeout: Duration) -> Self {
@@ -347,6 +343,111 @@ impl StandaloneHost {
             lease.retain();
         }
     }
+}
+
+async fn run_protocol_session(
+    handle: worker::WorkerHandle,
+    streams: WorkerProtocolSessionStreams,
+    mut peer: InProcessPeer,
+) {
+    let WorkerProtocolSessionStreams {
+        snapshot_event,
+        mut log_entries,
+        alert_snapshot,
+        mut events,
+    } = streams;
+
+    if !send_protocol_snapshot(&peer, alert_snapshot, snapshot_event).await {
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            message = peer.next() => {
+                let Some(message) = message else {
+                    return;
+                };
+                let Ok(method) = decode_method(&message) else {
+                    return;
+                };
+                if let Some(event) = dispatch_worker_protocol_method(&handle, method).await
+                    && !send_protocol_event(&peer, event).await
+                {
+                    return;
+                }
+            }
+            event = events.recv() => {
+                match event {
+                    Ok(event) => {
+                        if !send_protocol_event(&peer, event).await {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let replacement = subscribe_worker_protocol_session(&handle);
+                        let WorkerProtocolSessionStreams {
+                            snapshot_event,
+                            log_entries: replacement_log_entries,
+                            alert_snapshot,
+                            events: replacement_events,
+                        } = replacement;
+                        log_entries = replacement_log_entries;
+                        events = replacement_events;
+                        if !send_protocol_snapshot(&peer, alert_snapshot, snapshot_event).await {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+            entry = log_entries.recv() => {
+                match entry {
+                    Ok(entry) => {
+                        if let Some(event) = live_log_entry_event(entry)
+                            && !send_protocol_event(&peer, event).await
+                        {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let replacement = subscribe_worker_protocol_session(&handle);
+                        let WorkerProtocolSessionStreams {
+                            snapshot_event,
+                            log_entries: replacement_log_entries,
+                            alert_snapshot,
+                            events: replacement_events,
+                        } = replacement;
+                        log_entries = replacement_log_entries;
+                        events = replacement_events;
+                        if !send_protocol_snapshot(&peer, alert_snapshot, snapshot_event).await {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        }
+    }
+}
+
+async fn send_protocol_snapshot(
+    peer: &InProcessPeer,
+    alert_snapshot: Vec<protocol::Alert>,
+    snapshot_event: Event,
+) -> bool {
+    for alert in alert_snapshot {
+        if !send_protocol_event(peer, Event::Alert(alert)).await {
+            return false;
+        }
+    }
+    send_protocol_event(peer, snapshot_event).await
+}
+
+async fn send_protocol_event(peer: &InProcessPeer, event: Event) -> bool {
+    let Ok(message) = encode_event(&event) else {
+        return false;
+    };
+    peer.send(message).await.is_ok()
 }
 
 fn backing_store(

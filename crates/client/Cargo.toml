@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 protocol = { workspace = true }
 ticket = { workspace = true }

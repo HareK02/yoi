@@ -21,10 +21,13 @@ use protocol::{Greeting, RewindSummary, RewindTarget, RewindTargetId, Segment};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use standalone::{StandaloneHost, StandaloneLaunchConfig};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use client::{BackendRuntimeClient, BackendRuntimeTarget, StandaloneSessionResumeIntent};
+use client::transport::Socket;
+use client::{
+    BackendRuntimeTarget, Client, StandaloneSessionResumeIntent, connect_backend_runtime,
+};
 
 use crate::app::{ActionbarNoticeLevel, ActionbarNoticeSource, App};
 use crate::composer_keys::{ComposerEditAction, composer_edit_action};
@@ -119,74 +122,40 @@ fn copy_selection_to_terminal(app: &mut App) -> bool {
     copy_selection_to_writer(app, &mut stdout)
 }
 
-enum ConsoleConnection {
-    BackendRuntime(BackendRuntimeClient),
-    Standalone {
-        host: Option<StandaloneHost>,
-        events: broadcast::Receiver<Event>,
-        initial_snapshot: Option<Event>,
-    },
+struct ConsoleConnection<T> {
+    client: Client<T>,
+    standalone_host: Option<StandaloneHost>,
 }
 
-impl ConsoleConnection {
-    fn standalone(host: StandaloneHost) -> Self {
-        let events = host.subscribe();
-        let initial_snapshot = Some(host.snapshot());
-        Self::Standalone {
-            host: Some(host),
-            events,
-            initial_snapshot,
+impl<T: Socket> ConsoleConnection<T> {
+    fn new(client: Client<T>) -> Self {
+        Self {
+            client,
+            standalone_host: None,
         }
     }
 
-    fn try_next_event(&mut self) -> Option<Event> {
-        match self {
-            Self::BackendRuntime(client) => client.try_next_event(),
-            Self::Standalone {
-                events,
-                initial_snapshot,
-                ..
-            } => initial_snapshot.take().or_else(|| events.try_recv().ok()),
+    fn with_standalone_host(client: Client<T>, host: StandaloneHost) -> Self {
+        Self {
+            client,
+            standalone_host: Some(host),
         }
     }
 
-    async fn next_event(&mut self) -> Option<Event> {
-        match self {
-            Self::BackendRuntime(client) => client.next_event().await,
-            Self::Standalone { host, events, .. } => loop {
-                match events.recv().await {
-                    Ok(event) => break Some(event),
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let Some(host) = host.as_ref() else {
-                            break None;
-                        };
-                        break Some(host.snapshot());
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break None,
-                }
-            },
-        }
+    fn try_next_event(&mut self) -> Result<Option<Event>, Box<dyn std::error::Error>> {
+        Ok(self.client.try_next_event()?)
+    }
+
+    async fn next_event(&mut self) -> Result<Option<Event>, Box<dyn std::error::Error>> {
+        Ok(self.client.next_event().await?)
     }
 
     async fn send(&mut self, method: &Method) -> Result<(), Box<dyn std::error::Error>> {
-        match self {
-            Self::BackendRuntime(client) => Ok(client.send(method).await?),
-            Self::Standalone { host, .. } => {
-                let host = host.as_ref().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "Standalone Worker has already shut down",
-                    )
-                })?;
-                Ok(host.send(method.clone()).await?)
-            }
-        }
+        Ok(self.client.send(method).await?)
     }
 
     async fn shutdown(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Self::Standalone { host, .. } = self
-            && let Some(host) = host.take()
-        {
+        if let Some(host) = self.standalone_host.take() {
             host.shutdown().await?;
         }
         Ok(())
@@ -251,7 +220,8 @@ async fn run_standalone_host(
     worker_label: String,
     history_root: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut connection = ConsoleConnection::standalone(host);
+    let client = host.connect();
+    let mut connection = ConsoleConnection::with_standalone_host(client, host);
 
     let mut terminal = match enter_fullscreen() {
         Ok(terminal) => terminal,
@@ -280,12 +250,12 @@ pub(crate) async fn run_backend_runtime(
     target: BackendRuntimeTarget,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let worker_label = target.display_label();
-    let client = BackendRuntimeClient::connect(target).await?;
+    let client = connect_backend_runtime(target).await?;
     let mut terminal = enter_fullscreen()?;
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut app = App::new_with_persistent_input_history(worker_label, &workspace_root);
     app.connected = true;
-    let mut connection = ConsoleConnection::BackendRuntime(client);
+    let mut connection = ConsoleConnection::new(client);
     let result = run_loop(&mut terminal, &mut app, &mut connection).await;
     let _ = leave_fullscreen(&mut terminal);
     result
@@ -560,7 +530,7 @@ enum E2eRewindInput {
 
 enum LoopInput<P> {
     Terminal(TerminalEventResult),
-    Worker(Option<P>),
+    Worker(P),
 }
 
 async fn next_loop_input<P, F>(
@@ -569,7 +539,7 @@ async fn next_loop_input<P, F>(
     pod_next: F,
 ) -> LoopInput<P>
 where
-    F: Future<Output = Option<P>>,
+    F: Future<Output = P>,
 {
     tokio::select! {
         biased;
@@ -586,9 +556,9 @@ where
     }
 }
 
-async fn drain_terminal_events(
+async fn drain_terminal_events<T: Socket>(
     app: &mut App,
-    client: &mut ConsoleConnection,
+    client: &mut ConsoleConnection<T>,
     term_rx: &mut mpsc::UnboundedReceiver<TerminalEventResult>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut handled = false;
@@ -613,13 +583,13 @@ async fn drain_terminal_events(
     Ok(handled)
 }
 
-async fn drain_worker_events(
+async fn drain_worker_events<T: Socket>(
     app: &mut App,
-    client: &mut ConsoleConnection,
+    client: &mut ConsoleConnection<T>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut handled = false;
     for _ in 0..POD_EVENT_DRAIN_LIMIT {
-        match client.try_next_event() {
+        match client.try_next_event()? {
             Some(ev) => {
                 handled = true;
                 if let Some(method) = app.handle_worker_event(ev) {
@@ -632,10 +602,10 @@ async fn drain_worker_events(
     Ok(handled)
 }
 
-async fn run_loop(
+async fn run_loop<T: Socket>(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
-    client: &mut ConsoleConnection,
+    client: &mut ConsoleConnection<T>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_terminal_reader, mut term_rx) = TerminalEventReader::spawn()?;
 
@@ -660,7 +630,7 @@ async fn run_loop(
             LoopInput::Terminal(term_event) => {
                 handle_terminal_event(app, client, term_event?).await?;
             }
-            LoopInput::Worker(event) => match event {
+            LoopInput::Worker(event) => match event? {
                 Some(ev) => {
                     if let Some(method) = app.handle_worker_event(ev) {
                         client.send(&method).await?;
@@ -680,9 +650,9 @@ async fn run_loop(
     Ok(())
 }
 
-async fn handle_terminal_event(
+async fn handle_terminal_event<T: Socket>(
     app: &mut App,
-    client: &mut ConsoleConnection,
+    client: &mut ConsoleConnection<T>,
     event: TermEvent,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match event {
