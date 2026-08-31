@@ -3,6 +3,7 @@ declare const Deno: {
 };
 
 import {
+  parseRepositoryListApiResult,
   parseRepositoryListResponse,
   parseWorkspaceResponse,
 } from "../src/lib/workspace/api/workspace-model.ts";
@@ -53,6 +54,24 @@ Deno.test("stale repository aliases fail closed at the JSON boundary", () => {
     () => parseRepositoryListResponse(stale),
     ".repository_id is not part",
   );
+});
+
+Deno.test("repository API result converts stale payloads into bounded page errors", () => {
+  const result = parseRepositoryListApiResult({
+    data: {
+      workspace_id: "w-a",
+      items: { main: repositoryList.items[0] },
+      source: "workspace-control-plane",
+      diagnostics: [],
+    },
+    error: null,
+  });
+  if (result.data !== null) {
+    throw new Error("stale payload must not reach the page");
+  }
+  if (!result.error?.includes("items must be an array")) {
+    throw new Error(`unexpected bounded error: ${result.error}`);
+  }
 });
 
 Deno.test("workspace response requires the permission projection", () => {

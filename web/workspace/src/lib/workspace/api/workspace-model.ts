@@ -1,3 +1,4 @@
+import type { ApiResult } from "$lib/workspace/api/http";
 import type {
   Diagnostic,
   GitCommitSummary,
@@ -527,6 +528,22 @@ export function parseRepositoryListResponse(
         diagnostic(item, `repository list response.diagnostics[${index}]`),
     ),
   };
+}
+
+export function parseRepositoryListApiResult(
+  result: ApiResult<unknown>,
+): ApiResult<RepositoryListResponse> {
+  if (result.data === null) return { data: null, error: result.error };
+  try {
+    return { data: parseRepositoryListResponse(result.data), error: null };
+  } catch (cause) {
+    return {
+      data: null,
+      error: cause instanceof Error
+        ? cause.message
+        : "invalid repository list response",
+    };
+  }
 }
 
 export function parseRepositoryDetailResponse(
