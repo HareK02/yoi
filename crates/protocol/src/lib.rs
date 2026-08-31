@@ -1,3 +1,4 @@
+pub mod identity;
 #[cfg(feature = "stream")]
 pub mod stream;
 pub mod subscription;
@@ -7,6 +8,8 @@ pub mod typescript;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+pub use identity::{WorkerId, WorkerIdParseError};
 
 fn default_true() -> bool {
     true

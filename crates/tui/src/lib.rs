@@ -46,8 +46,8 @@ pub enum LaunchMode {
         worker_name: Option<String>,
         profile: Option<String>,
     },
-    /// Restore one client-owned standalone session. The current cwd is the default scope;
-    /// `include_all` opts into all standalone sessions under the same client data root.
+    /// Restore one client-owned standalone Worker. The current cwd is the default scope;
+    /// `include_all` opts into all standalone Workers under the same client data root.
     StandaloneResume { include_all: bool },
     /// List Backend Workers and attach to the selected Worker.
     Workers {

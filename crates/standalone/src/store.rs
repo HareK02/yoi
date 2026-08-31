@@ -1,12 +1,11 @@
-use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs4::fs_std::FileExt;
 use manifest::WorkerManifest;
+use protocol::WorkerId;
 use serde::{Deserialize, Serialize};
 use session_store::{SegmentId, SessionId};
 use thiserror::Error;
@@ -16,46 +15,9 @@ const RECORD_FILE: &str = "record.json";
 const COMMIT_MARKER: &str = "commit.pending";
 const LEASE_FILE: &str = "lease.json";
 const LEASE_LOCK_FILE: &str = "lease.lock";
-const SESSION_DIR: &str = "session";
+const SESSIONS_DIR: &str = "sessions";
 const WORKER_DIR: &str = "worker";
 const SCHEMA_VERSION: u32 = 1;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct StandaloneSessionId(Uuid);
-
-impl StandaloneSessionId {
-    #[must_use]
-    pub fn new() -> Self {
-        Self(Uuid::now_v7())
-    }
-
-    #[must_use]
-    pub fn short(self) -> String {
-        let simple = self.0.simple().to_string();
-        simple[simple.len() - 12..].to_string()
-    }
-}
-
-impl Default for StandaloneSessionId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl fmt::Display for StandaloneSessionId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl FromStr for StandaloneSessionId {
-    type Err = uuid::Error;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Uuid::parse_str(value).map(Self)
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StandaloneCwdIdentity {
@@ -100,7 +62,7 @@ impl StandaloneCwdIdentity {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum StandaloneSessionStatus {
+pub enum StandaloneWorkerStatus {
     Active,
     Stopped,
 }
@@ -115,17 +77,20 @@ pub enum StandaloneShutdownReason {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StandaloneSessionRecord {
+pub struct StandaloneWorkerRecord {
     pub schema_version: u32,
     pub revision: u64,
-    pub session_id: StandaloneSessionId,
+    pub worker_id: WorkerId,
+    /// User-facing Worker name resolved from the profile.
     pub worker_name: String,
+    /// Internal key used by the current name-keyed Worker store.
+    pub storage_key: String,
     pub cwd: StandaloneCwdIdentity,
     pub manifest: WorkerManifest,
     pub active_session_id: SessionId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_segment_id: Option<SegmentId>,
-    pub status: StandaloneSessionStatus,
+    pub status: StandaloneWorkerStatus,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -145,11 +110,11 @@ pub enum StaleLeasePolicy {
 }
 
 #[derive(Debug, Clone)]
-pub struct StandaloneSessionStore {
+pub struct StandaloneWorkerStore {
     root: PathBuf,
 }
 
-impl StandaloneSessionStore {
+impl StandaloneWorkerStore {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, StandaloneStoreError> {
         let root = root.into();
         fs::create_dir_all(&root).map_err(StandaloneStoreError::Io)?;
@@ -171,35 +136,41 @@ impl StandaloneSessionStore {
         &self,
         cwd: impl AsRef<Path>,
         policy: StaleLeasePolicy,
-    ) -> Result<StandaloneSessionAllocation, StandaloneStoreError> {
-        let id = StandaloneSessionId::new();
+    ) -> Result<StandaloneWorkerAllocation, StandaloneStoreError> {
+        let worker_id = WorkerId::now_v7();
         let cwd = StandaloneCwdIdentity::capture(cwd)?;
-        let dir = self.session_dir(id);
+        let dir = self.worker_dir(worker_id);
         fs::create_dir(&dir).map_err(StandaloneStoreError::Io)?;
-        fs::create_dir(dir.join(SESSION_DIR)).map_err(StandaloneStoreError::Io)?;
+        fs::create_dir(dir.join(SESSIONS_DIR)).map_err(StandaloneStoreError::Io)?;
         fs::create_dir(dir.join(WORKER_DIR)).map_err(StandaloneStoreError::Io)?;
-        let lease = self.acquire_lease(id, policy)?;
-        Ok(StandaloneSessionAllocation { id, cwd, lease })
+        let lease = self.acquire_lease(worker_id, policy)?;
+        Ok(StandaloneWorkerAllocation {
+            worker_id,
+            cwd,
+            lease,
+        })
     }
 
     pub fn commit_created(
         &self,
-        allocation: &StandaloneSessionAllocation,
+        allocation: &StandaloneWorkerAllocation,
         manifest: WorkerManifest,
+        storage_key: String,
         active_session_id: SessionId,
         active_segment_id: Option<SegmentId>,
-    ) -> Result<StandaloneSessionRecord, StandaloneStoreError> {
+    ) -> Result<StandaloneWorkerRecord, StandaloneStoreError> {
         let now = now_unix_ms()?;
-        let record = StandaloneSessionRecord {
+        let record = StandaloneWorkerRecord {
             schema_version: SCHEMA_VERSION,
             revision: 1,
-            session_id: allocation.id,
+            worker_id: allocation.worker_id,
             worker_name: manifest.worker.name.clone(),
+            storage_key,
             cwd: allocation.cwd.clone(),
             manifest,
             active_session_id,
             active_segment_id,
-            status: StandaloneSessionStatus::Active,
+            status: StandaloneWorkerStatus::Active,
             created_at_unix_ms: now,
             updated_at_unix_ms: now,
             shutdown_reason: None,
@@ -208,22 +179,19 @@ impl StandaloneSessionStore {
         Ok(record)
     }
 
-    pub fn load(
-        &self,
-        id: StandaloneSessionId,
-    ) -> Result<StandaloneSessionRecord, StandaloneStoreError> {
-        let dir = self.session_dir(id);
+    pub fn load(&self, id: WorkerId) -> Result<StandaloneWorkerRecord, StandaloneStoreError> {
+        let dir = self.worker_dir(id);
         if dir.join(COMMIT_MARKER).exists() {
             return Err(StandaloneStoreError::IncompleteCommit(id));
         }
         let bytes = fs::read(dir.join(RECORD_FILE)).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
-                StandaloneStoreError::SessionNotFound(id)
+                StandaloneStoreError::WorkerNotFound(id)
             } else {
                 StandaloneStoreError::Io(error)
             }
         })?;
-        let record: StandaloneSessionRecord = serde_json::from_slice(&bytes)
+        let record: StandaloneWorkerRecord = serde_json::from_slice(&bytes)
             .map_err(|source| StandaloneStoreError::CorruptRecord { id, source })?;
         if record.schema_version > SCHEMA_VERSION {
             return Err(StandaloneStoreError::NewerSchema {
@@ -232,7 +200,7 @@ impl StandaloneSessionStore {
                 supported: SCHEMA_VERSION,
             });
         }
-        if record.schema_version != SCHEMA_VERSION || record.session_id != id {
+        if record.schema_version != SCHEMA_VERSION || record.worker_id != id {
             return Err(StandaloneStoreError::InvalidRecord(id));
         }
         Ok(record)
@@ -243,7 +211,7 @@ impl StandaloneSessionStore {
         cwd: impl AsRef<Path>,
         scope: StandaloneListScope,
         limit: usize,
-    ) -> Result<Vec<StandaloneSessionRecord>, StandaloneStoreError> {
+    ) -> Result<Vec<StandaloneWorkerRecord>, StandaloneStoreError> {
         let current_cwd = (scope == StandaloneListScope::CurrentCwd)
             .then(|| StandaloneCwdIdentity::capture(cwd))
             .transpose()?;
@@ -269,12 +237,7 @@ impl StandaloneSessionStore {
             right
                 .updated_at_unix_ms
                 .cmp(&left.updated_at_unix_ms)
-                .then_with(|| {
-                    right
-                        .session_id
-                        .to_string()
-                        .cmp(&left.session_id.to_string())
-                })
+                .then_with(|| right.worker_id.to_string().cmp(&left.worker_id.to_string()))
         });
         records.truncate(limit);
         Ok(records)
@@ -282,10 +245,10 @@ impl StandaloneSessionStore {
 
     pub fn acquire_lease(
         &self,
-        id: StandaloneSessionId,
+        id: WorkerId,
         policy: StaleLeasePolicy,
-    ) -> Result<StandaloneSessionLease, StandaloneStoreError> {
-        let dir = self.session_dir(id);
+    ) -> Result<StandaloneWorkerLease, StandaloneStoreError> {
+        let dir = self.worker_dir(id);
         let path = dir.join(LEASE_FILE);
         let _guard = LeaseMutationGuard::acquire(&dir)?;
         let lease = LeaseRecord::current()?;
@@ -296,7 +259,7 @@ impl StandaloneSessionStore {
                     file.write_all(b"\n").map_err(StandaloneStoreError::Io)?;
                     file.sync_all().map_err(StandaloneStoreError::Io)?;
                     sync_directory(&dir)?;
-                    return Ok(StandaloneSessionLease {
+                    return Ok(StandaloneWorkerLease {
                         path,
                         lease_id: lease.lease_id,
                         released: false,
@@ -306,7 +269,7 @@ impl StandaloneSessionStore {
                     let existing = read_lease(&path, id)?;
                     match existing.liveness() {
                         LeaseLiveness::Live => {
-                            return Err(StandaloneStoreError::SessionLeased(id));
+                            return Err(StandaloneStoreError::WorkerLeased(id));
                         }
                         LeaseLiveness::Unknown => {
                             return Err(StandaloneStoreError::LeaseLivenessUnknown(id));
@@ -326,16 +289,16 @@ impl StandaloneSessionStore {
 
     pub fn update_active_pointer(
         &self,
-        record: &StandaloneSessionRecord,
+        record: &StandaloneWorkerRecord,
         active_session_id: SessionId,
         active_segment_id: Option<SegmentId>,
-    ) -> Result<StandaloneSessionRecord, StandaloneStoreError> {
+    ) -> Result<StandaloneWorkerRecord, StandaloneStoreError> {
         let mut next = record.clone();
         next.revision = next.revision.saturating_add(1);
         next.updated_at_unix_ms = now_unix_ms()?;
         next.active_session_id = active_session_id;
         next.active_segment_id = active_segment_id;
-        next.status = StandaloneSessionStatus::Active;
+        next.status = StandaloneWorkerStatus::Active;
         next.shutdown_reason = None;
         self.commit_record(Some(record.revision), &next)?;
         Ok(next)
@@ -343,73 +306,73 @@ impl StandaloneSessionStore {
 
     pub fn mark_stopped(
         &self,
-        record: &StandaloneSessionRecord,
+        record: &StandaloneWorkerRecord,
         active_session_id: SessionId,
         active_segment_id: Option<SegmentId>,
         reason: StandaloneShutdownReason,
-    ) -> Result<StandaloneSessionRecord, StandaloneStoreError> {
+    ) -> Result<StandaloneWorkerRecord, StandaloneStoreError> {
         let mut next = record.clone();
         next.revision = next.revision.saturating_add(1);
         next.updated_at_unix_ms = now_unix_ms()?;
         next.active_session_id = active_session_id;
         next.active_segment_id = active_segment_id;
-        next.status = StandaloneSessionStatus::Stopped;
+        next.status = StandaloneWorkerStatus::Stopped;
         next.shutdown_reason = Some(reason);
         self.commit_record(Some(record.revision), &next)?;
         Ok(next)
     }
 
-    pub fn delete(&self, id: StandaloneSessionId) -> Result<(), StandaloneStoreError> {
+    pub fn delete(&self, id: WorkerId) -> Result<(), StandaloneStoreError> {
         let record = self.load(id)?;
-        if record.status != StandaloneSessionStatus::Stopped {
+        if record.status != StandaloneWorkerStatus::Stopped {
             return Err(StandaloneStoreError::DeleteActive(id));
         }
-        let session_dir = self.session_dir(id);
-        let _guard = LeaseMutationGuard::acquire(&session_dir)?;
-        let lease_path = session_dir.join(LEASE_FILE);
+        let worker_dir = self.worker_dir(id);
+        let _guard = LeaseMutationGuard::acquire(&worker_dir)?;
+        let lease_path = worker_dir.join(LEASE_FILE);
         if lease_path.exists() {
             let lease = read_lease(&lease_path, id)?;
             return Err(match lease.liveness() {
-                LeaseLiveness::Live => StandaloneStoreError::SessionLeased(id),
+                LeaseLiveness::Live => StandaloneStoreError::WorkerLeased(id),
                 LeaseLiveness::Stale => StandaloneStoreError::StaleLease(id),
                 LeaseLiveness::Unknown => StandaloneStoreError::LeaseLivenessUnknown(id),
             });
         }
-        fs::remove_dir_all(self.session_dir(id)).map_err(StandaloneStoreError::Io)?;
+        fs::remove_dir_all(self.worker_dir(id)).map_err(StandaloneStoreError::Io)?;
         sync_directory(&self.root)
     }
 
     #[must_use]
-    pub fn session_log_dir(&self, id: StandaloneSessionId) -> PathBuf {
-        self.session_dir(id).join(SESSION_DIR)
+    pub fn sessions_dir(&self, id: WorkerId) -> PathBuf {
+        self.worker_dir(id).join(SESSIONS_DIR)
     }
 
     #[must_use]
-    pub fn worker_metadata_dir(&self, id: StandaloneSessionId) -> PathBuf {
-        self.session_dir(id).join(WORKER_DIR)
+    pub fn worker_metadata_dir(&self, id: WorkerId) -> PathBuf {
+        self.worker_dir(id).join(WORKER_DIR)
     }
 
     #[must_use]
-    pub(crate) fn runtime_dir(&self, id: StandaloneSessionId) -> PathBuf {
-        self.session_dir(id).join("runtime")
+    pub(crate) fn runtime_dir(&self, id: WorkerId) -> PathBuf {
+        self.worker_dir(id).join("runtime")
     }
 
     pub(crate) fn abandon_allocation(
         &self,
-        allocation: StandaloneSessionAllocation,
+        allocation: StandaloneWorkerAllocation,
     ) -> Result<(), StandaloneStoreError> {
-        let id = allocation.id;
+        let worker_id = allocation.worker_id;
         allocation.lease.release()?;
-        fs::remove_dir_all(self.session_dir(id)).map_err(StandaloneStoreError::Io)?;
+        fs::remove_dir_all(self.worker_dir(worker_id)).map_err(StandaloneStoreError::Io)?;
         sync_directory(&self.root)
     }
 
     fn commit_record(
         &self,
         expected_revision: Option<u64>,
-        next: &StandaloneSessionRecord,
+        next: &StandaloneWorkerRecord,
     ) -> Result<(), StandaloneStoreError> {
-        let dir = self.session_dir(next.session_id);
+        let dir = self.worker_dir(next.worker_id);
         let marker = dir.join(COMMIT_MARKER);
         let mut marker_file = OpenOptions::new()
             .write(true)
@@ -417,7 +380,7 @@ impl StandaloneSessionStore {
             .open(&marker)
             .map_err(|error| {
                 if error.kind() == io::ErrorKind::AlreadyExists {
-                    StandaloneStoreError::IncompleteCommit(next.session_id)
+                    StandaloneStoreError::IncompleteCommit(next.worker_id)
                 } else {
                     StandaloneStoreError::Io(error)
                 }
@@ -427,11 +390,11 @@ impl StandaloneSessionStore {
         sync_directory(&dir)?;
 
         if let Some(expected) = expected_revision {
-            let current = self.load_record_while_committing(next.session_id)?;
+            let current = self.load_record_while_committing(next.worker_id)?;
             if current.revision != expected {
                 let _ = fs::remove_file(&marker);
                 return Err(StandaloneStoreError::RevisionConflict {
-                    id: next.session_id,
+                    id: next.worker_id,
                     expected,
                     found: current.revision,
                 });
@@ -461,30 +424,30 @@ impl StandaloneSessionStore {
 
     fn load_record_while_committing(
         &self,
-        id: StandaloneSessionId,
-    ) -> Result<StandaloneSessionRecord, StandaloneStoreError> {
+        id: WorkerId,
+    ) -> Result<StandaloneWorkerRecord, StandaloneStoreError> {
         let bytes =
-            fs::read(self.session_dir(id).join(RECORD_FILE)).map_err(StandaloneStoreError::Io)?;
+            fs::read(self.worker_dir(id).join(RECORD_FILE)).map_err(StandaloneStoreError::Io)?;
         serde_json::from_slice(&bytes)
             .map_err(|source| StandaloneStoreError::CorruptRecord { id, source })
     }
 
-    fn session_dir(&self, id: StandaloneSessionId) -> PathBuf {
+    fn worker_dir(&self, id: WorkerId) -> PathBuf {
         self.root.join(id.to_string())
     }
 }
 
 #[derive(Debug)]
-pub struct StandaloneSessionAllocation {
-    id: StandaloneSessionId,
+pub struct StandaloneWorkerAllocation {
+    worker_id: WorkerId,
     cwd: StandaloneCwdIdentity,
-    lease: StandaloneSessionLease,
+    lease: StandaloneWorkerLease,
 }
 
-impl StandaloneSessionAllocation {
+impl StandaloneWorkerAllocation {
     #[must_use]
-    pub fn id(&self) -> StandaloneSessionId {
-        self.id
+    pub fn worker_id(&self) -> WorkerId {
+        self.worker_id
     }
 
     #[must_use]
@@ -492,19 +455,19 @@ impl StandaloneSessionAllocation {
         &self.cwd
     }
 
-    pub fn into_lease(self) -> StandaloneSessionLease {
+    pub fn into_lease(self) -> StandaloneWorkerLease {
         self.lease
     }
 }
 
 #[derive(Debug)]
-pub struct StandaloneSessionLease {
+pub struct StandaloneWorkerLease {
     path: PathBuf,
     lease_id: Uuid,
     released: bool,
 }
 
-impl StandaloneSessionLease {
+impl StandaloneWorkerLease {
     pub fn release(mut self) -> Result<(), StandaloneStoreError> {
         self.release_inner()
     }
@@ -534,7 +497,7 @@ impl StandaloneSessionLease {
     }
 }
 
-impl Drop for StandaloneSessionLease {
+impl Drop for StandaloneWorkerLease {
     fn drop(&mut self) {
         let _ = self.release_inner();
     }
@@ -624,7 +587,7 @@ fn classify_lease_liveness(
     }
 }
 
-fn read_lease(path: &Path, id: StandaloneSessionId) -> Result<LeaseRecord, StandaloneStoreError> {
+fn read_lease(path: &Path, id: WorkerId) -> Result<LeaseRecord, StandaloneStoreError> {
     let bytes = fs::read(path).map_err(StandaloneStoreError::Io)?;
     serde_json::from_slice(&bytes)
         .map_err(|source| StandaloneStoreError::CorruptLease { id, source })
@@ -692,47 +655,47 @@ pub enum StandaloneStoreError {
     CwdUnavailable(#[source] io::Error),
     #[error("standalone cwd is not a directory")]
     CwdNotDirectory,
-    #[error("standalone cwd identity no longer matches the persisted session")]
+    #[error("standalone cwd identity no longer matches the persisted Worker")]
     CwdIdentityMismatch,
-    #[error("standalone session {0} was not found")]
-    SessionNotFound(StandaloneSessionId),
-    #[error("standalone session {0} has an incomplete metadata commit")]
-    IncompleteCommit(StandaloneSessionId),
-    #[error("standalone session {0} has invalid metadata")]
-    InvalidRecord(StandaloneSessionId),
-    #[error("standalone session {id} metadata is corrupt")]
+    #[error("standalone Worker {0} was not found")]
+    WorkerNotFound(WorkerId),
+    #[error("standalone Worker {0} has an incomplete metadata commit")]
+    IncompleteCommit(WorkerId),
+    #[error("standalone Worker {0} has invalid metadata")]
+    InvalidRecord(WorkerId),
+    #[error("standalone Worker {id} metadata is corrupt")]
     CorruptRecord {
-        id: StandaloneSessionId,
+        id: WorkerId,
         #[source]
         source: serde_json::Error,
     },
-    #[error("standalone session {id} lease is corrupt")]
+    #[error("standalone Worker {id} lease is corrupt")]
     CorruptLease {
-        id: StandaloneSessionId,
+        id: WorkerId,
         #[source]
         source: serde_json::Error,
     },
-    #[error("standalone session {id} uses schema {found}, newer than supported schema {supported}")]
+    #[error("standalone Worker {id} uses schema {found}, newer than supported schema {supported}")]
     NewerSchema {
-        id: StandaloneSessionId,
+        id: WorkerId,
         found: u32,
         supported: u32,
     },
-    #[error("standalone session {0} is already active")]
-    SessionLeased(StandaloneSessionId),
-    #[error("standalone session {0} lease liveness cannot be proven; recovery is rejected")]
-    LeaseLivenessUnknown(StandaloneSessionId),
-    #[error("standalone session {0} has a stale lease; explicit recovery is required")]
-    StaleLease(StandaloneSessionId),
-    #[error("standalone session lease ownership changed")]
+    #[error("standalone Worker {0} is already active")]
+    WorkerLeased(WorkerId),
+    #[error("standalone Worker {0} lease liveness cannot be proven; recovery is rejected")]
+    LeaseLivenessUnknown(WorkerId),
+    #[error("standalone Worker {0} has a stale lease; explicit recovery is required")]
+    StaleLease(WorkerId),
+    #[error("standalone Worker lease ownership changed")]
     LeaseOwnershipLost,
-    #[error("standalone session {0} must be stopped before deletion")]
-    DeleteActive(StandaloneSessionId),
+    #[error("standalone Worker {0} must be stopped before deletion")]
+    DeleteActive(WorkerId),
     #[error(
-        "standalone session {id} metadata revision changed (expected {expected}, found {found})"
+        "standalone Worker {id} metadata revision changed (expected {expected}, found {found})"
     )]
     RevisionConflict {
-        id: StandaloneSessionId,
+        id: WorkerId,
         expected: u64,
         found: u64,
     },

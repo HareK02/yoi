@@ -10,8 +10,8 @@ pub mod store;
 
 pub use host::{StandaloneHost, StandaloneShutdownError, StandaloneStartupError};
 pub use launch::{ResolvedStandaloneLaunch, StandaloneLaunchConfig, StandaloneLaunchError};
+pub use protocol::WorkerId;
 pub use store::{
-    StaleLeasePolicy, StandaloneCwdIdentity, StandaloneListScope, StandaloneSessionId,
-    StandaloneSessionRecord, StandaloneSessionStatus, StandaloneSessionStore,
-    StandaloneShutdownReason, StandaloneStoreError,
+    StaleLeasePolicy, StandaloneCwdIdentity, StandaloneListScope, StandaloneShutdownReason,
+    StandaloneStoreError, StandaloneWorkerRecord, StandaloneWorkerStatus, StandaloneWorkerStore,
 };

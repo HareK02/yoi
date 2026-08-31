@@ -5,7 +5,7 @@ use agen::llm_client::client::LlmClient;
 use client::Client;
 use client::transport::in_process::{Peer as InProcessPeer, Socket as InProcessSocket};
 use protocol::stream::{decode_method, encode_event};
-use protocol::{Event, Method};
+use protocol::{Event, Method, WorkerId};
 use session_store::{
     CombinedStore, FsStore, FsWorkerStore, WorkerActiveSegmentRef, WorkerMetadataStore,
 };
@@ -20,14 +20,14 @@ use worker::{BootstrappedWorker, WorkerError, WorkerFilesystemAuthority, WorkerW
 
 use crate::launch::ResolvedStandaloneLaunch;
 use crate::store::{
-    StaleLeasePolicy, StandaloneSessionId, StandaloneSessionLease, StandaloneSessionRecord,
-    StandaloneSessionStore, StandaloneShutdownReason, StandaloneStoreError,
+    StaleLeasePolicy, StandaloneShutdownReason, StandaloneStoreError, StandaloneWorkerLease,
+    StandaloneWorkerRecord, StandaloneWorkerStore,
 };
 
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 type StandaloneBackingStore = CombinedStore<FsStore, FsWorkerStore>;
 
-/// One client-owned top-level Worker and its standalone session authority.
+/// One client-owned top-level Worker and its standalone Worker authority.
 ///
 /// The host deliberately exposes the existing typed Worker protocol rather than owning an
 /// HTTP/WebSocket server or creating Runtime/Workspace/Ticket/Workdir domain records.
@@ -35,21 +35,21 @@ pub struct StandaloneHost {
     handle: worker::WorkerHandle,
     shutdown: Option<worker::controller::ShutdownReceiver>,
     shutdown_timeout: Duration,
-    store: StandaloneSessionStore,
+    store: StandaloneWorkerStore,
     worker_store: FsWorkerStore,
-    record: StandaloneSessionRecord,
-    lease: Option<StandaloneSessionLease>,
+    record: StandaloneWorkerRecord,
+    lease: Option<StandaloneWorkerLease>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum StandaloneStartupError {
     #[error("the standalone state store could not be opened or validated")]
     StateStore,
-    #[error("the standalone session is already active")]
-    SessionActive,
-    #[error("the standalone session lease cannot be observed safely; recovery is rejected")]
+    #[error("the standalone Worker is already active")]
+    WorkerActive,
+    #[error("the standalone Worker lease cannot be observed safely; recovery is rejected")]
     LeaseLivenessUnknown,
-    #[error("the standalone session working directory is unavailable or changed")]
+    #[error("the standalone Worker working directory is unavailable or changed")]
     WorkingDirectoryUnavailable,
     #[error("the resolved Worker configuration or persisted history is invalid")]
     WorkerConfiguration,
@@ -67,7 +67,7 @@ pub enum StandaloneShutdownError {
     DeadlineExceeded,
     #[error("the standalone Worker shutdown confirmation was lost")]
     ConfirmationLost,
-    #[error("the standalone session final state could not be committed")]
+    #[error("the standalone Worker final state could not be committed")]
     StateStore,
 }
 
@@ -87,22 +87,24 @@ impl StandaloneHost {
     }
 
     async fn start_with_optional_model_client(
-        mut launch: ResolvedStandaloneLaunch,
+        launch: ResolvedStandaloneLaunch,
         model_client: Option<Box<dyn LlmClient>>,
     ) -> Result<Self, StandaloneStartupError> {
-        let store = StandaloneSessionStore::open(&launch.state_dir)
-            .map_err(classify_store_startup_error)?;
+        let store =
+            StandaloneWorkerStore::open(&launch.state_dir).map_err(classify_store_startup_error)?;
         let allocation = store
             .allocate(&launch.cwd, StaleLeasePolicy::Reject)
             .map_err(classify_store_startup_error)?;
-        let id = allocation.id();
+        let worker_id = allocation.worker_id();
 
-        // The standalone session ID is the local identity. A unique internal Worker name avoids
-        // process-global allocation collisions without creating a Runtime/Workspace Worker ID.
-        launch.profile.manifest.worker.name = format!("standalone-{id}");
+        // WorkerId is the stable identity. The current Worker store remains
+        // name-keyed, so keep its derived storage key separate from the
+        // user-facing profile name.
         let manifest = launch.profile.manifest.clone();
-        let worker_name = manifest.worker.name.clone();
-        let (backing_store, worker_store) = match backing_store(&store, id) {
+        let storage_key = format!("standalone-{worker_id}");
+        let mut bootstrap_manifest = manifest.clone();
+        bootstrap_manifest.worker.name = storage_key.clone();
+        let (backing_store, worker_store) = match backing_store(&store, worker_id) {
             Ok(stores) => stores,
             Err(error) => {
                 let _ = store.abandon_allocation(allocation);
@@ -112,10 +114,10 @@ impl StandaloneHost {
         let filesystem_authority =
             WorkerFilesystemAuthority::local(launch.cwd.clone(), launch.cwd.clone());
         let workspace_context = WorkerWorkspaceContext::local_filesystem(None);
-        let runtime_base = store.runtime_dir(id);
+        let runtime_base = store.runtime_dir(worker_id);
 
         let mut bootstrap = WorkerBootstrap::new(
-            manifest.clone(),
+            bootstrap_manifest,
             backing_store,
             launch.prompt_catalog,
             workspace_context,
@@ -133,7 +135,7 @@ impl StandaloneHost {
                 return Err(classify_startup_error(error));
             }
         };
-        let active = match active_pointer(&worker_store, &worker_name) {
+        let active = match active_pointer(&worker_store, &storage_key) {
             Ok(active) => active,
             Err(error) => {
                 stop_started_worker(started).await;
@@ -141,16 +143,20 @@ impl StandaloneHost {
                 return Err(error);
             }
         };
-        let record =
-            match store.commit_created(&allocation, manifest, active.session_id, active.segment_id)
-            {
-                Ok(record) => record,
-                Err(_) => {
-                    stop_started_worker(started).await;
-                    let _ = store.abandon_allocation(allocation);
-                    return Err(StandaloneStartupError::StateStore);
-                }
-            };
+        let record = match store.commit_created(
+            &allocation,
+            manifest,
+            storage_key,
+            active.session_id,
+            active.segment_id,
+        ) {
+            Ok(record) => record,
+            Err(_) => {
+                stop_started_worker(started).await;
+                let _ = store.abandon_allocation(allocation);
+                return Err(StandaloneStartupError::StateStore);
+            }
+        };
         Ok(Self::from_started(
             started,
             store,
@@ -162,50 +168,46 @@ impl StandaloneHost {
 
     pub async fn restore(
         state_dir: PathBuf,
-        session_id: StandaloneSessionId,
+        worker_id: WorkerId,
     ) -> Result<Self, StandaloneStartupError> {
-        Self::restore_with_optional_model_client(state_dir, session_id, None).await
+        Self::restore_with_optional_model_client(state_dir, worker_id, None).await
     }
 
     pub async fn restore_with_model_client<C>(
         state_dir: PathBuf,
-        session_id: StandaloneSessionId,
+        worker_id: WorkerId,
         model_client: C,
     ) -> Result<Self, StandaloneStartupError>
     where
         C: LlmClient + 'static,
     {
-        Self::restore_with_optional_model_client(
-            state_dir,
-            session_id,
-            Some(Box::new(model_client)),
-        )
-        .await
+        Self::restore_with_optional_model_client(state_dir, worker_id, Some(Box::new(model_client)))
+            .await
     }
 
     async fn restore_with_optional_model_client(
         state_dir: PathBuf,
-        session_id: StandaloneSessionId,
+        worker_id: WorkerId,
         model_client: Option<Box<dyn LlmClient>>,
     ) -> Result<Self, StandaloneStartupError> {
-        let store =
-            StandaloneSessionStore::open(state_dir).map_err(classify_store_startup_error)?;
+        let store = StandaloneWorkerStore::open(state_dir).map_err(classify_store_startup_error)?;
         let record = store
-            .load(session_id)
+            .load(worker_id)
             .map_err(classify_store_startup_error)?;
         record.cwd.verify().map_err(classify_store_startup_error)?;
         let lease = store
-            .acquire_lease(session_id, StaleLeasePolicy::Recover)
+            .acquire_lease(worker_id, StaleLeasePolicy::Recover)
             .map_err(classify_store_startup_error)?;
-        let (backing_store, worker_store) = backing_store(&store, session_id)?;
-        let worker_name = record.worker_name.clone();
-        let manifest = record.manifest.clone();
+        let (backing_store, worker_store) = backing_store(&store, worker_id)?;
+        let storage_key = record.storage_key.clone();
+        let mut manifest = record.manifest.clone();
+        manifest.worker.name = storage_key.clone();
         let filesystem_authority = WorkerFilesystemAuthority::local(
             record.cwd.canonical_path.clone(),
             record.cwd.canonical_path.clone(),
         );
         let workspace_context = WorkerWorkspaceContext::local_filesystem(None);
-        let runtime_base = store.runtime_dir(session_id);
+        let runtime_base = store.runtime_dir(worker_id);
 
         let mut bootstrap = WorkerBootstrap::new(
             manifest,
@@ -220,11 +222,11 @@ impl StandaloneHost {
             bootstrap = bootstrap.with_model_client(model_client);
         }
         let prepared = bootstrap
-            .prepare_restored(&worker_name)
+            .prepare_restored(&storage_key)
             .await
             .map_err(classify_startup_error)?;
         let started = prepared.start().await.map_err(classify_startup_error)?;
-        let active = match active_pointer(&worker_store, &worker_name) {
+        let active = match active_pointer(&worker_store, &storage_key) {
             Ok(active) => active,
             Err(error) => {
                 stop_started_worker(started).await;
@@ -251,10 +253,10 @@ impl StandaloneHost {
 
     fn from_started(
         started: BootstrappedWorker,
-        store: StandaloneSessionStore,
+        store: StandaloneWorkerStore,
         worker_store: FsWorkerStore,
-        record: StandaloneSessionRecord,
-        lease: StandaloneSessionLease,
+        record: StandaloneWorkerRecord,
+        lease: StandaloneWorkerLease,
     ) -> Self {
         Self {
             handle: started.handle,
@@ -268,12 +270,12 @@ impl StandaloneHost {
     }
 
     #[must_use]
-    pub fn session_id(&self) -> StandaloneSessionId {
-        self.record.session_id
+    pub fn worker_id(&self) -> WorkerId {
+        self.record.worker_id
     }
 
     #[must_use]
-    pub fn record(&self) -> &StandaloneSessionRecord {
+    pub fn record(&self) -> &StandaloneWorkerRecord {
         &self.record
     }
 
@@ -310,7 +312,7 @@ impl StandaloneHost {
                 return Err(StandaloneShutdownError::DeadlineExceeded);
             }
         }
-        let active = match active_pointer(&self.worker_store, &self.record.worker_name) {
+        let active = match active_pointer(&self.worker_store, &self.record.storage_key) {
             Ok(active) => active,
             Err(_) => {
                 self.retain_lease();
@@ -451,12 +453,12 @@ async fn send_protocol_event(peer: &InProcessPeer, event: Event) -> bool {
 }
 
 fn backing_store(
-    store: &StandaloneSessionStore,
-    id: StandaloneSessionId,
+    store: &StandaloneWorkerStore,
+    worker_id: WorkerId,
 ) -> Result<(StandaloneBackingStore, FsWorkerStore), StandaloneStartupError> {
-    let session_store =
-        FsStore::new(store.session_log_dir(id)).map_err(|_| StandaloneStartupError::StateStore)?;
-    let worker_store = FsWorkerStore::new(store.worker_metadata_dir(id))
+    let session_store = FsStore::new(store.sessions_dir(worker_id))
+        .map_err(|_| StandaloneStartupError::StateStore)?;
+    let worker_store = FsWorkerStore::new(store.worker_metadata_dir(worker_id))
         .map_err(|_| StandaloneStartupError::StateStore)?;
     Ok((
         CombinedStore::new(session_store, worker_store.clone()),
@@ -466,10 +468,10 @@ fn backing_store(
 
 fn active_pointer(
     worker_store: &FsWorkerStore,
-    worker_name: &str,
+    storage_key: &str,
 ) -> Result<WorkerActiveSegmentRef, StandaloneStartupError> {
     worker_store
-        .read_by_name(worker_name)
+        .read_by_name(storage_key)
         .map_err(|_| StandaloneStartupError::StateStore)?
         .and_then(|metadata| metadata.active)
         .ok_or(StandaloneStartupError::StateStore)
@@ -482,7 +484,7 @@ async fn stop_started_worker(started: BootstrappedWorker) {
 
 fn classify_store_startup_error(error: StandaloneStoreError) -> StandaloneStartupError {
     match error {
-        StandaloneStoreError::SessionLeased(_) => StandaloneStartupError::SessionActive,
+        StandaloneStoreError::WorkerLeased(_) => StandaloneStartupError::WorkerActive,
         StandaloneStoreError::LeaseLivenessUnknown(_) => {
             StandaloneStartupError::LeaseLivenessUnknown
         }

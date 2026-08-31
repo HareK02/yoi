@@ -25,9 +25,7 @@ use tokio::sync::mpsc;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use client::transport::Socket;
-use client::{
-    BackendRuntimeTarget, Client, StandaloneSessionResumeIntent, connect_backend_runtime,
-};
+use client::{BackendRuntimeTarget, Client, StandaloneWorkerResumeIntent, connect_backend_runtime};
 
 use crate::app::{ActionbarNoticeLevel, ActionbarNoticeSource, App};
 use crate::composer_keys::{ComposerEditAction, composer_edit_action};
@@ -193,18 +191,18 @@ pub(crate) async fn run_standalone(
 }
 
 pub(crate) async fn run_standalone_restore(
-    intent: StandaloneSessionResumeIntent,
+    intent: StandaloneWorkerResumeIntent,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let session_id = intent.session_id.parse().map_err(|error| {
+    let worker_id = intent.worker_id.parse().map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("Invalid standalone session ID: {error}"),
+            format!("Invalid standalone Worker ID: {error}"),
         )
     })?;
-    let host = StandaloneHost::restore(intent.state_dir, session_id)
+    let host = StandaloneHost::restore(intent.state_dir, worker_id)
         .await
         .map_err(|error| io::Error::other(format!("Standalone restore failed: {error}")))?;
-    let worker_label = format!("standalone-{}", session_id.short());
+    let worker_label = host.record().worker_name.clone();
     let history_root = host.record().cwd.canonical_path.clone();
     run_standalone_host(host, worker_label, history_root).await
 }

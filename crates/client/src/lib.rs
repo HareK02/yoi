@@ -35,9 +35,9 @@ pub use backend_workspace::{
 };
 pub use client::{Client, ClientError};
 pub use target::{
-    BackendTarget, Dashboard, ResolvedTarget, StandaloneSessionListIntent,
-    StandaloneSessionResumeIntent, StandaloneTarget, Target, TargetError, TargetKind,
-    WorkerConnection, WorkerConnectionSelector, WorkerList, WorkerListRequest, WorkerSpawn,
+    BackendTarget, Dashboard, ResolvedTarget, StandaloneTarget, StandaloneWorkerListIntent,
+    StandaloneWorkerResumeIntent, Target, TargetError, TargetKind, WorkerConnection,
+    WorkerConnectionSelector, WorkerList, WorkerListRequest, WorkerSpawn,
 };
 pub use workspace_api::{ObjectiveDetail, ObjectiveSummary};
 pub use workspace_product::BackendWorkspaceProductClient;
